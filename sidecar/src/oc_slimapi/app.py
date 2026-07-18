@@ -1,0 +1,96 @@
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+import uvicorn
+
+from .config import settings
+from .proxy import install_proxy
+from .routes import events, health, messages, metrics, questions, sessions
+from .sse.hub import HubRegistry
+from .transform import TransformConfig, TransformPool
+from .upstream import create_client
+from .versioning import SlimapiVersionMiddleware
+
+
+async def smoke(app: FastAPI) -> None:
+    sid = app.state.config.smoke_session_id
+    if not sid:
+        try:
+            sessions = (await app.state.upstream.get("/session", params={"limit": 1})).json()
+            sid = sessions[0].get("id") if sessions else None
+        except Exception:
+            sid = None
+    if not sid:
+        return
+    try:
+        response = await app.state.upstream.get(f"/session/{sid}/message", params={"limit": 1})
+        payload = response.json()
+        valid = response.status_code < 300 and isinstance(payload, list)
+        if payload:
+            valid = valid and isinstance(payload[0].get("info", {}).get("id"), str)
+            valid = valid and all(isinstance(part.get("type"), str) for part in payload[0].get("parts", []))
+        app.state.schema_degraded = not valid
+    except Exception:
+        app.state.schema_degraded = True
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    settings.validate()
+    app.state.config = settings
+    app.state.route_secret = settings.read_route_secret()
+    app.state.upstream = create_client(settings)
+    # Transform pool: admission semaphore + bounded worker executor, both
+    # sized by OC_SLIMAPI_MAX_TRANSFORMS. Acquired by the skeleton routes
+    # *before* their upstream GET so memory pressure stays bounded and the
+    # parse/project/serialize/gzip chain never runs on this event loop.
+    app.state.transforms = TransformPool(TransformConfig(
+        max_transforms=settings.max_transforms,
+        transform_wait_seconds=settings.transform_wait_seconds,
+        max_response_bytes=settings.max_response_bytes,
+    ))
+    app.state.directory_allowlist = set()
+    app.state.schema_degraded = False
+    # T3-hardened hub registry (contract §6): per-subscriber byte budget,
+    # per-frame ceiling, and per-directory / total admission caps all flow
+    # in from Settings so an operator can tune them via env without code.
+    app.state.hubs = HubRegistry(
+        app.state.upstream,
+        max_subscribers_per_directory=settings.max_subscribers_per_directory,
+        max_total_subscribers=settings.max_total_subscribers,
+        queue_items=settings.sse_queue_items,
+        buffer_bytes=settings.sse_buffer_bytes,
+        max_frame_bytes=settings.sse_max_frame_bytes,
+    )
+    # Wire the transform pool into the registry so /slimapi/metrics can
+    # report activeTransforms / waitingTransforms without the hub module
+    # importing transform.py (would be a circular import via skeleton.py).
+    app.state.hubs.set_transforms(app.state.transforms)
+    await smoke(app)
+    try:
+        yield
+    finally:
+        await app.state.hubs.close()
+        await app.state.upstream.aclose()
+        # Drain in-flight transforms before letting the process exit so a
+        # hot reload does not yank a worker out from under an active gzip.
+        app.state.transforms.shutdown()
+
+
+app = FastAPI(title="oc-slimapi", version="0.1.0", lifespan=lifespan)
+app.add_middleware(
+    SlimapiVersionMiddleware,
+    accepted_client_versions=settings.accepted_client_versions,
+)
+for router in (health.router, sessions.router, messages.router, questions.router, events.router, metrics.router):
+    app.include_router(router)
+install_proxy(app)
+
+
+def main() -> None:
+    settings.validate()
+    uvicorn.run("oc_slimapi.app:app", host=settings.host, port=settings.port, workers=1)
+
+
+if __name__ == "__main__":
+    main()

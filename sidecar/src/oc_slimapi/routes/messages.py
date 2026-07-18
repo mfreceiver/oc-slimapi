@@ -1,0 +1,465 @@
+from __future__ import annotations
+
+import re
+from typing import Literal
+from urllib.parse import urlparse
+
+import orjson
+from fastapi import APIRouter, Query, Request
+from starlette.background import BackgroundTask
+from starlette.responses import Response, StreamingResponse
+
+from ..gzip_util import error_response, json_response
+from ..transform import (
+    TransformBusy,
+    project_and_pack,
+    project_messages_and_pack,
+    read_with_cap,
+)
+from ..upstream import (
+    decoded_body_headers,
+    forward_directory_headers,
+    strip_hop_by_hop,
+)
+
+router = APIRouter(prefix="/slimapi/messages/{sid}", tags=["messages"])
+
+# Fixed Retry-After for transform admission timeouts. Kept as a module constant
+# so tests and the route agree on the wire contract.
+TRANSFORM_RETRY_AFTER_SECONDS = 2
+
+
+def _extract_before_verbatim(query: str) -> str | None:
+    """Return the raw ``before=<value>`` substring from a URL query string
+    WITHOUT any percent-decoding or ``+``→space substitution.
+
+    opencode's cursor is an opaque base64url JSON envelope that the upstream
+    ``cursor.decode`` consumes byte-for-byte. ``parse_qs`` / ``unquote_plus``
+    would transform ``%2B``→``+`` and ``+``→space, silently corrupting the
+    round-trip — the value might happen to look unchanged on the base64url
+    charset today, but that would be luck, not design. We MUST return the
+    original substring as it appeared on the wire.
+
+    Returns None when the param is absent OR present without a value
+    (``?before`` with no ``=``) — both are treated as "no cursor" so the
+    caller fails safe (no X-Next-Cursor emitted).
+    """
+    if not query:
+        return None
+    for part in query.split("&"):
+        if part == "before":
+            # ``?before`` with no value → treat as absent (fail-safe).
+            return None
+        if part.startswith("before="):
+            # Slice after ``before=`` to end of this ``&``-segment. Any
+            # percent-escapes / ``+`` are preserved verbatim.
+            return part[len("before="):]
+    return None
+
+
+_REL_PARAM_RE = re.compile(
+    # Match the ``rel`` link-param anywhere in a Link entry's attribute
+    # string. Pre-anchor on start/whitespace/``;`` so we don't false-match
+    # a ``rel=`` substring tucked inside another param's quoted value
+    # (e.g. ``title="rel=next"``). IGNORECASE covers the param NAME;
+    # value tokens are lowercased by the caller per RFC 5988 §3.
+    r'(?:^|[\s;])rel\s*=\s*(?:"([^"]*)"|([^;\s]+))',
+    re.IGNORECASE,
+)
+
+
+def _link_rel_tokens(attrs: str) -> list[str]:
+    """Extract the ``rel`` link-param value as a list of lowercased tokens.
+
+    RFC 5988 §3 allows multiple whitespace-separated relation types
+    (``rel="prev next"``) and treats relation types as case-insensitive.
+    Returns ``[]`` when ``rel`` is absent or has no value.
+    """
+    match = _REL_PARAM_RE.search(attrs)
+    if not match:
+        return []
+    raw = match.group(1) if match.group(1) is not None else match.group(2)
+    return [tok.lower() for tok in raw.split() if tok]
+
+
+def _parse_link_next_cursor(link_header: str | None) -> str | None:
+    """RFC 5988 ``Link`` parser — extract the ``before`` query param from the
+    ``rel="next"`` URL. Returns the opaque cursor string verbatim, or None
+    when no next-page link is present.
+
+    opencode advertises pagination via
+    ``Link: <...?before=<opaque>&limit=N>; rel="next"`` and recognises the
+    same opaque cursor as ``?before`` on the next request. We surface that
+    cursor verbatim as our own ``X-Next-Cursor`` response header so clients
+    never need to know opencode's cursor format — and crucially, never
+    substitute a bare messageID (opencode rejects those with 400 because
+    the cursor is a base64url JSON envelope, not a raw id).
+
+    The ``before`` value is sliced out of the raw query string via
+    :func:`_extract_before_verbatim` — never ``parse_qs`` / ``unquote``,
+    which would percent-decode and corrupt the opaque token.
+
+    ``rel`` matching follows RFC 5988 §3: case-insensitive on both the param
+    name and the relation-type tokens, and supports multi-token values
+    (``rel="prev next"`` is recognised as a next link). Entries are still
+    split on ``,`` — safe because opencode's base64url cursors do not
+    contain commas.
+    """
+    if not link_header:
+        return None
+    for raw in link_header.split(","):
+        segment = raw.strip()
+        if not segment.startswith("<"):
+            continue
+        end = segment.find(">")
+        if end < 0:
+            continue
+        url = segment[1:end]
+        attrs = segment[end + 1:]
+        # RFC 5988 §3: relation types are case-insensitive tokens. Match
+        # any entry whose ``rel`` value contains ``next`` as one of its
+        # whitespace-separated tokens — handles ``rel="next"``,
+        # ``rel="prev next"``, ``rel=next``, ``REL="Next"`` uniformly.
+        if "next" not in _link_rel_tokens(attrs):
+            continue
+        # urlparse splits structurally without decoding the query — safe.
+        cursor = _extract_before_verbatim(urlparse(url).query)
+        if cursor is not None:
+            return cursor
+    return None
+
+
+def _busy_response(accept_encoding: str | None = None) -> Response:
+    """503 + ``Retry-After`` — emitted when the transform pool admission
+    times out.
+
+    Routed through :func:`error_response` so the body honours gzip
+    negotiation (contract §9) when the client sent ``Accept-Encoding: gzip``.
+    ``error_response`` sets ``Vary: Accept-Encoding`` (and Content-Encoding
+    when gzip is negotiated); ``Retry-After`` is appended afterward because
+    it is a transport header, not a body field.
+    """
+    response = error_response(
+        "transform_busy", 503,
+        accept_encoding=accept_encoding,
+        retry_after=TRANSFORM_RETRY_AFTER_SECONDS,
+    )
+    response.headers["Retry-After"] = str(TRANSFORM_RETRY_AFTER_SECONDS)
+    return response
+
+
+async def _stream_upstream(
+    request: Request, path: str, params: dict, directory: str | None,
+):
+    """Build & send a streaming GET so we can cap-read the body instead of buffering.
+
+    Caller MUST ``await response.aclose()`` — typically inside a ``finally``
+    block — to release the underlying httpx connection.
+    """
+    upstream_request = request.app.state.upstream.build_request(
+        "GET", path, params=params,
+        headers=forward_directory_headers(directory),
+    )
+    return await request.app.state.upstream.send(upstream_request, stream=True)
+
+
+async def _drain_error(response) -> Response:
+    """Buffer a small upstream error body and pass it through verbatim."""
+    body = await response.aread()
+    return Response(
+        body, response.status_code,
+        headers=decoded_body_headers(response.headers),
+        media_type=response.headers.get("content-type"),
+    )
+
+
+def _item_updated(item: dict) -> int | None:
+    """Extract ``info.time.updated`` as an int, or None when absent/non-int."""
+    info = item.get("info") or {}
+    time_obj = info.get("time") or {}
+    updated = time_obj.get("updated")
+    return updated if isinstance(updated, int) and not isinstance(updated, bool) else None
+
+
+def _passes_ts_filter(item: dict, ts: int) -> bool:
+    """A2=A filter (contract §5): include items with ``info.time.updated >= ts``.
+
+    Items whose ``info.time.updated`` is missing or not a plain int are included
+    defensively — the client dedups by messageID anyway, and we'd rather
+    over-deliver a malformed edge item than silently hide it. Only a
+    definitively comparable ``updated < ts`` excludes an item.
+    """
+    updated = _item_updated(item)
+    if updated is None:
+        return True
+    return updated >= ts
+
+
+@router.get("/since/{ts}")
+async def messages_since(
+    request: Request,
+    sid: str,
+    ts: int,
+    limit: int = Query(50, ge=1, le=200),
+    before: str | None = None,
+    mode: Literal["skeleton", "full"] = "skeleton",
+    directory: str | None = None,
+):
+    """A2=A (contract §5): return skeleton messages with ``time.updated >= ts``.
+
+    Walks opencode's newest-first ``/session/{sid}/message`` listing backward
+    via the ``before`` cursor (opencode's own opaque base64url cursor,
+    forwarded verbatim — never decoded/re-encoded by sidecar). A single
+    transform-pool admission covers the whole multi-page scan, and a single
+    cumulative ``max_response_bytes`` budget is enforced across pages so a
+    runaway timestamp scan cannot accumulate more than the cap of upstream
+    bodies (413 ``response_too_large`` on overflow — contract §7).
+
+    Because upstream pages are sorted newest→oldest, the scan stops at the
+    first item with ``time.updated < ts``: every subsequent item in this page
+    and any older page is also below the floor. The boundary (``== ts``) is
+    included — clients dedup by messageID.
+
+    Pagination cursor: opencode advertises more pages via the RFC 5988
+    ``Link: <...?before=<opaque>; rel="next"`` response header. We extract
+    that opaque cursor and surface it verbatim as our own ``X-Next-Cursor``
+    response header — emitted only when we filled the client's limit AND
+    never tripped the ts floor AND opencode actually advertised another page.
+    """
+    if request.app.state.schema_degraded:
+        mode = "full"
+    config = request.app.state.config
+    pool = request.app.state.transforms
+    # Single admission covers the whole multi-page scan; cumulative byte
+    # budget is enforced across pages so a runaway timestamp scan cannot
+    # accumulate more than ``max_response_bytes`` of upstream bodies.
+    try:
+        async with pool:
+            collected: list[dict] = []
+            cursor = before
+            total_bytes = 0
+            hit_ts_floor = False
+            # opencode's opaque cursor from the last fetched page. Becomes
+            # our X-Next-Cursor iff we end the scan without tripping the ts
+            # floor and the limit is filled.
+            last_page_cursor: str | None = None
+            for _ in range(config.max_since_pages):
+                params = {"limit": limit}
+                if cursor:
+                    params["before"] = cursor
+                response = await _stream_upstream(
+                    request, f"/session/{sid}/message", params, directory,
+                )
+                try:
+                    if response.status_code >= 400:
+                        return await _drain_error(response)
+                    body, n = await read_with_cap(
+                        response, config.max_response_bytes - total_bytes,
+                    )
+                    if body is None:
+                        return error_response(
+                            "response_too_large", 413,
+                            limit=config.max_response_bytes,
+                            accept_encoding=request.headers.get("accept-encoding"),
+                        )
+                    total_bytes += n
+                    # Per-page parse stays inline because we must inspect
+                    # info.time.updated per item to apply the A2=A filter and
+                    # decide whether older pages still need scanning. The
+                    # expensive skeleton projection of the merged list runs
+                    # off-thread below.
+                    page = orjson.loads(body)
+                    # opencode advertises more pages via the Link header
+                    # (RFC 5988 rel="next"). Extract the opaque before cursor
+                    # verbatim — never synthesise one from a messageID
+                    # (opencode's cursor is a base64url JSON envelope, and
+                    # passing a bare id would 400 at upstream).
+                    last_page_cursor = _parse_link_next_cursor(
+                        response.headers.get("Link")
+                    )
+                finally:
+                    await response.aclose()
+                if not page:
+                    break
+                page_full = False
+                for item in page:
+                    if _passes_ts_filter(item, ts):
+                        collected.append(item)
+                        if len(collected) >= limit:
+                            page_full = True
+                            break
+                    else:
+                        # Pages are newest→oldest; the first item below the
+                        # ts floor means every older item (this page tail and
+                        # any further page) is also below ts. Stop scanning.
+                        hit_ts_floor = True
+                        page_full = True
+                        break
+                if page_full:
+                    break
+                if not last_page_cursor:
+                    break
+                cursor = last_page_cursor
+            # Emit X-Next-Cursor only when ALL of:
+            #   • we filled the limit (more matching items may exist),
+            #   • we never tripped the ts floor (older items would be < ts),
+            #   • opencode actually advertised another page (opaque cursor).
+            # The cursor is opencode's opaque string — passed through verbatim,
+            # never decoded or re-encoded.
+            base_headers: dict[str, str] = {"Cache-Control": "no-store"}
+            if (
+                collected
+                and len(collected) >= limit
+                and not hit_ts_floor
+                and last_page_cursor
+            ):
+                base_headers["X-Next-Cursor"] = last_page_cursor
+            if mode == "skeleton":
+                encoded, extra = await pool.offload(
+                    project_messages_and_pack, collected,
+                    accept_encoding=request.headers.get("accept-encoding"),
+                )
+                return Response(
+                    encoded, status_code=200,
+                    media_type="application/json",
+                    headers={**base_headers, **extra},
+                )
+            return json_response(
+                collected,
+                accept_encoding=request.headers.get("accept-encoding"),
+                headers=base_headers,
+            )
+    except TransformBusy:
+        return _busy_response(request.headers.get("accept-encoding"))
+
+
+@router.get("")
+async def messages(
+    request: Request,
+    sid: str,
+    limit: int = Query(40, ge=1, le=200),
+    before: str | None = None,
+    mode: Literal["skeleton", "full"] = "skeleton",
+    directory: str | None = None,
+):
+    if request.app.state.schema_degraded:
+        mode = "full"
+    params = {"limit": limit}
+    if before:
+        params["before"] = before
+    if mode == "full":
+        # Full mode is a verbatim streaming passthrough; no transform work,
+        # so admission is not needed and the event loop stays free.
+        upstream_request = request.app.state.upstream.build_request(
+            "GET", f"/session/{sid}/message", params=params,
+            headers=forward_directory_headers(directory),
+        )
+        response = await request.app.state.upstream.send(upstream_request, stream=True)
+        return StreamingResponse(
+            response.aiter_raw(), status_code=response.status_code,
+            headers={**strip_hop_by_hop(response.headers), "Cache-Control": "no-store"},
+            background=BackgroundTask(response.aclose),
+        )
+    config = request.app.state.config
+    pool = request.app.state.transforms
+    try:
+        # Admission BEFORE the upstream GET: this is the key fix. The prior
+        # code buffered the entire upstream body and only then tried to
+        # acquire the semaphore, so N concurrent clients could each buffer a
+        # large body before any of them failed admission.
+        async with pool:
+            response = await _stream_upstream(
+                request, f"/session/{sid}/message", params, directory,
+            )
+            next_cursor: str | None = None
+            try:
+                if response.status_code >= 400:
+                    return await _drain_error(response)
+                body, _ = await read_with_cap(response, config.max_response_bytes)
+                if body is None:
+                    return error_response(
+                        "response_too_large", 413,
+                        limit=config.max_response_bytes,
+                        accept_encoding=request.headers.get("accept-encoding"),
+                    )
+                # Translate opencode's Link header into our X-Next-Cursor
+                # (opaque passthrough). Capture BEFORE aclose() for clarity,
+                # though httpx headers remain readable afterward. Never
+                # leak the upstream Link header itself — the sidecar's
+                # pagination contract is X-Next-Cursor, so clients see one
+                # consistent shape whether they consume list or since.
+                next_cursor = _parse_link_next_cursor(response.headers.get("Link"))
+                # Full parse/project/serialize/gzip chain in the worker pool.
+                encoded, extra = await pool.offload(
+                    project_and_pack, body,
+                    single=False,
+                    accept_encoding=request.headers.get("accept-encoding"),
+                )
+            finally:
+                await response.aclose()
+        base_headers: dict[str, str] = {"Cache-Control": "no-store"}
+        if next_cursor:
+            base_headers["X-Next-Cursor"] = next_cursor
+        return Response(
+            encoded, status_code=200, media_type="application/json",
+            headers={**base_headers, **extra},
+        )
+    except TransformBusy:
+        return _busy_response(request.headers.get("accept-encoding"))
+
+
+@router.get("/full/{mid}")
+async def message(
+    request: Request, sid: str, mid: str,
+    mode: Literal["skeleton", "full"] = "full",
+    directory: str | None = None,
+):
+    if request.app.state.schema_degraded:
+        mode = "full"
+    if mode == "full":
+        # Single-message full mode keeps its existing buffered shape: a single
+        # upstream record is small enough that the max_message_bytes guard is
+        # sufficient and we avoid streaming-passthrough plumbing here.
+        response = await request.app.state.upstream.get(
+            f"/session/{sid}/message/{mid}", headers=forward_directory_headers(directory),
+        )
+        if len(response.content) > request.app.state.config.max_message_bytes:
+            return error_response(
+                "message_too_large", 413,
+                limitBytes=request.app.state.config.max_message_bytes,
+                accept_encoding=request.headers.get("accept-encoding"),
+            )
+        return Response(
+            response.content, response.status_code,
+            headers={**decoded_body_headers(response.headers), "Cache-Control": "no-store"},
+        )
+    config = request.app.state.config
+    pool = request.app.state.transforms
+    try:
+        async with pool:
+            response = await _stream_upstream(
+                request, f"/session/{sid}/message/{mid}", {}, directory,
+            )
+            try:
+                if response.status_code >= 400:
+                    return await _drain_error(response)
+                body, _ = await read_with_cap(response, config.max_response_bytes)
+                if body is None:
+                    return error_response(
+                        "response_too_large", 413,
+                        limit=config.max_response_bytes,
+                        accept_encoding=request.headers.get("accept-encoding"),
+                    )
+                encoded, extra = await pool.offload(
+                    project_and_pack, body,
+                    single=True,
+                    accept_encoding=request.headers.get("accept-encoding"),
+                )
+            finally:
+                await response.aclose()
+        return Response(
+            encoded, status_code=200, media_type="application/json",
+            headers={"Cache-Control": "no-store", **extra},
+        )
+    except TransformBusy:
+        return _busy_response(request.headers.get("accept-encoding"))

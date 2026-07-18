@@ -1,0 +1,1 @@
+"""Thin API route package."""

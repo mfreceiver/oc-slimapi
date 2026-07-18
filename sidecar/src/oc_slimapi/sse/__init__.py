@@ -1,0 +1,1 @@
+"""Curated SSE bridge package."""
