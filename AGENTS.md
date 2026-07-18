@@ -19,8 +19,8 @@ ocdroid ──(stunnel mTLS 14096)──▶ opencode :4096   # 直连回退，�
 - **只**通过 HTTP 调 opencode **legacy** `/session/**`（及 `/global/event` 等），**不读** opencode SQLite。
 - 为 ocdroid 提供：消息 skeleton 投影、策展 SSE（`session.digest` + q/p 直推）、routeToken 写端点、T3 资源限制、`/slimapi/**` 版本门禁 + catch-all 反代。
 - **权威契约**：[`docs/v1-contract.md`](docs/v1-contract.md)（唯一 wire 基准；与 design / INTERFACE_MAP 冲突时以契约为准）。
-- **设计 / 接口追踪**：[`docs/design-v2.md`](docs/design-v2.md)、[`INTERFACE_MAP.md`](INTERFACE_MAP.md)。
-- **客户端配套说明**：[`CLIENT_CHANGES.md`](CLIENT_CHANGES.md)（给 ocdroid 开发者的改动清单）。
+- **设计 / 接口追踪**：[`docs/design-v2.md`](docs/design-v2.md)、[`docs/INTERFACE_MAP.md`](docs/INTERFACE_MAP.md)。
+- **客户端配套说明**：[`docs/CLIENT_CHANGES.md`](docs/CLIENT_CHANGES.md)（给 ocdroid 开发者的改动清单）。
 
 本仓库 **不** 是 ocdroid 的子模块；与 ocdroid **并列** 开发、独立发版。ocdroid 侧对接规约见 ocdroid 仓库内 `docs/slim-mode-api-routing.md`（路径/版本头以 **本仓库契约** 为准；若 ocdroid 文档滞后，以本仓库 `docs/v1-contract.md` + `CHANGELOG.md` 为准）。
 
@@ -60,7 +60,7 @@ ocdroid ──(stunnel mTLS 14096)──▶ opencode :4096   # 直连回退，�
 | 改动后校验（必做） | `./scripts/check.sh` | 本文「硬规则」+ [`docs/release.md`](docs/release.md) §质量门禁 |
 | 发版（tag + changelog） | `./scripts/release.sh <patch\|minor\|major>` | **[`docs/release.md`](docs/release.md)**（发版规范权威） |
 | 接口行为变更记录 | 编辑 [`CHANGELOG.md`](CHANGELOG.md) | 每次**破坏/加性 wire 行为**变更必须记；ocdroid 对接以本文件为准 |
-| 契约 / 设计 | `docs/v1-contract.md`、`docs/design-v2.md`、`INTERFACE_MAP.md` | 契约只在破坏性变更时 bump `X-Slimapi-Version` |
+| 契约 / 设计 | `docs/v1-contract.md`、`docs/design-v2.md`、`docs/INTERFACE_MAP.md` | 契约只在破坏性变更时 bump `X-Slimapi-Version` |
 
 > 任何 release / tag / 版本号 / changelog 写入，都不得由 agent 自由发挥命令，必须走 `scripts/release.sh` 或 `docs/release.md` 写明的步骤。
 
@@ -110,8 +110,8 @@ journalctl --user -u oc-slimapi -f
 |---|---|
 | [`docs/v1-contract.md`](docs/v1-contract.md) | **Wire 契约权威** |
 | [`docs/design-v2.md`](docs/design-v2.md) | 当前态设计（接口/骨架/部署） |
-| [`INTERFACE_MAP.md`](INTERFACE_MAP.md) | 端点级实现追踪 |
-| [`CLIENT_CHANGES.md`](CLIENT_CHANGES.md) | ocdroid 侧配套改动清单 |
+| [`docs/INTERFACE_MAP.md`](docs/INTERFACE_MAP.md) | 端点级实现追踪 |
+| [`docs/CLIENT_CHANGES.md`](docs/CLIENT_CHANGES.md) | ocdroid 侧配套改动清单 |
 | [`CHANGELOG.md`](CHANGELOG.md) | **接口行为变更记录**（给 ocdroid / 运维） |
 | [`docs/release.md`](docs/release.md) | **发版流程规范**（本仓库权威） |
 | [`docs/operations.md`](docs/operations.md) | **部署 / 运维 / 日志**（systemd、journald、排障） |

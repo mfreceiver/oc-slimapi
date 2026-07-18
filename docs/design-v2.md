@@ -1,4 +1,4 @@
-# opencode 省流中间层 — 设计
+# oc-slimapi 设计
 
 > 硬约束：**纯 HTTP、禁 SQLite、只建在 legacy `/session`、loopback-only、stunnel mTLS、不替换 `List<MessageWithParts>` 形状**。
 > 版本契约：路径固定为 `/slimapi/**`，版本走必填请求头 `X-Slimapi-Version: <int>`；版本门禁仅接受配置闭区间，catch-all 不受影响。

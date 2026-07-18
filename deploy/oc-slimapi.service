@@ -1,5 +1,5 @@
 [Unit]
-Description=opencode mobile thin API sidecar
+Description=oc-slimapi (Python 省流 sidecar for ocdroid ↔ opencode)
 After=network.target
 
 [Service]

@@ -243,7 +243,7 @@ ocdroid 客户端**不直接操作** sidecar 进程，只通过 stunnel mTLS 接
 | 非 `/slimapi/**` | 透明反代 opencode，**不带**版本头 |
 | 健康自检（客户端侧） | `GET /slimapi/health` 读 `server.api_version` / `accepted_client_versions` 做运行时兼容判断 |
 | Wire 行为变更来源 | 本仓 [`CHANGELOG.md`](../CHANGELOG.md)（路径/头/错误码以本仓 + [`v1-contract.md`](v1-contract.md) 为准） |
-| 客户端配套改动清单 | [`CLIENT_CHANGES.md`](../CLIENT_CHANGES.md) |
+| 客户端配套改动清单 | [`CLIENT_CHANGES.md`](CLIENT_CHANGES.md) |
 
 sidecar 进程的启停、日志、升级由 **服务端运维** 负责，ocdroid 侧无需介入；但理解拓扑有助于排障（例如 sidecar 重启时 SSE 会断、客户端应收 `resync` 重连）。
 

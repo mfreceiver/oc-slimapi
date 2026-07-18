@@ -88,4 +88,4 @@ ocdroid 对接时：
 
 - 契约：[`docs/v1-contract.md`](docs/v1-contract.md)
 - 发版：[`docs/release.md`](docs/release.md)
-- 客户端清单：[`CLIENT_CHANGES.md`](CLIENT_CHANGES.md)
+- 客户端清单：[`docs/CLIENT_CHANGES.md`](docs/CLIENT_CHANGES.md)

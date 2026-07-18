@@ -58,5 +58,5 @@ curl -H 'X-Slimapi-Version: 1' http://127.0.0.1:4097/slimapi/health
 ```
 
 设计与接口见 [`docs/design-v2.md`](docs/design-v2.md) 和
-[`INTERFACE_MAP.md`](INTERFACE_MAP.md)；客户端配套见
-[`CLIENT_CHANGES.md`](CLIENT_CHANGES.md)。
+[`docs/INTERFACE_MAP.md`](docs/INTERFACE_MAP.md)；客户端配套见
+[`docs/CLIENT_CHANGES.md`](docs/CLIENT_CHANGES.md)。
