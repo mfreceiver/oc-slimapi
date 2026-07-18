@@ -30,6 +30,38 @@
 
 ---
 
+## 访问拓扑与连接方式（ocdroid 接入）
+
+sidecar 强制 loopback-only（契约 §0，`config.validate()` 拒绝非 loopback host），所有远程访问经 stunnel mTLS。两条访问路径：
+
+### 1. 本机 / 测试（明文 loopback，仅开发调试）
+| 目标 | URL | 说明 |
+|---|---|---|
+| sidecar 省流 API | `http://127.0.0.1:4097/slimapi/**` | 须带 `X-Slimapi-Version: 1` 头 |
+| opencode 直连（绕过 sidecar） | `http://127.0.0.1:4096/...` | legacy 写路径调试用 |
+
+仅本机可达。绑 `0.0.0.0` 会被 `config.validate()` 以 `OC_SLIMAPI_HOST must be loopback-only` RuntimeError 硬拒——这是**故意的安全 guard**：thin routes 无自身认证，安全模型完全依赖 stunnel mTLS 在前端。
+
+### 2. 远程 / 生产（mTLS via stunnel，ocdroid 实际接入路径）
+| 路径 | URL | 链路 |
+|---|---|---|
+| **slim 省流**（默认） | `https://opencode.vectory.cn:14097/slimapi/**` | mTLS 终结 → `127.0.0.1:4097` (sidecar) → `127.0.0.1:4096` (opencode) |
+| opencode 直连（回退） | `https://opencode.vectory.cn:14096/...` | 同 mTLS 信任织物，绕过 sidecar |
+
+- **服务器证书**：SAN = `opencode.vectory.cn`（hostname-bound，端口无关；同一证书服务 14096 与 14097）。
+- **客户端**：须持有本 CA 签发的 client cert/key + trust 本 CA；无证书在 TLS 握手阶段即拒（`requireCert = yes`、`verifyChain = yes`）。
+- **DNS / 穿透**：`opencode.vectory.cn` 解析到 FRP 节点（内网穿透）。14096 已对外暴露；**14097 须在 FRP 节点上加配等价的端口映射规则**（本机 stunnel 已 `listen 0.0.0.0:14097`，FRP 规则是部署侧动作，非本仓库代码）。
+
+### 当前部署实例（commit `7843f8e`，2026-07-18）
+- sidecar：`127.0.0.1:4097`，systemd user service `oc-slimapi.service`（active，B1 新代码已生效）。
+- opencode：`127.0.0.1:4096`（独立进程，opencode 自己监听 `0.0.0.0:4096`）。
+- stunnel：`0.0.0.0:{14096, 14097}`，systemd user `stunnel-opencode.service`（mTLS；证书在 `~/.config/stunnel/certs/`，仓库不托管）。
+- **mTLS 端到端自测通过**（14097）：`/slimapi/health` → 200；`/slimapi/sessions/ses_x/status` → 404 `{"code":"session_not_found",...}`；`POST /session/ses_x/shell` → 403 `{"code":"shell_not_allowed"}`。负向：无 client cert → TLS 握手即拒 ✓。
+
+> ocdroid 侧接入步骤：把 `~/.config/stunnel/certs/{ca-cert.pem, client-cert.pem, client-key.pem}` 部署到设备 → 客户端 HTTPS 客户端配置 `cert=(client-cert.pem, client-key.pem)`、`verify=ca-cert.pem` → 指向 `https://opencode.vectory.cn:14097`。
+
+---
+
 ## 逐节审计
 
 ### §0 范围与架构 — ✅ 完全实现
