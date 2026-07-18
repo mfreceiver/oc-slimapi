@@ -1,0 +1,171 @@
+# oc-slimapi 发版规范
+
+> **本文件是本仓库发版流程的权威说明。**  
+> 借鉴 ocdroid（`/home/mar/personal_projects/ocdroid`）的 `scripts/release.sh` + `.opencode/policies/versioning.md` 模式，按 **Python sidecar** 特点适配。  
+> Agent 入口索引见根目录 [`AGENTS.md`](../AGENTS.md)。
+
+---
+
+## 0. 与 ocdroid 的对照（原则借鉴，实现不同）
+
+| 维度 | ocdroid（参考） | oc-slimapi（本仓库） |
+|---|---|---|
+| 产物 | 签名 APK + Gitea Release | **git annotated tag** + 本仓 `CHANGELOG.md`（无 APK） |
+| 版本来源 | **纯 git 派生**（`versionName`/`versionCode` 不写文件） | **semver 写在** `sidecar/pyproject.toml` **且** 打 git tag `vX.Y.Z`（Python 包惯例） |
+| 发版入口 | `./scripts/release.sh <patch\|minor\|major>` | **同名同用法** `./scripts/release.sh <patch\|minor\|major>` |
+| 质量门禁 | `./scripts/check.sh`（compile + unit） | `./scripts/check.sh`（`pytest sidecar/tests/`） |
+| Changelog | 发版时从 conventional commits **生成**到 `APK/*.md`（无根 CHANGELOG） | **维护根目录 [`CHANGELOG.md`](../CHANGELOG.md)**（接口行为，给 ocdroid）；发版脚本要求目标版本节已存在 |
+| 对外发布 | 人工 `git push` + `upload-release.sh`（Gitea API 传 APK） | 人工 `git push origin main && git push origin vX.Y.Z`（可选：Gitea Release notes 贴 CHANGELOG 节） |
+| Wire 协议版本 | N/A（客户端） | **独立轨道**：`X-Slimapi-Version`（破坏性才 bump，见契约 §1） |
+
+**保留的 ocdroid 纪律**：
+
+- 发版必须在 **`main`**、工作区已跟踪文件干净。
+- 里程碑发版只走 **`release.sh`**，禁止随手 `git tag`。
+- 脚本打印 push 命令，**不自动 push**（人工确认）。
+- 质量门禁失败则中止发版。
+
+---
+
+## 1. 版本语义
+
+### 1.1 包版本（semver / git tag）
+
+| 类型 | 变化 | 何时使用 |
+|---|---|---|
+| `patch` | `0.1.0 → 0.1.1` | Bug 修复、内部重构、测试/文档、无客户端行为变化 |
+| `minor` | `0.1.0 → 0.2.0` | **加性** wire 能力（新可选字段/新端点、旧客户端可忽略） |
+| `major` | `0.1.0 → 1.0.0` | 产品大版本；**若含破坏性 wire，必须同时 bump `X-Slimapi-Version`** |
+
+Tag 格式：**`v` + semver**（例：`v0.1.0`），与 ocdroid 一致。
+
+### 1.2 Wire API 版本（整数头）
+
+- 头名：`X-Slimapi-Version`
+- 当前接受区间：见 `sidecar/src/oc_slimapi/versioning.py` 与 `docs/v1-contract.md` §1。
+- **仅破坏性**变更 bump；加性变更 **同版本**。
+- Bump 时必须同步：`versioning.py`、`docs/v1-contract.md`、`CHANGELOG.md`（写明客户端必改点）。
+
+---
+
+## 2. 发版前清单（人工 / agent）
+
+1. **行为变更**是否已写入 `CHANGELOG.md` 的 `[Unreleased]` 或目标版本节？  
+   - 路径、状态码、头字段、SSE 帧、错误 `code`、gzip/SSE 行为、资源限制默认值。
+2. 若破坏性：契约 + `X-Slimapi-Version` 是否已按 §1.2 处理？
+3. `main` 已包含全部要发的提交；本地 `./scripts/check.sh` 绿。
+4. （可选）对照 ocdroid `docs/slim-mode-api-routing.md`：客户端文档是否需同步（由 ocdroid 仓维护；本仓以 CHANGELOG 通知）。
+
+---
+
+## 3. 发版步骤（规范）
+
+### 3.0 首次 tag 引导（仅一次）
+
+仓库首次只有 commit、尚无任何 `v*` tag 时：若当前 `pyproject.toml` 已是 `0.1.0` 且 `CHANGELOG.md` 已有 `## [0.1.0]`，可**一次性**手动：
+
+```bash
+./scripts/check.sh
+git tag -a v0.1.0 -m "Release v0.1.0"
+git push origin main && git push origin v0.1.0
+```
+
+之后里程碑发版一律走 `release.sh`（禁止再随手 tag）。
+
+### 3.1 唯一入口
+
+```bash
+# 工作区：仓库根
+./scripts/check.sh                  # 可先单独跑
+./scripts/release.sh patch          # 或 minor | major
+```
+
+### 3.2 `release.sh` 应完成的事（实现约定）
+
+1. 校验当前分支 == `main`。
+2. 校验已跟踪文件工作区干净（允许 untracked，如本地 secret 路径备忘）。
+3. 跑 `./scripts/check.sh`。
+4. 读 `sidecar/pyproject.toml` 当前 `version`，按 patch|minor|major 推算下一版本 `X.Y.Z`。
+5. **要求** `CHANGELOG.md` 中存在 `## [X.Y.Z]` 节（或把 `[Unreleased]` 在发版说明里要求人工先折叠进去——脚本应失败并提示若缺失目标版本标题）。
+6. 写回 `sidecar/pyproject.toml` 的 `version = "X.Y.Z"`。
+7. `git add sidecar/pyproject.toml CHANGELOG.md`（及本次发版必要的契约文件，若有）并 **commit**：`release: vX.Y.Z`（conventional）。
+8. 创建 **annotated tag** `vX.Y.Z`（注释可用 CHANGELOG 该节摘要）。
+9. **打印**人工执行命令（不自动 push）：
+
+```bash
+git push origin main && git push origin vX.Y.Z
+```
+
+### 3.3 发版后
+
+1. 在 Gitea（`https://git.vectory.cn:18443/mfreceiver/oc-slimapi`）可为 tag 建 Release，body 粘贴 `CHANGELOG.md` 对应节（可选，无 APK 上传）。
+2. 通知 ocdroid：指向本仓 `CHANGELOG.md` 该版本；若路径/头/错误码有变，同步改 ocdroid 对接代码与 `docs/slim-mode-api-routing.md`。
+3. 打开新的 `## [Unreleased]` 空节（若 release 脚本未自动加）。
+
+### 3.4 同版本族热修（不打新 tag 时）
+
+- 仅文档/测试/无 wire 变化：正常 commit 即可，不必 `release.sh`。
+- 有 wire 行为修复：必须走至少 **patch** 发版，并写 CHANGELOG（ocdroid 需要可引用的版本锚点）。
+
+---
+
+## 4. 质量门禁（`scripts/check.sh`）
+
+最小集合（当前）：
+
+```bash
+.venv/bin/python -m pytest sidecar/tests/ -q
+```
+
+可选扩展（后续）：`compileall`、ruff/mypy、安装包可导入检查。  
+**默认门禁失败 → 禁止 tag。**
+
+---
+
+## 5. Changelog 与 ocdroid 的使用方式
+
+| 读者 | 用法 |
+|---|---|
+| ocdroid 开发 | 每个 slimapi 发版后读 `CHANGELOG.md` 新节，对照改客户端；路径/头以契约 + CHANGELOG 为准 |
+| oc-slimapi 开发 | 改 wire 前先想好 CHANGELOG 条目；发版前节必须齐 |
+| Agent | 禁止发版不写 CHANGELOG；破坏性变更禁止只改代码不改契约 |
+
+**不要**依赖 conventional commit 自动生成作为唯一记录：本项目 **接口语义**（如 `time.updated >= ts`、`archived` 为 epoch ms）必须用人工可读的行为描述，自动生成仅可作辅助。
+
+---
+
+## 6. 禁止事项
+
+- 禁止在非 `main` 上 `release.sh`。
+- 禁止跳过版本号（如 `0.1.0 → 0.1.2`）除非用户明确要求。
+- 禁止复用已 push 的 tag。
+- 禁止把 route secret、证书、本机绝对密钥路径提交进仓。
+- 禁止只 bump `pyproject.toml` 而不打 tag / 不写 CHANGELOG（拆开发版状态）。
+
+---
+
+## 7. 文件职责一览
+
+| 文件 | 职责 |
+|---|---|
+| [`AGENTS.md`](../AGENTS.md) | Agent 入口索引；引用本文件与 CHANGELOG |
+| [`docs/release.md`](release.md) | **本文件**：发版规范 |
+| [`CHANGELOG.md`](../CHANGELOG.md) | 接口行为变更记录 |
+| [`scripts/check.sh`](../scripts/check.sh) | 质量门禁 |
+| [`scripts/release.sh`](../scripts/release.sh) | 发版唯一入口 |
+| [`sidecar/pyproject.toml`](../sidecar/pyproject.toml) | 包版本号源 |
+| [`docs/v1-contract.md`](v1-contract.md) | Wire 契约 |
+| `sidecar/src/oc_slimapi/versioning.py` | Wire API 接受区间 |
+
+---
+
+## 8. 参考（ocdroid，只读对照）
+
+| ocdroid 路径 | 用途 |
+|---|---|
+| `AGENTS.md` | Agent 入口索引模式（本仓仿此结构） |
+| `scripts/release.sh` | 发版脚本骨架（分支/干净/门禁/semver/tag/不自动 push） |
+| `scripts/check.sh` | 改动校验入口 |
+| `.opencode/policies/versioning.md` | 版本纪律与禁止项 |
+| `docs/build-apk.md` | 发版细节长文（本仓无 APK，仅借鉴结构） |
+| `scripts/upload-release.sh` | Gitea 上传（本仓可选；无 APK 时多半不用） |
