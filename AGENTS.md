@@ -89,10 +89,14 @@ python -m venv .venv
 # 改动校验（必做）
 ./scripts/check.sh
 
-# 本地跑 sidecar（示例；secret 勿放仓内）
+# 开发：本地手动跑（临时 secret）
 openssl rand -base64 48 > /tmp/oc-slimapi-route-secret && chmod 600 /tmp/oc-slimapi-route-secret
 OC_SLIMAPI_ROUTE_SECRET_FILE=/tmp/oc-slimapi-route-secret \
   .venv/bin/python -m oc_slimapi.app
+
+# 生产：systemd user 服务（部署/日志/自启见 docs/operations.md）
+systemctl --user start oc-slimapi
+journalctl --user -u oc-slimapi -f
 
 # 发版（见 docs/release.md）
 ./scripts/release.sh patch    # | minor | major
@@ -110,5 +114,6 @@ OC_SLIMAPI_ROUTE_SECRET_FILE=/tmp/oc-slimapi-route-secret \
 | [`CLIENT_CHANGES.md`](CLIENT_CHANGES.md) | ocdroid 侧配套改动清单 |
 | [`CHANGELOG.md`](CHANGELOG.md) | **接口行为变更记录**（给 ocdroid / 运维） |
 | [`docs/release.md`](docs/release.md) | **发版流程规范**（本仓库权威） |
+| [`docs/operations.md`](docs/operations.md) | **部署 / 运维 / 日志**（systemd、journald、排障） |
 | [`sidecar/README.md`](sidecar/README.md) | sidecar 运行 / 测试备忘 |
 | ocdroid `docs/slim-mode-api-routing.md` | 客户端 slim 路由规约（对照用；冲突以本仓契约 + CHANGELOG 为准） |

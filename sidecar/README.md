@@ -28,6 +28,8 @@ python -m venv .venv
 
 ## 运行
 
+### 开发 / 手动
+
 ```bash
 OC_SLIMAPI_ROUTE_SECRET_FILE=/secure/route-secret \
   .venv/bin/python -m oc_slimapi.app
@@ -41,6 +43,20 @@ OC_SLIMAPI_ROUTE_SECRET_FILE=/secure/route-secret \
 ```
 
 必须单 worker；多 worker 会为同一 directory 重复建立 upstream SSE。
+
+### 生产 / systemd
+
+完整部署、service 单元、开机自启、日志策略见 **[`docs/operations.md`](../docs/operations.md)**。
+
+速查：
+
+```bash
+systemctl --user start oc-slimapi       # 启动
+systemctl --user status oc-slimapi      # 状态
+journalctl --user -u oc-slimapi -f      # 实时日志
+```
+
+> 日志走 journald，**不**落项目内文件。理由与查询手册见 `docs/operations.md` §5。
 
 所有 `/slimapi/**` 请求（包括 `/slimapi/events` SSE）必须带：
 
