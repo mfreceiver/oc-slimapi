@@ -88,9 +88,10 @@ B4  服务端 P1（可与 B1 并行）
 ### 实现要点
 
 - 现状 `routes/sessions.py:121-131` 用 `raise_for_status()` + `except Exception → 503`，**同时吞掉 allowlist 400 和 upstream 404**。
-- 修法：**re-raise `HTTPException`**（保留 allowlist 400）；对 upstream 用 `HTTPStatusError` 精确判 404；其它 4xx → 502；仅网络/5xx/解析失败 → 503。
+  - **现实校正（v1 B1 run, 2026-07-18）**：status handler 实际跨 `sessions.py:121-149`，`except Exception → 503` 有**两处**（discover 段 + status map 段）；G2 改造须同时覆盖两处。详见 `docs/ocmar/specs/2026-07-18-v1-b0-b1-design.md` §2 reality 表（行 A）+ §3.1。
+- 修法：**re-raise `HTTPException`**（保留 allowlist 400）；对 upstream 用 `HTTPStatusError` 精确判 404；其它 4xx → 502；仅网络/5xx/解析失败 → 503。✅ B1 已实现。
 - 批量 `GET /slimapi/sessions/status` 语义不变。
-- **错误 body 结构化迁移**：现网 `HTTPException(detail=str)` 渲染 `{"detail":"…"}`；G2/G7/G8 改造为 `{"code":…}`。
+- **错误 body 结构化迁移**：现网 `HTTPException(detail=str)` 渲染 `{"detail":"…"}`；G2/G7/G8 改造为 `{"code":…}`。✅ B1 已实现（`src/oc_slimapi/errors.py` 引入 `CodedHTTPException` + FastAPI `exception_handler`）。
 
 ---
 
@@ -107,7 +108,8 @@ B4  服务端 P1（可与 B1 并行）
 - **禁止**「先完整下载再查 32MiB」。
 - cap 计量：解压后逻辑 JSON 字节（与 list/since 口径一致，写死）。实现期确定 full 边读边按解压字节计数的流式实现（full 现为 passthrough，需在流上解压计数）。
 - 超限后须关闭 upstream response（防连接泄漏）。
-- **transform-busy 归一**：现状 `full/{mid}` skeleton 转换忙返回 **502**（INTERFACE_MAP line 23），与 list/since 及统一错误码表的 **503 `transform_busy`** 冲突；G8 顺带把 `full/{mid}` transform-busy 从 502 **归一为 503 `transform_busy`**。
+- **transform-busy 归一**：~~现状 `full/{mid}` skeleton 转换忙返回 **502**（INTERFACE_MAP line 23），与 list/since 及统一错误码表的 **503 `transform_busy`** 冲突；~~ G8 顺带把 `full/{mid}` transform-busy ~~从 502 **归一为 503 `transform_busy`**~~（文字同步实际代码；真相见下方现实校正）。
+  - **现实校正（v1 B1 run, 2026-07-18）**：代码层 `full/{mid}` transform-busy **实际一直返 503**（`_busy_response()` 写死 503；测试 `test_messages_route_returns_503_for_single_message_when_admission_saturated` 已断言 503）。即"502→503 归一"在代码层**本就完成**，G8 仅需同步更新 `docs/INTERFACE_MAP.md` line 23 文字。详见 `docs/ocmar/specs/2026-07-18-v1-b0-b1-design.md` §2 reality 表（行 B）+ §3.2。✅ B1 文档已同步。
 
 **参数不变**。
 
@@ -366,8 +368,11 @@ X-Slimapi-Version: 1
 | `response_too_large` | 413 | list/since/batch 累计 | 现有 |
 | `transform_busy` | 503 | 转换槽满（含 G8 归一后的 full/{mid}） | 现有（语义扩展） |
 | `upstream_unavailable` | 503 | 超时/5xx/解析失败（G2） | **新（统一命名）** |
-| `upstream_timeout` / `upstream_error` / `upstream_http_N` | **envelope 内 code**（非顶层 HTTP） | questions/permissions 聚合 `errors[]`；整体 200 部分成功 / 503 全败 | 现有 |
+| `upstream_http_N` | **502** (top-level body) | G2 `sessions/{sid}/status` discover/status-map other 4xx；`GET /slimapi/projects` discovery 4xx | **B1 语义扩展**（原仅 envelope） |
+| `upstream_http_N` / `upstream_timeout` / `upstream_error` | **envelope 内 code**（非顶层 HTTP） | questions/permissions 聚合 `errors[]`；整体 200 部分成功 / 503 全败 | 现有 |
 | `invalid_ids` | 400 | G6 ids 空/超限/解析失败（缺失走 422） | **新** |
+| `invalid_directory_count` | 400 | questions directory 数量守卫（repeated query 去重后须 1–32） | **新（B1 引入），加性，不 bump** |
+| `invalid_route_token` | 400 | questions routeToken 校验失败（签名/版本/iat/exp/kind/requestID/sessionID/directory 任一不通过） | **新（B1 引入），加性，不 bump** |
 | `shell_not_allowed` | 403 | G4 deny-list 命中 | **新** |
 | `websocket_not_supported` | —（WS 消息内 501，非 HTTP body） | WebSocket | 现有 |
 | `thin_route_not_found` | 404 | 未知 slim path | 现有 |

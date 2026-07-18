@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from typing import NoReturn
 from urllib.parse import quote
 
-from fastapi import APIRouter, HTTPException, Query, Request
+import httpx
+from fastapi import APIRouter, Query, Request
 
+from ..errors import CodedHTTPException
 from ..gzip_util import json_response
 from ..skeleton import skeleton_session
 from ..upstream import forward_directory_headers
@@ -56,9 +59,12 @@ async def require_directory(request: Request, directory: str) -> str:
         try:
             await load_projects(request)
         except Exception as exc:
-            raise HTTPException(503, "cannot refresh directory allowlist") from exc
+            raise CodedHTTPException(
+                503, code="upstream_unavailable",
+                message="cannot refresh directory allowlist",
+            ) from exc
     if normalized not in request.app.state.directory_allowlist:
-        raise HTTPException(400, "directory is not in opencode project allowlist")
+        raise CodedHTTPException(400, code="directory_not_allowed")
     return normalized
 
 
@@ -99,8 +105,10 @@ async def sessions(
 async def projects(request: Request):
     try:
         payload = await load_projects(request)
+    except httpx.HTTPStatusError as exc:
+        _raise_upstream_status(exc)
     except Exception as exc:
-        raise HTTPException(502, "project discovery failed") from exc
+        raise CodedHTTPException(503, code="upstream_unavailable") from exc
     return json_response(payload, accept_encoding=request.headers.get("accept-encoding"))
 
 
@@ -118,32 +126,60 @@ async def statuses(request: Request, directory: str):
     )
 
 
+def _raise_upstream_status(exc: httpx.HTTPStatusError, *, sid: str | None = None) -> NoReturn:
+    """Map an upstream HTTPStatusError to a structured CodedHTTPException.
+
+    404 on a session-discover call (sid provided) → session_not_found;
+    other 4xx → 502 upstream_http_N; 5xx → 503 upstream_unavailable.
+    """
+    status = exc.response.status_code
+    if status == 404 and sid is not None:
+        raise CodedHTTPException(404, code="session_not_found", sessionID=sid)
+    if status < 500:
+        raise CodedHTTPException(502, code=f"upstream_http_{status}")
+    raise CodedHTTPException(503, code="upstream_unavailable")
+
+
 @router.get("/sessions/{sid}/status")
 async def session_status(request: Request, sid: str):
+    # Discover: GET /session/{sid}
     try:
         session_response = await request.app.state.upstream.get(f"/session/{sid}")
+    except httpx.RequestError:
+        raise CodedHTTPException(503, code="upstream_unavailable")
+    try:
         session_response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        _raise_upstream_status(exc, sid=sid)
+    try:
         directory = session_response.json().get("directory")
-        if not isinstance(directory, str):
-            raise ValueError("session has no directory")
-        directory = await require_directory(request, directory)
-    except Exception as exc:
-        raise HTTPException(503, "cannot discover session directory") from exc
+    except Exception:
+        raise CodedHTTPException(503, code="upstream_unavailable")
+    if not isinstance(directory, str):
+        raise CodedHTTPException(503, code="upstream_unavailable")
+    # require_directory raises CodedHTTPException (400 directory_not_allowed /
+    # 503 upstream_unavailable) — must propagate, NOT be swallowed.
+    directory = await require_directory(request, directory)
+
+    # Status map: GET /session/status?directory=...
     try:
         result = await request.app.state.upstream.get(
             "/session/status", params={"directory": directory},
             headers=forward_directory_headers(directory),
         )
+    except httpx.RequestError:
+        raise CodedHTTPException(503, code="upstream_unavailable")
+    try:
         result.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        _raise_upstream_status(exc)
+    try:
         mapping = result.json()
-    except Exception as exc:
-        raise HTTPException(503, "session directory status query failed") from exc
+    except Exception:
+        raise CodedHTTPException(503, code="upstream_unavailable")
+    if not isinstance(mapping, dict):
+        raise CodedHTTPException(503, code="upstream_unavailable")
+
     if sid in mapping:
-        return json_response(
-            mapping[sid],
-            accept_encoding=request.headers.get("accept-encoding"),
-        )
-    return json_response(
-        {"type": "idle"},
-        accept_encoding=request.headers.get("accept-encoding"),
-    )
+        return json_response(mapping[sid], accept_encoding=request.headers.get("accept-encoding"))
+    return json_response({"type": "idle"}, accept_encoding=request.headers.get("accept-encoding"))

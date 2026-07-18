@@ -5,10 +5,12 @@ from typing import Literal
 from urllib.parse import urlparse
 
 import orjson
+import httpx
 from fastapi import APIRouter, Query, Request
 from starlette.background import BackgroundTask
 from starlette.responses import Response, StreamingResponse
 
+from ..errors import CodedHTTPException
 from ..gzip_util import error_response, json_response
 from ..transform import (
     TransformBusy,
@@ -21,6 +23,7 @@ from ..upstream import (
     forward_directory_headers,
     strip_hop_by_hop,
 )
+from .sessions import require_directory
 
 router = APIRouter(prefix="/slimapi/messages/{sid}", tags=["messages"])
 
@@ -148,6 +151,26 @@ def _busy_response(accept_encoding: str | None = None) -> Response:
     return response
 
 
+async def _resolve_messages_directory(request: Request, directory: str | None) -> str | None:
+    """G7-soft (spec §5): validate query ``directory`` against the allowlist.
+
+    - ``directory is None`` → not blocked (returns None; upstream default applies).
+      v1 only trusts query ``directory``; a lone ``X-Opencode-Directory`` header
+      is not validated and not forwarded (unchanged behaviour).
+    - query present AND header present AND they differ → 400 directory_not_allowed.
+    - query present → require_directory (may raise 400 directory_not_allowed /
+      503 upstream_unavailable on refresh failure).
+    Returns the normalised directory to forward (or None).
+    """
+    if directory is None:
+        return None
+    header_dir = request.headers.get("x-opencode-directory")
+    if header_dir:  # treat empty header as absent
+        if (header_dir.rstrip("/") or "/") != (directory.rstrip("/") or "/"):
+            raise CodedHTTPException(400, code="directory_not_allowed")
+    return await require_directory(request, directory)
+
+
 async def _stream_upstream(
     request: Request, path: str, params: dict, directory: str | None,
 ):
@@ -226,6 +249,7 @@ async def messages_since(
     response header — emitted only when we filled the client's limit AND
     never tripped the ts floor AND opencode actually advertised another page.
     """
+    directory = await _resolve_messages_directory(request, directory)
     if request.app.state.schema_degraded:
         mode = "full"
     config = request.app.state.config
@@ -342,6 +366,7 @@ async def messages(
     mode: Literal["skeleton", "full"] = "skeleton",
     directory: str | None = None,
 ):
+    directory = await _resolve_messages_directory(request, directory)
     if request.app.state.schema_degraded:
         mode = "full"
     params = {"limit": limit}
@@ -414,25 +439,44 @@ async def message(
     mode: Literal["skeleton", "full"] = "full",
     directory: str | None = None,
 ):
+    directory = await _resolve_messages_directory(request, directory)
     if request.app.state.schema_degraded:
         mode = "full"
     if mode == "full":
-        # Single-message full mode keeps its existing buffered shape: a single
-        # upstream record is small enough that the max_message_bytes guard is
-        # sufficient and we avoid streaming-passthrough plumbing here.
-        response = await request.app.state.upstream.get(
-            f"/session/{sid}/message/{mid}", headers=forward_directory_headers(directory),
+        # G8: stream + cap-read so a single oversized upstream body cannot spike
+        # sidecar RSS (MemoryMax=384M). Cap metric = decompressed logical bytes
+        # (httpx auto-decompresses), matching list/since. Aborting the read
+        # early requires closing the upstream response — done in the finally.
+        upstream_request = request.app.state.upstream.build_request(
+            "GET", f"/session/{sid}/message/{mid}",
+            headers=forward_directory_headers(directory),
         )
-        if len(response.content) > request.app.state.config.max_message_bytes:
-            return error_response(
-                "message_too_large", 413,
-                limitBytes=request.app.state.config.max_message_bytes,
-                accept_encoding=request.headers.get("accept-encoding"),
+        response = await request.app.state.upstream.send(upstream_request, stream=True)
+        try:
+            # Wrap mid-stream upstream I/O failures (httpx.RequestError raised by
+            # _drain_error.aread() or read_with_cap.aiter_bytes()) into a structured
+            # 503 instead of bubbling up as an unhandled FastAPI 500. The finally
+            # below still runs to release the connection.
+            try:
+                if response.status_code >= 400:
+                    return await _drain_error(response)
+                body, _ = await read_with_cap(
+                    response, request.app.state.config.max_message_bytes,
+                )
+            except httpx.RequestError:
+                raise CodedHTTPException(503, code="upstream_unavailable")
+            if body is None:
+                return error_response(
+                    "message_too_large", 413,
+                    limitBytes=request.app.state.config.max_message_bytes,
+                    accept_encoding=request.headers.get("accept-encoding"),
+                )
+            return Response(
+                body, response.status_code,
+                headers={**decoded_body_headers(response.headers), "Cache-Control": "no-store"},
             )
-        return Response(
-            response.content, response.status_code,
-            headers={**decoded_body_headers(response.headers), "Cache-Control": "no-store"},
-        )
+        finally:
+            await response.aclose()
     config = request.app.state.config
     pool = request.app.state.transforms
     try:

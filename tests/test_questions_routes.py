@@ -1,0 +1,132 @@
+from __future__ import annotations
+
+import httpx
+import orjson
+import pytest
+from fastapi import FastAPI
+
+from oc_slimapi.config import Settings
+from oc_slimapi.errors import register_error_handlers
+from oc_slimapi.proxy import install_proxy
+from oc_slimapi.routes import questions as questions_route
+from oc_slimapi.routes import sessions
+from oc_slimapi.tokens import issue_route_token
+
+VERSION_HEADERS = {"X-Slimapi-Version": "1"}
+
+
+def _settings() -> Settings:
+    return Settings(
+        host="127.0.0.1", port=4097, upstream="http://127.0.0.1:4096",
+        max_json_bytes=64 * 1024 * 1024, max_message_bytes=32 * 1024 * 1024,
+        max_transforms=1, transform_wait_seconds=0.5, max_response_bytes=64 * 1024,
+        route_secret="x" * 32, route_secret_file=None, smoke_session_id=None,
+        server_api_version=1, accepted_client_versions=(1, 1),
+    )
+
+
+def _build_app(upstream: httpx.AsyncClient, *, allowlist: set[str] | None = None) -> FastAPI:
+    app = FastAPI(title="oc-slimapi-questions-test")
+    app.state.config = _settings()
+    app.state.route_secret = app.state.config.route_secret.encode()
+    app.state.upstream = upstream
+    app.state.directory_allowlist = set(allowlist or ())
+    app.include_router(sessions.router)
+    app.include_router(questions_route.router)
+    register_error_handlers(app)
+    install_proxy(app)
+    return app
+
+
+async def test_questions_directory_count_bounds(upstream_factory):
+    """0 or >32 directories → 400 invalid_directory_count."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        # 0 directories: FastAPI Query(...) requires ≥1 occurrence → 422.
+        # Use 33 to hit our explicit 1-32 guard.
+        dirs = "&".join(f"directory=/d{i}" for i in range(33))
+        response = await client.get(f"/slimapi/questions?{dirs}", headers=VERSION_HEADERS)
+    assert response.status_code == 400
+    assert response.json()["code"] == "invalid_directory_count"
+
+
+async def test_aggregate_empty_directories_invalid_count():
+    """F11: direct call to _aggregate with 0 directories → CodedHTTPException
+    invalid_directory_count. Covers the `not unique` branch that FastAPI 422s
+    before reaching on the HTTP path (kept defensive for direct callers)."""
+    from unittest.mock import MagicMock
+
+    from oc_slimapi.errors import CodedHTTPException
+    from oc_slimapi.routes.questions import _aggregate
+
+    request = MagicMock()
+    # The 0-directory branch raises before any app.state access, so a bare
+    # MagicMock suffices (no AsyncMock setup needed).
+    with pytest.raises(CodedHTTPException) as ei:
+        await _aggregate(request, "question", [])
+    assert ei.value.status_code == 400
+    assert ei.value.code == "invalid_directory_count"
+
+
+async def test_questions_bad_route_token(upstream_factory):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/slimapi/questions/q1/reply",
+            headers=VERSION_HEADERS,
+            json={"answers": [["a"]], "routeToken": "garbage"},
+        )
+    assert response.status_code == 400
+    assert response.json()["code"] == "invalid_route_token"
+
+
+async def test_questions_token_directory_not_allowed(upstream_factory):
+    """Valid signature but directory no longer in allowlist → 400 directory_not_allowed."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream, allowlist=set())  # nothing allowed
+    secret = app.state.route_secret
+    token = issue_route_token(secret, kind="question", request_id="q1", session_id=None, directory="/gone")
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/slimapi/questions/q1/reply",
+            headers=VERSION_HEADERS,
+            json={"answers": [["a"]], "routeToken": token},
+        )
+    assert response.status_code == 400
+    assert response.json()["code"] == "directory_not_allowed"
+
+
+async def test_questions_mutation_timeout(upstream_factory):
+    """Upstream POST timing out → 504 upstream_timeout (not retried)."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.TimeoutException("simulated")
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream, allowlist={"/app"})
+    secret = app.state.route_secret
+    token = issue_route_token(secret, kind="question", request_id="q1", session_id=None, directory="/app")
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/slimapi/questions/q1/reply",
+            headers=VERSION_HEADERS,
+            json={"answers": [["a"]], "routeToken": token},
+        )
+    assert response.status_code == 504
+    body = response.json()
+    assert body["code"] == "upstream_timeout"
+    assert body["message"] == "upstream mutation timed out; not retried"

@@ -1,5 +1,11 @@
 # oc-slimapi v1 契约（唯一基准）
 
+> **变更记录 (implementation changelog)**
+>
+> 本文件是 wire 基准。实现侧的加性/修复性变更在下方对应小节就地标注，并在本头部汇总。所有变更**不 bump `X-Slimapi-Version`** 除非另行说明。
+>
+> - **2026-07-18 · v1 B1（additive）**：`session_not_found`(404) / 顶层 `upstream_unavailable`(503) / 顶层 `upstream_http_N`(502) / `shell_not_allowed`(403) / `invalid_directory_count`(400) / `invalid_route_token`(400) / thin 路由错误体 `{"code":...}`（非 `{"detail":...}`） / G2 status 404-502-503 分裂 / projects 5xx 502→503。详见 §7。
+
 > 状态：契约收敛版（A1-A3/B1-B3/C1-C2 全定，A2=A 时间戳锚点）。配套原型（fix-3/9/10 + 现有 routes）已覆盖大部分；本文 🔒=原型已覆盖、🆕=v1 待补缺口。
 > 权威性：本文件是正式实现的唯一基准。与 design-v2/INTERFACE_MAP 冲突时以本文件为准；后者需随后同步。
 
@@ -67,11 +73,18 @@
 - admission 在 `HubRegistry.subscribe` 单一无 await 临界段；超限→503 `sse_subscriber_limit_directory`/`_total`（带 `limit`/`current`/`Retry-After`）。
 - 转换池（fix-9 🔒）：`MAX_TRANSFORMS=1`，admission 在下载前，限长读 `MAX_RESPONSE_BYTES=64MiB`，parse/project/gzip offload worker thread。
 
-## §7 错误码 🔒 + 🆕
-- 400 `version_required` / `version_incompatible` / `thin_route_not_found` / routeToken 校验失败。
-- 413 `response_too_large`（超 `MAX_RESPONSE_BYTES`）。
-- 503 `transform_busy`（`Retry-After`）/ `sse_subscriber_limit_*` 🆕 / directory allowlist 刷新失败。
-- 502/504 上游写超时/错误。
+## §7 错误码 🔒 + 🆕 (additive, no X-Slimapi-Version bump)
+
+> v1 B1（2026-07-18）扩充：thin 路由错误体由 FastAPI 默认 `{"detail":…}` 改为 `{"code":…}`，并新增以下 code；均为加性、不 bump `X-Slimapi-Version`。详见 `docs/v1-impl-spec.md` §11 + `docs/CLIENT_CHANGES.md`「错误体形状」。
+
+- 400 `version_required` / `version_incompatible` / `directory_not_allowed` / `invalid_directory_count` / `invalid_route_token`
+- 403 `shell_not_allowed`（catch-all shell/PTY deny-list；ops 可关，非安全保证）
+- 404 `session_not_found`（`GET /slimapi/sessions/{sid}/status` discover 404；带 `sessionID`）；`thin_route_not_found`
+- 413 `response_too_large`（超 `MAX_RESPONSE_BYTES`）/ `message_too_large`（`full/{mid}` 流式 cap）
+- 502 `upstream_http_N`（G2/projects 等 thin 路由对 upstream 非 404 的 4xx）
+- 503 `transform_busy`（`Retry-After`）/ `upstream_unavailable` / allowlist 刷新失败 / `sse_subscriber_limit_*` 🆕
+- 504 `upstream_timeout`（q/p mutation）
+- thin 路由错误体统一：`{"code":string, "message"?:string, ...}`（非 `{"detail":...}`）
 
 ## §8 客户端 v1 最小集（C1，暂停 — ocdroid）
 连接(R8)+版本头+health 自检(M2/fail-closed)+冷启动(sessions+q/p 快照)+SSE(digest+q/p)+digest 触发拉消息(`/since`)+发消息(X-Opencode-Directory 透传)+q/p 应答(routeToken)+resync=冷启动。**+ C3 health 改 `/slimapi/health`（fix-7 已落地）**。

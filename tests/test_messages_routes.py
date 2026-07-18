@@ -25,6 +25,7 @@ import pytest
 from fastapi import FastAPI
 
 from oc_slimapi.config import Settings
+from oc_slimapi.errors import register_error_handlers
 from oc_slimapi.proxy import install_proxy
 from oc_slimapi.routes import events, health, messages, questions, sessions
 from oc_slimapi.sse.hub import HubRegistry
@@ -77,6 +78,7 @@ def _build_app(settings: Settings, upstream: httpx.AsyncClient) -> FastAPI:
     for router in (health.router, sessions.router, messages.router, questions.router, events.router):
         app.include_router(router)
     install_proxy(app)
+    register_error_handlers(app)
     return app
 
 
@@ -100,7 +102,7 @@ def _sample_upstream_payload() -> bytes:
 
 
 @pytest.fixture
-def upstream_factory():
+async def upstream_factory():
     """Build a MockTransport-backed AsyncClient; handler is set per-test.
 
     Mirrors ``oc_slimapi.upstream.create_client``: base_url must be set so
@@ -119,10 +121,7 @@ def upstream_factory():
     yield _make
 
     for client in clients:
-        try:
-            asyncio.get_event_loop()
-        except RuntimeError:
-            pass
+        await client.aclose()
 
 
 @pytest.fixture
@@ -1433,3 +1432,219 @@ def test_parse_link_next_cursor_does_not_match_rel_inside_other_param_value():
     link = '<http://x/y?before=ABC>; title="rel=next"; rel="prev"'
     # Real rel is "prev", so this is NOT a next link → no cursor extracted.
     assert _parse_link_next_cursor(link) is None
+
+
+async def test_messages_list_disallowed_directory_400(upstream_factory):
+    """G7-soft: query directory ∉ allowlist (empty /project) → 400."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    settings = _settings()
+    app = _build_app(settings, upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
+                "/slimapi/messages/s1?directory=/nope",
+                headers=VERSION_HEADERS,
+            )
+        assert response.status_code == 400
+        assert response.json()["code"] == "directory_not_allowed"
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_messages_list_query_header_conflict_400(upstream_factory):
+    """G7-soft: query directory ≠ X-Opencode-Directory header → 400 even if both allowed."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    settings = _settings()
+    app = _build_app(settings, upstream)
+    app.state.directory_allowlist = {"/app", "/other"}  # both allowed; conflict still 400
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
+                "/slimapi/messages/s1?directory=/app",
+                headers={**VERSION_HEADERS, "X-Opencode-Directory": "/other"},
+            )
+        assert response.status_code == 400
+        assert response.json()["code"] == "directory_not_allowed"
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_messages_list_no_directory_passes(upstream_factory):
+    """G7-soft: no query directory → not blocked."""
+    payload = orjson.dumps([])
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=payload, headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    settings = _settings()
+    app = _build_app(settings, upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/slimapi/messages/s1", headers=VERSION_HEADERS)
+        assert response.status_code == 200
+    finally:
+        app.state.transforms.shutdown()
+
+
+@pytest.mark.parametrize("path", ["/slimapi/messages/s1/since/1", "/slimapi/messages/s1/full/m1"])
+async def test_messages_since_and_full_allowlist(upstream_factory, path):
+    """G7-soft applies to /since and /full too."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    settings = _settings()
+    app = _build_app(settings, upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(f"{path}?directory=/nope", headers=VERSION_HEADERS)
+        assert response.status_code == 400
+        assert response.json()["code"] == "directory_not_allowed"
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_full_message_413_oversized(upstream_factory):
+    """G8: full-mode caps at max_message_bytes via streaming, not buffering."""
+    cap = 4 * 1024
+    oversized = b"x" * (cap * 16)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=oversized)
+
+    upstream = upstream_factory(handler)
+    settings = _settings(max_message_bytes=cap)
+    app = _build_app(settings, upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/slimapi/messages/s1/full/m1", headers=VERSION_HEADERS)
+        assert response.status_code == 413
+        body = response.json()
+        assert body["code"] == "message_too_large"
+        assert body["limitBytes"] == cap
+    finally:
+        app.state.transforms.shutdown()
+
+
+# NOTE: T4-C2 (streaming, no full buffer) and T4-C3 (aclose anti-leak) are NOT
+# unit-testable — httpx.MockTransport materialises the full response content
+# eagerly in the handler, so no in-test observable proves the sidecar stopped
+# reading early. Both are locked by code review at the final gate:
+#   • full-mode branch must use read_with_cap (aiter_bytes), NOT response.content/aread
+#   • full-mode branch must wrap the response in try/finally: await response.aclose()
+
+
+async def test_full_message_under_cap_passthrough(upstream_factory):
+    payload = orjson.dumps({"info": {"id": "m1"}, "parts": []})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=payload, headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    settings = _settings()
+    app = _build_app(settings, upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/slimapi/messages/s1/full/m1", headers=VERSION_HEADERS)
+        assert response.status_code == 200
+        assert response.headers["Cache-Control"] == "no-store"
+        assert response.json()["info"] == {"id": "m1"}
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_full_message_upstream_error_passthrough(upstream_factory):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, content=b'{"error":"missing"}', headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    settings = _settings()
+    app = _build_app(settings, upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/slimapi/messages/s1/full/m1", headers=VERSION_HEADERS)
+        assert response.status_code == 404
+        # Body and content-type pass through verbatim (thin-route contract).
+        assert response.content == b'{"error":"missing"}'
+        assert response.headers["Content-Type"] == "application/json"
+    finally:
+        app.state.transforms.shutdown()
+
+
+# ===========================================================================
+# F5e / F5f (B1 review hardening): G7-soft positive + query/header conflict
+# on /since and /full. The existing /list conflict test already locks the
+# conflict path on the listing endpoint; these add the symmetric coverage
+# on /since and /full, plus a positive (allowed) case proving the directory
+# is normalised and forwarded.
+# ===========================================================================
+
+
+async def test_messages_list_allowed_directory_forwarded_normalized(upstream_factory):
+    """G7-soft positive (T3-C1): allowed query directory passes AND is
+    forwarded upstream normalised — ``?directory=/app/`` (trailing slash)
+    must reach upstream as ``X-Opencode-Directory: /app`` (no trailing
+    slash). ``require_directory`` normalises via ``rstrip("/")``."""
+    captured: dict[str, str | None] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["dir"] = request.headers.get("x-opencode-directory")
+        return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    settings = _settings()
+    app = _build_app(settings, upstream)
+    app.state.directory_allowlist = {"/app"}
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
+                "/slimapi/messages/s1?directory=/app/", headers=VERSION_HEADERS,
+            )
+        assert response.status_code == 200
+        # Normalised: trailing slash stripped before forwarding.
+        assert captured["dir"] == "/app"
+    finally:
+        app.state.transforms.shutdown()
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/slimapi/messages/s1/since/1", "/slimapi/messages/s1/full/m1"],
+)
+async def test_messages_since_and_full_query_header_conflict_400(upstream_factory, path):
+    """G7-soft: query ``directory`` conflicting with ``X-Opencode-Directory``
+    header → 400 ``directory_not_allowed`` on /since and /full too (not just
+    /list). Both directories are in the allowlist, so this isolates the
+    conflict check from the allowlist check."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"{}", headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    settings = _settings()
+    app = _build_app(settings, upstream)
+    app.state.directory_allowlist = {"/app", "/other"}
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
+                f"{path}?directory=/app",
+                headers={**VERSION_HEADERS, "X-Opencode-Directory": "/other"},
+            )
+        assert response.status_code == 400
+        assert response.json()["code"] == "directory_not_allowed"
+    finally:
+        app.state.transforms.shutdown()

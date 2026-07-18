@@ -53,6 +53,13 @@ class Settings:
     sse_queue_items: int = int(os.getenv("OC_SLIMAPI_SSE_QUEUE_ITEMS", "256"))
     sse_buffer_bytes: int = int(os.getenv("OC_SLIMAPI_SSE_BUFFER_BYTES", str(2 * 1024 * 1024)))
     sse_max_frame_bytes: int = int(os.getenv("OC_SLIMAPI_SSE_MAX_FRAME_BYTES", str(256 * 1024)))
+    # Shell/PTY HTTP deny-list (spec §6). Default ON; the path table is
+    # code-level in proxy.py (hardcoded from B0 §1.3 route scan of opencode
+    # v1.18.3). This toggle exists for ops break-glass only — turning it OFF is
+    # NOT a security guarantee (real isolation = stunnel mTLS + network edge).
+    shell_deny_list_enabled: bool = os.getenv("OC_SLIMAPI_SHELL_DENY_LIST_ENABLED", "1").lower() in (
+        "1", "true", "yes", "on",
+    )
 
     def validate(self) -> None:
         if self.host not in {"127.0.0.1", "::1", "localhost"}:

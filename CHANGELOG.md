@@ -26,6 +26,18 @@ ocdroid 对接时：
 
 ---
 
+## 2026-07-18 — v1 B1（additive；不 bump `X-Slimapi-Version`）
+
+> 本节为 v1 B1 run（spec 见 `docs/ocmar/specs/2026-07-18-v1-b0-b1-design.md`）落地的加性 wire 行为变更。所有条目均**加性**或为对既有契约 §11 的 bug 修正，未 bump wire API 版本。
+
+- **status**：`GET /slimapi/sessions/{sid}/status` 错误语义分裂——upstream 404 → **404 `session_not_found`**（B1 前一律 503）；其它 4xx → **502 `upstream_http_N`**；网络/5xx/坏 JSON → **503 `upstream_unavailable`**；allowlist miss 仍 **400 `directory_not_allowed`**（body 改为结构化）。罕见边角：discover 200 但 session payload 无可用 `directory` 字段 → 503 `upstream_unavailable`。
+- **projects**（行为变更，grill #5）：`GET /slimapi/projects` 任一发现步骤失败从"统一 502"分裂以对齐 §11——upstream 4xx → **502 `upstream_http_N`**；网络/5xx → **503 `upstream_unavailable`**；body 改为结构化 `{"code":…}`。**5xx/网络分支的状态码由 502 变为 503**（其余 4xx 分支只是 body 形状变化）。
+- **messages**：`GET /slimapi/messages/**` 三条路径（list / since / full/{mid}）统一加 query `directory` allowlist 校验（G7-soft）；同时存在 `X-Opencode-Directory` header 且与 query 冲突 → 400。未传 query `directory` 时不拦（行为不变）。
+- **messages full/{mid}**：G8 流式 cap——`client.send(stream=True)` + `read_with_cap` 边读边按解压字节累计，超 `max_message_bytes`(32 MiB) 立即中止并 **413 `message_too_large`**，`try/finally: await response.aclose()` 防连接泄漏；不再 `httpx.get()` 整 body 缓冲，单条极大消息不再打满 RSS。transform-busy 维持 **503 `transform_busy`**（与 list/since 归一；B1 前文档误写 502，代码实际一直为 503）。
+- **shell/PTY deny-list**：catch-all 默认开启 deny-list——`/session/{sid}/shell`、`/pty/**`、`/api/pty/**` → **403 `shell_not_allowed`**，不连接 upstream。Ops 开关：`OC_SLIMAPI_SHELL_DENY_LIST_ENABLED`（默认 `1`=开）。WS 继续 501。**注意**：仅作 best-effort 第二道，真实隔离仍靠 stunnel mTLS + 网络边界。
+- **thin-route 错误体形状**：sessions / questions 由 FastAPI 默认的 `{"detail":"…"}` 改为 **`{"code":string, "message"?:string, …}`**（与 messages/events/versioning 既有的 `{"code":…}` 形状对齐）。messages 已使用该形状，未变。
+- **新增加性错误码（thin 路由）**：`invalid_directory_count`（400，questions directory 数量 1–32 守卫）；`invalid_route_token`（400，questions routeToken 校验失败）。两者均加入 `docs/v1-impl-spec.md` §11 统一错误码表，**加性，不 bump**。
+
 ## [Unreleased]
 
 > 开发中、尚未打 tag 的变更写在这里；`release.sh` 发版时把本节内容折叠进新版本标题下。

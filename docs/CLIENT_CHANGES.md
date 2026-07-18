@@ -23,6 +23,34 @@
 - mutation 只发一次，不因超时向 direct 重发。
 - POST reply/reject/permission 回传 item 附带的 routeToken，不自行猜 directory。
 
+## 错误体形状（thin routes）
+
+> 对接 v1 B1（2026-07-18）后的形状变化；ocdroid 必须能解析新结构。
+
+- **统一形状**：thin 路由（`/slimapi/sessions`、`/slimapi/sessions/{sid}/status`、`/slimapi/projects`、`/slimapi/questions`、`/slimapi/permissions`、`/slimapi/messages/**`）的错误体由 FastAPI 默认的 `{"detail":"…"}` 改为：
+  ```json
+  {"code": "<snake_case_code>", "message"?: "<short human-readable>", ...}
+  ```
+  例：`{"code":"session_not_found","sessionID":"ses_…"}`、`{"code":"directory_not_allowed"}`、`{"code":"upstream_http_409"}`、`{"code":"upstream_unavailable"}`、`{"code":"shell_not_allowed"}`。
+- **`code` 即机器可读判别字段**；客户端错误处理 / circuit breaker 触发 / 用户文案分发应基于 `code`（而非解析 `detail` 字符串）。
+- **messages / events / versioning** 既已使用 `{"code":…}`，本次仅是 sessions / questions / projects 对齐；ocdroid 侧已有解析器无需重写，但需扩展识别以下新增 / 显式化的 code：`session_not_found`(404)、`upstream_http_N`(502)、`upstream_unavailable`(503)、`invalid_directory_count`(400)、`invalid_route_token`(400)、`shell_not_allowed`(403)。
+- **catch-all（非 `/slimapi/**`）错误体不变**：透传 upstream 原始 body；FastAPI 顶层异常可能仍为 500（无 `code`）。统一错误码表**仅适用于 thin 路由**。
+
+### status 404 `session_not_found` 新分支
+
+- `GET /slimapi/sessions/{sid}/status` 在 upstream discover 返 404 时，B1 起改为透传 **404 `{"code":"session_not_found","sessionID":"…"}`**（B1 前一律 503）。
+- 客户端应区分：
+  - **404 `session_not_found`** → 该 session 已被删除 / 不存在；UI 移除该会话行，**勿**当成可重试的网络错误。
+  - **503 `upstream_unavailable`** → upstream 不可达 / 5xx / 坏 JSON；走 circuit breaker + 重试。
+  - **502 `upstream_http_N`** → upstream 返非 404 的 4xx；按业务语义处理。
+  - **400 `directory_not_allowed`** → directory 不在 allowlist；客户端不应重试同一 directory。
+
+### `/slimapi/projects` 5xx 502→503 状态码变更
+
+- B1 起 `/slimapi/projects` upstream 5xx / 网络异常由 **502 → 503 `upstream_unavailable`**（**状态码变更，非仅 body**）；upstream 4xx 仍走 502 `upstream_http_N`。
+- 客户端若按精确 `502` 判 projects 失败（如 circuit breaker 硬编码 502），需改判 5xx-class（500-599），不要匹配精确 502。
+- 与 `/slimapi/sessions/{sid}/status`（G2）5xx → 503 对齐；与 catch-all 透传 upstream 原状态码**不冲突**（catch-all 不重塑状态码）。
+
 ## SSE
 
 - Phase 0 先支持 `/event` 裸帧归一化及 400/404/405/501 global 回退。

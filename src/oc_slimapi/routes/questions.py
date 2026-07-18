@@ -4,10 +4,11 @@ import asyncio
 from typing import Literal
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel
 from starlette.responses import Response
 
+from ..errors import CodedHTTPException
 from ..gzip_util import json_response
 from ..tokens import RouteTokenError, issue_route_token, verify_route_token
 from ..upstream import decoded_body_headers, forward_directory_headers
@@ -24,7 +25,7 @@ def _request_id(item: dict) -> str | None:
 async def _aggregate(request: Request, kind: Literal["question", "permission"], directories: list[str]):
     unique = list(dict.fromkeys(directories))
     if not unique or len(unique) > 32:
-        raise HTTPException(400, "directory must be repeated 1-32 times")
+        raise CodedHTTPException(400, code="invalid_directory_count")
     checked = [await require_directory(request, directory) for directory in unique]
 
     async def fetch(directory: str):
@@ -96,10 +97,10 @@ def _token(request: Request, token: str, kind: str, request_id: str, session_id:
             request_id=request_id, session_id=session_id,
         )
     except RouteTokenError as exc:
-        raise HTTPException(400, str(exc)) from exc
+        raise CodedHTTPException(400, code="invalid_route_token") from exc
     directory = payload["directory"]
     if directory not in request.app.state.directory_allowlist:
-        raise HTTPException(400, "token directory is no longer allowed")
+        raise CodedHTTPException(400, code="directory_not_allowed")
     return directory
 
 
@@ -110,7 +111,10 @@ async def _post(request: Request, path: str, directory: str, body: dict):
             headers=forward_directory_headers(directory), json=body, timeout=30.0,
         )
     except httpx.TimeoutException as exc:
-        raise HTTPException(504, "upstream mutation timed out; not retried") from exc
+        raise CodedHTTPException(
+            504, code="upstream_timeout",
+            message="upstream mutation timed out; not retried",
+        ) from exc
     if response.status_code == 404:
         return Response(response.content, 404, headers=decoded_body_headers(response.headers))
     if response.status_code == 400:

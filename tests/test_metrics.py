@@ -18,6 +18,7 @@ import httpx
 from fastapi import FastAPI
 
 from oc_slimapi.config import Settings
+from oc_slimapi.errors import register_error_handlers
 from oc_slimapi.routes import metrics
 from oc_slimapi.sse.hub import HubRegistry
 from oc_slimapi.transform import TransformConfig, TransformPool
@@ -77,6 +78,7 @@ def _build_app(settings: Settings) -> tuple[FastAPI, HubRegistry, httpx.AsyncCli
     hubs.set_transforms(transforms)
     app.state.hubs = hubs
     app.include_router(metrics.router)
+    register_error_handlers(app)
     return app, hubs, upstream
 
 

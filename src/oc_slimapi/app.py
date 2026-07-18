@@ -4,6 +4,7 @@ from fastapi import FastAPI
 import uvicorn
 
 from .config import settings
+from .errors import register_error_handlers
 from .proxy import install_proxy
 from .routes import events, health, messages, metrics, questions, sessions
 from .sse.hub import HubRegistry
@@ -78,6 +79,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="oc-slimapi", version="0.1.0", lifespan=lifespan)
+register_error_handlers(app)
 app.add_middleware(
     SlimapiVersionMiddleware,
     accepted_client_versions=settings.accepted_client_versions,

@@ -17,12 +17,12 @@
 | sidecar 入口（本表所有 `/slimapi/**` 项均须带 `X-Slimapi-Version`） | 构造上游请求 | 上游预期返回 | sidecar 处理 | 返回请求方 | 坑 / 约束 |
 |---|---|---|---|---|---|
 | **GET `/slimapi/sessions`**<br>无应用层鉴权；可带 `Accept-Encoding`。参数：`directory:str?`、`roots:bool=false`、`limit:int=100`（1–1000）、`start:int?`（≥0）、`search:str?`；无 body。 | `GET http://127.0.0.1:4096/session`；query 始终有 `limit`、`roots`，其余非空才传。directory 存在时同时传 `?directory=` 和 `X-Opencode-Directory`。 | `Session[]` 裸数组；通常 200；上游也可能 4xx/5xx。 | directory 经 `require_directory()`；每项调用 `skeleton_session()`，只留 session 基础字段、`time{created,updated,archived}`、`summary{additions,deletions,files}`、`revert{messageID,partID}`。 | 200：`Session[]` 裸数组；支持 gzip，`Vary:Accept-Encoding`。上游非 2xx：尝试把上游 JSON 和状态码返回。业务 allowlist miss 400；allowlist 刷新失败 503；FastAPI 参数错误 422。 | 代码不接收 cursor；`limit=0` 在 sidecar 被校验拒绝，避免 legacy 把 0 解释为全量。上游错误分支假定 body 可解 JSON。
-| **GET `/slimapi/projects`**<br>无参数、无 body；可带 `Accept-Encoding`。 | 先 `GET http://127.0.0.1:4096/project`；再对每个项目以 semaphore=8 并发 `GET /project/{url-encoded-id}/directories`。 | `/project` 返回 project 数组；directories 返回数组，元素含 `directory`/`path`、`strategy`；典型 200。 | `load_projects()` 转成 `{id,name,worktree,directories:[{path,strategy}]}`，更新进程内 directory allowlist。 | 200：project 裸数组；gzip + `Vary`。任一发现步骤失败统一 502。 | 每次调用会 fan-out；没有 TTL/cache 锁。allowlist 还会在目录首次使用时按需刷新。
-| **GET `/slimapi/messages/{sid}`**<br>`limit:int=40`（1–200，0 被拒）、`before:str?` opaque、`mode:skeleton|full=skeleton`、`directory:str?`；无 body。 | `GET http://127.0.0.1:4096/session/{sid}/message?limit=&before=`；directory 作为 `X-Opencode-Directory`。 | `MessageWithParts[]` 裸数组；分页可能带 `Link: <...?before=CURSOR>; rel="next"`；典型 200/400/404。 | schema smoke degraded 时强制 full。skeleton：缓冲 body，64 MiB 上限，经转换 semaphore 后 `orjson.loads` + `skeleton_messages()`，**解析上游 `Link` 头中的 `?before=` cursor** → 下发 `X-Next-Cursor`（opaque base64url 字符串，不 decode/re-encode，**不再把 upstream `Link` 头原样复制给客户端**）；full：`aiter_raw()` 流式透传（含 upstream `Link` 头原样）。skeleton 规则见 §5。 | skeleton 200：裸数组、`Cache-Control:no-store`、下发 `X-Next-Cursor`（仅当上游给 `Link`），gzip+`Vary`。full：上游状态/body/编码流式透传并补 `Cache-Control:no-store`。skeleton body>64 MiB→413 `response_too_large`；转换槽立即拿不到→503 `transform_busy`；参数错误 422；上游错误原状态透传。 | `before` 不解析、不重建。skeleton 模式 sidecar 不再把 upstream 的 `Link` 头原样复制给客户端，而是从中抽取 cursor 改下发 `X-Next-Cursor`；full 模式仍原样透传 `Link`。full 不受 Python JSON body 上限，但客户端仍应有自己的响应上限。`directory` 没做 allowlist 校验，且只发 header。
+| **GET `/slimapi/projects`**<br>无参数、无 body；可带 `Accept-Encoding`。 | 先 `GET http://127.0.0.1:4096/project`；再对每个项目以 semaphore=8 并发 `GET /project/{url-encoded-id}/directories`。 | `/project` 返回 project 数组；directories 返回数组，元素含 `directory`/`path`、`strategy`；典型 200。 | `load_projects()` 转成 `{id,name,worktree,directories:[{path,strategy}]}`，更新进程内 directory allowlist。 | 200：project 裸数组；gzip + `Vary`。任一发现步骤失败结构化分裂：upstream 4xx → 502 `upstream_http_N`；网络/5xx → 503 `upstream_unavailable`（body 均为 `{"code":…}`）。 | 每次调用会 fan-out；没有 TTL/cache 锁。allowlist 还会在目录首次使用时按需刷新。
+| **GET `/slimapi/messages/{sid}`**<br>`limit:int=40`（1–200，0 被拒）、`before:str?` opaque、`mode:skeleton|full=skeleton`、`directory:str?`；无 body。 | `GET http://127.0.0.1:4096/session/{sid}/message?limit=&before=`；directory 作为 `X-Opencode-Directory`。 | `MessageWithParts[]` 裸数组；分页可能带 `Link: <...?before=CURSOR>; rel="next"`；典型 200/400/404。 | schema smoke degraded 时强制 full。skeleton：缓冲 body，64 MiB 上限，经转换 semaphore 后 `orjson.loads` + `skeleton_messages()`，**解析上游 `Link` 头中的 `?before=` cursor** → 下发 `X-Next-Cursor`（opaque base64url 字符串，不 decode/re-encode，**不再把 upstream `Link` 头原样复制给客户端**）；full：`aiter_raw()` 流式透传（含 upstream `Link` 头原样）。skeleton 规则见 §5。 | skeleton 200：裸数组、`Cache-Control:no-store`、下发 `X-Next-Cursor`（仅当上游给 `Link`），gzip+`Vary`。full：上游状态/body/编码流式透传并补 `Cache-Control:no-store`。skeleton body>64 MiB→413 `response_too_large`；转换槽立即拿不到→503 `transform_busy`；参数错误 422；上游错误原状态透传。 | `before` 不解析、不重建。skeleton 模式 sidecar 不再把 upstream 的 `Link` 头原样复制给客户端，而是从中抽取 cursor 改下发 `X-Next-Cursor`；full 模式仍原样透传 `Link`。full 不受 Python JSON body 上限，但客户端仍应有自己的响应上限。`directory` 仅作 `X-Opencode-Directory` header 转发上游；G7-soft query allowlist 校验（与 sessions/questions 对齐）见 §7 G7-soft。
 | **GET `/slimapi/messages/{sid}/since/{ts}`**<br>`ts:int`（path，epoch ms，客户端本地该 ses 最大 `updatedAt`）；`limit:int=50`（1–200）、`before:str?` opaque（来自上一响应 `X-Next-Cursor`，原样透传）、`mode:skeleton|full=skeleton`、`directory:str?`；无 body。 | 在**单个 transform admission + 单个累计字节预算**（`MAX_RESPONSE_BYTES`）下翻最多 `max_since_pages` 页（不暴露）：每页 `GET http://127.0.0.1:4096/session/{sid}/message?limit=&before={opaque-cursor}`；cursor 来自上一页响应的 `Link` 头；`?before=` 原样转发客户端回传的 `X-Next-Cursor`；directory 作为 header。 | 每页 `MessageWithParts[]`，可能带 `Link: <...?before=CURSOR>; rel="next"`；典型 200/4xx。 | 过滤条件 **`info.time.updated >= ts`**（含边界；客户端按 messageID 去重边界）；skeleton 时调 `skeleton_messages()`；累计字节在单 admission 下统一计数。透传 opencode 响应 `Link` 头里的 **opaque base64url cursor** 作为 `X-Next-Cursor`（原样字符串，不 decode/re-encode）——仅在"填满 limit 且未撞 ts 地板且 opencode 给了 Link"时下发。**ts 地板**：扫描中遇到 `time.updated < ts` 的项 → 停（后续都更旧），抑制 `X-Next-Cursor`。 | 200：骨架裸数组、`Cache-Control:no-store`、`X-Next-Cursor`（仅当有续且未撞地板），gzip+`Vary`。累计字节超 `MAX_RESPONSE_BYTES`→413 `response_too_large`；转换槽立即拿不到→503 `transform_busy`；参数错误 422；上游错误原状态/body 透传。 | **v1 语义：A2=A 时间戳锚点**（v0 基于 message-id 回溯的增量协议整体废弃；分页参数统一为 `limit`）。full 模式在该接口仍缓冲/解析页面，不是流式。
-| **GET `/slimapi/messages/{sid}/full/{mid}`**<br>`mode:skeleton|full=full`、`directory:str?`；无 body。 | `GET http://127.0.0.1:4096/session/{sid}/message/{mid}`；directory 作为 header。 | 单个 `MessageWithParts`；典型 200/404。 | 先缓冲完整上游 body；超过 32 MiB 立即 413。schema degraded 强制 full；skeleton 调 `skeleton_message()`，且共享转换 semaphore。 | full：上游对象/body/status，`Cache-Control:no-store`；skeleton 200：单对象、`Cache-Control:no-store`、gzip+`Vary`。>32 MiB→413 `message_too_large`；转换忙→502；上游 400/404/5xx 原状态/body 透传；参数错误 422。 | 路径段 `full` 仅作"展开全文"语义占位，并非 `mode=full` 的默认——`mode` 仍由 query 控制，默认 `full`。名为 full 但当前实现已由 httpx `.get()` 缓冲，不是流式；32 MiB 检查发生在下载完成后。客户端应按 messageId+partId 替换。
+| **GET `/slimapi/messages/{sid}/full/{mid}`**<br>`mode:skeleton|full=full`、`directory:str?`；无 body。 | `GET http://127.0.0.1:4096/session/{sid}/message/{mid}`；directory 作为 header。 | 单个 `MessageWithParts`；典型 200/404。 | G8 流式读 upstream body（`client.send(stream=True)` + `read_with_cap` + `try/finally: await response.aclose()`）；累计字节超 32 MiB 立即 413。schema degraded 强制 full；skeleton 调 `skeleton_message()`，且共享转换 semaphore。 | full：上游对象/body/status，`Cache-Control:no-store`；skeleton 200：单对象、`Cache-Control:no-store`、gzip+`Vary`。>32 MiB→413 `message_too_large`；转换忙→**503 `transform_busy`**（与 list/since 归一）；上游 400/404/5xx 原状态/body 透传；参数错误 422。 | 路径段 `full` 仅作"展开全文"语义占位，并非 `mode=full` 的默认——`mode` 仍由 query 控制，默认 `full`。名为 full 但 G8 后已改为流式（`client.send(stream=True)` + `read_with_cap` + `try/finally: aclose()`），不再 `httpx.get()` 整 body 缓冲；RSS 不再因单条极大消息打满。客户端应按 messageId+partId 替换。`/full/{mid}` 的 413 code 随 mode 变：full→`message_too_large`(32MiB)；skeleton→`response_too_large`(64MiB)。
 | **GET `/slimapi/sessions/status`**<br>`directory:str` 必填；无 body；可带 `Accept-Encoding`。 | `GET http://127.0.0.1:4096/session/status?directory=...` + `X-Opencode-Directory`。 | `Map<sid,Status>`；典型 200，空时 `{}`。 | `require_directory()` 后不裁剪 status map。 | 上游状态码 + map；gzip+`Vary`。directory 非 allowlist 400，刷新失败 503，参数缺失 422。 | 只在该 directory 查询成功时，空 map 才有 idle 语义；该批量接口自身不补 idle 项。
-| **GET `/slimapi/sessions/{sid}/status`**<br>仅 `sid`；无 body。 | 先 `GET http://127.0.0.1:4096/session/{sid}` 取 directory；校验 allowlist；再 `GET /session/status?directory=` + `X-Opencode-Directory`。 | session 单对象，随后为 `Map<sid,Status>`；典型 200/404。 | 精确反查该 sid 的 directory；status map 有 sid 则返回其值，成功但缺 sid 才合成 `{"type":"idle"}`。 | 200：单 Status 对象或 idle 对象。session/directory 发现任意失败→503；status 请求/解析失败→503。 | 当前实现把 upstream session 404 也映射为 503，不透传 404；响应调用 `json_response()` 但未传入 Accept-Encoding，因此实际不 gzip，仍带 `Vary`。
+| **GET `/slimapi/sessions/{sid}/status`**<br>仅 `sid`；无 body。 | 先 `GET http://127.0.0.1:4096/session/{sid}` 取 directory；校验 allowlist；再 `GET /session/status?directory=` + `X-Opencode-Directory`。 | session 单对象，随后为 `Map<sid,Status>`；典型 200/404。 | 精确反查该 sid 的 directory；status map 有 sid 则返回其值，成功但缺 sid 才合成 `{"type":"idle"}`。 | 200：单 Status 对象或 idle 对象。详细错误语义（G2 分离）见 §7：upstream 404→404 `session_not_found`；allowlist miss→400 `directory_not_allowed`；其它 4xx→502 `upstream_http_N`；网络/5xx/JSON 坏→503 `upstream_unavailable`。 | 响应调用 `json_response()` 并传入 Accept-Encoding；支持 gzip，带 `Vary: Accept-Encoding`。
 
 ## 2. Pending 聚合与写接口
 
@@ -71,3 +71,56 @@
 - payload：`v=1`、kind、requestID、sessionID、directory、iat、`exp=iat+3600`。
 - `verify_route_token()`：恢复 padding并解码；constant-time 比较签名；验证 v、过期、iat 不超过当前时间60s、kind、requestID、可选 sessionID、directory 类型。
 - secret 来自环境或 systemd `LoadCredential`，至少32 bytes，不随机生成；token 因而能跨 sidecar 重启验证。
+
+## 7. B1 实现态补充（G2 / G7-soft / G8 / shell deny-list）
+
+> 以下三节为 v1 B1 run（2026-07-18）落地行为的明确化补充。所有变更均为**加性**，未 bump `X-Slimapi-Version`。背景与代码地图见 `docs/ocmar/specs/2026-07-18-v1-b0-b1-design.md`（§2 reality 表 + §3 各项落点）。
+
+### `GET /slimapi/sessions/{sid}/status`（G2 错误语义分离）
+
+§1 表中该路径已指向本节。现行错误语义（取代 B1 前的"任意 discover 异常→503、不透传 404"）：
+
+| 条件 | HTTP | body |
+|---|---|---|
+| upstream discover `/session/{sid}` 返 404 / 明确 not found | **404** | `{"code":"session_not_found","sessionID":"…"}` |
+| discover 得到的 directory ∉ allowlist | **400** | `{"code":"directory_not_allowed"}` |
+| upstream 其它 4xx（401/403/409 等） | **502** | `{"code":"upstream_http_N"}` |
+| upstream 超时 / 5xx / JSON 解析失败 | **503** | `{"code":"upstream_unavailable"}` |
+| discover 与 status map 均成功，map 无 sid | **200** | `{"type":"idle"}`（假 idle 风险：session 已删但 status map 滞后可能误报 idle） |
+
+实现：`require_directory()` 抛的 `CodedHTTPException` 必须 re-raise（不被 `except Exception` 吞）；对 upstream 用 `httpx.HTTPStatusError` 精确判 404；其它 4xx → 502；仅网络/5xx/解析失败 → 503。批量 `GET /slimapi/sessions/status`（透传 upstream status + map）语义不变。
+
+> **罕见边角（grill #4）**：discover `/session/{sid}` 返 **200 但 session payload 无可用 `directory` 字段** → **503 `upstream_unavailable`**。opencode 正常 session 始终带 directory；该分支视为 upstream payload 不可用，与 B1 前的"任意 discover 异常→503"行为一致，未引入新失败模式。
+
+### `GET /slimapi/messages/**`（G7-soft directory allowlist）
+
+`/slimapi/messages/{sid}`、`/slimapi/messages/{sid}/since/{ts}`、`/slimapi/messages/{sid}/full/{mid}` 三条消息路由统一加 directory 校验，与 sessions/questions 对齐（B1 前这三条路径仅转发 header，不校验）：
+
+| 条件 | 行为 |
+|---|---|
+| 未传 query `directory` | 不拦（依赖上游默认）；v1 不强制必填 |
+| query `directory` ∈ allowlist | 通过 |
+| query `directory` ∉ allowlist | **400** `{"code":"directory_not_allowed"}`；允许 miss 时刷新 projects 一次 |
+| 同时存在 `X-Opencode-Directory` header 且与 query 冲突 | **400** `{"code":"directory_not_allowed"}` |
+
+校验源（写死）：v1 只认 query `directory` 走 `require_directory()`。复用 `sessions.py` 既有 helper，不新建。**soft ≠ 多租户隔离**——隔离仍靠 stunnel mTLS + 网络边界。
+
+### shell/PTY deny-list（catch-all 加固）
+
+`install_proxy(app)` 注册的 catch-all 在转发前对 HTTP 路径做 deny-list 检查；命中即 **403 `{"code":"shell_not_allowed"}`**，不连接 upstream。WebSocket 继续走全局 WS→501（`proxy.py:9-13`），不动。
+
+| 路径模式 | 方法 | 类别 | 来源 |
+|---|---|---|---|
+| `/session/{sid}/shell` | 任意（method-agnostic） | **任意命令执行**（spawn 子进程） | opencode `groups/session.ts:356`，handler `handlers/session.ts:341-347` |
+| `/pty/**` | 任意 | shell/PTY 树（8 条 HTTP 变体：`/pty/shells`、`/pty`、`/pty/{id}` CRUD、`/pty/{id}/connect-token`） | opencode `groups/pty.ts:30-37` |
+| `/api/pty/**` | 任意 | v2 PTY 树（7 条同构） | opencode `protocol/src/groups/pty.ts:23-119` |
+
+匹配策略：前缀匹配 `/pty` 与 `/api/pty`；正则 `^/session/[^/]+/shell$` 匹配 `/session/{sid}/shell`。路径表**写死**（来自 B0 全量扫表），不臆造，也不暴露为配置字段。
+
+**间接命令执行入口**（`/session/{id}/prompt`、`/prompt_async`、`/command`、`/tui/execute-command`、`/api/session/{id}/prompt`）**不 deny**——它们是 agent-mediated，且 `prompt_async` 是 §4 透传矩阵的主发送路径。
+
+**Ops 开关**：`OC_SLIMAPI_SHELL_DENY_LIST_ENABLED`（默认 `1`=开）。关闭后 deny-list 不生效，**不构成安全保证**——真实隔离靠 stunnel mTLS + 网络边界 + upstream 权限；deny-list 是 best-effort 第二道。
+
+**已知未覆盖（best-effort）**：路径大小写变体、`/./`、`/../` 段、双重编码。命中策略是精确/前缀字面匹配，不是 URL 规范化防火墙。
+
+> **诚实限制**：catch-all 不识别路径语义是结构性事实；漏路径即可绕过。

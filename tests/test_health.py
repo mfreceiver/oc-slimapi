@@ -19,6 +19,7 @@ import pytest
 from fastapi import FastAPI
 
 from oc_slimapi.config import Settings
+from oc_slimapi.errors import register_error_handlers
 from oc_slimapi.routes import health
 from oc_slimapi.versioning import SlimapiVersionMiddleware
 
@@ -58,6 +59,7 @@ def _build_app(settings: Settings, upstream: httpx.AsyncClient) -> FastAPI:
     app.state.upstream = upstream
     app.state.schema_degraded = False
     app.include_router(health.router)
+    register_error_handlers(app)
     return app
 
 
