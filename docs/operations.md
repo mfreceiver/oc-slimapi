@@ -36,10 +36,10 @@ ocdroid (Android)
 ```bash
 cd /home/mar/personal_projects/oc-slimapi
 python -m venv .venv
-.venv/bin/pip install -e './sidecar[test]'
+.venv/bin/pip install -e '.[test]'
 ```
 
-升级代码后（`git pull`）重装一次即可：`.venv/bin/pip install -e './sidecar[test]'`。
+升级代码后（`git pull`）重装一次即可：`.venv/bin/pip install -e '.[test]'`。
 
 ---
 
@@ -91,7 +91,7 @@ SyslogIdentifier=oc-slimapi
 WantedBy=default.target
 ```
 
-调参（订阅上限、buffer 字节预算、transform 并发等）只需在 `[Service]` 加 `Environment=OC_SLIMAPI_*` 行，参见 [`sidecar/README.md`](../sidecar/README.md) §配置。
+调参（订阅上限、buffer 字节预算、transform 并发等）只需在 `[Service]` 加 `Environment=OC_SLIMAPI_*` 行，参见 [`develop.md`](develop.md) §配置。
 
 ### 3.3 启用与开机自启
 
@@ -127,7 +127,7 @@ sudo loginctl enable-linger "$USER"
 ```bash
 cd /home/mar/personal_projects/oc-slimapi
 git pull
-.venv/bin/pip install -e './sidecar[test]'
+.venv/bin/pip install -e '.[test]'
 systemctl --user restart oc-slimapi
 ```
 
@@ -219,7 +219,7 @@ curl -s -H 'X-Slimapi-Version: 1' http://127.0.0.1:4097/slimapi/health | jq .
 }
 ```
 
-- `sidecar.version` = `sidecar/pyproject.toml` 的版本。
+- `sidecar.version` = `pyproject.toml` 的版本。
 - `schema.degraded=true` → 启动 smoke 探针发现 opencode 响应字段漂移，需查上游是否升级/改了 schema。
 - 不带版本头 → `400`（版本门禁生效，符合契约）。
 
@@ -268,5 +268,5 @@ sidecar 进程的启停、日志、升级由 **服务端运维** 负责，ocdroi
 | [`v1-contract.md`](v1-contract.md) | Wire 契约权威 |
 | [`release.md`](release.md) | 发版流程 |
 | [`../CHANGELOG.md`](../CHANGELOG.md) | 接口行为变更记录 |
-| [`../sidecar/README.md`](../sidecar/README.md) | 配置项速查 + 开发运行 |
+| [`develop.md`](develop.md) | 配置项速查 + 开发运行 |
 | [`../AGENTS.md`](../AGENTS.md) | Agent 入口索引 |

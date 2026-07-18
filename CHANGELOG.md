@@ -8,7 +8,7 @@
 
 | 轨道 | 是什么 | 何时变 |
 |---|---|---|
-| **包版本** `vX.Y.Z`（本文件标题 + git tag + `sidecar/pyproject.toml`） | 产品发版版本 | 每次 `./scripts/release.sh` |
+| **包版本** `vX.Y.Z`（本文件标题 + git tag + `pyproject.toml`） | 产品发版版本 | 每次 `./scripts/release.sh` |
 | **Wire API 版本** `X-Slimapi-Version`（整数，见 `versioning.py` / 契约 §1） | 协议兼容门禁 | **仅破坏性** wire 变更 bump；加性变更 **不** bump |
 
 ocdroid 对接时：

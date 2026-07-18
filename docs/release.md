@@ -11,9 +11,9 @@
 | 维度 | ocdroid（参考） | oc-slimapi（本仓库） |
 |---|---|---|
 | 产物 | 签名 APK + Gitea Release | **git annotated tag** + 本仓 `CHANGELOG.md`（无 APK） |
-| 版本来源 | **纯 git 派生**（`versionName`/`versionCode` 不写文件） | **semver 写在** `sidecar/pyproject.toml` **且** 打 git tag `vX.Y.Z`（Python 包惯例） |
+| 版本来源 | **纯 git 派生**（`versionName`/`versionCode` 不写文件） | **semver 写在** `pyproject.toml` **且** 打 git tag `vX.Y.Z`（Python 包惯例） |
 | 发版入口 | `./scripts/release.sh <patch\|minor\|major>` | **同名同用法** `./scripts/release.sh <patch\|minor\|major>` |
-| 质量门禁 | `./scripts/check.sh`（compile + unit） | `./scripts/check.sh`（`pytest sidecar/tests/`） |
+| 质量门禁 | `./scripts/check.sh`（compile + unit） | `./scripts/check.sh`（`pytest tests/`） |
 | Changelog | 发版时从 conventional commits **生成**到 `APK/*.md`（无根 CHANGELOG） | **维护根目录 [`CHANGELOG.md`](../CHANGELOG.md)**（接口行为，给 ocdroid）；发版脚本要求目标版本节已存在 |
 | 对外发布 | 人工 `git push` + `upload-release.sh`（Gitea API 传 APK） | 人工 `git push origin main && git push origin vX.Y.Z`（可选：Gitea Release notes 贴 CHANGELOG 节） |
 | Wire 协议版本 | N/A（客户端） | **独立轨道**：`X-Slimapi-Version`（破坏性才 bump，见契约 §1） |
@@ -42,7 +42,7 @@ Tag 格式：**`v` + semver**（例：`v0.1.0`），与 ocdroid 一致。
 ### 1.2 Wire API 版本（整数头）
 
 - 头名：`X-Slimapi-Version`
-- 当前接受区间：见 `sidecar/src/oc_slimapi/versioning.py` 与 `docs/v1-contract.md` §1。
+- 当前接受区间：见 `src/oc_slimapi/versioning.py` 与 `docs/v1-contract.md` §1。
 - **仅破坏性**变更 bump；加性变更 **同版本**。
 - Bump 时必须同步：`versioning.py`、`docs/v1-contract.md`、`CHANGELOG.md`（写明客户端必改点）。
 
@@ -85,10 +85,10 @@ git push origin main && git push origin v0.1.0
 1. 校验当前分支 == `main`。
 2. 校验已跟踪文件工作区干净（允许 untracked，如本地 secret 路径备忘）。
 3. 跑 `./scripts/check.sh`。
-4. 读 `sidecar/pyproject.toml` 当前 `version`，按 patch|minor|major 推算下一版本 `X.Y.Z`。
+4. 读 `pyproject.toml` 当前 `version`，按 patch|minor|major 推算下一版本 `X.Y.Z`。
 5. **要求** `CHANGELOG.md` 中存在 `## [X.Y.Z]` 节（或把 `[Unreleased]` 在发版说明里要求人工先折叠进去——脚本应失败并提示若缺失目标版本标题）。
-6. 写回 `sidecar/pyproject.toml` 的 `version = "X.Y.Z"`。
-7. `git add sidecar/pyproject.toml CHANGELOG.md`（及本次发版必要的契约文件，若有）并 **commit**：`release: vX.Y.Z`（conventional）。
+6. 写回 `pyproject.toml` 的 `version = "X.Y.Z"`。
+7. `git add pyproject.toml CHANGELOG.md`（及本次发版必要的契约文件，若有）并 **commit**：`release: vX.Y.Z`（conventional）。
 8. 创建 **annotated tag** `vX.Y.Z`（注释可用 CHANGELOG 该节摘要）。
 9. **打印**人工执行命令（不自动 push）：
 
@@ -114,7 +114,7 @@ git push origin main && git push origin vX.Y.Z
 最小集合（当前）：
 
 ```bash
-.venv/bin/python -m pytest sidecar/tests/ -q
+.venv/bin/python -m pytest tests/ -q
 ```
 
 可选扩展（后续）：`compileall`、ruff/mypy、安装包可导入检查。  
@@ -153,9 +153,9 @@ git push origin main && git push origin vX.Y.Z
 | [`CHANGELOG.md`](../CHANGELOG.md) | 接口行为变更记录 |
 | [`scripts/check.sh`](../scripts/check.sh) | 质量门禁 |
 | [`scripts/release.sh`](../scripts/release.sh) | 发版唯一入口 |
-| [`sidecar/pyproject.toml`](../sidecar/pyproject.toml) | 包版本号源 |
+| [`pyproject.toml`](../pyproject.toml) | 包版本号源 |
 | [`docs/v1-contract.md`](v1-contract.md) | Wire 契约 |
-| `sidecar/src/oc_slimapi/versioning.py` | Wire API 接受区间 |
+| `src/oc_slimapi/versioning.py` | Wire API 接受区间 |
 
 ---
 

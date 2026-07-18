@@ -200,7 +200,7 @@ REST 字节是原始 JSON（opencode ≥1KB 自动 gzip，OkHttp 自动解压）
 含义：
 - **raw 骨架 ~50%**（reasoning-heavy 会话）；text/tool-heavy 会话更低（~15–25%）。
 - **sidecar 自 gzip 后，手机实际收 ~67KB（相对原始 443KB raw 省 85%，相对原始 gzip 约 5–8× 收益）**。
-- **不要再立"raw skeleton <15%"的验收线**——它与"保留 reasoning.text"互斥。验收改为：`raw < 55%` + `gzip wire 显著低于 full gzip` + 字段契约断言（见 `sidecar/tests/test_skeleton.py`）。
+- **不要再立"raw skeleton <15%"的验收线**——它与"保留 reasoning.text"互斥。验收改为：`raw < 55%` + `gzip wire 显著低于 full gzip` + 字段契约断言（见 `tests/test_skeleton.py`）。
 - 若日后要把 raw 也压到 <15%，**唯一现实做法**是允许 reasoning 按需展开（骨架里 reasoning→占位 + `hasFull`，点开再 `mode=full` 拉全文）——但这要求客户端扩 `Part` 模型 + 展开 hook 先到位，且须给纯 reasoning 消息注入非空占位 part（否则触发过滤）。属可选后续优化。
 
 ---

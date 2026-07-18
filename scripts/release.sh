@@ -37,7 +37,7 @@ echo "==> 质量门禁"
 ./scripts/check.sh
 
 # --- 3. 读当前版本并推算 ---
-PYPROJECT="sidecar/pyproject.toml"
+PYPROJECT="pyproject.toml"
 [[ -f "$PYPROJECT" ]] || { echo "❌ 缺少 $PYPROJECT"; exit 1; }
 CUR=$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$PYPROJECT" | head -1)
 [[ -n "$CUR" ]] || { echo "❌ 无法从 $PYPROJECT 解析 version"; exit 1; }

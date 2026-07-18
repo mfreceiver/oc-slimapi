@@ -68,10 +68,10 @@ ocdroid ──(stunnel mTLS 14096)──▶ opencode :4096   # 直连回退，�
 
 ## 硬规则（不可违反）
 
-- **改动校验必做**：每次改 Python / 契约相关行为后，必须 `./scripts/check.sh` 通过才算改动完成（当前 = `pytest sidecar/tests/`）。
+- **改动校验必做**：每次改 Python / 契约相关行为后，必须 `./scripts/check.sh` 通过才算改动完成（当前 = `pytest tests/`）。
 - **契约权威**：wire 行为以 `docs/v1-contract.md` 为准；实现与契约冲突 → 先改实现或走正式契约 bump（见 `docs/release.md`），**禁止**静默偏离契约。
 - **版本双轨**：
-  - **包版本**（semver，git tag `vX.Y.Z` + `sidecar/pyproject.toml`）：产品/发版版本。
+  - **包版本**（semver，git tag `vX.Y.Z` + `pyproject.toml`）：产品/发版版本。
   - **Wire API 版本**（整数头 `X-Slimapi-Version`，`versioning.py` 中 `ACCEPTED_CLIENT_VERSIONS`）：仅**破坏性**协议变更 bump；加性变更不 bump。
 - **Git 分支**：主线 `main`；发版在 `main` 上打 tag。
 - **禁止**：手写随意 tag 跳过 `release.sh`；在未更新 `CHANGELOG.md` 的情况下发布 wire 行为变更；把 secret / `.venv` / 本机路径密钥提交进仓。
@@ -84,7 +84,7 @@ ocdroid ──(stunnel mTLS 14096)──▶ opencode :4096   # 直连回退，�
 ```bash
 # 环境
 python -m venv .venv
-.venv/bin/pip install -e './sidecar[test]'
+.venv/bin/pip install -e '.[test]'
 
 # 改动校验（必做）
 ./scripts/check.sh
@@ -115,5 +115,5 @@ journalctl --user -u oc-slimapi -f
 | [`CHANGELOG.md`](CHANGELOG.md) | **接口行为变更记录**（给 ocdroid / 运维） |
 | [`docs/release.md`](docs/release.md) | **发版流程规范**（本仓库权威） |
 | [`docs/operations.md`](docs/operations.md) | **部署 / 运维 / 日志**（systemd、journald、排障） |
-| [`sidecar/README.md`](sidecar/README.md) | sidecar 运行 / 测试备忘 |
+| [`docs/develop.md`](docs/develop.md) | 开发 / 运行 / 测试备忘 |
 | ocdroid `docs/slim-mode-api-routing.md` | 客户端 slim 路由规约（对照用；冲突以本仓契约 + CHANGELOG 为准） |

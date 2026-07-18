@@ -1,4 +1,4 @@
-# sidecar
+# oc-slimapi 开发指南
 
 ## 安装
 
@@ -6,7 +6,7 @@
 
 ```bash
 python -m venv .venv
-.venv/bin/pip install -e './sidecar[test]'
+.venv/bin/pip install -e '.[test]'
 ```
 
 由于 Debian/Ubuntu 的 PEP 668，推荐使用 venv，不要向系统 Python 强装依赖。
@@ -46,7 +46,7 @@ OC_SLIMAPI_ROUTE_SECRET_FILE=/secure/route-secret \
 
 ### 生产 / systemd
 
-完整部署、service 单元、开机自启、日志策略见 **[`docs/operations.md`](../docs/operations.md)**。
+完整部署、service 单元、开机自启、日志策略见 **[`operations.md`](operations.md)**。
 
 速查：
 
@@ -56,7 +56,7 @@ systemctl --user status oc-slimapi      # 状态
 journalctl --user -u oc-slimapi -f      # 实时日志
 ```
 
-> 日志走 journald，**不**落项目内文件。理由与查询手册见 `docs/operations.md` §5。
+> 日志走 journald，**不**落项目内文件。理由与查询手册见 `operations.md` §5。
 
 所有 `/slimapi/**` 请求（包括 `/slimapi/events` SSE）必须带：
 
@@ -69,8 +69,8 @@ X-Slimapi-Version: 1
 ## 测试
 
 ```bash
-.venv/bin/python -m pytest sidecar/tests/
-.venv/bin/python -m compileall -q sidecar/src
+.venv/bin/python -m pytest tests/
+.venv/bin/python -m compileall -q src
 ```
 
 gzip 检查：

@@ -12,19 +12,19 @@ cd "$ROOT"
 
 PY="${ROOT}/.venv/bin/python"
 if [[ ! -x "$PY" ]]; then
-  echo "❌ 未找到 .venv/bin/python；请先: python -m venv .venv && .venv/bin/pip install -e './sidecar[test]'"
+  echo "❌ 未找到 .venv/bin/python；请先: python -m venv .venv && .venv/bin/pip install -e '.[test]'"
   exit 1
 fi
 
 MODE="${1:-default}"
 
-echo "==> pytest sidecar/tests/"
-"$PY" -m pytest sidecar/tests/ -q
+echo "==> pytest tests/"
+"$PY" -m pytest tests/ -q
 
 case "$MODE" in
   --full)
-    echo "==> compileall sidecar/src"
-    "$PY" -m compileall -q sidecar/src
+    echo "==> compileall src"
+    "$PY" -m compileall -q src
     ;;
   default|"")
     ;;

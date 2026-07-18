@@ -397,9 +397,9 @@ X-Slimapi-Version: 1
 
 | 变更 | 文件 |
 |---|---|
-| G1 lastError + session-less 帧 | `sidecar/src/oc_slimapi/sse/hub.py` |
-| G2 status 404 | `sidecar/src/oc_slimapi/routes/sessions.py` |
-| G6 multi full | `sidecar/src/oc_slimapi/routes/messages.py`（路由注册先于 `{mid}`） |
+| G1 lastError + session-less 帧 | `src/oc_slimapi/sse/hub.py` |
+| G2 status 404 | `src/oc_slimapi/routes/sessions.py` |
+| G6 multi full | `src/oc_slimapi/routes/messages.py`（路由注册先于 `{mid}`） |
 | G7-soft allowlist | `routes/messages.py` + 复用 `require_directory` |
 | G8 流式 cap | `routes/messages.py`（对齐 `read_with_cap`） |
 | shell deny-list | `proxy.py` + `config.py` |

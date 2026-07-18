@@ -24,7 +24,7 @@ stunnel mTLS。双入口确保 sidecar 故障时客户端可真正回退直连�
 ```bash
 cd /home/mar/personal_projects/oc-slimapi
 python -m venv .venv
-.venv/bin/pip install -e './sidecar[test]'
+.venv/bin/pip install -e '.[test]'
 openssl rand -base64 48 > /tmp/oc-slimapi-route-secret
 chmod 600 /tmp/oc-slimapi-route-secret
 OC_SLIMAPI_ROUTE_SECRET_FILE=/tmp/oc-slimapi-route-secret \
@@ -35,7 +35,7 @@ OC_SLIMAPI_ROUTE_SECRET_FILE=/tmp/oc-slimapi-route-secret \
 
 ```bash
 curl --fail -H 'X-Slimapi-Version: 1' http://127.0.0.1:4097/slimapi/health
-.venv/bin/python -m pytest sidecar/tests/
+.venv/bin/python -m pytest tests/
 ```
 
 生产环境不要使用 `/tmp` secret；使用 `deploy/oc-slimapi.service` 的 systemd
