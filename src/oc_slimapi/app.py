@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 import uvicorn
 
+from . import __version__
 from .config import settings
 from .errors import register_error_handlers
 from .proxy import install_proxy
@@ -81,7 +82,7 @@ async def lifespan(app: FastAPI):
         app.state.transforms.shutdown()
 
 
-app = FastAPI(title="oc-slimapi", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="oc-slimapi", version=__version__, lifespan=lifespan)
 register_error_handlers(app)
 app.add_middleware(
     SlimapiVersionMiddleware,
