@@ -24,6 +24,7 @@ import json
 
 import pytest
 
+from oc_slimapi.config import Settings
 from oc_slimapi.sse.hub import (
     GlobalHub,
     HubRegistry,
@@ -213,7 +214,11 @@ async def test_message_part_delta_produces_no_frames(fresh_hub):
         "sessionID": "s1", "partID": "p1",
     }))
     hub.publish(make_global_event("/proj", "tool.update", {"sessionID": "s1"}))
-    hub.publish(make_global_event("/proj", "session.error", {"sessionID": "s1"}))
+    # Abort session.error is filtered (G1); non-abort errors produce frames (see G1 tests).
+    hub.publish(make_global_event("/proj", "session.error", {
+        "sessionID": "s1",
+        "error": {"name": "MessageAbortedError", "data": {"message": "aborted"}},
+    }))
     hub.flush()
 
     frames = await drain_queue(subscriber, timeout=0.1)
@@ -323,6 +328,13 @@ class _MockHubs:
         # events-route tests can exercise the SSE generator without a
         # fully-configured registry.
         return self._hub.subscribe()
+
+    def unsubscribe(self, subscriber: Subscriber) -> None:
+        # Mirror HubRegistry.unsubscribe signature so events.py teardown
+        # (registry-level) works under this fast-path mock. Byte-ledger /
+        # total_subscribers accounting is not exercised here — see the
+        # real-HubRegistry integration tests below.
+        self._hub.unsubscribe(subscriber)
 
 
 class _MockRequest:
@@ -722,3 +734,390 @@ async def test_publish_increments_upstream_events_and_emitted_frames_counters(fr
     # 1 question frame fanned out to 1 subscriber + 1 digest frame → 2 emits.
     assert hub.emitted_frames_total == 2
     assert hub.reconnects_total == 0
+
+
+def test_sanitize_strips_unix_paths():
+    from oc_slimapi.sse.hub import _sanitize_error_message
+    assert _sanitize_error_message("open(/home/bob/secret.txt) failed", None) == "open(<path>) failed"
+
+
+def test_sanitize_strips_windows_paths():
+    from oc_slimapi.sse.hub import _sanitize_error_message
+    assert _sanitize_error_message("load C:\\Users\\bob\\file.txt failed", None) == "load <path> failed"
+
+
+def test_sanitize_strips_stack_frames():
+    from oc_slimapi.sse.hub import _sanitize_error_message
+    assert _sanitize_error_message("boom at app.ts:10:5", None) == "boom"
+    assert _sanitize_error_message("err at module.js:42", None) == "err"
+
+
+def test_sanitize_strips_secrets():
+    from oc_slimapi.sse.hub import _sanitize_error_message
+    assert _sanitize_error_message("token=abc123-xyz leaked", None) == "<redacted> leaked"
+    assert _sanitize_error_message('Authorization: Bearer abc.def', None) == "<redacted>"
+
+
+def test_sanitize_takes_first_line():
+    from oc_slimapi.sse.hub import _sanitize_error_message
+    assert _sanitize_error_message("main error\n  at a:1:1\n  at b:2:2", None) == "main error"
+
+
+def test_sanitize_missing_message_uses_fallback_name():
+    from oc_slimapi.sse.hub import _sanitize_error_message
+    assert _sanitize_error_message(None, "UnknownError") == "UnknownError"
+    assert _sanitize_error_message("", "UnknownError") == "UnknownError"
+
+
+def test_sanitize_missing_message_and_name():
+    from oc_slimapi.sse.hub import _sanitize_error_message
+    assert _sanitize_error_message(None, None) == "(no detail)"
+
+
+def test_sanitize_truncates_long():
+    from oc_slimapi.sse.hub import _sanitize_error_message
+    assert len(_sanitize_error_message("x" * 600, None)) == 512
+
+
+def test_sanitize_strips_access_token():
+    from oc_slimapi.sse.hub import _sanitize_error_message
+    assert _sanitize_error_message("auth failed access_token=eyJhbGci.xyz", None) == "auth failed <redacted>"
+
+
+def test_sanitize_strips_refresh_token():
+    from oc_slimapi.sse.hub import _sanitize_error_message
+    assert _sanitize_error_message("refresh_token=rt_123-abc expired", None) == "<redacted> expired"
+
+
+def test_sanitize_strips_client_secret():
+    from oc_slimapi.sse.hub import _sanitize_error_message
+    assert _sanitize_error_message("load client_secret=topsecret-xyz done", None) == "load <redacted> done"
+
+
+# ---------------------------------------------------------------------------
+# G1: session.error → digest lastError / session-less frame / sticky / clear
+# ---------------------------------------------------------------------------
+
+async def test_g1_a_immediate_flush_with_last_error(fresh_hub):
+    """session.error with sid (non-abort) → immediate digest with lastError."""
+    hub, subscriber = fresh_hub
+
+    hub.publish(make_global_event("/proj", "session.error", {
+        "sessionID": "s1",
+        "error": {
+            "name": "UnknownError",
+            "data": {"message": "boom at app.ts:1:1"},
+        },
+    }))
+    # No hub.flush() — publish must immediate-flush for G1-A.
+    frames = await drain_queue(subscriber)
+    digests = [
+        data for event, data in (parse_event(f) for f in frames)
+        if event == "session.digest"
+    ]
+    assert any(
+        d.get("lastError", {}).get("name") == "UnknownError" for d in digests
+    )
+    # message desensitized (stack frame stripped)
+    assert all(
+        "app.ts" not in d.get("lastError", {}).get("message", "") for d in digests
+    )
+    le = next(d["lastError"] for d in digests if "lastError" in d)
+    assert le["message"] == "boom"
+    assert isinstance(le.get("at"), int)
+
+
+async def test_g1_b_session_less_frame(fresh_hub):
+    """session.error without sid → immediate session.error frame (not digest)."""
+    hub, subscriber = fresh_hub
+
+    hub.publish(make_global_event("/proj", "session.error", {
+        "error": {
+            "name": "UnknownError",
+            "data": {"message": "plugin load failed"},
+        },
+    }))
+    frames = await drain_queue(subscriber)
+    err_frames = [
+        data for event, data in (parse_event(f) for f in frames)
+        if event == "session.error"
+    ]
+    assert len(err_frames) == 1
+    assert err_frames[0]["name"] == "UnknownError"
+    assert err_frames[0]["message"] == "plugin load failed"
+    assert err_frames[0].get("directory") == "/proj"
+    assert isinstance(err_frames[0].get("at"), int)
+
+
+async def test_g1_abort_filtered(fresh_hub):
+    """MessageAbortedError → no digest lastError and no session.error frame."""
+    hub, subscriber = fresh_hub
+
+    hub.publish(make_global_event("/proj", "session.error", {
+        "sessionID": "s1",
+        "error": {"name": "MessageAbortedError", "data": {"message": "aborted"}},
+    }))
+    frames = await drain_queue(subscriber)
+    parsed = [parse_event(f) for f in frames]
+    assert not any(
+        event == "session.digest" and "lastError" in data
+        for event, data in parsed
+    )
+    assert not any(event == "session.error" for event, _ in parsed)
+
+
+async def test_g1_sticky_across_windows(fresh_hub):
+    """lastError sticks across debounce windows via sticky_last_error."""
+    hub, subscriber = fresh_hub
+
+    hub.publish(make_global_event("/proj", "session.error", {
+        "sessionID": "s1",
+        "error": {"name": "UnknownError", "data": {"message": "boom"}},
+    }))
+    await drain_queue(subscriber)  # clear immediate digest
+
+    hub.publish(make_global_event("/proj", "session.status", {
+        "sessionID": "s1", "status": "idle",
+    }))
+    hub.flush()
+    frames = await drain_queue(subscriber)
+    digests = [
+        data for event, data in (parse_event(f) for f in frames)
+        if event == "session.digest" and data.get("sessionID") == "s1"
+    ]
+    assert any(
+        d.get("lastError", {}).get("name") == "UnknownError" for d in digests
+    )
+
+
+async def test_g1_clear_on_busy(fresh_hub):
+    """session.status busy clears sticky lastError with explicit null frame."""
+    hub, subscriber = fresh_hub
+
+    hub.publish(make_global_event("/proj", "session.error", {
+        "sessionID": "s1",
+        "error": {"name": "UnknownError", "data": {"message": "boom"}},
+    }))
+    await drain_queue(subscriber)
+
+    hub.publish(make_global_event("/proj", "session.status", {
+        "sessionID": "s1", "status": "busy",
+    }))
+    frames = await drain_queue(subscriber)
+    clear_digests = [
+        data for event, data in (parse_event(f) for f in frames)
+        if event == "session.digest"
+        and data.get("sessionID") == "s1"
+        and "lastError" in data
+    ]
+    assert any(d["lastError"] is None for d in clear_digests)
+
+    # Subsequent status must not carry lastError.
+    hub.publish(make_global_event("/proj", "session.status", {
+        "sessionID": "s1", "status": "idle",
+    }))
+    hub.flush()
+    frames2 = await drain_queue(subscriber)
+    digests2 = [
+        data for event, data in (parse_event(f) for f in frames2)
+        if event == "session.digest" and data.get("sessionID") == "s1"
+    ]
+    assert digests2, "expected a digest for the idle status"
+    assert all("lastError" not in d for d in digests2)
+
+
+async def test_g1_deleted_clears(fresh_hub):
+    """session.deleted pops sticky; digest omits lastError entirely."""
+    hub, subscriber = fresh_hub
+
+    hub.publish(make_global_event("/proj", "session.error", {
+        "sessionID": "s1",
+        "error": {"name": "UnknownError", "data": {"message": "boom"}},
+    }))
+    await drain_queue(subscriber)
+
+    hub.publish(make_global_event("/proj", "session.deleted", {"sessionID": "s1"}))
+    hub.flush()
+    frames = await drain_queue(subscriber)
+    digests = [
+        data for event, data in (parse_event(f) for f in frames)
+        if event == "session.digest" and data.get("sessionID") == "s1"
+    ]
+    assert digests, "expected a deleted digest"
+    assert all("lastError" not in d for d in digests)
+    assert all(d.get("deleted") is True for d in digests)
+
+
+# ---------------------------------------------------------------------------
+# SSE lifecycle regressions (teardown registry slot / queued_bytes ack / G1 name)
+# ---------------------------------------------------------------------------
+
+async def test_events_teardown_releases_registry_slot():
+    """events.py must call HubRegistry.unsubscribe on generator teardown.
+
+    Subscribe goes through HubRegistry (total_subscribers += 1); teardown that
+    only hits GlobalHub.unsubscribe would leak the registry counter and
+    permanently 503 once max_total_subscribers is reached. Cycle connect /
+    disconnect N times and assert the counter returns to zero each round.
+    """
+    from oc_slimapi.routes.events import events
+
+    registry = HubRegistry(
+        client=None,
+        max_subscribers_per_directory=10,
+        max_total_subscribers=10,
+    )
+    try:
+        for _ in range(5):
+            assert registry.total_subscribers == 0
+            request = type("Request", (), {})()
+            request.app = type("App", (), {})()
+            request.app.state = type("State", (), {"hubs": registry})()
+            request.headers = {}
+            response = await events(request)
+            assert response.media_type == "text/event-stream"
+            iterator = response.body_iterator
+            try:
+                first = await asyncio.wait_for(anext(iterator), timeout=0.5)
+                assert b"event: server.connected" in first
+                # Slot held while the generator is live.
+                assert registry.total_subscribers == 1
+            finally:
+                await iterator.aclose()
+            # aclose → generate() finally → registry.unsubscribe → counter 0.
+            assert registry.total_subscribers == 0
+    finally:
+        await registry.close()
+
+
+async def test_subscriber_queued_bytes_decrements_on_consume():
+    """queued_bytes must track *currently queued* bytes, not lifetime total.
+
+    put() increments on enqueue; ack() (called by events.py after queue.get)
+    must decrement by the same size. Without ack, a healthy consumer that
+    drains frames still hits buffer_bytes and is false-positive
+    subscriber_backpressure-disconnected.
+    """
+    # Keep queue_items high so overflow is driven by buffer_bytes only.
+    buffer = 64 * 1024  # 64 KiB
+    queue_items = 1024
+    subscriber = Subscriber(
+        queue_items=queue_items,
+        buffer_bytes=buffer,
+        max_frame_bytes=buffer,
+    )
+    # Frames of known size so we can assert exact ledger math.
+    frame = sse_frame({"payload": "x" * 200}, event="test")
+    size = len(frame)
+    # Cap by both budgets so neither queue_items nor buffer_bytes overflows.
+    n = min(buffer // size, queue_items)
+    assert n >= 2
+    assert n * size <= buffer
+
+    for _ in range(n):
+        subscriber.put(frame)
+    assert not subscriber.closed
+    assert subscriber.queued_bytes == n * size
+    assert subscriber.queue.qsize() == n
+
+    # Consume + ack every frame → ledger returns to 0.
+    for _ in range(n):
+        item = subscriber.queue.get_nowait()
+        subscriber.ack(item)
+    assert subscriber.queued_bytes == 0
+    assert subscriber.queue.qsize() == 0
+
+    # Same volume again must NOT overflow (old bug: second fill would trip
+    # buffer_bytes because queued_bytes never decremented).
+    for _ in range(n):
+        subscriber.put(frame)
+    assert not subscriber.closed
+    assert subscriber.queued_bytes == n * size
+    assert subscriber.forced_disconnects == 0
+
+    # Contrast: without ack the second fill overflows once cumulative
+    # (stale) queued_bytes + new frames exceed buffer_bytes.
+    no_ack = Subscriber(
+        queue_items=queue_items,
+        buffer_bytes=buffer,
+        max_frame_bytes=buffer,
+    )
+    for _ in range(n):
+        no_ack.put(frame)
+    for _ in range(n):
+        no_ack.queue.get_nowait()  # drain without ack — old events.py path
+    assert no_ack.queued_bytes == n * size  # ledger stuck high
+    # Next put: real queue is empty so queue_items would allow it, but
+    # queued_bytes + size > buffer → overflow (the false-positive path).
+    assert no_ack.queued_bytes + size > buffer
+    no_ack.put(frame)
+    assert no_ack.closed is True
+    assert no_ack.forced_disconnects == 1
+
+
+async def test_g1_publish_non_string_error_name_does_not_crash(fresh_hub):
+    """Non-str error.name must not TypeError out of publish (would resync hub).
+
+    Upstream may send name as dict/int; ``(name or "")[:128]`` on a truthy
+    non-str raises TypeError. Coerce to None so sanitize + slice stay safe.
+    """
+    hub, subscriber = fresh_hub
+
+    # Must not raise.
+    hub.publish(make_global_event("/proj", "session.error", {
+        "sessionID": "s1",
+        "error": {
+            "name": {"weird": True},
+            "data": {"message": "x"},
+        },
+    }))
+
+    frames = await drain_queue(subscriber)
+    digests = [
+        data for event, data in (parse_event(f) for f in frames)
+        if event == "session.digest" and data.get("sessionID") == "s1"
+    ]
+    # Coerced name → "" in lastError; message still sanitized from data.
+    assert digests, "expected an immediate G1-A digest despite non-str name"
+    le = digests[0].get("lastError")
+    assert le is not None
+    assert le["name"] == ""  # (None or "")[:128]
+    assert le["message"] == "x"
+    assert isinstance(le.get("at"), int)
+
+    # Session-less path likewise must not crash.
+    hub.publish(make_global_event("/proj", "session.error", {
+        "error": {
+            "name": 42,
+            "data": {"message": "y"},
+        },
+    }))
+    frames2 = await drain_queue(subscriber)
+    err_frames = [
+        data for event, data in (parse_event(f) for f in frames2)
+        if event == "session.error"
+    ]
+    assert len(err_frames) == 1
+    assert err_frames[0]["name"] == ""
+    assert err_frames[0]["message"] == "y"
+
+
+# ---------------------------------------------------------------------------
+# Config: sse_queue_items must be >= 2 (overflow enqueues resync + STOP)
+# ---------------------------------------------------------------------------
+
+def test_settings_rejects_sse_queue_items_of_one():
+    """queue_items=1 cannot hold both resync and STOP after overflow clear.
+
+    Settings.validate() must reject this so the SSE backpressure contract
+    (clear + resync + STOP) holds for every legal configuration.
+    """
+    settings = Settings(sse_queue_items=1)
+    with pytest.raises(RuntimeError, match=r">= 2|resync \+ STOP"):
+        settings.validate()
+
+
+def test_settings_accepts_sse_queue_items_of_two():
+    """Minimum legal queue size is 2 (resync + STOP after clear)."""
+    settings = Settings(sse_queue_items=2)
+    settings.validate()  # must not raise

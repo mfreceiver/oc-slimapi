@@ -99,21 +99,25 @@ async def test_status_discover_bad_json_returns_503(upstream_factory):
     assert response.json()["code"] == "upstream_unavailable"
 
 
-async def test_status_allowlist_miss_returns_400(upstream_factory):
-    """discover succeeds, directory not in allowlist (and /project empty) → 400."""
+async def test_status_allowlist_miss_relaxed_returns_status(upstream_factory):
+    """T4-C1/F2: per-session status 放宽 allowlist —— sid 自洽即能力。
+    discover 得 /secret（非白名单）+ status map 有效 → 200，不再 400。"""
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/session/ses_x":
             return httpx.Response(200, content=orjson.dumps({"id": "ses_x", "directory": "/secret"}),
                                   headers={"Content-Type": "application/json"})
+        if request.url.path == "/session/status":
+            return httpx.Response(200, content=orjson.dumps({"ses_x": {"type": "busy"}}),
+                                  headers={"Content-Type": "application/json"})
         return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
 
     upstream = upstream_factory(handler)
-    app = _build_app(upstream)
+    app = _build_app(upstream)  # allowlist 默认空；/secret 不在内
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get("/slimapi/sessions/ses_x/status", headers=VERSION_HEADERS)
-    assert response.status_code == 400
-    assert response.json()["code"] == "directory_not_allowed"
+    assert response.status_code == 200
+    assert response.json() == {"type": "busy"}
 
 
 async def test_status_map_missing_sid_returns_idle(upstream_factory):
@@ -276,3 +280,33 @@ async def test_batch_status_allowlist_miss_renders_code(upstream_factory):
         response = await client.get("/slimapi/sessions/status?directory=/nope", headers=VERSION_HEADERS)
     assert response.status_code == 400
     assert response.json()["code"] == "directory_not_allowed"
+
+
+async def test_load_products_takes_app_state(upstream_factory):
+    from oc_slimapi.routes import sessions as sessions_mod
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/project":
+            return httpx.Response(200, content=orjson.dumps([{"id": "p1", "worktree": "/app"}]),
+                                  headers={"Content-Type": "application/json"})
+        if request.url.path == "/project/p1/directories":
+            return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
+        return httpx.Response(404, content=b"[]")
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream)
+    result = await sessions_mod.load_products(app)
+    assert any(p["id"] == "p1" for p in result)
+    assert app.state.directory_allowlist == {"/app"}
+
+
+async def test_warm_allowlist_swallows_upstream_error(upstream_factory):
+    from oc_slimapi.routes import sessions as sessions_mod
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("simulated", request=request)
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream)
+    await sessions_mod.warm_allowlist(app)
+    assert app.state.directory_allowlist == set()

@@ -1648,3 +1648,484 @@ async def test_messages_since_and_full_query_header_conflict_400(upstream_factor
         assert response.json()["code"] == "directory_not_allowed"
     finally:
         app.state.transforms.shutdown()
+
+
+# ===========================================================================
+# G6 — GET /slimapi/messages/{sid}/full?ids= batch multi-mid expand
+# ===========================================================================
+
+
+async def test_g6_ids_missing_returns_422(upstream_factory):
+    """T7-C1: missing ``ids`` → FastAPI 422 validation error."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"[]")
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/slimapi/messages/s1/full", headers=VERSION_HEADERS)
+        assert response.status_code == 422
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_g6_ids_invalid_count(upstream_factory):
+    """T7-C2: empty / >20 ids → 400 ``invalid_ids``."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"[]")
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            # 空（仅逗号/空白）
+            r1 = await client.get(
+                "/slimapi/messages/s1/full?ids=,,", headers=VERSION_HEADERS,
+            )
+            assert r1.status_code == 400 and r1.json()["code"] == "invalid_ids"
+            # >20
+            big = ",".join(f"m{i}" for i in range(21))
+            r2 = await client.get(
+                f"/slimapi/messages/s1/full?ids={big}", headers=VERSION_HEADERS,
+            )
+            assert r2.status_code == 400 and r2.json()["code"] == "invalid_ids"
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_g6_session_not_found_no_mid_fetch(upstream_factory):
+    """T7-C3: discover 404 → 404 ``session_not_found``, zero mid fetches."""
+    calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        return httpx.Response(404, content=b'{"error":"no session"}')
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m1,m2", headers=VERSION_HEADERS,
+            )
+        assert r.status_code == 404 and r.json()["code"] == "session_not_found"
+        assert calls["count"] == 1  # 只 discover，没拉 mid
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_g6_partial_mid_failure(upstream_factory):
+    """T7-C4: partial mid 404 → 200 + items[] + errors[] message_not_found."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session/s1":
+            return httpx.Response(200, content=orjson.dumps({"id": "s1"}))
+        if request.url.path == "/session/s1/message/m_ok":
+            return httpx.Response(200, content=orjson.dumps(_msg("m_ok", 100)))
+        if request.url.path == "/session/s1/message/m_missing":
+            return httpx.Response(404, content=b"{}")
+        return httpx.Response(404)
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m_ok,m_missing",
+                headers=VERSION_HEADERS,
+            )
+        assert r.status_code == 200
+        body = r.json()
+        assert len(body["items"]) == 1
+        assert any(
+            e["code"] == "message_not_found" and e["messageID"] == "m_missing"
+            for e in body["errors"]
+        )
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_g6_all_mid_missing_still_200(upstream_factory):
+    """T7-C5: all mid 404 → still 200 + all errors[] (no whole-response fail)."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session/s1":
+            return httpx.Response(200, content=orjson.dumps({"id": "s1"}))
+        return httpx.Response(404)
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m1,m2", headers=VERSION_HEADERS,
+            )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["items"] == []
+        assert len(body["errors"]) == 2
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_g6_cumulative_byte_budget(upstream_factory):
+    """T7-C6: concurrent chunk-ledger cumulative budget → 413.
+
+    8 mids, each ~40KiB, max_response_bytes=64KiB. A barrier holds the first
+    4 streams until all 4 sem slots are occupied (max_in_flight==4). After the
+    first wave's chunks trip the shared ledger, mids 5–8 must NOT be fetched
+    (aborted blocks queue). Proves TOCTOU fix: debit is per-chunk, not after
+    full body.
+    """
+    cap = 64 * 1024
+    payload = orjson.dumps(_msg("m", 100, text="y" * 40000))
+    assert len(payload) < cap
+    assert 2 * len(payload) > cap
+
+    discover_calls = {"n": 0}
+    mid_calls = {"n": 0}
+    in_flight = {"n": 0, "max": 0}
+    barrier_ready = asyncio.Event()
+    barrier_count = {"n": 0}
+    # First 4 mid streams wait here before yielding any body bytes so all 4
+    # concurrent slots are held before the ledger is debited.
+    first_wave_size = 4
+
+    class BarrierStream(httpx.AsyncByteStream):
+        def __init__(self, data: bytes, *, join_barrier: bool):
+            self._data = data
+            self._join = join_barrier
+
+        async def __aiter__(self):
+            if self._join:
+                barrier_count["n"] += 1
+                if barrier_count["n"] >= first_wave_size:
+                    barrier_ready.set()
+                await barrier_ready.wait()
+            # Yield in small chunks so the ledger can trip mid-stream.
+            chunk = 8 * 1024
+            for i in range(0, len(self._data), chunk):
+                yield self._data[i:i + chunk]
+                # Yield to the event loop so sibling streams interleave.
+                await asyncio.sleep(0)
+
+        async def aclose(self):
+            return None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session/s1":
+            discover_calls["n"] += 1
+            return httpx.Response(200, content=orjson.dumps({"id": "s1"}))
+        mid_calls["n"] += 1
+        in_flight["n"] += 1
+        in_flight["max"] = max(in_flight["max"], in_flight["n"])
+        # First 4 mids join the barrier; later ones (if any slip through)
+        # stream immediately — they should not exist under a correct abort.
+        join = mid_calls["n"] <= first_wave_size
+        # Track in_flight release via a wrapper that decrements on aclose.
+        stream = BarrierStream(payload, join_barrier=join)
+
+        class CountingStream(httpx.AsyncByteStream):
+            def __init__(self, inner: httpx.AsyncByteStream):
+                self._inner = inner
+
+            async def __aiter__(self):
+                async for c in self._inner:
+                    yield c
+
+            async def aclose(self):
+                in_flight["n"] -= 1
+                await self._inner.aclose()
+
+        return httpx.Response(200, stream=CountingStream(stream))
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(max_response_bytes=cap), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            ids = ",".join(f"m{i}" for i in range(1, 9))
+            r = await client.get(
+                f"/slimapi/messages/s1/full?ids={ids}", headers=VERSION_HEADERS,
+            )
+        assert r.status_code == 413
+        body = r.json()
+        assert body["code"] == "response_too_large"
+        assert body["limit"] == cap
+        assert discover_calls["n"] == 1
+        # Initial 4 start; queued 5–8 never fire once budget_exceeded trips.
+        assert mid_calls["n"] == 4, (
+            f"expected 4 mid fetches (sem wave only), got {mid_calls['n']}"
+        )
+        assert in_flight["max"] == 4
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_g6_no_under_fetch_small_messages(upstream_factory):
+    """Anti-regression: 20 small mids must all succeed under a generous cap."""
+    mid_calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session/s1":
+            return httpx.Response(200, content=orjson.dumps({"id": "s1"}))
+        mid_calls["n"] += 1
+        mid = request.url.path.rsplit("/", 1)[-1]
+        return httpx.Response(
+            200, content=orjson.dumps(_msg(mid, 100, text="x" * 900)),
+        )
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(max_response_bytes=64 * 1024), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            ids = ",".join(f"m{i}" for i in range(20))
+            r = await client.get(
+                f"/slimapi/messages/s1/full?ids={ids}", headers=VERSION_HEADERS,
+            )
+        assert r.status_code == 200
+        body = r.json()
+        assert len(body["items"]) == 20
+        assert body["errors"] == []
+        assert mid_calls["n"] == 20
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_g6_message_too_large_charges_budget(upstream_factory):
+    """Rev-5: per-mid too-large must still debit the shared ledger.
+
+    Deterministic order (m2 stream waits for m1 aclose):
+      m1: chunk0 (16KiB) accepted; chunk1 charges then trips
+      message_too_large → charged = 32KiB. m2 (~12KiB) then trips
+      budget (32+12 > 40) → whole-response 413.
+
+    Old code skipped debit on the per-mid-triggering chunk → charged
+    only 16KiB → 16+12 < 40 → 200 + envelope (the bug this locks).
+    """
+    # BATCH_CHUNK_SIZE = 16KiB. max_msg between 1 and 2 chunks so the
+    # second chunk is the per-mid trigger; max_resp > 2 chunks so that
+    # second chunk hits per-mid (not budget) and still charges.
+    max_msg = 20 * 1024
+    max_resp = 40 * 1024
+    big_payload = orjson.dumps(_msg("m1", 100, text="B" * 40_000))  # ~2.5 chunks
+    small_payload = orjson.dumps(_msg("m2", 100, text="s" * 11_000))  # ~12KiB
+    assert len(big_payload) > max_msg
+    assert len(small_payload) < max_msg
+    assert len(small_payload) < max_resp
+    charged_m1_with_fix = 32 * 1024  # two BATCH_CHUNK debits
+    charged_m1_old_bug = 16 * 1024     # only first chunk if trigger not debited
+    assert charged_m1_with_fix + len(small_payload) > max_resp
+    assert charged_m1_old_bug + len(small_payload) <= max_resp
+
+    m1_finished = asyncio.Event()
+
+    class OrderedStream(httpx.AsyncByteStream):
+        def __init__(self, data: bytes, *, is_m1: bool):
+            self._data = data
+            self._is_m1 = is_m1
+
+        async def __aiter__(self):
+            if not self._is_m1:
+                await m1_finished.wait()
+            chunk = 16 * 1024  # match BATCH_CHUNK_SIZE for predictable debit
+            for i in range(0, len(self._data), chunk):
+                yield self._data[i:i + chunk]
+                await asyncio.sleep(0)
+
+        async def aclose(self):
+            if self._is_m1:
+                m1_finished.set()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session/s1":
+            return httpx.Response(200, content=orjson.dumps({"id": "s1"}))
+        if request.url.path.endswith("/m1"):
+            return httpx.Response(200, stream=OrderedStream(big_payload, is_m1=True))
+        if request.url.path.endswith("/m2"):
+            return httpx.Response(200, stream=OrderedStream(small_payload, is_m1=False))
+        return httpx.Response(404)
+
+    upstream = upstream_factory(handler)
+    app = _build_app(
+        _settings(max_message_bytes=max_msg, max_response_bytes=max_resp),
+        upstream,
+    )
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m1,m2", headers=VERSION_HEADERS,
+            )
+        # m1 charged 16KiB then message_too_large; m2 then trips budget → 413.
+        # Without the debit, m2 would fit under max_resp and the route would
+        # return 200 with items=[m2] + errors=[m1 too_large].
+        assert r.status_code == 413, (
+            f"expected 413 from ledger charge of too-large mid, got "
+            f"{r.status_code}: {r.text[:200]}"
+        )
+        assert r.json()["code"] == "response_too_large"
+        assert r.json()["limit"] == max_resp
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_g6_mid_malformed_json_envelope_error(upstream_factory):
+    """Mid 200 + illegal JSON body → errors[] upstream_error; whole request 200."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session/s1":
+            return httpx.Response(200, content=orjson.dumps({"id": "s1"}))
+        if request.url.path.endswith("/m1"):
+            return httpx.Response(200, content=b"not json{")
+        if request.url.path.endswith("/m2"):
+            return httpx.Response(200, content=orjson.dumps(_msg("m2", 100)))
+        return httpx.Response(404)
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m1,m2", headers=VERSION_HEADERS,
+            )
+        assert r.status_code == 200
+        body = r.json()
+        assert len(body["items"]) == 1
+        assert body["items"][0]["info"]["id"] == "m2"
+        assert any(
+            e["messageID"] == "m1" and e["code"] == "upstream_error"
+            for e in body["errors"]
+        )
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_g6_network_error_returns_503(upstream_factory):
+    """Network-layer httpx.RequestError on a mid stream → 503, never 413."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session/s1":
+            return httpx.Response(200, content=orjson.dumps({"id": "s1"}))
+        if request.url.path.endswith("/m_bad"):
+            raise httpx.ConnectError("simulated mid stream failure")
+        mid = request.url.path.rsplit("/", 1)[-1]
+        return httpx.Response(200, content=orjson.dumps(_msg(mid, 100)))
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m_ok,m_bad",
+                headers=VERSION_HEADERS,
+            )
+        assert r.status_code == 503
+        assert r.json()["code"] == "upstream_unavailable"
+        assert r.status_code != 413
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_g6_discover_malformed_json_returns_503(upstream_factory):
+    """Discover 200 + illegal JSON → 503; zero mid fetches."""
+    mid_calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session/s1":
+            return httpx.Response(200, content=b"not json{")
+        mid_calls["n"] += 1
+        return httpx.Response(200, content=orjson.dumps(_msg("m1", 100)))
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m1,m2", headers=VERSION_HEADERS,
+            )
+        assert r.status_code == 503
+        assert r.json()["code"] == "upstream_unavailable"
+        assert mid_calls["n"] == 0
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_g6_items_strict_order(upstream_factory):
+    """T7-C7: items[] strict order of deduped ids (dict.fromkeys order)."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session/s1":
+            return httpx.Response(200, content=orjson.dumps({"id": "s1"}))
+        mid = request.url.path.rsplit("/", 1)[-1]
+        return httpx.Response(200, content=orjson.dumps(_msg(mid, 100)))
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m3,m1,m3,m2",
+                headers=VERSION_HEADERS,
+            )
+        body = r.json()
+        ids = [m["info"]["id"] for m in body["items"]]
+        assert ids == ["m3", "m1", "m2"]  # 去重保序
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_g6_route_not_shadowed(upstream_factory):
+    """T7-C8: GET /full?ids= is not swallowed by /full/{mid}.
+
+    Runtime check: request hits batch envelope. Static check: router
+    registration order places ``/full`` before ``/full/{mid}``.
+    """
+    from fastapi.routing import APIRoute
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session/s1":
+            return httpx.Response(200, content=orjson.dumps({"id": "s1"}))
+        return httpx.Response(200, content=orjson.dumps(_msg("m1", 100)))
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m1", headers=VERSION_HEADERS,
+            )
+        # 若被 /full/{mid} 吞，会 422（{mid} 缺）或不同行为；这里断言 200 + envelope
+        assert r.status_code == 200
+        assert "items" in r.json()
+
+        # Static registration order (spec MUST): /full before /full/{mid}.
+        paths = [
+            route.path for route in app.router.routes
+            if isinstance(route, APIRoute)
+        ]
+        # Also check the messages router directly (app may wrap routes).
+        from oc_slimapi.routes import messages as msgs_mod
+        msg_paths = [
+            route.path for route in msgs_mod.router.routes
+            if isinstance(route, APIRoute)
+        ]
+        full_idx = next(
+            i for i, p in enumerate(msg_paths)
+            if p.endswith("/full") and "{mid}" not in p
+        )
+        full_mid_idx = next(
+            i for i, p in enumerate(msg_paths) if p.endswith("/full/{mid}")
+        )
+        assert full_idx < full_mid_idx, (
+            f"/full must register before /full/{{mid}}: {msg_paths}"
+        )
+    finally:
+        app.state.transforms.shutdown()

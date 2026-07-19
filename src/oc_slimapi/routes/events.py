@@ -31,7 +31,6 @@ async def events(request: Request):
             accept_encoding=request.headers.get("accept-encoding"),
         )
 
-    hub = request.app.state.hubs.get_global()
     subscriber_id = subscriber.id
 
     async def generate():
@@ -42,9 +41,15 @@ async def events(request: Request):
                 item = await subscriber.queue.get()
                 if item is STOP:
                     break
+                # Mirror put(): only sized frames bump queued_bytes; STOP is a
+                # control sentinel and never entered the byte ledger.
+                subscriber.ack(item)
                 yield item
         finally:
-            hub.unsubscribe(subscriber)
+            # Must go through HubRegistry.unsubscribe (not GlobalHub) so
+            # total_subscribers is decremented — otherwise the registry
+            # counter leaks and admission permanently 503s after the cap.
+            request.app.state.hubs.unsubscribe(subscriber)
 
     return StreamingResponse(
         generate(),

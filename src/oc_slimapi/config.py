@@ -92,8 +92,17 @@ class Settings:
             raise RuntimeError(
                 "OC_SLIMAPI_MAX_TOTAL_SUBSCRIBERS must be >= OC_SLIMAPI_MAX_SUBSCRIBERS_PER_DIRECTORY"
             )
-        if self.sse_queue_items < 1:
-            raise RuntimeError("OC_SLIMAPI_SSE_QUEUE_ITEMS must be >= 1")
+        if self.sse_queue_items < 2:
+            # Overflow terminal path enqueues resync + STOP after clearing;
+            # a queue of size 1 cannot hold both, which would drop STOP and
+            # violate the SSE backpressure contract (resync without guaranteed
+            # connection close).
+            raise RuntimeError(
+                "OC_SLIMAPI_SSE_QUEUE_ITEMS must be >= 2 "
+                "(overflow terminal path enqueues resync + STOP after clearing; "
+                "a queue of size 1 cannot hold both, which would drop STOP and "
+                "violate the SSE backpressure contract)"
+            )
         if self.sse_buffer_bytes <= 0:
             raise RuntimeError("OC_SLIMAPI_SSE_BUFFER_BYTES must be > 0")
         if self.sse_max_frame_bytes <= 0:

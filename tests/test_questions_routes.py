@@ -130,3 +130,65 @@ async def test_questions_mutation_timeout(upstream_factory):
     body = response.json()
     assert body["code"] == "upstream_timeout"
     assert body["message"] == "upstream mutation timed out; not retried"
+
+
+async def test_token_refreshes_cold_allowlist_then_reply(upstream_factory):
+    """F3: cold allowlist + valid /project refresh → routeToken dir allowed → 204."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/project":
+            return httpx.Response(
+                200,
+                content=orjson.dumps([{"id": "p1", "worktree": "/app"}]),
+                headers={"Content-Type": "application/json"},
+            )
+        if request.url.path == "/project/p1/directories":
+            return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
+        if request.url.path == "/question/q1/reply":
+            return httpx.Response(204)
+        return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream, allowlist=set())
+    secret = app.state.route_secret
+    token = issue_route_token(secret, kind="question", request_id="q1", session_id=None, directory="/app")
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/slimapi/questions/q1/reply",
+            headers=VERSION_HEADERS,
+            json={"answers": [["a"]], "routeToken": token},
+        )
+    assert response.status_code == 204
+
+
+async def test_questions_null_directory_aggregates_allowlist(upstream_factory):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/question":
+            return httpx.Response(200, content=orjson.dumps([{"id": "q1", "sessionID": "ses_1"}]),
+                                  headers={"Content-Type": "application/json"})
+        return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream, allowlist={"/app"})
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/slimapi/questions", headers=VERSION_HEADERS)
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["items"]) == 1
+    assert body["items"][0]["directory"] == "/app"
+    assert "routeToken" in body["items"][0]
+    assert body["errors"] == []
+
+
+async def test_questions_null_directory_empty_allowlist_returns_empty_envelope(upstream_factory):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream, allowlist=set())
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/slimapi/questions", headers=VERSION_HEADERS)
+    assert response.status_code == 200
+    assert response.json() == {"items": [], "errors": []}

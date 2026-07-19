@@ -1,8 +1,8 @@
 # oc-slimapi v1 契约实现状态报告
 
 - **基准契约**：[`docs/v1-contract.md`](./v1-contract.md)（唯一 wire 基准）
-- **审计对象**：oc-slimapi 仓库截至 commit `268d5c5`（origin/main）
-- **审计方法**：逐条对照契约 §0–§11，交叉核验源码（`src/oc_slimapi/**`）+ 测试（`tests/`，150 passed）+ 配套文档（v1-impl-spec / INTERFACE_MAP / CHANGELOG / CLIENT_CHANGES）
+- **审计对象**：oc-slimapi 仓库 working tree at `9373550` + 本批（2026-07-19 ocdroid-findings）未提交改动
+- **审计方法**：逐条对照契约 §0–§11，交叉核验源码（`src/oc_slimapi/**`）+ 测试（`tests/`，**190 passed** @ 2026-07-20）+ 配套文档（v1-impl-spec / INTERFACE_MAP / CHANGELOG / CLIENT_CHANGES）
 - **状态图例**：✅ 完全实现 · 🟡 部分实现 · ⚫ 未实现 · 🔄 变更（相对契约前的行为变化）
 - **给**：ocdroid 项目组
 
@@ -14,9 +14,9 @@
 |---|---|---|---|
 | §0 | 范围与架构 | ✅ | FastAPI+httpx+orjson+uvicorn 单 worker，loopback，不读 SQLite |
 | §1 | 版本契约 | ✅ | `SERVER_API_VERSION=1`，`ACCEPTED_CLIENT_VERSIONS=(1,1)`，门闩齐全 |
-| §2 | 端点表（16 路由） | ✅ + 🔄 | 全部就绪；B1 引入若干加性 wire 行为变更（见下） |
-| §2 写路径 B2 | routeToken | ✅ | issue/verify + directory 注入 + 过期透明 |
-| §3 | SSE 契约 | ✅ | digest(含 archived) / asked 直推 / heartbeat / resync 全覆盖 |
+| §2 | 端点表（16+ 路由） | ✅ + 🔄 | 全部就绪；B1 + 2026-07-19 加性变更（F1/F2/G6 等，见下） |
+| §2 写路径 B2 | routeToken | ✅ | issue/verify + directory 注入 + 过期透明；**F3** lifespan warm + `_token` 走 `require_directory` |
+| §3 | SSE 契约 | ✅ + 🔄 | digest(含 archived + **lastError?**) / **session.error G1** / asked 直推 / heartbeat / resync 全覆盖 |
 | §4 | 冷启动 & resync | ✅ | sidecar 提供所需端点；resync 流程在客户端 |
 | §5 | 拉消息 A2=A | ✅ | `/since/{ts}` 语义 `time.updated >= ts` + 分页 |
 | §6 | 资源限制 T3 | ✅ | 订阅上限 / 字节预算 / 溢出清 queue / `/metrics` |
@@ -87,16 +87,17 @@ sidecar 强制 loopback-only（契约 §0，`config.validate()` 拒绝非 loopba
 | `GET /slimapi/sessions` | ✅ | 骨架列表 + `?directory/roots/limit/start/search`，排除 archived，每条带 `directory` |
 | `GET /slimapi/projects` | 🔄 | 发现 + allowlist；**B1：upstream 5xx/网络 502→503**（状态码变更，见下） |
 | `GET /slimapi/sessions/status` | ✅ | 批量 status；B1 起错误体结构化 |
-| `GET /slimapi/sessions/{sid}/status` | 🔄 | **B1：404/502/503 三态分裂**（见下） |
+| `GET /slimapi/sessions/{sid}/status` | 🔄 | **B1：404/502/503 三态分裂**；**🔄 F2：放宽 allowlist**（`normalize_directory` 不 gate） |
 | `GET /slimapi/messages/{sid}` | 🔄 | 骨架分页；**B1：query `directory` 软 allowlist**（见下） |
 | `GET /slimapi/messages/{sid}/since/{ts}` | ✅ + 🔄 | A2=A 语义（§11.2 闭环）；**B1：同上 directory allowlist** |
 | `GET /slimapi/messages/{sid}/full/{mid}` | 🔄 | **B1：oversized → 413 流式 cap**（不再整缓冲，见下） |
-| `GET /slimapi/questions` | ✅ | 跨目录聚合（1-32 directory），每条带 `routeToken` |
-| `GET /slimapi/permissions` | ✅ | 同上 |
+| `GET /slimapi/messages/{sid}/full?ids=` | 🆕 G6 | **批量展开**（1–20 mid，discover 先行，mid 级 envelope `errors[]`，累计 413） |
+| `GET /slimapi/questions` | 🔄 F1 | 跨目录聚合；**directory 可选**（null=聚合 allowlist；显式 1–32），每条带 `routeToken` |
+| `GET /slimapi/permissions` | 🔄 F1 | 同上 |
 | `POST /slimapi/questions/{qid}/reply` | ✅ | routeToken 校验 + directory 注入 + 转发 |
 | `POST /slimapi/questions/{qid}/reject` | ✅ | 同上 |
 | `POST /slimapi/sessions/{sid}/permissions/{pid}` | ✅ | 同上（`response: once/always/reject`） |
-| `GET /slimapi/events` | ✅ | 策展 SSE（§3） |
+| `GET /slimapi/events` | ✅ + 🔄 | 策展 SSE（§3）；**G1：`lastError?` + `session.error`** |
 | `* /{path}` catch-all | 🔄 | 透传 opencode；**B1：shell/PTY 路径 403 拒绝**（见下） |
 
 #### 🔄 B1 加性变更明细（ocdroid 须识别）
@@ -105,16 +106,16 @@ sidecar 强制 loopback-only（契约 §0，`config.validate()` 拒绝非 loopba
 - upstream discover **404** → HTTP **404** `{"code":"session_not_found","sessionID":"<sid>"}`
 - upstream discover 其它 **4xx**（401/403/409…）→ HTTP **502** `{"code":"upstream_http_<N>"}`
 - upstream **5xx / 网络错误 / JSON 解析失败 / 非映射 JSON / 200 但 directory 不可用** → HTTP **503** `{"code":"upstream_unavailable"}`
-- 允许名单 miss 透传 400 `directory_not_allowed`（不被上述 except 吞掉）
-- **客户端影响**：原先统一 502 的失败现在按上游语义分裂；按 `code` 分发即可。
+- **F2（2026-07-19）放宽 allowlist**：per-session status 用 `normalize_directory` **仅规范化、不 gate**；discover 得到的 directory ∉ allowlist 时**仍 200**（继续查 status map / 合成 idle），**不再** 400 `directory_not_allowed`。批量 `GET /slimapi/sessions/status` 仍走 `require_directory`。
+- **客户端影响**：原先统一 502 的失败现在按上游语义分裂；按 `code` 分发即可。F2 后客户端勿再把 per-session status 的 400 当成 allowlist miss 主路径。
 
 **2. `GET /slimapi/projects` — 5xx 状态码 502→503**（contract §7）
 - upstream 5xx/网络错误由原 **502** 改为 **503 `upstream_unavailable`**；4xx 仍走 502 `upstream_http_N`。
 - **客户端影响**：若 ocdroid 的 circuit breaker 硬编码 `/slimapi/projects` 失败=精确 502，须改为按 5xx 类（502/503）分发。
 
-**3. `GET /slimapi/messages/{sid}` + `/since/{ts}` + `/full/{mid}` — query `directory` 软 allowlist**（contract §2/§7，G7-soft）
-- 三路由统一校验 query `directory`：∈ allowlist → 透传；∉ allowlist → 400 `directory_not_allowed`；query 与 `X-Opencode-Directory` 头冲突 → 400；无 query → 透传（不拦）。
-- **客户端影响**：发请求时带 `?directory=<允许的目录>`。命中后 sidecar 把 normalized directory 作为 `X-Opencode-Directory` 转发上游。**该机制是省流路由的核心**，与 `/slimapi/questions` 聚合里下发的 `routeToken` 共同保证 directory 一致性。
+**3. `GET /slimapi/messages/{sid}` + `/since/{ts}` + `/full/{mid}` + `/full?ids=`（G6）— query `directory` 软 allowlist**（contract §2/§7，G7-soft）
+- **四路由**统一经 `_resolve_messages_directory`：**directory 可选**——未传 query 时**不拦**（用 upstream 默认 directory）；显式传入则走 `require_directory` gate（∈ allowlist → 透传；∉ allowlist → 400 `directory_not_allowed`；query 与 `X-Opencode-Directory` 头冲突 → 400）。G6 `message_batch` 与单 mid `/full/{mid}` 同 gate。
+- **客户端影响**：可省略 `?directory`（依赖 upstream 默认）；若显式传则须为 allowlist 内目录。命中后 sidecar 把 normalized directory 作为 `X-Opencode-Directory` 转发上游。与 `/slimapi/questions` 聚合里下发的 `routeToken` 共同保证 directory 一致性（契约 §12）。
 
 **4. `GET /slimapi/messages/{sid}/full/{mid}` — oversized 流式 cap**（contract §7，G8）
 - 单条全文超过 `max_message_bytes`（默认 32 MiB）→ HTTP **413** `{"code":"message_too_large","limitBytes":<cap>}`。
@@ -137,10 +138,11 @@ sidecar 强制 loopback-only（契约 §0，`config.validate()` 拒绝非 loopba
 - routeToken 404/过期透明（已应答/失效）→ 客户端重取聚合。
 - 通用写（发消息/abort）走 catch-all，客户端带 `X-Opencode-Directory` 头，sidecar 不剥（`forward_directory_headers`）。
 
-### §3 SSE 契约 — ✅ 完全实现
+### §3 SSE 契约 — ✅ 完全实现 + 🔄 G1
 - 上游：单一 `/global/event` 进程级 GlobalBus，全实例跨目录，每事件自带 `directory`。
 - 帧类型全覆盖（`hub.py`）：
-  - `session.digest`（debounce 250ms/session）：`{sessionID, directory, status?, messageID?, updatedAt?, archived?, deleted?}`。**`archived` 字段已落地**（§11.1 闭环：取 `info.time.archived`，永久状态）。
+  - `session.digest`（debounce 250ms/session）：`{sessionID, directory, status?, messageID?, updatedAt?, archived?, deleted?, lastError?}`。**`archived` 字段已落地**（§11.1 闭环：取 `info.time.archived`，永久状态）。**G1 `lastError?`**：`{name,message,at}` sticky 跨窗口；`status=busy` 显式 `null` 清除；`deleted` 后不保留。
+  - **`session.error`（G1-B，立即直推，无 sid 时）**：`{directory?, name, message, at}`。有 sid 时错误进 digest 的 `lastError`（G1-A 立即 flush），不下发独立 `session.error` 帧。`MessageAbortedError` 静默过滤；message 脱敏（首行/剥路径/剥 stack/剥 secret/截断 512）。
   - `question.asked`/`v2.asked`、`permission.asked`/`resolved`/`v2.asked`/`v2.resolved`：立即直推 `{directory, type, properties}`。
   - `server.connected`（订阅即吐）、`server.heartbeat`（10s）、`resync`（`{"reason":"reconnect_no_replay"}`，无 replay）。
 - 丢弃：`?stream`、text.delta、`message.part.*`、`tool.*`、`sessionId` 参数、per-directory hub。
@@ -162,29 +164,35 @@ sidecar 强制 loopback-only（契约 §0，`config.validate()` 拒绝非 loopba
 - 转换池：`MAX_TRANSFORMS=1`，admission 在下载前，限长读 `MAX_RESPONSE_BYTES=64 MiB`，parse/project/gzip offload worker thread。
 - `GET /slimapi/metrics` 暴露订阅者/queue/hub 指标（§11.3 闭环）。
 
-### §7 错误码 — ✅ 完全实现 + 🔄 B1 扩充
-完整码表（含 B1 加性扩充）：
+### §7 错误码 — ✅ 完全实现 + 🔄 B1 / 2026-07-19（G6）扩充
+完整码表（含 B1 + G6 加性扩充）。**top-level** = HTTP 状态 + body `{"code":…}`；**envelope** = 整请求通常仍 200，code 在 `errors[]` mid 项。**同一 code 名两语境含义不同**。
 
-| HTTP | code | 来源 |
-|---|---|---|
-| 400 | `version_required` / `version_incompatible` | §1 版本门闩 |
-| 400 | `directory_not_allowed` | allowlist miss / query-header 冲突 |
-| 400 | `invalid_directory_count` | 🆕 B1 questions directory count guard（1-32） |
-| 400 | `invalid_route_token` | 🆕 B1 routeToken 校验失败 |
-| 403 | `shell_not_allowed` | 🆕 B1 catch-all shell/PTY deny-list |
-| 404 | `session_not_found`（带 `sessionID`） | 🆕 B1 G2 status discover 404 |
-| 404 | `thin_route_not_found` | `/slimapi/**` 未知 |
-| 413 | `response_too_large` | 超 `MAX_RESPONSE_BYTES` |
-| 413 | `message_too_large` | 🆕 B1 `/full/{mid}` 流式 cap |
-| 502 | `upstream_http_N` | 🆕 B1（顶层 body；G2/projects 非 404 的 4xx） |
-| 503 | `transform_busy`（带 `Retry-After`） | 转换池饱和 |
-| 503 | `upstream_unavailable` | 🆕 B1（顶层；5xx/网络/坏 JSON/非映射/无 directory） |
-| 503 | `sse_subscriber_limit_directory` / `_total` | §6 订阅上限 |
-| 503 | allowlist 刷新失败 | `/project` 发现失败 |
-| 504 | `upstream_timeout` | q/p mutation 超时 |
+| 语境 | HTTP | code | 来源 |
+|---|---|---|---|
+| top-level | 400 | `version_required` / `version_incompatible` | §1 版本门闩 |
+| top-level | 400 | `directory_not_allowed` | allowlist miss / query-header 冲突（F2：不再适用 per-session status） |
+| top-level | 400 | `invalid_directory_count` | 🆕 B1 questions directory count guard（1-32） |
+| top-level | 400 | `invalid_route_token` | 🆕 B1 routeToken 校验失败 |
+| top-level | 400 | `invalid_ids` | 🆕 G6：`ids` 空 / 超 20 / 解析后无有效 mid（缺 `ids`→422） |
+| top-level | 403 | `shell_not_allowed` | 🆕 B1 catch-all shell/PTY deny-list |
+| top-level | 404 | `session_not_found`（带 `sessionID`） | 🆕 B1 G2 status discover 404；**G6 discover** 404（0 mid 拉取） |
+| top-level | 404 | `thin_route_not_found` | `/slimapi/**` 未知 |
+| top-level | 413 | `response_too_large` | 超 `MAX_RESPONSE_BYTES`（含 **G6 累计**） |
+| top-level | 413 | `message_too_large` | 🆕 B1 `/full/{mid}?mode=full` 流式 cap |
+| top-level | 502 | `upstream_http_N` | 🆕 B1 G2/projects 非 404 的 4xx；**G6 discover** 其它 4xx |
+| top-level | 503 | `transform_busy`（带 `Retry-After`） | 转换池饱和（含 **G6 skeleton**） |
+| top-level | 503 | `upstream_unavailable` | 🆕 B1（5xx/网络/坏 JSON/…）；**G6 discover** 5xx·网络·坏 JSON；**G6 任一 mid 网络**（**优先于** 累计 413） |
+| top-level | 503 | `sse_subscriber_limit_directory` / `_total` | §6 订阅上限 |
+| top-level | 503 | allowlist 刷新失败 | `/project` 发现失败 |
+| top-level | 504 | `upstream_timeout` | q/p mutation 超时 |
+| **G6 envelope** | 200 | `message_not_found` | 🆕 G6 mid 404（**非整请求 404**） |
+| **G6 envelope** | 200 | `upstream_http_N` | 🆕 G6 mid **≥400（含 5xx）**（**不**升级整请求） |
+| **G6 envelope** | 200 | `message_too_large` | 🆕 G6 mid body > `max_message_bytes`（非整请求 413） |
+| **G6 envelope** | 200 | `upstream_error` | 🆕 G6 mid 2xx 坏 JSON（非整请求 500） |
+| q/p envelope | 200/503 | `upstream_http_N` / `upstream_timeout` / `upstream_error` | questions/permissions fan-out 单 dir 失败项 |
 
 - thin 路由错误体统一 `{"code":string, "message"?:string, ...}`（非 `{"detail":...}`）。
-- **注**：`upstream_http_N` / `upstream_timeout` / `upstream_error` 在 questions/permissions **聚合 envelope 内**（`errors[]`，整体 200 部分成功 / 503 全败）也复用——同一 code 在顶层 HTTP body 与 envelope 两个位置出现，由端点语义决定（详见 v1-impl-spec §11 双行）。
+- **双语境复用**：`upstream_http_N` / `message_too_large` / `upstream_error` 等在 top-level 与 envelope 均出现——按端点 + 是否在 `errors[]` 分发（契约 §7；v1-impl-spec §11 双行）。
 
 ### §8 客户端 v1 最小集 — ✅ 完全实现（sidecar 侧）
 - sidecar 已支持：版本头 + health 自检（`schema.degraded` fail-closed 信号）+ 冷启动端点 + SSE(digest+q/p) + `/since` 拉消息 + catch-all 写 + routeToken 应答 + resync 语义。
@@ -225,16 +233,17 @@ sidecar 强制 loopback-only（契约 §0，`config.validate()` 拒绝非 loopba
 1. **错误体形状变更（最高优先）**：thin 路由 `{"detail":...}` → `{"code":...}`。**破坏性解析**——所有错误分发须改 `json()["code"]`。详见 `docs/CLIENT_CHANGES.md`。
 2. **`/slimapi/sessions/{sid}/status` 三态分裂**：原统一 502，现 404(`session_not_found`)/502(`upstream_http_N`)/503(`upstream_unavailable`)。建议按 `code` 而非 HTTP 状态分发。
 3. **`/slimapi/projects` 5xx 状态码 502→503**：circuit breaker 不应硬编码 502。
-4. **messages 三路由 query `directory` allowlist**：请求须带 `?directory=<allowed>`；与 `X-Opencode-Directory` 头冲突会 400。
-5. **新增 413 `message_too_large`**（`/full/{mid}` 默认 mode）；`?mode=skeleton` 仍用 `response_too_large`。
+4. **messages 四路由 query `directory` 软 allowlist（G7-soft）**（list / since / full/{mid} / **G6 full?ids=**）：`directory` **可选**——未传不拦（upstream 默认）；显式传则 `require_directory` gate；与 `X-Opencode-Directory` 头冲突会 400。
+5. **新增 413 `message_too_large`**（`/full/{mid}` 默认 mode）；`?mode=skeleton` 仍用 `response_too_large`。G6 累计超限整请求 413 `response_too_large`；单 mid 过大进 envelope。
 6. **新增 403 `shell_not_allowed`**：省流模式不应调 shell/PTY。
 7. **新增 400 `invalid_directory_count` / `invalid_route_token`**：q/p 聚合与 reply 错误分支。
+8. **G6 批量展开 + F1 q/p null directory + G1 lastError/session.error**：见 `CLIENT_CHANGES.md` 对应节；wire 版本仍为 1。
 
 ## 已知 best-effort / 非保证（契约外诚实声明）
 
 - **shell/PTY deny-list 是 best-effort，非安全保证**：路径大小写变体、`/./`、`/../` 段、双重编码**不归一化**；真实隔离靠 stunnel mTLS + 网络边缘。Ops 可 `OC_SLIMAPI_SHELL_DENY_LIST_ENABLED=0` 关闭。
 - **thin 路由 mid-stream upstream 异常**：list/since 路径的 `read_with_cap` 在上游中途断流时按 pre-existing 行为可能 500（spec §7 承认）；`/full/{mid}` 已包裹为 503 `upstream_unavailable`。
-- **routeToken 不刷 allowlist**（pre-existing）：sidecar 冷启动后 allowlist 为空，首个带合法 routeToken 的 reply 会 400 `directory_not_allowed`，直到 `/slimapi/projects` 或带 `?directory=` 的端点暖起来。建议 ocdroid 冷启动**先**调会触发 `require_directory` 的端点。
+- **routeToken-allowlist 时序（F3 已修复）**：sidecar `lifespan` 启动 warm `/project`；`_token` 走 `require_directory`（miss 自动刷新）。冷启动空窗不再致首个合法 reply 400。
 
 ## 审计产物
 - 契约：`docs/v1-contract.md`（含头部「变更记录」+ §7 加性小节，wire 权威同步实现）
@@ -245,5 +254,5 @@ sidecar 强制 loopback-only（契约 §0，`config.validate()` 拒绝非 loopba
 - 交付报告：`docs/ocmar/reports/2026-07-18-v1-b0-b1.md`
 
 ## 校验
-- `./scripts/check.sh` → **150 passed**, EXIT=0。
-- 基线 commit：`268d5c5`（origin/main）。
+- `./scripts/check.sh` → **190 passed**, EXIT=0（@ 2026-07-20；含 SSE lifecycle 3 回归：teardown registry slot / queued_bytes ack / G1 non-str name）。
+- 基线：working tree at `9373550` + 本批未提交改动（ocdroid-findings-evaluation + SSE lifecycle fix）。

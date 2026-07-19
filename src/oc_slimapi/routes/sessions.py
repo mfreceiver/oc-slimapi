@@ -5,7 +5,7 @@ from typing import NoReturn
 from urllib.parse import quote
 
 import httpx
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, FastAPI, Query, Request
 
 from ..errors import CodedHTTPException
 from ..gzip_util import json_response
@@ -15,8 +15,8 @@ from ..upstream import forward_directory_headers
 router = APIRouter(prefix="/slimapi", tags=["sessions"])
 
 
-async def load_projects(request: Request) -> list[dict]:
-    client = request.app.state.upstream
+async def load_products(app: FastAPI) -> list[dict]:
+    client = app.state.upstream
     response = await client.get("/project")
     response.raise_for_status()
     projects = response.json()
@@ -49,15 +49,30 @@ async def load_projects(request: Request) -> list[dict]:
         for path in ([project.get("worktree")] + [item["path"] for item in project["directories"]])
         if isinstance(path, str) and path.startswith("/")
     }
-    request.app.state.directory_allowlist = allowlist
+    app.state.directory_allowlist = allowlist
     return output
 
 
+async def warm_allowlist(app: FastAPI) -> None:
+    """Best-effort allowlist warm-up at startup. Swallows upstream errors so a
+    not-yet-ready opencode does not block sidecar boot; lazy refresh via
+    require_directory remains the fallback."""
+    try:
+        await load_products(app)
+    except Exception:
+        pass
+
+
+def normalize_directory(directory: str) -> str:
+    """Strip trailing slash (keep root '/'). Pure; no allowlist check."""
+    return directory.rstrip("/") or "/"
+
+
 async def require_directory(request: Request, directory: str) -> str:
-    normalized = directory.rstrip("/") or "/"
+    normalized = normalize_directory(directory)
     if normalized not in request.app.state.directory_allowlist:
         try:
-            await load_projects(request)
+            await load_products(request.app)
         except Exception as exc:
             raise CodedHTTPException(
                 503, code="upstream_unavailable",
@@ -104,7 +119,7 @@ async def sessions(
 @router.get("/projects")
 async def projects(request: Request):
     try:
-        payload = await load_projects(request)
+        payload = await load_products(request.app)
     except httpx.HTTPStatusError as exc:
         _raise_upstream_status(exc)
     except Exception as exc:
@@ -157,9 +172,10 @@ async def session_status(request: Request, sid: str):
         raise CodedHTTPException(503, code="upstream_unavailable")
     if not isinstance(directory, str):
         raise CodedHTTPException(503, code="upstream_unavailable")
-    # require_directory raises CodedHTTPException (400 directory_not_allowed /
-    # 503 upstream_unavailable) — must propagate, NOT be swallowed.
-    directory = await require_directory(request, directory)
+    # F2: per-session status is a read keyed by sid (capability). allowlist is
+    # not a security boundary (stunnel mTLS is); normalize without gating,
+    # aligning with /messages/{sid} (G7-soft). Batch /sessions/status still gates.
+    directory = normalize_directory(directory)
 
     # Status map: GET /session/status?directory=...
     try:

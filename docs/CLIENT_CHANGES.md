@@ -43,7 +43,7 @@
   - **404 `session_not_found`** → 该 session 已被删除 / 不存在；UI 移除该会话行，**勿**当成可重试的网络错误。
   - **503 `upstream_unavailable`** → upstream 不可达 / 5xx / 坏 JSON；走 circuit breaker + 重试。
   - **502 `upstream_http_N`** → upstream 返非 404 的 4xx；按业务语义处理。
-  - **400 `directory_not_allowed`** → directory 不在 allowlist；客户端不应重试同一 directory。
+  - **400 `directory_not_allowed`** → **F2 起 per-session status 不再因 allowlist miss 返 400**（`normalize_directory` 仅规范化）；批量 `GET /slimapi/sessions/status` 仍可能 400。其它端点（q/p 显式 directory、messages query directory 等）仍可能 400。
 
 ### `/slimapi/projects` 5xx 502→503 状态码变更
 
@@ -53,15 +53,45 @@
 
 ## SSE
 
-- Phase 0 先支持 `/event` 裸帧归一化及 400/404/405/501 global 回退。
-- Phase 2 改连 `/slimapi/events?directory=...&sessionId=...`；需要实时文本时显式
-  `stream=1`。
-- reducer 支持 curated 类型：`status.changed`、`message.appended`、
-  `thin.session.dirty`、question/permission；SSE `event: resync` 触发
-  latest-id/catch-up。
-- sidecar 的 curated SSE 已是 `SSEEvent{directory,payload}`，不要再假设原始
-  opencode part.updated 一定存在完整 part。
-- 客户端所有 `/slimapi/**` 请求（含 SSE）须带 `X-Slimapi-Version: 1`；连接时读取
-  `/slimapi/health` 的 `server.api_version` 与 `server.accepted_client_versions` 自检。
-- OkHttp SSE 可直接设置版本头；浏览器 EventSource 若未来需要 query 兜底，可另行设计
-  `?version=`，本版本不支持该兜底。
+- 连接单一 `GET /slimapi/events`（**无 query 参数**——`directory`/`sessionId`/`stream` 在 v2 重写后已完全移除；全实例、全目录聚合，每事件自带 `directory`）。
+- curated 帧类型：
+  - `session.digest`（debounce 250ms/session）：`{sessionID,directory,status?,messageID?,updatedAt?,archived?,deleted?,lastError?}`。
+  - **`session.error`（G1，立即直推，无 sid 时）**：`{directory?,name,message,at}`。客户端 UI：有 sid 已含在 digest 的 `lastError`（该 session banner）；无 sid → 全局 toast。
+  - `question.asked`/`v2.asked`、`permission.asked`/`resolved`/`v2.asked`/`v2.resolved`（立即直推）。
+  - `server.connected`（订阅即吐）、`server.heartbeat`（10s）、`resync`（重连 `{"reason":"reconnect_no_replay"}`，**无 replay**）。
+- digest `lastError`：sticky 跨窗口，`status=busy` 清除（显式 `null` 帧）；客户端据此显隐 session 错误 banner。`MessageAbortedError` 被 sidecar 过滤，不下发。
+- 客户端所有 `/slimapi/**` 请求（含 SSE）须带 `X-Slimapi-Version: 1`；连接时读 `/slimapi/health` 自检。
+
+## 批量展开（G6，新）
+
+- `GET /slimapi/messages/{sid}/full?ids=m1,m2,...`（1–20 mid，逗号分隔，去重保序）：批量展开多条 message。
+- 响应 envelope：`{"items":[...], "errors":[{"messageID":..,"code":"message_not_found|message_too_large|upstream_http_N|upstream_error"}]}`；**mid 级部分失败仍 200 + errors[]**；全 mid 404 仍 200。
+- **`items[]` 顺序 = ids 去重保序**；**`errors[]` 顺序 = 完成序（不保证与 ids 一致）**。
+- **Top-level 错误（非 envelope）**：
+  - ids 缺失 → 422；空 / 超 20 / 解析失败 → 400 `invalid_ids`。
+  - discover 404 → 404 `session_not_found`（0 mid 拉取）。
+  - discover 其它 4xx → 502 `upstream_http_N`。
+  - discover 或任一 mid **网络失败**（`httpx.RequestError`）/ discover 5xx / discover 坏 JSON → **503 `upstream_unavailable`**（整请求）。
+  - 累计字节超限 → 413 `response_too_large`（整请求，非单 mid）。
+  - `mode=skeleton` 转换池饱和 → **503 `transform_busy`** + `Retry-After` 头。
+  - **503 优先于 413**（网络失败与累计超限同时成立时返 503）。
+- **Mid 级 envelope（整请求仍 200）**：
+  - mid 404 → `message_not_found`。
+  - mid ≥400（**含 5xx**）→ `upstream_http_N`（mid 5xx **不**升级整请求）。
+  - mid 超 `max_message_bytes` → `message_too_large`。
+  - mid 2xx 坏 JSON → `upstream_error`。
+- 推荐使用此端点替代「N 并行 `/full/{mid}`」（ocdroid 现走 404 fallback，升级后首调即 200）。
+
+## q/p 聚合 directory 可选（F1，新）+ 冷启动顺序
+
+- `GET /slimapi/questions` / `GET /slimapi/permissions`：query `directory` 由**必填改可选**。
+  - **不传**（null）：聚合 sidecar allowlist 全部目录（不受 1–32 上限；allowlist 空 → 200 空 `{items:[],errors:[]}`，不再 cold-start 422）。
+  - **显式 repeated `?directory=`**：去重保序，1–32；空/超 32 → 400 `invalid_directory_count`；单 dir ∉ allowlist → 400 `directory_not_allowed`。
+- **冷启动推荐顺序**（F3 暖机后仍建议遵循，避免竞态）：
+  1. `GET /slimapi/health`（版本自检 + `schema.degraded`）
+  2. `GET /slimapi/projects`（刷新 allowlist；F3 启动已 best-effort warm，本步仍是权威刷新）
+  3. `GET /slimapi/sessions`（骨架列表）
+  4. `GET /slimapi/questions` + `/permissions`（可 null directory）
+  5. 按需 `GET /slimapi/messages/{sid}` / `/since/{ts}` / `/full?ids=`
+  6. 再连 `GET /slimapi/events`
+- routeToken reply/reject：F3 起 `_token` 走 `require_directory`（miss 自动刷新）；冷启动首个合法 reply 不再因空 allowlist 误 400。

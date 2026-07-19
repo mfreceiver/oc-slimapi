@@ -53,6 +53,10 @@ B4  服务端 P1（可与 B1 并行）
     └─ G6  multi-mid full（envelope，MUST 定序，discover 先行）
 ```
 
+> **B0 决策结果（2026-07-19，GO）**：经 opencode v1.18.3 源码核验，`session.error` 实发于 `/global/event`（`schema/src/v1/session.ts:651-657` + `event-v2-bridge.ts:35-44` + `handlers/global.ts:36-52`），`sessionID` optional，abort name=`MessageAbortedError`（TUI `app.tsx:1021` 同名过滤）。G1 按 §7 实现。
+
+**[✅ 已实现 2026-07-19，GET /slimapi/messages/{sid}/full?ids=]**
+
 **依赖**：B0 是 go/no-go gate；B2 依赖 B0 决策；B1 三项 + shell 相互独立；B4 可与 B1 并行。
 
 ---
@@ -157,7 +161,7 @@ catch-all（`proxy.py`）**无路径黑名单**，不识别语义；shell/PTY �
 
 ---
 
-## 7. B2 — G1 error 可见性（依赖 B0 通过）
+## 7. B2 — G1 error 可见性（依赖 B0 通过） **[✅ 已实现 2026-07-19]**
 
 ### 硬约束
 
@@ -228,7 +232,7 @@ data: {"sessionID"?,"directory"?,"name","message","at"}
 
 ---
 
-## 8. B4 — G6 multi-mid full（新端点）
+## 8. B4 — G6 multi-mid full（新端点） **[✅ 已实现 2026-07-19]**
 
 ### 接口
 
@@ -298,6 +302,8 @@ for mid in order (concurrency ≤ 4, 共享累计字节计数):
 reassemble items strictly in order（仅 succeeded mid）
 return 200 {items, errors}
 ```
+
+**[✅ 已实现 2026-07-19，GET /slimapi/messages/{sid}/full?ids=]**
 
 ---
 

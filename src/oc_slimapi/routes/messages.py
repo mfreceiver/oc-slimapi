@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import Literal
 from urllib.parse import urlparse
@@ -12,6 +13,7 @@ from starlette.responses import Response, StreamingResponse
 
 from ..errors import CodedHTTPException
 from ..gzip_util import error_response, json_response
+from ..skeleton import skeleton_message
 from ..transform import (
     TransformBusy,
     project_and_pack,
@@ -23,13 +25,18 @@ from ..upstream import (
     forward_directory_headers,
     strip_hop_by_hop,
 )
-from .sessions import require_directory
+from .sessions import _raise_upstream_status, require_directory
 
 router = APIRouter(prefix="/slimapi/messages/{sid}", tags=["messages"])
 
 # Fixed Retry-After for transform admission timeouts. Kept as a module constant
 # so tests and the route agree on the wire contract.
 TRANSFORM_RETRY_AFTER_SECONDS = 2
+
+# G6 batch stream chunk size for the shared cumulative-byte ledger. Smaller than
+# transform.read_with_cap's default (64KiB) so concurrent mids debit the budget
+# at finer granularity (pay-as-you-read).
+BATCH_CHUNK_SIZE = 16 * 1024
 
 
 def _extract_before_verbatim(query: str) -> str | None:
@@ -431,6 +438,174 @@ async def messages(
         )
     except TransformBusy:
         return _busy_response(request.headers.get("accept-encoding"))
+
+
+@router.get("/full")
+async def message_batch(
+    request: Request,
+    sid: str,
+    ids: str,
+    mode: Literal["skeleton", "full"] = "full",
+    directory: str | None = None,
+):
+    """G6 batch multi-mid expand (impl-spec §8). discover-first; mid-level
+    partial failures into errors[]; cumulative byte budget 413 via a shared
+    chunk ledger (pay-as-you-read). Registered BEFORE /full/{mid} per spec
+    MUST (segment count differs so no actual collision, but order is
+    spec-mandated)."""
+    directory = await _resolve_messages_directory(request, directory)
+    if request.app.state.schema_degraded:
+        mode = "full"
+    # ids parse: split + strip + dedupe保序 + 1–20 guard (no charset check)
+    order = list(dict.fromkeys(s.strip() for s in ids.split(",") if s.strip()))
+    if not order or len(order) > 20:
+        raise CodedHTTPException(400, code="invalid_ids")
+
+    config = request.app.state.config
+    pool = request.app.state.transforms
+
+    # discover 先行（带 directory 头，spec §8 L266）
+    try:
+        resp = await request.app.state.upstream.get(
+            f"/session/{sid}", headers=forward_directory_headers(directory),
+        )
+    except httpx.RequestError:
+        raise CodedHTTPException(503, code="upstream_unavailable")
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        _raise_upstream_status(exc, sid=sid)  # 404→session_not_found (no mid fetch); 其它→502/503
+    # 200 + malformed body must not proceed to mid expand (→ 503).
+    try:
+        resp.json()
+    except (ValueError, UnicodeDecodeError):
+        raise CodedHTTPException(503, code="upstream_unavailable")
+
+    sem = asyncio.Semaphore(4)
+    # Shared ledger: total is debited per decoded chunk under a no-await
+    # critical section so concurrent mids cannot TOCTOU the cumulative cap.
+    # network_failed and budget_exceeded are distinct: 503 beats 413.
+    state = {
+        "total": 0,
+        "network_failed": False,
+        "budget_exceeded": False,
+    }
+    succeeded: dict[str, dict] = {}
+    errors: list[dict] = []
+
+    def _aborted() -> bool:
+        return state["network_failed"] or state["budget_exceeded"]
+
+    async def fetch_one(mid: str) -> None:
+        if _aborted():
+            return  # 阻止尚未排队的任务
+        await sem.acquire()
+        response = None
+        # body is set only on a complete successful stream read. Early
+        # exits (404 / 4xx / too-large / aborted / network) leave it None
+        # so the post-finally path never submits a partial into succeeded.
+        body: bytes | None = None
+        try:
+            if _aborted():  # 获取 sem 后必须二次检查
+                return
+            upstream_request = request.app.state.upstream.build_request(
+                "GET", f"/session/{sid}/message/{mid}",
+                headers=forward_directory_headers(directory),
+            )
+            try:
+                response = await request.app.state.upstream.send(
+                    upstream_request, stream=True,
+                )
+            except httpx.RequestError:
+                state["network_failed"] = True
+                return
+            if _aborted():  # send() 是 await 点
+                return
+            if response.status_code == 404:
+                errors.append({"messageID": mid, "code": "message_not_found"})
+                return
+            if response.status_code >= 400:
+                errors.append({
+                    "messageID": mid,
+                    "code": f"upstream_http_{response.status_code}",
+                })
+                return
+            buf = bytearray()
+            mid_total = 0
+            try:
+                async for chunk in response.aiter_bytes(BATCH_CHUNK_SIZE):
+                    # ↓↓↓ 从此处到 buf.extend 之间严禁 await（同步临界段）↓↓↓
+                    if _aborted():
+                        return
+                    next_batch_total = state["total"] + len(chunk)
+                    # 1) budget 优先（累计超限 → terminal；此 chunk 不计入）
+                    if next_batch_total > config.max_response_bytes:
+                        state["budget_exceeded"] = True
+                        return
+                    # 2) 先扣账（chunk 已读 → 计入累计预算，即使随后 per-mid 超限）
+                    state["total"] = next_batch_total
+                    # 3) 再查 per-mid（超限 → message_too_large envelope，字节已计入）
+                    next_mid_total = mid_total + len(chunk)
+                    if next_mid_total > config.max_message_bytes:
+                        errors.append({
+                            "messageID": mid, "code": "message_too_large",
+                        })
+                        return
+                    mid_total = next_mid_total
+                    buf.extend(chunk)
+                    # ↑↑↑ 临界段结束 ↑↑↑
+            except httpx.RequestError:
+                state["network_failed"] = True
+                return
+            body = bytes(buf)
+        finally:
+            if response is not None:
+                await response.aclose()
+            sem.release()
+        if body is None or _aborted():  # aclose/sem 释放都是调度边界
+            return
+        # Mid-level malformed JSON → envelope errors[] (whole request still 200).
+        try:
+            if mode == "skeleton":
+                parsed = await pool.offload(
+                    lambda b=body: skeleton_message(orjson.loads(b)),
+                )
+                if _aborted():  # offload 是 await 点
+                    return
+                succeeded[mid] = parsed
+            else:
+                succeeded[mid] = orjson.loads(body)
+        except (orjson.JSONDecodeError, ValueError):
+            errors.append({"messageID": mid, "code": "upstream_error"})
+            return
+
+    try:
+        if mode == "skeleton":
+            async with pool:
+                await asyncio.gather(*(fetch_one(mid) for mid in order))
+        else:
+            await asyncio.gather(*(fetch_one(mid) for mid in order))
+    except TransformBusy:
+        return _busy_response(request.headers.get("accept-encoding"))
+
+    # 503 优先于 413：网络失败与累计超限同时成立时返 503。
+    if state["network_failed"]:
+        return error_response(
+            "upstream_unavailable", 503,
+            accept_encoding=request.headers.get("accept-encoding"),
+        )
+    if state["budget_exceeded"]:
+        return error_response(
+            "response_too_large", 413, limit=config.max_response_bytes,
+            accept_encoding=request.headers.get("accept-encoding"),
+        )
+
+    items = [succeeded[mid] for mid in order if mid in succeeded]
+    return json_response(
+        {"items": items, "errors": errors},
+        headers={"Cache-Control": "no-store"},
+        accept_encoding=request.headers.get("accept-encoding"),
+    )
 
 
 @router.get("/full/{mid}")

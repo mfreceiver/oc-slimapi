@@ -42,11 +42,34 @@ ocdroid 对接时：
 
 > 开发中、尚未打 tag 的变更写在这里；`release.sh` 发版时把本节内容折叠进新版本标题下。
 
+---
+
+## [0.2.0] - 2026-07-20
+
+> 本批次（2026-07-20）所有变更加性，**不** bump `X-Slimapi-Version`（仍为 `1`）。ocdroid《slimapi 接口评审报告》原始发现 F1–F5 + §5 文档建议全部落地；本仓扩展 G1（错误可见性）/ G6（批量展开）/ D1–D8（文档同步）一并实现；另修 2 个 pre-existing SSE 生命周期 bug + G1 `error.name` 类型防御。逐条对照见 `docs/v1-contract.md` §14。
+
 ### Added
+
+- **F1 `/slimapi/questions` + `/permissions` null directory 聚合**：`directory` 由必填改可选；不传时聚合 allowlist 全部 dir。消除 cold-start 422。
+- **F3 allowlist 启动暖机**：`lifespan` 启动主动 `load_products`（best-effort）。
+- **G1 错误可见性**：`session.digest` 加 `lastError?` 字段（`{name,message,at}`，sticky，`status=busy` 清除，`deleted` 后不保留）；新 `event: session.error` session-less 帧（无 sid 时立即直推）；`MessageAbortedError` 静默过滤；message 脱敏（首行/剥路径/剥 stack/剥 secret/截断 512）。
+- **G6 批量展开**：`GET /slimapi/messages/{sid}/full?ids=`（1–20 mid，discover 先行，mid 级 envelope errors[]，累计 413）。
+  - **discover 错误分裂**（top-level，0 mid 拉取）：404→`session_not_found`；其它 4xx→502 `upstream_http_N`；5xx / 网络 / 坏 JSON→503 `upstream_unavailable`。
+  - **mid 级 envelope**（整请求仍 200）：`message_not_found`(mid 404) / `upstream_http_N`(mid ≥400 含 5xx，**不**升级整请求) / `message_too_large` / `upstream_error`(mid 2xx 坏 JSON)。
+  - **整请求终端**：`invalid_ids`(400) / 累计 413 `response_too_large` / mid 网络 503 `upstream_unavailable`（**优先于** 413）/ skeleton 池饱和 503 `transform_busy`+`Retry-After`。
+  - **定序**：`items[]` = ids 去重保序（保证）；`errors[]` = 并发完成序（**不**保证）。
 
 ### Changed
 
+- **F2 `/slimapi/sessions/{sid}/status` 放宽 allowlist**：sid 自洽即能力，`normalize_directory` 不 gate；与 messages soft 对齐。批量 status 不变。
+- **F3 routeToken 应答 allowlist 刷新**：`_token` 走 `require_directory`（miss 自动刷新）。
+
 ### Fixed
+
+- **F4 文档**：`CLIENT_CHANGES.md` SSE 节同步 INTERFACE_MAP §3。
+- **F5 文档**：契约 §1 `accepted:[1,1]` 闭区间说明。
+- **§5 文档**：契约新增 directory 三态语义表 + allowlist 机制节 + cold-start 暖机 + CLIENT_CHANGES 同步纪律。
+- **D1–D8 文档**：design-v2（§1.4 limit 422 / §1.7 q/p 可选 / §1.9 status / §1.10 删 session.error / §3 SSEClient + 删 thin.session.dirty）、impl-spec（B0 决策记录 GO / G1·G6 标已实现）、AGENTS.md（对齐版本 v1.18.3）、契约 §11 标 closed。
 
 ### Removed
 

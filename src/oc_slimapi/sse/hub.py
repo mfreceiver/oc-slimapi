@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 import contextlib
+import re
 import secrets
 import time
 from typing import Any
@@ -39,6 +40,37 @@ import orjson
 
 
 STOP = object()
+
+_UNSET = object()  # three-state sentinel for DigestFields.last_error
+ABORT_NAME = "MessageAbortedError"
+
+_UNIX_PATH_RE = re.compile(r"/(?:[A-Za-z0-9._\-]+/)*[A-Za-z0-9._\-]+")
+_WIN_PATH_RE = re.compile(r"[A-Za-z]:(?:[\\/][A-Za-z0-9._\-]+)+")
+_STACK_FRAME_RE = re.compile(r"\s*\bat\s+\S+?:\d+(?::\d+)?", re.IGNORECASE)
+# Plan regex left "Authorization: Bearer <tok>" as "<redacted> <tok>" because the
+# value class stops at the first space after "Bearer". Optional "Bearer " after
+# the separator makes the golden 'Authorization: Bearer abc.def' → '<redacted>'.
+_SECRET_RE = re.compile(
+    r"(?i)\b(access[_-]?token|refresh[_-]?token|client[_-]?secret|auth[_-]?token|api[_-]?key|token|key|bearer|password|passwd|secret|authorization)\b"
+    r"\s*[:=]\s*(?:bearer\s+)?[\"']?[A-Za-z0-9._\-/=+]+"
+)
+
+
+def _sanitize_error_message(message: str | None, fallback_name: str | None) -> str:
+    """G1 desensitization (impl-spec §7 硬约束 4): first line → strip abs paths
+    → strip stack frames → strip secrets → truncate ≤512. Missing message falls
+    back to the error name, else "(no detail)"."""
+    if not message or not isinstance(message, str):
+        return fallback_name or "(no detail)"
+    first_line = message.split("\n", 1)[0]
+    first_line = _WIN_PATH_RE.sub("<path>", first_line)   # Windows first (drive letter)
+    first_line = _UNIX_PATH_RE.sub("<path>", first_line)
+    first_line = _STACK_FRAME_RE.sub("", first_line)
+    first_line = _SECRET_RE.sub("<redacted>", first_line)
+    first_line = first_line.strip()
+    if len(first_line) > 512:
+        first_line = first_line[:512]
+    return first_line or fallback_name or "(no detail)"
 
 # T3 defaults used when a caller constructs GlobalHub / HubRegistry without
 # explicit knobs (tests, ad-hoc scripts). Production wiring overrides these
@@ -104,6 +136,7 @@ class DigestFields:
     updated_at: Any = None
     archived: int | None = None
     deleted: bool = False
+    last_error: Any = _UNSET  # three-state: _UNSET=omit, None=explicit clear, dict=object
 
     def to_payload(self, session_id: str) -> dict[str, Any]:
         payload: dict[str, Any] = {"sessionID": session_id}
@@ -119,6 +152,8 @@ class DigestFields:
             payload["archived"] = self.archived
         if self.deleted:
             payload["deleted"] = True
+        if self.last_error is not _UNSET:
+            payload["lastError"] = self.last_error
         return payload
 
 
@@ -201,6 +236,19 @@ class Subscriber:
             self.queue.put_nowait(resync)
             self.queue.put_nowait(STOP)
 
+    def ack(self, frame: Any) -> None:
+        """Decrement ``queued_bytes`` for a frame consumed from the queue.
+
+        Size accounting is the exact mirror of :meth:`put` (``len(frame)`` for
+        non-STOP frames). STOP is a control sentinel that ``put`` never adds
+        to the byte ledger, so callers must not ``ack`` STOP either. Floor at
+        0 so a mis-paired ack cannot under-flow the counter.
+        """
+        if frame is STOP:
+            return
+        size = len(frame)
+        self.queued_bytes = max(0, self.queued_bytes - size)
+
     def _clear_queue(self) -> None:
         while True:
             try:
@@ -232,6 +280,8 @@ class GlobalHub:
         self.stop_task: asyncio.Task | None = None
         self.ever_connected = False
         self.pending: dict[str, DigestFields] = {}
+        # G1 sticky lastError: sid -> lastError dict (cleared = popped).
+        self.sticky_last_error: dict[str, dict] = {}
         # T3 observability counters (contract §6 / §2 metrics endpoint).
         self.upstream_events_total = 0
         self.emitted_frames_total = 0
@@ -277,6 +327,9 @@ class GlobalHub:
             return
         snapshot, self.pending = self.pending, {}
         for session_id, fields in snapshot.items():
+            # Merge sticky lastError only when entry did not set/clear it this window.
+            if fields.last_error is _UNSET and session_id in self.sticky_last_error:
+                fields.last_error = self.sticky_last_error[session_id]
             frame = sse_frame(fields.to_payload(session_id), event="session.digest")
             for subscriber in tuple(self.subscribers):
                 subscriber.put(frame)
@@ -328,8 +381,16 @@ class GlobalHub:
                 status = props.get("status")
                 if isinstance(status, str):
                     entry.status = status
+                # G1: busy clears sticky lastError with explicit null digest.
+                if props.get("status") == "busy" and session_id in self.sticky_last_error:
+                    self.sticky_last_error.pop(session_id, None)
+                    entry.last_error = None  # explicit null → clear frame
+                    self.flush()
             elif event_type == "session.deleted":
                 entry.deleted = True
+                # G1: deleted pops sticky; digest omits lastError.
+                self.sticky_last_error.pop(session_id, None)
+                entry.last_error = _UNSET
             elif event_type == "session.updated":
                 # Contract §3: archived ← session.updated's info.time.archived
                 # (epoch-ms int). Pass-through — same handling as
@@ -360,6 +421,57 @@ class GlobalHub:
             if isinstance(message_id, str):
                 entry.message_id = message_id
             entry.updated_at = updated_at
+            return
+
+        # G1: session.error — immediate digest (with sid) or session.error frame (session-less).
+        # Sid MUST be props.get("sessionID") only — do NOT use _extract_session_id
+        # (it falls back to payload.id = GlobalBus event id).
+        if event_type == "session.error":
+            err = props.get("error") if isinstance(props, dict) else None
+            err = err if isinstance(err, dict) else {}
+            name = err.get("name")
+            # Coerce non-str name → None so ``(name or "")[:128]`` and
+            # ``_sanitize_error_message(..., name)`` never TypeError on a
+            # truthy dict/int (which would escape publish → resync whole hub).
+            name = name if isinstance(name, str) else None
+            if name == ABORT_NAME:
+                return  # abort silently dropped
+            raw_msg = (
+                (err.get("data") or {}).get("message")
+                if isinstance(err.get("data"), dict)
+                else None
+            )
+            message = _sanitize_error_message(raw_msg, name)
+            at = _now_ms()
+            sid = props.get("sessionID") if isinstance(props, dict) else None
+            if isinstance(sid, str) and sid:
+                entry = self.pending.setdefault(sid, DigestFields())
+                if entry.deleted:
+                    return
+                last_error_obj = {
+                    "name": (name or "")[:128],
+                    "message": message,
+                    "at": at,
+                }
+                entry.last_error = last_error_obj
+                self.sticky_last_error[sid] = last_error_obj
+                if isinstance(directory, str):
+                    entry.directory = directory
+                self.flush()  # G1-A immediate
+            else:
+                # G1-B session-less: immediate direct push (no debounce)
+                frame_payload: dict[str, Any] = {
+                    "name": (name or "")[:128],
+                    "message": message,
+                    "at": at,
+                }
+                if directory:
+                    frame_payload["directory"] = directory
+                frame = sse_frame(frame_payload, event="session.error")
+                for subscriber in tuple(self.subscribers):
+                    subscriber.put(frame)
+                if self.subscribers:
+                    self.emitted_frames_total += len(self.subscribers)
             return
 
         # Drop text deltas, tool.*, message.part.*, and anything else.

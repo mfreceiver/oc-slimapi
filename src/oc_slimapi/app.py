@@ -68,6 +68,9 @@ async def lifespan(app: FastAPI):
     # importing transform.py (would be a circular import via skeleton.py).
     app.state.hubs.set_transforms(app.state.transforms)
     await smoke(app)
+    # F3: best-effort allowlist warm-up so the first routeToken-bearing reply
+    # does not hit a cold allowlist. Failure is non-fatal (lazy refresh fallback).
+    await sessions.warm_allowlist(app)
     try:
         yield
     finally:

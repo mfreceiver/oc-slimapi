@@ -42,7 +42,7 @@
 增量走 §1.5 的时间戳锚点接口 `/slimapi/messages/{sid}/since/{ts}`；冷启动/resync 直接走 §1.4 + §1.5 + SSE digest 接力。**不提供**单独的"最后消息 ID 探针"端点。
 
 ### 1.4 `GET /slimapi/messages/{sid}`（历史分页，核心省流）
-- **参数**：`sid`；`limit`(int **1–200** 默认40，**0→400**)；`before`(str?, opaque, 原样透传)；`mode`(enum `skeleton`|`full` 默认 skeleton；`lite` 延后)；`directory`(透传)。
+- **参数**：`sid`；`limit`(int **1–200** 默认40，**0→422** FastAPI ge=1)；`before`(str?, opaque, 原样透传)；`mode`(enum `skeleton`|`full` 默认 skeleton；`lite` 延后)；`directory`(透传)。
 - **upstream**：`GET /session/{sid}/message?limit=&before=` + `X-Opencode-Directory`。
 - **响应**：`List<MessageWithParts>` **裸数组**（不套 envelope）；skeleton 模式 sidecar **解析上游 `Link: <...?before=CURSOR>; rel="next"` 头** → 下发 `X-Next-Cursor`（opaque base64url 字符串，不 decode/re-encode），**不再把 upstream `Link` 头原样复制给客户端**；full 模式流式透传（含 upstream `Link` 原样）；`Cache-Control:no-store`。
 - **裁剪**：顺序/id/数量不变；按 §2 规则；`info` 保留 `tokens/cost`（上下文用量）。
@@ -65,7 +65,7 @@
 - **路径段 `full`**：仅作"展开全文"语义占位，并非 `mode=full` 的默认——`mode` 仍由 query 控制，默认 `full`。
 
 ### 1.7 `GET /slimapi/questions` / `GET /slimapi/permissions`（聚合）
-- **参数**：`directory`(repeated，`?directory=/a&directory=/b`，每项∈allowlist，去重 ≤32)。**禁逗号拼接**。
+- **参数**：`directory`(repeated，**可选**；显式传时 `?directory=/a&directory=/b` 每项∈allowlist 去重 ≤32；null=聚合 allowlist 全部 dir)。**禁逗号拼接**。
 - **upstream**：每 directory 并发 `GET /question`/`GET /permission` + `X-Opencode-Directory` + `?directory=`（2s 超时）。
 - **响应**（聚合 envelope，允许——仅消息列表不套）：
   ```json
@@ -84,7 +84,7 @@
 
 ### 1.9 `GET /slimapi/sessions/status`
 - **批量**：`?directory=`(必填,∈allowlist) → upstream `GET /session/status?directory=` → 原 map。
-- **单 sid**：`GET /slimapi/sessions/{sid}/status` → sidecar 按 session 缓存或 fan-out 找到正确 directory 的 map；**map 缺 sid→idle 仅当该 directory 查询成功**；fan-out 失败→503（禁误报 idle）。
+- **单 sid**：`GET /slimapi/sessions/{sid}/status` → discover `/session/{sid}`（B1 三态：404→`session_not_found` / 其它 4xx→502 / 5xx→503）；**F2：放宽 allowlist，sid 自洽即能力，normalize 不 gate**。
 - **须实测**：未落盘 active 会话是否在 status map。
 
 ### 1.10 `GET /slimapi/events`（策展 SSE：单全局连接 + digest 合并）
@@ -96,19 +96,25 @@
   1. **`event: session.digest`**——debounce 250ms/session，每 session 一帧；窗口内有变化的 session 才发，字段按变化出现：
      ```
      event: session.digest
-      data: {"sessionID":"...","directory":"/path","status?":"busy","messageID?":"msg_..","updatedAt?":<epoch_ms>,"archived?":<epoch_ms>,"deleted?":true}
+      data: {"sessionID":"...","directory":"/path","status?":"busy","messageID?":"msg_..","updatedAt?":<epoch_ms>,"archived?":<epoch_ms>,"deleted?":true,"lastError?":{"name":"...","message":"...","at":<epoch_ms>}|null}
      ```
      - `status` ← `session.status`(idle/busy) 的 properties.status
      - `messageID` ← `message.updated`/`message.appended` 的 `info.id`（取最新）；`updatedAt` ← `info.time.updated`/`created`/事件到达时间 epoch_ms
      - `deleted=true` ← `session.deleted`（一旦为 true 持续到窗口结束）
      - `archived` ← `session.updated` 的 `info.time.archived`（epoch_ms int，一旦有值粘滞保留到窗口结束）
      - `directory` ← GlobalEvent 的 directory
+     - **`lastError`（G1-A）**←有 sid 的 `session.error` 经脱敏后的 `{name,message,at}`（`at`=sidecar 收到 epoch-ms）。**三态 wire**（与 sticky 共存，互不矛盾；权威见 `docs/v1-contract.md` §3）：
+       - **对象** `{name,message,at}`：本窗口新 error，或 flush 时该 sid 仍有 sticky（其它字段触发的后续 digest 会继续带出对象，直至 clear/deleted）；error 到达时**立即 flush**（不等 250ms）
+       - **显式 `null`**：clear 帧——该 session 出现新 `status=busy` 时 pop sticky 并立即 flush
+       - **省略**：本 digest 没有本窗口新 error 对象、也没有显式 clear（`null`），**且** 该 sid 当前不存在 sticky error；`deleted=true` 的 digest **强制省略**（pop sticky，**不**发 null）
+       - abort（`error.name=="MessageAbortedError"`）静默丢弃（不写 lastError、不发 G1-B 帧）
      - `session.updated` 创建 pending 项；若 `info.time.archived` 有值则设 `archived`（见上）；无其它字段变化时 emit `{sessionID,directory}` 让客户端 refetch `/sessions`
-     - 同 session 多次变化 → 合并取最新；窗口 flush 后清 pending。
-  2. **`question.*` / `permission.*`**——**立即推**（不进 debounce）：`question.asked`/`question.v2.asked`/`permission.asked`/`permission.resolved`/`permission.v2.asked`/`permission.v2.resolved`，原样 `{"directory":..,"type":..,"properties":..}`。
-  3. `event: server.connected`（订阅即吐首帧）+ `event: server.heartbeat`（10s）+ `event: resync` `{"reason":"reconnect_no_replay"}`（上游重连或客户端带 `Last-Event-ID` 时）。
-- **全部丢弃**：`message.part.delta`/`.updated`/`.removed`（逐 token）、`tool.*`、`session.error`、`message.removed`、未知类型——省流核心。
-- **背压**：每订阅 `asyncio.Queue(maxsize=256)`，满则丢最旧 + 推 `STOP` 断慢消费者令其重连 catch-up。
+     - 同 session 多次变化 → 合并取最新；窗口 flush 后清 pending（lastError sticky 经独立持久层跨窗口保留，见 `docs/v1-impl-spec.md` §7）。
+  2. **`event: session.error`（G1-B）**——**无** `sessionID` 时**立即直推**（不进 debounce）：`data: {"directory"?,"name","message","at"}`。有 sid 的 `session.error` **不**走本帧，走 digest `lastError`（G1-A）。abort（`MessageAbortedError`）静默丢弃。实现细节见 `docs/v1-impl-spec.md` §7；wire 权威见 `docs/v1-contract.md` §3。
+  3. **`question.*` / `permission.*`**——**立即推**（不进 debounce）：`question.asked`/`question.v2.asked`/`permission.asked`/`permission.resolved`/`permission.v2.asked`/`permission.v2.resolved`，原样 `{"directory":..,"type":..,"properties":..}`。
+  4. `event: server.connected`（订阅即吐首帧）+ `event: server.heartbeat`（10s）+ `event: resync` `{"reason":"reconnect_no_replay"}`（上游重连或客户端带 `Last-Event-ID` 时）。
+- **全部丢弃**：`message.part.delta`/`.updated`/`.removed`（逐 token）、`tool.*`、`message.removed`、未知类型——省流核心。上游 `session.error` **不**在此列：经 G1 处理（有 sid→digest `lastError`；无 sid→`event: session.error`；abort 过滤），见上吐出帧 + `docs/v1-contract.md` §3 / `docs/v1-impl-spec.md` §7。
+- **背压**：每订阅 `asyncio.Queue`（item 上限 + 字节预算）；溢出时 **立即断开慢消费者**：标记 `closed` → **清空全部旧 queue 帧** → 入队 `event: resync` `{"reason":"subscriber_backpressure"}` → 入队 `STOP`（**不**交付此前积压帧，**不**「丢最旧续发」）。
 - **不承诺 replay**：无 event store；重连接收 `resync` 后走冷启动流程（sessions + questions + permissions + `/since/{ts}`）或前台 catch-up。
 - **生命周期**：首 subscriber 到达→启动 upstream 任务；末 subscriber 离开后 30s grace 再取消任务；`HubRegistry.close()` 取消所有任务。
 - **HubRegistry 接口**：`HubRegistry(client)` + `await close()`；内部维护单一 `_global: GlobalHub`。`get(directory)` 保留兼容签名但忽略 directory；新增 `get_global()`。
@@ -125,6 +131,12 @@
 - **超时**：command ≥300s（客户端 commandApi 读超时）；SSE 无限 read + 禁缓冲 + `aiter_raw()` 保 `Content-Encoding`。
 - **WebSocket**→501（不处理；PTY 需另上 nginx/Caddy）。
 - **SSRF 防护**：upstream 固定 loopback，禁参数控制；禁 body 日志。
+
+### 1.13 `GET /slimapi/messages/{sid}/full?ids=`（批量展开，G6）
+- **参数**：`sid`；`ids`(query, 必填, 逗号分隔 messageId 1–20, 去重保序)；`mode`(skeleton|full 默认 full)；`directory`(soft)。
+- **discover 先行**：`GET /session/{sid}`（带 directory 头）；404→404 `session_not_found`（不拉 mid）；其它 4xx→502；5xx→503。
+- **并发 ≤4** 拉 N mid；mid 404→`errors[]` `message_not_found`；mid >`max_message_bytes`→`errors[]` `message_too_large`；累计 >`max_response_bytes`→413 `response_too_large` 中止；全 mid 404 仍 200+全 errors。
+- **items[]** 严格按 `ids` 去重后序；`Cache-Control:no-store`。
 
 ---
 
@@ -157,9 +169,9 @@
 1. **`Part` 扩字段**：`hasFull:Boolean?=null`、`omitted:List<String>?=null`（`ignoreUnknownKeys=true` 当前会丢弃这些标记 → 无展开 affordance）。
 2. **`QuestionRequest`/permission 加 `directory:String?=null`**；questions/permissions 返回类型改 `{items,errors}` + 每 item 带 `directory/routeToken`。
 3. **展开 hook**：`hasFull && omitted` 的 part，首次展开→`GET /slimapi/messages/{sid}/full/{mid}`（默认 mode=full）→按 `messageId+partId` 替换；loading/失败内联状态。
-4. **`SSEClient.kt`**：URL `/global/event`→`/event`；**裸帧归一化**（`/event` 返回 `{id,type,properties}`，`/global/event` 是 `{directory,project,payload:{..}}`——当前 `SSEEvent` 强依赖 `payload`，需双格式兼容）；`/event` 返 404/400/405/501→回退 `/global/event`（5xx/网络错不回退）。
+4. **`SSEClient.kt`**：连接单一 `/slimapi/events`（**无 query 参数**，v2 全实例聚合）；curated 帧解析（`session.digest` / `session.error` / `question.*` / `permission.*` / `heartbeat` / `resync`）。
 5. **GET 侧 circuit breaker**：连续 3 次 sidecar transport/5xx→禁用 thin 5min→half-open 探测；**mutation 不双发**（POST 可能已被 upstream 接收）。
-6. **增量 reducer**：处理 `thin.session.dirty`（debounced 时间戳锚点拉取 `/since/{ts}`）、`event:resync`（前台 catch-up）。
+6. **增量 reducer**：处理 `session.digest`（debounced 时间戳锚点拉取 `/since/{ts}`）、`event:resync`（前台 catch-up）、`event:session.error`（G1，UI banner/toast）。
 
 ---
 
