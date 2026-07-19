@@ -70,6 +70,7 @@ ocdroid 对接时：
 - **F5 文档**：契约 §1 `accepted:[1,1]` 闭区间说明。
 - **§5 文档**：契约新增 directory 三态语义表 + allowlist 机制节 + cold-start 暖机 + CLIENT_CHANGES 同步纪律。
 - **D1–D8 文档**：design-v2（§1.4 limit 422 / §1.7 q/p 可选 / §1.9 status / §1.10 删 session.error / §3 SSEClient + 删 thin.session.dirty）、impl-spec（B0 决策记录 GO / G1·G6 标已实现）、AGENTS.md（对齐版本 v1.18.3）、契约 §11 标 closed。
+- **版本报告**：`/slimapi/health` 的 `sidecar.version` 与 OpenAPI `version` 改从 `importlib.metadata` 读取（单一真源 = `pyproject.toml`），随 `release.sh` 自动更新；此前 `__version__` 与 `app.py` 各自硬编码 `0.1.0`，发版后 health 不刷新。
 
 ### Removed
 
