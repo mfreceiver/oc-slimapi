@@ -179,9 +179,11 @@ async def test_questions_null_directory_aggregates_allowlist(upstream_factory):
     assert body["items"][0]["directory"] == "/app"
     assert "routeToken" in body["items"][0]
     assert body["errors"] == []
+    assert body["scope"] == {"directories": 1}
 
 
 async def test_questions_null_directory_empty_allowlist_returns_empty_envelope(upstream_factory):
+    """Cold-start: empty allowlist → scope.directories == 0 (scope not ready)."""
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
 
@@ -191,4 +193,94 @@ async def test_questions_null_directory_empty_allowlist_returns_empty_envelope(u
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get("/slimapi/questions", headers=VERSION_HEADERS)
     assert response.status_code == 200
-    assert response.json() == {"items": [], "errors": []}
+    assert response.json() == {"items": [], "errors": [], "scope": {"directories": 0}}
+
+
+async def test_questions_null_directory_populated_allowlist_empty_items_scope(upstream_factory):
+    """Scope ready, authoritative empty: populated allowlist + upstream [] → directories == N."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream, allowlist={"/app", "/foo"})
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/slimapi/questions", headers=VERSION_HEADERS)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["items"] == []
+    assert body["errors"] == []
+    assert body["scope"] == {"directories": 2}
+
+
+async def test_questions_explicit_directory_scope_count(upstream_factory):
+    """Explicit directory list → scope.directories == unique dir count after dedupe."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream, allowlist={"/app", "/foo"})
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/slimapi/questions?directory=/app&directory=/app",
+            headers=VERSION_HEADERS,
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["items"] == []
+    assert body["errors"] == []
+    assert body["scope"] == {"directories": 1}
+
+
+async def test_questions_explicit_directory_normalizes_before_dedupe(upstream_factory):
+    """rev-13: `/app` and `/app/` are the same directory after trailing-slash
+    normalization. Dedupe must run on normalized form, not raw strings —
+    otherwise the sidecar fans out duplicate upstream calls and reports
+    scope.directories == 2 instead of 1."""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/question":
+            calls["n"] += 1
+            return httpx.Response(
+                200, content=orjson.dumps([{"id": "q1", "sessionID": "ses_1"}]),
+                headers={"Content-Type": "application/json"},
+            )
+        return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream, allowlist={"/app"})
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/slimapi/questions?directory=/app&directory=/app/",
+            headers=VERSION_HEADERS,
+        )
+    assert response.status_code == 200
+    body = response.json()
+    # Normalized-then-deduped → exactly one directory in scope.
+    assert body["scope"] == {"directories": 1}
+    # Upstream fanned out exactly once (no duplicate `/question?directory=/app`).
+    assert calls["n"] == 1
+    # No duplicate items.
+    assert len(body["items"]) == 1
+    assert body["items"][0]["directory"] == "/app"
+    assert body["errors"] == []
+
+
+async def test_permissions_envelope_includes_scope(upstream_factory):
+    """ /permissions shares _aggregate — same scope signal on 200 envelope."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream, allowlist={"/app"})
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/slimapi/permissions", headers=VERSION_HEADERS)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["items"] == []
+    assert body["errors"] == []
+    assert body["scope"] == {"directories": 1}

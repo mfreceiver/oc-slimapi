@@ -204,20 +204,28 @@ async def _drain_error(response) -> Response:
 
 
 def _item_updated(item: dict) -> int | None:
-    """Extract ``info.time.updated`` as an int, or None when absent/non-int."""
+    """Extract message watermark as ``info.time.updated or info.time.created``.
+
+    Mirrors digest ``updatedAt`` derivation (hub.py) without the ``_now_ms()``
+    fallback — filtering must compare against the message's real timestamps.
+    opencode v1.18.3 message schema has no ``time.updated`` (only ``created``,
+    plus ``completed`` on assistant); without the ``created`` fallback the
+    A2=A ``/since/{ts}`` filter is a no-op.
+    """
     info = item.get("info") or {}
     time_obj = info.get("time") or {}
-    updated = time_obj.get("updated")
-    return updated if isinstance(updated, int) and not isinstance(updated, bool) else None
+    raw = time_obj.get("updated") or time_obj.get("created")
+    return raw if isinstance(raw, int) and not isinstance(raw, bool) else None
 
 
 def _passes_ts_filter(item: dict, ts: int) -> bool:
-    """A2=A filter (contract §5): include items with ``info.time.updated >= ts``.
+    """A2=A filter (contract §5): include items with watermark ``>= ts``.
 
-    Items whose ``info.time.updated`` is missing or not a plain int are included
+    Watermark is ``info.time.updated or info.time.created`` (see
+    ``_item_updated``). Items with neither (or a non-int) are included
     defensively — the client dedups by messageID anyway, and we'd rather
     over-deliver a malformed edge item than silently hide it. Only a
-    definitively comparable ``updated < ts`` excludes an item.
+    definitively comparable ``watermark < ts`` excludes an item.
     """
     updated = _item_updated(item)
     if updated is None:
@@ -235,7 +243,7 @@ async def messages_since(
     mode: Literal["skeleton", "full"] = "skeleton",
     directory: str | None = None,
 ):
-    """A2=A (contract §5): return skeleton messages with ``time.updated >= ts``.
+    """A2=A (contract §5): return skeleton messages with ``(info.time.updated or info.time.created) >= ts``.
 
     Walks opencode's newest-first ``/session/{sid}/message`` listing backward
     via the ``before`` cursor (opencode's own opaque base64url cursor,

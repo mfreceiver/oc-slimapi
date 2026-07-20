@@ -4,7 +4,7 @@
 
 - `Part` 墠加 `hasFull: Boolean? = null`、`omitted: List<String>? = null`。
 - `QuestionRequest`、permission item 增加 `directory`、`routeToken`。
-- 聚合返回模型改为 `{items,errors}`；errors 非空不能显示成权威空状态。
+- 聚合返回模型改为 `{items,errors,scope:{directories:N}}`（v0.2.1：`scope.directories`=有效 scope dir 数，区分 scope 未就绪/权威空）；errors 非空不能显示成权威空状态。
 
 ## 消息加载与展开
 
@@ -13,8 +13,10 @@
 - `hasFull=true` 的 part 首次展开时请求 `/slimapi/messages/{sid}/full/{mid}?mode=full`，
   按 `messageId+partId` 替换，禁止追加重复 part。
 - foreground catch-up 使用 `/slimapi/messages/{sid}/since/{lastSeenUpdatedAt}`
-  （`time.updated >= ts`，含边界）；客户端按 messageID 本地去重边界；翻页用
+  （`(info.time.updated or info.time.created) >= ts`，含边界；v1.18.3 无 message 级 `time.updated`，服务端实读 `created`，与 digest `updatedAt` 同源）；客户端按 messageID 本地去重边界；翻页用
   `X-Next-Cursor`（透传 opencode `Link` 头 opaque cursor）。无 409 resync。
+- **per-session watermark 升级为 `(updatedAt, messageID)` 二元组字典序**（v0.2.1，ocdroid 缺口 1）：先 strict 比 `updatedAt`（严格 > 才推进时间维），相等时 strict 比 `messageID`（`msg_+ascending()` 单调，新消息 id 字典序更大 → 严格 > 才推进 id 维）。对齐上游 `(time_created DESC, id DESC)` 全序，解 strict-advance 在等时间戳不同 id 时的残留 bug。
+- **无 watermark 的初始拉取推荐 cursor drain**（`?before` 游标分页，与 focus digest / resync 共享 reconciler）；`/since/0` 虽合法但非推荐路径（ocdroid 缺口 3 裁定）。
 
 ## 路由与失败策略
 
@@ -35,6 +37,7 @@
 - **`code` 即机器可读判别字段**；客户端错误处理 / circuit breaker 触发 / 用户文案分发应基于 `code`（而非解析 `detail` 字符串）。
 - **messages / events / versioning** 既已使用 `{"code":…}`，本次仅是 sessions / questions / projects 对齐；ocdroid 侧已有解析器无需重写，但需扩展识别以下新增 / 显式化的 code：`session_not_found`(404)、`upstream_http_N`(502)、`upstream_unavailable`(503)、`invalid_directory_count`(400)、`invalid_route_token`(400)、`shell_not_allowed`(403)。
 - **catch-all（非 `/slimapi/**`）错误体不变**：透传 upstream 原始 body；FastAPI 顶层异常可能仍为 500（无 `code`）。统一错误码表**仅适用于 thin 路由**。
+- **v0.2.1 修复**（ocdroid 缺口 2）：`GET /slimapi/sessions`（列表）失败路径此前**静默偏离**上述 coded 形状（upstream 4xx/5xx 原样透传 body、网络错落 FastAPI 默认 `{"detail":...}` 500）；现已对齐——4xx→502 `upstream_http_N`、5xx/网络→503 `upstream_unavailable`，body 为 `{"code":...}`。客户端若已按 `code` 解析（如 status/projects），sessions 列表现同样处理；若此前按"非 200 = 失败"粗判，行为不变。
 
 ### status 404 `session_not_found` 新分支
 
@@ -85,7 +88,12 @@
 ## q/p 聚合 directory 可选（F1，新）+ 冷启动顺序
 
 - `GET /slimapi/questions` / `GET /slimapi/permissions`：query `directory` 由**必填改可选**。
-  - **不传**（null）：聚合 sidecar allowlist 全部目录（不受 1–32 上限；allowlist 空 → 200 空 `{items:[],errors:[]}`，不再 cold-start 422）。
+  - **不传**（null）：聚合 sidecar allowlist 全部目录（不受 1–32 上限；allowlist 空 → 200 空 `{items:[],errors:[],scope:{directories:0}}`，不再 cold-start 422）。
+- **envelope `scope` 字段**（v0.2.1，ocdroid 缺口 2）：`/questions` + `/permissions` 的 200 响应含 `scope: {directories: N}`（N = 有效 scope dir 数：null 路径=allowlist 大小，显式路径=去重后 dir 数）。
+  - `scope.directories == 0` → **scope 未就绪**（allowlist 空，sidecar 启动早于 opencode）：冷启动**不**清本地 stale，等 scope 就绪后重拉。
+  - `scope.directories > 0 && items == []` → **scope 就绪、权威空**：可清本地 stale。
+  - `scope.directories > 0 && items != []` → 正常 pending 列表。
+  - 503 全失败响应**不含** `scope`（失败时语义无意义）。
   - **显式 repeated `?directory=`**：去重保序，1–32；空/超 32 → 400 `invalid_directory_count`；单 dir ∉ allowlist → 400 `directory_not_allowed`。
 - **冷启动推荐顺序**（F3 暖机后仍建议遵循，避免竞态）：
   1. `GET /slimapi/health`（版本自检 + `schema.degraded`）

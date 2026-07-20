@@ -4,6 +4,7 @@
 >
 > | 修订日期 | wire 版本 | 文档 rev | 变更摘要 | 落地对照 |
 > |---|---|---|---|---|
+> | **2026-07-20** | **1（additive，未 bump）** | **C** | ocdroid 契约遗留缺口 ratify（3 缺口 + 2 个 pre-existing 真 bug）：**Gap1** `/since/{ts}` 时间过滤 no-op 修复（`info.time.updated` 在 v1.18.3 不存在 → 改读 `updated or created`，与 digest `updatedAt` 对齐）+ 等时间戳 tie-break 规则 `(updatedAt, messageID)` 二元组字典序；**Gap2** `/slimapi/sessions` 列表 §7 偏离修复（原样透传 → `_raise_upstream_status`）+ q/p envelope 加 `scope.directories` 区分「scope 未就绪 / 权威空」；**Gap3** `/since/0` cursor drain 推荐。197 tests green。详见 §14.6。 | §5 / §2 / §7 / §12 / §14.6 |
 > | **2026-07-20** | **1（additive，未 bump）** | **B** | ocdroid《slimapi 接口评审报告》§3–§6 原始发现 **F1–F5 + §5 文档重构** 全部落地；本仓审计扩展 **G1（错误可见性）/ G6（批量展开）/ D1–D8（文档同步）** 一并实现；另修 2 个 pre-existing SSE 生命周期 bug（teardown 计数泄漏 / queued_bytes 不扣账）+ G1 `error.name` 类型防御。全加性，`X-Slimapi-Version` 仍为 `1`。190 tests green（双独立门控 PASS）。逐条对照见 **§14**。 | §14 |
 > | 2026-07-19 | 1（additive） | —（并入 B） | F1–F5/§5/G1/G6/D1–D8 实现提交日（同一批次，文档 rev B 统一收录）。 | §14 |
 > | 2026-07-18 | 1（B1） | A | 初始收敛版（A1-A3 / B1-B3 / C1-C2 全定，A2=A 时间戳锚点）；thin 路由错误体 `{"code":...}`、G2 status 404-502-503 分裂、projects 5xx 502→503、新增 8 个错误码。详见 §7。 | — |
@@ -43,10 +44,10 @@
 | GET | `/slimapi/sessions/status` | A | 🔒 | 批量 status（`?directory` 必填，∈allowlist） |
 | GET | `/slimapi/sessions/{sid}/status` | A | 🔒 | 单 ses status（id→directory 自洽；**sid 为能力凭证，不受 allowlist 约束**） |
 | GET | `/slimapi/messages/{sid}` | A | 🔒 | 骨架分页（`?limit/before/mode`） |
-| GET | `/slimapi/messages/{sid}/since/{ts}` | A | 🔒 (语义 🆕) | **A2=A**：`time.updated >= ts` 的骨架；`?limit/before` 分页 |
+| GET | `/slimapi/messages/{sid}/since/{ts}` | A | 🔒 (语义 🆕；rev C 勘误) | **A2=A**：`(info.time.updated or info.time.created) >= ts` 的骨架（rev C：v1.18.3 无 message 级 `time.updated`，实读 `created`，与 digest `updatedAt` 同源）；`?limit/before` 分页；等时间戳 tie-break 见 §5 |
 | GET | `/slimapi/messages/{sid}/full/{mid}` | A | 🔒 | 单条全文（mode=full，展开某条） |
 | GET | `/slimapi/messages/{sid}/full?ids=` | A | 🔒 (G6 🆕) | 批量展开（1–20 mid，discover 先行，mid 级 envelope `errors[]`，累计 413） |
-| GET | `/slimapi/questions` | A | 🔒 | 跨目录聚合 pending（`?directory` repeated 1-32 **可选**；null=聚合 allowlist 全部 dir），每条带 `routeToken` |
+| GET | `/slimapi/questions` | A | 🔒 | 跨目录聚合 pending（`?directory` repeated 1-32 **可选**；null=聚合 allowlist 全部 dir），每条带 `routeToken`；200 envelope `{items,errors,scope:{directories:N}}`（rev C：N=有效 scope dir 数，区分 scope 未就绪/权威空，见 §12） |
 | GET | `/slimapi/permissions` | A | 🔒 | 同上 |
 | POST | `/slimapi/questions/{qid}/reply` | A | 🔒 | routeToken 校验 + 注入 directory + 转发 opencode |
 | POST | `/slimapi/questions/{qid}/reject` | A | 🔒 | 同上 |
@@ -103,11 +104,17 @@
 - 之后 SSE 接力增量。
 - **resync = 复用冷启动流程**（同一"加载初始状态"代码路径）。
 
-## §5 拉消息（A2=A 锁定）🔒 (语义 🆕)
-- digest 推 `{messageID, updatedAt}`；客户端记本地该 ses 最大 `updatedAt`。
+## §5 拉消息（A2=A 锁定）🔒 (语义 🆕；rev C 勘误 + tie-break + cursor drain)
+- digest 推 `{messageID, updatedAt}`；客户端记本地该 ses 的 **watermark = `(updatedAt, messageID)` 二元组**（见下 tie-break）。
 - 比对发现更新 → 拉 `/slimapi/messages/{sid}/since/{lastSeenUpdatedAt}`。
-- 服务端返回 `time.updated >= lastSeenUpdatedAt` 的骨架；客户端按 messageID 去重边界。
+- 服务端返回 **`(info.time.updated or info.time.created) >= lastSeenUpdatedAt`** 的骨架；客户端按 messageID 去重边界。
+  - **勘误（rev C）**：原述 `time.updated >= ts` 引用了 opencode v1.18.3 **不存在**的 message 级 `info.time.updated`（仅 `SessionInfo.time` 有 `updated`；message 级 `User.time={created}`、`Assistant.time={created,completed?}`）。服务端实际过滤键 = `info.time.updated or info.time.created`，与 digest `updatedAt` 推导（§3：`updated or created or now`）**去掉 now 兜底**一致；v1.18.3 下两者都解析到 `info.time.created`。修复前该过滤是 no-op（已修，见 CHANGELOG `[0.2.1]`）。
+- **等时间戳 tie-break**（opencode 不保证 per-session `time` 严格单调——同毫秒批量 = 同时间戳；上游 `orderBy(desc(time_created), desc(id))` 显式以 `id` 为次键）：客户端 watermark 必须用 **`(updatedAt, messageID)` 二元组字典序**比较：
+  1. 先 strict 比 `updatedAt`（严格 `>` 才推进时间维）；
+  2. 时间相等时 strict 比 `messageID`（`MessageID = msg_+ascending()` 单调递增、字典序可排序 → 新消息 id 字典序更大 → 严格 `>` 才推进 id 维）。
+  - 此规则与上游 `(time_created DESC, id DESC)` + cursor `older()` 全序**完全对齐**，复用上游单调 `MessageID` 作天然 tie-break，零契约创新。
 - 分页：`?limit` + `?before` 游标。
+- **无 watermark 的初始拉取推荐 cursor drain（`?before` 游标分页）而非 `/since/0`**（rev C，ocdroid 缺口 3 裁定）：focus digest + resync 统一走 cursor drain 共享 reconciler；`/since/{ts}` 语义为"基于 watermark 的增量过滤"，`ts=0` 虽合法（返回全部）但非推荐路径。
 - 全文：单条 `/full/{mid}`；批量 `/full?ids=`（§2 G6）。
 
 ## §6 资源限制（T3，C2=2-5 台进 v1）🆕
@@ -120,6 +127,7 @@
 
 > v1 B1（2026-07-18）扩充：thin 路由错误体由 FastAPI 默认 `{"detail":…}` 改为 `{"code":…}`，并新增以下 code；均为加性、不 bump `X-Slimapi-Version`。详见 `docs/v1-impl-spec.md` §11 + `docs/CLIENT_CHANGES.md`「错误体形状」。
 > 2026-07-19 加性：G6 `invalid_ids` / envelope `message_not_found` / envelope `upstream_error`（mid 坏 JSON）；F2 收窄 `directory_not_allowed` 适用范围。
+> 2026-07-20 加性（rev C）：`GET /slimapi/sessions` 列表端点失败路径对齐 §7（原静默偏离：upstream 4xx/5xx 原样透传 body、网络错落 FastAPI 默认 `{"detail":...}` 500；现统一 4xx→502 `upstream_http_N`、5xx/网络→503 `upstream_unavailable`，body 为 `{"code":...}`）。
 >
 > **top-level vs envelope**：下列 code 默认指 thin 路由 **HTTP 状态 + body `{"code":…}`**。G6 另有 **envelope 语境**（整请求通常仍 200，code 出现在 `errors[]` 的 mid 项）。**同一 code 名两语境含义不同**，见各条标注。
 
@@ -150,7 +158,7 @@ skeleton 共享缓存（YAGNI，先指标）、多用户（独立 stack）、Par
 
 ## §11 v1 待补缺口清单（已闭环）
 1. ✅ 已闭环（`docs/v1-contract-implementation-status.md` §11）：hub.py digest `archived` 字段（§3）。
-2. ✅ 已闭环（`docs/v1-contract-implementation-status.md` §11）：messages.py `/since` 语义 `time.updated >= ts` + `limit/before` 分页（§5）。
+2. ✅ 已闭环（`docs/v1-contract-implementation-status.md` §11）：messages.py `/since` 语义 `(info.time.updated or info.time.created) >= ts` + `limit/before` 分页（§5；rev C 勘误：原述 `time.updated` 在 v1.18.3 不存在）。
 3. ✅ 已闭环（`docs/v1-contract-implementation-status.md` §11）：T3 硬化：订阅上限 + buffer 字节预算 + 立即清式溢出 + `/slimapi/metrics`（§6）。
 4. ✅ 已闭环（`docs/v1-contract-implementation-status.md` §11）：gzip 清理：health/ready 等 JSON 路由转发 accept_encoding（§9）。
 5. ✅ 已闭环（`docs/v1-contract-implementation-status.md` §11）：核验（非实现）：发消息写路径经 catch-all + 客户端 `X-Opencode-Directory` 是否端到端 work（opencode `/session/{sid}/message` 是否认该头）。
@@ -164,7 +172,7 @@ skeleton 共享缓存（YAGNI，先指标）、多用户（独立 stack）、Par
 | `GET /slimapi/sessions` | 200，不过滤（upstream 默认） | 透传 `?directory=` + header | 400 `directory_not_allowed` |
 | `GET /slimapi/sessions/status` | **必填**（缺→422） | 透传批量 status map | 400 `directory_not_allowed` |
 | `GET /slimapi/sessions/{sid}/status` | **无** directory 参数；discover sid→directory，**仅 normalize，不 gate allowlist**（F2） | — | —（不因 allowlist 400） |
-| `GET /slimapi/questions` / `/permissions` | **可选**；null=聚合 allowlist **全部** dir（不受 1–32 守卫）；空 allowlist→200 `{"items":[],"errors":[]}`（F1） | 去重后 1–32 项 fan-out；每条带 `routeToken` | 任一项 miss→400 `directory_not_allowed`；0 或 >32→400 `invalid_directory_count` |
+| `GET /slimapi/questions` / `/permissions` | **可选**；null=聚合 allowlist **全部** dir（不受 1–32 守卫）；空 allowlist→200 `{"items":[],"errors":[],"scope":{"directories":0}}`（F1；`scope.directories` 区分 scope 未就绪/权威空，见 §2） | 去重后 1–32 项 fan-out；每条带 `routeToken` | 任一项 miss→400 `directory_not_allowed`；0 或 >32→400 `invalid_directory_count` |
 | `GET /slimapi/messages/**`（含 G6 `/full?ids=`） | **不拦**（G7-soft；upstream 默认） | `require_directory` 后作 `X-Opencode-Directory` | 400；query 与 header 冲突亦 400 |
 | `POST` q/p reply/reject/permission | directory 来自 routeToken，不接受 body directory | token 校验后 `require_directory`（miss 自动刷新，F3） | 刷新后仍 miss→400 |
 
@@ -193,7 +201,7 @@ skeleton 共享缓存（YAGNI，先指标）、多用户（独立 stack）、Par
 >
 > **原始报告来源**：ocdroid 仓库 `.ocmar/workflows/slimapi-client-v1/`（接口评审 / B1 兼容审计报告 §3–§6，F1–F5 + §5 文档建议）。本表据该报告发现 + 本仓 spec `docs/ocmar/specs/2026-07-19-ocdroid-findings-evaluation-design.md` §3（逐条核验源码）落地。
 >
-> **验证总览**：`./scripts/check.sh` → **190 passed, EXIT=0**（独立 verifier live rerun，禁缓存）；final rev-cgpt 整审 + SSE 验证双门控 PASS。全加性，`X-Slimapi-Version` 仍为 `1`。
+> **验证总览**：`./scripts/check.sh` → **200 passed, EXIT=0**（v0.2.0 = 190；v0.2.1 rev C 缺口 ratify +10）。final rev-cgpt 整审 + SSE 验证双门控 PASS；rev C 再经 rev-cgpt review（必修项已闭环）。全加性，`X-Slimapi-Version` 仍为 `1`。
 
 ### 14.1 ocdroid 原始要求（F1–F5 + §5）
 
@@ -236,3 +244,19 @@ skeleton 共享缓存（YAGNI，先指标）、多用户（独立 stack）、Par
 ### 14.5 一句话结论
 
 > ocdroid 原始评审 F1–F5 + §5 **全部落地**；本仓扩展 G1 / G6 / D1–D8 **全部落地**；终审发现的 2 个 pre-existing SSE 生产 bug + G1 类型防御 **一并修复**。190 tests green（双独立门控），全加性不 bump wire。
+
+### 14.6 ocdroid 契约遗留缺口 ratify（2026-07-20 rev C，v0.2.1）
+
+> 来源：ocdroid 对 rev B（commit `22ddc3a`）的核对（ocdroid `.ocmar/workflows/slimapi-client-v1/problem-report-wip.md`，oracle T11 设计审查 D5/D2/I2）。F1–F5/§5/G1/G6/D1–D8 已在 14.1–14.4 核实；本节为**仍未被契约 ratify** 的 3 个开放项 + 查证中发现的 2 个 pre-existing 真 bug + 2 处防御缺口。
+
+| # | 缺口 | 查证结论（explorer 源码核验） | 落地动作 | 状态 | 契约落点 |
+|---|---|---|---|---|---|
+| **Gap 1** | 等时间戳不同 messageId 的 tie-break 未定义 | opencode **不保证** per-session `time` 严格单调（同毫秒批量=同时间戳；上游 `messages-pagination.test.ts:258-272` 显式证）；`MessageID`=`msg_+ascending()` **严格单调**；上游 `orderBy(desc(time_created), desc(id))` + cursor `older()` 已是 `(time,id)` 全序 | tie-break = **`(updatedAt, messageID)` 二元组字典序**（复用上游单调 id，零契约创新）；**另发现** §5 引用的 `info.time.updated` 在 v1.18.3 **不存在**（message 级只有 `created`）→ `/since` 过滤 no-op，修 `_item_updated` 读 `updated or created` | ✅ 已落地 | §5（勘误 + tie-break） / §2 /since 行 |
+| **Gap 2** | cold-start "成功空" vs "失败" wire 层不可区分 | **q/p**：缺口**不成立**（200 空 vs 503 全失败 vs 200+非空 `errors[]`，已可区分；是客户端未按 §7 处理）；**`/sessions` 列表**：发现真实 §7 偏离（upstream 4xx/5xx 原样透传、网络错→FastAPI 默认 500、零测试覆盖） | (a) `/sessions` 列表对齐 sibling（`_raise_upstream_status` + RequestError→503 + 200+坏 JSON→503）；(b) q/p envelope 加 `scope.directories`（区分 scope 未就绪/权威空，加性，不破坏 F1） | ✅ 已落地 | §7（/sessions coded）/ §2 + §12（q/p scope） |
+| **Gap 3** | `/since/0` 允许性与 cursor-drain 一致性 | 文档级：ocdroid 已单边裁定 cursor drain；契约 §5 未表态 | §5 补注：无 watermark 初始拉取**推荐 cursor drain**（`?before` 分页）而非 `/since/0` | ✅ 已落地 | §5 |
+
+**额外修复（查证中发现，用户批准一并修）**：
+- 🔴 q/p 显式 directory **规范化后去重**（`/app`+`/app/` 不再算 2 scope dir / 双 fan-out；rev-13 review 捕获）。
+- 🔴 `/sessions` 列表 200+坏 JSON/坏 shape → 503 `upstream_unavailable`（复刻 sibling `/projects` 防御；rev-13 review 捕获）。
+
+**验证**：本批 +10 测试（Gap1 `/since` 过滤 1 + Gap2 sessions 失败路径 3 + 坏 JSON 2 + q/p scope 5 含 normalize-dedup 1）；`./scripts/check.sh` → **200 passed**, EXIT=0。全加性，wire 仍 `1`。

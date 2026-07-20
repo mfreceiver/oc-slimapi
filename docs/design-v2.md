@@ -50,9 +50,9 @@
 
 ### 1.5 `GET /slimapi/messages/{sid}/since/{ts}`（增量，A2=A 时间戳锚点）
 - **参数**：`ts`(path, epoch ms，客户端本地该 ses 最大 `updatedAt`)；`limit`(int 1–200 默认50)；`before`(str?, opaque, 来自上一响应 `X-Next-Cursor`，原样透传)；`mode`(enum `skeleton`|`full` 默认 skeleton)；`directory`(透传)。
-- **行为**：在**单个 transform admission + 单个累计字节预算**（`max_response_bytes`）下翻最多 `max_since_pages` 页（不暴露）；过滤条件 **`info.time.updated >= ts`**（含边界；客户端按 messageID 去重边界）；skeleton 时调 `skeleton_messages()`。
+- **行为**：在**单个 transform admission + 单个累计字节预算**（`max_response_bytes`）下翻最多 `max_since_pages` 页（不暴露）；过滤条件 **`(info.time.updated or info.time.created) >= ts`**（含边界；客户端按 messageID 去重边界；v0.2.1 勘误：opencode v1.18.3 无 message 级 `time.updated`，实读 `created`，与 digest `updatedAt` 同源）；skeleton 时调 `skeleton_messages()`。
 - **`X-Next-Cursor`**：透传 opencode 响应 `Link: <...?before=CURSOR>; rel="next"` 头里的 **opaque base64url cursor**（原样字符串，不 decode/re-encode）。仅在"填满 limit 且未撞 ts 地板且 opencode 给了 Link"时下发；客户端回传的 `X-Next-Cursor` 经 `?before=` 原样转发给 opencode。
-- **ts 地板**：扫描中遇到 `time.updated < ts` 的项 → 停（后续都更旧），抑制 `X-Next-Cursor`。
+- **ts 地板**：扫描中遇到 `(time.updated or time.created) < ts` 的项 → 停（后续都更旧），抑制 `X-Next-Cursor`。
 - **响应**：200 骨架裸数组 + `Cache-Control:no-store` + `X-Next-Cursor`（仅当有续且未撞地板），gzip+`Vary`；累计字节超限→413 `response_too_large`。
 - **注**：A2=A 锚点（时间戳），覆盖该 ses 自 `ts` 起所有更新；中段变更（revert/compaction）靠 SSE digest 或回前台 full resync。
 
@@ -70,9 +70,10 @@
 - **响应**（聚合 envelope，允许——仅消息列表不套）：
   ```json
   {"items":[{"<原 question/permission 对象>,"directory":"/a","routeToken":"<sig>"}],
-   "errors":[{"directory":"/b","code":"upstream_timeout"}]}
+   "errors":[{"directory":"/b","code":"upstream_timeout"}],
+   "scope":{"directories":2}}
   ```
-  部分失败仍 200 + errors 非空；全失败→503。
+  部分失败仍 200 + errors 非空；全失败→503（**不含** `scope`）。`scope.directories`=本次有效 dir 数（null 路径=allowlist 大小；显式=规范化去重后数；v0.2.1，区分 scope 未就绪/权威空）。
 - **routeToken**：base64url(payload).base64url(hmac)；payload=`{v,kind,requestID,sessionID,directory,iat,exp}`；secret 经 systemd `LoadCredential`（持久、非 SQLite）；exp ~1h。
 
 ### 1.8 写：`POST /slimapi/questions/{qid}/reply|reject`、`POST /slimapi/sessions/{sid}/permissions/{pid}`

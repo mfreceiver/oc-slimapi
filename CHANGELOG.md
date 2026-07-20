@@ -44,6 +44,25 @@ ocdroid 对接时：
 
 ---
 
+## [0.2.1] - 2026-07-20
+
+> 本批次（2026-07-20 rev C）ratify ocdroid 契约遗留 3 缺口（**Gap1** 等时间戳 tie-break + **Gap2** 空/失败区分 + **Gap3** `/since/0` cursor drain）+ 查证中发现的 2 个 pre-existing 真 bug（`/since` 过滤 no-op + `/sessions` 列表 §7 偏离）+ 2 处防御缺口（q/p 规范化去重 + `/sessions` 坏 JSON→503）。全加性，**不** bump `X-Slimapi-Version`（仍为 `1`）。逐条对照见 `docs/v1-contract.md` §14.6。
+
+### Added
+
+- **q/p envelope `scope` 字段**（ocdroid 缺口 2）：`GET /slimapi/questions` / `/permissions` 的 200 响应加 `scope: {directories: N}`（N = 本次请求有效 scope 的 dir 数：null 路径=allowlist 大小，显式路径=去重后 dir 数）。`N == 0` = scope 未就绪（allowlist 空，sidecar 启动早于 opencode）；`N > 0 && items == []` = scope 就绪、权威空。客户端据此决定冷启动是否清本地 stale。加性，不破坏 F1（仍 200 + items/errors）。
+
+### Changed
+
+- **`/since/{ts}` 时间过滤真正生效 + tie-break 规则**（ocdroid 缺口 1）：`_item_updated` 从只读 `info.time.updated`（opencode v1.18.3 无此字段）改为读 `info.time.updated or info.time.created`，与 digest `updatedAt` 推导对齐。修复前 `>= ts` 过滤是 no-op（对任何 ts 返回最新 N 条）；修复后返回真过滤子集。客户端 per-session watermark 升级为 `(updatedAt, messageID)` 二元组字典序（等时间戳 tie-break，复用上游单调 `MessageID`，对齐 `(time_created DESC, id DESC)` 全序）。
+
+### Fixed
+
+- **`/slimapi/sessions` 列表 §7 偏离**（ocdroid 缺口 2）：upstream 4xx/5xx 不再原样透传 body、网络错（`httpx.RequestError`）不再落 FastAPI 默认 `{"detail":...}` 500；统一对齐 sibling（`/sessions/{sid}/status`、`/projects`）：4xx→502 `upstream_http_N`、5xx/网络→503 `upstream_unavailable`，body 为 `{"code":...}`。补 3 测试（原零覆盖）。
+- **契约 §5 字段勘误 + `/since/0` 推荐**（ocdroid 缺口 1 + 3）：§5 原述 `time.updated >= ts` 引用了 v1.18.3 不存在的 message 级字段，勘误为 `(info.time.updated or info.time.created) >= ts`；并补注无 watermark 的初始拉取推荐 cursor drain（`?before` 分页）而非 `/since/0`。
+
+---
+
 ## [0.2.0] - 2026-07-20
 
 > 本批次（2026-07-20）所有变更加性，**不** bump `X-Slimapi-Version`（仍为 `1`）。ocdroid《slimapi 接口评审报告》原始发现 F1–F5 + §5 文档建议全部落地；本仓扩展 G1（错误可见性）/ G6（批量展开）/ D1–D8（文档同步）一并实现；另修 2 个 pre-existing SSE 生命周期 bug + G1 `error.name` 类型防御。逐条对照见 `docs/v1-contract.md` §14。

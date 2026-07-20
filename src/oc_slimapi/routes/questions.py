@@ -12,7 +12,7 @@ from ..errors import CodedHTTPException
 from ..gzip_util import json_response
 from ..tokens import RouteTokenError, issue_route_token, verify_route_token
 from ..upstream import decoded_body_headers, forward_directory_headers
-from .sessions import require_directory, load_products
+from .sessions import load_products, normalize_directory, require_directory
 
 router = APIRouter(prefix="/slimapi", tags=["pending"])
 
@@ -24,7 +24,11 @@ def _request_id(item: dict) -> str | None:
 
 async def _aggregate(request: Request, kind: Literal["question", "permission"], directories: list[str] | None):
     if directories is not None:
-        unique = list(dict.fromkeys(directories))
+        # Normalize BEFORE dedupe: `/app` and `/app/` are the same directory
+        # once trailing slashes are stripped. Deduping on raw strings would
+        # fan-out duplicate upstream calls and inflate scope.directories.
+        normalized = [normalize_directory(d) for d in directories]
+        unique = list(dict.fromkeys(normalized))
         if not unique or len(unique) > 32:
             raise CodedHTTPException(400, code="invalid_directory_count")
         checked = [await require_directory(request, d) for d in unique]
@@ -71,7 +75,13 @@ async def _aggregate(request: Request, kind: Literal["question", "permission"], 
     items = [item for group, _ in results if group for item in group]
     errors = [e for _, e in results if e]
     status = 503 if results and len(errors) == len(results) else 200
-    return json_response({"items": items, "errors": errors}, status_code=status,
+    # scope only on 200 success envelope (Gap 2B): distinguishes cold-start
+    # (directories==0) from authoritative empty (directories>0, items==[]).
+    # 503 all-fail keeps the same envelope shape without scope.
+    body: dict = {"items": items, "errors": errors}
+    if status == 200:
+        body["scope"] = {"directories": len(checked)}
+    return json_response(body, status_code=status,
                          accept_encoding=request.headers.get("accept-encoding"))
 
 

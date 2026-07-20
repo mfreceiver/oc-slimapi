@@ -2,7 +2,7 @@
 
 - **基准契约**：[`docs/v1-contract.md`](./v1-contract.md)（唯一 wire 基准）
 - **审计对象**：oc-slimapi 仓库 working tree at `9373550` + 本批（2026-07-19 ocdroid-findings）未提交改动
-- **审计方法**：逐条对照契约 §0–§11，交叉核验源码（`src/oc_slimapi/**`）+ 测试（`tests/`，**190 passed** @ 2026-07-20）+ 配套文档（v1-impl-spec / INTERFACE_MAP / CHANGELOG / CLIENT_CHANGES）
+- **审计方法**：逐条对照契约 §0–§11，交叉核验源码（`src/oc_slimapi/**`）+ 测试（`tests/`，**200 passed** @ 2026-07-20）+ 配套文档（v1-impl-spec / INTERFACE_MAP / CHANGELOG / CLIENT_CHANGES）
 - **状态图例**：✅ 完全实现 · 🟡 部分实现 · ⚫ 未实现 · 🔄 变更（相对契约前的行为变化）
 - **给**：ocdroid 项目组
 
@@ -18,7 +18,7 @@
 | §2 写路径 B2 | routeToken | ✅ | issue/verify + directory 注入 + 过期透明；**F3** lifespan warm + `_token` 走 `require_directory` |
 | §3 | SSE 契约 | ✅ + 🔄 | digest(含 archived + **lastError?**) / **session.error G1** / asked 直推 / heartbeat / resync 全覆盖 |
 | §4 | 冷启动 & resync | ✅ | sidecar 提供所需端点；resync 流程在客户端 |
-| §5 | 拉消息 A2=A | ✅ | `/since/{ts}` 语义 `time.updated >= ts` + 分页 |
+| §5 | 拉消息 A2=A | ✅ + 🔄 | `/since/{ts}` 语义 `(info.time.updated or info.time.created) >= ts` + 分页（v0.2.1 勘误 + tie-break `(updatedAt,messageID)`） |
 | §6 | 资源限制 T3 | ✅ | 订阅上限 / 字节预算 / 溢出清 queue / `/metrics` |
 | §7 | 错误码 | ✅ + 🔄 | B1 加性扩充（thin 错误体 `{"detail":...}`→`{"code":...}`） |
 | §8 | 客户端最小集 | ✅ | sidecar 全部就绪；剩余在 ocdroid 侧 |
@@ -84,7 +84,7 @@ sidecar 强制 loopback-only（契约 §0，`config.validate()` 拒绝非 loopba
 | `GET /slimapi/health` | ✅ | 含版本+降级+self-check；B1 起支持 gzip |
 | `GET /slimapi/ready` | ✅ | liveness；B1 起支持 gzip |
 | `GET /slimapi/metrics` | ✅ | 订阅者/queue/hub 指标（§11.3 闭环） |
-| `GET /slimapi/sessions` | ✅ | 骨架列表 + `?directory/roots/limit/start/search`，排除 archived，每条带 `directory` |
+| `GET /slimapi/sessions` | ✅ + 🔄 | 骨架列表 + `?directory/roots/limit/start/search`，排除 archived，每条带 `directory`；**v0.2.1：失败路径对齐 §7 coded**（4xx→502 `upstream_http_N` / 5xx·网络→503 / 200+坏 JSON·坏 shape→503；原静默透传 upstream body / 网络→FastAPI 500） |
 | `GET /slimapi/projects` | 🔄 | 发现 + allowlist；**B1：upstream 5xx/网络 502→503**（状态码变更，见下） |
 | `GET /slimapi/sessions/status` | ✅ | 批量 status；B1 起错误体结构化 |
 | `GET /slimapi/sessions/{sid}/status` | 🔄 | **B1：404/502/503 三态分裂**；**🔄 F2：放宽 allowlist**（`normalize_directory` 不 gate） |
@@ -92,7 +92,7 @@ sidecar 强制 loopback-only（契约 §0，`config.validate()` 拒绝非 loopba
 | `GET /slimapi/messages/{sid}/since/{ts}` | ✅ + 🔄 | A2=A 语义（§11.2 闭环）；**B1：同上 directory allowlist** |
 | `GET /slimapi/messages/{sid}/full/{mid}` | 🔄 | **B1：oversized → 413 流式 cap**（不再整缓冲，见下） |
 | `GET /slimapi/messages/{sid}/full?ids=` | 🆕 G6 | **批量展开**（1–20 mid，discover 先行，mid 级 envelope `errors[]`，累计 413） |
-| `GET /slimapi/questions` | 🔄 F1 | 跨目录聚合；**directory 可选**（null=聚合 allowlist；显式 1–32），每条带 `routeToken` |
+| `GET /slimapi/questions` | 🔄 F1 + v0.2.1 | 跨目录聚合；**directory 可选**（null=聚合 allowlist；显式**规范化后去重** 1–32），每条带 `routeToken`；200 envelope 含 `scope.directories`（区分 scope 未就绪/权威空） |
 | `GET /slimapi/permissions` | 🔄 F1 | 同上 |
 | `POST /slimapi/questions/{qid}/reply` | ✅ | routeToken 校验 + directory 注入 + 转发 |
 | `POST /slimapi/questions/{qid}/reject` | ✅ | 同上 |
@@ -153,7 +153,7 @@ sidecar 强制 loopback-only（契约 §0，`config.validate()` 拒绝非 loopba
 
 ### §5 拉消息（A2=A）— ✅ 完全实现
 - digest 推 `{messageID, updatedAt}`；客户端记本地最大 `updatedAt`。
-- `/slimapi/messages/{sid}/since/{ts}` 返回 `info.time.updated >= ts` 的骨架（`messages.py:207` `_passes_ts_filter`）。
+- `/slimapi/messages/{sid}/since/{ts}` 返回 `(info.time.updated or info.time.created) >= ts` 的骨架（`messages.py:215` `_item_updated`/`_passes_ts_filter`；v0.2.1 勘误：原读 `info.time.updated` 在 v1.18.3 不存在→过滤 no-op，已修）。
 - 缺/非 int 的 `time.updated` 防御性包含（客户端按 messageID 去重边界）。
 - 分页 `?limit` + `?before` 游标；累计 `max_response_bytes` 预算跨页执行。
 
@@ -219,7 +219,7 @@ sidecar 强制 loopback-only（契约 §0，`config.validate()` 拒绝非 loopba
 | # | 缺口 | 状态 | 证据 |
 |---|---|---|---|
 | 1 | hub.py digest `archived` 字段 | ✅ | `hub.py:105/118/334-344`：取 `info.time.archived`，永久状态，进 digest payload |
-| 2 | messages.py `/since` 语义 `time.updated >= ts` + 分页 | ✅ | `messages.py:207-218` `_passes_ts_filter`；`?limit` + `?before` |
+| 2 | messages.py `/since` 语义 `(info.time.updated or info.time.created) >= ts` + 分页 | ✅ | `messages.py:215` `_item_updated`/`_passes_ts_filter`；`?limit` + `?before`（v0.2.1 勘误：原读 `time.updated` 在 v1.18.3 不存在→no-op，已修） |
 | 3 | T3 硬化（订阅上限 + 字节预算 + 立即清式溢出 + `/metrics`） | ✅ | `hub.py` MAX_SUBSCRIBERS / `subscriber_backpressure`；`routes/metrics.py` |
 | 4 | gzip 清理（health/ready 等转发 accept_encoding） | ✅ | `routes/health.py:20/38` |
 | 5 | 写路径核验（catch-all + `X-Opencode-Directory`） | ✅ | `forward_directory_headers` 在 messages/proxy 转发；端到端 work |
@@ -254,5 +254,5 @@ sidecar 强制 loopback-only（契约 §0，`config.validate()` 拒绝非 loopba
 - 交付报告：`docs/ocmar/reports/2026-07-18-v1-b0-b1.md`
 
 ## 校验
-- `./scripts/check.sh` → **190 passed**, EXIT=0（@ 2026-07-20；含 SSE lifecycle 3 回归：teardown registry slot / queued_bytes ack / G1 non-str name）。
+- `./scripts/check.sh` → **200 passed**, EXIT=0（@ 2026-07-20；含 SSE lifecycle 3 回归：teardown registry slot / queued_bytes ack / G1 non-str name）。
 - 基线：working tree at `9373550` + 本批未提交改动（ocdroid-findings-evaluation + SSE lifecycle fix）。

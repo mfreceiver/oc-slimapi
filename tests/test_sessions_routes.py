@@ -191,6 +191,85 @@ async def test_projects_failure_renders_code(upstream_factory):
     assert response.json()["code"] == "upstream_unavailable"
 
 
+async def test_sessions_list_upstream_4xx_returns_502(upstream_factory):
+    """GET /slimapi/sessions upstream 4xx → 502 upstream_http_N (§7, sibling status pattern)."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, content=b'{"error":"bad request"}')
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/slimapi/sessions", headers=VERSION_HEADERS)
+    assert response.status_code == 502
+    assert response.json()["code"] == "upstream_http_400"
+
+
+async def test_sessions_list_upstream_5xx_returns_503(upstream_factory):
+    """GET /slimapi/sessions upstream 5xx → 503 upstream_unavailable (§7)."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, content=b"boom")
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/slimapi/sessions", headers=VERSION_HEADERS)
+    assert response.status_code == 503
+    assert response.json()["code"] == "upstream_unavailable"
+
+
+async def test_sessions_list_network_error_returns_503(upstream_factory):
+    """GET /slimapi/sessions httpx.RequestError → 503 upstream_unavailable (§7)."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("simulated", request=request)
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/slimapi/sessions", headers=VERSION_HEADERS)
+    assert response.status_code == 503
+    assert response.json()["code"] == "upstream_unavailable"
+
+
+async def test_sessions_list_upstream_200_bad_json_returns_503(upstream_factory):
+    """GET /slimapi/sessions upstream 200 but body not JSON → 503 upstream_unavailable.
+
+    Regression: previously response.json() raised JSONDecodeError → escaped as
+    unstructured FastAPI 500 lacking {code:...} (rev-13 must-fix B)."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"not json at all",
+                              headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/slimapi/sessions", headers=VERSION_HEADERS)
+    assert response.status_code == 503
+    assert response.json()["code"] == "upstream_unavailable"
+
+
+async def test_sessions_list_upstream_200_non_array_json_returns_503(upstream_factory):
+    """GET /slimapi/sessions upstream 200 but JSON is non-array (dict) → 503
+    upstream_unavailable.
+
+    Regression: previously `for item in payload` iterated dict keys (str),
+    skeleton_session received a str → raised → unstructured 500 (rev-13 must-fix B)."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b'{"unexpected":"shape"}',
+                              headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/slimapi/sessions", headers=VERSION_HEADERS)
+    assert response.status_code == 503
+    assert response.json()["code"] == "upstream_unavailable"
+
+
 async def test_status_discover_network_error_returns_503(upstream_factory):
     """G2 discover raises httpx.RequestError (network) → 503 upstream_unavailable."""
     def handler(request: httpx.Request) -> httpx.Response:

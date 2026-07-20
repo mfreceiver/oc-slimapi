@@ -318,6 +318,74 @@ async def test_messages_since_returns_only_items_at_or_above_ts(upstream_factory
         app.state.transforms.shutdown()
 
 
+def _msg_created_only(mid: str, created: int, *, text: str = "x" * 200) -> dict:
+    """Upstream-shape message with only ``info.time.created`` (no ``updated``).
+
+    Mirrors opencode v1.18.3 message schema: User.time={created},
+    Assistant.time={created, completed?}. Used to lock the Gap-1 regression
+    where ``_item_updated`` only read ``updated`` and made /since a no-op.
+    """
+    return {
+        "info": {
+            "id": mid,
+            "role": "user",
+            "time": {"created": created},
+        },
+        "parts": [{"id": f"p-{mid}", "type": "text", "messageID": mid, "text": text}],
+    }
+
+
+async def test_messages_since_filters_by_created_when_updated_absent(upstream_factory):
+    """Gap 1 regression: /since/{ts} must filter on ``updated or created``.
+
+    opencode v1.18.3 messages have no ``info.time.updated``; watermark is
+    ``created`` (same expression as digest updatedAt, without now fallback).
+    Old code returned None → always included → no-op filter (FAIL this test).
+    """
+    # Newest-first page (opencode order). created: 3000, 2000, 1000.
+    page = [
+        _msg_created_only("m3", 3000),
+        _msg_created_only("m2", 2000),
+        _msg_created_only("m1", 1000),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, content=orjson.dumps(page),
+            headers={"Content-Type": "application/json"},
+        )
+
+    upstream = upstream_factory(handler)
+    settings = _settings()
+    app = _build_app(settings, upstream)
+    transport = httpx.ASGITransport(app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            # /since/2000 → only created >= 2000 (m3, m2); m1 (1000) excluded.
+            response = await client.get(
+                "/slimapi/messages/s1/since/2000?mode=skeleton",
+                headers=VERSION_HEADERS,
+            )
+            assert response.status_code == 200
+            body = orjson.loads(response.content)
+            ids = [item["info"]["id"] for item in body]
+            assert ids == ["m3", "m2"]
+            assert "m1" not in ids
+            assert len(body) == 2
+
+            # /since/0 → all items (watermark >= 0 for every real message).
+            response_all = await client.get(
+                "/slimapi/messages/s1/since/0?mode=skeleton",
+                headers=VERSION_HEADERS,
+            )
+            assert response_all.status_code == 200
+            body_all = orjson.loads(response_all.content)
+            assert [item["info"]["id"] for item in body_all] == ["m3", "m2", "m1"]
+            assert len(body_all) == 3
+    finally:
+        app.state.transforms.shutdown()
+
+
 async def test_messages_since_boundary_includes_equal_ts(upstream_factory):
     """② Boundary: items with ``time.updated == ts`` are included (``>=``, not ``>``).
     The contract pins A2=A and relies on client-side messageID dedup."""

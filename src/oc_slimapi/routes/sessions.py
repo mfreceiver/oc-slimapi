@@ -101,17 +101,23 @@ async def sessions(
         params["start"] = start
     if search is not None:
         params["search"] = search
-    response = await request.app.state.upstream.get(
-        "/session", params=params, headers=forward_directory_headers(directory)
-    )
-    if response.status_code >= 400:
-        return json_response(
-            response.json(),
-            status_code=response.status_code,
-            accept_encoding=request.headers.get("accept-encoding"),
+    try:
+        response = await request.app.state.upstream.get(
+            "/session", params=params, headers=forward_directory_headers(directory),
         )
+    except httpx.RequestError:
+        raise CodedHTTPException(503, code="upstream_unavailable")
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        _raise_upstream_status(exc)
+    try:
+        payload = response.json()
+        sessions = [skeleton_session(item) for item in payload]
+    except Exception:
+        raise CodedHTTPException(503, code="upstream_unavailable")
     return json_response(
-        [skeleton_session(item) for item in response.json()],
+        sessions,
         accept_encoding=request.headers.get("accept-encoding"),
     )
 
