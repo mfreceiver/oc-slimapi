@@ -10,15 +10,20 @@
 
 ```text
 ocdroid (Android)
-   │
-   ├──(stunnel mTLS :14097)──▶ oc-slimapi :4097 (loopback)  ──HTTP──▶ opencode :4096
-   │                             Python FastAPI 省流 sidecar            legacy /session/**
-   │
-   └──(stunnel mTLS :14096)──▶ opencode :4096   # 直连回退，不经 sidecar
+    │
+    ├──(stunnel mTLS :14097)──▶ oc-slimapi :4097 (loopback)  ──HTTP──▶ opencode :4096
+    │                             Python FastAPI 省流 sidecar            legacy /session/**
+    │
+    ├──(Tailscale 明文直连 :4097)──▶ 同上（推荐仅内网/Tailscale ACL 受限）
+    │
+    └──(stunnel mTLS :14096)──▶ opencode :4096   # 直连回退，不经 sidecar
 ```
 
-- **oc-slimapi 仅监听 loopback**（`127.0.0.1:4097`），公网暴露由 stunnel mTLS 负责。
-- upstream 固定 `http://127.0.0.1:4096`（opencode legacy HTTP API）。
+- **两个 :4097 入口**（明文）：
+  - **`127.0.0.1:4097`**（默认，loopback）：仅供本机 + stunnel mTLS（:14097）终结后转发的推荐路径。
+  - **`0.0.0.0:4097`**（可选，明文直连入口）：允许通过 Tailscale 地址直接访问，**不强制 mTLS**。**安全模型**：远程暴露需依赖 Tailscale ACL / 主机防火墙隔离；该入口**无**应用层鉴权（thin routes 自身不验证客户端身份），版本门禁（`X-Slimapi-Version`）仍生效。
+- **:14097 仍为推荐的 mTLS 入口**；明文直连仅为 Tailscale 内网/运维便利，不应在不可信网络暴露。
+- upstream 固定 `http://127.0.0.1:4096`（opencode legacy HTTP API）——**无论 host 如何**，`config.validate()` 始终强制 upstream 必须是 fixed loopback HTTP（SSRF guard 不放松）。
 - **单进程单 worker**：多 worker 会为同一 directory 重复建立 upstream SSE，禁止。
 
 ### 1.1 运行依赖
@@ -78,7 +83,7 @@ RestartSec=5
 # CREDENTIALS_DIRECTORY 读取（无需再设 OC_SLIMAPI_ROUTE_SECRET_FILE）。
 LoadCredential=route-secret:%h/.config/oc-slimapi/route-secret
 
-Environment=OC_SLIMAPI_HOST=127.0.0.1
+Environment=OC_SLIMAPI_HOST=0.0.0.0   # 或 127.0.0.1（仅 loopback，更保守）
 Environment=OC_SLIMAPI_PORT=4097
 Environment=OC_SLIMAPI_UPSTREAM=http://127.0.0.1:4096
 Environment=PYTHONUNBUFFERED=1
@@ -186,10 +191,12 @@ systemd[...]: Started oc-slimapi.service ...
 oc-slimapi[...]: INFO: Started server process [PID]
 oc-slimapi[...]: INFO: Waiting for application startup.
 oc-slimapi[...]: INFO: Application startup complete.
-oc-slimapi[...]: INFO: Uvicorn running on http://127.0.0.1:4097 (Press CTRL+C to quit)
+oc-slimapi[...]: INFO: Uvicorn running on http://0.0.0.0:4097 (Press CTRL+C to quit)
 ```
 
-启动失败常见原因：route secret 缺失/不足 32 字节、upstream 不可达、`OC_SLIMAPI_HOST` 非 loopback、`OC_SLIMAPI_UPSTREAM` 非 loopback HTTP。
+> 若 `OC_SLIMAPI_HOST=127.0.0.1`，则日志显示 `http://127.0.0.1:4097`。
+
+启动失败常见原因：route secret 缺失/不足 32 字节、upstream 不可达、`OC_SLIMAPI_HOST` 非 loopback 且非 `0.0.0.0`、`OC_SLIMAPI_UPSTREAM` 非 loopback HTTP。
 
 ---
 
@@ -237,7 +244,8 @@ ocdroid 客户端**不直接操作** sidecar 进程，只通过 stunnel mTLS 接
 
 | 项 | 值 |
 |---|---|
-| 经 sidecar 入口 | stunnel `:14097` → sidecar `127.0.0.1:4097` |
+| 经 sidecar mTLS 入口（推荐） | stunnel `:14097` → sidecar `127.0.0.1:4097` |
+| 经 sidecar 明文直连入口（Tailscale 等） | Tailscale 地址`:4097` → sidecar `0.0.0.0:4097`（依赖 Tailscale ACL / 防火墙；无 mTLS） |
 | 直连回退（不经 sidecar） | stunnel `:14096` → opencode `127.0.0.1:4096` |
 | 所有 `/slimapi/**` 请求必带头 | `X-Slimapi-Version: 1`（缺/非整数 → `400 version_required`；越界 → `400 version_incompatible`） |
 | 非 `/slimapi/**` | 透明反代 opencode，**不带**版本头 |

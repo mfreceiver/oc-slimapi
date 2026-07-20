@@ -181,7 +181,7 @@
 - **双 stunnel 入口**（都 mTLS + 同 CA/客户端证书）：
   - `14096 → 127.0.0.1:4096`（直连 opencode，回退用）
   - `14097 → 127.0.0.1:4097`（经 sidecar）
-- **sidecar** `127.0.0.1:4097`（禁 0.0.0.0，启动 assert）；systemd user unit，`Restart=on-failure`，`MemoryMax=384M`，`LoadCredential=route-secret:`。
+- **sidecar** 默认 `127.0.0.1:4097`；可选 `0.0.0.0:4097` 作为明文直连入口（Tailscale 直达，依赖 Tailscale ACL / 防火墙；非 routable 主机仍启动 assert 拒绝）。upstream 始终固定 loopback HTTP；systemd user unit，`Restart=on-failure`，`MemoryMax=384M`，`LoadCredential=route-secret:`。
 - 框架：**FastAPI+httpx+orjson+uvicorn**（typed 校验降低契约错误）；单 worker（共享 SSE hub）。
 - SSE 长连接：stunnel `TIMEOUTidle=0 或 43200` + `TCP_NODELAY`+`SO_KEEPALIVE`。
 

@@ -15,9 +15,9 @@ python -m venv .venv
 
 | 环境变量 | 默认 | 说明 |
 |---|---:|---|
-| `OC_SLIMAPI_HOST` | `127.0.0.1` | 仅允许 loopback |
+| `OC_SLIMAPI_HOST` | `127.0.0.1` | 允许 loopback（`127.0.0.1`/`::1`/`localhost`）或 `0.0.0.0`（明文直连入口，远程暴露需依赖 Tailscale ACL / 主机防火墙；14097 仍为推荐 mTLS 入口） |
 | `OC_SLIMAPI_PORT` | `4097` | HTTP 监听端口 |
-| `OC_SLIMAPI_UPSTREAM` | `http://127.0.0.1:4096` | 固定 loopback upstream |
+| `OC_SLIMAPI_UPSTREAM` | `http://127.0.0.1:4096` | 固定 loopback upstream（无论 host 如何，upstream 必须保持 loopback HTTP） |
 | `OC_SLIMAPI_MAX_JSON_BYTES` | `67108864` | skeleton 页面上限 |
 | `OC_SLIMAPI_MAX_MESSAGE_BYTES` | `33554432` | 单消息上限 |
 | `OC_SLIMAPI_ROUTE_SECRET` | 无 | 测试用持久 secret |

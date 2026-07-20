@@ -15,7 +15,7 @@
 | §0 | 范围与架构 | ✅ | FastAPI+httpx+orjson+uvicorn 单 worker，loopback，不读 SQLite |
 | §1 | 版本契约 | ✅ | `SERVER_API_VERSION=1`，`ACCEPTED_CLIENT_VERSIONS=(1,1)`，门闩齐全 |
 | §2 | 端点表（16+ 路由） | ✅ + 🔄 | 全部就绪；B1 + 2026-07-19 加性变更（F1/F2/G6 等，见下） |
-| §2 写路径 B2 | routeToken | ✅ | issue/verify + directory 注入 + 过期透明；**F3** lifespan warm + `_token` 走 `require_directory` |
+| §2 写路径 B2 | routeToken | ✅ | issue/verify + directory 注入 + 过期透明；[Unreleased] allowlist gate 全面移除，`_token` 仅 normalize 后透传 |
 | §3 | SSE 契约 | ✅ + 🔄 | digest(含 archived + **lastError?**) / **session.error G1** / asked 直推 / heartbeat / resync 全覆盖 |
 | §4 | 冷启动 & resync | ✅ | sidecar 提供所需端点；resync 流程在客户端 |
 | §5 | 拉消息 A2=A | ✅ + 🔄 | `/since/{ts}` 语义 `(info.time.updated or info.time.created) >= ts` + 分页（v0.2.1 勘误 + tie-break `(updatedAt,messageID)`） |
@@ -32,7 +32,7 @@
 
 ## 访问拓扑与连接方式（ocdroid 接入）
 
-sidecar 强制 loopback-only（契约 §0，`config.validate()` 拒绝非 loopback host），所有远程访问经 stunnel mTLS。两条访问路径：
+sidecar 监听 host 范围由 `config.validate()` 控制：loopback（`127.0.0.1`/`::1`/`localhost`）或 `0.0.0.0`（明文直连入口）。upstream 仍强制 fixed loopback HTTP（SSRF guard 不放松）。两条+远程访问路径：
 
 ### 1. 本机 / 测试（明文 loopback，仅开发调试）
 | 目标 | URL | 说明 |
@@ -40,7 +40,7 @@ sidecar 强制 loopback-only（契约 §0，`config.validate()` 拒绝非 loopba
 | sidecar 省流 API | `http://127.0.0.1:4097/slimapi/**` | 须带 `X-Slimapi-Version: 1` 头 |
 | opencode 直连（绕过 sidecar） | `http://127.0.0.1:4096/...` | legacy 写路径调试用 |
 
-仅本机可达。绑 `0.0.0.0` 会被 `config.validate()` 以 `OC_SLIMAPI_HOST must be loopback-only` RuntimeError 硬拒——这是**故意的安全 guard**：thin routes 无自身认证，安全模型完全依赖 stunnel mTLS 在前端。
+绑 loopback 时仅本机可达。绑 `0.0.0.0` 时 `:4097` 成为**明文直连入口**——thin routes 无自身认证，安全模型依赖前置（stunnel mTLS :14097 推荐）或后置（Tailscale ACL / 主机防火墙）。除 loopback 与 `0.0.0.0` 外的任意 routable host（如 `192.168.x.x`）仍被 `config.validate()` 硬拒——这是**故意的安全 guard**，避免误绑到非预期的接口。
 
 ### 2. 远程 / 生产（mTLS via stunnel，ocdroid 实际接入路径）
 | 路径 | URL | 链路 |
@@ -65,10 +65,10 @@ sidecar 强制 loopback-only（契约 §0，`config.validate()` 拒绝非 loopba
 ## 逐节审计
 
 ### §0 范围与架构 — ✅ 完全实现
-- 纯 HTTP sidecar，FastAPI + httpx + orjson + uvicorn，单 worker，loopback only（`host ∈ {127.0.0.1, ::1, localhost}`，`config.validate()` 强制）。
+- 纯 HTTP sidecar，FastAPI + httpx + orjson + uvicorn，单 worker，host ∈ `{127.0.0.1, ::1, localhost, 0.0.0.0}`（`config.validate()` 强制；`0.0.0.0` 为明文直连入口，远程暴露依赖 Tailscale ACL / 防火墙；upstream 必须保持 fixed loopback HTTP）。
 - 仅 legacy `/session/**` HTTP API，**不读** opencode SQLite（`upstream.py` 走 httpx）。
 - T3 硬化已进 v1（见 §6）。
-- stunnel mTLS 在 sidecar 前端（部署侧，非代码契约）。
+- stunnel mTLS 在 sidecar 前端（部署侧，非代码契约）；:14097 推荐，:4097 明文直连为可选。
 
 ### §1 版本契约 — ✅ 完全实现
 - `versioning.py`：`SERVER_API_VERSION=1`，`ACCEPTED_CLIENT_VERSIONS=(1,1)`。
@@ -106,16 +106,16 @@ sidecar 强制 loopback-only（契约 §0，`config.validate()` 拒绝非 loopba
 - upstream discover **404** → HTTP **404** `{"code":"session_not_found","sessionID":"<sid>"}`
 - upstream discover 其它 **4xx**（401/403/409…）→ HTTP **502** `{"code":"upstream_http_<N>"}`
 - upstream **5xx / 网络错误 / JSON 解析失败 / 非映射 JSON / 200 但 directory 不可用** → HTTP **503** `{"code":"upstream_unavailable"}`
-- **F2（2026-07-19）放宽 allowlist**：per-session status 用 `normalize_directory` **仅规范化、不 gate**；discover 得到的 directory ∉ allowlist 时**仍 200**（继续查 status map / 合成 idle），**不再** 400 `directory_not_allowed`。批量 `GET /slimapi/sessions/status` 仍走 `require_directory`。
-- **客户端影响**：原先统一 502 的失败现在按上游语义分裂；按 `code` 分发即可。F2 后客户端勿再把 per-session status 的 400 当成 allowlist miss 主路径。
+- **F2（2026-07-19）放宽 allowlist**：per-session status 用 `normalize_directory` **仅规范化、不 gate**；discover 得到的 directory ∉ allowlist 时**仍 200**（继续查 status map / 合成 idle），**不再** 400 `directory_not_allowed`。[Unreleased] 批量 `GET /slimapi/sessions/status` 也不再 gate，与 per-session 行为对齐。
+- **客户端影响**：原先统一 502 的失败现在按上游语义分裂；按 `code` 分发即可。F2 后客户端勿再把 per-session status 的 400 当成 allowlist miss 主路径。[Unreleased] 后 allowlist gate 全面移除，所有端点的 directory 一律透传。
 
 **2. `GET /slimapi/projects` — 5xx 状态码 502→503**（contract §7）
 - upstream 5xx/网络错误由原 **502** 改为 **503 `upstream_unavailable`**；4xx 仍走 502 `upstream_http_N`。
 - **客户端影响**：若 ocdroid 的 circuit breaker 硬编码 `/slimapi/projects` 失败=精确 502，须改为按 5xx 类（502/503）分发。
 
-**3. `GET /slimapi/messages/{sid}` + `/since/{ts}` + `/full/{mid}` + `/full?ids=`（G6）— query `directory` 软 allowlist**（contract §2/§7，G7-soft）
-- **四路由**统一经 `_resolve_messages_directory`：**directory 可选**——未传 query 时**不拦**（用 upstream 默认 directory）；显式传入则走 `require_directory` gate（∈ allowlist → 透传；∉ allowlist → 400 `directory_not_allowed`；query 与 `X-Opencode-Directory` 头冲突 → 400）。G6 `message_batch` 与单 mid `/full/{mid}` 同 gate。
-- **客户端影响**：可省略 `?directory`（依赖 upstream 默认）；若显式传则须为 allowlist 内目录。命中后 sidecar 把 normalized directory 作为 `X-Opencode-Directory` 转发上游。与 `/slimapi/questions` 聚合里下发的 `routeToken` 共同保证 directory 一致性（契约 §12）。
+**3. `GET /slimapi/messages/{sid}` + `/since/{ts}` + `/full/{mid}` + `/full?ids=`（G6）— query `directory` 转发**（contract §2/§7/§12）
+- **四路由**统一经 `_resolve_messages_directory`：**directory 可选**——未传 query 时**不拦**（用 upstream 默认 directory）；显式传入则 `normalize_directory` 后作 `X-Opencode-Directory` 透传。[Unreleased] **不再**走 allowlist gate——directory ∉ allowlist 不再 400；仅 query 与 `X-Opencode-Directory` 头冲突仍 400 `directory_not_allowed`（结构性歧义）。G6 `message_batch` 与单 mid `/full/{mid}` 同行为。
+- **客户端影响**：可省略 `?directory`（依赖 upstream 默认）；显式传则任意值（包括 `/projects` 未列出的）都会被原样规范化后透传，由上游 opencode 决定能否服务。
 
 **4. `GET /slimapi/messages/{sid}/full/{mid}` — oversized 流式 cap**（contract §7，G8）
 - 单条全文超过 `max_message_bytes`（默认 32 MiB）→ HTTP **413** `{"code":"message_too_large","limitBytes":<cap>}`。
@@ -134,7 +134,7 @@ sidecar 强制 loopback-only（契约 §0，`config.validate()` 拒绝非 loopba
 ### §2 写路径（B2）— ✅ 完全实现
 - routeToken：`tokens.py` HMAC 签发/校验，绑 `kind+requestID+sessionID+directory`，~1h TTL。
 - 聚合响应里随条下发（`questions.py:45`）；reply/reject/permissions 端点校验后注入 directory 转发。
-- 校验失败 → 400 `invalid_route_token`；directory 离开 allowlist → 400 `directory_not_allowed`；mutation 超时 → 504 `upstream_timeout`。
+- 校验失败 → 400 `invalid_route_token`；mutation 超时 → 504 `upstream_timeout`。[Unreleased] **不再**因 directory 离开 allowlist 返 400 `directory_not_allowed`——token 校验后 directory 直接 normalize 后透传给上游 opencode。
 - routeToken 404/过期透明（已应答/失效）→ 客户端重取聚合。
 - 通用写（发消息/abort）走 catch-all，客户端带 `X-Opencode-Directory` 头，sidecar 不剥（`forward_directory_headers`）。
 
@@ -170,7 +170,7 @@ sidecar 强制 loopback-only（契约 §0，`config.validate()` 拒绝非 loopba
 | 语境 | HTTP | code | 来源 |
 |---|---|---|---|
 | top-level | 400 | `version_required` / `version_incompatible` | §1 版本门闩 |
-| top-level | 400 | `directory_not_allowed` | allowlist miss / query-header 冲突（F2：不再适用 per-session status） |
+| top-level | 400 | `directory_not_allowed` | [Unreleased] **仅** messages `/**` query `directory` 与 `X-Opencode-Directory` 头冲突（结构性歧义）；allowlist gate 已移除 |
 | top-level | 400 | `invalid_directory_count` | 🆕 B1 questions directory count guard（1-32） |
 | top-level | 400 | `invalid_route_token` | 🆕 B1 routeToken 校验失败 |
 | top-level | 400 | `invalid_ids` | 🆕 G6：`ids` 空 / 超 20 / 解析后无有效 mid（缺 `ids`→422） |
@@ -233,7 +233,7 @@ sidecar 强制 loopback-only（契约 §0，`config.validate()` 拒绝非 loopba
 1. **错误体形状变更（最高优先）**：thin 路由 `{"detail":...}` → `{"code":...}`。**破坏性解析**——所有错误分发须改 `json()["code"]`。详见 `docs/CLIENT_CHANGES.md`。
 2. **`/slimapi/sessions/{sid}/status` 三态分裂**：原统一 502，现 404(`session_not_found`)/502(`upstream_http_N`)/503(`upstream_unavailable`)。建议按 `code` 而非 HTTP 状态分发。
 3. **`/slimapi/projects` 5xx 状态码 502→503**：circuit breaker 不应硬编码 502。
-4. **messages 四路由 query `directory` 软 allowlist（G7-soft）**（list / since / full/{mid} / **G6 full?ids=**）：`directory` **可选**——未传不拦（upstream 默认）；显式传则 `require_directory` gate；与 `X-Opencode-Directory` 头冲突会 400。
+4. **messages 四路由 query `directory` 转发**（list / since / full/{mid} / **G6 full?ids=**）：`directory` **可选**——未传不拦（upstream 默认）；显式传则 normalize 后透传（[Unreleased] 不再 gate allowlist）；与 `X-Opencode-Directory` 头冲突会 400 `directory_not_allowed`。
 5. **新增 413 `message_too_large`**（`/full/{mid}` 默认 mode）；`?mode=skeleton` 仍用 `response_too_large`。G6 累计超限整请求 413 `response_too_large`；单 mid 过大进 envelope。
 6. **新增 403 `shell_not_allowed`**：省流模式不应调 shell/PTY。
 7. **新增 400 `invalid_directory_count` / `invalid_route_token`**：q/p 聚合与 reply 错误分支。
@@ -243,7 +243,7 @@ sidecar 强制 loopback-only（契约 §0，`config.validate()` 拒绝非 loopba
 
 - **shell/PTY deny-list 是 best-effort，非安全保证**：路径大小写变体、`/./`、`/../` 段、双重编码**不归一化**；真实隔离靠 stunnel mTLS + 网络边缘。Ops 可 `OC_SLIMAPI_SHELL_DENY_LIST_ENABLED=0` 关闭。
 - **thin 路由 mid-stream upstream 异常**：list/since 路径的 `read_with_cap` 在上游中途断流时按 pre-existing 行为可能 500（spec §7 承认）；`/full/{mid}` 已包裹为 503 `upstream_unavailable`。
-- **routeToken-allowlist 时序（F3 已修复）**：sidecar `lifespan` 启动 warm `/project`；`_token` 走 `require_directory`（miss 自动刷新）。冷启动空窗不再致首个合法 reply 400。
+- **routeToken-allowlist 时序**：[Unreleased] slimapi 已**完全移除 directory allowlist gate**；`_token` 仅校验 HMAC + normalize directory，不再查 allowlist、不再调 `load_products`。冷启动空 allowlist 不再影响 routeToken 路径。`warm_allowlist` 保留用于 `/projects` 展示与 q/p null-directory 聚合 fan-out。
 
 ## 审计产物
 - 契约：`docs/v1-contract.md`（含头部「变更记录」+ §7 加性小节，wire 权威同步实现）

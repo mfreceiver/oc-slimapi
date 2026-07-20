@@ -1502,9 +1502,19 @@ def test_parse_link_next_cursor_does_not_match_rel_inside_other_param_value():
     assert _parse_link_next_cursor(link) is None
 
 
-async def test_messages_list_disallowed_directory_400(upstream_factory):
-    """G7-soft: query directory ∉ allowlist (empty /project) → 400."""
+async def test_messages_list_unknown_directory_passes_through(upstream_factory):
+    """slimapi no longer gates directories — ``?directory=/nope`` is forwarded
+    to upstream opencode normalised as ``X-Opencode-Directory``. Previously
+    this returned ``400 directory_not_allowed``; the allowlist gate is
+    removed and opencode now decides whether it can serve the directory.
+
+    Handler returns an empty message list (200), which slimapi surfaces
+    verbatim; we additionally assert the directory was forwarded.
+    """
+    captured: dict[str, str | None] = {}
+
     def handler(request: httpx.Request) -> httpx.Response:
+        captured["dir"] = request.headers.get("x-opencode-directory")
         return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
 
     upstream = upstream_factory(handler)
@@ -1517,8 +1527,9 @@ async def test_messages_list_disallowed_directory_400(upstream_factory):
                 "/slimapi/messages/s1?directory=/nope",
                 headers=VERSION_HEADERS,
             )
-        assert response.status_code == 400
-        assert response.json()["code"] == "directory_not_allowed"
+        assert response.status_code == 200
+        # Directory normalised (no trailing slash) and forwarded to upstream.
+        assert captured["dir"] == "/nope"
     finally:
         app.state.transforms.shutdown()
 
@@ -1564,9 +1575,15 @@ async def test_messages_list_no_directory_passes(upstream_factory):
 
 
 @pytest.mark.parametrize("path", ["/slimapi/messages/s1/since/1", "/slimapi/messages/s1/full/m1"])
-async def test_messages_since_and_full_allowlist(upstream_factory, path):
-    """G7-soft applies to /since and /full too."""
+async def test_messages_since_and_full_unknown_directory_passes_through(upstream_factory, path):
+    """slimapi no longer gates directories — applies uniformly to /since and
+    /full/{mid}. ``?directory=/nope`` is forwarded normalised; allowlist gate
+    (formerly 400 ``directory_not_allowed``) removed."""
+    captured: dict[str, str | None] = {}
+
     def handler(request: httpx.Request) -> httpx.Response:
+        captured["dir"] = request.headers.get("x-opencode-directory")
+        # Return a shape that both /since (array) and /full/{mid} (object) accept.
         return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
 
     upstream = upstream_factory(handler)
@@ -1576,8 +1593,10 @@ async def test_messages_since_and_full_allowlist(upstream_factory, path):
     try:
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.get(f"{path}?directory=/nope", headers=VERSION_HEADERS)
-        assert response.status_code == 400
-        assert response.json()["code"] == "directory_not_allowed"
+        # Either 200 (since returns [], or full/{mid} drains upstream body) —
+        # both indicate slimapi forwarded to upstream rather than 400'ing.
+        assert response.status_code in (200, 404)
+        assert captured["dir"] == "/nope"
     finally:
         app.state.transforms.shutdown()
 

@@ -374,18 +374,35 @@ async def test_projects_4xx_returns_502_upstream_http_n(upstream_factory):
     assert response.json() == {"code": "upstream_http_409"}
 
 
-async def test_batch_status_allowlist_miss_renders_code(upstream_factory):
-    """Batch GET /slimapi/sessions/status allowlist-miss → 400 structured body."""
+async def test_batch_status_passthrough_unknown_directory(upstream_factory):
+    """slimapi no longer gates directories — ``?directory=/nope`` is forwarded
+    to upstream opencode normalized; whatever opencode returns (status map +
+    status code) passes through unchanged. Allowlist miss used to 400 with
+    ``directory_not_allowed``; that gate is removed and opencode now decides.
+
+    The handler below returns an empty status map with 200, mirroring what a
+    real opencode would respond for an unknown directory it cannot serve
+    politely; slimapi surfaces it verbatim.
+    """
+    captured: dict[str, str | None] = {}
+
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session/status":
+            captured["dir"] = request.headers.get("x-opencode-directory")
+            captured["query"] = request.url.params.get("directory")
+            return httpx.Response(200, content=b"{}",
+                                  headers={"Content-Type": "application/json"})
         return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
 
     upstream = upstream_factory(handler)
-    app = _build_app(upstream)
+    app = _build_app(upstream)  # allowlist 默认空；不再 gate
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get("/slimapi/sessions/status?directory=/nope", headers=VERSION_HEADERS)
-    assert response.status_code == 400
-    assert response.json()["code"] == "directory_not_allowed"
+    assert response.status_code == 200
+    # Directory is normalised and forwarded both as query and header.
+    assert captured["query"] == "/nope"
+    assert captured["dir"] == "/nope"
 
 
 async def test_load_products_takes_app_state(upstream_factory):
@@ -416,3 +433,63 @@ async def test_warm_allowlist_swallows_upstream_error(upstream_factory):
     app = _build_app(upstream)
     await sessions_mod.warm_allowlist(app)
     assert app.state.directory_allowlist == set()
+
+
+# ---------------------------------------------------------------------------
+# slimapi no longer gates directories (regression coverage)
+# ---------------------------------------------------------------------------
+
+async def test_sessions_list_unknown_directory_passes_through(upstream_factory):
+    """``GET /slimapi/sessions?directory=/nope`` used to 400 with
+    ``directory_not_allowed`` when ``/nope`` was outside the discovery
+    allowlist. slimapi now normalises and forwards; opencode decides.
+
+    Locks the new passthrough on the sessions-list endpoint specifically
+    (batch /sessions/status and per-session /sessions/{sid}/status are
+    covered by sibling tests).
+    """
+    captured: dict[str, str | None] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session":
+            captured["dir"] = request.headers.get("x-opencode-directory")
+            captured["query"] = request.url.params.get("directory")
+            return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
+        return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream, allowlist=set())  # discovery allowlist empty
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/slimapi/sessions?directory=/nope", headers=VERSION_HEADERS,
+        )
+    assert response.status_code == 200
+    # Forwarded as both query and X-Opencode-Directory header.
+    assert captured["query"] == "/nope"
+    assert captured["dir"] == "/nope"
+
+
+async def test_sessions_list_normalizes_trailing_slash_before_forward(upstream_factory):
+    """``?directory=/app/`` (trailing slash) is forwarded normalised as
+    ``/app`` in both query and header — the allowlist gate is gone but
+    ``normalize_directory`` stays for forwarding consistency."""
+    captured: dict[str, str | None] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session":
+            captured["dir"] = request.headers.get("x-opencode-directory")
+            captured["query"] = request.url.params.get("directory")
+            return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
+        return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream, allowlist=set())
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/slimapi/sessions?directory=/app/", headers=VERSION_HEADERS,
+        )
+    assert response.status_code == 200
+    assert captured["query"] == "/app"
+    assert captured["dir"] == "/app"

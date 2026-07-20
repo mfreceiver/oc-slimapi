@@ -62,8 +62,17 @@ class Settings:
     )
 
     def validate(self) -> None:
-        if self.host not in {"127.0.0.1", "::1", "localhost"}:
-            raise RuntimeError("OC_SLIMAPI_HOST must be loopback-only")
+        # Bind host: loopback is the safe default; ``0.0.0.0`` is allowed as a
+        # plaintext direct-entry surface (port 4097) for ops scenarios such as
+        # reaching the sidecar over a Tailscale address without terminating
+        # stunnel mTLS in front. The :4097 listener is **plaintext** — remote
+        # exposure must rely on Tailscale ACL / host firewall for isolation.
+        # Arbitrary routable hosts (e.g. 192.168.x.x) remain rejected.
+        if self.host not in {"127.0.0.1", "::1", "localhost", "0.0.0.0"}:
+            raise RuntimeError(
+                "OC_SLIMAPI_HOST must be loopback or 0.0.0.0 "
+                "(plaintext direct-entry; protect via Tailscale ACL / firewall)"
+            )
         parsed = urlsplit(self.upstream)
         if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "::1", "localhost"}:
             raise RuntimeError("OC_SLIMAPI_UPSTREAM must be fixed loopback HTTP")

@@ -55,8 +55,12 @@ async def load_products(app: FastAPI) -> list[dict]:
 
 async def warm_allowlist(app: FastAPI) -> None:
     """Best-effort allowlist warm-up at startup. Swallows upstream errors so a
-    not-yet-ready opencode does not block sidecar boot; lazy refresh via
-    require_directory remains the fallback."""
+    not-yet-ready opencode does not block sidecar boot.
+
+    The allowlist is no longer a gate (directories are now passed through to
+    upstream opencode, which decides whether it can serve them). It survives
+    as a discovery dataset for ``/slimapi/projects`` display and for the
+    null-directory aggregation fan-out in ``questions._aggregate``."""
     try:
         await load_products(app)
     except Exception:
@@ -64,23 +68,14 @@ async def warm_allowlist(app: FastAPI) -> None:
 
 
 def normalize_directory(directory: str) -> str:
-    """Strip trailing slash (keep root '/'). Pure; no allowlist check."""
+    """Strip trailing slash (keep root '/'). Pure; no allowlist check.
+
+    slimapi no longer gates directories — any directory is forwarded to
+    upstream opencode (which decides whether it can serve it). Normalisation
+    is kept so forwarded ``X-Opencode-Directory`` headers and ``?directory=``
+    query params stay consistent across endpoints and across callers.
+    """
     return directory.rstrip("/") or "/"
-
-
-async def require_directory(request: Request, directory: str) -> str:
-    normalized = normalize_directory(directory)
-    if normalized not in request.app.state.directory_allowlist:
-        try:
-            await load_products(request.app)
-        except Exception as exc:
-            raise CodedHTTPException(
-                503, code="upstream_unavailable",
-                message="cannot refresh directory allowlist",
-            ) from exc
-    if normalized not in request.app.state.directory_allowlist:
-        raise CodedHTTPException(400, code="directory_not_allowed")
-    return normalized
 
 
 @router.get("/sessions")
@@ -93,7 +88,9 @@ async def sessions(
     search: str | None = None,
 ):
     if directory is not None:
-        directory = await require_directory(request, directory)
+        # slimapi no longer gates directories — normalize and forward; the
+        # upstream opencode decides whether it can serve the directory.
+        directory = normalize_directory(directory)
     params = {"limit": limit, "roots": str(roots).lower()}
     if directory is not None:
         params["directory"] = directory
@@ -135,7 +132,9 @@ async def projects(request: Request):
 
 @router.get("/sessions/status")
 async def statuses(request: Request, directory: str):
-    directory = await require_directory(request, directory)
+    # slimapi no longer gates directories — normalize and forward. opencode
+    # decides whether it can serve the directory (returns its own 4xx if not).
+    directory = normalize_directory(directory)
     response = await request.app.state.upstream.get(
         "/session/status",
         params={"directory": directory},
@@ -178,9 +177,10 @@ async def session_status(request: Request, sid: str):
         raise CodedHTTPException(503, code="upstream_unavailable")
     if not isinstance(directory, str):
         raise CodedHTTPException(503, code="upstream_unavailable")
-    # F2: per-session status is a read keyed by sid (capability). allowlist is
-    # not a security boundary (stunnel mTLS is); normalize without gating,
-    # aligning with /messages/{sid} (G7-soft). Batch /sessions/status still gates.
+    # F2 (historic): per-session status is a read keyed by sid (capability).
+    # slimapi no longer gates directories at all — normalize purely for
+    # forwarding consistency with the rest of the surface. Batch
+    # /sessions/status likewise only normalizes now.
     directory = normalize_directory(directory)
 
     # Status map: GET /session/status?directory=...

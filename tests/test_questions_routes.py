@@ -90,13 +90,26 @@ async def test_questions_bad_route_token(upstream_factory):
     assert response.json()["code"] == "invalid_route_token"
 
 
-async def test_questions_token_directory_not_allowed(upstream_factory):
-    """Valid signature but directory no longer in allowlist → 400 directory_not_allowed."""
+async def test_questions_token_unknown_directory_passes_through(upstream_factory):
+    """slimapi no longer gates the routeToken directory — the token's
+    directory is forwarded to upstream opencode regardless of whether the
+    sidecar's discovery allowlist knows about it. opencode (200 here) is
+    authoritative; slimapi does not police directories.
+
+    Previously this returned ``400 directory_not_allowed`` when the token's
+    directory was outside the discovery allowlist; that gate is removed.
+    """
+    seen: dict[str, str | None] = {}
+
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/question/q1/reply":
+            seen["dir"] = request.headers.get("x-opencode-directory")
+            seen["query"] = request.url.params.get("directory")
+            return httpx.Response(204)
         return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
 
     upstream = upstream_factory(handler)
-    app = _build_app(upstream, allowlist=set())  # nothing allowed
+    app = _build_app(upstream, allowlist=set())  # discovery allowlist empty
     secret = app.state.route_secret
     token = issue_route_token(secret, kind="question", request_id="q1", session_id=None, directory="/gone")
     transport = httpx.ASGITransport(app=app)
@@ -106,8 +119,10 @@ async def test_questions_token_directory_not_allowed(upstream_factory):
             headers=VERSION_HEADERS,
             json={"answers": [["a"]], "routeToken": token},
         )
-    assert response.status_code == 400
-    assert response.json()["code"] == "directory_not_allowed"
+    assert response.status_code == 204
+    # Token directory normalised and forwarded to upstream verbatim.
+    assert seen["query"] == "/gone"
+    assert seen["dir"] == "/gone"
 
 
 async def test_questions_mutation_timeout(upstream_factory):
@@ -132,8 +147,12 @@ async def test_questions_mutation_timeout(upstream_factory):
     assert body["message"] == "upstream mutation timed out; not retried"
 
 
-async def test_token_refreshes_cold_allowlist_then_reply(upstream_factory):
-    """F3: cold allowlist + valid /project refresh → routeToken dir allowed → 204."""
+async def test_token_cold_allowlist_then_reply(upstream_factory):
+    """F3 (historic): a valid routeToken whose directory is in cold-cache
+    allowlist produces 204. After [Unreleased] removed the allowlist gate,
+    this same path also covers directories NOT in any allowlist — slimapi
+    no longer polices directory membership, so the token's directory is
+    forwarded to upstream opencode which authoritatively returns 204."""
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/project":
             return httpx.Response(

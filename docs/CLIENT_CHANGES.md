@@ -33,11 +33,12 @@
   ```json
   {"code": "<snake_case_code>", "message"?: "<short human-readable>", ...}
   ```
-  例：`{"code":"session_not_found","sessionID":"ses_…"}`、`{"code":"directory_not_allowed"}`、`{"code":"upstream_http_409"}`、`{"code":"upstream_unavailable"}`、`{"code":"shell_not_allowed"}`。
+  例：`{"code":"session_not_found","sessionID":"ses_…"}`、`{"code":"directory_not_allowed"}`（仅 query/header 冲突场景，见下）、`{"code":"upstream_http_409"}`、`{"code":"upstream_unavailable"}`、`{"code":"shell_not_allowed"}`。
 - **`code` 即机器可读判别字段**；客户端错误处理 / circuit breaker 触发 / 用户文案分发应基于 `code`（而非解析 `detail` 字符串）。
 - **messages / events / versioning** 既已使用 `{"code":…}`，本次仅是 sessions / questions / projects 对齐；ocdroid 侧已有解析器无需重写，但需扩展识别以下新增 / 显式化的 code：`session_not_found`(404)、`upstream_http_N`(502)、`upstream_unavailable`(503)、`invalid_directory_count`(400)、`invalid_route_token`(400)、`shell_not_allowed`(403)。
 - **catch-all（非 `/slimapi/**`）错误体不变**：透传 upstream 原始 body；FastAPI 顶层异常可能仍为 500（无 `code`）。统一错误码表**仅适用于 thin 路由**。
 - **v0.2.1 修复**（ocdroid 缺口 2）：`GET /slimapi/sessions`（列表）失败路径此前**静默偏离**上述 coded 形状（upstream 4xx/5xx 原样透传 body、网络错落 FastAPI 默认 `{"detail":...}` 500）；现已对齐——4xx→502 `upstream_http_N`、5xx/网络→503 `upstream_unavailable`，body 为 `{"code":...}`。客户端若已按 `code` 解析（如 status/projects），sessions 列表现同样处理；若此前按"非 200 = 失败"粗判，行为不变。
+- **[Unreleased] directory allowlist gate 已移除**：slimapi 不再因 directory ∉ allowlist 返 400 `directory_not_allowed`。客户端任意 `?directory=`（包括未在 `/slimapi/projects` 列出的）会被原样规范化后透传给上游 opencode，由 opencode 决定能否服务。`directory_not_allowed` 错误码**仅**保留于 query `directory` 与 `X-Opencode-Directory` 头冲突的**结构性歧义**场景。其它结构性守卫未变：`invalid_directory_count`（显式 list 0 / >32）、`invalid_route_token`、版本门禁、upstream loopback SSRF guard。
 
 ### status 404 `session_not_found` 新分支
 
@@ -46,7 +47,7 @@
   - **404 `session_not_found`** → 该 session 已被删除 / 不存在；UI 移除该会话行，**勿**当成可重试的网络错误。
   - **503 `upstream_unavailable`** → upstream 不可达 / 5xx / 坏 JSON；走 circuit breaker + 重试。
   - **502 `upstream_http_N`** → upstream 返非 404 的 4xx；按业务语义处理。
-  - **400 `directory_not_allowed`** → **F2 起 per-session status 不再因 allowlist miss 返 400**（`normalize_directory` 仅规范化）；批量 `GET /slimapi/sessions/status` 仍可能 400。其它端点（q/p 显式 directory、messages query directory 等）仍可能 400。
+  - **400 `directory_not_allowed`** → **[Unreleased] slimapi 已完全移除 directory allowlist gate**：directory 不再因 ∉ allowlist 返 400；任意 directory 透传给上游 opencode。该错误码**仅**保留于 query `directory` 与 `X-Opencode-Directory` 头冲突的**结构性歧义**场景（messages `/**` 端点）。客户端此前因 allowlist miss 触发的 400 路径**不再发生**，opencode 自身的 4xx 会以 `upstream_http_N` 透传。
 
 ### `/slimapi/projects` 5xx 502→503 状态码变更
 
@@ -94,7 +95,7 @@
   - `scope.directories > 0 && items == []` → **scope 就绪、权威空**：可清本地 stale。
   - `scope.directories > 0 && items != []` → 正常 pending 列表。
   - 503 全失败响应**不含** `scope`（失败时语义无意义）。
-  - **显式 repeated `?directory=`**：去重保序，1–32；空/超 32 → 400 `invalid_directory_count`；单 dir ∉ allowlist → 400 `directory_not_allowed`。
+  - **显式 repeated `?directory=`**：去重保序，1–32；空/超 32 → 400 `invalid_directory_count`。[Unreleased] **不再因 directory ∉ allowlist 返 400**——任意 directory 透传给上游 opencode。
 - **冷启动推荐顺序**（F3 暖机后仍建议遵循，避免竞态）：
   1. `GET /slimapi/health`（版本自检 + `schema.degraded`）
   2. `GET /slimapi/projects`（刷新 allowlist；F3 启动已 best-effort warm，本步仍是权威刷新）
@@ -102,4 +103,4 @@
   4. `GET /slimapi/questions` + `/permissions`（可 null directory）
   5. 按需 `GET /slimapi/messages/{sid}` / `/since/{ts}` / `/full?ids=`
   6. 再连 `GET /slimapi/events`
-- routeToken reply/reject：F3 起 `_token` 走 `require_directory`（miss 自动刷新）；冷启动首个合法 reply 不再因空 allowlist 误 400。
+- routeToken reply/reject：[Unreleased] slimapi 已移除 allowlist gate，token 校验后 directory 直接 normalize 后透传给上游 opencode；冷启动空 allowlist 不再导致 400。`_token` 仅校验 HMAC 签名 + kind/requestID/sessionID/directory。

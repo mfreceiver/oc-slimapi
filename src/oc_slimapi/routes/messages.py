@@ -25,7 +25,7 @@ from ..upstream import (
     forward_directory_headers,
     strip_hop_by_hop,
 )
-from .sessions import _raise_upstream_status, require_directory
+from .sessions import _raise_upstream_status, normalize_directory
 
 router = APIRouter(prefix="/slimapi/messages/{sid}", tags=["messages"])
 
@@ -159,14 +159,19 @@ def _busy_response(accept_encoding: str | None = None) -> Response:
 
 
 async def _resolve_messages_directory(request: Request, directory: str | None) -> str | None:
-    """G7-soft (spec §5): validate query ``directory`` against the allowlist.
+    """Resolve query ``directory`` to a normalised value to forward upstream.
+
+    slimapi no longer gates directories — any directory is forwarded to
+    upstream opencode (which decides whether it can serve it). The two
+    structural checks below are kept:
 
     - ``directory is None`` → not blocked (returns None; upstream default applies).
       v1 only trusts query ``directory``; a lone ``X-Opencode-Directory`` header
       is not validated and not forwarded (unchanged behaviour).
-    - query present AND header present AND they differ → 400 directory_not_allowed.
-    - query present → require_directory (may raise 400 directory_not_allowed /
-      503 upstream_unavailable on refresh failure).
+    - query present AND header present AND they differ → 400 ``directory_not_allowed``
+      (defensive: the conflict is structurally ambiguous, regardless of which
+      directories are involved — slimapi refuses to guess which one to forward).
+
     Returns the normalised directory to forward (or None).
     """
     if directory is None:
@@ -175,7 +180,7 @@ async def _resolve_messages_directory(request: Request, directory: str | None) -
     if header_dir:  # treat empty header as absent
         if (header_dir.rstrip("/") or "/") != (directory.rstrip("/") or "/"):
             raise CodedHTTPException(400, code="directory_not_allowed")
-    return await require_directory(request, directory)
+    return normalize_directory(directory)
 
 
 async def _stream_upstream(

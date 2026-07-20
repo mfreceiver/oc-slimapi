@@ -12,7 +12,7 @@ from ..errors import CodedHTTPException
 from ..gzip_util import json_response
 from ..tokens import RouteTokenError, issue_route_token, verify_route_token
 from ..upstream import decoded_body_headers, forward_directory_headers
-from .sessions import load_products, normalize_directory, require_directory
+from .sessions import normalize_directory
 
 router = APIRouter(prefix="/slimapi", tags=["pending"])
 
@@ -31,14 +31,19 @@ async def _aggregate(request: Request, kind: Literal["question", "permission"], 
         unique = list(dict.fromkeys(normalized))
         if not unique or len(unique) > 32:
             raise CodedHTTPException(400, code="invalid_directory_count")
-        checked = [await require_directory(request, d) for d in unique]
+        # slimapi no longer gates directories — pass through to upstream
+        # opencode, which decides whether it can serve each directory.
+        checked = unique
     else:
-        # F1: null = aggregate the sidecar's whole scope (allowlist). NOT subject
-        # to the 1–32 guard — that constrains client-supplied lists; null means
-        # "sidecar's whole scope" sized by ops via opencode project list.
+        # F1: null = aggregate the sidecar's whole scope (discovered from
+        # ``/project``). NOT subject to the 1–32 guard — that constrains
+        # client-supplied lists; null means "sidecar's whole scope" sized
+        # by ops via opencode project list. The allowlist dataset survives
+        # only as a discovery list for this null fan-out (no longer a gate).
         allowlist = request.app.state.directory_allowlist
         if not allowlist:
             try:
+                from .sessions import load_products
                 await load_products(request.app)
             except Exception:
                 pass
@@ -119,7 +124,10 @@ async def _token(
         )
     except RouteTokenError as exc:
         raise CodedHTTPException(400, code="invalid_route_token") from exc
-    return await require_directory(request, payload["directory"])
+    # slimapi no longer gates the token's directory — normalize and forward.
+    # The token was issued by slimapi for a specific directory, so we honour
+    # that signature; upstream opencode decides whether it can serve the dir.
+    return normalize_directory(payload["directory"])
 
 
 async def _post(request: Request, path: str, directory: str, body: dict):

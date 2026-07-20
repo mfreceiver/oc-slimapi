@@ -42,6 +42,12 @@ ocdroid 对接时：
 
 > 开发中、尚未打 tag 的变更写在这里；`release.sh` 发版时把本节内容折叠进新版本标题下。
 
+### Changed
+
+- **`:4097` 放开为明文直连入口（可绑 `0.0.0.0`）**：`OC_SLIMAPI_HOST` 接受值由 `{127.0.0.1, ::1, localhost}` 扩展为 `{127.0.0.1, ::1, localhost, 0.0.0.0}`。绑 `0.0.0.0` 后客户端可通过 Tailscale 地址**直接**访问 `:4097`，**不强制 mTLS**——安全边界由 Tailscale ACL / 主机防火墙负责。`:14097` 仍为推荐的 mTLS 入口；任意 routable host（如 `192.168.x.x`）仍被 `config.validate()` 拒绝。**Upstream SSRF guard 不放松**：`OC_SLIMAPI_UPSTREAM` 仍必须为 fixed loopback HTTP，与 host 选择无关。`X-Slimapi-Version` 版本门禁未改动。**加性，未 bump** `X-Slimapi-Version`。
+
+- **完全移除 directory allowlist gate（slimapi 不再做目录警察）**：`require_directory()` 已删除；directory 不再因 ∉ allowlist 返 400 `directory_not_allowed`。涉及端点：`/slimapi/sessions`（列表）、`/slimapi/sessions/status`（批量）、`/slimapi/sessions/{sid}/status`（早已不 gate）、`/slimapi/questions`、`/slimapi/permissions`、`/slimapi/messages/**`（list/since/full/full?ids=）、routeToken 写端点（reply/reject/permission）。所有 directory 现统一行为：经 `normalize_directory` 规范化后作为 `X-Opencode-Directory` 头 + `?directory=` query **透传**给上游 opencode，由 opencode 自行决定能否服务。slimapi 保留：`normalize_directory`、显式 repeated `?directory=` 的去重保序 + `invalid_directory_count`（1–32 结构限制）、query `directory` 与 `X-Opencode-Directory` 头冲突 → 400 `directory_not_allowed`（结构性歧义，仍由 slimapi 拒绝）、`X-Slimapi-Version` 版本门禁、upstream 必须 loopback 的 SSRF guard。`/slimapi/projects` 仍返回发现到的项目；`app.state.directory_allowlist` 数据结构保留作 `/projects` 展示与 q/p null-directory 聚合 fan-out 用途，**不再作 gate**。**加性，未 bump** `X-Slimapi-Version`（错误码 `directory_not_allowed` 保留作 query/header 冲突场景，未删除）。
+
 ---
 
 ## [0.2.2] - 2026-07-20
