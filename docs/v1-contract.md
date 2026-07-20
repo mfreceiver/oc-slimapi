@@ -4,7 +4,7 @@
 >
 > | 修订日期 | wire 版本 | 文档 rev | 变更摘要 | 落地对照 |
 > |---|---|---|---|---|
-> | **2026-07-20** | **1（additive，未 bump）** | **C** | ocdroid 契约遗留缺口 ratify（3 缺口 + 2 个 pre-existing 真 bug）：**Gap1** `/since/{ts}` 时间过滤 no-op 修复（`info.time.updated` 在 v1.18.3 不存在 → 改读 `updated or created`，与 digest `updatedAt` 对齐）+ 等时间戳 tie-break 规则 `(updatedAt, messageID)` 二元组字典序；**Gap2** `/slimapi/sessions` 列表 §7 偏离修复（原样透传 → `_raise_upstream_status`）+ q/p envelope 加 `scope.directories` 区分「scope 未就绪 / 权威空」；**Gap3** `/since/0` cursor drain 推荐。197 tests green。详见 §14.6。 | §5 / §2 / §7 / §12 / §14.6 |
+> | **2026-07-20** | **1（additive，未 bump）** | **C** | ocdroid 契约遗留缺口 ratify（3 缺口 + 2 个 pre-existing 真 bug）：**Gap1** `/since/{ts}` 时间过滤 no-op 修复（`info.time.updated` 在 v1.18.3 不存在 → 改读 `updated or created`，与 digest `updatedAt` 对齐）+ 等时间戳 tie-break 规则 `(updatedAt, messageID)` 二元组字典序；**Gap2** `/slimapi/sessions` 列表 §7 偏离修复（原样透传 → `_raise_upstream_status`）+ q/p envelope 加 `scope.directories` 区分「scope 未就绪 / 权威空」；**Gap3** `/since/0` cursor drain 推荐。200 tests green。详见 §14.6。 | §5 / §2 / §7 / §12 / §14.6 |
 > | **2026-07-20** | **1（additive，未 bump）** | **B** | ocdroid《slimapi 接口评审报告》§3–§6 原始发现 **F1–F5 + §5 文档重构** 全部落地；本仓审计扩展 **G1（错误可见性）/ G6（批量展开）/ D1–D8（文档同步）** 一并实现；另修 2 个 pre-existing SSE 生命周期 bug（teardown 计数泄漏 / queued_bytes 不扣账）+ G1 `error.name` 类型防御。全加性，`X-Slimapi-Version` 仍为 `1`。190 tests green（双独立门控 PASS）。逐条对照见 **§14**。 | §14 |
 > | 2026-07-19 | 1（additive） | —（并入 B） | F1–F5/§5/G1/G6/D1–D8 实现提交日（同一批次，文档 rev B 统一收录）。 | §14 |
 > | 2026-07-18 | 1（B1） | A | 初始收敛版（A1-A3 / B1-B3 / C1-C2 全定，A2=A 时间戳锚点）；thin 路由错误体 `{"code":...}`、G2 status 404-502-503 分裂、projects 5xx 502→503、新增 8 个错误码。详见 §7。 | — |
@@ -259,4 +259,4 @@ skeleton 共享缓存（YAGNI，先指标）、多用户（独立 stack）、Par
 - 🔴 q/p 显式 directory **规范化后去重**（`/app`+`/app/` 不再算 2 scope dir / 双 fan-out；rev-13 review 捕获）。
 - 🔴 `/sessions` 列表 200+坏 JSON/坏 shape → 503 `upstream_unavailable`（复刻 sibling `/projects` 防御；rev-13 review 捕获）。
 
-**验证**：本批 +10 测试（Gap1 `/since` 过滤 1 + Gap2 sessions 失败路径 3 + 坏 JSON 2 + q/p scope 5 含 normalize-dedup 1）；`./scripts/check.sh` → **200 passed**, EXIT=0。全加性，wire 仍 `1`。
+**验证**：本批 +10 测试（Gap1 `/since` 过滤 1 + Gap2 sessions 失败路径 3 + 坏 JSON 2 + q/p scope 3 + normalize-dedup 1）；`./scripts/check.sh` → **200 passed**, EXIT=0。全加性，wire 仍 `1`。

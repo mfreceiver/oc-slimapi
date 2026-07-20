@@ -269,6 +269,37 @@ async def test_questions_explicit_directory_normalizes_before_dedupe(upstream_fa
     assert body["errors"] == []
 
 
+async def test_questions_all_directories_fail_returns_503_without_scope(upstream_factory):
+    """rev-glm/rev-grok 🟡 consensus gap: when EVERY directory's upstream fetch
+    fails (here: explicit ?directory= list, each upstream /question returns 500),
+    _aggregate returns 503 with the same {items, errors} envelope shape but
+    WITHOUT the `scope` key — scope is a success-only signal (Gap 2B).
+
+    Locks the line `if status == 200: body["scope"] = ...` (questions.py:82-83)
+    so a future refactor cannot accidentally attach scope to the 503 branch."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/question":
+            return httpx.Response(500, content=b"boom")
+        return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream, allowlist={"/app", "/foo"})
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/slimapi/questions?directory=/app&directory=/foo",
+            headers=VERSION_HEADERS,
+        )
+    assert response.status_code == 503
+    body = response.json()
+    # Envelope shape preserved on 503...
+    assert body["items"] == []
+    assert [e["code"] for e in body["errors"]] == ["upstream_http_500", "upstream_http_500"]
+    assert [e["directory"] for e in body["errors"]] == ["/app", "/foo"]
+    # ...but `scope` MUST be absent (key locking assertion).
+    assert "scope" not in body
+
+
 async def test_permissions_envelope_includes_scope(upstream_factory):
     """ /permissions shares _aggregate — same scope signal on 200 envelope."""
     def handler(request: httpx.Request) -> httpx.Response:

@@ -1,7 +1,7 @@
 # oc-slimapi v1 契约实现状态报告
 
 - **基准契约**：[`docs/v1-contract.md`](./v1-contract.md)（唯一 wire 基准）
-- **审计对象**：oc-slimapi 仓库 working tree at `9373550` + 本批（2026-07-19 ocdroid-findings）未提交改动
+- **审计对象**：oc-slimapi 仓库 @ main（含 v0.2.0 `0752beb` + v0.2.1 `340378b` ocdroid-findings + 缺口 ratify 累计；现行状态见 `docs/v1-contract.md` §14）
 - **审计方法**：逐条对照契约 §0–§11，交叉核验源码（`src/oc_slimapi/**`）+ 测试（`tests/`，**200 passed** @ 2026-07-20）+ 配套文档（v1-impl-spec / INTERFACE_MAP / CHANGELOG / CLIENT_CHANGES）
 - **状态图例**：✅ 完全实现 · 🟡 部分实现 · ⚫ 未实现 · 🔄 变更（相对契约前的行为变化）
 - **给**：ocdroid 项目组

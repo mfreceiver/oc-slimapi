@@ -205,6 +205,33 @@ async def test_sessions_list_upstream_4xx_returns_502(upstream_factory):
     assert response.json()["code"] == "upstream_http_400"
 
 
+async def test_sessions_list_upstream_404_returns_502_upstream_http_404(upstream_factory):
+    """rev-glm/rev-grok 🟡 consensus gap: GET /slimapi/sessions (list, no sid)
+    with upstream /session returning 404 → HTTP 502 with code
+    `upstream_http_404`, NOT `session_not_found`.
+
+    The session_not_found mapping in _raise_upstream_status (sessions.py:157-158)
+    only fires when sid is provided (single-session discover paths). The list
+    handler calls _raise_upstream_status(exc) WITHOUT sid, so 404 falls through
+    to the generic `status < 500` branch → 502 upstream_http_404. This test
+    locks that distinction so a future refactor cannot accidentally start
+    routing list-level 404s through session_not_found."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, content=b'{"error":"not found"}')
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/slimapi/sessions", headers=VERSION_HEADERS)
+    assert response.status_code == 502
+    body = response.json()
+    assert body["code"] == "upstream_http_404"
+    # Key negative assertion: list-level 404 is NOT session_not_found.
+    assert body["code"] != "session_not_found"
+    assert "sessionID" not in body
+
+
 async def test_sessions_list_upstream_5xx_returns_503(upstream_factory):
     """GET /slimapi/sessions upstream 5xx → 503 upstream_unavailable (§7)."""
     def handler(request: httpx.Request) -> httpx.Response:

@@ -130,7 +130,7 @@ git push origin main && git push origin vX.Y.Z
 | oc-slimapi 开发 | 改 wire 前先想好 CHANGELOG 条目；发版前节必须齐 |
 | Agent | 禁止发版不写 CHANGELOG；破坏性变更禁止只改代码不改契约 |
 
-**不要**依赖 conventional commit 自动生成作为唯一记录：本项目 **接口语义**（如 `time.updated >= ts`、`archived` 为 epoch ms）必须用人工可读的行为描述，自动生成仅可作辅助。
+**不要**依赖 conventional commit 自动生成作为唯一记录：本项目 **接口语义**（如 `(info.time.updated or info.time.created) >= ts`、`archived` 为 epoch ms）必须用人工可读的行为描述，自动生成仅可作辅助。
 
 ---
 

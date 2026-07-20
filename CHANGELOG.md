@@ -44,6 +44,24 @@ ocdroid 对接时：
 
 ---
 
+## [0.2.2] - 2026-07-20
+
+> v0.2.1 三审门控（rev-gpt 9.0 / rev-glm 9.0 / rev-grok 9.3 → 均 NEEDS-FIX）发现的发布级文档 stale 修复 + 2 回归测试增强。**无 wire 行为变更**（纯文档一致性 + 测试加固），`X-Slimapi-Version` 仍为 `1`。
+
+### Fixed
+
+- **v1-contract.md 修订日志 rev C 测试数 stale**（`197`→`200`，对齐 §14.6 / impl-status / check.sh 实跑 202）+ **§14.6 测试拆解算术**（"+10 各分项"对齐：messages 1 + sessions 3 + 坏 JSON 2 + q/p scope 3 + normalize-dedup 1）。
+- **release.md §5 当前语义示例**：`time.updated >= ts` → `(info.time.updated or info.time.created) >= ts`；**v1-contract-implementation-status** 审计 commit ref 刷新（`9373550` working tree → main 累计 `0752beb`+`340378b`）。
+- **messages.py `messages_since` docstring**：ts 地板字段 `time.updated` → `(time.updated or time.created)`。
+- **CHANGELOG `[0.1.0]` 历史条目**加 v0.2.1 勘误脚注（避免后人按历史条目重新引入 no-op）。
+- **CHANGELOG `[0.2.1]` Fixed** 补 q/p 规范化去重条目（`invalid_directory_count` 守卫语义改为按规范化后 fan-out 数，客户端可观测）。
+
+### Added
+
+- **2 回归测试**（rev-glm + rev-grok 🟡 共识缺口）：q/p 全 dir 失败 503 **不含 `scope`**（`test_questions_all_directories_fail_returns_503_without_scope`）；`/sessions` list upstream 404 → **502 `upstream_http_404`**（非 `session_not_found`，`test_sessions_list_upstream_404_returns_502_upstream_http_404`）。
+
+---
+
 ## [0.2.1] - 2026-07-20
 
 > 本批次（2026-07-20 rev C）ratify ocdroid 契约遗留 3 缺口（**Gap1** 等时间戳 tie-break + **Gap2** 空/失败区分 + **Gap3** `/since/0` cursor drain）+ 查证中发现的 2 个 pre-existing 真 bug（`/since` 过滤 no-op + `/sessions` 列表 §7 偏离）+ 2 处防御缺口（q/p 规范化去重 + `/sessions` 坏 JSON→503）。全加性，**不** bump `X-Slimapi-Version`（仍为 `1`）。逐条对照见 `docs/v1-contract.md` §14.6。
@@ -60,6 +78,7 @@ ocdroid 对接时：
 
 - **`/slimapi/sessions` 列表 §7 偏离**（ocdroid 缺口 2）：upstream 4xx/5xx 不再原样透传 body、网络错（`httpx.RequestError`）不再落 FastAPI 默认 `{"detail":...}` 500；统一对齐 sibling（`/sessions/{sid}/status`、`/projects`）：4xx→502 `upstream_http_N`、5xx/网络→503 `upstream_unavailable`，body 为 `{"code":...}`。补 3 测试（原零覆盖）。
 - **契约 §5 字段勘误 + `/since/0` 推荐**（ocdroid 缺口 1 + 3）：§5 原述 `time.updated >= ts` 引用了 v1.18.3 不存在的 message 级字段，勘误为 `(info.time.updated or info.time.created) >= ts`；并补注无 watermark 的初始拉取推荐 cursor drain（`?before` 分页）而非 `/since/0`。
+- **q/p 显式 directory 规范化后去重**（rev-13 review 捕获；客户端可观测）：显式 `?directory=` 先 `normalize_directory` 再去重，消除 `/app`+`/app/` 双 fan-out；`invalid_directory_count` 守卫语义随之改为按**规范化后 fan-out 数**判定（33 个 raw dir 去重 ≤32 → 200，旧 raw-dedup 行为 → 400）。
 
 ---
 
@@ -106,7 +125,7 @@ ocdroid 对接时：
 - **会话 / 项目 / 状态**：`GET /slimapi/sessions`、`GET /slimapi/projects`、`GET /slimapi/sessions/status`、`GET /slimapi/sessions/{sid}/status`（骨架裁剪 + directory allowlist）。
 - **消息（扁平路径，契约 §2）**：
   - `GET /slimapi/messages/{sid}` — 骨架分页（`?limit`/`before`/`mode=skeleton|full`）。
-  - `GET /slimapi/messages/{sid}/since/{ts}` — **A2=A**：返回 `info.time.updated >= ts` 的骨架（含边界）；`?limit`（默认 50，上限 200）+ `?before`；多页扫描共用单 transform admission + 累计字节预算；超限 → `413 response_too_large`。
+  - `GET /slimapi/messages/{sid}/since/{ts}` — **A2=A**：返回 `info.time.updated >= ts` 的骨架（含边界）；`?limit`（默认 50，上限 200）+ `?before`；多页扫描共用单 transform admission + 累计字节预算；超限 → `413 response_too_large`。 _(勘误于 v0.2.1：opencode v1.18.3 无 message 级 `info.time.updated`，实读 `created`；见 `[0.2.1]` Changed）_
   - `GET /slimapi/messages/{sid}/full/{mid}` — 单条按需展开（默认 `mode=full`）。
 - **分页游标**：`X-Next-Cursor` = opencode 响应 **`Link: rel="next"`** 中 `before=` 的 **opaque 字符串原样透传**（不 decode/re-encode）。客户端翻页：`?before=<X-Next-Cursor>`。opencode cursor 为 base64url；含 percent-encoding 的非规范 cursor 经 FastAPI/httpx 会规范化（见契约实现边界）。
 - **SSE 策展**：`GET /slimapi/events` — 单上游 `/global/event`；吐 `session.digest`（debounce）+ question/permission 直推 + `server.connected`/`heartbeat`/`resync`；丢弃 text.delta / part.* / tool.*。

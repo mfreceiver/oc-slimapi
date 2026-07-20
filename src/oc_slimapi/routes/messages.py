@@ -254,7 +254,7 @@ async def messages_since(
     bodies (413 ``response_too_large`` on overflow — contract §7).
 
     Because upstream pages are sorted newest→oldest, the scan stops at the
-    first item with ``time.updated < ts``: every subsequent item in this page
+    first item with ``(time.updated or time.created) < ts``: every subsequent item in this page
     and any older page is also below the floor. The boundary (``== ts``) is
     included — clients dedup by messageID.
 
