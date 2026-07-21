@@ -289,84 +289,66 @@ sidecar 进程的启停、日志、升级由 **服务端运维** 负责，ocdroi
 | [`../AGENTS.md`](../AGENTS.md) | Agent 入口索引 |
 
 ---
-## 10. G-ACL 收紧 runbook（hardened posture：loopback + 14097 mTLS）
+## 10. G-ACL 部署姿态与边界验证（0.0.0.0:4097 + 14097 mTLS 隧道）
 
 > **参照**：`docs/ocmar/reports/2026-07-21-g-acl-ops-evidence.md`（本日证据报告）  
-> **批准**：omni 已批准 option A（严格 loopback + 14097 mTLS）作为 v0.3.1 的默认 hardened 部署姿态。以下为 ops 执行的精确收紧步骤。
+> **部署姿态**：用户最终接受 `0.0.0.0:4097` 明文监听 + `:14097` mTLS 隧道（stunnel `requireCert=yes verifyChain=yes`，复用既有证书）作为 steady-state。以下为 ops 维护的边界验证 runbook。
 
-### 10.1 目标拓扑
+### 10.1 稳态拓扑
 
 ```
-ocdroid ──(stunnel mTLS 14097)──▶ oc-slimapi 127.0.0.1:4097 (loopback only)
-                                      └─ loopback HTTP ──▶ opencode 127.0.0.1:4096
+ocdroid ──(stunnel mTLS 14097)──▶ oc-slimapi 0.0.0.0:4097 (plaintext, all interfaces)
+                    │
+                    ╰──(Tailscale 明文直连 :4097)──▶ oc-slimapi 0.0.0.0:4097 (plaintext; Tailscale ACL 受限)
 ```
 
-- `:4097` 绑定 **`127.0.0.1`（loopback）**，仅本机可达。
-- `:14097` 为公网唯一入口（mTLS，`requireCert=yes verifyChain=yes`）。
-- `:14096` 保留为直连回退（mTLS，不经 sidecar）。
+- **`:4097`（sidecar 明文端口）**：绑定 `0.0.0.0`（所有接口），**用户接受的稳态**。直接 `:4097` 的明文访问**必须**被网络边界（主机防火墙 / Tailscale ACL）阻塞，外部客户端须经 `:14097` mTLS 隧道。
+- **`:14097`（mTLS 入口）**：stunnel 终结后转发至 `127.0.0.1:4097`，公网唯一可达入口。任何未持有有效 CA 签名客户端证书的连接在 TLS 层即被拒绝。
+- **安全边界关键**：`0.0.0.0` 本身不提供接入控制——**依赖**网络边缘（防火墙 / Tailscale ACL）阻断公共/LAN 对 `:4097` 的直接明文 TCP。这就是使 `0.0.0.0` 可接受的安全约束。
+- **loopback-only（`127.0.0.1:4097`）** 属于更严格的替代姿态（代码支持 `config.validate()` 允许），但**不是**当前部署选择。
 
-### 10.2 收紧步骤（由 ops 执行）
+### 10.2 负向探针（边界验证）
 
-1. **编辑 systemd 用户单元**：  
-   文件 `~/.config/systemd/user/oc-slimapi.service`，找到 `Environment=OC_SLIMAPI_HOST` 行：
-   - 将 `OC_SLIMAPI_HOST=0.0.0.0` 改为 **`OC_SLIMAPI_HOST=127.0.0.1`**（或直接删除该行让代码默认值生效）。  
-   - 然后执行 `systemctl --user daemon-reload`。
+> **目的**：证实 `:14097` 仅可通过 mTLS（cert enforced）可达，且公共/LAN 不可直接到达 `:4097` 明文。
 
-2. **确认 stunnel mTLS 配置**（`~/.config/stunnel/stunnel.conf`）：  
-   - 节 `[slimapi-mtls]` 已包含 `accept=14097 connect=127.0.0.1:4097`，  
-     `requireCert=yes verifyChain=yes`，`CAfile/ca-cert.pem`，`cert/server-cert.pem key/server-key.pem`，  
-     SAN = `opencode.vectory.cn`。  
-   - 若证书需轮转，参照 `docs/mtls-setup-guide.md`（如存在）——**不在本仓库内**。无该文件时，ops 自行维护证书管理流程。
+```bash
+# 从外网（非 Tailscale 节点）扫描 14097 — 预期 port open（stunnel 响应）
+nmap -p 14097 opencode.vectory.cn
 
-3. **重启 sidecar**：  
-   ```bash
-   systemctl --user restart oc-slimapi
-   ```
-   （stunnel 若配置未变则无需重启；但改 unit 后 daemon-reload 已隐式重启 stunnel）
+# 从外网扫描 4097（明文）— 预期 filtered/closed（防火墙/ACL 阻断）
+nmap -p 4097 opencode.vectory.cn
 
-4. **正面验证（本机 loopback）**：  
-   ```bash
-   curl -s -H 'X-Slimapi-Version: 1' http://127.0.0.1:4097/slimapi/health   # 200
-   curl --cert client-cert.pem --key client-key.pem \
-     https://opencode.vectory.cn:14097/slimapi/health   # 200（mTLS）
-   ```
+# 从外网尝试 mTLS 连接，预期 TLS 握手失败（无有效客户端证书）
+curl -v https://opencode.vectory.cn:14097/slimapi/health
 
-5. **负面验证（外部 vantage，ops 执行记录）**：  
-   从非 Tailscale 主机（如公网蜂窝网络）执行：
-   ```bash
-   nmap -p 14097 opencode.vectory.cn          # filtered/closed
-   nmap -p 4097  opencode.vectory.cn          # filtered/closed
-   curl https://opencode.vectory.cn:14097/slimapi/health  # TLS reject（无有效客户端证书）
-   curl http://opencode.vectory.cn:4097/slimapi/health    # refused/timeout
-   ```
-   记录结果至证据报告 §3。
+# 从外网尝试明文连接 4097，预期拒绝/超时（边界阻断）
+curl http://opencode.vectory.cn:4097/slimapi/health
 
-6. **ocdroid profile 迁移**（外部仓库责任）：  
-   - ocdroid 客户端 `serverUrl` 须从 `http://<host>:4097` 改为 **`https://opencode.vectory.cn:14097`**（scheme + port + mTLS client cert）。  
-   - 此为 ocdroid 团队需执行的动作（另一个 Primary 仓库）；此处仅标注协调依赖。
+# 本机 loopback 验证（明文可达——此路径应被边界阻止，但本机不受限）
+curl -s -H 'X-Slimapi-Version: 1' http://127.0.0.1:4097/slimapi/health
 
-7. **回退（break-glass）**：  
-   若 `:14097` mTLS 路径故障，临时改回 `OC_SLIMAPI_HOST=0.0.0.0` 明文直连（Tailscale ACL 保护）——仅作 break-glass，**不** 稳态默认。
+# mTLS 回环（须带客户端证书；本机可用 stunnel 自签名测试）
+curl -s --cert client-cert.pem --key client-key.pem \
+  https://127.0.0.1:14097/slimapi/health
+```
 
-### 10.3 配置项一览
+**负向探针结果写入**：`docs/ocmar/reports/2026-07-21-g-acl-ops-evidence.md` §3，由 ops 从外部 vantage 执行后填充。
 
-| 配置项 | 当前 hardened 值 | 说明 |
-|---|---|---|
-| `OC_SLIMAPI_HOST` | **`127.0.0.1`** | hardened：loopback only；`0.0.0.0` 为 break-glass |
-| `OC_SLIMAPI_UPSTREAM` | `http://127.0.0.1:4096` | 不变（SSRF guard） |
-| stunnel `requireCert` | `yes` | 不变 |
-| stunnel `verifyChain` | `yes` | 不变 |
+### 10.3 正向验证（本机）
 
-### 10.4 mtls-setup-guide.md 存在性
+```bash
+# sidecar 健康（本机 loopback 明文）
+curl -s -H 'X-Slimapi-Version: 1' http://127.0.0.1:4097/slimapi/health
 
-| 文件 | 路径 | 存在性 |
-|---|---|---|
-| `docs/mtls-setup-guide.md` | `/home/mar/personal_projects/oc-slimapi/docs/mtls-setup-guide.md` | **不存在**（ops 需自行维护 mTLS 证书管理流程） |
+# mTLS 回环（须带客户端证书）
+curl -s --cert client-cert.pem --key client-key.pem \
+  https://127.0.0.1:14097/slimapi/health
+```
 
-| 文件 | 用途 |
-|---|---|
-| [`v1-contract.md`](v1-contract.md) | Wire 契约权威 |
-| [`release.md`](release.md) | 发版流程 |
-| [`../CHANGELOG.md`](../CHANGELOG.md) | 接口行为变更记录 |
-| [`develop.md`](develop.md) | 配置项速查 + 开发运行 |
-| [`../AGENTS.md`](../AGENTS.md) | Agent 入口索引 |
+### 10.4 Cert 复用说明
+
+- **Server cert/key**：`/home/mar/.config/stunnel/certs/server-cert.pem` + `server-key.pem`，SAN=`opencode.vectory.cn`，已用于 `:14097` mTLS 入口。
+- **CA cert**：`/home/mar/.config/stunnel/certs/ca-cert.pem`，用于签发客户端证书。
+- **Client cert**：ocdroid 客户端持有 `client-cert.pem` + `client-key.pem`（CA 签发）。**本轮 patch 无需轮换**。
+
+> **注意**：`docs/mtls-setup-guide.md` 不在此仓库；ops-maintained。证书更新流程由 ops 自行维护。

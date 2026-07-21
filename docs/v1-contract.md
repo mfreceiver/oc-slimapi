@@ -27,8 +27,9 @@
 
 ## §0 范围与架构
 - 纯 HTTP sidecar：FastAPI + httpx + orjson + uvicorn **单 worker**，host ∈ `{127.0.0.1, ::1, localhost, 0.0.0.0}`。
-  - **hardened 默认姿态**（v0.3.1 起）：`127.0.0.1`（loopback）绑定，**仅**本机 loopback + `:14097` mTLS（stunnel）可达；`0.0.0.0` 明文直连入口**降级为 break-glass**（Tailscale ACL / 防火墙保护），**不**是稳态推荐。
-  - `:14097` 为推荐 mTLS 入口（公网唯一）；upstream 始终固定 `127.0.0.1:4096`（SSRF guard 不随 host 放松）。
+  - **已部署稳态**：绑定 `0.0.0.0:4097`（所有接口），**用户接受**；直接 `:4097` 明文访问须经网络边界（防火墙/Tailscale ACL）阻断；外部客户端经 `:14097` mTLS 隧道（stunnel `requireCert=yes verifyChain=yes`，复用既有证书）可达。
+  - **`:14097`** 为公网唯一 mTLS 入口；upstream 始终固定 `127.0.0.1:4096`（SSRF guard 不随 host 放松）。
+  - **loopback-only（`127.0.0.1:4097`）** 属更严格替代姿态，非当前部署；代码允许该配置。
 - **不读 opencode SQLite**；仅 legacy `/session` API；upstream 始终固定 loopback HTTP（SSRF guard 不随 host 放松）。
 - v1 目标：**2-5 台同用户设备**（T3 硬化进 v1）。
 - 客户端通过"切换服务器"进省流（R8：`mtls×slim` 两布尔→4 配置），非连接属性开关。

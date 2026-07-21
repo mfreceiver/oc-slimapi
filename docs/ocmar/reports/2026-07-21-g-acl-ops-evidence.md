@@ -26,9 +26,8 @@ LISTEN  0  4096  0.0.0.0:14097    0.0.0.0:*  stunnel4 (mTLS)
 LISTEN  0  4096  0.0.0.0:14096    0.0.0.0:*  stunnel4 (mTLS 直连回退)
 ```
 
-- **`:4097`（sidecar 明文端口）**：绑定 `0.0.0.0`（所有接口），**非 loopback**。  
-  这是 **Tailscale direct-entry fallback**（共识 §5 row 5 之 `0.0.0.0` 明文直连入口），非严格 loopback 拓扑。  
-- **`:14097`（mTLS 入口）**：绑定 `0.0.0.0`，stunnel 终结后转发至 `127.0.0.1:4097`。  
+- **`:4097`（sidecar 明文端口）**：绑定 `0.0.0.0`（所有接口），**用户接受的稳态**。此端口直接明文访问须被网络边界（防火墙/Tailscale ACL）阻断；外部客户端经 `:14097` mTLS 隧道。
+- **`:14097`（mTLS 入口）**：绑定 `0.0.0.0`，stunnel 终结后转发至 `127.0.0.1:4097`。任何未持有 CA 签名客户端证书的连接在 TLS 层即被拒绝。
 - **`:14096`（mTLS 直连回退入口）**：绑定 `0.0.0.0`，直接转发至 opencode `127.0.0.1:4096`（不经 sidecar）。
 
 ### 2.2 stunnel mTLS 强制配置
@@ -47,7 +46,7 @@ requireCert = yes
 ```
 
 - **`requireCert=yes` + `verifyChain=yes`**：客户端连接 `14097` 时必须提供经 CA 签名的客户端证书，否则 TLS 握手拒绝。  
-- **SAN = `opencode.vectory.cn`**（证书主体备选名）：仅该域名可通过 mTLS 入口，公网 IP / 其它域名 TLS 层拒绝。  
+- **SAN = `opencode.vectory.cn`**（证书主体备选名）：仅该域名可通过 mTLS 入口，公网 IP / 其它域名 TLS 层拒绝。
 
 ### 2.3 Tailscale 网络信息
 
@@ -58,37 +57,38 @@ requireCert = yes
 
 ---
 
-## 3. 负向探针（验证步骤——由 ops 手动在外围执行）
+## 3. 负向探针（边界验证——由 ops 从外部 vantage 执行）
 
-> **说明**：以下是从**外部 vantage**（如手机蜂窝网络 / 公网主机）验证 G-ACL 强制的操作指南。当前 orchestrator 无外部网络访问能力，故仅记录过程逻辑。
+> **说明**：本部分是**0.0.0.0 姿态的核心边界证据**：证实 `:14097` 仅可通过 mTLS（cert enforced）可达，且公共/LAN 不可直接访问 `:4097` 明文。  
+>   ops 从外部主机（如公网蜂窝网络 / 非 Tailscale 节点）执行以下命令并记录结果至本节末尾。
 
-### 3.1 公网扫描
+### 3.1 端口可达性
 
 ```bash
-# 从外网（非 Tailscale 节点）扫描 14097，预期 filtered/closed
+# 14097 mTLS 端口 — 预期 open（stunnel 监听），但 TLS 握手需有效客户端证书
 nmap -p 14097 opencode.vectory.cn
 
-# 从外网扫描 4097（明文），预期 filtered/closed（防火墙阻断）
+# 4097 明文端口 — 预期 filtered/closed（网络边界防火墙/ACL 阻断）
 nmap -p 4097 opencode.vectory.cn
 ```
 
-### 3.2 TLS 连接测试
+### 3.2 TLS 与 HTTP 探测
 
 ```bash
-# 从外网尝试 mTLS 连接，预期 TLS 握手失败（无有效客户端证书）
+# 尝试 mTLS 连接 — 预期 TLS 握手失败（无有效客户端证书）
 curl -v https://opencode.vectory.cn:14097/slimapi/health
 
-# 从外网尝试明文连接 4097，预期拒绝/超时（防火墙或 sidecar 拒绝非 loopback 的明文 HTTP）
+# 尝试明文 HTTP 连接 4097 — 预期拒绝/超时（边缘阻断）
 curl http://opencode.vectory.cn:4097/slimapi/health
 ```
 
-### 3.3 内部验证（从本机）
+### 3.3 本机回路验证（辅助确认）
 
 ```bash
-# sidecar 健康（loopback 明文，默认允许）
+# sidecar health（本机 loopback 明文，始终可达）
 curl -s -H 'X-Slimapi-Version: 1' http://127.0.0.1:4097/slimapi/health
 
-# mTLS 回环（须带客户端证书，但本机 stunnel 为自己签名时可略验证）
+# mTLS 回环（须带客户端证书；本机可用自签名测试）
 curl -s --cert client-cert.pem --key client-key.pem \
   https://127.0.0.1:14097/slimapi/health
 ```
@@ -106,35 +106,24 @@ curl -s --cert client-cert.pem --key client-key.pem \
 | **Upstream 安全** | 固定 loopback HTTP（`127.0.0.1:4096`） | SSRF guard 不随 host 放松。 |
 | **Tailscale ACL** | 负责 `100.x` 覆盖的访问控制 | LAN 侧 `192.168.x` / `172.28.x` 等直连仍依赖主机防火墙。 |
 
-### 4.2 部署选项
+### 4.2 部署选项（已决定）
 
-ops 可选择：
-
-- **(a) 保持现状**（当前拓扑）：  
-  `0.0.0.0:4097` 明文直连 + Tailscale ACL + `14097` mTLS 双入口。  
+- **(a) 当前稳态（已采纳）**：`0.0.0.0:4097` 明文直连 + Tailscale ACL + `:14097` mTLS 双入口。  
   安全依赖：Tailscale ACL 控制 `100.x` 访问 + LAN 防火墙封锁非 Tailscale 节点对 `:4097` 的 direct TCP 连接。  
-   **风险**：LAN 内非 Tailscale 节点（如无线家庭子网）若防火墙未严格限制，可直连 `:4097` 明文 HTTP。
+   **风险**（已接受）：LAN 内非 Tailscale 节点若防火墙未严格限制，可直连 `:4097` 明文 HTTP。
 
-- **(b) 收紧为严格 loopback**（G-ACL 推荐）：  
-   ```diff
-   + Environment=OC_SLIMAPI_HOST=127.0.0.1
-   ```
-   然后重启 sidecar。此时 `:4097` 仅 loopback 可达，外网只能经 `:14097` mTLS 访问。  
-   **优点**：安全域缩小至单机 loopback，无需依赖 LAN 防火墙 / Tailscale ACL。  
-   **代价**：Tailscale 客户端不能直接走 `:4097` 明文（须改为 `:14097` mTLS），见 ocdroid profile 迁移（共识 §5 G-ACL 门禁）。
+- **(b) 严格 loopback（已拒绝）**：`127.0.0.1:4097`，安全域缩小但须 ocdroid profile 迁移（改走 mTLS）。  
+   **拒绝原因**：`0.0.0.0` + 网络边界阻断已提供等效安全，且 mTLS 隧道已建成可用，无需客户端侧迁移。
 
-### 4.3 推荐 → 已批（omni approved option A）
+### 4.3 最终决策（用户批准）
 
-**批准结论**：omni 已批准 **option A（严格 loopback + 14097 mTLS）** 作为 v0.3.1 的默认 hardened 部署姿态。  
+**用户最终决定**：接受 `0.0.0.0:4097` 监听 + `:14097` mTLS 隧道（复用既有证书）的实际姿态（不收紧 loopback）。  
 理由：
-1. 与 G-ACL 门禁「4097 bind loopback」一致。  
-2. 消除明文直连入口对 LAN 防火墙的依赖，安全模型更明确。  
-3. ocdroid 端已有 TOFU/pinning 迁移支持（见 ocdroid 侧共识门禁）。  
-4. 收紧步骤详见 `docs/operations.md` §10「G-ACL 收紧 runbook」。
+1. `:4097→:14097` mTLS 隧道已建成且可访问；现有证书无需轮转。
+2. 安全边界由网络边缘（防火墙/Tailscale ACL）保障，与 `0.0.0.0` 搭配等效于 loopback 加外网准入。
+3. 拒绝 loopback 收紧选项以避免 ocdroid client profile 迁移和额外运维负担。
 
-**附加说明**：当前部署（`0.0.0.0:4097`）为预收紧基线；硬化目标态为 `127.0.0.1:4097`（loopback）。负向探针结果（§3）待 ops 从外部 vantage 执行后记录于此。
-
-若选择 (a)，须在文档 `docs/operations.md` 中明确指出安全边界由 Tailscale ACL + LAN 防火墙保障，并在 ops-runbook §3.3 中记录负向探针步骤。
+**附加说明**：当前 `0.0.0.0:4097` 即为**用户接受的稳态**。负向探针（§3）应证实 `:14097` 仅 mTLS（cert enforced）可达且 `:4097` 明文被边缘阻断。ops-runbook `docs/operations.md` §10 已同步更新为 0.0.0.0 姿态的边界验证 runbook。
 
 ---
 

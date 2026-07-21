@@ -57,7 +57,7 @@ ocdroid 对接时：
 
 - **C1 累计 413 一致**：累计字节超限 `response_too_large`（顶层 413）对 opt-in / 非 opt-in **一致**，不返 partial。per-mid `message_too_large` 同理。**Additive 行为对齐，未 bump**（非 opt-in 已有行为不变）。
 - **非 opt-in 零改变**：旧客户端（不传能力头）所有行为保持部署前语义（legacy 等价）。
-- **G-ACL hardened posture（option A）**：文档/部署默认收紧为 `:4097` loopback + `:14097` mTLS（stunnel，`requireCert=yes verifyChain=yes`）；`0.0.0.0` 明文直连降级为 break-glass（Tailscale ACL/防火墙保护，非 hardened 稳态）。代码无需改（`config.py` 默认已 `127.0.0.1`）；收紧步骤见 `docs/operations.md` §10 G-ACL runbook。**无 wire 变更，无代码变更**——仅 posture + runbook 更新。
+- **G-ACL 部署姿态**：`0.0.0.0:4097` + `:14097` mTLS 隧道（stunnel `requireCert=yes verifyChain=yes`，复用既有证书）为**用户接受的稳态**；直接 `:4097` 明文访问由网络边界（防火墙/Tailscale ACL）阻断，外部客户端经 `:14097` mTLS。代码无需改（`config.py` 默认 `127.0.0.1`；部署覆盖为 `0.0.0.0` 由 ops 控制）；边界验证 runbook 见 `docs/operations.md` §10。**无 wire 变更，无代码变更**——仅 posture 文档更新。
 
 ### Fixed
 
