@@ -61,6 +61,55 @@ class Settings:
         "1", "true", "yes", "on",
     )
 
+    # Opt-A partial-envelope (v0.3.1, wire-additive, no X-Slimapi-Version bump).
+    # Feature-flagged so ops can force legacy semantics even when clients send the
+    # capability header. Rollback thresholds drive an in-memory 1h rolling window
+    # in BatchLedger (see observability.py); trips ONLY when sample >= min_sample.
+    opt_a_partial_envelope_enabled: bool = os.getenv("OC_SLIMAPI_OPT_A_PARTIAL_ENVELOPE_ENABLED", "1").lower() in (
+        "1", "true", "yes", "on",
+    )
+    opt_a_auto_rollback_enabled: bool = os.getenv("OC_SLIMAPI_OPT_A_AUTO_ROLLBACK_ENABLED", "1").lower() in (
+        "1", "true", "yes", "on",
+    )
+    opt_a_rollback_window_seconds: int = int(os.getenv("OC_SLIMAPI_OPT_A_ROLLBACK_WINDOW_SECONDS", "3600"))
+    opt_a_rollback_min_sample: int = int(os.getenv("OC_SLIMAPI_OPT_A_ROLLBACK_MIN_SAMPLE", "100"))
+    opt_a_rollback_envelope_5xx_zero_baseline_rate: float = float(
+        os.getenv("OC_SLIMAPI_OPT_A_ROLLBACK_ENVELOPE_5XX_ZERO_BASELINE_RATE", "0.01")
+    )
+    opt_a_rollback_unknown_code_rate: float = float(
+        os.getenv("OC_SLIMAPI_OPT_A_ROLLBACK_UNKNOWN_CODE_RATE", "0.05")
+    )
+    # S-C/S-E deployment revision (env-or-file, best-effort, no validate needed).
+    deployment_revision: str | None = os.getenv("OC_SLIMAPI_DEPLOYMENT_REVISION")
+    deployment_revision_file: str | None = os.getenv("OC_SLIMAPI_DEPLOYMENT_REVISION_FILE")
+
+    # S-B Retry-After. Conservative minimum for network errors with no upstream
+    # guidance; hard cap for any passthrough/derived per-mid retryAfterMs value.
+    opt_a_retry_after_ms_conservative: int = int(
+        os.getenv("OC_SLIMAPI_OPT_A_RETRY_AFTER_MS_CONSERVATIVE", "200")
+    )
+    opt_a_retry_after_ms_cap: int = int(
+        os.getenv("OC_SLIMAPI_OPT_A_RETRY_AFTER_MS_CAP", "10000")
+    )
+
+    def read_deployment_revision(self) -> str | None:
+        """Best-effort deployment revision (env or file). Returns None if unset.
+        Swallows read errors (non-fatal — health simply omits the field)."""
+        # env wins; else file (support CREDENTIALS_DIRECTORY fallback like route_secret);
+        # strip whitespace; no length requirement (it's a deploy label, not a secret).
+        value: str | None = self.deployment_revision
+        if value:
+            return value.strip()
+        path = self.deployment_revision_file
+        if path is None and os.getenv("CREDENTIALS_DIRECTORY"):
+            path = str(Path(os.environ["CREDENTIALS_DIRECTORY"]) / "deployment-revision")
+        if not path:
+            return None
+        try:
+            return Path(path).read_text().strip()
+        except Exception:
+            return None
+
     def validate(self) -> None:
         # Bind host: loopback is the safe default; ``0.0.0.0`` is allowed as a
         # plaintext direct-entry surface (port 4097) for ops scenarios such as
@@ -116,6 +165,31 @@ class Settings:
             raise RuntimeError("OC_SLIMAPI_SSE_BUFFER_BYTES must be > 0")
         if self.sse_max_frame_bytes <= 0:
             raise RuntimeError("OC_SLIMAPI_SSE_MAX_FRAME_BYTES must be > 0")
+
+        # Opt-A rollback / retry-after guards (v0.3.1, additive).
+        if self.opt_a_rollback_window_seconds < 1:
+            raise RuntimeError("OC_SLIMAPI_OPT_A_ROLLBACK_WINDOW_SECONDS must be >= 1")
+        if self.opt_a_rollback_min_sample < 1:
+            raise RuntimeError("OC_SLIMAPI_OPT_A_ROLLBACK_MIN_SAMPLE must be >= 1")
+        if not 0.0 <= self.opt_a_rollback_envelope_5xx_zero_baseline_rate <= 1.0:
+            raise RuntimeError(
+                "OC_SLIMAPI_OPT_A_ROLLBACK_ENVELOPE_5XX_ZERO_BASELINE_RATE "
+                "must be between 0.0 and 1.0"
+            )
+        if not 0.0 <= self.opt_a_rollback_unknown_code_rate <= 1.0:
+            raise RuntimeError(
+                "OC_SLIMAPI_OPT_A_ROLLBACK_UNKNOWN_CODE_RATE "
+                "must be between 0.0 and 1.0"
+            )
+        if not 1 <= self.opt_a_retry_after_ms_cap <= 10000:
+            raise RuntimeError(
+                "OC_SLIMAPI_OPT_A_RETRY_AFTER_MS_CAP must be between 1 and 10000"
+            )
+        if not 0 <= self.opt_a_retry_after_ms_conservative <= self.opt_a_retry_after_ms_cap:
+            raise RuntimeError(
+                "OC_SLIMAPI_OPT_A_RETRY_AFTER_MS_CONSERVATIVE must be between 0 "
+                "and OC_SLIMAPI_OPT_A_RETRY_AFTER_MS_CAP"
+            )
 
     def read_route_secret(self) -> bytes:
         if self.route_secret:

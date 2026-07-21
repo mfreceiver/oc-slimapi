@@ -126,3 +126,69 @@
   5. 按需 `GET /slimapi/messages/{sid}` / `/since/{ts}` / `/full?ids=`
   6. 再连 `GET /slimapi/events`（消费 `server.reconfigured` + 连接建立期 coalescing）
 - routeToken reply/reject：**v0.3.0** slimapi 已移除 allowlist gate，token 校验后 directory 直接 normalize 后透传给上游 opencode；冷启动空 allowlist 不再导致 400。`_token` 仅校验 HMAC 签名 + kind/requestID/sessionID/directory。
+
+---
+
+## Opt-A 体验优先（v0.3.1，wire 保持 1）
+
+### 能力协商 (Opt-A)
+
+客户端通过 HTTP 头选择是否 opt-in partial-envelope：
+
+- **发送**：`X-Slimapi-Capabilities: mid-partial-envelope=1`（加性，非 wire bump）。
+- **语法**：逗号切分 token，trim 空白，每个 token 须恰含一个 `=`，name 大小写不敏感，value 字面比较。未知/格式错误 token 忽略。重复且值冲突 → fail-closed（该 capability 按非 opt-in 处理，并计入服务器 `capabilityConflicts` 指标）。
+- **旧客户端**（不传能力头）保持现有行为（legacy 语义）。
+
+### Envelope 形状（B2）
+
+部分成功（partial）、全部失败（errors-only）、整批网络失败等场景的响应形状：
+
+```text
+# 成功（items 非空，errors 空）
+200 { "items": [...], "errors": [] }
+
+# partial（items 与 errors 均非空）
+200 { "items": [...], "errors": [ { "messageID": "...", "code": "upstream_http_500" }, ... ] }
+
+# errors-only（items 空，errors 非空）——可为 terminal 或含可重试 code
+200 { "items": [], "errors": [ { "messageID": "...", "code": "message_not_found" }, ... ] }
+
+# 整批 network 失败（全部 ids 均为 RequestError，无任何其它 envelope error）
+503 upstream_unavailable  （仅 opt-in 全失败场景；非 opt-in 同样 503）
+```
+
+- **errors 项结构**：`{ "messageID": "<mid>", "code": "<snake_case_code>", "retryAfterMs"?: <int> }`。
+- **codes 分类**：
+  - **mid-terminal**：`message_not_found`、`message_too_large`、及按契约归类为终态的 4xx。
+  - **mid-retryable**：`upstream_http_5xx`、`upstream_http_429`、及 Opt-A 映射出的 `upstream_unavailable`（前半成功场景）。
+  - **network error**（仅 opt-in 映射）：`upstream_unavailable`（后半无成功场景不映射，仍顶层 503）。
+- **invariant**：items/errors 按 messageID 互斥幂等，顺序无关。
+
+### Retry-After
+
+- **顶层 503**（opt-in 全失败）：HTTP 响应头 `Retry-After: 1`（秒），或透传上游 int-seconds。客户端视作整体预算的一部分。非 opt-in 503 **不** 含 `Retry-After`（回归 legacy 语义）。
+- **Per-mid envelope**（opt-in 且存在成功 item 或其它 envelope error）：`errors[].retryAfterMs`（毫秒，≤10000）。典型值：
+  - `upstream_unavailable`（network）→ 200ms。
+  - `upstream_http_429`/`upstream_http_5xx` → passthrough upstream Retry-After(ms,capped 10000) 或 200。
+- **客户端 cap**：`retryAfterMs` 超 10s 时裁为 10s。
+- **backoff**：首次重试 200ms，二次 400ms（±30% 抖动）；遵循 §5 P0-A 预算表。
+
+### B1 预算（客户端侧 413 恢复）
+
+- **服务器保证**：顶层 413 `response_too_large`、不返 partial、不泄露完成态。
+- **客户端恢复算法**：halve（拆半）+ merge（合并）+ singleton（单 mid 副本不重复拉）。详细分区公式、并发上限、重试次数等参见 ocdroid 侧预算模型（rev 6 §5 P0-A）。slimapi 侧不改变此。
+
+### G-F1 cursor-walk 降级
+
+当 `/since` 检测到异常（重复 cursor、nextCursor 返回但页内无新 mid 经 dedup 后为空、或 digest 不一致）时，客户端应降级为 cursor-walk：
+
+- **端点**：`GET /slimapi/messages/{sid}`（`?before` cursor，无 timestamp 过滤）。
+- **机制**：复用已有 `fetchSlimInitialWindowBounded`（T11 round-4，`bumpBookmarkOnPartialFailure=false`）。maxPages 公式、wall-clock 30s、dedup by messageID HashSet。
+- **触发源**：digest-probe 不一致、`server.connected` 新 generation、`server.reconfigured`、用户手动刷新。自动合并触发（同 connection generation 最多 1 in-flight + 1 trailing，最小间隔 15min）。
+- **诚实标注**：该 endpoint 与 `/since` 共用上游 newest-first 排序/tie-break，故仅规避 `/since` 的 timestamp-filter 边界，不抵御上游排序 bug——由 G-F1 fixture + 周期 re-sync 兜底。
+
+---
+
+> **更新纪律**：以上 Opt-A 行为变更须同步反映在 `docs/v1-contract.md` §15 及 `CHANGELOG.md` v0.3.1 节。
+
+(End of file)

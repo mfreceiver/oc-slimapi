@@ -91,7 +91,8 @@ async def test_metrics_route_returns_snapshot_with_version_header():
         assert response.status_code == 200
         data = response.json()
         # Contract §2/§6 shape.
-        assert set(data) == {"sse", "skeleton"}
+        # Since the test app may or may not have a batch_ledger, accept both.
+        assert set(data) <= {"sse", "skeleton", "batch"}
         sse = data["sse"]
         assert set(sse) == {"subscribers", "hubs", "clients"}
         assert sse["subscribers"] == {

@@ -5,8 +5,10 @@ from fastapi import FastAPI
 import uvicorn
 
 from . import __version__
+from .capabilities import parse_capabilities
 from .config import settings
 from .errors import register_error_handlers
+from .observability import BatchLedger
 from .proxy import install_proxy
 from .routes import events, health, messages, metrics, questions, sessions
 from .sse.hub import HubRegistry
@@ -41,6 +43,9 @@ async def smoke(app: FastAPI) -> None:
 async def lifespan(app: FastAPI):
     settings.validate()
     app.state.config = settings
+    app.state.batch_ledger = BatchLedger(
+        window_seconds=settings.opt_a_rollback_window_seconds
+    )
     app.state.route_secret = settings.read_route_secret()
     app.state.upstream = create_client(settings)
     # Transform pool: admission semaphore + bounded worker executor, both
@@ -61,6 +66,11 @@ async def lifespan(app: FastAPI):
     # overwrite a fast fresh one.
     app.state.allowlist_lock = asyncio.Lock()
     app.state.schema_degraded = False
+    # S-E: best-effort deployment revision (env or file, swallow errors)
+    try:
+        app.state.deployment_revision = settings.read_deployment_revision()
+    except Exception:
+        app.state.deployment_revision = None
     # T3-hardened hub registry (contract §6): per-subscriber byte budget,
     # per-frame ceiling, and per-directory / total admission caps all flow
     # in from Settings so an operator can tune them via env without code.

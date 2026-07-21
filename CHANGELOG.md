@@ -38,6 +38,33 @@ ocdroid 对接时：
 - **thin-route 错误体形状**：sessions / questions 由 FastAPI 默认的 `{"detail":"…"}` 改为 **`{"code":string, "message"?:string, …}`**（与 messages/events/versioning 既有的 `{"code":…}` 形状对齐）。messages 已使用该形状，未变。
 - **新增加性错误码（thin 路由）**：`invalid_directory_count`（400，questions directory 数量 1–32 守卫）；`invalid_route_token`（400，questions routeToken 校验失败）。两者均加入 `docs/v1-impl-spec.md` §11 统一错误码表，**加性，不 bump**。
 
+## [0.3.1] - 2026-07-21
+
+> 体验优先 patch（Opt-A partial-envelope）。**全加性** wire / 部署行为，**未 bump** `X-Slimapi-Version`（仍为 `1`）。移交：`docs/ocmar/reports/2026-07-21-ux-first-consensus-archive.md`。
+
+### Added
+
+- **能力头 `X-Slimapi-Capabilities`（Opt-A）**：客户端 opt-in partial-envelope 的加性 HTTP 头。语法：逗号切分 token，trim，单 `=`，name 大小写不敏感，value 字面比较；未知/格式错误 token 忽略；重复值冲突 fail-closed。**Additive，未 bump**。
+- **B2 六行响应矩阵（Opt-A）**：success / partial / errors-only / terminal-envelope-completion / top-503 全场景。invariant（items/errors 按 messageID 互斥幂等）。**Additive，未 bump**。
+- **Retry-After**：顶层 HTTP `Retry-After`（秒）+ per-mid envelope `retryAfterMs`（ms，≤10000）。保守值 200ms，cap 10s。**Additive，未 bump**。
+- **Feature flag + 回滚阈值**：`OC_SLIMAPI_OPT_A_PARTIAL_ENVELOPE_ENABLED`（默认 1）；auto-rollback 1h 窗口，5xx >2×baseline 或 baseline=0→>1%、unknown-code >5%、min sample 100、latched sticky disable、in-flight not reverted、manual override。**Additive，未 bump**。（零基线 >1% 活跃；>2×baseline 通例暂延迟，待历史基线采集就绪）
+- **`/slimapi/metrics` batch ledger**：新子对象 `batch`，含 `optA{disabledLatched,disabledReason}`、`counters{...}`、`rollbackWindow{...}`、`byteSamples{...}`。**Additive，未 bump**。
+- **G-F1 fixtures**：循环触发 cursor-walk 降级（复用 `GET /slimapi/messages/{sid}`），事件驱动 + 15min 最小间隔 + single-flight。**Additive，未 bump**。
+- **S-C `/slimapi/metrics` byte-ratio 聚合**：`batch.byteSamples` 新增 `ratioMedian`/`ratioP90`（匿名 median/P90 的 skeleton-delivered/fetched 字节比率；fetched≤0 的样本不计）。**Additive，未 bump**。
+- **S-E deployment revision**：`OC_SLIMAPI_DEPLOYMENT_REVISION(_FILE)` env-or-file 注入 → `health` 响应 `server.deploymentRevision`（可选；未设置时整个字段省略）。**Additive，未 bump**。
+
+### Changed
+
+- **C1 累计 413 一致**：累计字节超限 `response_too_large`（顶层 413）对 opt-in / 非 opt-in **一致**，不返 partial。per-mid `message_too_large` 同理。**Additive 行为对齐，未 bump**（非 opt-in 已有行为不变）。
+- **非 opt-in 零改变**：旧客户端（不传能力头）所有行为保持部署前语义（legacy 等价）。
+- **G-ACL hardened posture（option A）**：文档/部署默认收紧为 `:4097` loopback + `:14097` mTLS（stunnel，`requireCert=yes verifyChain=yes`）；`0.0.0.0` 明文直连降级为 break-glass（Tailscale ACL/防火墙保护，非 hardened 稳态）。代码无需改（`config.py` 默认已 `127.0.0.1`）；收紧步骤见 `docs/operations.md` §10 G-ACL runbook。**无 wire 变更，无代码变更**——仅 posture + runbook 更新。
+
+### Fixed
+
+- **Legacy ledger 记录完整性**：`/slimapi/metrics` 的 `counters` 对象此前仅区分 opt-in/legacy 总量；现增加 `capabilityConflicts`、`capabilityMalformedTokens`、`networkMidErrorsTotal`、`unknownCodeTotal` 等细项，与 Opt-A 回滚联动。
+
+---
+
 ## [Unreleased]
 
 > 开发中、尚未打 tag 的变更写在这里；`release.sh` 发版时把本节内容折叠进新版本标题下。

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import re
+import time
 from typing import Literal
 from urllib.parse import urlparse
+from email.utils import parsedate_to_datetime
+from datetime import timezone
 
 import orjson
 import httpx
@@ -11,6 +15,7 @@ from fastapi import APIRouter, Query, Request
 from starlette.background import BackgroundTask
 from starlette.responses import Response, StreamingResponse
 
+from ..capabilities import parse_capabilities
 from ..errors import CodedHTTPException
 from ..gzip_util import error_response, json_response
 from ..skeleton import skeleton_message
@@ -37,6 +42,42 @@ TRANSFORM_RETRY_AFTER_SECONDS = 2
 # transform.read_with_cap's default (64KiB) so concurrent mids debit the budget
 # at finer granularity (pay-as-you-read).
 BATCH_CHUNK_SIZE = 16 * 1024
+
+
+def _parse_upstream_retry_after_seconds(value: str | None) -> int | None:
+    """Parse upstream Retry-After header to whole seconds (int). Returns None on
+    absent/unparseable. Supports delta-seconds (int) and HTTP-date (RFC 7231).
+    Never raises."""
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        # Try delta-seconds (integer)
+        return int(value)
+    except ValueError:
+        pass
+    # Try HTTP-date (RFC 7231)
+    try:
+        dt = parsedate_to_datetime(value)
+        if dt is not None:
+            # Normalize naive datetime to UTC before timestamp computation.
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            now = time.time()
+            return max(0, int((dt.timestamp() - now) + 0.5))  # ceil rounding
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return None
+
+
+def _opt_a_top_level_503(
+    request: Request, *, accept_encoding: str | None, retry_after_seconds: int | None,
+) -> Response:
+    """Return a 503 upstream_unavailable response with optional Retry-After for opt-in."""
+    response = error_response("upstream_unavailable", 503, accept_encoding=accept_encoding)
+    if retry_after_seconds is not None:
+        response.headers["Retry-After"] = str(retry_after_seconds)
+    return response
 
 
 def _extract_before_verbatim(query: str) -> str | None:
@@ -287,6 +328,7 @@ async def messages_since(
             # our X-Next-Cursor iff we end the scan without tripping the ts
             # floor and the limit is filled.
             last_page_cursor: str | None = None
+            _exhausted = True
             for _ in range(config.max_since_pages):
                 params = {"limit": limit}
                 if cursor:
@@ -324,6 +366,7 @@ async def messages_since(
                 finally:
                     await response.aclose()
                 if not page:
+                    _exhausted = False
                     break
                 page_full = False
                 for item in page:
@@ -340,8 +383,10 @@ async def messages_since(
                         page_full = True
                         break
                 if page_full:
+                    _exhausted = False
                     break
                 if not last_page_cursor:
+                    _exhausted = False
                     break
                 cursor = last_page_cursor
             # Emit X-Next-Cursor only when ALL of:
@@ -356,6 +401,7 @@ async def messages_since(
                 and len(collected) >= limit
                 and not hit_ts_floor
                 and last_page_cursor
+                and not _exhausted
             ):
                 base_headers["X-Next-Cursor"] = last_page_cursor
             if mode == "skeleton":
@@ -476,6 +522,25 @@ async def message_batch(
 
     config = request.app.state.config
     pool = request.app.state.transforms
+    ledger = getattr(request.app.state, "batch_ledger", None)
+    cap = parse_capabilities(request.headers.get("x-slimapi-capabilities"))
+    if ledger is not None:
+        ledger.record_capability_parse(conflict=cap.duplicate_conflict, malformed_tokens=cap.malformed_tokens)
+    opt_in = bool(
+        config.opt_a_partial_envelope_enabled
+        and cap.opt_in
+        and not cap.duplicate_conflict
+    )
+    if opt_in and ledger is not None:
+        if config.opt_a_auto_rollback_enabled:
+            ledger.evaluate_rollback(
+                auto_enabled=True,
+                min_sample=config.opt_a_rollback_min_sample,
+                envelope_5xx_zero_baseline_rate=config.opt_a_rollback_envelope_5xx_zero_baseline_rate,
+                unknown_code_rate_threshold=config.opt_a_rollback_unknown_code_rate,
+            )
+        if ledger.disabled:
+            opt_in = False
 
     # discover 先行（带 directory 头，spec §8 L266）
     try:
@@ -483,15 +548,58 @@ async def message_batch(
             f"/session/{sid}", headers=forward_directory_headers(directory),
         )
     except httpx.RequestError:
+        if opt_in:
+            accept_enc = request.headers.get("accept-encoding")
+            # Intentionally not recorded to Opt-A ledger: discover is pre-envelope /
+            # orthogonal to Opt-A (shared infra); rollback envelope_5xx measures
+            # Opt-A-specific regressions only.
+            return _opt_a_top_level_503(
+                request,
+                accept_encoding=accept_enc,
+                retry_after_seconds=max(1, math.ceil(config.opt_a_retry_after_ms_conservative / 1000)),
+            )
         raise CodedHTTPException(503, code="upstream_unavailable")
     try:
         resp.raise_for_status()
     except httpx.HTTPStatusError as exc:
-        _raise_upstream_status(exc, sid=sid)  # 404→session_not_found (no mid fetch); 其它→502/503
+        if exc.response.status_code == 404:
+            _raise_upstream_status(exc, sid=sid)
+        elif exc.response.status_code >= 500:
+            if opt_in:
+                accept_enc = request.headers.get("accept-encoding")
+                parsed_s = _parse_upstream_retry_after_seconds(
+                    exc.response.headers.get("retry-after")
+                )
+                retry_s = (
+                    max(1, parsed_s)
+                    if parsed_s is not None
+                    else max(1, math.ceil(config.opt_a_retry_after_ms_conservative / 1000))
+                )
+                # Intentionally not recorded to Opt-A ledger: discover is pre-envelope /
+                # orthogonal to Opt-A (shared infra); rollback envelope_5xx measures
+                # Opt-A-specific regressions only.
+                return _opt_a_top_level_503(
+                    request,
+                    accept_encoding=accept_enc,
+                    retry_after_seconds=retry_s,
+                )
+            _raise_upstream_status(exc, sid=sid)
+        else:
+            _raise_upstream_status(exc, sid=sid)
     # 200 + malformed body must not proceed to mid expand (→ 503).
     try:
         resp.json()
     except (ValueError, UnicodeDecodeError):
+        if opt_in:
+            accept_enc = request.headers.get("accept-encoding")
+            # Intentionally not recorded to Opt-A ledger: discover is pre-envelope /
+            # orthogonal to Opt-A (shared infra); rollback envelope_5xx measures
+            # Opt-A-specific regressions only.
+            return _opt_a_top_level_503(
+                request,
+                accept_encoding=accept_enc,
+                retry_after_seconds=None,
+            )
         raise CodedHTTPException(503, code="upstream_unavailable")
 
     sem = asyncio.Semaphore(4)
@@ -502,12 +610,15 @@ async def message_batch(
         "total": 0,
         "network_failed": False,
         "budget_exceeded": False,
+        "network_mids": set(),
     }
     succeeded: dict[str, dict] = {}
     errors: list[dict] = []
 
     def _aborted() -> bool:
-        return state["network_failed"] or state["budget_exceeded"]
+        if state["budget_exceeded"]:
+            return True
+        return (not opt_in) and state["network_failed"]
 
     async def fetch_one(mid: str) -> None:
         if _aborted():
@@ -530,7 +641,10 @@ async def message_batch(
                     upstream_request, stream=True,
                 )
             except httpx.RequestError:
-                state["network_failed"] = True
+                if opt_in:
+                    state["network_mids"].add(mid)
+                else:
+                    state["network_failed"] = True
                 return
             if _aborted():  # send() 是 await 点
                 return
@@ -538,10 +652,20 @@ async def message_batch(
                 errors.append({"messageID": mid, "code": "message_not_found"})
                 return
             if response.status_code >= 400:
-                errors.append({
-                    "messageID": mid,
-                    "code": f"upstream_http_{response.status_code}",
-                })
+                code = f"upstream_http_{response.status_code}"
+                entry = {"messageID": mid, "code": code}
+                if response.status_code == 429 or response.status_code >= 500:
+                    if opt_in:
+                        parsed_s = _parse_upstream_retry_after_seconds(
+                            response.headers.get("retry-after")
+                        )
+                        ms = (
+                            (parsed_s * 1000)
+                            if parsed_s is not None
+                            else config.opt_a_retry_after_ms_conservative
+                        )
+                        entry["retryAfterMs"] = min(max(0, ms), config.opt_a_retry_after_ms_cap)
+                errors.append(entry)
                 return
             buf = bytearray()
             mid_total = 0
@@ -568,7 +692,10 @@ async def message_batch(
                     buf.extend(chunk)
                     # ↑↑↑ 临界段结束 ↑↑↑
             except httpx.RequestError:
-                state["network_failed"] = True
+                if opt_in:
+                    state["network_mids"].add(mid)
+                else:
+                    state["network_failed"] = True
                 return
             body = bytes(buf)
         finally:
@@ -601,24 +728,95 @@ async def message_batch(
     except TransformBusy:
         return _busy_response(request.headers.get("accept-encoding"))
 
-    # 503 优先于 413：网络失败与累计超限同时成立时返 503。
-    if state["network_failed"]:
-        return error_response(
-            "upstream_unavailable", 503,
-            accept_encoding=request.headers.get("accept-encoding"),
-        )
-    if state["budget_exceeded"]:
-        return error_response(
-            "response_too_large", 413, limit=config.max_response_bytes,
-            accept_encoding=request.headers.get("accept-encoding"),
-        )
+    KNOWN_ENVELOPE_CODES = {"message_not_found", "message_too_large", "upstream_error", "upstream_unavailable"}
+    accept = request.headers.get("accept-encoding")
 
+    if not opt_in:
+        # LEGACY — wire-equivalent to pre-deploy (only ledger recording added).
+        if state["network_failed"]:
+            if ledger is not None:
+                ledger.record_legacy_outcome(top_level_503=True, mode=mode)
+            return error_response("upstream_unavailable", 503, accept_encoding=accept)
+        if state["budget_exceeded"]:
+            if ledger is not None:
+                ledger.record_legacy_outcome(top_level_503=False, mode=mode)
+            return error_response("response_too_large", 413, limit=config.max_response_bytes, accept_encoding=accept)
+        items = [succeeded[mid] for mid in order if mid in succeeded]
+        resp = json_response({"items": items, "errors": errors}, headers={"Cache-Control":"no-store"}, accept_encoding=accept)
+        if ledger is not None:
+            ledger.record_legacy_outcome(top_level_503=False, mode=mode)
+        return resp
+
+    # OPT-IN path
+    # C1: cumulative 413 stays top-level for opt-in too.
+    if state["budget_exceeded"]:
+        resp = error_response("response_too_large", 413, limit=config.max_response_bytes, accept_encoding=accept)
+        if ledger is not None:
+            ledger.record_opt_in_outcome(outcome="top_level_413", envelope_5xx=False,
+                unknown_codes=0, network_mid_errors=len(state["network_mids"]),
+                items_count=0, errors_count=0, bytes_fetched=state["total"],
+                bytes_delivered_skeleton=len(resp.body), mode=mode, retry_after_ms_emitted=0)
+        return resp
+
+    # Row 6: ALL requested IDs network-failed, no items, no other errors → top-level 503.
+    all_network = len(state["network_mids"]) == len(order)
+    if all_network and not succeeded and not errors:
+        retry_s = max(1, -(-config.opt_a_retry_after_ms_conservative // 1000))  # ceil
+        resp = _opt_a_top_level_503(request, accept_encoding=accept, retry_after_seconds=retry_s)
+        if ledger is not None:
+            ledger.record_opt_in_outcome(outcome="top_level_503", envelope_5xx=True,
+                unknown_codes=0, network_mid_errors=len(state["network_mids"]),
+                items_count=0, errors_count=0, bytes_fetched=state["total"],
+                bytes_delivered_skeleton=len(resp.body), mode=mode, retry_after_ms_emitted=0)
+        return resp
+
+    # 200 envelope (success / partial / errors-only). Materialize network mids.
+    conservative_ms = config.opt_a_retry_after_ms_conservative
+    cap_ms = config.opt_a_retry_after_ms_cap
+    retry_after_emitted = 0
+    for mid in state["network_mids"]:
+        errors.append({"messageID": mid, "code": "upstream_unavailable",
+                       "retryAfterMs": min(conservative_ms, cap_ms)})
+        retry_after_emitted += 1
+    # Defensive cap pass for upstream_http_N entries (already set in fetch_one)
+    if opt_in:
+        for entry in errors:
+            code = entry.get("code", "")
+            if code.startswith("upstream_http_") and entry.get("retryAfterMs") is not None:
+                entry["retryAfterMs"] = min(int(entry["retryAfterMs"]), cap_ms)
+                retry_after_emitted += 1
+
+    # Build items
     items = [succeeded[mid] for mid in order if mid in succeeded]
-    return json_response(
-        {"items": items, "errors": errors},
-        headers={"Cache-Control": "no-store"},
-        accept_encoding=request.headers.get("accept-encoding"),
-    )
+
+    # Invariant assertion
+    succeeded_ids = set(succeeded.keys())
+    error_ids = {e["messageID"] for e in errors}
+    if not succeeded_ids.isdisjoint(error_ids):
+        raise RuntimeError(f"invariant violation: {succeeded_ids & error_ids}")
+
+    # Classify outcome
+    if not items and not errors:
+        outcome = "errors_only"
+    elif items and errors:
+        outcome = "partial"
+    elif items and not errors:
+        outcome = "success"
+    else:  # not items and errors
+        outcome = "errors_only"
+
+    unknown_codes = sum(1 for e in errors if e.get("code") not in KNOWN_ENVELOPE_CODES
+                    and not e.get("code","").startswith("upstream_http_"))
+
+    resp = json_response({"items": items, "errors": errors},
+                         headers={"Cache-Control":"no-store"}, accept_encoding=accept)
+    if ledger is not None:
+        ledger.record_opt_in_outcome(outcome=outcome, envelope_5xx=False,
+            unknown_codes=unknown_codes, network_mid_errors=len(state["network_mids"]),
+            items_count=len(items), errors_count=len(errors),
+            bytes_fetched=state["total"], bytes_delivered_skeleton=len(resp.body),
+            mode=mode, retry_after_ms_emitted=retry_after_emitted)
+    return resp
 
 
 @router.get("/full/{mid}")

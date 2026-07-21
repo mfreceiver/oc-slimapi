@@ -18,7 +18,13 @@ router = APIRouter(prefix="/slimapi", tags=["metrics"])
 
 @router.get("/metrics")
 async def metrics(request: Request):
+    hubs_snapshot = request.app.state.hubs.snapshot_metrics()
+    batch_ledger = getattr(request.app.state, "batch_ledger", None)
+    if batch_ledger is not None:
+        hubs_snapshot["batch"] = batch_ledger.snapshot()
+    else:
+        hubs_snapshot["batch"] = None
     return json_response(
-        request.app.state.hubs.snapshot_metrics(),
+        hubs_snapshot,
         accept_encoding=request.headers.get("accept-encoding"),
     )

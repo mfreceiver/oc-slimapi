@@ -5,6 +5,7 @@
 > | 修订日期 | wire 版本 | 文档 rev | 变更摘要 | 落地对照 |
 > |---|---|---|---|---|
 > | **2026-07-21** | **1（additive，未 bump）** | **F** | ocdroid v0.11.7 契约反馈落地（设计 v6 + 实现）：**§1** `/slimapi/sessions` 200 加三头 `X-Complete` / `X-Discovery-Directories` / `X-Discovery-Ready`；`start` 语义勘误为 epoch-ms 时间戳水位（非 offset）；非 list body→503；**roots 默认保持 False**。**§2** partId 跨 thin/`/full` 稳定（schema-valid）ratify；placeholder 保留为 message-level 兜底（去 placeholder 转 backlog）。**§3** 新 SSE 帧 `server.reconfigured{reason:"discovery_changed",at}`（仅 discovery 集合变或就绪态 false→true）；`resync` 路径完全不动；`load_products` 全程锁 + 双层 list shape 守卫 + last-known-good。**§4** `/health`+`/ready` schema 加 `version`/`clientMin`/`clientMax`。247 tests green。设计稿：`docs/ocmar/specs/2026-07-21-ocdroid-v0.11.7-feedback-design.md`。 | §1 / §2 / §3 / §4 / §5 / §13 |
+> | **2026-07-21** | **1（additive，未 bump）** | **G** | **Opt-A partial-envelope（体验优先 patch）**：能力头 `X-Slimapi-Capabilities`（grammar: comma-split,trim,single `=`,name case-insensitive,value literal,unknown/malformed ignored,dup-conflict fail-closed） + B2 六行响应矩阵（success/partial/errors-only/terminal-envelope-completion/top-503） + C1 累计 413 顶层一致（不返 partial）+ per-mid `upstream_unavailable` 映射（opt-in 仅，non-opt-in 仍顶层 503）+ Retry-After（顶层 HTTP + envelope `retryAfterMs` bounds）+ feature flag + rollback thresholds（5xx>2×baseline / baseline=0→>1% / unknown-code>5% / sample≥100 / 1h window）+ `/metrics` batch ledger（`optA{disabledLatched,disabledReason}`, `counters{...}`, `rollbackWindow{...}`, `byteSamples{...}`）。**Additive，未 bump** `X-Slimapi-Version`（仍为 `1`）。落地对照 §2（G6 批处理依赖能力头）、§7（`upstream_unavailable` per-mid envelope）、§6（指标 ledger 扩展）、**new §15**。**S-C** byte-ratio aggregation (median/P90) added to `byteSamples`; **S-E** optional deployment revision env-or-file injected into `/slimapi/health`. | §2 / §7 / §6 / §15 |
 > | **2026-07-20** | **1（无 wire 变更）** | **E** | ocdroid §6「slimapi 侧待确认事项」3 项 slimapi 侧源码级确认（纯核验，无行为变更）：(1) messageID 全路径 verbatim 透传（含 SSE digest fan-out：`skeleton.py:142` info deepcopy / `hub.py:415` `message_id=info.id` / `questions.py:60` q/p 不触碰 id）；(2) `Partial+scope.directories==0` 结构不可能（Partial ⇒ ≥1 fetch ⇒ N≥1）、`Success+N==0` 真实可达（冷启动空 allowlist，§2 + 单测锚定），ocdroid N==0 retain-prior gate 设计正确；(3) `/sessions` 最小错误消费深度（log code + rethrow 原始）= 契约正确，slimapi 不要求差异化（codes 为 observability 面，非分支契约）。**无 wire 变更，不 bump**。确认报告：`docs/ocmar/reports/2026-07-20-v0.2.2-ocdroid-handoff-confirmation.md`。 | 本条 changelog（ocdroid §6 反向确认；无 wire 变更） |
 > | **2026-07-20** | **1（additive，未 bump）** | **D** | **ocdroid 客户端适配完成并部署 v0.11.5**（ocdroid commit `807ed52` / tag `v0.11.5`，本地未 push）：tuple tie-break `(updatedAt, messageID)` 二元组字典序 watermark（`compareWatermark` @ onReconcileSuccess/needsReconcile/needsCatchUp/reduceSlimDigest 4 站点）+ q/p `scope.directories` 消费（修 N==0 误清 stale；Success **与** Partial 均 N==0 retain）+ `/sessions` 列表 coded-error observability（`parseErrorCode`→internal + log + rethrow 原始，不引入新异常类型）+ directory 客户端 normalize-dedup（`normalizeDirectory` + fan-out + onResync）。**纯客户端，无 wire 变更**；ocdroid final whole-branch review APPROVED (0C/0I) + fresh verifier EXIT=0/FAILURES=0（live rerun）。**F-1**「`/since` 真过滤 + tie-break」runtime 联调待确认（loopback `127.0.0.1:4097` / mTLS `opencode.vectory.cn:14097`）。ocdroid 报告：其仓 `docs/ocmar/reports/2026-07-20-slimapi-v022-client-adapt.md`。 | 本条 changelog（ocdroid 侧落地确认；无 wire 变更） |
 > | **2026-07-20** | **1（additive，未 bump）** | **C** | ocdroid 契约遗留缺口 ratify（3 缺口 + 2 个 pre-existing 真 bug）：**Gap1** `/since/{ts}` 时间过滤 no-op 修复（`info.time.updated` 在 v1.18.3 不存在 → 改读 `updated or created`，与 digest `updatedAt` 对齐）+ 等时间戳 tie-break 规则 `(updatedAt, messageID)` 二元组字典序；**Gap2** `/slimapi/sessions` 列表 §7 偏离修复（原样透传 → `_raise_upstream_status`）+ q/p envelope 加 `scope.directories` 区分「scope 未就绪 / 权威空」；**Gap3** `/since/0` cursor drain 推荐。200 tests green。详见 §14.6。 | §5 / §2 / §7 / §12 / §14.6 |
@@ -17,14 +18,17 @@
 > **同步纪律**：本文件 changelog 条目须同时列出受影响的 `docs/CLIENT_CHANGES.md` 小节。
 >
 > **详细变更内容（按修订日）**：
+> - **2026-07-21 · v1（additive，rev G）**：**Opt-A partial-envelope（体验优先 patch）**：能力头 `X-Slimapi-Capabilities`（grammar: comma-split,trim,single `=`,name case-insensitive,value literal,unknown/malformed ignored,dup-conflict fail-closed） + B2 六行响应矩阵（success/partial/errors-only/terminal-envelope-completion/top-503） + C1 累计 413 顶层一致（不返 partial）+ per-mid `upstream_unavailable` 映射（opt-in 仅，non-opt-in 仍顶层 503）+ Retry-After（顶层 HTTP + envelope `retryAfterMs` bounds）+ feature flag + rollback thresholds（5xx>2×baseline / baseline=0→>1% / unknown-code>5% / sample≥100 / 1h window）+ `/metrics` batch ledger（`optA{disabledLatched,disabledReason}`, `counters{...}`, `rollbackWindow{...}`, `byteSamples{...}`）。**Additive，未 bump** `X-Slimapi-Version`（仍为 `1`）。落地对照 §2（G6 批处理依赖能力头）、§7（`upstream_unavailable` per-mid envelope）、§6（指标 ledger 扩展）、**new §15**。受影响 CLIENT_CHANGES：能力协商、envelope shape、Retry-After、B1 预算、G-F1 cursor-walk。详见本节各小节 + `docs/CLIENT_CHANGES.md` 相应更新。
 > - **2026-07-20 / 2026-07-19 · v1（additive）**：`/slimapi/questions`+`/permissions` 的 `directory` 改可选（null=聚合 allowlist，**F1**）；`/slimapi/sessions/{sid}/status` 放宽 allowlist（sid 自洽，**F2**）；sidecar 启动主动 warm `/project` 暖 allowlist（**F3a**）；routeToken 应答路径 allowlist miss 自动刷新（**F3b**）；`CLIENT_CHANGES.md` SSE 节同步（**F4**）；§1 `accepted:[1,1]` 闭区间说明（**F5**）；新增 §12 directory 三态语义表 + §13 allowlist 机制（**§5**）；**G1** `session.digest` 加 `lastError?` 三态字段 + 新 `event: session.error` session-less 帧 + 脱敏算法；**G6** `GET /slimapi/messages/{sid}/full?ids=` 批量展开端点（envelope + mid 级部分失败 + chunk-ledger 累计预算）；D1–D8 文档同步（§11 标 closed）。受影响 CLIENT_CHANGES：SSE（`lastError` / `session.error`）、消息批量展开、q/p null directory、cold-start 顺序、错误体形状。
 > - **2026-07-18 · v1 B1（additive）**：`session_not_found`(404) / 顶层 `upstream_unavailable`(503) / 顶层 `upstream_http_N`(502) / `shell_not_allowed`(403) / `invalid_directory_count`(400) / `invalid_route_token`(400) / thin 路由错误体 `{"code":...}`（非 `{"detail":...}`） / G2 status 404-502-503 分裂 / projects 5xx 502→503。详见 §7。受影响 CLIENT_CHANGES：错误体形状。
 
-> 状态：契约收敛版（A1-A3/B1-B3/C1-C2 全定，A2=A 时间戳锚点；rev B F1–F5/§5/G1/G6/D1–D8；rev C Gap1–3 ratify；rev D ocdroid 客户端适配完成 + 部署 v0.11.5；rev E ocdroid §6 三项 slimapi 侧确认；**rev F ocdroid v0.11.7 反馈落地（sessions 三头 + discovery_changed SSE + health schema + partId ratify）**）。配套原型与正式实现已覆盖；本文 🔒=已覆盖、🆕=历史缺口标注（§11 已闭环）。
+> 状态：契约收敛版（A1-A3/B1-B3/C1-C2 全定，A2=A 时间戳锚点；rev B F1–F5/§5/G1/G6/D1–D8；rev C Gap1–3 ratify；rev D ocdroid 客户端适配完成 + 部署 v0.11.5；rev E ocdroid §6 三项 slimapi 侧确认；**rev F ocdroid v0.11.7 反馈落地（sessions 三头 + discovery_changed SSE + health schema + partId ratify）**；**rev G Opt-A partial-envelope（体验优先 patch）**）。配套原型与正式实现已覆盖；本文 🔒=已覆盖、🆕=历史缺口标注（§11 已闭环）。
 > 权威性：本文件是正式实现的唯一基准。与 design-v2/INTERFACE_MAP 冲突时以本文件为准；后者需随后同步。
 
 ## §0 范围与架构
-- 纯 HTTP sidecar：FastAPI + httpx + orjson + uvicorn **单 worker**，host ∈ `{127.0.0.1, ::1, localhost, 0.0.0.0}`；默认 loopback（stunnel mTLS 后），可选 `0.0.0.0` 明文直连入口（远程暴露依赖 Tailscale ACL / 防火墙，14097 仍为推荐 mTLS 入口）。
+- 纯 HTTP sidecar：FastAPI + httpx + orjson + uvicorn **单 worker**，host ∈ `{127.0.0.1, ::1, localhost, 0.0.0.0}`。
+  - **hardened 默认姿态**（v0.3.1 起）：`127.0.0.1`（loopback）绑定，**仅**本机 loopback + `:14097` mTLS（stunnel）可达；`0.0.0.0` 明文直连入口**降级为 break-glass**（Tailscale ACL / 防火墙保护），**不**是稳态推荐。
+  - `:14097` 为推荐 mTLS 入口（公网唯一）；upstream 始终固定 `127.0.0.1:4096`（SSRF guard 不随 host 放松）。
 - **不读 opencode SQLite**；仅 legacy `/session` API；upstream 始终固定 loopback HTTP（SSRF guard 不随 host 放松）。
 - v1 目标：**2-5 台同用户设备**（T3 硬化进 v1）。
 - 客户端通过"切换服务器"进省流（R8：`mtls×slim` 两布尔→4 配置），非连接属性开关。
@@ -32,7 +36,8 @@
 ## §1 版本契约 🔒
 - 头 `X-Slimapi-Version: <int>`，所有 `/slimapi/**` 必带。
 - 门闩 `ACCEPTED_CLIENT_VERSIONS=(1,1)`：`accepted:[1,1]` 是闭区间 `[min,max]`，当前 `min=max=1`（仅接受整数 `1`）。缺/非整数→400 `version_required`；越界→400 `version_incompatible`（带 `client`/`accepted`）。
-- `/slimapi/health` 与 `/slimapi/ready` 返回 `sidecar.ok`（health）/ `upstream`（ready）+ `server.api_version` + `accepted_client_versions` + `schema:{degraded, version, clientMin, clientMax}`（rev F：`version`/`clientMin`/`clientMax` 从 config 读，与 `server.*` 同源；**诊断用 wire 范围回显，非 feature discovery**——additive 时 version 保持 1，三元组不变）。
+- `/slimapi/health` 与 `/slimapi/ready` 返回 `sidecar.ok`（health）/ `upstream`（ready）+ `server.api_version` + `accepted_client_versions` + `schema:{degraded, version, clientMin, clientMax}`（rev F：`version`/`clientMin`/`clientMax` 从 config 读，与 `server.*` 同源；**诊断用 wire 范围回显，非 feature discovery**——additive 时 version 保持 1，三元组不变）。**S-E**：`health` 响应 `server` 对象可选加 `deploymentRevision` 字段（当通过 `OC_SLIMAPI_DEPLOYMENT_REVISION(_FILE)` 设置时出现；未设置时整字段省略）。
+- **能力头 Opt-A 不属于版本 bump**：`X-Slimapi-Capabilities: mid-partial-envelope=1` 是加性 HTTP 头，**不**改变 `X-Slimapi-Version`（仍为 `1`）。详见 §15。
 - bump 规则：整数，仅破坏性变更 bump；加性变更同版本。
 
 ## §2 端点
@@ -76,7 +81,9 @@
   - **全 mid 404 / 全 mid 失败仍 200 + 全 errors**（只要无整请求 terminal）。
 - **整请求 terminal**（覆盖 envelope）：
   - 累计解码体超 `max_response_bytes` → 413 `response_too_large`，中止后续 mid。
-  - 任一 mid `httpx.RequestError`（网络 / 流中断）→ **503 `upstream_unavailable`**；**503 优先于 413**（网络失败与累计超限同时成立时返 503）。
+  - **任一 mid `httpx.RequestError`（网络 / 流中断）→ 依赖能力头**：
+    - **非 opt-in / opt-in 且全部 mids 均为 RequestError** → **503 `upstream_unavailable`**（整请求 503，优先于 413）。
+    - **opt-in 且存在至少一个成功 item 或其它 envelope error** → part of `errors[]`（envelope 200，不触发整请求 503）。详见 §15。
   - skeleton 模式 transform pool 饱和 → 503 `transform_busy`（`Retry-After`）。
 - **定序**：`items[]` 顺序 = `ids` 去重后序（保证）；`errors[]` 顺序 = 并发完成序（**不保证**，客户端不得依赖）。
 - **路由**：`/full` 注册先于 `/full/{mid}`。
@@ -177,6 +184,7 @@
   - **top-level**：G2 status / projects / G6 **discover** 等对 upstream **非 404 的 4xx** → 502（discover 5xx 走 503，见上）
   - **G6 envelope**：mid **≥400（含 5xx）** → `errors[]` `upstream_http_N`，**整请求仍 200**（mid 5xx **不**升级为整请求 5xx）
 - 503 `transform_busy`（`Retry-After`；含 G6 skeleton pool 饱和）/ `upstream_unavailable`（含 G6：discover 5xx·网络·坏 JSON；**任一 mid 网络失败**——且 **优先于** 累计 413）/ allowlist 刷新失败 / `sse_subscriber_limit_*` 🆕
+- **`upstream_unavailable`（envelope per-mid，仅 Opt-A opt-in 且存在成功 item 或其它 envelope error）**：mid 网络失败（`httpx.RequestError`）在 envelope 中映射为此 code，同时可选携带 `retryAfterMs`（ms，≤10000）。整请求仍 200，items 含成功项。非 opt-in 或全部 mids 网络失败时仍为顶层 503 `upstream_unavailable`。详见 §15。
 - **`upstream_error`**：**G6 envelope** mid 2xx body 不可解析（坏 JSON）；亦见 q/p fan-out 单 dir 失败项。非整请求 500。
 - 504 `upstream_timeout`（q/p mutation）
 - thin 路由错误体统一：`{"code":string, "message"?:string, ...}`（非 `{"detail":...}`）
@@ -298,3 +306,155 @@ skeleton 共享缓存（YAGNI，先指标）、多用户（独立 stack）、Par
 - 🔴 `/sessions` 列表 200+坏 JSON/坏 shape → 503 `upstream_unavailable`（复刻 sibling `/projects` 防御；rev-13 review 捕获）。
 
 **验证**：本批 +10 测试（Gap1 `/since` 过滤 1 + Gap2 sessions 失败路径 3 + 坏 JSON 2 + q/p scope 3 + normalize-dedup 1）；`./scripts/check.sh` → **200 passed**, EXIT=0。全加性，wire 仍 `1`。
+
+---
+
+## §15 Opt-A partial-envelope（体验优先 patch）🆕
+
+> 本节内容为 **v0.3.1 体验优先 patch** 的全面说明。所有行为均**加性**，不 bump `X-Slimapi-Version`（仍为 `1`）。依据：`docs/ocmar/reports/2026-07-21-ux-first-consensus-archive.md` §2 / §6 + ocdroid `docs/0.11-ux-first-joint-plan.md` rev 6 §6 B2。
+
+### 15.1 能力头协商
+
+客户端通过 HTTP 头 `X-Slimapi-Capabilities` 选择 opt-in partial-envelope：
+
+| 头 | 值 | 解释 |
+|---|---|---|
+| `X-Slimapi-Capabilities` | `mid-partial-envelope=1` | opt-in；不传 / `=0` / 其它 → 非 opt-in |
+
+**语法（I-R4-CAP-GRAMMAR + I-R5-CAP-DUPLICATES）**：
+- 逗号切分 token，trim 两侧 ASCII whitespace。
+- 每个 token 必须恰含一个 `=`，name 大小写不敏感，value trim 后字面比较。
+- 未知 name / 格式错误 token 忽略，**不**导致整请求失败。
+- 同一 capability 重复且值冲突 → **fail-closed**：该 capability 按非 opt-in 处理，并计入 `capabilityConflicts` 指标。
+- 能力头是加性 HTTP 头，**不** bump wire API 版本。
+
+### 15.2 六行响应矩阵（B2）
+
+摘自 joint-plan rev 6 §6 B2，完整响应矩阵如下：
+
+| 请求能力 | 成功 items | RequestError network mids | 其它 envelope errors | 响应 |
+|---|---|---|---|---|
+| **非 opt-in** | 任意 | 任意 | 任意 | **完整执行 legacy 分支**：不得先应用 Opt-A 映射；响应状态、body 与错误优先级保持部署前语义（R4-B2-OLD-SEMANTICS）。 |
+| opt-in | ≥1 | 0 | 0 | **200 success envelope**：`items[]` 非空，`errors[]` 为空。 |
+| opt-in | ≥1 | 任意 | 任意非空 | **200 partial**：成功 mid 进 `items[]`；network、mid-retryable、mid-terminal errors 均进 `errors[]`。客户端立即 merge items，仅重试可重试 errors。 |
+| opt-in | 0 | 0 | ≥1 | **200 errors-only envelope**：保持已有 per-mid HTTP error 语义。客户端按 code 分类；若全为 mid-terminal code → terminal envelope completion；若含 `upstream_http_5xx`/429 等 mid-retryable code → 仅 bounded retry 这些 mids。 |
+| opt-in | 0 | ≥1 | ≥1 | **200 errors-only envelope**：RequestError mids 映射为可重试 code，其它 errors 保持原 code；客户端仅 bounded retry network/mid-retryable mids，mid-terminal mids 不重试。 |
+| opt-in | 0 | ≥1（覆盖全部请求 IDs） | 0 | **顶层 503 `upstream_unavailable`**：所有请求 IDs 均 unresolved，客户端按顶层 503 预算整批重试。 |
+
+**规则提炼**：
+1. 非 opt-in 请求**必须在 RequestError→envelope 映射之前进入 legacy 分支**，逐场景保持部署前语义。
+2. opt-in 请求只要存在至少一个可交付或可分类的确定结果（成功 item，或非 RequestError 形成的 envelope error），就返回 HTTP 200 envelope。
+3. 仅当全部请求 IDs 都因 RequestError 失败、无任何成功 item、也无任何其它 envelope error 时，返回顶层 503。
+4. HTTP 200 ≠ 所有 mids 均成功或终态；客户端必须按 `items[]` 和每个 `errors[].code` 分别 merge、retry 或标终态。
+5. `partial` 仅指 `items[]` 与 `errors[]` 均非空；errors-only 响应统一称 `errors-only envelope`（§1）。
+
+### 15.3 C1 累计 413 一致
+
+**关键共识（C1）**：Opt-A 变更面 = **仅 mid `httpx.RequestError` 映射为 envelope 可重试 code**。累计字节超限 `response_too_large`（顶层整请求 413）对 opt-in / 非 opt-in **一致**——保持顶层 413、`succeeded` 不输出、B1 分区恢复统一适用（**不返 200 partial**）。per-mid `message_too_large` 与 mid HTTP≥400 同理对 opt-in/非 opt-in 一致。
+
+理由：413 = batch 过大 → 确定性分区（B1）；Opt-A = 网络瞬态 → 保 partial 防重下，失败模式与恢复策略不同；保持 413 顶层使 B1 分区契约对 opt-in/非 opt-in 统一，最小变更面，且不重开 rev-bgpt 已 CLOSED 的 B1 契约（「顶层 413 不返 partial」）。
+
+### 15.4 Retry-After
+
+| 层级 | 适用场景 | 值 | 客户端行为 |
+|---|---|---|---|
+| **顶层 HTTP**（响应 `upstream_unavailable` 503） | opt-in 全 RequestError / discover 503（opt-in） | `Retry-After: 1`（秒）或 passthrough upstream int-seconds | 优先用上游直值，否则保守 `1`s；遵 top-level 分区预算 |
+| **Envelope per-mid**（`retryAfterMs`） | opt-in 且存在成功 item 或其它 envelope error | `int ∈ [0,10000]`，network `upstream_unavailable`→200ms，`upstream_http_429`/`upstream_http_5xx` → passthrough upstream Retry-After(ms,capped 10000) 或 200 | 客户端 cap 10s，backoff 200ms/400ms ±30% jitter |
+
+**保守值**：`OC_SLIMAPI_OPT_A_RETRY_AFTER_MS_CONSERVATIVE=200`；cap `OC_SLIMAPI_OPT_A_RETRY_AFTER_MS_CAP=10000`。
+
+> **non-opt-in 503 从不发 Retry-After（legacy 等价）**。
+
+### 15.5 Feature Flag 与回滚
+
+| 项 | 默认 | 说明 |
+|---|---|---|
+| **Feature flag** `OC_SLIMAPI_OPT_A_PARTIAL_ENVELOPE_ENABLED` | `1`（on） | 全局开关；关闭后所有客户端（无论能力头）走非 opt-in 旧语义 |
+| **Auto-rollback flag** `OC_SLIMAPI_OPT_A_AUTO_ROLLBACK_ENABLED` | `1`（on） | 自动关闭 Feature，按阈值触发 |
+| **Rollback window** `OC_SLIMAPI_OPT_A_ROLLBACK_WINDOW_SECONDS` | `3600`（1h） | 滑动时间窗用于基线比较 |
+| **Min sample** `OC_SLIMAPI_OPT_A_ROLLBACK_MIN_SAMPLE` | `100` | 窗内样本数 < 100 时仅告警不自动关闭 |
+| **Envelope 5xx 阈值**（零基线特例） | `OC_SLIMAPI_OPT_A_ROLLBACK_ENVELOPE_5XX_ZERO_BASELINE_RATE=0.01`（1%） | 基线率=0 时，当前窗出现率 >1% 触发关闭 |
+| **Unknown code 阈值** | `OC_SLIMAPI_OPT_A_ROLLBACK_UNKNOWN_CODE_RATE=0.05`（5%） | 窗内 unknown-code 占比 >5% 触发关闭 |
+| **Client expand-failure 阈值**（仅 ops 侧） | 客户端上报展开失败率 >5%（样本≥100） | 若监控到则 ops 人工介入，非自动 |
+
+**回滚行为**：latched sticky disable（进程生命周期），进行中 operation 已 merged 的 partial items **不撤回**；manual override 通过 feature flag。
+
+> **>2×baseline 通例已延迟**：通用 x2 历史基线阈值需存储 24h 历史 baseline，当前尚无持久化层——仅零基线特例（§15.10）有效。待历史基线采集机制就绪后再启用 >2×baseline 回滚规则。
+
+### 15.6 Invariant
+
+- envelope 内 `items[]` 与 `errors[]` 按 messageID **互斥**：同 messageID 不会同时出现在 items 和 errors。
+- idempotent merge：同 messageID 第二次出现（如重试）应被合并/去重。
+- 顺序无关：`items[]` 与 `errors[]` 各自的顺序由服务端决定（items 按 ids 去重保序，errors 按完成序），客户端不得依赖。
+
+### 15.7 可观测性（`/slimapi/metrics`）
+
+新增定制子对象 `batch`：
+
+```json
+{
+  "batch": {
+    "optA": {
+      "disabledLatched": false,
+      "disabledReason": ""
+    },
+    "counters": {
+      "optInRequestsTotal": 0,
+      "optInSuccessEnvelope": 0,
+      "optInPartial": 0,
+      "optInErrorsOnly": 0,
+      "optInTopLevel503": 0,
+      "legacyRequestsTotal": 0,
+      "legacyTopLevel503": 0,
+      "capabilityConflicts": 0,
+      "capabilityMalformedTokens": 0,
+      "networkMidErrorsTotal": 0,
+      "unknownCodeTotal": 0,
+      "modeFullRequests": 0,
+      "modeSkeletonRequests": 0,
+      "bytesFetchedTotal": 0,
+      "bytesDeliveredSkeletonTotal": 0,
+      "retryAfterMsEmittedCount": 0
+    },
+    "rollbackWindow": {
+      "windowSeconds": 3600,
+      "optInEvents": 0,
+      "envelope5xxInWindow": 0,
+      "unknownCodesInWindow": 0
+    },
+    "byteSamples": {
+      "count": 0,
+      "capacity": 0,
+      "ratioMedian": null,
+      "ratioP90": null
+    }
+  }
+}
+```
+
+- `optA.disabledLatched` = true 表示 Opt-A 已被自动回滚关闭。
+- `counters` 区分 opt-in / legagy 请求量、成功/partial/errors-only/503、能力头冲突/格式错误、network mid 失败数、unknown-code 数、mode=full/skeleton 请求数、字节 fetch/deliver 总量、retryAfterMs 发出数。
+- `rollbackWindow` 记录窗内 opt-in 事件数、envelope 5xx 计数、unknown-code 计数（用于自动回滚判断）。
+- `byteSamples` 用于字节比统计（匿名聚合 median/P90），`capacity` 为采样桶容量。
+
+### 15.8 与 §2 G6 批量展开的关系
+
+G6 批量展开 endpoint（`GET /slimapi/messages/{sid}/full?ids=`）的 `httpx.RequestError` 行为已与能力头绑定（见 §2）：非 opt-in 或全部 mids 网络失败仍保持整请求 503；opt-in 且存在至少一个成功 item 或其它 envelope error 时，mid 网络失败进入 envelope `errors[]`（可选 `retryAfterMs`），整请求仍 200。
+
+### 15.9 与 §7 错误码的关系
+
+`upstream_unavailable` 在非 opt-in 或全部 mids 网络失败时仍为顶层 503；opt-in 且存在成功 item 或其它 envelope error 时变为 per-mid envelope error（可选 `retryAfterMs`）。`retryAfterMs` 仅在此场景的 envelope 中出现。
+
+### 15.10 回滚零基线特例
+
+当 baseline rate = 0（部署后从未出现 envelope 5xx），当前 1h 窗内 envelope 5xx 出现率 >1% 且样本 ≥100 → 触发自动关闭。此条件与常规 >2×baseline 不同，目的是在初期无数据时也防御突发问题。
+
+### 15.11 客户端侧 B1 预算（仅文档参考）
+
+Opt-A 不改变 B1 分区预算：客户端 413 恢复仍为 halve + merge + singleton，服务器保证（顶层 413、无 partial、不泄露完成态）不变。客户端预算公式、分区节点数、瞬态重试次数、并行度、wall-clock 等参见 §5 P0-A / CLIENT_CHANGES § B1 budget。
+
+---
+
+> **更新纪律**：影响以上节的行为变更（能力头 grammar / 矩阵行 / 回滚阈值）须同步更新 `docs/CLIENT_CHANGES.md` 相关节。
+
+(End of file)

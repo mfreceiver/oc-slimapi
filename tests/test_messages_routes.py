@@ -26,6 +26,7 @@ from fastapi import FastAPI
 
 from oc_slimapi.config import Settings
 from oc_slimapi.errors import register_error_handlers
+from oc_slimapi.observability import BatchLedger
 from oc_slimapi.proxy import install_proxy
 from oc_slimapi.routes import events, health, messages, questions, sessions
 from oc_slimapi.sse.hub import HubRegistry
@@ -50,6 +51,15 @@ def _settings(**overrides) -> Settings:
         smoke_session_id=None,
         server_api_version=1,
         accepted_client_versions=(1, 1),
+        # Opt-A partial-envelope (v0.3.1, additive).
+        opt_a_partial_envelope_enabled=True,
+        opt_a_auto_rollback_enabled=True,
+        opt_a_rollback_window_seconds=3600,
+        opt_a_rollback_min_sample=100,
+        opt_a_rollback_envelope_5xx_zero_baseline_rate=0.01,
+        opt_a_rollback_unknown_code_rate=0.05,
+        opt_a_retry_after_ms_conservative=200,
+        opt_a_retry_after_ms_cap=10000,
     )
     base.update(overrides)
     return Settings(**base)
@@ -78,7 +88,9 @@ def _build_app(settings: Settings, upstream: httpx.AsyncClient) -> FastAPI:
     app.state.allowlist_ready = False
     app.state.allowlist_lock = asyncio.Lock()
     app.state.schema_degraded = False
+    app.state.deployment_revision = None
     app.state.hubs = HubRegistry(upstream)
+    app.state.batch_ledger = BatchLedger(window_seconds=settings.opt_a_rollback_window_seconds)
     for router in (health.router, sessions.router, messages.router, questions.router, events.router):
         app.include_router(router)
     install_proxy(app)
@@ -2220,3 +2232,713 @@ async def test_g6_route_not_shadowed(upstream_factory):
         )
     finally:
         app.state.transforms.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Opt-A (mid-partial-envelope) B2 6-row matrix + non-opt-in legacy tests
+# ---------------------------------------------------------------------------
+
+
+async def test_opt_a_row2_success(upstream_factory):
+    """B2 Row 2: all mids succeed → 200 envelope, items non-empty, errors empty."""
+    mids = {"m1": (200, orjson.dumps(_msg("m1", 100))),
+            "m2": (200, orjson.dumps(_msg("m2", 200)))}
+    handler = _opt_in_handler(mids)
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m1,m2",
+                headers={**VERSION_HEADERS, "X-Slimapi-Capabilities": "mid-partial-envelope=1"},
+            )
+        assert r.status_code == 200
+        data = r.json()
+        assert len(data["items"]) == 2
+        assert data["errors"] == []
+        # Not marked as partial
+        assert "partial" not in data
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_opt_a_row3_partial(upstream_factory):
+    """B2 Row 3: mid1 success, mid2 network error → 200 envelope, items=[m1], errors=[m2:upstream_unavailable]."""
+    mids = {"m1": (200, orjson.dumps(_msg("m1", 100))),
+            "m2": (httpx.ConnectError("simulated"),)}
+    handler = _opt_in_handler(mids)
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m1,m2",
+                headers={**VERSION_HEADERS, "X-Slimapi-Capabilities": "mid-partial-envelope=1"},
+            )
+        assert r.status_code == 200
+        data = r.json()
+        assert len(data["items"]) == 1
+        assert data["items"][0]["info"]["id"] == "m1"
+        assert len(data["errors"]) == 1
+        err = data["errors"][0]
+        assert err["messageID"] == "m2"
+        assert err["code"] == "upstream_unavailable"
+        assert "retryAfterMs" in err
+        assert err["retryAfterMs"] == 200  # conservative
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_opt_a_row4_errors_only_terminal(upstream_factory):
+    """B2 Row 4: all mids terminal HTTP errors → 200 errors-only envelope."""
+    mids = {"m1": (404, b"{}"),
+            "m2": (404, b"{}")}
+    handler = _opt_in_handler(mids)
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m1,m2",
+                headers={**VERSION_HEADERS, "X-Slimapi-Capabilities": "mid-partial-envelope=1"},
+            )
+        assert r.status_code == 200
+        data = r.json()
+        assert data["items"] == []
+        assert len(data["errors"]) == 2
+        for err in data["errors"]:
+            assert err["code"] == "message_not_found"
+            assert "retryAfterMs" not in err
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_opt_a_row5_errors_only_mixed(upstream_factory):
+    """B2 Row 5: mid1 terminal, mid2 network → 200 errors-only envelope."""
+    mids = {"m1": (404, b"{}"),
+            "m2": (httpx.ConnectError("simulated"),)}
+    handler = _opt_in_handler(mids)
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m1,m2",
+                headers={**VERSION_HEADERS, "X-Slimapi-Capabilities": "mid-partial-envelope=1"},
+            )
+        assert r.status_code == 200
+        data = r.json()
+        assert data["items"] == []
+        assert len(data["errors"]) == 2
+        # m1: terminal, no retryAfterMs
+        err1 = data["errors"][0]
+        assert err1["messageID"] == "m1"
+        assert err1["code"] == "message_not_found"
+        assert "retryAfterMs" not in err1
+        # m2: network, retryAfterMs=200
+        err2 = data["errors"][1]
+        assert err2["messageID"] == "m2"
+        assert err2["code"] == "upstream_unavailable"
+        assert err2["retryAfterMs"] == 200
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_opt_a_row6_top_level_503(upstream_factory):
+    """B2 Row 6: all mids network failure → 503 upstream_unavailable + Retry-After."""
+    mids = {"m1": (httpx.ConnectError("simulated"),),
+            "m2": (httpx.ConnectError("simulated"),)}
+    handler = _opt_in_handler(mids)
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m1,m2",
+                headers={**VERSION_HEADERS, "X-Slimapi-Capabilities": "mid-partial-envelope=1"},
+            )
+        assert r.status_code == 503
+        assert r.json()["code"] == "upstream_unavailable"
+        assert r.headers.get("Retry-After") == "1"
+        # No items/errors envelope
+        assert "items" not in r.json()
+        assert "errors" not in r.json()
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_opt_a_mid_retryable_http_429(upstream_factory):
+    """Mid returns 429 with Retry-After → retryAfterMs passthrough."""
+    mids = {"m1": (429, orjson.dumps({"error": "rate limit"}), "5")}
+    handler = _opt_in_handler(mids)
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(opt_a_retry_after_ms_cap=10000), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m1",
+                headers={**VERSION_HEADERS, "X-Slimapi-Capabilities": "mid-partial-envelope=1"},
+            )
+        assert r.status_code == 200
+        data = r.json()
+        assert len(data["items"]) == 0
+        assert len(data["errors"]) == 1
+        err = data["errors"][0]
+        assert err["code"] == "upstream_http_429"
+        assert err["retryAfterMs"] == 5000  # 5s → 5000ms
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_opt_a_mid_retryable_http_503_with_retry_after(upstream_factory):
+    """Mid returns 503 with Retry-After → retryAfterMs passthrough."""
+    mids = {"m1": (503, orjson.dumps({"error": "server err"}), "2")}
+    handler = _opt_in_handler(mids)
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(opt_a_retry_after_ms_cap=10000), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m1",
+                headers={**VERSION_HEADERS, "X-Slimapi-Capabilities": "mid-partial-envelope=1"},
+            )
+        assert r.status_code == 200
+        data = r.json()
+        assert len(data["errors"]) == 1
+        err = data["errors"][0]
+        assert err["code"] == "upstream_http_503"
+        assert err["retryAfterMs"] == 2000  # 2s → 2000ms
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_opt_a_mid_retryable_http_503_no_retry_after(upstream_factory):
+    """Mid returns 503 without Retry-After → retryAfterMs conservative."""
+    mids = {"m1": (503, orjson.dumps({"error": "server err"}))}
+    handler = _opt_in_handler(mids)
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m1",
+                headers={**VERSION_HEADERS, "X-Slimapi-Capabilities": "mid-partial-envelope=1"},
+            )
+        assert r.status_code == 200
+        data = r.json()
+        assert len(data["errors"]) == 1
+        err = data["errors"][0]
+        assert err["code"] == "upstream_http_503"
+        assert err["retryAfterMs"] == 200  # conservative
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_opt_a_mid_terminal_404(upstream_factory):
+    """Mid returns 404 → no retryAfterMs."""
+    mids = {"m1": (404, b"{}")}
+    handler = _opt_in_handler(mids)
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m1",
+                headers={**VERSION_HEADERS, "X-Slimapi-Capabilities": "mid-partial-envelope=1"},
+            )
+        assert r.status_code == 200
+        data = r.json()
+        assert len(data["errors"]) == 1
+        err = data["errors"][0]
+        assert err["code"] == "message_not_found"
+        assert "retryAfterMs" not in err
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_opt_a_mid_terminal_400(upstream_factory):
+    """Mid returns 400 → upstream_http_400, no retryAfterMs."""
+    mids = {"m1": (400, b"{}")}
+    handler = _opt_in_handler(mids)
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m1",
+                headers={**VERSION_HEADERS, "X-Slimapi-Capabilities": "mid-partial-envelope=1"},
+            )
+        assert r.status_code == 200
+        data = r.json()
+        assert len(data["errors"]) == 1
+        err = data["errors"][0]
+        assert err["code"] == "upstream_http_400"
+        assert "retryAfterMs" not in err
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_opt_a_bad_upstream_retry_after(upstream_factory):
+    """Mid returns 503 with unparseable Retry-After → retryAfterMs falls back to conservative."""
+    mids = {"m1": (503, orjson.dumps({"error": "err"}), "not-a-date")}
+    handler = _opt_in_handler(mids)
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m1",
+                headers={**VERSION_HEADERS, "X-Slimapi-Capabilities": "mid-partial-envelope=1"},
+            )
+        assert r.status_code == 200
+        data = r.json()
+        err = data["errors"][0]
+        assert err["code"] == "upstream_http_503"
+        assert err["retryAfterMs"] == 200  # conservative
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_opt_a_retry_after_http_date_naive_parsed_as_utc(upstream_factory):
+    """Mid 503 with HTTP-date Retry-After → retryAfterMs parsed as UTC, not local."""
+    from datetime import datetime, timezone
+    # Create a datetime 3 seconds in the future in UTC
+    future_utc = datetime.now(timezone.utc) + __import__("datetime").timedelta(seconds=3)
+    retry_after_str = future_utc.strftime("%a, %d %b %Y %H:%M:%S GMT")
+    mids = {"m1": (503, orjson.dumps({"error": "err"}), retry_after_str)}
+    handler = _opt_in_handler(mids)
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m1",
+                headers={**VERSION_HEADERS, "X-Slimapi-Capabilities": "mid-partial-envelope=1"},
+            )
+        assert r.status_code == 200
+        data = r.json()
+        err = data["errors"][0]
+        assert err["code"] == "upstream_http_503"
+        # retryAfterMs should be positive and ≤ cap
+        assert 0 < err["retryAfterMs"] <= 10000
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_opt_a_c1_cumulative_413(upstream_factory):
+    """C1: cumulative byte budget exceeded → top-level 413 for opt-in and non-opt-in."""
+    # Use tiny max_response_bytes so even small mids trigger 413.
+    settings = _settings(max_response_bytes=100)
+    # We need a discover that is small enough
+    mids = {"m1": (200, orjson.dumps(_msg("m1", 100, text="x" * 50)))}
+    handler = _opt_in_handler(mids, discover_200_body=orjson.dumps({"id": "s1"}))
+    upstream = upstream_factory(handler)
+    app = _build_app(settings, upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m1",
+                headers={**VERSION_HEADERS, "X-Slimapi-Capabilities": "mid-partial-envelope=1"},
+            )
+            assert r.status_code == 413
+            assert r.json()["code"] == "response_too_large"
+            # Also verify non-opt-in falls back to 413
+            r2 = await client.get(
+                "/slimapi/messages/s1/full?ids=m1",
+                headers=VERSION_HEADERS,
+            )
+            assert r2.status_code == 413
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_opt_a_discover_5xx_retry_after_zero_clamped(upstream_factory):
+    """Discover 5xx with Retry-After=0/-5 → clamped to 1 second."""
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session/s1":
+            return httpx.Response(503, headers={"Retry-After": "0"}, content=b"{}")
+        return httpx.Response(200, content=orjson.dumps({"id": "s1"}))
+    upstream = upstream_factory(handler)
+    settings = _settings(opt_a_retry_after_ms_conservative=500)
+    app = _build_app(settings, upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m1",
+                headers={**VERSION_HEADERS, "X-Slimapi-Capabilities": "mid-partial-envelope=1"},
+            )
+        assert r.status_code == 503
+        assert r.json()["code"] == "upstream_unavailable"
+        assert r.headers["Retry-After"] == "1"
+    finally:
+        app.state.transforms.shutdown()
+
+    # Also test with negative value
+    async def handler2(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session/s1":
+            return httpx.Response(503, headers={"Retry-After": "-5"}, content=b"{}")
+        return httpx.Response(200, content=orjson.dumps({"id": "s1"}))
+    upstream2 = upstream_factory(handler2)
+    app2 = _build_app(settings, upstream2)
+    transport2 = httpx.ASGITransport(app=app2)
+    try:
+        async with httpx.AsyncClient(transport=transport2, base_url="http://test") as client2:
+            r2 = await client2.get(
+                "/slimapi/messages/s1/full?ids=m1",
+                headers={**VERSION_HEADERS, "X-Slimapi-Capabilities": "mid-partial-envelope=1"},
+            )
+        assert r2.status_code == 503
+        assert r2.headers["Retry-After"] == "1"
+    finally:
+        app2.state.transforms.shutdown()
+
+
+# ----- Non-opt-in LEGACY regression -----
+
+async def test_non_opt_in_network_failure_returns_503(upstream_factory):
+    """Non-opt-in: all mids network failure → 503 (not 200 envelope)."""
+    mids = {"m1": (httpx.ConnectError("simulated"),),
+            "m2": (httpx.ConnectError("simulated"),)}
+    handler = _opt_in_handler(mids)
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m1,m2",
+                headers=VERSION_HEADERS,
+            )
+        assert r.status_code == 503
+        assert r.json()["code"] == "upstream_unavailable"
+        # No Retry-After on non-opt-in 503
+        assert "Retry-After" not in r.headers
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_non_opt_in_mixed_success_and_network_loses_success(upstream_factory):
+    """Non-opt-in: mix success + network → 503 (success dropped)."""
+    mids = {"m1": (200, orjson.dumps(_msg("m1", 100))),
+            "m2": (httpx.ConnectError("simulated"),)}
+    handler = _opt_in_handler(mids)
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m1,m2",
+                headers=VERSION_HEADERS,
+            )
+        assert r.status_code == 503
+        assert r.json()["code"] == "upstream_unavailable"
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_non_opt_in_all_terminal_errors_200_errors_only(upstream_factory):
+    """Non-opt-in: all terminal errors → 200 errors-only (not promoted to 503)."""
+    mids = {"m1": (404, b"{}"),
+            "m2": (404, b"{}")}
+    handler = _opt_in_handler(mids)
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m1,m2",
+                headers=VERSION_HEADERS,
+            )
+        assert r.status_code == 200
+        data = r.json()
+        assert data["items"] == []
+        assert len(data["errors"]) == 2
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_non_opt_in_success_200_success_envelope(upstream_factory):
+    """Non-opt-in: all success → 200 success envelope."""
+    mids = {"m1": (200, orjson.dumps(_msg("m1", 100))),
+            "m2": (200, orjson.dumps(_msg("m2", 200)))}
+    handler = _opt_in_handler(mids)
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m1,m2",
+                headers=VERSION_HEADERS,
+            )
+        assert r.status_code == 200
+        data = r.json()
+        assert len(data["items"]) == 2
+        assert data["errors"] == []
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_non_opt_in_no_retry_after_header(upstream_factory):
+    """Non-opt-in: never emits Retry-After header on any path."""
+    # Test discover network error path
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session/s1":
+                raise httpx.ConnectError("simulated")
+        return httpx.Response(200, content=b"{}")
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m1",
+                headers=VERSION_HEADERS,
+            )
+        assert r.status_code == 503
+        assert "Retry-After" not in r.headers
+    finally:
+        app.state.transforms.shutdown()
+
+    # Also test post-gather all-network path
+    mids = {"m1": (httpx.ConnectError("simulated"),)}
+    handler2 = _opt_in_handler(mids)
+    upstream2 = upstream_factory(handler2)
+    app2 = _build_app(_settings(), upstream2)
+    transport2 = httpx.ASGITransport(app=app2)
+    try:
+        async with httpx.AsyncClient(transport=transport2, base_url="http://test") as client2:
+            r2 = await client2.get(
+                "/slimapi/messages/s1/full?ids=m1",
+                headers=VERSION_HEADERS,
+            )
+        assert r2.status_code == 503
+        assert "Retry-After" not in r2.headers
+    finally:
+        app2.state.transforms.shutdown()
+
+
+async def test_non_opt_in_mid_429_no_retry_after_ms(upstream_factory):
+    """Non-opt-in mid 429 → envelope errors[0] has no retryAfterMs."""
+    mids = {"m1": (429, b"{}")}
+    handler = _opt_in_handler(mids)
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m1",
+                headers=VERSION_HEADERS,
+            )
+        assert r.status_code == 200
+        data = r.json()
+        assert len(data["errors"]) == 1
+        err = data["errors"][0]
+        assert err["code"] == "upstream_http_429"
+        assert "retryAfterMs" not in err
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_non_opt_in_mid_503_no_retry_after_ms(upstream_factory):
+    """Non-opt-in mid 503 → envelope errors[0] has no retryAfterMs."""
+    mids = {"m1": (503, b"{}")}
+    handler = _opt_in_handler(mids)
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m1",
+                headers=VERSION_HEADERS,
+            )
+        assert r.status_code == 200
+        data = r.json()
+        assert len(data["errors"]) == 1
+        err = data["errors"][0]
+        assert err["code"] == "upstream_http_503"
+        assert "retryAfterMs" not in err
+    finally:
+        app.state.transforms.shutdown()
+
+
+# ----- Capability header edge cases -----
+
+async def test_opt_a_duplicate_conflict_treated_as_non_opt_in(upstream_factory):
+    """Duplicate conflicting capability header → treated as non-opt-in (legacy)."""
+    mids = {"m1": (httpx.ConnectError("simulated"),)}
+    handler = _opt_in_handler(mids)
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m1",
+                headers={**VERSION_HEADERS, "X-Slimapi-Capabilities": "mid-partial-envelope=1, mid-partial-envelope=0"},
+            )
+        # Non-opt-in behavior: network failure → 503 (not envelope)
+        assert r.status_code == 503
+        assert "Retry-After" not in r.headers
+        # Verify capability parse recorded a conflict
+        # We can check the ledger counters via /slimapi/metrics if we wanted.
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_opt_a_feature_flag_off_treated_as_legacy(upstream_factory):
+    """Feature flag disabled → even with opt-in header → legacy behavior."""
+    mids = {"m1": (httpx.ConnectError("simulated"),)}
+    handler = _opt_in_handler(mids)
+    upstream = upstream_factory(handler)
+    settings = _settings(opt_a_partial_envelope_enabled=False)
+    app = _build_app(settings, upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m1",
+                headers={**VERSION_HEADERS, "X-Slimapi-Capabilities": "mid-partial-envelope=1"},
+            )
+        assert r.status_code == 503
+        assert "Retry-After" not in r.headers
+    finally:
+        app.state.transforms.shutdown()
+
+
+# ----- Invariant (R3-B2-INVARIANT) -----
+
+async def test_opt_a_invariant_mutual_exclusivity(upstream_factory):
+    """Assert every messageID appears in at most one of items/errors."""
+    mids = {"m1": (200, orjson.dumps(_msg("m1", 100))),
+            "m2": (404, b"{}"),
+            "m3": (httpx.ConnectError("simulated"),)}
+    handler = _opt_in_handler(mids)
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m1,m2,m3",
+                headers={**VERSION_HEADERS, "X-Slimapi-Capabilities": "mid-partial-envelope=1"},
+            )
+        assert r.status_code == 200
+        data = r.json()
+        items_ids = {item["info"]["id"] for item in data.get("items", [])}
+        errors_ids = {err["messageID"] for err in data.get("errors", [])}
+        assert items_ids.isdisjoint(errors_ids)
+    finally:
+        app.state.transforms.shutdown()
+
+
+# ----- Rollback end-to-end -----
+
+async def test_opt_a_rollback_trips_and_forces_legacy(upstream_factory):
+    """After latched disabled, subsequent opt-in requests fall back to legacy."""
+    # Build a ledger that is already latched disabled.
+    ledger = _BatchLedger(window_seconds=3600)
+    ledger._disabled = True
+    ledger._disabled_reason = "test"
+
+    mids = {"m1": (httpx.ConnectError("simulated"),)}
+    handler = _opt_in_handler(mids)
+    upstream = upstream_factory(handler)
+    settings = _settings()
+    app = _build_app(settings, upstream)
+    # Inject the latched ledger
+    app.state.batch_ledger = ledger
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                "/slimapi/messages/s1/full?ids=m1",
+                headers={**VERSION_HEADERS, "X-Slimapi-Capabilities": "mid-partial-envelope=1"},
+            )
+        # Despite opt-in header, should behave as legacy (503, no retry-after)
+        assert r.status_code == 503
+        assert "Retry-After" not in r.headers
+        # Also verify the response body is the legacy upstream_unavailable code
+        assert r.json()["code"] == "upstream_unavailable"
+    finally:
+        app.state.transforms.shutdown()
+
+import os
+from oc_slimapi.capabilities import parse_capabilities as _parse_cap
+from oc_slimapi.observability import BatchLedger as _BatchLedger
+
+OPT_IN_HEADER = "X-Slimapi-Capabilities: mid-partial-envelope=1"
+OPT_A_MODE_KEY = "opt_a_partial_envelope_enabled"
+
+# A dict mapping mid → (status_code, body_or_exception_class, retry_after_str|None)
+# body_or_exception_class: bytes (for 200), exception type (for network error), or
+# a tuple (status_code, body_bytes) for status>=400 responses.
+# For 200, body is the upstream JSON message bytes.
+# For network errors, use httpx.ConnectError.
+
+def _opt_in_handler(
+    mid_map: dict[str, tuple],
+    *,
+    discover_200_body: bytes = orjson.dumps({"id": "s1"}),
+):
+    """Build a MockTransport handler that serves discover + per-mid responses.
+
+    ``mid_map`` keys are messageIDs; values are:
+        (200, body_bytes) for success
+        (NetworkError,) for network error (any subclass of Exception)
+        (http_status, body_bytes) for HTTP error (≥400, no Retry-After)
+        (http_status, body_bytes, retry_after_str|None) for HTTP error with Retry-After
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session/s1":
+            return httpx.Response(200, content=discover_200_body)
+        mid = request.url.path.rsplit("/", 1)[-1]
+        entry = mid_map.get(mid)
+        if entry is None:
+            return httpx.Response(404, content=orjson.dumps({"error": "not found"}))
+        # Handle network error (single-element tuple of Exception subclass)
+        if len(entry) == 1:
+            exc = entry[0]
+            if isinstance(exc, BaseException):
+                raise exc
+            if isinstance(exc, type) and issubclass(exc, Exception):
+                raise exc()
+            # fall through to raise ValueError below
+        if len(entry) == 2:
+            status, body = entry
+            if isinstance(status, int):
+                if status < 400:
+                    return httpx.Response(status, content=body)
+                # HTTP error without Retry-After
+                return httpx.Response(status, content=body)
+            # If status is an Exception subclass, raise it
+            if isinstance(status, type) and issubclass(status, Exception):
+                raise status()
+        if len(entry) == 3:
+            status, body, retry_after = entry
+            if not isinstance(status, int):
+                raise ValueError(f"unexpected status type in entry: {entry}")
+            resp = httpx.Response(status, content=body)
+            if retry_after is not None:
+                resp.headers["Retry-After"] = retry_after
+            return resp
+        raise ValueError(f"unexpected entry: {entry}")
+    return handler

@@ -58,6 +58,7 @@ def _build_app(settings: Settings, upstream: httpx.AsyncClient) -> FastAPI:
     app.state.config = settings
     app.state.upstream = upstream
     app.state.schema_degraded = False
+    app.state.deployment_revision = None
     app.include_router(health.router)
     register_error_handlers(app)
     return app

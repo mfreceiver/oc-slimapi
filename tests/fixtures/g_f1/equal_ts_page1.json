@@ -1,0 +1,4 @@
+[
+    {"info": {"id": "m1", "role": "user", "time": {"created": 100, "updated": 100}}, "parts": [{"id": "p1", "type": "text", "messageID": "m1", "text": "hi"}]},
+    {"info": {"id": "m2", "role": "user", "time": {"created": 100, "updated": 100}}, "parts": [{"id": "p2", "type": "text", "messageID": "m2", "text": "there"}]}
+]

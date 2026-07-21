@@ -10,7 +10,7 @@ router = APIRouter(prefix="/slimapi", tags=["health"])
 
 @router.get("/health")
 async def health(request: Request):
-    return json_response({
+    resp = {
         "sidecar": {"ok": True, "version": __version__},
         "server": {
             "api_version": request.app.state.config.server_api_version,
@@ -26,7 +26,12 @@ async def health(request: Request):
             "clientMin": request.app.state.config.accepted_client_versions[0],
             "clientMax": request.app.state.config.accepted_client_versions[1],
         },
-    }, accept_encoding=request.headers.get("accept-encoding"))
+    }
+    # S-E: optional deployment revision, omitted when None
+    rev = request.app.state.deployment_revision
+    if rev is not None:
+        resp["server"]["deploymentRevision"] = rev
+    return json_response(resp, accept_encoding=request.headers.get("accept-encoding"))
 
 
 @router.get("/ready")
