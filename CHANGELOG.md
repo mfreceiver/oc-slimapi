@@ -42,11 +42,29 @@ ocdroid 对接时：
 
 > 开发中、尚未打 tag 的变更写在这里；`release.sh` 发版时把本节内容折叠进新版本标题下。
 
+---
+
+## [0.3.0] - 2026-07-21
+
+> ocdroid v0.11.7 反馈 rev F / 实现 v6 + 接入放开。**全加性** wire / 部署行为，**未 bump** `X-Slimapi-Version`（仍为 `1`）。移交：`docs/ocmar/reports/2026-07-21-v0.11.7-feedback-handoff.md`。
+
+### Added
+
+- **`GET /slimapi/sessions` 完整性 + discovery readiness 响应头**（ocdroid v0.11.7 §1）：200 成功路径加 `X-Complete`（本页未满：`len < limit`；**不得**当权威全集）、`X-Discovery-Directories`（`len(directory_allowlist)`，非 query 命中数）、`X-Discovery-Ready`（是否存在 last-known-good 发现快照）。502/503 等错误路径**不**发三头。非 list 上游 body → 503 `upstream_unavailable`。**加性，未 bump** `X-Slimapi-Version`。
+- **SSE `server.reconfigured`**（ocdroid v0.11.7 §3）：payload `{reason:"discovery_changed", at:<epoch-ms>}`。仅 discovery 变更时直推——`load_products` 成功后 `(new_set != old_set) OR (old_ready is False AND new_ready is True)`。上游重连/掉线/背压/Last-Event-ID **仍发既有 `resync`**（路径不动，无双重 cold-start）。无活跃订阅者时 no-op。客户端收到应作废本地 commitToken 并 cold-start。**加性，未 bump**。
+- **`/slimapi/health` + `/slimapi/ready` schema 三键**（ocdroid v0.11.7 §4）：`schema.version` / `schema.clientMin` / `schema.clientMax`（从 config 读）；旧 `server.api_version` / `server.accepted_client_versions` 保留。定位为**诊断用 wire 范围回显**（非 feature discovery）。**加性，未 bump**。
+- **`load_products` 并发护栏 + 双层 shape 守卫**：`app.state.allowlist_lock` 全程串行；顶层 `/project` 与每个 `/project/{id}/directories` 响应必须为 list，任一非 list → 整次刷新失败（保留 last-known-good set/`allowlist_ready`，不通知）。`allowlist_ready` 首次成功置 True，后续失败不复位。
+
 ### Changed
 
 - **`:4097` 放开为明文直连入口（可绑 `0.0.0.0`）**：`OC_SLIMAPI_HOST` 接受值由 `{127.0.0.1, ::1, localhost}` 扩展为 `{127.0.0.1, ::1, localhost, 0.0.0.0}`。绑 `0.0.0.0` 后客户端可通过 Tailscale 地址**直接**访问 `:4097`，**不强制 mTLS**——安全边界由 Tailscale ACL / 主机防火墙负责。`:14097` 仍为推荐的 mTLS 入口；任意 routable host（如 `192.168.x.x`）仍被 `config.validate()` 拒绝。**Upstream SSRF guard 不放松**：`OC_SLIMAPI_UPSTREAM` 仍必须为 fixed loopback HTTP，与 host 选择无关。`X-Slimapi-Version` 版本门禁未改动。**加性，未 bump** `X-Slimapi-Version`。
 
 - **完全移除 directory allowlist gate（slimapi 不再做目录警察）**：`require_directory()` 已删除；directory 不再因 ∉ allowlist 返 400 `directory_not_allowed`。涉及端点：`/slimapi/sessions`（列表）、`/slimapi/sessions/status`（批量）、`/slimapi/sessions/{sid}/status`（早已不 gate）、`/slimapi/questions`、`/slimapi/permissions`、`/slimapi/messages/**`（list/since/full/full?ids=）、routeToken 写端点（reply/reject/permission）。所有 directory 现统一行为：经 `normalize_directory` 规范化后作为 `X-Opencode-Directory` 头 + `?directory=` query **透传**给上游 opencode，由 opencode 自行决定能否服务。slimapi 保留：`normalize_directory`、显式 repeated `?directory=` 的去重保序 + `invalid_directory_count`（1–32 结构限制）、query `directory` 与 `X-Opencode-Directory` 头冲突 → 400 `directory_not_allowed`（结构性歧义，仍由 slimapi 拒绝）、`X-Slimapi-Version` 版本门禁、upstream 必须 loopback 的 SSRF guard。`/slimapi/projects` 仍返回发现到的项目；`app.state.directory_allowlist` 数据结构保留作 `/projects` 展示与 q/p null-directory 聚合 fan-out 用途，**不再作 gate**。**加性，未 bump** `X-Slimapi-Version`（错误码 `directory_not_allowed` 保留作 query/header 冲突场景，未删除）。
+
+### Fixed
+
+- **契约 §2 `start` 语义 stale 勘误**：`GET /slimapi/sessions` 的 `start` 是上游 legacy 的 epoch-ms **时间戳水位**（`time_updated >= start`），**非 offset 偏移分页**；上游不暴露前向 cursor、不保证 id tie-break。文档与实现透传行为对齐（代码未改透传逻辑）。
+- **partId 稳定性文档 ratify**：schema-valid 下 thin/`/full` 跨端点 part `id` 稳定；`thin_placeholder_*` 为 message-level UI 兜底，不参与 `/full` part-level 对齐（客户端应 message-level 整体替换）。去 placeholder 转 backlog。
 
 ---
 

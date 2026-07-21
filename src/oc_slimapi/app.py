@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -52,6 +53,13 @@ async def lifespan(app: FastAPI):
         max_response_bytes=settings.max_response_bytes,
     ))
     app.state.directory_allowlist = set()
+    # discovery readiness signal (v6 §1.1): False until first successful
+    # load_products; subsequent failures retain last-known-good (do not reset).
+    app.state.allowlist_ready = False
+    # serialises concurrent load_products callers (warm_allowlist,
+    # /projects, q-p null-dir fan-out) so a slow stale fetch cannot
+    # overwrite a fast fresh one.
+    app.state.allowlist_lock = asyncio.Lock()
     app.state.schema_degraded = False
     # T3-hardened hub registry (contract §6): per-subscriber byte budget,
     # per-frame ceiling, and per-directory / total admission caps all flow

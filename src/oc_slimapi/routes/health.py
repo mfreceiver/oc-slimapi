@@ -16,7 +16,16 @@ async def health(request: Request):
             "api_version": request.app.state.config.server_api_version,
             "accepted_client_versions": list(request.app.state.config.accepted_client_versions),
         },
-        "schema": {"degraded": request.app.state.schema_degraded},
+        "schema": {
+            "degraded": request.app.state.schema_degraded,
+            # v6 §4: diagnostic re-exposure of the wire-version triplet. These
+            # are *config values*, NOT a feature-discovery surface — version=1
+            # is identical to v1 so it cannot enable capability negotiation
+            # on its own. Existing ``server.*`` keys are preserved for back-compat.
+            "version": request.app.state.config.server_api_version,
+            "clientMin": request.app.state.config.accepted_client_versions[0],
+            "clientMax": request.app.state.config.accepted_client_versions[1],
+        },
     }, accept_encoding=request.headers.get("accept-encoding"))
 
 
@@ -34,5 +43,10 @@ async def ready(request: Request):
             "api_version": request.app.state.config.server_api_version,
             "accepted_client_versions": list(request.app.state.config.accepted_client_versions),
         },
-        "schema": {"degraded": request.app.state.schema_degraded},
+        "schema": {
+            "degraded": request.app.state.schema_degraded,
+            "version": request.app.state.config.server_api_version,
+            "clientMin": request.app.state.config.accepted_client_versions[0],
+            "clientMax": request.app.state.config.accepted_client_versions[1],
+        },
     }, status_code=200 if ok else 503, accept_encoding=request.headers.get("accept-encoding"))

@@ -197,22 +197,32 @@ class Subscriber:
         if self.queue is None:
             self.queue = asyncio.Queue(maxsize=self.queue_items)
 
-    def put(self, frame: Any) -> None:
+    def put(self, frame: Any) -> bool:
+        """Enqueue ``frame`` for this subscriber under the T3 guards.
+
+        Returns ``True`` iff the frame was actually accepted onto the queue
+        (so the caller can count it as a successfully emitted frame); returns
+        ``False`` on every non-success exit (closed, oversized dropped,
+        overflow path with self-produced resync+STOP, STOP that could not be
+        enqueued). Byte bookkeeping and overflow behaviour are unchanged from
+        the v1 contract — only the return value was added in v6 §3.5.
+        """
         if self.closed:
             # Post-disconnect: silently drop. The resync + STOP pair already
             # enqueued by the overflow path is the only thing the SSE
             # generator should see.
-            return
+            return False
         if frame is STOP:
-            # Control sentinel — always passes (used by the overflow path
-            # itself and by orderly shutdown).
-            with contextlib.suppress(asyncio.QueueFull):
+            # Control sentinel — only return True if it actually landed.
+            try:
                 self.queue.put_nowait(STOP)
-            return
+            except asyncio.QueueFull:
+                return False
+            return True
         size = len(frame)
         if size > self.max_frame_bytes:
             self.dropped_frames += 1
-            return
+            return False
         if (
             self.queue.qsize() < self.queue_items
             and self.queued_bytes + size <= self.buffer_bytes
@@ -226,7 +236,7 @@ class Subscriber:
                 pass
             else:
                 self.queued_bytes += size
-                return
+                return True
         # Overflow: immediate disconnect per contract §6.
         self.closed = True
         self.forced_disconnects += 1
@@ -235,6 +245,7 @@ class Subscriber:
         with contextlib.suppress(asyncio.QueueFull):
             self.queue.put_nowait(resync)
             self.queue.put_nowait(STOP)
+        return False
 
     def ack(self, frame: Any) -> None:
         """Decrement ``queued_bytes`` for a frame consumed from the queue.
@@ -483,6 +494,26 @@ class GlobalHub:
         if self.subscribers:
             self.emitted_frames_total += len(self.subscribers)
 
+    def notify_reconfigured(self, reason: str) -> int:
+        """Push one ``server.reconfigured`` frame to every active subscriber.
+
+        Counter increment is keyed on :meth:`Subscriber.put` returning True
+        (frame actually landed on the queue) so a closed/overflowed
+        subscriber does not get counted as an emit. Returns the number of
+        subscribers that successfully received the frame. Used by
+        ``HubRegistry.notify_reconfigured_if_active`` (the only intended
+        caller) to signal a discovery-state change; subscribers must treat
+        it as a cold-start trigger.
+        """
+        frame = sse_frame({"reason": reason, "at": _now_ms()}, event="server.reconfigured")
+        emitted = 0
+        for subscriber in tuple(self.subscribers):
+            if subscriber.put(frame):
+                emitted += 1
+        if emitted:
+            self.emitted_frames_total += emitted
+        return emitted
+
     async def run(self) -> None:
         delay = 1.0
         while self.subscribers:
@@ -617,6 +648,19 @@ class HubRegistry:
 
     def get_global(self) -> GlobalHub:
         return self.get(None)
+
+    def notify_reconfigured_if_active(self, reason: str) -> int:
+        """Push a ``server.reconfigured`` frame to active subscribers, if any.
+
+        Returns 0 (and **does not** lazily create a GlobalHub) when no hub
+        exists yet or no one is listening. External callers (e.g.
+        ``load_products``) use this so a discovery-state change between
+        connects does not spin up a hub just to push into an empty room.
+        """
+        hub = self._global
+        if hub is not None and hub.subscribers:
+            return hub.notify_reconfigured(reason)
+        return 0
 
     def subscribe(self) -> Subscriber:
         """Admit a new subscriber under T3 caps, then start / reuse the hub.

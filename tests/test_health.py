@@ -315,3 +315,96 @@ async def test_health_identity_body_is_not_gzip_encoded(upstream_factory):
     assert raw_bytes[:2] != b"\x1f\x8b"
     body = orjson.loads(raw_bytes)
     assert body["sidecar"]["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# v6 §4: schema section now exposes version / clientMin / clientMax.
+# Old ``server.*`` fields are preserved for back-compat.
+# ---------------------------------------------------------------------------
+
+async def test_health_schema_includes_version_and_client_range(upstream_factory):
+    """`/slimapi/health` schema carries the wire-version triplet from config."""
+    upstream = upstream_factory(_make_upstream_ok())
+    app = _build_app(_settings(), upstream)
+
+    response = await _get(app, "/slimapi/health")
+    assert response.status_code == 200
+    body = response.json()
+    # New keys exist and are read from config (not hard-coded).
+    assert body["schema"] == {
+        "degraded": False,
+        "version": 1,
+        "clientMin": 1,
+        "clientMax": 1,
+    }
+    # Old ``server.*`` keys still there for back-compat.
+    assert body["server"]["api_version"] == 1
+    assert body["server"]["accepted_client_versions"] == [1, 1]
+
+
+async def test_health_schema_reflects_non_default_config(upstream_factory):
+    """With a wider accepted range, clientMin/clientMax follow the config.
+
+    Locks that the new keys are NOT hard-coded to 1,1 — they come from
+    ``Settings.accepted_client_versions`` at request time.
+    """
+    upstream = upstream_factory(_make_upstream_ok())
+    settings = _settings(accepted_client_versions=(1, 3))
+    app = _build_app(settings, upstream)
+
+    response = await _get(app, "/slimapi/health")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["schema"]["clientMin"] == 1
+    assert body["schema"]["clientMax"] == 3
+    assert body["server"]["accepted_client_versions"] == [1, 3]
+
+
+async def test_ready_schema_includes_version_and_client_range(upstream_factory):
+    """`/slimapi/ready` mirrors the same schema expansion as `/health`."""
+    upstream = upstream_factory(_make_upstream_ok())
+    app = _build_app(_settings(), upstream)
+
+    response = await _get(app, "/slimapi/ready")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["schema"] == {
+        "degraded": False,
+        "version": 1,
+        "clientMin": 1,
+        "clientMax": 1,
+    }
+
+
+async def test_ready_503_path_preserves_schema_fields(upstream_factory):
+    """Schema fields are present on the 503 path too (diagnostic, not gated
+    on upstream health)."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, content=b"boom")
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+
+    response = await _get(app, "/slimapi/ready")
+    assert response.status_code == 503
+    body = response.json()
+    assert body["schema"]["version"] == 1
+    assert body["schema"]["clientMin"] == 1
+    assert body["schema"]["clientMax"] == 1
+    # Old fields still there.
+    assert body["server"]["api_version"] == 1
+    assert body["server"]["accepted_client_versions"] == [1, 1]
+
+
+async def test_health_schema_reflects_schema_degraded_state(upstream_factory):
+    """``schema.degraded`` is dynamic — flip it on the app and re-read."""
+    upstream = upstream_factory(_make_upstream_ok())
+    app = _build_app(_settings(), upstream)
+    app.state.schema_degraded = True
+
+    response = await _get(app, "/slimapi/health")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["schema"]["degraded"] is True
+    # Other keys still present.
+    assert body["schema"]["version"] == 1

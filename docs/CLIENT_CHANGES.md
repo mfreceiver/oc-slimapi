@@ -12,11 +12,23 @@
   （sidecar 从 opencode `Link` 头透传 opaque cursor，原样回传 `?before=`）。
 - `hasFull=true` 的 part 首次展开时请求 `/slimapi/messages/{sid}/full/{mid}?mode=full`，
   按 `messageId+partId` 替换，禁止追加重复 part。
+- **partId 稳定性（rev F）**：schema-valid 消息下 thin skeleton 的 part `id` 与 `/full/{mid}` / `/full?ids=` 中的 part `id` **跨端点稳定**（真实 `prt_*`）。
+- **placeholder → real 对齐（修「展开失败」）**：thin 在无可渲染 part 时仍可能注入 `id=thin_placeholder_{messageID}`。该 id **不会**出现在 `/full`。客户端判定：`partId.startsWith("thin_placeholder_")` → **message-level 整体替换**该 message 的 parts（禁止按 placeholder id 做 part-level lookup / `replaced=false`）。推荐同时迁 G6 batch（`/full?ids=`）。
 - foreground catch-up 使用 `/slimapi/messages/{sid}/since/{lastSeenUpdatedAt}`
   （`(info.time.updated or info.time.created) >= ts`，含边界；v1.18.3 无 message 级 `time.updated`，服务端实读 `created`，与 digest `updatedAt` 同源）；客户端按 messageID 本地去重边界；翻页用
   `X-Next-Cursor`（透传 opencode `Link` 头 opaque cursor）。无 409 resync。
 - **per-session watermark 升级为 `(updatedAt, messageID)` 二元组字典序**（v0.2.1，ocdroid 缺口 1）：先 strict 比 `updatedAt`（严格 > 才推进时间维），相等时 strict 比 `messageID`（`msg_+ascending()` 单调，新消息 id 字典序更大 → 严格 > 才推进 id 维）。对齐上游 `(time_created DESC, id DESC)` 全序，解 strict-advance 在等时间戳不同 id 时的残留 bug。
 - **无 watermark 的初始拉取推荐 cursor drain**（`?before` 游标分页，与 focus digest / resync 共享 reconciler）；`/since/0` 虽合法但非推荐路径（ocdroid 缺口 3 裁定）。
+
+## sessions 列表完整性头（rev F，新）
+
+- `GET /slimapi/sessions` 200 响应头：
+  - **`X-Complete`**：`"true"` = 本页 `len < limit`（未满）；`"false"` = 可能截断。**禁止**当「权威全集 / 权威空 / 结束冷启动」——上游无 total、无前向 cursor；`start` 是 epoch-ms 时间戳水位（`time_updated >= start`），**非 offset**。
+  - **`X-Discovery-Directories`**：sidecar 发现目录数（allowlist 大小）。**不是**本次 query 命中数，**不是** q/p `scope.directories`。须与 Ready 联读。
+  - **`X-Discovery-Ready`**：`"false"` = 尚无成功发现；`"true"` = 持有 last-known-good 快照（Directories 对该快照权威，**不保证实时**；后续刷新失败不复位）。
+- 错误路径（502/503）**不**带三头。
+- **`roots` 默认仍为 `false`**——客户端**应显式传** `roots=true` 以排除 subagent/task（ocdroid 已传）。
+- 推荐：`limit=500` 兜底可保留，但用 `X-Complete` 判断是否可能截断，勿盲猜全集。
 
 ## 路由与失败策略
 
@@ -62,9 +74,19 @@
   - `session.digest`（debounce 250ms/session）：`{sessionID,directory,status?,messageID?,updatedAt?,archived?,deleted?,lastError?}`。
   - **`session.error`（G1，立即直推，无 sid 时）**：`{directory?,name,message,at}`。客户端 UI：有 sid 已含在 digest 的 `lastError`（该 session banner）；无 sid → 全局 toast。
   - `question.asked`/`v2.asked`、`permission.asked`/`resolved`/`v2.asked`/`v2.resolved`（立即直推）。
-  - `server.connected`（订阅即吐）、`server.heartbeat`（10s）、`resync`（重连 `{"reason":"reconnect_no_replay"}`，**无 replay**）。
+  - `server.connected`（订阅即吐）、`server.heartbeat`（10s）、`resync`（重连 `{"reason":"reconnect_no_replay"}` / 背压 `{"reason":"subscriber_backpressure"}`，**无 replay**）。
+  - **`server.reconfigured`（rev F，新）**：`{reason:"discovery_changed", at:<epoch-ms>}`。**仅** discovery 变更（allowlist 集合变 **或** 就绪态 false→true）时直推。收到即作废本地 commitToken / stale，触发 cold-start（与 resync 同路径、幂等）。
+- **`resync` 路径未改**：上游重连/掉线/背压/Last-Event-ID 仍发 `resync`；**不**与 `server.reconfigured` 重叠（前者连接层，后者 discovery 层）→ 无双重 cold-start。
+- **连接建立期 coalescing**：带 `Last-Event-ID` 重连时同连接可能先 `resync` 再 `server.connected`（既有）。客户端 **SHOULD** 对同一连接建立期 cold-start 触发帧做 once-latch（至多一次 reconcile）。
+- **`server.heartbeat` ≠ 上游健康**：仅证 sidecar + 订阅存活；outage 探测用 `/slimapi/ready` 或自然 fetch/write 失败。sidecar 重启后重连收 `server.connected` → **应** cold-start。
 - digest `lastError`：sticky 跨窗口，`status=busy` 清除（显式 `null` 帧）；客户端据此显隐 session 错误 banner。`MessageAbortedError` 被 sidecar 过滤，不下发。
-- 客户端所有 `/slimapi/**` 请求（含 SSE）须带 `X-Slimapi-Version: 1`；连接时读 `/slimapi/health` 自检。
+- 客户端所有 `/slimapi/**` 请求（含 SSE）须带 `X-Slimapi-Version: 1`；连接时读 `/slimapi/health` 自检（见下 schema 三键）。
+
+## health schema 回显（rev F，新）
+
+- `/slimapi/health` 与 `/slimapi/ready` 的 `schema` 节：`{degraded, version, clientMin, clientMax}`（从服务端 config 读）。
+- 旧 `server.api_version` / `server.accepted_client_versions` **保留**。
+- **定位**：诊断用 wire 兼容范围回显；**非** feature discovery（version 保持 1 时三元组不变，无法探测 cursor/reconfigured 等能力）。
 
 ## 批量展开（G6，新）
 
@@ -97,10 +119,10 @@
   - 503 全失败响应**不含** `scope`（失败时语义无意义）。
   - **显式 repeated `?directory=`**：去重保序，1–32；空/超 32 → 400 `invalid_directory_count`。[Unreleased] **不再因 directory ∉ allowlist 返 400**——任意 directory 透传给上游 opencode。
 - **冷启动推荐顺序**（F3 暖机后仍建议遵循，避免竞态）：
-  1. `GET /slimapi/health`（版本自检 + `schema.degraded`）
+  1. `GET /slimapi/health`（版本自检 + `schema.degraded` + `schema.version/clientMin/clientMax`）
   2. `GET /slimapi/projects`（刷新 allowlist；F3 启动已 best-effort warm，本步仍是权威刷新）
-  3. `GET /slimapi/sessions`（骨架列表）
+  3. `GET /slimapi/sessions`（骨架列表；消费 `X-Complete` / `X-Discovery-*` 三头）
   4. `GET /slimapi/questions` + `/permissions`（可 null directory）
   5. 按需 `GET /slimapi/messages/{sid}` / `/since/{ts}` / `/full?ids=`
-  6. 再连 `GET /slimapi/events`
+  6. 再连 `GET /slimapi/events`（消费 `server.reconfigured` + 连接建立期 coalescing）
 - routeToken reply/reject：[Unreleased] slimapi 已移除 allowlist gate，token 校验后 directory 直接 normalize 后透传给上游 opencode；冷启动空 allowlist 不再导致 400。`_token` 仅校验 HMAC 签名 + kind/requestID/sessionID/directory。

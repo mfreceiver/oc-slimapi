@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 from fastapi import FastAPI
@@ -26,6 +28,10 @@ def _build_app(upstream: httpx.AsyncClient) -> FastAPI:
     app.state.route_secret = app.state.config.route_secret.encode()
     app.state.upstream = upstream
     app.state.directory_allowlist = set()
+    # v6 §1.3 fixture sync: sessions() now reads ``allowlist_ready`` for
+    # the X-Discovery-Ready header; mirror the lifespan initialisation.
+    app.state.allowlist_ready = False
+    app.state.allowlist_lock = asyncio.Lock()
     app.state.schema_degraded = False
     app.include_router(sessions.router)
     # messages router is needed for the directory query/header conflict path,

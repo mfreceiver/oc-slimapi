@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import orjson
 import pytest
@@ -31,6 +33,11 @@ def _build_app(upstream: httpx.AsyncClient, *, allowlist: set[str] | None = None
     app.state.route_secret = app.state.config.route_secret.encode()
     app.state.upstream = upstream
     app.state.directory_allowlist = set(allowlist or ())
+    # v6 §1.3 fixture sync: questions.py also drives ``load_products`` for
+    # the null-directory fan-out, and it transitively needs the readiness
+    # flag + lock that sessions.py requires.
+    app.state.allowlist_ready = False
+    app.state.allowlist_lock = asyncio.Lock()
     app.include_router(sessions.router)
     app.include_router(questions_route.router)
     register_error_handlers(app)

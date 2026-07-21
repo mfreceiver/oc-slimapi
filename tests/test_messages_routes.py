@@ -73,6 +73,10 @@ def _build_app(settings: Settings, upstream: httpx.AsyncClient) -> FastAPI:
         max_response_bytes=settings.max_response_bytes,
     ))
     app.state.directory_allowlist = set()
+    # v6 §1.3 fixture sync: sessions() reads ``allowlist_ready`` for
+    # X-Discovery-Ready; load_products (transitively) acquires the lock.
+    app.state.allowlist_ready = False
+    app.state.allowlist_lock = asyncio.Lock()
     app.state.schema_degraded = False
     app.state.hubs = HubRegistry(upstream)
     for router in (health.router, sessions.router, messages.router, questions.router, events.router):
