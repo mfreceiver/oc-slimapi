@@ -28,6 +28,7 @@
 ## §0 范围与架构
 - 纯 HTTP sidecar：FastAPI + httpx + orjson + uvicorn **单 worker**，host ∈ `{127.0.0.1, ::1, localhost, 0.0.0.0}`。
   - **已部署稳态**：绑定 `0.0.0.0:4097`（所有接口），**用户接受**；直接 `:4097` 明文访问须经网络边界（防火墙/Tailscale ACL）阻断；外部客户端经 `:14097` mTLS 隧道（stunnel `requireCert=yes verifyChain=yes`，复用既有证书）可达。
+> **（2026-07-21 cdba40d：G-ACL 部署姿态由「收紧 loopback」改为「0.0.0.0:4097 用户接受稳态 + 14097 mTLS」——用户最终决定不收紧 loopback，复用既有 mTLS 证书；详见 `docs/ocmar/reports/2026-07-21-g-acl-ops-evidence.md` §4.3。非 wire 变更。）**
   - **`:14097`** 为公网唯一 mTLS 入口；upstream 始终固定 `127.0.0.1:4096`（SSRF guard 不随 host 放松）。
   - **loopback-only（`127.0.0.1:4097`）** 属更严格替代姿态，非当前部署；代码允许该配置。
 - **不读 opencode SQLite**；仅 legacy `/session` API；upstream 始终固定 loopback HTTP（SSRF guard 不随 host 放松）。
@@ -364,7 +365,7 @@ skeleton 共享缓存（YAGNI，先指标）、多用户（独立 stack）、Par
 
 **保守值**：`OC_SLIMAPI_OPT_A_RETRY_AFTER_MS_CONSERVATIVE=200`；cap `OC_SLIMAPI_OPT_A_RETRY_AFTER_MS_CAP=10000`。
 
-> **non-opt-in 503 从不发 Retry-After（legacy 等价）**。
+> **non-opt-in 的 `upstream_unavailable` 503 从不发 Retry-After（Opt-A 信号对旧客户端不泄露）。注：`transform_busy` 503 的 `Retry-After: 2` 为既有 pool-saturation 行为（v0.2.0，与 Opt-A 无关），对 opt-in / non-opt-in 客户端一致发出，不在此约束内。
 
 ### 15.5 Feature Flag 与回滚
 
