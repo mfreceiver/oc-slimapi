@@ -1,7 +1,11 @@
 # ocdroid v0.11.7 slimapi 契约反馈与完善建议
 
-> 客户端视角，基于 ocdroid **v0.11.7**（2026-07-21 发版）本会话修复与联调发现。
-> 对照 `v1-contract.md` / `CLIENT_CHANGES.md`。每条结构：【客户端观测】→【已落地契约（确认已读）】→【建议，★标注最理想选项】→【接口新增/调整要求】。
+> **档案说明（2026-07-21）**：本文是 ocdroid 侧**原始反馈**快照，保留历史措辞（含当时「尚未迁移 / 服务端无 reconfigure」等观测）。  
+> **slimapi 落地结果**以 **v0.3.0 / 契约 rev F** 为准：移交 `docs/ocmar/reports/2026-07-21-v0.11.7-feedback-handoff.md`；活文档见 `v1-contract.md` / `CLIENT_CHANGES.md` / `CHANGELOG.md` `[0.3.0]`。  
+> 请勿把下文「建议 / 未落地」读成当前状态。
+>
+> 客户端视角，基于 ocdroid **v0.11.7**（2026-07-21 发版）本会话修复与联调发现。  
+> 对照 `v1-contract.md` / `CLIENT_CHANGES.md`。每条结构：【客户端观测】→【已落地契约（确认已读）】→【建议，★标注最理想选项】→【接口新增/调整要求】。  
 > 所有建议默认**加性、不 bump `X-Slimapi-Version`**（沿用既有 additive 模式），除非另注。
 
 ---

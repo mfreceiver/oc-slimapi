@@ -119,23 +119,22 @@ B4  服务端 P1（可与 B1 并行）
 
 ---
 
-## 5. B1 — G7-soft messages allowlist
+## 5. B1 — G7-soft messages directory（**v0.3.0 修订：allowlist gate 已移除**）
 
-### 现状
+### 现状（v0.3.0+）
 
-`/slimapi/messages/**` 的 `directory` 只转发 header，不做 allowlist（与 sessions/pending 不一致）。
+`/slimapi/messages/**` 的 `directory` **可选**：未传不拦；显式传则 `normalize_directory` 后作 `X-Opencode-Directory` + `?directory=` **透传**上游 opencode。  
+**不再**因 ∉ allowlist 返 400（`require_directory` 已删）。allowlist 仅供 `/projects` 展示与 q/p null-dir 聚合。
 
-### v1 契约（soft）
+### 行为表
 
 | 条件 | 行为 |
 |---|---|
-| 未传 query `directory` | 不拦（依赖上游默认）；**v1 不强制必填** |
-| 传了 query `directory` 且 ∈ allowlist | 通过 |
-| 传了 query `directory` 且 ∉ allowlist | **400** `{"code":"directory_not_allowed"}`；允许 miss 时刷新 projects 一次 |
+| 未传 query `directory` | 不拦（依赖上游默认）；**不强制必填** |
+| 传了 query `directory` | normalize 后透传上游（不论是否曾在 allowlist） |
+| query `directory` 与 `X-Opencode-Directory` 头同时存在且冲突 | **400** `{"code":"directory_not_allowed"}`（结构性歧义） |
 
-**校验源（写死）**：v1 **只认 query `directory`** 走 `require_directory()`。  
-若同时存在 `X-Opencode-Directory` header 且与 query 冲突 → **400**。  
-**禁止**宣称 soft = 多租户隔离；隔离靠 stunnel/mTLS + 网络边界。
+**禁止**宣称 directory 透传 = 多租户隔离；隔离靠 stunnel/mTLS + 网络边界。
 
 ### 涉及路径
 
@@ -411,7 +410,7 @@ X-Slimapi-Version: 1
 | G1 lastError + session-less 帧 | `src/oc_slimapi/sse/hub.py` |
 | G2 status 404 | `src/oc_slimapi/routes/sessions.py` |
 | G6 multi full | `src/oc_slimapi/routes/messages.py`（路由注册先于 `{mid}`） |
-| G7-soft allowlist | `routes/messages.py` + 复用 `require_directory` |
+| G7-soft directory（v0.3.0：无 gate） | `routes/messages.py` `_resolve_messages_directory`（normalize 透传；query/header 冲突→400） |
 | G8 流式 cap | `routes/messages.py`（对齐 `read_with_cap`） |
 | shell deny-list | `proxy.py` + `config.py` |
 | 错误码统一 | 各 route + helper |

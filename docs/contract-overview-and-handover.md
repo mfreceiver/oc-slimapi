@@ -1,8 +1,8 @@
 # oc-slimapi 契约总览与交接（ocdroid ↔ slimapi）
 
-> **截至 2026-07-21（rev F 落地后）。** 本文是 ocdroid 客户端与 oc-slimapi 契约相关的**全部内容汇总**，供交接/转交用。详细论据见 §八参考文档。
+> **截至 2026-07-21（slimapi v0.3.0 / 契约 rev F 已发版部署）。** 本文是 ocdroid 客户端与 oc-slimapi 契约相关的**全部内容汇总**，供交接/转交用。详细论据见 §八参考文档。
 >
-> 一句话现状：契约主体已成熟；ocdroid v0.11.7 反馈 4 项中 **§1 / §3 / §4 已在 slimapi 实现并文档化**（wire 仍为 1）；**§2 partId 已 ratify**（placeholder 保留）；ocdroid 侧「展开失败」靠 message-level 替换 + 建议迁 G6，不阻塞本批 slimapi 部署。
+> 一句话现状：契约主体已成熟；ocdroid v0.11.7 反馈 4 项中 **§1 / §3 / §4 已在 slimapi v0.3.0 实现并文档化**（wire 仍为 1）；**§2 partId 已 ratify**（placeholder 保留）；ocdroid 侧「展开失败」靠 message-level 替换 + G6 batch，不阻塞 slimapi。
 
 ---
 
@@ -35,7 +35,7 @@
 | 项 | 状态 | 说明 |
 |---|---|---|
 | G1 `session.error` / `digest.lastError` 三态 | ✅ 已落地 | ocdroid 已消费 |
-| G6 批量展开 `/full?ids=` | ✅ 服务端已落地 | **ocdroid 尚未迁移**（仍走单条 `/full/{mid}` 404 fallback） |
+| G6 批量展开 `/full?ids=` | ✅ 服务端已落地 | ocdroid 主路径已 batch（含 404 单条 fallback；以客户端仓为准） |
 | `/since` tie-break + cursor drain | ✅ 已 ratify | Gap1/3 闭环 |
 | q/p `scope.directories` 三态 | ✅ 已落地 | ocdroid 已消费 |
 | 错误体 `{code}` 统一 | ✅ 已落地 | circuit breaker 友好 |
@@ -113,4 +113,4 @@
 | `docs/ocmar/reports/2026-07-21-v0.11.7-feedback-handoff.md` | **本批移交报告** |
 | `docs/CLIENT_CHANGES.md` | 客户端影响清单 |
 | `docs/INTERFACE_MAP.md` | 端点实现映射 |
-| `CHANGELOG.md` [Unreleased] | 行为变更条目 |
+| `CHANGELOG.md` **v0.3.0** | 行为变更条目 |

@@ -25,7 +25,7 @@
 ## 1. 接口契约（参数 + 与 opencode 的精确转化）
 
 ### 1.1 `GET /slimapi/sessions`
-- **参数**：`directory`(str?, 绝对路径∈allowlist)、`roots`(bool)、`limit`(int 1–1000 默认100)、`start`(int? ms,透传)、`search`(str?)。**无 cursor**。
+- **参数**：`directory`(str?, 绝对路径；**v0.3.0** normalize 后透传，不 gate allowlist)、`roots`(bool)、`limit`(int 1–1000 默认100)、`start`(int? ms,透传)、`search`(str?)。**无 cursor**。
 - **upstream**：`GET /session?directory=&roots=&limit=&start=&search=` + `X-Opencode-Directory`。
 - **转化**（字段白名单）：
   - **留**：`id, directory, parentID, projectID, title, agent, model{id,providerID,variant?}, time{created,updated,archived}, summary{additions,deletions,files}, revert{messageID,partID}`
@@ -36,7 +36,7 @@
 - **参数**：无（始终含 directories）。
 - **upstream**：`GET /project` → 对每个 id 并发 `GET /project/{id}/directories`（URL-encode，并发限流）。
 - **转化**：每项 `{id, name, worktree, directories:[{path:<-upstream.directory>, strategy:<-upstream.strategy>}]}`。剥 `vcs/icon/time/sandboxes/commands`。
-- **用途**：建 directory allowlist（worktree ∪ directories[].path，规范化去尾斜杠；写接口 directory 须精确匹配）。
+- **用途**：维护 discovery 数据集（worktree ∪ directories[].path，规范化去尾斜杠）供 `/projects` 展示与 q/p null-dir 聚合；**v0.3.0 起不再作写路径 allowlist gate**。
 
 ### 1.3 增量查询策略
 增量走 §1.5 的时间戳锚点接口 `/slimapi/messages/{sid}/since/{ts}`；冷启动/resync 直接走 §1.4 + §1.5 + SSE digest 接力。**不提供**单独的"最后消息 ID 探针"端点。
@@ -65,7 +65,7 @@
 - **路径段 `full`**：仅作"展开全文"语义占位，并非 `mode=full` 的默认——`mode` 仍由 query 控制，默认 `full`。
 
 ### 1.7 `GET /slimapi/questions` / `GET /slimapi/permissions`（聚合）
-- **参数**：`directory`(repeated，**可选**；显式传时 `?directory=/a&directory=/b` 每项∈allowlist 去重 ≤32；null=聚合 allowlist 全部 dir)。**禁逗号拼接**。
+- **参数**：`directory`(repeated，**可选**；显式传时 `?directory=/a&directory=/b` 规范化去重 ≤32 后透传；null=聚合 discovery allowlist 全部 dir)。**禁逗号拼接**。
 - **upstream**：每 directory 并发 `GET /question`/`GET /permission` + `X-Opencode-Directory` + `?directory=`（2s 超时）。
 - **响应**（聚合 envelope，允许——仅消息列表不套）：
   ```json
@@ -78,14 +78,14 @@
 
 ### 1.8 写：`POST /slimapi/questions/{qid}/reply|reject`、`POST /slimapi/sessions/{sid}/permissions/{pid}`
 - **body**：reply `{answers:[[..]], routeToken}`；reject `{routeToken}`；permission `{response:"once|always|reject", routeToken}`。
-- **校验**：token 签名/过期/kind/path-id 一致/directory∈allowlist。
+- **校验**：token 签名/过期/kind/path-id 一致；directory 经 `normalize` 后透传上游（**v0.3.0 起不再** `directory∈allowlist` gate）。
 - **upstream**：`POST /question/{qid}/reply|reject?directory=&X-Opencode-Directory:` + body(去 token，只 `{answers}`)；permission `POST /session/{sid}/permissions/{pid}` body `{response}`。
 - **结果**：2xx→204；upstream NotFound→透传（已答/不存在，客户端刷新 pending）；400→400；timeout→504 不自动重试。
 - **`always`** 后失效整个 directory 的 permission 缓存。
 
 ### 1.9 `GET /slimapi/sessions/status`
-- **批量**：`?directory=`(必填,∈allowlist) → upstream `GET /session/status?directory=` → 原 map。
-- **单 sid**：`GET /slimapi/sessions/{sid}/status` → discover `/session/{sid}`（B1 三态：404→`session_not_found` / 其它 4xx→502 / 5xx→503）；**F2：放宽 allowlist，sid 自洽即能力，normalize 不 gate**。
+- **批量**：`?directory=`(必填) → `normalize` 后透传 upstream `GET /session/status?directory=` → 原 map（**v0.3.0 起不 gate allowlist**）。
+- **单 sid**：`GET /slimapi/sessions/{sid}/status` → discover `/session/{sid}`（B1 三态：404→`session_not_found` / 其它 4xx→502 / 5xx→503）；normalize 不 gate（F2 + v0.3.0 全面去 gate）。
 - **须实测**：未落盘 active 会话是否在 status map。
 
 ### 1.10 `GET /slimapi/events`（策展 SSE：单全局连接 + digest 合并）

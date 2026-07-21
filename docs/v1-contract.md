@@ -44,7 +44,7 @@
 | GET | `/slimapi/metrics` | A | 🆕 T3 | 订阅者/queue/hub 指标 |
 | GET | `/slimapi/sessions` | A | 🔒 (rev F 头 🆕) | 骨架 session 列表（`?directory/roots/limit/start/search`；`roots` 默认 **False**——客户端**应显式传** `roots=true` 以排除 subagent/task；`start` = epoch-ms **时间戳水位** `time_updated >= start`，**非 offset**，上游 legacy 不暴露前向 cursor、不保证 id tie-break）；200 加三头见下；每条带 `directory` 字段 |
 | GET | `/slimapi/projects` | A | 🔒 | project/directory 发现 + allowlist |
-| GET | `/slimapi/sessions/status` | A | 🔒 | 批量 status（`?directory` 必填，∈allowlist） |
+| GET | `/slimapi/sessions/status` | A | 🔒 | 批量 status（`?directory` 必填；v0.3.0 起 normalize 透传，不 gate allowlist） |
 | GET | `/slimapi/sessions/{sid}/status` | A | 🔒 | 单 ses status（id→directory 自洽；**sid 为能力凭证，不受 allowlist 约束**） |
 | GET | `/slimapi/messages/{sid}` | A | 🔒 | 骨架分页（`?limit/before/mode`） |
 | GET | `/slimapi/messages/{sid}/since/{ts}` | A | 🔒 (语义 🆕；rev C 勘误) | **A2=A**：`(info.time.updated or info.time.created) >= ts` 的骨架（rev C：v1.18.3 无 message 级 `time.updated`，实读 `created`，与 digest `updatedAt` 同源）；`?limit/before` 分页；等时间戳 tie-break 见 §5 |
@@ -62,7 +62,7 @@
 - q/p 应答：走 §2 的 routeToken 端点（routeToken 在 `/slimapi/questions`/`/permissions` 聚合响应里随条下发，绑 kind+requestID+sessionID+directory，HMAC ~1h）。
 - 发消息/abort 等通用写：客户端走 catch-all 透传，自带 `X-Opencode-Directory` 头（现有 `DirectoryHeaderInterceptor`），slimapi 不剥（非 hop-by-hop）。
 - routeToken 404/过期 → 透明（已应答/失效），客户端重取聚合。
-- routeToken 应答路径：token 校验后 normalize directory 并作 `?directory=` + `X-Opencode-Directory` 透传上游。[Unreleased] 不再 gate allowlist，刷新失败也不返 503。
+- routeToken 应答路径：token 校验后 normalize directory 并作 `?directory=` + `X-Opencode-Directory` 透传上游。**v0.3.0** 不再 gate allowlist，刷新失败也不返 503。
 
 ### G6 批量展开（`GET /slimapi/messages/{sid}/full?ids=`）🔒
 - **参数**：`ids` 必填（逗号分隔 mid，缺失→422 FastAPI）；解析后去重保序，长度 1–20，否则 400 `invalid_ids`；不校验 mid 字符集。可选 `mode=skeleton|full`（默认 full）、`directory`（G7-soft，见 §12）。
@@ -127,7 +127,7 @@
 - **heartbeat ≠ 上游健康**：`server.heartbeat` 仅证 sidecar + 订阅连接存活；上游 outage 探测委托 `GET /slimapi/ready` 或自然 fetch/write 失败。sidecar 进程重启 = 连接断开；客户端重连收 `server.connected`，**应**视为 cold-start 触发。
 
 ## §4 冷启动 & resync（A1 + A3）🔒
-- **sidecar 启动暖机**：lifespan 在 smoke 后 best-effort 调一次 `/project` 预热 `app.state.directory_allowlist` + `allowlist_ready`（`warm_allowlist`；失败仅吞错，不阻断启动，ready 保持 False）。[Unreleased] allowlist 已不作 gate，暖机仅供 `/slimapi/projects` 展示与 q/p null-directory 聚合 fan-out；不再有"lazy `require_directory` 刷新"回退路径。
+- **sidecar 启动暖机**：lifespan 在 smoke 后 best-effort 调一次 `/project` 预热 `app.state.directory_allowlist` + `allowlist_ready`（`warm_allowlist`；失败仅吞错，不阻断启动，ready 保持 False）。**v0.3.0** allowlist 已不作 gate，暖机仅供 `/slimapi/projects` 展示与 q/p null-directory 聚合 fan-out；不再有"lazy `require_directory` 刷新"回退路径。
 - **客户端冷启动顺序**：
   1. 可选 `GET /slimapi/projects`（显式刷新 allowlist / 发现 project；成功则 `X-Discovery-Ready` 后续为 true）；
   2. `GET /slimapi/sessions`（`directory` null OK，不过滤；消费三完整性头）；
@@ -162,12 +162,12 @@
 > v1 B1（2026-07-18）扩充：thin 路由错误体由 FastAPI 默认 `{"detail":…}` 改为 `{"code":…}`，并新增以下 code；均为加性、不 bump `X-Slimapi-Version`。详见 `docs/v1-impl-spec.md` §11 + `docs/CLIENT_CHANGES.md`「错误体形状」。
 > 2026-07-19 加性：G6 `invalid_ids` / envelope `message_not_found` / envelope `upstream_error`（mid 坏 JSON）；F2 收窄 `directory_not_allowed` 适用范围。
 > 2026-07-20 加性（rev C）：`GET /slimapi/sessions` 列表端点失败路径对齐 §7（原静默偏离：upstream 4xx/5xx 原样透传 body、网络错落 FastAPI 默认 `{"detail":...}` 500；现统一 4xx→502 `upstream_http_N`、5xx/网络→503 `upstream_unavailable`，body 为 `{"code":...}`）。
-> [Unreleased] 加性：**完全移除 directory allowlist gate**——directory ∉ allowlist 不再 400；slimapi 把 normalized directory 作为 `X-Opencode-Directory` + `?directory=` 透传，由上游 opencode 决定能否服务。`directory_not_allowed` 错误码保留，仅用于 messages `/**` query `directory` 与 `X-Opencode-Directory` 头冲突的结构性歧义。
+> **v0.3.0** 加性：**完全移除 directory allowlist gate**——directory ∉ allowlist 不再 400；slimapi 把 normalized directory 作为 `X-Opencode-Directory` + `?directory=` 透传，由上游 opencode 决定能否服务。`directory_not_allowed` 错误码保留，仅用于 messages `/**` query `directory` 与 `X-Opencode-Directory` 头冲突的结构性歧义。
 >
 > **top-level vs envelope**：下列 code 默认指 thin 路由 **HTTP 状态 + body `{"code":…}`**。G6 另有 **envelope 语境**（整请求通常仍 200，code 出现在 `errors[]` 的 mid 项）。**同一 code 名两语境含义不同**，见各条标注。
 
 - 400 `version_required` / `version_incompatible` / `directory_not_allowed` / `invalid_directory_count` / `invalid_route_token` / **`invalid_ids`**（G6 top-level：`ids` 空 / 超 20 / 解析后无有效 mid）
-  - **`directory_not_allowed` 适用范围**（[Unreleased] 收窄）：**仅** messages `/**`（list / since / full/{mid} / full?ids=）当 query `directory` 与 `X-Opencode-Directory` 头同时存在且冲突时返 400——这是结构性歧义（slimapi 不能猜该透传哪个），与上游能否服务无关。**不再**因 directory ∉ allowlist 触发；其它结构性守卫（`invalid_directory_count` 显式 list 0 / >32、`invalid_route_token`、版本门禁）不变。
+  - **`directory_not_allowed` 适用范围**（**v0.3.0** 收窄）：**仅** messages `/**`（list / since / full/{mid} / full?ids=）当 query `directory` 与 `X-Opencode-Directory` 头同时存在且冲突时返 400——这是结构性歧义（slimapi 不能猜该透传哪个），与上游能否服务无关。**不再**因 directory ∉ allowlist 触发；其它结构性守卫（`invalid_directory_count` 显式 list 0 / >32、`invalid_route_token`、版本门禁）不变。
 - 403 `shell_not_allowed`（catch-all shell/PTY deny-list；ops 可关，非安全保证）
 - 404 `session_not_found`（`GET /slimapi/sessions/{sid}/status` 与 G6 **discover** 的 upstream 404；top-level，带 `sessionID`）；`thin_route_not_found`
   - **`message_not_found`**：**仅 G6 envelope** mid 级 code（HTTP 仍 200；**非整请求 404**）
@@ -202,7 +202,7 @@ skeleton 共享缓存（YAGNI，先指标）、多用户（独立 stack）、Par
 
 跨端点对 query `directory` 的统一语义（**null = 未传 / 空列表语义按端点**；规范化 = 去尾斜杠，根保留 `/`）。
 
-> [Unreleased]：slimapi 已**完全移除 directory allowlist gate**——任意 directory 经 `normalize_directory` 后透传给上游 opencode（由 opencode 决定能否服务）。下表「显式且 ∉ allowlist」一列从「400」改为「透传」。
+> **v0.3.0**：slimapi 已**完全移除 directory allowlist gate**——任意 directory 经 `normalize_directory` 后透传给上游 opencode（由 opencode 决定能否服务）。下表「显式且 ∉ allowlist」一列从「400」改为「透传」。
 
 | 端点 | null / 未传 | 显式 directory（∈ 或 ∉ allowlist 同行为） |
 |---|---|---|
@@ -220,7 +220,7 @@ skeleton 共享缓存（YAGNI，先指标）、多用户（独立 stack）、Par
 
 ## §13 directory 发现与转发
 
-> [Unreleased]：allowlist 已**不再是 gate**——slimapi 不再做目录警察。本节描述 directory 数据流的现状。
+> **v0.3.0**：allowlist 已**不再是 gate**——slimapi 不再做目录警察。本节描述 directory 数据流的现状。
 
 - **用途**：directory 的合法性由**上游 opencode** 决定；slimapi 把客户端传入的 directory 经 `normalize_directory` 规范化后，作为 `X-Opencode-Directory` 头 + `?directory=` query **透传**给上游。slimapi 自身仅保留**结构性守卫**：显式 repeated `?directory=` 的去重保序 + `invalid_directory_count`（1–32）+ query 与 `X-Opencode-Directory` 头冲突 400（见 §7、§12）。隔离靠 stunnel mTLS（:14097）/ Tailscale ACL + 防火墙（:4097 明文直连）+ loopback upstream 等网络边界。
 - **发现数据集（保留作展示 / fan-out 用途）**：`load_products(app)` → `GET /project` + 并发 `GET /project/{id}/directories`；allowlist = 各 project 的 `worktree` ∪ `directories[].path|directory`，经 `normalize_directory`（去尾斜杠，根 `/`）后写入 `app.state.directory_allowlist: set[str]`。**该 set 不再 gate 任何端点**；它支撑：
