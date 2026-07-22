@@ -23,7 +23,6 @@ class Settings:
     host: str = os.getenv("OC_SLIMAPI_HOST", "127.0.0.1")
     port: int = int(os.getenv("OC_SLIMAPI_PORT", "4097"))
     upstream: str = os.getenv("OC_SLIMAPI_UPSTREAM", "http://127.0.0.1:4096").rstrip("/")
-    max_json_bytes: int = int(os.getenv("OC_SLIMAPI_MAX_JSON_BYTES", str(64 * 1024 * 1024)))
     max_message_bytes: int = int(os.getenv("OC_SLIMAPI_MAX_MESSAGE_BYTES", str(32 * 1024 * 1024)))
     # Transform-pool sizing. Admission is acquired BEFORE the upstream GET so
     # the sidecar cannot OOM by buffering many concurrent large bodies; the

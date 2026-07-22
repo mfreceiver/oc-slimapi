@@ -181,6 +181,27 @@ class TransformPool:
             )
         return await loop.run_in_executor(self._executor, func, *args)
 
+    def snapshot_metrics(self) -> dict[str, int]:
+        """Return current transform pool admission state.
+
+        ``active``: permits currently held (i.e., transforms in-flight),
+        ``waiting``: acquirers blocked on the semaphore.
+
+        Encapsulates :attr:`asyncio.Semaphore._value` and
+        :attr:`asyncio.Semaphore._waiters` so callers
+        (:class:`~oc_slimapi.sse.hub.HubRegistry`) do not reach into
+        private semaphore fields.
+        """
+        waiters = self._semaphore._waiters
+        if waiters is not None:
+            waiting = len(waiters)
+        else:
+            waiting = 0
+        return {
+            "active": self._config.max_transforms - self._semaphore._value,
+            "waiting": waiting,
+        }
+
     def shutdown(self) -> None:
         """Drain in-flight workers (``wait=True``) without cancelling queued futures."""
         self._executor.shutdown(wait=True, cancel_futures=False)

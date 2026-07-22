@@ -188,7 +188,7 @@ sidecar 监听 host 范围由 `config.validate()` 控制：loopback（`127.0.0.1
 | **G6 envelope** | 200 | `message_not_found` | 🆕 G6 mid 404（**非整请求 404**） |
 | **G6 envelope** | 200 | `upstream_http_N` | 🆕 G6 mid **≥400（含 5xx）**（**不**升级整请求） |
 | **G6 envelope** | 200 | `message_too_large` | 🆕 G6 mid body > `max_message_bytes`（非整请求 413） |
-| **G6 envelope** | 200 | `upstream_error` | 🆕 G6 mid 2xx 坏 JSON（非整请求 500） |
+| **G6 envelope** | 200 | `upstream_error` | 🆕 G6 mid 2xx 坏 JSON **或合法 JSON 非 MessageWithParts 形状**（skeleton/full 一致；原 skeleton 逃逸 500、full 入 items[]） |
 | q/p envelope | 200/503 | `upstream_http_N` / `upstream_timeout` / `upstream_error` | questions/permissions fan-out 单 dir 失败项 |
 
 - thin 路由错误体统一 `{"code":string, "message"?:string, ...}`（非 `{"detail":...}`）。

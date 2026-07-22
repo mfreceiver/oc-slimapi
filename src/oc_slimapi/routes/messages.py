@@ -30,7 +30,9 @@ from ..upstream import (
     forward_directory_headers,
     strip_hop_by_hop,
 )
-from .sessions import _raise_upstream_status, normalize_directory
+from ..upstream_errors import fetch_json_mapped
+from ..directory import normalize_directory
+from .sessions import _raise_upstream_status
 
 router = APIRouter(prefix="/slimapi/messages/{sid}", tags=["messages"])
 
@@ -236,7 +238,10 @@ async def _stream_upstream(
         "GET", path, params=params,
         headers=forward_directory_headers(directory),
     )
-    return await request.app.state.upstream.send(upstream_request, stream=True)
+    try:
+        return await request.app.state.upstream.send(upstream_request, stream=True)
+    except httpx.RequestError:
+        raise CodedHTTPException(503, code="upstream_unavailable")
 
 
 async def _drain_error(response) -> Response:
@@ -445,7 +450,10 @@ async def messages(
             "GET", f"/session/{sid}/message", params=params,
             headers=forward_directory_headers(directory),
         )
-        response = await request.app.state.upstream.send(upstream_request, stream=True)
+        try:
+            response = await request.app.state.upstream.send(upstream_request, stream=True)
+        except httpx.RequestError:
+            raise CodedHTTPException(503, code="upstream_unavailable")
         return StreamingResponse(
             response.aiter_raw(), status_code=response.status_code,
             headers={**strip_hop_by_hop(response.headers), "Cache-Control": "no-store"},
@@ -704,20 +712,39 @@ async def message_batch(
             sem.release()
         if body is None or _aborted():  # aclose/sem 释放都是调度边界
             return
-        # Mid-level malformed JSON → envelope errors[] (whole request still 200).
+        # Mid-level malformed JSON / bad shape → envelope errors[] (whole
+        # request still 200). C⑨: valid JSON that is NOT a usable
+        # MessageWithParts shape (non-dict, or dict with missing/malformed
+        # info/parts) must NOT escape as HTTP 500 — skeleton_message raises
+        # KeyError/TypeError/AttributeError on such shapes, which the prior
+        # ``except (orjson.JSONDecodeError, ValueError)`` did not catch. Map
+        # every such case to the EXISTING upstream_error code (no new code).
         try:
-            if mode == "skeleton":
-                parsed = await pool.offload(
-                    lambda b=body: skeleton_message(orjson.loads(b)),
-                )
-                if _aborted():  # offload 是 await 点
-                    return
-                succeeded[mid] = parsed
-            else:
-                succeeded[mid] = orjson.loads(body)
+            raw = orjson.loads(body)
         except (orjson.JSONDecodeError, ValueError):
             errors.append({"messageID": mid, "code": "upstream_error"})
             return
+        if not (
+            isinstance(raw, dict)
+            and isinstance(raw.get("info"), dict)
+            and isinstance(raw.get("parts"), list)
+        ):
+            errors.append({"messageID": mid, "code": "upstream_error"})
+            return
+        if mode == "skeleton":
+            try:
+                parsed = await pool.offload(lambda r=raw: skeleton_message(r))
+            except (KeyError, TypeError, AttributeError):
+                # Defense-in-depth: the shape guard above catches every known
+                # bad shape, but any residual failure still maps to
+                # upstream_error rather than escaping as a 500.
+                errors.append({"messageID": mid, "code": "upstream_error"})
+                return
+            if _aborted():  # offload 是 await 点
+                return
+            succeeded[mid] = parsed
+        else:
+            succeeded[mid] = raw
 
     try:
         if mode == "skeleton":
@@ -837,7 +864,10 @@ async def message(
             "GET", f"/session/{sid}/message/{mid}",
             headers=forward_directory_headers(directory),
         )
-        response = await request.app.state.upstream.send(upstream_request, stream=True)
+        try:
+            response = await request.app.state.upstream.send(upstream_request, stream=True)
+        except httpx.RequestError:
+            raise CodedHTTPException(503, code="upstream_unavailable")
         try:
             # Wrap mid-stream upstream I/O failures (httpx.RequestError raised by
             # _drain_error.aread() or read_with_cap.aiter_bytes()) into a structured

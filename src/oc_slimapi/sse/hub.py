@@ -33,10 +33,13 @@ import contextlib
 import re
 import secrets
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import orjson
+
+if TYPE_CHECKING:
+    from ..children_cache import ChildrenCache
 
 
 STOP = object()
@@ -135,6 +138,7 @@ class DigestFields:
     message_id: str | None = None
     updated_at: Any = None
     archived: int | None = None
+    children_version: int | None = None
     deleted: bool = False
     last_error: Any = _UNSET  # three-state: _UNSET=omit, None=explicit clear, dict=object
 
@@ -150,6 +154,8 @@ class DigestFields:
             payload["updatedAt"] = self.updated_at
         if self.archived is not None:
             payload["archived"] = self.archived
+        if self.children_version is not None:
+            payload["childrenVersion"] = self.children_version
         if self.deleted:
             payload["deleted"] = True
         if self.last_error is not _UNSET:
@@ -291,8 +297,19 @@ class GlobalHub:
         self.stop_task: asyncio.Task | None = None
         self.ever_connected = False
         self.pending: dict[str, DigestFields] = {}
+        self._children_cache: ChildrenCache | None = None
         # G1 sticky lastError: sid -> lastError dict (cleared = popped).
         self.sticky_last_error: dict[str, dict] = {}
+        # C⑩ tombstone: sids whose session.deleted digest has been emitted.
+        # Survives pending eviction so a LATE session.error (arriving after
+        # flush() cleared the deleted entry from self.pending) cannot revive
+        # the sticky lastError for an already-deleted session. Complements the
+        # same-window ``if entry.deleted: return`` guard. Pruned on
+        # resync_all() (cold-start semantics — a resync means the client
+        # cold-starts anyway; sids are unique in opencode so a tombstone
+        # persisting until resync is correct and the set cannot grow
+        # unbounded across reconnects).
+        self.deleted_tombstones: set[str] = set()
         # T3 observability counters (contract §6 / §2 metrics endpoint).
         self.upstream_events_total = 0
         self.emitted_frames_total = 0
@@ -399,6 +416,9 @@ class GlobalHub:
                     self.flush()
             elif event_type == "session.deleted":
                 entry.deleted = True
+                # C⑩: record a tombstone that survives pending eviction so a
+                # LATE session.error (post-flush) cannot revive lastError.
+                self.deleted_tombstones.add(session_id)
                 # G1: deleted pops sticky; digest omits lastError.
                 self.sticky_last_error.pop(session_id, None)
                 entry.last_error = _UNSET
@@ -416,6 +436,18 @@ class GlobalHub:
                 archived_val = time_obj.get("archived")
                 if archived_val:
                     entry.archived = archived_val
+            return
+
+        if event_type == "session.created":
+            info = props.get("info") if isinstance(props.get("info"), dict) else {}
+            parent_id = info.get("parentID")
+            if not isinstance(parent_id, str) or not parent_id or self._children_cache is None:
+                return
+            self._children_cache.invalidate(parent_id)
+            entry = self.pending.setdefault(parent_id, DigestFields())
+            entry.children_version = self._children_cache.generation_of(parent_id)
+            if isinstance(directory, str):
+                entry.directory = directory
             return
 
         if event_type in MESSAGE_EVENTS:
@@ -456,6 +488,13 @@ class GlobalHub:
             at = _now_ms()
             sid = props.get("sessionID") if isinstance(props, dict) else None
             if isinstance(sid, str) and sid:
+                # C⑩: drop late errors for sessions already deleted + evicted.
+                # The ``entry.deleted`` guard below only covers the
+                # pre-eviction (same-window) case; this tombstone covers the
+                # post-eviction case (the deleted digest has been flushed and
+                # self.pending no longer carries the entry).
+                if sid in self.deleted_tombstones:
+                    return
                 entry = self.pending.setdefault(sid, DigestFields())
                 if entry.deleted:
                     return
@@ -488,6 +527,10 @@ class GlobalHub:
         # Drop text deltas, tool.*, message.part.*, and anything else.
 
     def resync_all(self) -> None:
+        # C⑩: cold-start semantics — a resync means the client cold-starts
+        # anyway, so deleted tombstones are pruned to prevent unbounded growth
+        # across reconnects (sids are unique per opencode process run).
+        self.deleted_tombstones.clear()
         frame = sse_frame({"reason": "reconnect_no_replay"}, event="resync")
         for subscriber in tuple(self.subscribers):
             subscriber.put(frame)
@@ -626,6 +669,7 @@ class HubRegistry:
         self.total_subscribers = 0
         self.rejected_total = 0
         self._transforms: Any = None  # TransformPool, wired from app.py for metrics.
+        self._children_cache: ChildrenCache | None = None
         self._removal_task: asyncio.Task | None = None
 
     def set_transforms(self, pool: Any) -> None:
@@ -636,6 +680,11 @@ class HubRegistry:
         """
         self._transforms = pool
 
+    def set_children_cache(self, cache: ChildrenCache) -> None:
+        self._children_cache = cache
+        if self._global is not None:
+            self._global._children_cache = cache
+
     def get(self, directory: str | None = None) -> GlobalHub:
         if self._global is None:
             self._global = GlobalHub(
@@ -644,6 +693,7 @@ class HubRegistry:
                 buffer_bytes=self.buffer_bytes,
                 max_frame_bytes=self.max_frame_bytes,
             )
+            self._global._children_cache = self._children_cache
         return self._global
 
     def get_global(self) -> GlobalHub:
@@ -787,27 +837,19 @@ class HubRegistry:
         }
 
     def _snapshot_skeleton(self) -> dict[str, Any]:
-        """Read TransformPool counters without importing the module.
+        """Read TransformPool counters via its public API.
 
-        Avoids a circular import (transform.py pulls skeleton.py); we duck-type
-        the semaphore's private ``_value`` / ``_waiters``. Skeleton shared cache
+        Uses ``pool.snapshot_metrics()`` instead of duck-typing the
+        semaphore's private ``_value`` / ``_waiters``. Skeleton shared cache
         is YAGNI for v1 (contract §10) so cacheEnabled is hard-coded False.
         """
         pool = self._transforms
         if pool is None:
             return {"activeTransforms": 0, "waitingTransforms": 0, "cacheEnabled": False}
-        config = pool.config
-        semaphore = pool._semaphore  # type: ignore[attr-defined]
-        available = getattr(semaphore, "_value", config.max_transforms)
-        active = max(0, config.max_transforms - available)
-        waiters = getattr(semaphore, "_waiters", None)
-        if waiters:
-            waiting = sum(1 for fut in waiters if not fut.done())
-        else:
-            waiting = 0
+        snap = pool.snapshot_metrics()
         return {
-            "activeTransforms": active,
-            "waitingTransforms": waiting,
+            "activeTransforms": snap["active"],
+            "waitingTransforms": snap["waiting"],
             "cacheEnabled": False,
         }
 

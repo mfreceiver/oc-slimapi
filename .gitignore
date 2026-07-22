@@ -6,3 +6,6 @@ __pycache__/
 
 # ocmar workflow runtime state (specs/plans/reports under docs/ocmar/ ARE tracked)
 .ocmar/
+
+# omni-orchestrator runtime state
+.omni-orch/
