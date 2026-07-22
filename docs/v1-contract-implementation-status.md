@@ -1,8 +1,8 @@
 # oc-slimapi v1 契约实现状态报告
 
 - **基准契约**：[`docs/v1-contract.md`](./v1-contract.md)（唯一 wire 基准）
-- **审计对象**：oc-slimapi 仓库 @ main（含至 **v0.3.0** / 契约 rev F 累计；现行状态见 `docs/v1-contract.md` 修订日志）
-- **审计方法**：逐条对照契约 §0–§11，交叉核验源码（`src/oc_slimapi/**`）+ 测试（`tests/`，**247 passed** @ 2026-07-21 v0.3.0）+ 配套文档（v1-impl-spec / INTERFACE_MAP / CHANGELOG / CLIENT_CHANGES）
+- **审计对象**：oc-slimapi 仓库 @ main（含至 **v0.4.0** / 契约 rev I 累计；现行状态见 `docs/v1-contract.md` 修订日志）
+- **审计方法**：逐条对照契约 §0–§11，交叉核验源码（`src/oc_slimapi/**`）+ 测试（`tests/`，**544 passed** @ 2026-07-22 v0.4.0）+ 配套文档（v1-impl-spec / INTERFACE_MAP / CHANGELOG / CLIENT_CHANGES）
 - **状态图例**：✅ 完全实现 · 🟡 部分实现 · ⚫ 未实现 · 🔄 变更（相对契约前的行为变化）
 - **给**：ocdroid 项目组
 
@@ -254,5 +254,5 @@ sidecar 监听 host 范围由 `config.validate()` 控制：loopback（`127.0.0.1
 - 交付报告：`docs/ocmar/reports/2026-07-18-v1-b0-b1.md`
 
 ## 校验
-- `./scripts/check.sh` → **247 passed**, EXIT=0（@ 2026-07-21 **v0.3.0**；含 rev F sessions 三头 / reconfigured / health schema + 既有 SSE lifecycle 回归）。
+- `./scripts/check.sh` → **544 passed**, EXIT=0（@ 2026-07-22 **v0.4.0**；含 Batch 1–5 透传收敛：错误边界 / children 投影+缓存 / childrenVersion 失效 / G6 shape / deleted tombstone + 既有 SSE lifecycle 回归）。
 - 基线：working tree at `9373550` + 本批未提交改动（ocdroid-findings-evaluation + SSE lifecycle fix）。
