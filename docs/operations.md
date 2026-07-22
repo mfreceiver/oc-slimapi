@@ -44,7 +44,21 @@ python -m venv .venv
 .venv/bin/pip install -e '.[test]'
 ```
 
-升级代码后（`git pull`）重装一次即可：`.venv/bin/pip install -e '.[test]'`。
+升级代码后（`git pull`）**必须**重装一次 editable 包，再重启服务：
+
+```bash
+.venv/bin/pip install -e '.[test]'
+systemctl --user restart oc-slimapi
+```
+
+**为何必须 reinstall**：`oc_slimapi.__version__` 来自已安装包的 dist-info（`importlib.metadata.version("oc-slimapi")`，见 `src/oc_slimapi/__init__.py`），由 `pyproject.toml` 在 **install 时**写入。`release.sh` / `git pull` 只改工作树与 `pyproject.toml`，**不会**自动刷新 dist-info。若跳过 reinstall 只 restart，进程会跑新代码，但 `/slimapi/health` 的 `sidecar.version` 仍可能报旧版本（v0.4.0 发版时踩过：代码已是 0.4.0，health 仍报 0.3.1，直到 `pip install -e .` + restart）。
+
+验证：
+
+```bash
+curl -s -H 'X-Slimapi-Version: 1' http://127.0.0.1:4097/slimapi/health
+# 期望 sidecar.version 与 pyproject.toml / 刚发的 tag 一致
+```
 
 ---
 
@@ -136,14 +150,18 @@ sudo loginctl enable-linger "$USER"
 | 关闭自启 | `systemctl --user disable oc-slimapi` |
 | 改了 unit 文件后 | `systemctl --user daemon-reload` 然后 `restart` |
 
-代码升级流程：
+代码升级 / 发版后部署流程（**三步缺一不可**）：
 
 ```bash
 cd /home/mar/personal_projects/oc-slimapi
-git pull
-.venv/bin/pip install -e '.[test]'
-systemctl --user restart oc-slimapi
+git pull                                          # 1. 拉代码（含 pyproject version）
+.venv/bin/pip install -e '.[test]'                # 2. 刷新 editable dist-info（否则 health.version 滞后）
+systemctl --user restart oc-slimapi               # 3. 重启进程加载新代码 + 新 __version__
+curl -s -H 'X-Slimapi-Version: 1' http://127.0.0.1:4097/slimapi/health
+# 确认 sidecar.ok=true 且 sidecar.version 与 tag 一致
 ```
+
+发版侧完整步骤见 [`release.md`](release.md) §3.3（含 Gitea Release 与 reinstall 提醒）。
 
 ---
 

@@ -98,9 +98,29 @@ git push origin main && git push origin vX.Y.Z
 
 ### 3.3 发版后
 
-1. 在 Gitea（`https://git.vectory.cn:18443/mfreceiver/oc-slimapi`）可为 tag 建 Release，body 粘贴 `CHANGELOG.md` 对应节（可选，无 APK 上传）。
-2. 通知 ocdroid：指向本仓 `CHANGELOG.md` 该版本；若路径/头/错误码有变，同步改 ocdroid 对接代码与 `docs/slim-mode-api-routing.md`。
-3. 打开新的 `## [Unreleased]` 空节（若 release 脚本未自动加）。
+1. **push**（脚本不自动 push）：
+   ```bash
+   git push origin main && git push origin vX.Y.Z
+   ```
+2. **Gitea Release**（可选，无 APK）：在 `https://git.vectory.cn:18443/mfreceiver/oc-slimapi` 为 tag 建 Release，body 贴 `CHANGELOG.md` 对应节。CLI 示例：
+   ```bash
+   # 从 CHANGELOG 抽出 ## [X.Y.Z] 节到临时文件后：
+   tea releases create vX.Y.Z \
+     --title "vX.Y.Z — <一句话摘要>" \
+     --note-file /tmp/oc-slimapi-vX.Y.Z-notes.md \
+     --repo mfreceiver/oc-slimapi
+   ```
+3. **本机 / 生产部署（editable install 必做 reinstall）**：
+   ```bash
+   git pull
+   .venv/bin/pip install -e '.[test]'   # 刷新 dist-info；否则 health.sidecar.version 仍报旧版
+   systemctl --user restart oc-slimapi
+   curl -s -H 'X-Slimapi-Version: 1' http://127.0.0.1:4097/slimapi/health
+   # 期望 sidecar.version == X.Y.Z
+   ```
+   原因：`__version__` 读自已安装包的 dist-info（`importlib.metadata`），不是运行时读 `pyproject.toml`。详见 [`operations.md`](operations.md) §2 / §4。
+4. 通知 ocdroid：指向本仓 `CHANGELOG.md` 该版本；若路径/头/错误码有变，同步改 ocdroid 对接代码与 `docs/slim-mode-api-routing.md`。
+5. 打开新的 `## [Unreleased]` 空节（若 release 脚本未自动加）。
 
 ### 3.4 同版本族热修（不打新 tag 时）
 
