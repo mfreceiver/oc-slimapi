@@ -60,12 +60,6 @@ ocdroid 对接时：
 - **thin-route 错误体形状**：sessions / questions 由 FastAPI 默认的 `{"detail":"…"}` 改为 **`{"code":string, "message"?:string, …}`**（与 messages/events/versioning 既有的 `{"code":…}` 形状对齐）。messages 已使用该形状，未变。
 - **新增加性错误码（thin 路由）**：`invalid_directory_count`（400，questions directory 数量 1–32 守卫）；`invalid_route_token`（400，questions routeToken 校验失败）。两者均加入 `docs/v1-impl-spec.md` §11 统一错误码表，**加性，不 bump**。
 
-## [Unreleased]
-
-> 开发中、尚未打 tag 的变更写在这里；`release.sh` 发版时把本节内容折叠进新版本标题下。
-
----
-
 ## [0.3.1] - 2026-07-21
 
 > 体验优先 patch（Opt-A partial-envelope）。**全加性** wire / 部署行为，**未 bump** `X-Slimapi-Version`（仍为 `1`）。移交：`docs/ocmar/reports/2026-07-21-ux-first-consensus-archive.md`。
