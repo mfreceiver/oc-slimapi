@@ -191,4 +191,34 @@
 
 > **更新纪律**：以上 Opt-A 行为变更须同步反映在 `docs/v1-contract.md` §15 及 `CHANGELOG.md` v0.3.1 节。
 
+---
+
+## status / active 轮询降频（收敛步骤 1 · 规划，slimapi 零改动）
+
+> **状态：规划中**（透传接口收敛 · 步骤 1）。slimapi 侧**无代码 / 契约 / wire 变更**；本节是 ocdroid 侧行为优化建议，待联合确认。依据：access log 7d 频次 + exp-1 上游事件源码确认（fork/status/active）。
+
+### 现状（access log 近 7 天）
+- `GET /session/status` 3740 次 + `GET /api/session/active` 3038 次 = **6782 次**透传（ocdroid 经 Tailscale 1560 + 本机 5222），约 4s 均匀轮询。
+- 两者经 catch-all 透传 opencode，**未走 slimapi 省流路径**。
+
+### 上游事实（exp-1 源码确认）
+- **`session.status` 事件覆盖率完整**：所有 idle↔busy↔retry 迁移（含 prompt 执行 / cancel / abort / retry）均经 `SessionStatus.set` 发 `session.status` GlobalBus 事件（`packages/opencode/src/session/status.ts:39-48` + `processor.ts` / `run-state.ts` / `prompt.ts` 全路径）。**无遗漏路径**。
+- **digest wire 承诺范围（收窄，rev-gpt 终审校正）**：上方是**上游事件事实**；但 hub 会原样存储 status 字符串（接受任意值），**契约 §3 digest `status` 只承诺 `idle|busy`**。客户端**不得**把 digest `status` 当完整状态机枚举；未知值应保守处理（fallback 受控轮询或 cold-start 重拉），不得静默假定语义。`active`/`running` 只按 `busy` 推导。
+- **`/api/session/active` 是 v2 协议端点**，返回 `Record<sid,{type:"running"}>`，语义 = `/session/status` 的 `busy` **子集**（`packages/protocol/src/groups/session.ts:146-155`）。slimapi `/slimapi/sessions/status` 已返回全量 `{idle|busy|retry}` map，客户端过滤 `type=="busy"` 即等价覆盖，**无需新增端点**。
+
+### 客户端改造（ocdroid）
+1. **停止 4s 轮询** `/session/status` 与 `/api/session/active`（透传路径）。
+2. **冷启动一次** `GET /slimapi/sessions/status`（全量 status map）建立基线；`active` 的 `running` 语义改由本地按 `type=="busy"` 过滤推导。
+3. **SSE digest `status` 增量接力**：`session.digest` 早已带 `status`（契约 §3）；客户端按 digest 更新对应 session 的本地 status。
+4. **断连 fallback**：SSE 断连期降级为受控轮询（建议 10–30s，非 4s）；重连收 `resync` / `server.connected` → cold-start 全量刷新，不丢失 busy 状态。
+
+### 收益
+- ocdroid：1560 次/7d 轮询归零（**省电 + 弱网稳定**，干掉持续 RTT）。
+- 本机 / upstream：5222 次/7d upstream QPS 归零（`/session/status` + `/active` 不再打 opencode）。
+- slimapi：**零改动**（digest `status` + `/sessions/status` 早已就绪）。
+
+### 前置与风险
+- 无 wire / 契约变更；无 slimapi 代码改动。
+- 唯一前提：信任 SSE `session.status` 覆盖率（exp-1 已源码确认完整）+ 断连 fallback 不丢 busy。
+
 (End of file)

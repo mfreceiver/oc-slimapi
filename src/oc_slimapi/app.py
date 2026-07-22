@@ -6,11 +6,12 @@ import uvicorn
 
 from . import __version__
 from .capabilities import parse_capabilities
+from .children_cache import ChildrenCache
 from .config import settings
 from .errors import register_error_handlers
 from .observability import BatchLedger
 from .proxy import install_proxy
-from .routes import events, health, messages, metrics, questions, sessions
+from .routes import events, health, messages, metrics, questions, sessions, sessions_children
 from .sse.hub import HubRegistry
 from .transform import TransformConfig, TransformPool
 from .upstream import create_client
@@ -48,6 +49,7 @@ async def lifespan(app: FastAPI):
     )
     app.state.route_secret = settings.read_route_secret()
     app.state.upstream = create_client(settings)
+    app.state.children = ChildrenCache(app.state.upstream)
     # Transform pool: admission semaphore + bounded worker executor, both
     # sized by OC_SLIMAPI_MAX_TRANSFORMS. Acquired by the skeleton routes
     # *before* their upstream GET so memory pressure stays bounded and the
@@ -82,6 +84,7 @@ async def lifespan(app: FastAPI):
         buffer_bytes=settings.sse_buffer_bytes,
         max_frame_bytes=settings.sse_max_frame_bytes,
     )
+    app.state.hubs.set_children_cache(app.state.children)
     # Wire the transform pool into the registry so /slimapi/metrics can
     # report activeTransforms / waitingTransforms without the hub module
     # importing transform.py (would be a circular import via skeleton.py).
@@ -93,6 +96,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        await app.state.children.aclose()
         await app.state.hubs.close()
         await app.state.upstream.aclose()
         # Drain in-flight transforms before letting the process exit so a
@@ -106,7 +110,7 @@ app.add_middleware(
     SlimapiVersionMiddleware,
     accepted_client_versions=settings.accepted_client_versions,
 )
-for router in (health.router, sessions.router, messages.router, questions.router, events.router, metrics.router):
+for router in (health.router, sessions.router, sessions_children.router, messages.router, questions.router, events.router, metrics.router):
     app.include_router(router)
 install_proxy(app)
 

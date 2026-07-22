@@ -7,10 +7,12 @@ from urllib.parse import quote
 import httpx
 from fastapi import APIRouter, FastAPI, Query, Request
 
+from ..directory import normalize_directory
 from ..errors import CodedHTTPException
 from ..gzip_util import json_response
 from ..skeleton import skeleton_session
 from ..upstream import forward_directory_headers
+from ..upstream_errors import fetch_json_mapped
 
 router = APIRouter(prefix="/slimapi", tags=["sessions"])
 
@@ -113,17 +115,6 @@ async def warm_allowlist(app: FastAPI) -> None:
         pass
 
 
-def normalize_directory(directory: str) -> str:
-    """Strip trailing slash (keep root '/'). Pure; no allowlist check.
-
-    slimapi no longer gates directories — any directory is forwarded to
-    upstream opencode (which decides whether it can serve it). Normalisation
-    is kept so forwarded ``X-Opencode-Directory`` headers and ``?directory=``
-    query params stay consistent across endpoints and across callers.
-    """
-    return directory.rstrip("/") or "/"
-
-
 @router.get("/sessions")
 async def sessions(
     request: Request,
@@ -172,6 +163,21 @@ async def sessions(
     complete = len(sessions) < limit
     discovery_directories = len(request.app.state.directory_allowlist)
     discovery_ready = bool(getattr(request.app.state, "allowlist_ready", False))
+    # children hint (rev H): per-session additive fields, pure cache peek
+    children = getattr(request.app.state, "children", None)
+    if children is not None:
+        for session in sessions:
+            sid = session.get("id")
+            if sid is not None:
+                hint = children.peek(sid, directory)
+                if hint is not None:
+                    ids, compl = hint
+                    session["childrenComplete"] = compl
+                    if compl:
+                        session["childrenIDs"] = ids
+                else:
+                    session["childrenComplete"] = False
+                # else: cache miss → omit both keys (childrenComplete defaults false)
     return json_response(
         sessions,
         headers={
@@ -199,13 +205,14 @@ async def statuses(request: Request, directory: str):
     # slimapi no longer gates directories — normalize and forward. opencode
     # decides whether it can serve the directory (returns its own 4xx if not).
     directory = normalize_directory(directory)
-    response = await request.app.state.upstream.get(
+    payload = await fetch_json_mapped(
+        request.app.state.upstream,
         "/session/status",
         params={"directory": directory},
         headers=forward_directory_headers(directory),
     )
     return json_response(
-        response.json(), status_code=response.status_code,
+        payload,
         accept_encoding=request.headers.get("accept-encoding"),
     )
 

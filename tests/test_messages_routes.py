@@ -41,7 +41,6 @@ def _settings(**overrides) -> Settings:
         host="127.0.0.1",
         port=4097,
         upstream="http://127.0.0.1:4096",
-        max_json_bytes=64 * 1024 * 1024,
         max_message_bytes=32 * 1024 * 1024,
         max_transforms=1,
         transform_wait_seconds=0.5,
@@ -2105,6 +2104,66 @@ async def test_g6_mid_malformed_json_envelope_error(upstream_factory):
             e["messageID"] == "m1" and e["code"] == "upstream_error"
             for e in body["errors"]
         )
+    finally:
+        app.state.transforms.shutdown()
+
+
+# C⑨ — valid JSON that is NOT a usable MessageWithParts shape must NOT escape
+# as HTTP 500. Every such case lands in errors[] with the EXISTING
+# ``upstream_error`` code (no new code); the whole request stays 200 and the
+# good mid still succeeds (partial-failure promise). Covers both skeleton and
+# full modes (both flow through the same per-mid parse block in fetch_one).
+_G6_BAD_SHAPES = [
+    b"[]",                                                       # list
+    b'"a string"',                                               # string
+    b"42",                                                       # number
+    b"true",                                                     # bool
+    b"null",                                                     # null
+    orjson.dumps({"info": "not-a-dict"}),                        # info wrong type
+    orjson.dumps({"parts": "not-a-list"}),                       # parts wrong type
+    orjson.dumps({}),                                            # empty dict
+    orjson.dumps({"unrelated": "missing both info and parts"}),  # dict, no info/parts
+]
+
+
+@pytest.mark.parametrize("mode", ["skeleton", "full"])
+@pytest.mark.parametrize("bad_body", _G6_BAD_SHAPES)
+async def test_g6_mid_bad_shape_envelope_error(upstream_factory, mode, bad_body):
+    """C⑨: mid 200 + valid JSON that is not a usable MessageWithParts shape →
+    errors[] upstream_error (never a 500). Both skeleton and full modes."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session/s1":
+            return httpx.Response(200, content=orjson.dumps({"id": "s1"}))
+        if request.url.path.endswith("/m_bad"):
+            return httpx.Response(200, content=bad_body)
+        if request.url.path.endswith("/m_ok"):
+            return httpx.Response(200, content=orjson.dumps(_msg("m_ok", 100)))
+        return httpx.Response(404)
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get(
+                f"/slimapi/messages/s1/full?ids=m_bad,m_ok&mode={mode}",
+                headers=VERSION_HEADERS,
+            )
+        # Whole request MUST stay 200 — never a 500 from an escaped shape
+        # exception (KeyError/TypeError/AttributeError from skeleton_message).
+        assert r.status_code == 200, r.text
+        body = r.json()
+        # The bad mid lands in errors[] with the existing upstream_error code.
+        assert any(
+            e["messageID"] == "m_bad" and e["code"] == "upstream_error"
+            for e in body["errors"]
+        ), body
+        # The bad mid does NOT leak into items[]; the good mid still succeeds.
+        item_ids = [
+            m.get("info", {}).get("id") for m in body["items"]
+            if isinstance(m, dict) and isinstance(m.get("info"), dict)
+        ]
+        assert item_ids == ["m_ok"], body
     finally:
         app.state.transforms.shutdown()
 

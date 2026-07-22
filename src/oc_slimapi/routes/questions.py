@@ -12,7 +12,7 @@ from ..errors import CodedHTTPException
 from ..gzip_util import json_response
 from ..tokens import RouteTokenError, issue_route_token, verify_route_token
 from ..upstream import decoded_body_headers, forward_directory_headers
-from .sessions import normalize_directory
+from ..directory import normalize_directory
 
 router = APIRouter(prefix="/slimapi", tags=["pending"])
 

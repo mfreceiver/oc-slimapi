@@ -6,6 +6,8 @@
 > |---|---|---|---|---|
 > | **2026-07-21** | **1（additive，未 bump）** | **F** | ocdroid v0.11.7 契约反馈落地（设计 v6 + 实现）：**§1** `/slimapi/sessions` 200 加三头 `X-Complete` / `X-Discovery-Directories` / `X-Discovery-Ready`；`start` 语义勘误为 epoch-ms 时间戳水位（非 offset）；非 list body→503；**roots 默认保持 False**。**§2** partId 跨 thin/`/full` 稳定（schema-valid）ratify；placeholder 保留为 message-level 兜底（去 placeholder 转 backlog）。**§3** 新 SSE 帧 `server.reconfigured{reason:"discovery_changed",at}`（仅 discovery 集合变或就绪态 false→true）；`resync` 路径完全不动；`load_products` 全程锁 + 双层 list shape 守卫 + last-known-good。**§4** `/health`+`/ready` schema 加 `version`/`clientMin`/`clientMax`。247 tests green。设计稿：`docs/ocmar/specs/2026-07-21-ocdroid-v0.11.7-feedback-design.md`。 | §1 / §2 / §3 / §4 / §5 / §13 |
 > | **2026-07-21** | **1（additive，未 bump）** | **G** | **Opt-A partial-envelope（体验优先 patch）**：能力头 `X-Slimapi-Capabilities`（grammar: comma-split,trim,single `=`,name case-insensitive,value literal,unknown/malformed ignored,dup-conflict fail-closed） + B2 六行响应矩阵（success/partial/errors-only/terminal-envelope-completion/top-503） + C1 累计 413 顶层一致（不返 partial）+ per-mid `upstream_unavailable` 映射（opt-in 仅，non-opt-in 仍顶层 503）+ Retry-After（顶层 HTTP + envelope `retryAfterMs` bounds）+ feature flag + rollback thresholds（5xx>2×baseline / baseline=0→>1% / unknown-code>5% / sample≥100 / 1h window）+ `/metrics` batch ledger（`optA{disabledLatched,disabledReason}`, `counters{...}`, `rollbackWindow{...}`, `byteSamples{...}`）。**Additive，未 bump** `X-Slimapi-Version`（仍为 `1`）。落地对照 §2（G6 批处理依赖能力头）、§7（`upstream_unavailable` per-mid envelope）、§6（指标 ledger 扩展）、**new §15**。**S-C** byte-ratio aggregation (median/P90) added to `byteSamples`; **S-E** optional deployment revision env-or-file injected into `/slimapi/health`. | §2 / §7 / §6 / §15 |
+> | **2026-07-22** | **1（additive，未 bump）** | **I** | **session.created→父 digest childrenVersion（X-main 失效）**：hub 新增 `session.created` 处理——提取子 `info.parentID`→`children_cache.invalidate(parentID)`（bump generation + 驱逐父 cache）+ 触发**父** digest 带 `childrenVersion=generation_of(parentID)`；`DigestFields` 加 `children_version` 字段；`HubRegistry.set_children_cache` 接线（仿 `set_transforms`）。客户端 digest 收到更大 childrenVersion→重拉 `GET /slimapi/sessions/{sid}/children`（缓存已失效→fresh fetch）。**Additive，未 bump** `X-Slimapi-Version`。落地对照 §3（digest childrenVersion）/ §16（invalidate 语义）。受影响 CLIENT_CHANGES：session.digest childrenVersion 消费。 |
+> | **2026-07-22** | **1（additive，未 bump）** | **H** | **children 投影端点 + per-key 缓存**：新端点 `GET /slimapi/sessions/{sid}/children`（child skeleton **数组** + 响应头 `X-Children-Version`；sid 感知错误映射复用 §7；slimapi 侧稳定排序 `time.created DESC, id ASC`）；`GET /slimapi/sessions` 每条加性 `childrenIDs[]`/`childrenComplete` hint（纯缓存回填、budget 32、超限省略，杜绝 N× 放大）；`fetch_json_mapped` 加 `expect` 参数（默认 dict、children 用 list）；per-key 缓存（TTL 30s/空 5s、single-flight per-waiter Future、generation 守卫防旧覆盖新、shutdown 取消+await）。**Additive，未 bump** `X-Slimapi-Version`（仍 `1`）。落地对照 §2（children 行 + 小节）/ §7 / **新 §16**。受影响 CLIENT_CHANGES：children 端点消费 / sessions hint / childrenVersion 与 digest 比对（Batch4 接入）。 | §2 / §7 / §16 |
 > | **2026-07-20** | **1（无 wire 变更）** | **E** | ocdroid §6「slimapi 侧待确认事项」3 项 slimapi 侧源码级确认（纯核验，无行为变更）：(1) messageID 全路径 verbatim 透传（含 SSE digest fan-out：`skeleton.py:142` info deepcopy / `hub.py:415` `message_id=info.id` / `questions.py:60` q/p 不触碰 id）；(2) `Partial+scope.directories==0` 结构不可能（Partial ⇒ ≥1 fetch ⇒ N≥1）、`Success+N==0` 真实可达（冷启动空 allowlist，§2 + 单测锚定），ocdroid N==0 retain-prior gate 设计正确；(3) `/sessions` 最小错误消费深度（log code + rethrow 原始）= 契约正确，slimapi 不要求差异化（codes 为 observability 面，非分支契约）。**无 wire 变更，不 bump**。确认报告：`docs/ocmar/reports/2026-07-20-v0.2.2-ocdroid-handoff-confirmation.md`。 | 本条 changelog（ocdroid §6 反向确认；无 wire 变更） |
 > | **2026-07-20** | **1（additive，未 bump）** | **D** | **ocdroid 客户端适配完成并部署 v0.11.5**（ocdroid commit `807ed52` / tag `v0.11.5`，本地未 push）：tuple tie-break `(updatedAt, messageID)` 二元组字典序 watermark（`compareWatermark` @ onReconcileSuccess/needsReconcile/needsCatchUp/reduceSlimDigest 4 站点）+ q/p `scope.directories` 消费（修 N==0 误清 stale；Success **与** Partial 均 N==0 retain）+ `/sessions` 列表 coded-error observability（`parseErrorCode`→internal + log + rethrow 原始，不引入新异常类型）+ directory 客户端 normalize-dedup（`normalizeDirectory` + fan-out + onResync）。**纯客户端，无 wire 变更**；ocdroid final whole-branch review APPROVED (0C/0I) + fresh verifier EXIT=0/FAILURES=0（live rerun）。**F-1**「`/since` 真过滤 + tie-break」runtime 联调待确认（loopback `127.0.0.1:4097` / mTLS `opencode.vectory.cn:14097`）。ocdroid 报告：其仓 `docs/ocmar/reports/2026-07-20-slimapi-v022-client-adapt.md`。 | 本条 changelog（ocdroid 侧落地确认；无 wire 变更） |
 > | **2026-07-20** | **1（additive，未 bump）** | **C** | ocdroid 契约遗留缺口 ratify（3 缺口 + 2 个 pre-existing 真 bug）：**Gap1** `/since/{ts}` 时间过滤 no-op 修复（`info.time.updated` 在 v1.18.3 不存在 → 改读 `updated or created`，与 digest `updatedAt` 对齐）+ 等时间戳 tie-break 规则 `(updatedAt, messageID)` 二元组字典序；**Gap2** `/slimapi/sessions` 列表 §7 偏离修复（原样透传 → `_raise_upstream_status`）+ q/p envelope 加 `scope.directories` 区分「scope 未就绪 / 权威空」；**Gap3** `/since/0` cursor drain 推荐。200 tests green。详见 §14.6。 | §5 / §2 / §7 / §12 / §14.6 |
@@ -22,7 +24,7 @@
 > - **2026-07-20 / 2026-07-19 · v1（additive）**：`/slimapi/questions`+`/permissions` 的 `directory` 改可选（null=聚合 allowlist，**F1**）；`/slimapi/sessions/{sid}/status` 放宽 allowlist（sid 自洽，**F2**）；sidecar 启动主动 warm `/project` 暖 allowlist（**F3a**）；routeToken 应答路径 allowlist miss 自动刷新（**F3b**）；`CLIENT_CHANGES.md` SSE 节同步（**F4**）；§1 `accepted:[1,1]` 闭区间说明（**F5**）；新增 §12 directory 三态语义表 + §13 allowlist 机制（**§5**）；**G1** `session.digest` 加 `lastError?` 三态字段 + 新 `event: session.error` session-less 帧 + 脱敏算法；**G6** `GET /slimapi/messages/{sid}/full?ids=` 批量展开端点（envelope + mid 级部分失败 + chunk-ledger 累计预算）；D1–D8 文档同步（§11 标 closed）。受影响 CLIENT_CHANGES：SSE（`lastError` / `session.error`）、消息批量展开、q/p null directory、cold-start 顺序、错误体形状。
 > - **2026-07-18 · v1 B1（additive）**：`session_not_found`(404) / 顶层 `upstream_unavailable`(503) / 顶层 `upstream_http_N`(502) / `shell_not_allowed`(403) / `invalid_directory_count`(400) / `invalid_route_token`(400) / thin 路由错误体 `{"code":...}`（非 `{"detail":...}`） / G2 status 404-502-503 分裂 / projects 5xx 502→503。详见 §7。受影响 CLIENT_CHANGES：错误体形状。
 
-> 状态：契约收敛版（A1-A3/B1-B3/C1-C2 全定，A2=A 时间戳锚点；rev B F1–F5/§5/G1/G6/D1–D8；rev C Gap1–3 ratify；rev D ocdroid 客户端适配完成 + 部署 v0.11.5；rev E ocdroid §6 三项 slimapi 侧确认；**rev F ocdroid v0.11.7 反馈落地（sessions 三头 + discovery_changed SSE + health schema + partId ratify）**；**rev G Opt-A partial-envelope（体验优先 patch）**）。配套原型与正式实现已覆盖；本文 🔒=已覆盖、🆕=历史缺口标注（§11 已闭环）。
+> 状态：契约收敛版（A1-A3/B1-B3/C1-C2 全定，A2=A 时间戳锚点；rev B F1–F5/§5/G1/G6/D1–D8；rev C Gap1–3 ratify；rev D ocdroid 客户端适配完成 + 部署 v0.11.5；rev E ocdroid §6 三项 slimapi 侧确认；**rev F ocdroid v0.11.7 反馈落地（sessions 三头 + discovery_changed SSE + health schema + partId ratify）**；**rev G Opt-A partial-envelope（体验优先 patch）**；**rev H children 投影端点 + per-key 缓存**）。配套原型与正式实现已覆盖；本文 🔒=已覆盖、🆕=历史缺口标注（§11 已闭环）。
 > 权威性：本文件是正式实现的唯一基准。与 design-v2/INTERFACE_MAP 冲突时以本文件为准；后者需随后同步。
 
 ## §0 范围与架构
@@ -53,6 +55,7 @@
 | GET | `/slimapi/projects` | A | 🔒 | project/directory 发现 + allowlist |
 | GET | `/slimapi/sessions/status` | A | 🔒 | 批量 status（`?directory` 必填；v0.3.0 起 normalize 透传，不 gate allowlist） |
 | GET | `/slimapi/sessions/{sid}/status` | A | 🔒 | 单 ses status（id→directory 自洽；**sid 为能力凭证，不受 allowlist 约束**） |
+| GET | `/slimapi/sessions/{sid}/children` | A | 🆕 rev H | 子会话 skeleton 列表（`?directory` 可选透传；body=child skeleton 数组 + 响应头 `X-Children-Version`；per-key 缓存 + single-flight，见 §16；排序 `time.created DESC, id ASC`） |
 | GET | `/slimapi/messages/{sid}` | A | 🔒 | 骨架分页（`?limit/before/mode`） |
 | GET | `/slimapi/messages/{sid}/since/{ts}` | A | 🔒 (语义 🆕；rev C 勘误) | **A2=A**：`(info.time.updated or info.time.created) >= ts` 的骨架（rev C：v1.18.3 无 message 级 `time.updated`，实读 `created`，与 digest `updatedAt` 同源）；`?limit/before` 分页；等时间戳 tie-break 见 §5 |
 | GET | `/slimapi/messages/{sid}/full/{mid}` | A | 🔒 | 单条全文（mode=full，展开某条） |
@@ -112,10 +115,23 @@
 | `GET /slimapi/sessions` | `X-Discovery-Ready` | true/false | 是否存在 last-known-good 发现快照 |
 | `GET /slimapi/questions` / `/permissions` | `scope.directories` | fan-out 有效 dir 数 | null 路径=allowlist 大小；显式路径=去重后 dir 数 |
 
+### children 投影与缓存（rev H 🆕）
+
+- **端点** `GET /slimapi/sessions/{sid}/children`（A 桶、version 门禁）：
+  - query `directory` 可选，经 `normalize_directory` 后作 `X-Opencode-Directory` + `?directory=` 透传上游 `GET /session/{sid}/children`（§12/§13 同语义；上游返回 `Session.Info[]`，父 sid 不存在→404，无子→`[]`）。
+  - 响应 body = child skeleton **数组**（投影自 `Session.Info[]`，复用 `skeleton_session`，含 `parentID`/`directory`/`time.created`）；**响应头 `X-Children-Version: <int>`** = 该 parentSid 的单调 generation（§16），客户端与后续 digest `childrenVersion` 比对（Batch4）。
+  - **排序**（slimapi 侧稳定排序 = 加性 wire 保证）：`time.created DESC`、`id ASC` tie-break（上游 children 查询无 ORDER BY，slimapi 缓存命中/miss 交替须稳定输出；缺失 `created` 归 0 排尾）。
+  - 错误映射复用 §7（sid 感知，经 `fetch_json_mapped(sid=sid, expect=list)`）：upstream 404 → 404 `session_not_found`（带 `sessionID`）；其它 4xx → 502 `upstream_http_N`；5xx / 网络 / 坏 JSON / 非 list → 503 `upstream_unavailable`。
+  - **per-key 缓存 + single-flight**（§16）：同 `(parentSid, normalized_dir)` 并发请求合并为一次上游 fetch；TTL 命中直接返；缓存对客户端不可见（除 `X-Children-Version`）。
+- **列表 hint**（`GET /slimapi/sessions` 每条 session 加性字段）：
+  - `childrenIDs[]`：该 session 作为 parent 的子 sid 列表——**纯缓存回填**（仅当 children 缓存已有该 parent 条目才下发，**不**触发新上游调用，杜绝 N× 放大）。
+  - `childrenComplete`：`true` = hint 权威（缓存命中且 child 数 ≤ `CHILDREN_IDS_HINT_LIMIT=32`）；`false`/省略 = 缓存未命中或超 budget，客户端应调权威端点 `/slimapi/sessions/{sid}/children`。
+
 ## §3 SSE 契约（简化版，A1-A3 落定）🔒 + archived 🆕 + G1 🆕 + reconfigured 🆕
 - 上游：**一条** `/global/event`（进程级 GlobalBus，全实例跨目录，每事件自带 `directory`）。
 - 帧：
-  - `session.digest`（debounce 250ms/session，仅发有变化的字段）：`{sessionID, directory, status?, messageID?, updatedAt?, archived?, deleted?, lastError?}`。
+  - `session.digest`（debounce 250ms/session，仅发有变化的字段）：`{sessionID, directory, status?, messageID?, updatedAt?, archived?, deleted?, lastError?, childrenVersion?}`。
+    - `childrenVersion`（rev I 🆕，**仅父会话**）：当某 parent 的子会话集变更时，该 **parent** 的 digest 携带 `childrenVersion` = 其单调 generation（与 `GET /slimapi/sessions/{sid}/children` 的 `X-Children-Version` 同源、同键）。客户端记本地该 parent 的 version，digest 收到更大值 → 重拉 `/slimapi/sessions/{sid}/children`（缓存已被 invalidate，必 fresh fetch）。**来源**：上游 `session.created`（fork/create 子会话，子 `Info.parentID` 指向父）→ slimapi hub `invalidate(parentID)`（bump generation + 驱逐父 cache）+ 触发父 digest 带 `childrenVersion=generation_of(parentID)`。进程重启 generation 归零——客户端以 `server.connected`/resync 为 server generation 边界重置 baseline（R3/OC-3）。
     - `status`←`session.status`(idle/busy)；`messageID`+`updatedAt`←`message.updated`/`message.appended`（info.id + info.time.updated/created，取最新）；**`archived`←`session.updated` 的 `info.time.archived`（有值→epoch-ms 时间戳）** 🆕；`deleted`←`session.deleted`。
     - **`lastError`（G1-A）**←`session.error` 经脱敏后的 `{name,message,at}`（`at`=sidecar 收到时 epoch-ms）。**三态 wire**（与 sticky 共存，互不矛盾）：
       - **对象** `{name,message,at}`：本窗口新 error，或 flush 时该 sid 仍有 sticky（其它字段触发的后续 digest 会继续带出对象，直至 clear/deleted）。
@@ -284,8 +300,8 @@ skeleton 共享缓存（YAGNI，先指标）、多用户（独立 stack）、Par
 以下为执行中识别的边界，**不在** ocdroid 原始要求 / 本批 plan 验收条件内，已记入最终报告 §5 供后续关注：
 
 - G1 脱敏 regex 边缘（Bearer-no-space / 自然语言 stack 误剥 / Unicode path 带空格）— defense-in-depth on loopback / Tailscale 直连，非主安全边界。
-- G6 mid body 形状错误（合法 JSON 但非 MessageWithParts）未 envelope 映射（保持 500）；仅 JSON 解析错映射 `upstream_error`。
-- G1 deleted flush 后迟到 `session.error` 可能重建 entry（无 durable tombstone）。
+- ~~G6 mid body 形状错误（合法 JSON 但非 MessageWithParts）未 envelope 映射（保持 500）；仅 JSON 解析错映射 `upstream_error`~~。 **✅ 已修复（Batch5a / C⑨，2026-07-22）**：skeleton/full 两模式一致映射 per-mid `upstream_error` envelope（整请求仍 200）；见 CHANGELOG §Fixed。
+- ~~G1 deleted flush 后迟到 `session.error` 可能重建 entry（无 durable tombstone）~~。 **✅ 已修复（Batch5a / C⑩，2026-07-22）**：`deleted_tombstones` 集合 survive pending 驱逐（`resync_all` 清理）；见 CHANGELOG §Fixed。
 - G6 真实 HTTP streaming 早停 / 取消（MockTransport 未完全证明 chunk-ledger 行为）。
 - rev-13 🟡 维护项：端到端 events-body-iterator ack 测试增强 / `test_hub.py:369` 滞后注释。
 
@@ -458,5 +474,23 @@ Opt-A 不改变 B1 分区预算：客户端 413 恢复仍为 halve + merge + sin
 ---
 
 > **更新纪律**：影响以上节的行为变更（能力头 grammar / 矩阵行 / 回滚阈值）须同步更新 `docs/CLIENT_CHANGES.md` 相关节。
+
+---
+
+## §16 children 投影缓存（rev H 🆕）
+
+> per-key 缓存 + single-flight，消除 children 透传的 N× 放大（本机观测 75k/7d）。全加性，不 bump wire。实现：`src/oc_slimapi/children_cache.py`（`ChildrenCache`，纯 asyncio，对齐 `HubRegistry` 无锁 house pattern：所有变更段无 await → 单 worker 单 loop 天然原子）。
+
+- **键** `(parent_sid, normalized_dir)`；**粒度** = 完整 child skeleton 数组 + version。
+- **TTL**：正缓存（非空）`30s`；空负缓存（上游 200 + `[]`）`5s`。惰性过期（命中时判 `fresh()`），**无** janitor task（YAGNI）。
+- **single-flight**：同 key 并发请求合并到一个上游 fetch task；每个 waiter 持独立 `asyncio.Future`；leader 完成后广播结果/异常给所有 waiter。
+- **generation 守卫**：每个 parentSid 单调 generation 计数；fetch 启动采样 generation，完成时仅当 `inflight.generation >= generation_of(sid)` 才写 cache（慢 fetch 不覆盖已失效条目）。响应 `X-Children-Version` = fetch 启动时的 generation（**数据与版本同源**——禁止响应时取当前 generation，那会造成 version 与数据不匹配）。
+- **waiter 取消**：单 waiter 取消（客户端断开）只摘自己，**不**取消共享 fetch（fetch 不 await 任何 waiter，结构隔离；不用 `asyncio.shield`）。
+- **异常**：fetch 失败 → 广播 coded 错误给所有 waiter，**不**写 cache；下个请求重试。
+- **失效**（Batch4 接入；Batch3 先立 `invalidate(parent_sid)` 签名 + 单测）：同步 bump generation + 驱逐该 sid **所有 dir** 的 cache entry（in-flight **不**取消，由 generation 守卫拦截其写入）。
+- **shutdown**：`aclose()` 置 `_closed`（新请求立即 503）→ 取消所有 in-flight task → `await asyncio.gather(*tasks, return_exceptions=True)`（fetch 收 cancel 后先向 waiter 广播 503 再 re-raise）；lifespan 顺序：`children.aclose()` 先于 `upstream.aclose()`（在途 fetch 用着 upstream client）。
+- **容量**：`MAX_ENTRIES=4096` 软上限，写时惰性清理（先清过期，仍超则按 `fetched_at` 最旧驱逐）。
+- **不变量**（rev-bgpt 深审基准）：INV-1 `_cache[key]` 与 `_inflight[key]` 不同时存在；INV-2 `entry.version == entry.generation ≤ generation_of(sid)`；INV-3 `inflight.generation` 创建后不变；INV-4 generation 单调、进程内不 reset；INV-5 waiter Future 只属一个 inflight；INV-6 `_closed=True` 后不起新 task/entry。
+- **诚实限制（非阻塞）**：(1) 上游 children 数组无 body cap（`fetch_json_mapped` 整 body 解析；上线后观察 `/slimapi/metrics` 再定是否加 streaming cap）；(2) 空负缓存 5s 窗口内 fork 的新子会话不可见（Batch4 invalidate 是主路径，5s 仅 SSE 丢失兜底）；(3) generation 进程重启归零——客户端须以 `server.connected`/resync 为 server generation 边界重置 baseline（Batch4 + R3/OC-3）。
 
 (End of file)

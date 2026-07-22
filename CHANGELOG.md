@@ -26,6 +26,28 @@ ocdroid 对接时：
 
 ---
 
+## [Unreleased]
+
+> 开发中、尚未打 tag 的变更写在这里；`release.sh` 发版时把本节内容折叠进新版本标题下。
+
+## [0.4.0] - 2026-07-22
+
+> 透传收敛 + 重构（Batch 0–5）。多批加性 wire 行为变更，**未 bump** `X-Slimapi-Version`（仍 `1`）。契约权威 `docs/v1-contract.md` rev I。
+
+### Added
+- **batch status 错误边界（Batch1）**：`GET /slimapi/sessions/status`（批量）补齐 §7 coded-error——upstream 网络错 / 5xx / 坏 JSON / 非 dict → **503 `upstream_unavailable`**；4xx（含 404；batch 无 path sid → **非** `session_not_found`）→ **502 `upstream_http_N`**（原裸透传：网络错冒泡 500、4xx/5xx 原样透传）。
+- **messages 初始 send 错误边界（Batch1）**：`GET /slimapi/messages/{sid}`(list) / `/since/{ts}` / `/full/{mid}` 初始 `upstream.send` 的 `httpx.RequestError` → **503 `upstream_unavailable`**（原逃逸 500）。
+- **children 投影端点（Batch3）**：新端点 `GET /slimapi/sessions/{sid}/children`——child skeleton **数组** + 响应头 `X-Children-Version`；sid 感知错误映射（404→`session_not_found`、4xx→`upstream_http_N`、5xx/网络/坏JSON/非list→`upstream_unavailable`）；slimapi 侧稳定排序 `time.created DESC, id ASC`；per-key 缓存 + single-flight（契约 §16）。
+- **sessions 列表 hint（Batch3）**：`GET /slimapi/sessions` 每条加性 `childrenIDs[]` + `childrenComplete`（纯缓存回填、budget 32、超限省略，杜绝 N× 放大）。
+- **session.created→父 digest childrenVersion（Batch4，X-main 失效）**：hub 新增 `session.created` 处理——子 `info.parentID` → `children_cache.invalidate(parentID)`（bump generation + 驱逐父 cache）+ **父** digest 加性字段 `childrenVersion`（= parentSid 单调 generation，与 `X-Children-Version` 同源）；客户端 digest 收更大值 → 重拉 `/slimapi/sessions/{sid}/children`（缓存已 fresh）。`session.created` 仍**不**经 `/slimapi/events` 原样转发（curated stream 不变；X-main childrenVersion 是唯一子会话变更信号）。
+
+### Changed（内部，无 wire 变更——仅记录）
+- `TransformPool.snapshot_metrics()` 公开 API 取代 `HubRegistry` 直读 `_semaphore._value/_waiters`（Batch2；metrics wire 输出形状不变）。
+
+### Fixed
+- **G6 mid 形状错误 envelope 收敛（Batch5a，C⑨）**：`GET /slimapi/messages/{sid}/full?ids=`（G6 批量）单个 mid 返回**合法 JSON 但非 MessageWithParts 形状**（非 dict / 缺 `info`·`parts` / 字段类型错）时，不再逃逸 **500**（skeleton 模式）或塞入 `items[]`（full 模式）；改为**两模式一致**映射到 per-mid `errors[]` 的 `upstream_error`（整请求仍 **200**），兑现 batch partial-failure 语义。复用既有 `upstream_error` 码——**无新错误码、不 bump `X-Slimapi-Version`**。
+- **deleted durable tombstone（Batch5a，C⑩）**：`session.deleted` digest 被 flush 驱逐后，迟到的 `session.error` 不再经 `setdefault` 重建 sticky `lastError`（已删除会话错误"复活"）；新增 `deleted_tombstones` 集合（survive pending 驱逐；`resync_all` 清理）。digest 流上已删除会话不再出现伪 `lastError`。
+
 ## 2026-07-18 — v1 B1（additive；不 bump `X-Slimapi-Version`）
 
 > 本节为 v1 B1 run（spec 见 `docs/ocmar/specs/2026-07-18-v1-b0-b1-design.md`）落地的加性 wire 行为变更。所有条目均**加性**或为对既有契约 §11 的 bug 修正，未 bump wire API 版本。
@@ -62,12 +84,6 @@ ocdroid 对接时：
 ### Fixed
 
 - **Legacy ledger 记录完整性**：`/slimapi/metrics` 的 `counters` 对象此前仅区分 opt-in/legacy 总量；现增加 `capabilityConflicts`、`capabilityMalformedTokens`、`networkMidErrorsTotal`、`unknownCodeTotal` 等细项，与 Opt-A 回滚联动。
-
----
-
-## [Unreleased]
-
-> 开发中、尚未打 tag 的变更写在这里；`release.sh` 发版时把本节内容折叠进新版本标题下。
 
 ---
 

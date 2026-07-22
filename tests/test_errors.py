@@ -15,7 +15,7 @@ from oc_slimapi.proxy import install_proxy
 def _settings() -> Settings:
     return Settings(
         host="127.0.0.1", port=4097, upstream="http://127.0.0.1:4096",
-        max_json_bytes=64 * 1024 * 1024, max_message_bytes=32 * 1024 * 1024,
+        max_message_bytes=32 * 1024 * 1024,
         max_transforms=1, transform_wait_seconds=0.5, max_response_bytes=64 * 1024,
         route_secret="x" * 32, route_secret_file=None, smoke_session_id=None,
         server_api_version=1, accepted_client_versions=(1, 1),
