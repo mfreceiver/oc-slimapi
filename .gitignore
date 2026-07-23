@@ -9,3 +9,6 @@ __pycache__/
 
 # omni-orchestrator runtime state
 .omni-orch/
+
+# traffic access log runtime output (docs/manual/traffic-accounting.md; OC_SLIMAPI_ACCESS_LOG_PATH default logs/access.jsonl)
+logs/

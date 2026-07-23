@@ -116,4 +116,5 @@ journalctl --user -u oc-slimapi -f
 | [`docs/release.md`](docs/release.md) | **发版流程规范**（本仓库权威） |
 | [`docs/operations.md`](docs/operations.md) | **部署 / 运维 / 日志**（systemd、journald、排障） |
 | [`docs/develop.md`](docs/develop.md) | 开发 / 运行 / 测试备忘 |
+| [`docs/manual/traffic-accounting.md`](docs/manual/traffic-accounting.md) | 流量/省流查询使用手册（`/slimapi/metrics.traffic` + access log，v0.7.0+） |
 | ocdroid `docs/slim-mode-api-routing.md` | 客户端 slim 路由规约（对照用；冲突以本仓契约 + CHANGELOG 为准） |
