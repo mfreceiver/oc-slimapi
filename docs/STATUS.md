@@ -19,6 +19,7 @@
 - `cb59e96`：R2 ocdroid 配合计划 + 双边契约/协商 handoff。
 - `694d73d`：merge main（R1 计划副本同步）。
 - 文档清理：`.ocmar/workflows/token-stream-p3-p4/`（FINISHED 工作流产物，2.1M，gitignored）已删；5 个无引用的过期 docs/ 文档已删。
+- **MB-P-S1**（`3e4b3b7`）：method-B eviction current-key 锚点闭合。新增 `_emit_snapshot_or_truncated_nodrop`（截断不 drop）；`_evict_part_for_memory` re-snapshot 重新纳入 current key 走 nodrop，非 current 维持 C6 drop；`skip_key` 保留。rev-grok APPROVED_WITH_NITS（NIT #1 docstring + #2 多 sub 测已修），fresh verifier 773 passed。**服务端 R2 unilateral 工作至此尽**——余项皆阻塞于 ocdroid（D-MB-P/D-F-1/D-F-2）或产品 go。
 
 ---
 
@@ -46,7 +47,7 @@
 
 | ID | 项 | 服务端 | ocdroid | wire | 状态 |
 |---|---|---|---|---|---|
-| **MB-P-S1** | method B 硬前置（current-key 锚点闭合） | **本仓下一步**（见 §4） | — | 无 | **待做（服务端先行）** |
+| **MB-P-S1** | method B 硬前置（current-key 锚点闭合） | ✅ 完成 `3e4b3b7`（dev） | — | 无 | **✅ 完成** |
 | **MB-P** | method B 产品化（flip `triggersReconnect` true→false） | MB-P-S1 先做 | flip + flow 测 | 无 | 阻塞于 MB-P-S1 + D-MB-P |
 | **F-1** | reasoning/tool-input 流式 | 停 drop + 扩 wire | reducer+UI | 待裁定（D-F-1） | 阻塞于产品 go + D-F-1 |
 | **F-2** | busy-open 占位帧 | `server.connected{busy:true}` | UX skeleton | 加性（不 bump） | 阻塞于产品 go + D-F-2 |
@@ -55,11 +56,11 @@
 | **V-B** | 生产长连 idle 实证 | heartbeat+防代理头 | 45s watchdog+抓包 | 无 | 运维（任意时点） |
 
 **双边关键路径**：ocdroid 收 R2 handoff → 回 D-MB-P/D-F-1/D-F-2 → 解锁 MB-P flip / F-1 / F-2。
-**服务端先行**：MB-P-S1 不被阻塞，是兑现 method B 价值的最短路径。
+**服务端先行（已完成）**：MB-P-S1 ✅（`3e4b3b7`）。服务端 unilateral R2 工作已尽；余项皆双边/产品门控。下一可推动项 = ocdroid 回 D-MB-P（MB-P 仅剩 ocdroid flip，服务端无活）。
 
 ---
 
-## 4. 当前任务：MB-P-S1（压缩后执行）
+## 4. 最近完成：MB-P-S1 ✅（dev `3e4b3b7`，2026-07-23）
 
 ### 4.1 目标
 method B 产品化（`token_memory_limit` clear-only 不重连）的**服务端硬前置**：闭合 eviction 后 current key 的客户端锚点缺口。
@@ -74,7 +75,7 @@ method B 产品化（`token_memory_limit` clear-only 不重连）的**服务端�
 - current key snapshot 帧 **≤ `max_frame_bytes`** → 发正常 `snapshot{done:false}`（保动画）。
 - current key snapshot 帧 **> `max_frame_bytes`**（近 1MiB）→ 发 `snapshot{truncated:true}` + **不 `drop_part`**（客户端 `/since` 拉权威全文）。
 - **关键**：现有 `_emit_snapshot_or_truncated` 超限时走 `_truncate_part_for_all`→`drop_part`（正是 O1 re-entrancy 源）——**不可用于 current key**。需新路径（如 `_emit_snapshot_or_truncated_nodrop`）：发 truncated 帧但**保留 LivePart、不 drop**，从而不 invalidate 调用方 `_reserve`/`on_part_delta` 持有的 `live` 引用。
-- `skip_key` 参数随之可移除/重构（current key 现安全地重新纳入）。
+- ~~`skip_key` 参数随之可移除/重构~~ **（更正：`skip_key` 保留）**——nodrop 路径仍需区分 current key（`live_key == skip_key` 走 nodrop，其余走带 drop 的 C6 backstop）。rev-grok 评审确认「保留 `skip_key` 比移除更稳」。
 
 ### 4.4 已知取舍（须在 D-MB-P 让 ocdroid 裁定，但实现时记住）
 large-part 分支下，即便服务端保留 LivePart，客户端收 `truncated` 后清该 part、停 append → 服务端继续累计的 delta 在客户端 orphan 被丢。即 **large current key 动画不可救（仍 blank 至 `/since`）；仅 small current key 真 snapshot 分支保住动画**。
@@ -102,5 +103,9 @@ large-part 分支下，即便服务端保留 LivePart，客户端收 `truncated`
 
 1. 读本文件。
 2. 切到 `dev`：`git switch dev && git pull`。
-3. 按 §4 执行 MB-P-S1（实现 → rev-grok 评审 → fix loop → fresh verifier → commit/push dev）。
-4. 完成后回写本文件 §1/§3 状态 + R2 计划 §2 MB-P。
+3. **MB-P-S1 已完成**（§4，`3e4b3b7`）。服务端 unilateral R2 工作已尽。
+4. **下一步取决于双边输入**：
+   - 若 ocdroid 回 **D-MB-P**（接受 S1 变体）→ MB-P 仅剩 ocdroid flip `triggersReconnect`，服务端无活；可转 S-4/C-4/V-B（提供契约/运维）或等 ocdroid 联调。
+   - 若产品 go + ocdroid 回 **D-F-2** → 做 F-2（busy 占位，加性字段；流程同 §4.6）。
+   - 若产品 go + ocdroid 回 **D-F-1** → 做 F-1（reasoning/tool-input 流式，wire 决策先行；最大双边项）。
+5. 用户给定新任务时，按 §4.6 评委约定（fixer-zlm → rev-grok lane → rev-opus 终审[多 lane] → fresh `_priv-verifier` live rerun）。
