@@ -470,11 +470,11 @@ for live_key, part in sorted(
 
 > 第 1 轮（2026-07-23）：S-1 / S-3a / S-2 已完成（commit `7a1861a`）。下表为下一轮可选项，按「先闭合硬前置 → 再门控项 → 最后清理」排序。
 
-### 6.1 硬前置（Method B 产品化前必修）
+### 6.1 硬前置（Method B 产品化前必修）— ✅ O1 已完成（c21ca3b）
 
 | ID | 项 | 来源 | 严重度 | 说明 |
 |---|---|---|---|---|
-| **O1** | `_reserve → _evict_part_for_memory` re-entrancy 截断 | rev-opus 终审（新发现，per-task 评审均漏） | Minor（本轮不阻塞） | 当被 evict 的 `oldest` 与当前 reserve 的 key K **同 sid** 且 K 累计接近 `TOKEN_PART_MAX_BYTES`(1MiB) 时，eviction 尾部对 K 的 re-snapshot（S-2 引入）可能 `> max_frame_bytes` → `_truncate_part_for_all(K)` → `drop_part(K)`；调用方 `on_part_delta` 仍持旧 `live` 引用追加 → `_total_live_bytes` 单调上漂 + 1 帧游离 delta。**当前被 `triggersReconnect=true` 完全掩盖**（生产近零可达）；一旦放宽 `triggersReconnect=false`（Method B 产品化）即暴露，**必须先修**。修复方向：re-snapshot 前排除「正在被 reserve 的 current key」，或对 truncate-while-reserving 加守卫。 |
+| **O1** ✅ | `_reserve → _evict_part_for_memory` re-entrancy 截断 | rev-opus 终审（新发现，per-task 评审均漏） | Minor → **已修 c21ca3b** | **✅ 已修（main `c21ca3b`）**：`_evict_part_for_memory` 增 `skip_key` 参数，4 个调用点（`_reserve`/`_check_pending_budget`/`_start_part`×2）各传本路径 current key，re-snapshot 循环跳过之；reconnect handshake 在 `triggersReconnect=true` 下恢复 K 锚点（严格优于修前）。回归测 `test_o1_evict_skips_current_key_being_reserved`（768→769 passed）。**残留**：method B 产品化时（flip `triggersReconnect=false`）current-key 锚点需 MB-P-S1 闭合 → 见 R2 计划 [`2026-07-23-ocdroid-cooperation-r2.md`](2026-07-23-ocdroid-cooperation-r2.md)。 |
 
 ### 6.2 门控项（满足 gate 才开）
 
@@ -501,7 +501,7 @@ for live_key, part in sorted(
 
 ### 6.4 下一轮建议序列
 
-1. **O1**（若计划推进 Method B 产品化 / 放宽 `triggersReconnect`）— 否则可继续延后。
+1. ~~**O1**~~ ✅ **已完成**（c21ca3b，skip_key）；method B 产品化（MB-P-S1 + flip `triggersReconnect`）转 R2 计划 [`2026-07-23-ocdroid-cooperation-r2.md`](2026-07-23-ocdroid-cooperation-r2.md)。
 2. **2-M1 / 2-M2 / 2-M3 / O2**（一波清理 PR，低成本，可顺手）。
 3. **S-3b**（采 harness 基线后再决策是否调参；无数据不改常量）。
 4. **F-2 → F-3**（产品 go 后）。
