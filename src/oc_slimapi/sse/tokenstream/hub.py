@@ -287,6 +287,8 @@ class TokenStreamHub:
         self._drain_pending_session_resyncs()
         t1 = time.perf_counter()
         self._metrics.flush_duration_ms_total += (t1 - t0) * 1000.0
+        # O2: counts EVERY flush() invocation — flush_loop ticks AND
+        # _check_pending_budget force-flushes — not just the 100ms loop ticks.
         self._metrics.flush_ticks_total += 1
 
     def flush_sid(self, sid: str) -> None:

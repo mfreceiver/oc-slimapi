@@ -1156,18 +1156,57 @@ class TestMetricsTokenStream:
             await _close_app(app)
 
     async def test_flush_ticks_and_duration_metrics(self):
-        """T2-C3: after a flush, flushTicksTotal>=1 and flushDurationMsTotal>=0."""
+        """T2-C3: a flush bumps flushTicksTotal and records a STRICTLY
+        increasing wall-clock duration (not the always-true >= 0)."""
         app = _build_app(_settings())
         try:
             th = app.state.token_hub
-            # Start the flush loop (tick starts).
-            th.start()
-            # Wait for at least one tick.
-            await asyncio.sleep(TOKEN_FLUSH_SECONDS * 1.5)
+            # Seed a part + pending delta so flush() does real drain work.
+            th.on_part_updated(_updated_props("s1", "m1", "p1", text=""))
+            th.on_part_delta(_delta_props("s1", "m1", "p1", delta="x" * 200))
+            before = th._metrics.flush_duration_ms_total
+            ticks_before = th._metrics.flush_ticks_total
+            th.flush()  # synchronous drain
+            after = th._metrics.flush_duration_ms_total
+            ticks_after = th._metrics.flush_ticks_total
+            assert ticks_after == ticks_before + 1
+            assert after > before, (
+                "flushDurationMsTotal must strictly increase after a real flush"
+            )
+            # Surfaced via /slimapi/metrics too.
             response = await _get(app, "/slimapi/metrics")
             ts = response.json()["sse"]["tokenStream"]
             assert ts["flushTicksTotal"] >= 1
-            assert ts["flushDurationMsTotal"] >= 0
+            assert ts["flushDurationMsTotal"] > 0
+        finally:
+            await _close_app(app)
+
+    async def test_max_subscriber_queue_depth_value_level(self):
+        """2-M2: maxSubscriberQueueDepth is a LIVE gauge of attached subs'
+        queue depth — it grows as frames enqueue (no drain) and drops to 0
+        once no sub is attached (value-level, not just key-presence)."""
+        app = _build_app(_settings(token_stream_max_subscribers=3))
+        try:
+            reg = app.state.token_registry
+            sub = reg.subscribe("s1")
+            try:
+                resp0 = await _get(app, "/slimapi/metrics")
+                d0 = resp0.json()["sse"]["tokenStream"]["maxSubscriberQueueDepth"]
+                # Enqueue 5 frames directly; no HTTP generator is draining in
+                # this test, so qsize grows by exactly 5.
+                frame = _delta_frame(("s1", "m1", "p1"), "a")
+                for _ in range(5):
+                    sub.put(frame)
+                resp1 = await _get(app, "/slimapi/metrics")
+                d1 = resp1.json()["sse"]["tokenStream"]["maxSubscriberQueueDepth"]
+                assert d1 >= d0 + 5, (
+                    f"depth {d1} should reflect 5 enqueued frames (was {d0})"
+                )
+            finally:
+                reg.unsubscribe(sub)
+            # Last sub detached → depth 0.
+            resp2 = await _get(app, "/slimapi/metrics")
+            assert resp2.json()["sse"]["tokenStream"]["maxSubscriberQueueDepth"] == 0
         finally:
             await _close_app(app)
 

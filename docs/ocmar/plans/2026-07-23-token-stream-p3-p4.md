@@ -488,14 +488,16 @@ for live_key, part in sorted(
 
 ### 6.3 清理项（cosmetic / optional，不阻塞任何事）
 
-| ID | 项 | 来源 | 处理 |
+| ID | 项 | 来源 | 状态 |
 |---|---|---|---|
-| **2-M1** | 删 dead field `_TokenMetrics.max_subscriber_queue_depth`（定义未写，snapshot 用 local） | rev-grok (S-3a) | 建议删 + 删 docstring 行 |
-| **2-M2** | `maxSubscriberQueueDepth` 加 value-level 测（put N 帧 → depth≥N；unsubscribe → 0） | rev-grok (S-3a) | 补测 |
-| **2-M3** | `flushDurationMsTotal >= 0` 断言过弱（恒真）→ 改 strict 增长断言 | rev-grok (S-3a) | 改测 |
-| **O2** | `flushTicksTotal` 实际计「所有 flush() 调用」（含 `_check_pending_budget` force-flush）而非「纯 loop tick」 | rev-opus | 文档一行说明即可（观测无害） |
-| **M1** | `PartKey` 在 `frames.py` 而非 `models.py`（brief map drift） | rev-grok (S-1) | 已接受，可不改 |
-| **Y1** | `frames.py:16-18` STOP 相对 hub 的注释精度 | rev-grok (S-1) | 可微调 |
+| **2-M1** | 删 dead field `_TokenMetrics.max_subscriber_queue_depth`（定义未写，snapshot 用 local） | rev-grok (S-3a) | **✅ 已清理 r1**（删字段 + docstring 改述为 live gauge） |
+| **2-M2** | `maxSubscriberQueueDepth` value-level 测（put 5 帧 → depth≥+5；unsubscribe → 0） | rev-grok (S-3a) | **✅ 已补测 r1**（`test_max_subscriber_queue_depth_value_level`） |
+| **2-M3** | `flushDurationMsTotal >= 0` 断言过弱（恒真）→ 改 strict 增长断言 | rev-grok (S-3a) | **✅ 已改 r1**（direct flush + `after > before` strict） |
+| **O2** | `flushTicksTotal` 实际计「所有 flush() 调用」（含 `_check_pending_budget` force-flush）而非「纯 loop tick」 | rev-opus | **✅ 已注释 r1**（hub.py bump 点一行说明） |
+| **M1** | `PartKey` 在 `frames.py` 而非 `models.py`（brief map drift） | rev-grok (S-1) | 已接受，不改（reviewer：either fine） |
+| **Y1** | `frames.py:16-18` STOP 相对 hub 的注释精度 | rev-grok (S-1) | 已接受，不改 |
+
+> r1 清理后 767 → 768 passed。
 
 ### 6.4 下一轮建议序列
 

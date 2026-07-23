@@ -77,7 +77,11 @@ class _TokenMetrics:
     S-3a additive observability counters:
     - ``gzip_raw_bytes_total`` / ``gzip_compressed_bytes_total``
     - ``flush_duration_ms_total`` / ``flush_ticks_total``
-    - ``max_subscriber_queue_depth``
+
+    ``maxSubscriberQueueDepth`` is NOT a stored counter — it is a live gauge
+    computed at snapshot time in
+    :meth:`TokenStreamRegistry.snapshot_token_metrics` (max ``queue.qsize()``
+    over attached subs).
     """
 
     orphan_deltas: int = 0
@@ -90,4 +94,3 @@ class _TokenMetrics:
     gzip_compressed_bytes_total: int = 0
     flush_duration_ms_total: float = 0.0
     flush_ticks_total: int = 0
-    max_subscriber_queue_depth: int = 0
