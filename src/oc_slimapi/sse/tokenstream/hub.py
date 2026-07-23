@@ -732,6 +732,40 @@ class TokenStreamHub:
         if not in_fanout:
             sub.put(_truncated_frame(key, done))
 
+    def _emit_snapshot_or_truncated_nodrop(
+        self, sub: Any, key: PartKey, text: str | None, done: bool
+    ) -> None:
+        """Per-sub snapshot emit for eviction re-snapshot of the **current key**
+        (``skip_key``).  ***Never*** calls ``_truncate_part_for_all`` /
+        ``drop_part`` — an outer caller (e.g. ``_reserve`` / ``_start_part``,
+        which invoked ``_evict_part_for_memory``) holds a stale
+        ``live`` reference for this key; dropping it mid-iteration would cause
+        ``_total_live_bytes`` drift and orphan deltas (O1 invariant).
+
+        * If the snapshot frame fits ``self._max_frame_bytes``: deliver it
+          directly (animation preserved).
+        * If the frame is oversized: deliver ``snapshot{truncated:true, done}``
+          to **this subscriber only**, but **keep the LivePart intact** (no
+          ``drop_part``).  The client clears its local accumulator for this
+          part on receipt of ``truncated`` and stops appending further deltas
+          — subsequent deltas from the server become orphan on the client side
+          (lost).  Animation is unrecoverable (blank until ``/since``
+          re-fetch).  This is an acceptable trade-off: only oversized
+          current-key snapshots lose animation; small current-key snapshots
+          (the common case) preserve it.
+
+        ``truncated_snapshots_total`` is incremented **per-sub** each time
+        an oversized frame is emitted (one count per subscriber, unlike
+        ``_truncate_part_for_all`` which counts once per part drop).
+        """
+        frame = _snapshot_frame(key, text, done)
+        if len(frame) <= self._max_frame_bytes:
+            sub.put(frame)
+            return
+        # Oversized → deliver truncated frame directly (no _truncate_part_for_all).
+        sub.put(_truncated_frame(key, done))
+        self._metrics.truncated_snapshots_total += 1
+
     def _truncate_part_for_all(self, key: PartKey, done: bool) -> None:
         """C6 backstop: fan ``snapshot{truncated:true}`` to ALL subscribers of
         the key's sid, then :meth:`drop_part`.
@@ -816,14 +850,27 @@ class TokenStreamHub:
         subscriber, so existing subscribers get a fresh snapshot anchor
         without needing to reconnect (S-2 method B).
 
-        ``skip_key`` (O1): the key the CALLER is currently reserving/admitting
-        for (e.g. ``_reserve``'s ``key``, ``_start_part``'s new ``key``). It is
-        EXCLUDED from the re-snapshot loop: re-snapshotting a near-cap part
-        mid-reserve can exceed ``max_frame_bytes`` → truncate → ``drop_part``
-        while the caller still holds the stale ``live`` reference (gauge drift
-        + orphan delta). The skipped key keeps its existing client anchor
-        (restored on the next reconnect handshake under the current
-        ``triggersReconnect=true`` model).
+        ``skip_key`` (MB-P-S1): the key the CALLER is currently
+        reserving/admitting for (e.g. ``_reserve``'s ``key``,
+        ``_start_part``'s new ``key``). It is **re-included** in the
+        re-snapshot loop via the nodrop path
+        (:meth:`_emit_snapshot_or_truncated_nodrop`), which delivers the
+        snapshot or truncated frame **without** calling ``drop_part``. This
+        closes the client-anchor gap for clear-only (method B,
+        ``triggersReconnect=false``) eviction: the current key's client-side
+        anchor is restored by the re-snapshot, just like any other remaining
+        live part.
+
+        O1 invariant (still holds): the current key (``skip_key``) is
+        ***never*** passed to ``_truncate_part_for_all`` or ``drop_part``
+        during re-snapshot — the nodrop path emits truncated frames directly
+        and keeps the LivePart alive. The caller's stale ``live`` reference
+        remains valid; no gauge drift or orphan deltas.
+
+        Under the older ``triggersReconnect=true`` model this re-snapshot of
+        the current key is redundant (the reconnect handshake restores all
+        anchors), but it is harmless — the client simply ignores the
+        redundant frame.
         """
         if not self.drop_part(key):
             return  # already disabled — eviction resync already fanned.
@@ -834,17 +881,23 @@ class TokenStreamHub:
         self._fanout_resync(sid, "token_memory_limit")
         self._metrics.token_memory_limit_total += 1
         # Re-snapshot remaining live parts of this sid to existing subs.
-        # O1: skip the key the caller is reserving for (see docstring).
+        # MB-P-S1: include skip_key via nodrop path (no drop_part).
         subs = list(self._subs_by_sid.get(sid, ()))
         if not subs:
             return
         for live_key in sorted(
-            k for k in self.live_parts if k[0] == sid and k != skip_key
+            k for k in self.live_parts if k[0] == sid
         ):
             live = self.live_parts[live_key]
             text = "".join(live.chunks)
-            for sub in subs:
-                self._emit_snapshot_or_truncated(sub, live_key, text, done=False)
+            if live_key == skip_key:
+                for sub in subs:
+                    self._emit_snapshot_or_truncated_nodrop(
+                        sub, live_key, text, done=False
+                    )
+            else:
+                for sub in subs:
+                    self._emit_snapshot_or_truncated(sub, live_key, text, done=False)
 
     def _check_pending_budget(self, current_key: PartKey) -> None:
         """Stage E (§16-C residual split): global PENDING budget overflow handler.

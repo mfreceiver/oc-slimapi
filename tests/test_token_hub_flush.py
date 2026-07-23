@@ -810,11 +810,15 @@ class TestReserve:
                     "I1: delta frame must not re-send pending text already in snapshot"
 
     def test_o1_evict_skips_current_key_being_reserved(self, monkeypatch):
-        """O1: ``_reserve → _evict_part_for_memory`` must skip (``skip_key``)
-        the key currently being reserved. Otherwise, when that key K's
-        snapshot frame exceeds ``max_frame_bytes``, K gets truncate +
-        ``drop_part`` mid-reserve while the caller still holds the stale
-        ``live`` reference (``_total_live_bytes`` drift + orphan delta)."""
+        """MB-P-S1: ``_reserve → _evict_part_for_memory`` re-includes the
+        current key (``skip_key``) via the nodrop path, closing the
+        client-anchor gap for clear-only (method B) eviction.
+
+        O1 invariant (unchanged): K is NEVER passed to ``drop_part``; the
+        caller's stale ``live`` reference remains valid — no gauge drift or
+        orphan deltas. Previously K was skipped entirely; now it receives a
+        nodrop ``snapshot{truncated:true}`` frame (oversized for
+        ``max_frame_bytes=64``)."""
         # Per-part cap huge (K may exceed max_frame_bytes without per-part
         # truncate); global LIVE cap small (K+A overflows → evict A).
         monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_PART_MAX_BYTES", 10 ** 9)
@@ -844,11 +848,217 @@ class TestReserve:
         assert ("s1", "m1", "pA") not in th.live_parts
         # No gauge drift: K's 150 + new delta 50 = 200 (A's 40 removed).
         assert th._total_live_bytes == 200
+        # MB-P-S1: sub receives resync THEN a truncated snapshot for K (nodrop).
+        events = [parse_event(f) for f in sub.frames]
+        # First event: resync{token_memory_limit}.
+        assert events[0][0] == "resync"
+        assert events[0][1] == {"reason": "token_memory_limit", "sessionID": "s1"}
+        # Second event: truncated snapshot for K (oversized → truncated, not dropped).
+        assert events[1][0] == "message.part.snapshot"
+        assert events[1][1]["partID"] == "pK"
+        assert events[1][1].get("truncated") is True
+        assert "text" not in events[1][1]
+        assert events[1][1].get("done") is False
+        # Only two frames.
+        assert len(events) == 2, f"expected 2 events (resync + truncated), got {len(events)}"
+        # truncated_snapshots_total counted per-sub (nodrop path).
+        assert th.truncated_snapshots_total == 1
         # O1 consequence: K survived, so its delta is delivered (not orphan).
         sub.frames.clear()
         th.flush()
         assert th.orphan_deltas == 0, "K's delta must not be orphaned (K survived)"
         assert any(b"X" in f for f in sub.frames), "K's delta must be delivered on flush"
+
+    def test_mb_p_s1_small_current_key_gets_real_snapshot_on_evict(self, monkeypatch):
+        """MB-P-S1: when the current key K's snapshot frame fits within
+        ``max_frame_bytes``, it receives a real ``snapshot{done:false}`` with
+        full text (animation preserved) — not truncated."""
+        # Small global LIVE cap so the delta triggers eviction.
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_PART_MAX_BYTES", 10 ** 9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_LIVEPARTS_MAX_BYTES", 48)
+        # Use the default (large) max_frame_bytes so K's snapshot fits.
+        th = TokenStreamHub()  # max_frame_bytes = DEFAULT_TOKEN_MAX_FRAME_BYTES (1 MiB)
+        sub = _attach(th, "s1")
+        sub.frames.clear()
+        th.on_part_updated(_updated_props("s1", "m1", "pK", text="small"))  # 5 bytes
+        th.on_part_updated(_updated_props("s1", "m1", "pA", text="A" * 40))   # 40 bytes
+        th.live_parts[("s1", "m1", "pA")].last_delta_ms = _now_ms() - 10000
+        live_before = th.live_parts[("s1", "m1", "pK")]
+        # Total before delta: 5 + 40 = 45, under 48.
+        assert th._total_live_bytes == 45
+
+        # Delta to K (6 bytes " extra") → 45 + 6 = 51 > 48 → _reserve evicts A.
+        th.on_part_delta(_delta_props("s1", "m1", "pK", delta=" extra"))
+
+        k_key = ("s1", "m1", "pK")
+        # K survived, not dropped, same object. A evicted.
+        assert k_key in th.live_parts
+        assert k_key not in th._disabled_parts
+        assert th.live_parts[k_key] is live_before
+        assert ("s1", "m1", "pA") not in th.live_parts
+        # No gauge drift: K seed (5) + delta (6) = 11 (A's 40 removed).
+        assert th._total_live_bytes == 11, \
+            f"expected 11 (only K: 5 seed + 6 delta), got {th._total_live_bytes}"
+
+        # MB-P-S1: sub gets resync THEN a real (non-truncated) snapshot with
+        # K's seed text "small" (the delta hasn't been appended yet when
+        # _evict_part_for_memory reads live.chunks).
+        events = [parse_event(f) for f in sub.frames]
+        assert events[0][0] == "resync"
+        assert events[0][1] == {"reason": "token_memory_limit", "sessionID": "s1"}
+        assert events[1][0] == "message.part.snapshot"
+        assert events[1][1]["partID"] == "pK"
+        assert events[1][1].get("truncated") is None  # not truncated (fits)
+        assert events[1][1].get("text") is not None   # full text
+        assert events[1][1]["text"] == "small"         # seed text only
+        assert events[1][1].get("done") is False
+        assert len(events) == 2, f"expected 2 events, got {len(events)}"
+        # No truncated frame emitted (snapshot fits).
+        assert th.truncated_snapshots_total == 0
+
+        # Subsequent delta not orphan.
+        sub.frames.clear()
+        th.flush()
+        assert th.orphan_deltas == 0
+
+    def test_mb_p_s1_large_current_key_truncated_without_drop(self, monkeypatch):
+        """MB-P-S1: a large current key K receives a nodrop truncated frame
+        (``truncated:true``) on eviction re-snapshot. K stays in
+        ``live_parts``, NOT in ``_disabled_parts``; ``truncated_snapshots_total``
+        reflects the per-sub count."""
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_PART_MAX_BYTES", 10 ** 9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_LIVEPARTS_MAX_BYTES", 200)
+        th = TokenStreamHub(max_frame_bytes=64)
+        sub = _attach(th, "s1")
+        sub.frames.clear()
+        th.on_part_updated(_updated_props("s1", "m1", "pK", text="K" * 150))
+        th.on_part_updated(_updated_props("s1", "m1", "pA", text="A" * 40))
+        th.live_parts[("s1", "m1", "pA")].last_delta_ms = _now_ms() - 10000
+
+        k_key = ("s1", "m1", "pK")
+        live_before = th.live_parts[k_key]
+        th.on_part_delta(_delta_props("s1", "m1", "pK", delta="X" * 50))
+
+        # K still alive — O1 invariant holds.
+        assert k_key in th.live_parts
+        assert k_key not in th._disabled_parts
+        assert th.live_parts[k_key] is live_before
+        assert th._total_live_bytes == 200
+        # truncated_snapshots_total counts the per-sub nodrop truncated emit.
+        assert th.truncated_snapshots_total == 1
+        # Wire: resync → truncated for K.
+        events = [parse_event(f) for f in sub.frames]
+        assert len(events) == 2
+        assert events[1][0] == "message.part.snapshot"
+        assert events[1][1]["partID"] == "pK"
+        assert events[1][1].get("truncated") is True
+        assert "text" not in events[1][1]
+
+    def test_mb_p_s1_nodrop_truncated_emitted_per_sub(self, monkeypatch):
+        """MB-P-S1 multi-sub: an oversized current key K delivers a nodrop
+        truncated frame to EACH attached subscriber, and
+        ``truncated_snapshots_total`` counts per-sub (== number of subs) —
+        distinct from ``_truncate_part_for_all``'s per-drop (==1) count."""
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_PART_MAX_BYTES", 10 ** 9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_LIVEPARTS_MAX_BYTES", 200)
+        th = TokenStreamHub(max_frame_bytes=64)
+        sub1 = _attach(th, "s1")
+        sub2 = _attach(th, "s1")
+        sub1.frames.clear()
+        sub2.frames.clear()
+        th.on_part_updated(_updated_props("s1", "m1", "pK", text="K" * 150))
+        th.on_part_updated(_updated_props("s1", "m1", "pA", text="A" * 40))
+        th.live_parts[("s1", "m1", "pA")].last_delta_ms = _now_ms() - 10000
+
+        k_key = ("s1", "m1", "pK")
+        live_before = th.live_parts[k_key]
+        # Delta to K overflows global cap → _reserve evicts A; re-snapshot
+        # sends K's truncated frame to BOTH subs via the nodrop path.
+        th.on_part_delta(_delta_props("s1", "m1", "pK", delta="X" * 50))
+
+        # O1 invariant: K survived (not dropped mid-reserve).
+        assert k_key in th.live_parts
+        assert k_key not in th._disabled_parts
+        assert th.live_parts[k_key] is live_before
+        # Both subs received K's truncated frame (per-sub nodrop emit).
+        for sub in (sub1, sub2):
+            k_events = [e for e in (parse_event(f) for f in sub.frames)
+                        if e[1].get("partID") == "pK"]
+            assert len(k_events) == 1, "each sub gets exactly one K frame"
+            assert k_events[0][1].get("truncated") is True
+            assert "text" not in k_events[0][1]
+        # per-sub metric: 2 subs → truncated_snapshots_total == 2 (vs the
+        # _truncate_part_for_all path which would count == 1 per part drop).
+        assert th.truncated_snapshots_total == 2, \
+            f"per-sub nodrop count: expected 2 (two subs), got {th.truncated_snapshots_total}"
+
+    def test_evict_resnapshot_drops_oversized_non_current_part(self, monkeypatch):
+        """MB-P-S1 regression: a non-current oversized part B is still
+        truncated AND dropped during eviction re-snapshot (C6 backstop
+        unchanged for non-skip_key parts). The current key K is also
+        truncated (114-byte frame > 64 max_frame_bytes) but stays in
+        ``live_parts`` (nodrop path)."""
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_PART_MAX_BYTES", 10 ** 9)
+        # Live parts after seed: K=5, A=40, B=150 → total=195.
+        # Set cap to 195 so the 1-byte delta triggers eviction.
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_LIVEPARTS_MAX_BYTES", 195)
+        th = TokenStreamHub(max_frame_bytes=64)
+        sub = _attach(th, "s1")
+        sub.frames.clear()
+        # Three parts on same sid: K (current), A (eviction victim), B (oversized non-current).
+        th.on_part_updated(_updated_props("s1", "m1", "pK", text="small"))   # 5 bytes
+        th.on_part_updated(_updated_props("s1", "m1", "pA", text="A" * 40))   # 40 bytes
+        th.on_part_updated(_updated_props("s1", "m1", "pB", text="B" * 150))  # 150 bytes
+        # Backdate A so it is the LRU eviction target.
+        th.live_parts[("s1", "m1", "pA")].last_delta_ms = _now_ms() - 20000
+        th.live_parts[("s1", "m1", "pB")].last_delta_ms = _now_ms() - 10000
+        assert th._total_live_bytes == 195  # 5 + 40 + 150
+
+        k_key = ("s1", "m1", "pK")
+        b_key = ("s1", "m1", "pB")
+        # Delta to K (1 byte) → 196 > 195 → _reserve evicts A (oldest non-current).
+        th.on_part_delta(_delta_props("s1", "m1", "pK", delta="!"))
+
+        # K survived via nodrop (NOT in _disabled_parts).
+        assert k_key in th.live_parts
+        assert k_key not in th._disabled_parts, \
+            "current key K must NOT be in _disabled_parts (nodrop path)"
+        # A evicted (victim).
+        assert ("s1", "m1", "pA") not in th.live_parts
+        # B was truncated + DROPPED (non-current oversized → C6 backstop).
+        assert b_key not in th.live_parts, \
+            "non-current oversized part B must be dropped by C6 backstop"
+        assert b_key in th._disabled_parts, \
+            "non-current oversized part B must be recorded in _disabled_parts"
+        # No gauge drift: K 5 + delta 1 = 6. (A 40 + B 150 removed).
+        assert th._total_live_bytes == 6, \
+            f"expected 6 (K only), got {th._total_live_bytes}"
+
+        # Check wire: resync → K truncated (nodrop) → B truncated (C6 dropped).
+        events = [parse_event(f) for f in sub.frames]
+        assert events[0][0] == "resync"
+        assert events[0][1] == {"reason": "token_memory_limit", "sessionID": "s1"}
+        # K event: truncated nodrop (114-byte frame > 64 max_frame_bytes).
+        k_events = [e for e in events if e[1].get("partID") == "pK"]
+        assert len(k_events) == 1
+        assert k_events[0][1].get("truncated") is True, \
+            "K truncated via nodrop (frame > max_frame_bytes)"
+        assert "text" not in k_events[0][1]
+        # B event: truncated C6 (dropped).
+        b_events = [e for e in events if e[1].get("partID") == "pB"]
+        assert len(b_events) == 1
+        assert b_events[0][1].get("truncated") is True
+        assert "text" not in b_events[0][1]
+
+        # Key invariant: K in live_parts (nodrop), B not (C6 dropped).
+        assert k_key in th.live_parts
+        assert b_key not in th.live_parts
+        assert b_key in th._disabled_parts
+
+        # Subsequent delta for K not orphan.
+        sub.frames.clear()
+        th.flush()
+        assert th.orphan_deltas == 0
 
 
 # ===========================================================================
