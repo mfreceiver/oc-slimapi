@@ -41,14 +41,14 @@ main `c21ca3b` 已落地（均 push）：
 ### MB-P — Method B 产品化（最高价值双边项）
 
 - **现状**：S-2 让服务端在 eviction 后对**非 current 的剩余 live part**重发 snapshot。但 **current key（正在 reserve 的）被 O1 的 `skip_key` 排除**——其客户端锚点在 resync 清态后**不**由 method B 恢复，仍依赖 `triggersReconnect=true` 的重连 handshake。
-- **服务端剩余工作（MB-P-S，前置）— ✅ 已完成**（dev `3e4b3b7`，2026-07-23；rev-grok APPROVED_WITH_NITS + fresh verifier 773 passed）：闭合 current-key 锚点缺口（O1 的 `skip_key` 让 current key 在 eviction re-snapshot 时被跳过 → clear-only 下其客户端锚点不恢复），使 clear-only（不重连）也安全。**统一变体 MB-P-S1（推荐，与 handoff §2.1 一致）**：eviction re-snapshot 时把 current key 重新纳入重发，带「截断不 drop」守卫——
+- **服务端剩余工作（MB-P-S，前置）— ✅ 已发版+部署 v0.6.0**（main `d97f701`/tag `v0.6.0`，2026-07-23；含 S-2+O1+MB-P-S1+Q4 debug env；rev-grok APPROVED；792 passed；生产 health 0.6.0）：闭合 current-key 锚点缺口（O1 的 `skip_key` 让 current key 在 eviction re-snapshot 时被跳过 → clear-only 下其客户端锚点不恢复），使 clear-only（不重连）也安全。**统一变体 MB-P-S1（推荐，与 handoff §2.1 一致）**：eviction re-snapshot 时把 current key 重新纳入重发，带「截断不 drop」守卫——
   - current key snapshot 帧 **≤ `max_frame_bytes`** → 发正常 `snapshot{done:false}`（保留动画）。
   - **> `max_frame_bytes`**（近 1MiB part）→ 发 `snapshot{truncated:true}` + 客户端 `/since`（大 part 动画让位于权威真值）。
   - **「截断而不 `drop_part`」= 新增服务端发射路径**（现有 `_emit_snapshot_or_truncated` 超限必 `_truncate_part_for_all`→`drop_part`，正是 O1 re-entrancy 源）。需一条「发 `truncated` 帧但保留 LivePart、不 drop」的新路径，从而不 invalidate 调用方 `live` 引用（无 gauge 上漂、无游离 delta）。**wire 帧复用（不 bump 正确），但服务端逻辑是新增、且恰好绕开 O1 那次 drop_part——非「复用现有 truncated 语义」**。
   - **已知取舍（large-part 分支）**：即便服务端保留 LivePart，客户端收 `truncated` 后清该 part、停 append → 服务端继续累计并 flush 的 delta 在客户端 orphan 被丢。即 **large current key 动画不可救（仍 blank 至 `/since`）；仅 small current key 真 snapshot 分支保住动画**。取舍交 D-MB-P 由 ocdroid 裁定。
   - 备选 MB-P-S2：resync 携带 hint 触发客户端 `/since`（需新字段，不推荐）。
 - **ocdroid 工作**：`TokenStreamFrame.TOKEN_MEMORY_LIMIT.triggersReconnect` true→false；reducer 在该 resync 下走 ClearPartState + TriggerSinceFetch（authoritative）+ **不** Reconnect；flow 测。
-- **前置**：~~MB-P-S 落地 + 测绿~~ ✅（`3e4b3b7`，773 passed）→ ocdroid 现可安全 flip。
+- **前置**：~~MB-P-S 落地 + 测绿~~ ✅（v0.6.0 已发版+部署，792 passed）→ ocdroid 已 flip（v0.13.2 `da47fe3`，gate 9.8 GO）。**MB-P 双边完成。**
 - **验收**：服务端单测「evict current key 附近 → 现有 sub 收 truncated/since 恢复，无重连」；ocdroid flow 测「memory-limit → clear + /since，openCount 不增」。
 - **wire**：无变化（triggersReconnect 是客户端策略）。**不 bump**。
 - **价值**：消除 memory-limit 时的重连抖动（实时流不中断），显著改善高负载/大 part 场景体验。

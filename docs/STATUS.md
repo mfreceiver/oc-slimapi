@@ -7,19 +7,18 @@
 
 ## 1. 当前交付态
 
-### main（稳定，已 push）
-- **v0.5.0**：token 批式 SSE（opt-in，lever1 done-marker + lever2 gzip）已发版+部署生效。
-- **P3 r1**（commit `7a1861a`）：S-1 拆 `token_hub.py`→`sse/tokenstream/` 包；S-3a 加 5 观测指标；S-2 method B 半成品（eviction 后对非 current 的剩余 live part 重发 snapshot）。
-- **清理**（`1bf0c4c`）：2-M1/2-M2/2-M3/O2 minors。
-- **O1**（`c21ca3b`）：`_reserve→evict` re-entrancy 闭合（`skip_key` 排除 current key，4 调用点）。
-- **R1 计划状态**（`90983da`）：§6.1/§6.4 标 O1 ✅。
-- `./scripts/check.sh` = **769 passed**。
+### main（稳定，已 push + 部署生效）
+- **v0.6.0**（tag `v0.6.0`，commit `d97f701`）：token-stream method-B 产品化 + O1 闭合 + Q4 debug env。**已发版 + 已部署生产**（health `version:0.6.0`、`tokenStream:true`、`api_version:1`）。ocdroid v0.13.2 flip（`da47fe3`，gate 9.8 GO）的服务端前置，D-MB-P 已确认；双边 lockstep 完成。
+  - **S-2**：memory-limit eviction 现向**既有 subscriber** 同流重发 surviving part `snapshot{done:false}`。
+  - **MB-P-S1**：current-key 经 `_emit_snapshot_or_truncated_nodrop` 重新纳入 re-snapshot（small→真 snapshot 保动画；large→truncated 不 drop）；O1 不变量继续成立（current key 绝不 drop_part mid-reserve）。
+  - **O1**：`_reserve→evict` re-entrancy 闭合（`skip_key`）。
+  - **Q4 debug env**：`OC_SLIMAPI_TOKEN_STREAM_DEBUG_{LIVE_BUDGET_BYTES,PART_MAX_BYTES,LIVE_PARTS_MAX}`（联调/ops，默认 off = 零行为变化）。
+  - check.sh **792 passed**；无 wire 变化，不 bump（`X-Slimapi-Version: 1`）。rev-grok lane APPROVED。
+- **v0.5.0**：token 批式 SSE（opt-in，lever1 done-marker + lever2 gzip）。
 
-### dev（R2 双边工作，已 push）
-- `cb59e96`：R2 ocdroid 配合计划 + 双边契约/协商 handoff。
-- `694d73d`：merge main（R1 计划副本同步）。
-- 文档清理：`.ocmar/workflows/token-stream-p3-p4/`（FINISHED 工作流产物，2.1M，gitignored）已删；5 个无引用的过期 docs/ 文档已删。
-- **MB-P-S1**（`3e4b3b7`）：method-B eviction current-key 锚点闭合。新增 `_emit_snapshot_or_truncated_nodrop`（截断不 drop）；`_evict_part_for_memory` re-snapshot 重新纳入 current key 走 nodrop，非 current 维持 C6 drop；`skip_key` 保留。rev-grok APPROVED_WITH_NITS（NIT #1 docstring + #2 多 sub 测已修），fresh verifier 773 passed。**服务端 R2 unilateral 工作至此尽**——余项皆阻塞于 ocdroid（D-MB-P/D-F-1/D-F-2）或产品 go。
+### dev（R2 双边工作；已 ff-merge 入 main v0.6.0）
+- R2 method-B + debug env 工作已发版 v0.6.0（见 §main）。dev 落后 main 一个 release commit；下次开发前 `git switch dev && git merge main` 同步。
+- 历史：MB-P-S1 `3e4b3b7`、Q4 debug env `491cb41`、R2 文档 `cb59e96`、文档清理 `62c2d99`。
 
 ---
 
@@ -47,16 +46,16 @@
 
 | ID | 项 | 服务端 | ocdroid | wire | 状态 |
 |---|---|---|---|---|---|
-| **MB-P-S1** | method B 硬前置（current-key 锚点闭合） | ✅ 完成 `3e4b3b7`（dev） | — | 无 | **✅ 完成** |
-| **MB-P** | method B 产品化（flip `triggersReconnect` true→false） | MB-P-S1 先做 | flip + flow 测 | 无 | 阻塞于 MB-P-S1 + D-MB-P |
+| **MB-P-S1** | method B 硬前置（current-key 锚点闭合） | ✅ v0.6.0 shipped+deployed | — | 无 | **✅ 完成** |
+| **MB-P** | method B 产品化（flip `triggersReconnect` true→false） | ✅ v0.6.0 shipped+deployed | ✅ v0.13.2 flip `da47fe3`（gate 9.8 GO） | 无 | **✅ 完成（双边 lockstep）** |
 | **F-1** | reasoning/tool-input 流式 | 停 drop + 扩 wire | reducer+UI | 待裁定（D-F-1） | 阻塞于产品 go + D-F-1 |
 | **F-2** | busy-open 占位帧 | `server.connected{busy:true}` | UX skeleton | 加性（不 bump） | 阻塞于产品 go + D-F-2 |
 | **S-4** | ocdroid flow 级测 | 提供契约 | 实施 | 无 | 任意时点（跨仓） |
 | **C-4** | ocdroid 文档对齐 | 提供终态 wire | 对齐 | 无 | 任意时点（跨仓） |
 | **V-B** | 生产长连 idle 实证 | heartbeat+防代理头 | 45s watchdog+抓包 | 无 | 运维（任意时点） |
 
-**双边关键路径**：ocdroid 收 R2 handoff → 回 D-MB-P/D-F-1/D-F-2 → 解锁 MB-P flip / F-1 / F-2。
-**服务端先行（已完成）**：MB-P-S1 ✅（`3e4b3b7`）。服务端 unilateral R2 工作已尽；余项皆双边/产品门控。下一可推动项 = ocdroid 回 D-MB-P（MB-P 仅剩 ocdroid flip，服务端无活）。
+**MB-P 双边完成**：服务端 v0.6.0（S-2/O1/MB-P-S1）已部署 + ocdroid v0.13.2 flip 已发——method-B clear-only 恢复已上线。
+**剩余 R2**：S-4 联调（ocdroid 实施；可用 v0.6.0 debug env 验 a/b + >32 part 验 c/d）；F-1/F-2 阻塞于产品 go + D-F-1/D-F-2；C-4/V-B 任意时点。
 
 ---
 
