@@ -10,7 +10,7 @@
 ## 0. 状态一句话
 
 oc-slimapi 已落地 opt-in token 流端点 `GET /slimapi/sessions/{sid}/stream`（批式 delta + lever1 done:true marker 无 text + lever2 默认 gzip）。  
-ocdroid 客户端 5 阶段已完成；双边核验结论：**可进联合终审**，但有 **1 项风险 + 1 项缺口** 须 ocdroid 侧落地（见 §5 / §8）。
+**v0.5.0 已发版（push main + tag + Gitea Release，2026-07-23）**；ocdroid 已 pushed（origin）。双边联合终审 re-gate **GO 9.7**（rev-bgpt）。发版/部署（reinstall+重启）/post-release backlog 见 [`release-v0.5.0-token-stream.md`](release-v0.5.0-token-stream.md)；双边对接契约见本文 §1 + 该文 §4。
 
 **2026-07-23 ocdroid 回传裁定（已收，含 `session_notify` from `ses_0755e5995ffewjM6BrAM7hD0F5`）**：C-1=**A**、C-2=**修**、C-3/C-4=做、V-A/V-C 确认、V-B 客户端无可见性（服务端侧见 §8.3）。
 
