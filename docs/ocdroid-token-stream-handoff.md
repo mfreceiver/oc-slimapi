@@ -7,20 +7,15 @@
 
 ---
 
-## 0. 状态一句话
+## 0. 状态一句话（终态）
 
-oc-slimapi 已落地 opt-in token 流端点 `GET /slimapi/sessions/{sid}/stream`（批式 delta + lever1 done:true marker 无 text + lever2 默认 gzip）。  
-**v0.5.0 已发版（push main + tag + Gitea Release，2026-07-23）**；ocdroid 已 pushed（origin）。双边联合终审 re-gate **GO 9.7**（rev-bgpt）。发版/部署（reinstall+重启）/post-release backlog 见 [`release-v0.5.0-token-stream.md`](release-v0.5.0-token-stream.md)；双边对接契约见本文 §1 + 该文 §4。
+oc-slimapi **v0.5.0 已发版 + 部署生效**：push main + tag `v0.5.0` + Gitea Release（2026-07-23）；服务端 reinstall + restart + `/slimapi/health` 自检通过（2026-07-23，`sidecar.version=0.5.0` / `server.api_version=1` / `features.tokenStream=true` / `schema.degraded=false`）。token 批式 SSE（opt-in 实时流，lever1 done:true 无 text + lever2 默认 gzip）上线；全加性 wire，**不 bump** `X-Slimapi-Version`（仍 `1`）。ocdroid 已 push origin（含 `token_memory_limit` 重连修复 commit `1986567`）。
 
-**2026-07-23 ocdroid 回传裁定（已收，含 `session_notify` from `ses_0755e5995ffewjM6BrAM7hD0F5`）**：C-1=**A**、C-2=**修**、C-3/C-4=做、V-A/V-C 确认、V-B 客户端无可见性（服务端侧见 §8.3）。
+**双边对接契约**：本文 §1 + [`release-v0.5.0-token-stream.md`](release-v0.5.0-token-stream.md) §4（post-fix 权威）。发版/部署/post-release backlog 见该文。
 
-**2026-07-23 ocdroid ready**：C-1=A + C-2 + C-3 已落地（commit `d4b22da`，ocdroid main）；self-gate rev-grok 9.7 GO；check.sh GREEN（~3967 单测）。C-4 文档延后不阻塞。
+**ocdroid 回传裁定（已收，2026-07-23）**：C-1=**A**、C-2=**修**、C-3=做、C-4=延后；V-A=确认、V-B=客户端无可见性（服务端侧见 §8.3）、V-C=确认。
 
-**2026-07-23 联合终审（rev-bgpt）**：**NO-GO 8.4/10**。C-1/C-2/C-3 与 wire A 项均 PASS；**阻塞项**：`token_memory_limit` 清态不重连 → 后续 delta orphan（见 §9）。服务端 763 re-check green。
-
-**2026-07-23 §9.4 方案 A 修复**：ocdroid 工作区 `TOKEN_MEMORY_LIMIT.triggersReconnect=true` + 测（Frame/Reducer/Coordinator）；本仓 `CLIENT_CHANGES` resync 两档表已同步。
-
-**2026-07-23 re-gate（rev-bgpt）**：**GO 9.7/10** — `token_memory_limit` 阻塞路径闭合。服务端 763 green；ocdroid Frame/Reducer/Coordinator 相关单测 0 fail。可发版（不 bump `X-Slimapi-Version`）；客户端随本修复 commit 出货。
+**联合终审轨迹（2026-07-23，rev-bgpt）**：初裁 **NO-GO 8.4**（`token_memory_limit` clear-only 不重连 → 后续 delta orphan，见 §9）；§9.4 方案 A 修复（`TOKEN_MEMORY_LIMIT.triggersReconnect=true`）后 re-gate **GO 9.7**（见 §11）。详细审查记录见 §8–§11。
 
 ---
 
