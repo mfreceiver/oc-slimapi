@@ -32,11 +32,22 @@ async def events(request: Request):
         )
 
     subscriber_id = subscriber.id
+    # Pull the traffic ledger here (not in the generator) so a missing /
+    # disabled ledger does not crash the SSE path on the first yield.
+    traffic_ledger = getattr(request.app.state, "traffic_ledger", None)
 
     async def generate():
         try:
             if request.headers.get("last-event-id"):
-                yield sse_frame({"reason": "reconnect_no_replay"}, event="resync")
+                resync = sse_frame({"reason": "reconnect_no_replay"}, event="resync")
+                if traffic_ledger is not None:
+                    try:
+                        traffic_ledger.record_sse_downstream(
+                            bucket="events_sse", bytes_out=len(resync),
+                        )
+                    except Exception:
+                        pass
+                yield resync
             while True:
                 item = await subscriber.queue.get()
                 if item is STOP:
@@ -44,6 +55,22 @@ async def events(request: Request):
                 # Mirror put(): only sized frames bump queued_bytes; STOP is a
                 # control sentinel and never entered the byte ledger.
                 subscriber.ack(item)
+                # Traffic accounting: per-frame downstream bytes (the curated
+                # SSE ``downOut`` owner — see TrafficLedger.snapshot).
+                # Semantics: ``record_sse_downstream`` counts bytes handed to
+                # the ASGI ``send`` path (the yielded frame). This is the same
+                #口径 as the middleware's ``downOut`` for non-SSE buckets: both
+                # count bytes submitted to the ASGI send callable, before any
+                # possible send-failure from a client disconnect. If ASGI send
+                # fails the frame has already been counted — this is intentional
+                # and consistent (no send-failure rollback exists elsewhere).
+                if traffic_ledger is not None:
+                    try:
+                        traffic_ledger.record_sse_downstream(
+                            bucket="events_sse", bytes_out=len(item),
+                        )
+                    except Exception:
+                        pass
                 yield item
         finally:
             # Must go through HubRegistry.unsubscribe (not GlobalHub) so

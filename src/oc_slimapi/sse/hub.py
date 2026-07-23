@@ -40,6 +40,7 @@ import orjson
 
 if TYPE_CHECKING:
     from ..children_cache import ChildrenCache
+    from ..traffic import TrafficLedger
     from .token_hub import TokenStreamHub
 
 
@@ -114,6 +115,28 @@ def sse_frame(payload: dict[str, Any], event: str | None = None) -> bytes:
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _upstream_line_bytes(line: str) -> int:
+    """Byte length to attribute to one ``aiter_lines()`` line from the shared
+    upstream ``/global/event`` stream.
+
+    ``aiter_lines()`` strips the trailing newline and decodes UTF-8, so we
+    re-encode for a byte-accurate count and add ``+1`` for the stripped line
+    terminator so the 省流 ratio is not under-counted in our favour. Empty
+    lines (SSE frame separators between ``data:`` blocks) also count —
+    ``_upstream_line_bytes("") == 1``, exactly the stripped terminator byte.
+
+    .. note::
+       The ``+1`` assumes an LF (``\\n``) line terminator, which is the SSE
+       standard and what opencode ``/global/event`` emits. A CRLF
+       (``\\r\\n``) upstream would be under-counted by 1 byte per line
+       (``aiter_lines`` strips only the ``\\n``, leaving a trailing ``\\r``
+       in ``line`` that the ``+1`` does not compensate for) — a conservative
+       bias (we'd slightly under-report upstream bytes, making the ratio look
+       marginally better than reality).
+    """
+    return len(line.encode("utf-8", "replace")) + 1
 
 
 @dataclass
@@ -286,12 +309,14 @@ class GlobalHub:
         queue_items: int = DEFAULT_SSE_QUEUE_ITEMS,
         buffer_bytes: int = DEFAULT_SSE_BUFFER_BYTES,
         max_frame_bytes: int = DEFAULT_SSE_MAX_FRAME_BYTES,
+        traffic_ledger: "TrafficLedger | None" = None,
     ):
         self.client = client
         self.subscribers: set[Subscriber] = set()
         self.queue_items = queue_items
         self.buffer_bytes = buffer_bytes
         self.max_frame_bytes = max_frame_bytes
+        self._traffic_ledger = traffic_ledger
         self.task: asyncio.Task | None = None
         self.flush_task: asyncio.Task | None = None
         self.heartbeat_task: asyncio.Task | None = None
@@ -697,6 +722,25 @@ class GlobalHub:
                     delay = 1.0
                     data_lines: list[str] = []
                     async for line in response.aiter_lines():
+                        # Traffic accounting: count the raw upstream bytes
+                        # consumed from the single shared /global/event
+                        # stream. Delegated to the pure helper
+                        # ``_upstream_line_bytes`` so the empty-line /
+                        # separator counting (+1) is unit-tested directly
+                        # (driving the real ``run()`` loop with a mock
+                        # upstream is avoided — it busy-loops inside httpx
+                        # and resists ``task.cancel()``; see
+                        # tests/test_traffic_sse.py header). Empty SSE
+                        # separator lines are counted too (``"" → 1``).
+                        # CRLF caveat: see ``_upstream_line_bytes`` docstring.
+                        if self._traffic_ledger is not None:
+                            try:
+                                self._traffic_ledger.record_sse_upstream(
+                                    bucket="events_sse",
+                                    bytes_in=_upstream_line_bytes(line),
+                                )
+                            except Exception:
+                                pass
                         if line.startswith("data:"):
                             data_lines.append(line[5:].lstrip())
                         elif not line and data_lines:
@@ -782,6 +826,7 @@ class HubRegistry:
         queue_items: int = DEFAULT_SSE_QUEUE_ITEMS,
         buffer_bytes: int = DEFAULT_SSE_BUFFER_BYTES,
         max_frame_bytes: int = DEFAULT_SSE_MAX_FRAME_BYTES,
+        traffic_ledger: "TrafficLedger | None" = None,
     ):
         self.client = client
         self._global: GlobalHub | None = None
@@ -790,6 +835,7 @@ class HubRegistry:
         self.queue_items = queue_items
         self.buffer_bytes = buffer_bytes
         self.max_frame_bytes = max_frame_bytes
+        self._traffic_ledger = traffic_ledger
         self.total_subscribers = 0
         self.rejected_total = 0
         self._transforms: Any = None  # TransformPool, wired from app.py for metrics.
@@ -830,6 +876,7 @@ class HubRegistry:
                 queue_items=self.queue_items,
                 buffer_bytes=self.buffer_bytes,
                 max_frame_bytes=self.max_frame_bytes,
+                traffic_ledger=self._traffic_ledger,
             )
             self._global._children_cache = self._children_cache
             self._global._token_hub = self._token_hub

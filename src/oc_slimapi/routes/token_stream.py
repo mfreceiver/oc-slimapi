@@ -98,6 +98,9 @@ async def token_stream(request: Request, sid: str, directory: str | None = None)
         )
 
     subscriber_id = subscriber.id
+    # Pull the traffic ledger here so a missing / disabled ledger does not
+    # crash the SSE path on the first yield.
+    traffic_ledger = getattr(request.app.state, "traffic_ledger", None)
 
     async def generate():
         # One deflater per connection. wbits = MAX_WBITS | 16 (31) emits a
@@ -119,6 +122,25 @@ async def token_stream(request: Request, sid: str, directory: str | None = None)
             subscriber.metrics.gzip_compressed_bytes_total += len(out)
             return out
 
+        def _account(out_bytes: bytes) -> None:
+            # Traffic accounting: the on-the-wire (post-gzip) frame bytes —
+            # the token_stream_sse ``downOut`` owner.
+            # Semantics: counts bytes handed to the ASGI ``send`` path
+            # (the yielded frame after gzip encoding). This is the same
+            #口径 as the middleware's ``downOut`` for non-SSE buckets: both
+            # count bytes submitted to ASGI send, before any possible
+            # send-failure from a client disconnect. If ASGI send fails
+            # the frame has already been counted — this is intentional and
+            # consistent (no send-failure rollback exists elsewhere).
+            if traffic_ledger is None:
+                return
+            try:
+                traffic_ledger.record_sse_downstream(
+                    bucket="token_stream_sse", bytes_out=len(out_bytes),
+                )
+            except Exception:
+                pass
+
         try:
             # §5.5 step 1: Last-Event-ID (value ignored) → leading
             # reconnect_no_replay resync BEFORE server.connected. The
@@ -126,7 +148,9 @@ async def token_stream(request: Request, sid: str, directory: str | None = None)
             # synchronously by subscribe()→attach_subscriber and sits behind
             # this leading frame on the wire.
             if last_event_id:
-                yield encode(_resync_frame(sid, "reconnect_no_replay"))
+                out = encode(_resync_frame(sid, "reconnect_no_replay"))
+                _account(out)
+                yield out
             while True:
                 item = await subscriber.queue.get()
                 if item is STOP:
@@ -134,7 +158,9 @@ async def token_stream(request: Request, sid: str, directory: str | None = None)
                 # Mirror put(): only sized frames bump queued_bytes; STOP is a
                 # control sentinel never entered into the byte ledger.
                 subscriber.ack(item)
-                yield encode(item)
+                out = encode(item)
+                _account(out)
+                yield out
         finally:
             # Detach via the registry so total_subscribers is decremented and
             # the flush loop is stopped on last-detach (NB-C4). Idempotent.

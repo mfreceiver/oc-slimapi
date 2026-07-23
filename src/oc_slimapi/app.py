@@ -5,16 +5,19 @@ from fastapi import FastAPI
 import uvicorn
 
 from . import __version__
+from .access_log import setup_access_log
 from .capabilities import parse_capabilities
 from .children_cache import ChildrenCache
 from .config import settings
 from .errors import register_error_handlers
+from .middleware.traffic_accounting import TrafficAccountingMiddleware
 from .observability import BatchLedger
 from .proxy import install_proxy
 from .routes import events, health, messages, metrics, questions, sessions, sessions_children, token_stream
 from .sse.hub import HubRegistry
 from .sse.token_hub import TokenStreamHub, TokenStreamRegistry
 from .sse.tokenstream.hub import apply_debug_budget_overrides
+from .traffic import TrafficLedger
 from .transform import TransformConfig, TransformPool
 from .upstream import create_client
 from .versioning import SlimapiVersionMiddleware
@@ -46,8 +49,25 @@ async def smoke(app: FastAPI) -> None:
 async def lifespan(app: FastAPI):
     settings.validate()
     app.state.config = settings
+    # Structured access log (RotatingFileHandler on the oc_slimapi.access
+    # logger). Idempotent — safe under uvicorn hot reload. Disabled-logger
+    # path skips all filesystem work.
+    setup_access_log(
+        enabled=settings.access_log_enabled,
+        path=settings.access_log_path,
+        max_bytes=settings.access_log_max_bytes,
+        backups=settings.access_log_backups,
+    )
+    # Full bidirectional byte ledger (traffic accounting). Single shared
+    # instance — read by the ASGI middleware (down/up per-request), the SSE
+    # generators (SSE downstream per-frame), and GlobalHub.run (SSE upstream
+    # per-line). When disabled, record_* are no-ops and snapshot reports
+    # ``{"enabled": False}``.
+    app.state.traffic_ledger = TrafficLedger(enabled=settings.traffic_metrics_enabled)
     # Debug/联调-only: override token-stream memory budget caps from env
     # (OC_SLIMAPI_TOKEN_STREAM_DEBUG_*). No-op when env vars are unset.
+    # (placed before parse_capabilities import; here for proximity to other
+    # budget-tuning.)
     apply_debug_budget_overrides(settings)
     app.state.batch_ledger = BatchLedger(
         window_seconds=settings.opt_a_rollback_window_seconds
@@ -81,6 +101,9 @@ async def lifespan(app: FastAPI):
     # T3-hardened hub registry (contract §6): per-subscriber byte budget,
     # per-frame ceiling, and per-directory / total admission caps all flow
     # in from Settings so an operator can tune them via env without code.
+    # ``traffic_ledger`` is forwarded onto the lazily-created GlobalHub so
+    # SSE upstream bytes (single shared /global/event) are counted exactly
+    # once at the upstream consume site (run()).
     app.state.hubs = HubRegistry(
         app.state.upstream,
         max_subscribers_per_directory=settings.max_subscribers_per_directory,
@@ -88,6 +111,7 @@ async def lifespan(app: FastAPI):
         queue_items=settings.sse_queue_items,
         buffer_bytes=settings.sse_buffer_bytes,
         max_frame_bytes=settings.sse_max_frame_bytes,
+        traffic_ledger=app.state.traffic_ledger,
     )
     app.state.hubs.set_children_cache(app.state.children)
     # Token-stream accumulator (design-token-stream.md §5.3). Constructed
@@ -141,6 +165,12 @@ app.add_middleware(
     SlimapiVersionMiddleware,
     accepted_client_versions=settings.accepted_client_versions,
 )
+# Traffic-accounting middleware. Added AFTER the version gate so it is the
+# OUTERMOST middleware — it wraps every HTTP route including the version
+# gate's own 400 ``version_required`` responses and the catch-all reverse
+# proxy. Pure-ASGI (NOT BaseHTTPMiddleware) so SSE / StreamingResponse keep
+# streaming untouched.
+app.add_middleware(TrafficAccountingMiddleware)
 # token_stream is registered alongside the other /slimapi routers and BEFORE
 # install_proxy's catch-all (design §5.1: route must precede the reverse
 # proxy). Its path ``/slimapi/sessions/{sid}/stream`` does not shadow

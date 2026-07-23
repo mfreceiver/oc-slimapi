@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import NoReturn
+from typing import Any, NoReturn
 from urllib.parse import quote
 
 import httpx
@@ -11,13 +11,14 @@ from ..directory import normalize_directory
 from ..errors import CodedHTTPException
 from ..gzip_util import json_response
 from ..skeleton import skeleton_session
+from ..traffic import stash_up_in
 from ..upstream import forward_directory_headers
 from ..upstream_errors import fetch_json_mapped
 
 router = APIRouter(prefix="/slimapi", tags=["sessions"])
 
 
-async def load_products(app: FastAPI) -> list[dict]:
+async def load_products(app: FastAPI, traffic_request: Any = None) -> list[dict]:
     """Refresh the discovery dataset and, on success, write the allowlist.
 
     Concurrency: the whole fetch → validate → commit → notify sequence is
@@ -45,6 +46,11 @@ async def load_products(app: FastAPI) -> list[dict]:
         old_ready = bool(getattr(app.state, "allowlist_ready", False))
         client = app.state.upstream
         response = await client.get("/project")
+        # Traffic accounting: stash project-list bytes when called from a
+        # request-scoped caller (e.g. /projects route or null-dir fan-out).
+        # Background callers (warm_allowlist) pass traffic_request=None.
+        if traffic_request is not None:
+            stash_up_in(traffic_request, len(response.content))
         response.raise_for_status()
         projects = response.json()
         if not isinstance(projects, list):
@@ -54,6 +60,8 @@ async def load_products(app: FastAPI) -> list[dict]:
         async def decorate(project: dict) -> dict:
             async with semaphore:
                 result = await client.get(f"/project/{quote(str(project['id']), safe='')}/directories")
+                if traffic_request is not None:
+                    stash_up_in(traffic_request, len(result.content))
                 result.raise_for_status()
                 raw_directories = result.json()
             if not isinstance(raw_directories, list):
@@ -141,6 +149,8 @@ async def sessions(
         )
     except httpx.RequestError:
         raise CodedHTTPException(503, code="upstream_unavailable")
+    # Traffic accounting: sessions-list upstream body.
+    stash_up_in(request, len(response.content))
     try:
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
@@ -192,7 +202,7 @@ async def sessions(
 @router.get("/projects")
 async def projects(request: Request):
     try:
-        payload = await load_products(request.app)
+        payload = await load_products(request.app, traffic_request=request)
     except httpx.HTTPStatusError as exc:
         _raise_upstream_status(exc)
     except Exception as exc:
@@ -210,6 +220,7 @@ async def statuses(request: Request, directory: str):
         "/session/status",
         params={"directory": directory},
         headers=forward_directory_headers(directory),
+        traffic_request=request,
     )
     return json_response(
         payload,
@@ -238,6 +249,8 @@ async def session_status(request: Request, sid: str):
         session_response = await request.app.state.upstream.get(f"/session/{sid}")
     except httpx.RequestError:
         raise CodedHTTPException(503, code="upstream_unavailable")
+    # Traffic accounting: discover body.
+    stash_up_in(request, len(session_response.content))
     try:
         session_response.raise_for_status()
     except httpx.HTTPStatusError as exc:
@@ -262,6 +275,8 @@ async def session_status(request: Request, sid: str):
         )
     except httpx.RequestError:
         raise CodedHTTPException(503, code="upstream_unavailable")
+    # Traffic accounting: status-map body.
+    stash_up_in(request, len(result.content))
     try:
         result.raise_for_status()
     except httpx.HTTPStatusError as exc:

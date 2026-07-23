@@ -4,6 +4,7 @@ from fastapi import APIRouter, Request
 
 from .. import __version__
 from ..gzip_util import json_response
+from ..traffic import stash_up_in
 
 router = APIRouter(prefix="/slimapi", tags=["health"])
 
@@ -46,6 +47,9 @@ async def ready(request: Request):
     started = time.monotonic()
     try:
         response = await request.app.state.upstream.get("/global/health", timeout=5.0)
+        # Traffic accounting: stash the health-check response body so the
+        # health bucket's upIn reflects the upstream ping bytes.
+        stash_up_in(request, len(response.content))
         ok = response.status_code < 300
     except Exception:
         ok = False

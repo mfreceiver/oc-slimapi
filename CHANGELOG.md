@@ -32,6 +32,29 @@ ocdroid 对接时：
 
 ---
 
+## [0.7.0] - 2026-07-24
+
+> 流量记录与分析（省流实证）。新增全量双向字节账本 + 结构化 access log，作为 `GET /slimapi/metrics` 的加性 `traffic` 键暴露。**全加性 ops 可观测能力**，**未 bump** `X-Slimapi-Version`（仍 `1`）；ocdroid 对接无变化（`/slimapi/metrics` 为 T3 ops 端点，非客户端契约）。两轮三评委评审（GLM/Grok/GPT）全票 APPROVE-WITH-NITS，无阻塞。
+
+### Added
+
+- **`GET /slimapi/metrics` 加性 `traffic` 键**：全量双向字节账本——按路由桶（`events_sse` / `token_stream_sse` / `messages` / `sessions` / `qp` / `proxy_passthrough` / `health` / `projects` / `metrics` / `other`）记录 `upIn`（从 opencode 拉的字节=成本）、`downOut`（下发给客户端=省流后）、`downIn`/`upOut`、`requests`，及 `totals` 与 `ratios.{bucket}.downOutOverUpIn`。未接线 ledger 时 `/metrics` 形状零变化（纯加性）。**加性，未 bump**。
+  - **downstream 计数**：纯 ASGI middleware（包 `receive`/`send`，O(1) `len(chunk)`，不缓冲/不延迟首字节）；SSE 桶的 `downOut` 由 per-frame `record_sse_downstream` 拥有——middleware 对真 SSE 流（`200` + `text/event-stream`）传 `resp_bytes=0`，SSE 路径上的 400/503 错误响应正常计 downOut。
+  - **upstream 计数**：各消费点 `stash_up_in`（含 4xx/5xx 错误响应 drain+stash、`/ready` 探活、`load_products` 发现、batch per-mid 404/4xx）；proxy 请求流 `try/finally` 保断连时 `upOut` 不丢。
+  - **`ratios` 语义**：`downOutOverUpIn` 对非 SSE 桶 = 下发/成本省流比（`messages` 骨架投影 <1.0 即省流）；对 SSE 桶 = **聚合下发/共享上游成本**（多订阅 fanout 下可 >1.0，**非单连接省流比**；单订阅 `downOut ≪ upIn` 才是真省流证据）。
+- **结构化 access log**：JSON-lines 落盘（默认 `logs/access.jsonl`，`RotatingFileHandler` 轮转），每请求一行 `{ts,method,path,bucket,status,durationMs,downIn,downOut,upIn,upOut}`；logger 名 `oc_slimapi.access`、`propagate=False`（不污染 uvicorn 日志）、disabled 时纯 no-op。**加性，未 bump**。
+- **配置 env**：`OC_SLIMAPI_TRAFFIC_METRICS_ENABLED`（默认 `1`，内存账本总开关，关时 `traffic`=`{enabled:false}`）、`OC_SLIMAPI_ACCESS_LOG_ENABLED`（默认 `1`）、`OC_SLIMAPI_ACCESS_LOG_PATH`（默认 `logs/access.jsonl`）、`OC_SLIMAPI_ACCESS_LOG_MAX_BYTES`（默认 `10485760`）、`OC_SLIMAPI_ACCESS_LOG_BACKUPS`（默认 `5`）。
+
+### 运维/已知限制（非 wire 变更，已 docstring 文档化）
+
+- **SSE upstream 字节为 LF 行尾估算**：计数抽成纯函数 `_upstream_line_bytes(line)` = `len(line.encode)+1`；CRLF 上游每行少计 1 字节（保守偏向，让省流比看起来更少；opencode `/global/event` 预期为 LF）。
+- **children-cache fetch 不归属 per-bucket upIn**：single-flight coalescing 下归属不公，有意不计；`snapshot()` docstring 标注此盲区（sessions/children 桶省流比略偏乐观）。
+- **access log `downOut`（wire 级）与 ledger SSE 桶 `downOut`（per-subscriber-per-frame 聚合）口径不同**，不应直接对照；SSE 统计以 `/slimapi/metrics.traffic` 为准。
+- **SSE 桶快照时间口径**：`requests`/`downIn` 在 SSE 连接关闭时才落账（活跃长连接期间为 0），而 `downOut`/`upIn`/`framesEmitted` 实时累加。
+- **`record_downstream`/`record_upstream` 的 `method`/`status`/`duration_ms` 为 reserved/unused**（status 由 access log 另记；metrics 无 per-method/per-status 细分）。
+
+---
+
 ## [0.6.0] - 2026-07-23
 
 > Token-stream method-B 产品化（`token_memory_limit` clear-only 不重连恢复）+ O1 正确性闭合。**全加性 wire 行为**（memory-limit resync 现向既有 subscriber 同流重发 surviving + current-key snapshot/truncated），**未 bump** `X-Slimapi-Version`（仍 `1`）。ocdroid v0.13.2 flip `TOKEN_MEMORY_LIMIT.triggersReconnect` true→false 的服务端硬前置（双边 D-MB-P 已确认接受 S1 变体）。

@@ -19,6 +19,7 @@ from ..capabilities import parse_capabilities
 from ..errors import CodedHTTPException
 from ..gzip_util import error_response, json_response
 from ..skeleton import skeleton_message
+from ..traffic import stash_up_in
 from ..transform import (
     TransformBusy,
     project_and_pack,
@@ -244,9 +245,16 @@ async def _stream_upstream(
         raise CodedHTTPException(503, code="upstream_unavailable")
 
 
-async def _drain_error(response) -> Response:
-    """Buffer a small upstream error body and pass it through verbatim."""
+async def _drain_error(response, request: Request | None = None) -> Response:
+    """Buffer a small upstream error body and pass it through verbatim.
+
+    When ``request`` is given, the buffered body length is stashed for
+    traffic accounting so even upstream error responses contribute ``upIn``
+    to the request's bucket.
+    """
     body = await response.aread()
+    if request is not None:
+        stash_up_in(request, len(body))
     return Response(
         body, response.status_code,
         headers=decoded_body_headers(response.headers),
@@ -343,7 +351,7 @@ async def messages_since(
                 )
                 try:
                     if response.status_code >= 400:
-                        return await _drain_error(response)
+                        return await _drain_error(response, request)
                     body, n = await read_with_cap(
                         response, config.max_response_bytes - total_bytes,
                     )
@@ -354,6 +362,8 @@ async def messages_since(
                             accept_encoding=request.headers.get("accept-encoding"),
                         )
                     total_bytes += n
+                    # Traffic accounting: per-page upstream bytes.
+                    stash_up_in(request, n)
                     # Per-page parse stays inline because we must inspect
                     # info.time.updated per item to apply the A2=A filter and
                     # decide whether older pages still need scanning. The
@@ -454,8 +464,21 @@ async def messages(
             response = await request.app.state.upstream.send(upstream_request, stream=True)
         except httpx.RequestError:
             raise CodedHTTPException(503, code="upstream_unavailable")
+        # Wrap the upstream iterator so the response body bytes are counted
+        # (``upIn`` for the messages bucket). ``len(chunk)`` only — body is
+        # not buffered.
+        async def _counted_full_messages():
+            n = 0
+            try:
+                async for chunk in response.aiter_raw():
+                    n += len(chunk)
+                    yield chunk
+            finally:
+                if n > 0:
+                    stash_up_in(request, n)
+
         return StreamingResponse(
-            response.aiter_raw(), status_code=response.status_code,
+            _counted_full_messages(), status_code=response.status_code,
             headers={**strip_hop_by_hop(response.headers), "Cache-Control": "no-store"},
             background=BackgroundTask(response.aclose),
         )
@@ -473,14 +496,16 @@ async def messages(
             next_cursor: str | None = None
             try:
                 if response.status_code >= 400:
-                    return await _drain_error(response)
-                body, _ = await read_with_cap(response, config.max_response_bytes)
+                    return await _drain_error(response, request)
+                body, n_read = await read_with_cap(response, config.max_response_bytes)
                 if body is None:
                     return error_response(
                         "response_too_large", 413,
                         limit=config.max_response_bytes,
                         accept_encoding=request.headers.get("accept-encoding"),
                     )
+                # Traffic accounting: skeleton-mode upstream bytes.
+                stash_up_in(request, n_read)
                 # Translate opencode's Link header into our X-Next-Cursor
                 # (opaque passthrough). Capture BEFORE aclose() for clarity,
                 # though httpx headers remain readable afterward. Never
@@ -567,6 +592,10 @@ async def message_batch(
                 retry_after_seconds=max(1, math.ceil(config.opt_a_retry_after_ms_conservative / 1000)),
             )
         raise CodedHTTPException(503, code="upstream_unavailable")
+    # Traffic accounting: discover response body (small, but counts toward
+    # the messages bucket upIn — the discover GET is part of the batch
+    # request's upstream work).
+    stash_up_in(request, len(resp.content))
     try:
         resp.raise_for_status()
     except httpx.HTTPStatusError as exc:
@@ -657,9 +686,17 @@ async def message_batch(
             if _aborted():  # send() 是 await 点
                 return
             if response.status_code == 404:
+                # Drain the streaming response body so it contributes to
+                # traffic accounting (upIn) and releases the connection.
+                err_body = await response.aread()
+                stash_up_in(request, len(err_body))
                 errors.append({"messageID": mid, "code": "message_not_found"})
                 return
             if response.status_code >= 400:
+                # Drain the streaming response body so it contributes to
+                # traffic accounting (upIn) and releases the connection.
+                err_body = await response.aread()
+                stash_up_in(request, len(err_body))
                 code = f"upstream_http_{response.status_code}"
                 entry = {"messageID": mid, "code": code}
                 if response.status_code == 429 or response.status_code >= 500:
@@ -754,6 +791,12 @@ async def message_batch(
             await asyncio.gather(*(fetch_one(mid) for mid in order))
     except TransformBusy:
         return _busy_response(request.headers.get("accept-encoding"))
+
+    # Traffic accounting: the batch's shared cumulative upstream byte counter
+    # already sums every fetched mid body chunk (BATCH_CHUNK_SIZE granularity,
+    # pay-as-you-read). Stash it once here so the middleware attributes the
+    # full batch upIn to this request's bucket.
+    stash_up_in(request, state["total"])
 
     KNOWN_ENVELOPE_CODES = {"message_not_found", "message_too_large", "upstream_error", "upstream_unavailable"}
     accept = request.headers.get("accept-encoding")
@@ -875,12 +918,14 @@ async def message(
             # below still runs to release the connection.
             try:
                 if response.status_code >= 400:
-                    return await _drain_error(response)
-                body, _ = await read_with_cap(
+                    return await _drain_error(response, request)
+                body, n_read = await read_with_cap(
                     response, request.app.state.config.max_message_bytes,
                 )
             except httpx.RequestError:
                 raise CodedHTTPException(503, code="upstream_unavailable")
+            # Traffic accounting: cap-read upstream bytes.
+            stash_up_in(request, n_read)
             if body is None:
                 return error_response(
                     "message_too_large", 413,
@@ -902,14 +947,16 @@ async def message(
             )
             try:
                 if response.status_code >= 400:
-                    return await _drain_error(response)
-                body, _ = await read_with_cap(response, config.max_response_bytes)
+                    return await _drain_error(response, request)
+                body, n_read = await read_with_cap(response, config.max_response_bytes)
                 if body is None:
                     return error_response(
                         "response_too_large", 413,
                         limit=config.max_response_bytes,
                         accept_encoding=request.headers.get("accept-encoding"),
                     )
+                # Traffic accounting: skeleton-mode upstream bytes.
+                stash_up_in(request, n_read)
                 encoded, extra = await pool.offload(
                     project_and_pack, body,
                     single=True,

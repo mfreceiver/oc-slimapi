@@ -190,6 +190,23 @@ class Settings:
         os.getenv("OC_SLIMAPI_OPT_A_RETRY_AFTER_MS_CAP", "10000")
     )
 
+    # Full bidirectional byte ledger + structured access log (traffic
+    # accounting). Additive observability — does NOT touch the wire contract.
+    # The in-memory ledger is the source for the new ``traffic`` block on
+    # ``/slimapi/metrics``; the JSON-lines access log captures per-request
+    # downstream + upstream bytes for ops forensics. Both default ON.
+    traffic_metrics_enabled: bool = os.getenv(
+        "OC_SLIMAPI_TRAFFIC_METRICS_ENABLED", "true"
+    ).lower() in ("1", "true", "yes", "on")
+    access_log_enabled: bool = os.getenv(
+        "OC_SLIMAPI_ACCESS_LOG_ENABLED", "true"
+    ).lower() in ("1", "true", "yes", "on")
+    access_log_path: str = os.getenv("OC_SLIMAPI_ACCESS_LOG_PATH", "logs/access.jsonl")
+    access_log_max_bytes: int = int(
+        os.getenv("OC_SLIMAPI_ACCESS_LOG_MAX_BYTES", str(10 * 1024 * 1024))
+    )
+    access_log_backups: int = int(os.getenv("OC_SLIMAPI_ACCESS_LOG_BACKUPS", "5"))
+
     def read_deployment_revision(self) -> str | None:
         """Best-effort deployment revision (env or file). Returns None if unset.
         Swallows read errors (non-fatal — health simply omits the field)."""
@@ -320,6 +337,15 @@ class Settings:
                 "OC_SLIMAPI_OPT_A_RETRY_AFTER_MS_CONSERVATIVE must be between 0 "
                 "and OC_SLIMAPI_OPT_A_RETRY_AFTER_MS_CAP"
             )
+
+        # Traffic-accounting guards. The in-memory ledger flag has no scalar
+        # bound (it is a bool), but the access-log rotation knobs must be
+        # strictly positive so the RotatingFileHandler does not divide-by-zero
+        # or refuse to roll over.
+        if self.access_log_max_bytes <= 0:
+            raise RuntimeError("OC_SLIMAPI_ACCESS_LOG_MAX_BYTES must be > 0")
+        if self.access_log_backups < 0:
+            raise RuntimeError("OC_SLIMAPI_ACCESS_LOG_BACKUPS must be >= 0")
 
     def read_route_secret(self) -> bytes:
         if self.route_secret:

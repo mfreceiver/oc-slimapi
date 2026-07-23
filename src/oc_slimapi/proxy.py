@@ -4,6 +4,7 @@ from fastapi import FastAPI, Request, WebSocket
 from starlette.background import BackgroundTask
 from starlette.responses import JSONResponse, StreamingResponse
 
+from .traffic import stash_up_in, stash_up_out
 from .upstream import strip_hop_by_hop
 
 # B0 §1.3 shell/PTY route table (opencode v1.18.3). Hardcoded — do NOT infer.
@@ -37,12 +38,28 @@ def install_proxy(app: FastAPI) -> None:
         if request.app.state.config.shell_deny_list_enabled and _is_shell_path(request.url.path):
             return JSONResponse({"code": "shell_not_allowed"}, status_code=403)
         client = request.app.state.upstream
+        # Wrap the downstream request body stream so we count the bytes
+        # actually forwarded upstream (``upOut``). Only ``len()`` per chunk —
+        # body is not buffered.
+        async def _counted_req_stream():
+            n = 0
+            try:
+                async for chunk in request.stream():
+                    n += len(chunk)
+                    yield chunk
+            finally:
+                # finally ensures the stash runs even on client disconnect
+                # (GeneratorExit/CancelledError mid-stream), preventing lost
+                # upOut bytes on interrupted proxy requests.
+                if n > 0:
+                    stash_up_out(request, n)
+
         upstream_request = client.build_request(
             request.method,
             f"/{path}",
             params=request.query_params.multi_items(),
             headers=strip_hop_by_hop(request.headers),
-            content=request.stream(),
+            content=_counted_req_stream(),
         )
         is_sse = request.url.path in {"/event", "/global/event"}
         is_command = request.url.path.endswith("/command")
@@ -53,8 +70,22 @@ def install_proxy(app: FastAPI) -> None:
             "pool": 5.0,
         }
         response = await client.send(upstream_request, stream=True)
+        # Wrap the upstream response iterator so we count the bytes returned
+        # to the client (``upIn`` — the upstream leg of THIS request). The
+        # finally guarantees the count lands even on disconnect / error mid
+        # stream. BackgroundTask still owns response.aclose().
+        async def _counted_upstream_response():
+            n = 0
+            try:
+                async for chunk in response.aiter_raw():
+                    n += len(chunk)
+                    yield chunk
+            finally:
+                if n > 0:
+                    stash_up_in(request, n)
+
         return StreamingResponse(
-            response.aiter_raw(),
+            _counted_upstream_response(),
             status_code=response.status_code,
             headers=strip_hop_by_hop(response.headers),
             background=BackgroundTask(response.aclose),

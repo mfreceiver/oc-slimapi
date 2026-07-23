@@ -122,6 +122,16 @@ class ChildrenCache:
     async def _fetch_and_publish(self, key, inflight: InFlight):
         parent_sid, directory = key
         try:
+            # NOTE: fetch_json_mapped is called with traffic_request=None (no
+            # per-request upIn accounting for the children fetch). This is an
+            # intentional design choice: the single-flight cache coalesces
+            # concurrent requests, and attributing the single upstream fetch
+            # to any one of the coalesced waiters would be unfair (the others
+            # would "ride free" on another request's counted bytes). Per the
+            # approved review (rev-1), children fetch bytes are not charged to
+            # any per-request bucket. They are, however, real upstream bytes
+            # that the sidecar consumes — consider adding a process-level
+            # counter if full visibility is needed.
             raw = await fetch_json_mapped(
                 self._upstream,
                 f"/session/{quote(parent_sid, safe='')}/children",

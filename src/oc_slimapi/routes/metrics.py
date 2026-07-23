@@ -32,6 +32,13 @@ async def metrics(request: Request):
     token_registry = getattr(request.app.state, "token_registry", None)
     if token_registry is not None:
         hubs_snapshot["sse"]["tokenStream"] = token_registry.snapshot_token_metrics()
+    # Traffic-accounting ledger (additive). Only emitted when a ledger is
+    # wired into app.state so existing test fixtures that do not construct
+    # one continue to see the original ``{sse, skeleton, batch}`` shape
+    # untouched (zero-knowledge additive).
+    traffic_ledger = getattr(request.app.state, "traffic_ledger", None)
+    if traffic_ledger is not None:
+        hubs_snapshot["traffic"] = traffic_ledger.snapshot()
     return json_response(
         hubs_snapshot,
         accept_encoding=request.headers.get("accept-encoding"),

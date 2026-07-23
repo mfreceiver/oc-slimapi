@@ -14,6 +14,7 @@ from typing import Any
 import httpx
 
 from .errors import CodedHTTPException
+from .traffic import stash_up_in
 
 
 async def fetch_json_mapped(
@@ -24,6 +25,7 @@ async def fetch_json_mapped(
     headers: dict[str, str] | None = None,
     sid: str | None = None,
     expect: type = dict,
+    traffic_request: Any = None,
 ) -> dict[str, Any] | list[Any]:
     """Fetch from upstream and map errors per contract §7.
 
@@ -34,11 +36,27 @@ async def fetch_json_mapped(
     For no-sid calls (batch / list): upstream 404 → 502 ``upstream_http_404``,
     **not** ``session_not_found``. For sid-scoped calls: upstream 404 → 404
     ``session_not_found`` (with ``sessionID`` field).
+
+    ``traffic_request`` (optional): when given, the raw upstream response body
+    byte length is stashed into the request's traffic accounting state so the
+    ASGI middleware attributes ``upIn`` for the request's bucket at request
+    end. Pass ``None`` (the default) for non-request-scoped callers such as
+    background cache fills.
     """
     try:
         response = await upstream.get(path, params=params, headers=headers)
     except httpx.RequestError:
         raise CodedHTTPException(503, code="upstream_unavailable")
+    # Stash the upstream response body length BEFORE error mapping and
+    # parsing (httpx has already buffered it for a non-streaming .get()).
+    # Best-effort; ignore callers that pass traffic_request without a
+    # scope (defensive). Counts both success and error response bodies
+    # so upstream HTTP errors are not missing from the byte ledger.
+    if traffic_request is not None:
+        try:
+            stash_up_in(traffic_request, len(response.content))
+        except Exception:
+            pass
     if response.status_code >= 400:
         try:
             response.raise_for_status()

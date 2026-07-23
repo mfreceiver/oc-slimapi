@@ -11,6 +11,7 @@ from starlette.responses import Response
 from ..errors import CodedHTTPException
 from ..gzip_util import json_response
 from ..tokens import RouteTokenError, issue_route_token, verify_route_token
+from ..traffic import stash_up_in, stash_up_out
 from ..upstream import decoded_body_headers, forward_directory_headers
 from ..directory import normalize_directory
 
@@ -44,7 +45,7 @@ async def _aggregate(request: Request, kind: Literal["question", "permission"], 
         if not allowlist:
             try:
                 from .sessions import load_products
-                await load_products(request.app)
+                await load_products(request.app, traffic_request=request)
             except Exception:
                 pass
             allowlist = request.app.state.directory_allowlist
@@ -56,6 +57,11 @@ async def _aggregate(request: Request, kind: Literal["question", "permission"], 
                 f"/{kind}", params={"directory": directory},
                 headers=forward_directory_headers(directory), timeout=2.0,
             )
+            # Traffic accounting: per-directory fan-out GET body. Stashed
+            # on the parent request so the qp bucket sees aggregate upIn.
+            # Must happen BEFORE the 4xx early return so error response
+            # bodies are also counted (not just 2xx).
+            stash_up_in(request, len(response.content))
             if response.status_code >= 400:
                 return None, {"directory": directory, "code": f"upstream_http_{response.status_code}"}
             output = []
@@ -141,6 +147,13 @@ async def _post(request: Request, path: str, directory: str, body: dict):
             504, code="upstream_timeout",
             message="upstream mutation timed out; not retried",
         ) from exc
+    # Traffic accounting: the serialized request body + the upstream response
+    # body. ``response.request.content`` is exactly what httpx sent on the
+    # wire, so no re-serialisation drift.
+    sent = getattr(getattr(response, "request", None), "content", None)
+    if sent:
+        stash_up_out(request, len(sent))
+    stash_up_in(request, len(response.content))
     if response.status_code == 404:
         return Response(response.content, 404, headers=decoded_body_headers(response.headers))
     if response.status_code == 400:
