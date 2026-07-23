@@ -2,7 +2,7 @@
 """
 scripts/measure_token_overhead.py — Token-stream SSE overhead measurement harness.
 
-Implements the §11 performance methodology from docs/design-token-stream.md:
+Implements the §11 performance methodology from docs/specs/design-token-stream.md:
 measure raw upstream delta bytes vs token-stream wire bytes (batched per §5.4)
 across >=10 representative generation traces. Validates the ≤1.2x overhead
 target after the two user-approved wire levers (see "Approved levers" below).

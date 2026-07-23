@@ -20,7 +20,7 @@ or ``tests/test_hub.py``. Locks the boundaries called out in the Batch 2 spec:
      + STOP (old frames NOT delivered)
   7. registry metrics (subscribers / queue / hub summary shape + counters)
 
-Reference: ``docs/v1-contract.md`` §3 (SSE) + §6 (T3 resource limits).
+Reference: ``docs/specs/v1-contract.md`` §3 (SSE) + §6 (T3 resource limits).
 
 Freeze-baseline notes:
   * ``TransformPool.snapshot_metrics()`` is a public API Batch 2 will ADD to

@@ -189,18 +189,18 @@
 
 ---
 
-> **更新纪律**：以上 Opt-A 行为变更须同步反映在 `docs/v1-contract.md` §15 及 `CHANGELOG.md` v0.3.1 节。
+> **更新纪律**：以上 Opt-A 行为变更须同步反映在 `docs/specs/v1-contract.md` §15 及 `CHANGELOG.md` v0.3.1 节。
 
 ---
 
 ## Token stream SSE（Stages A–E 落地，opt-in 实时流 — design-token-stream.md §9/§10）
 
-> **状态**：服务端 Stages A–E 已落地（A 地基 9.5 / B 生命周期 9.5 / C flush 9.5 / D 端点 9.6 / E 文档+预算 4+4）。未随当前发版出货前 `GET /slimapi/health` 根级 `features.tokenStream` 缺省，ocdroid 走既有「完成后整条出现」路径，**零回归**。本节是 ocdroid 侧改动清单（对应设计 §9 的 8 项 + §10 硬约束），供客户端预读。设计权威以 `docs/design-token-stream.md` 为准；wire 以 `docs/v1-contract.md` §3.x + §6.x 为准。
+> **状态**：服务端 Stages A–E 已落地（A 地基 9.5 / B 生命周期 9.5 / C flush 9.5 / D 端点 9.6 / E 文档+预算 4+4）。未随当前发版出货前 `GET /slimapi/health` 根级 `features.tokenStream` 缺省，ocdroid 走既有「完成后整条出现」路径，**零回归**。本节是 ocdroid 侧改动清单（对应设计 §9 的 8 项 + §10 硬约束），供客户端预读。设计权威以 `docs/specs/design-token-stream.md` 为准；wire 以 `docs/specs/v1-contract.md` §3.x + §6.x 为准。
 
 ### capability 探测（必须）
 
 - `/slimapi/health` 根级 **`features.tokenStream === true`** 才启用 stream 客户端；缺字段 / 404 / 405 → 降级为既有「完成后整条出现」（`/since` 拉权威全文），**不得**尝试连 stream 端点。
-- 路径与版本头以**本仓库** `docs/v1-contract.md` + `CHANGELOG.md` 为准（端点 `GET /slimapi/sessions/{sid}/stream`，仍带 `X-Slimapi-Version: 1`，**不 bump**）。
+- 路径与版本头以**本仓库** `docs/specs/v1-contract.md` + `CHANGELOG.md` 为准（端点 `GET /slimapi/sessions/{sid}/stream`，仍带 `X-Slimapi-Version: 1`，**不 bump**）。
 
 ### stream 客户端生命周期（必须）
 

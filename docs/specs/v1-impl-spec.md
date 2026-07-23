@@ -2,7 +2,7 @@
 
 > **来源**：拆自 `~/personal_projects/ocdroid/docs/slimapi-gap-contract-v1-draft.md`（v1 最终契约，三轮评审通过）。  
 > **范围**：oc-slimapi sidecar 须实现的全部变更。客户端配套见 ocdroid 侧文档。  
-> **实现真源**：本仓库 `docs/INTERFACE_MAP.md` + `docs/design-v2.md`。  
+> **实现真源**：本仓库 `docs/specs/INTERFACE_MAP.md` + `docs/specs/design-v2.md`。  
 > **v1 全部为加性变更，不 bump `X-Slimapi-Version`**。
 
 ---
@@ -113,7 +113,7 @@ B4  服务端 P1（可与 B1 并行）
 - cap 计量：解压后逻辑 JSON 字节（与 list/since 口径一致，写死）。实现期确定 full 边读边按解压字节计数的流式实现（full 现为 passthrough，需在流上解压计数）。
 - 超限后须关闭 upstream response（防连接泄漏）。
 - **transform-busy 归一**：~~现状 `full/{mid}` skeleton 转换忙返回 **502**（INTERFACE_MAP line 23），与 list/since 及统一错误码表的 **503 `transform_busy`** 冲突；~~ G8 顺带把 `full/{mid}` transform-busy ~~从 502 **归一为 503 `transform_busy`**~~（文字同步实际代码；真相见下方现实校正）。
-  - **现实校正（v1 B1 run, 2026-07-18）**：代码层 `full/{mid}` transform-busy **实际一直返 503**（`_busy_response()` 写死 503；测试 `test_messages_route_returns_503_for_single_message_when_admission_saturated` 已断言 503）。即"502→503 归一"在代码层**本就完成**，G8 仅需同步更新 `docs/INTERFACE_MAP.md` line 23 文字。详见 `docs/ocmar/specs/2026-07-18-v1-b0-b1-design.md` §2 reality 表（行 B）+ §3.2。✅ B1 文档已同步。
+  - **现实校正（v1 B1 run, 2026-07-18）**：代码层 `full/{mid}` transform-busy **实际一直返 503**（`_busy_response()` 写死 503；测试 `test_messages_route_returns_503_for_single_message_when_admission_saturated` 已断言 503）。即"502→503 归一"在代码层**本就完成**，G8 仅需同步更新 `docs/specs/INTERFACE_MAP.md` line 23 文字。详见 `docs/ocmar/specs/2026-07-18-v1-b0-b1-design.md` §2 reality 表（行 B）+ §3.2。✅ B1 文档已同步。
 
 **参数不变**。
 
@@ -414,7 +414,7 @@ X-Slimapi-Version: 1
 | G8 流式 cap | `routes/messages.py`（对齐 `read_with_cap`） |
 | shell deny-list | `proxy.py` + `config.py` |
 | 错误码统一 | 各 route + helper |
-| 契约文档 | `docs/INTERFACE_MAP.md` / `docs/CLIENT_CHANGES.md` / `docs/design-v2.md` |
+| 契约文档 | `docs/specs/INTERFACE_MAP.md` / `docs/specs/CLIENT_CHANGES.md` / `docs/specs/design-v2.md` |
 
 ---
 

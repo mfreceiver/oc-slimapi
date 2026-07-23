@@ -3,7 +3,7 @@
 > **日期**：2026-07-23　**分支**：`dev`　**基线**：main `c21ca3b`（v0.5.0 + P3 r1 S-1/S-3a/S-2 + O1 已 push）
 > **范围**：枚举 **所有需要 ocdroid 配合**的本仓后续任务，给出服务端/客户端分工、wire 影响、依赖与排序。
 > **契约/协商文档**（双边权威）：[`docs/ocdroid-cooperation-r2-handoff.md`](../ocdroid-cooperation-r2-handoff.md)
-> **R1 上下文**：v0.5.0 双边 handoff [`docs/ocdroid-token-stream-handoff.md`](../ocdroid-token-stream-handoff.md)；R1 P3-P4 计划 [`docs/ocmar/plans/2026-07-23-token-stream-p3-p4.md`](2026-07-23-token-stream-p3-p4.md)
+> **R1 上下文**：v0.5.0 双边 handoff（已发版；R1 handoff 文档已移除，终态 wire 见 `docs/specs/v1-contract.md` rev J + `CHANGELOG.md` `[0.5.0]`）；R1 P3-P4 计划 [`docs/ocmar/plans/2026-07-23-token-stream-p3-p4.md`](2026-07-23-token-stream-p3-p4.md)
 
 ---
 

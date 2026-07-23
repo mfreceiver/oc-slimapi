@@ -104,17 +104,17 @@
      - `deleted=true` ← `session.deleted`（一旦为 true 持续到窗口结束）
      - `archived` ← `session.updated` 的 `info.time.archived`（epoch_ms int，一旦有值粘滞保留到窗口结束）
      - `directory` ← GlobalEvent 的 directory
-     - **`lastError`（G1-A）**←有 sid 的 `session.error` 经脱敏后的 `{name,message,at}`（`at`=sidecar 收到 epoch-ms）。**三态 wire**（与 sticky 共存，互不矛盾；权威见 `docs/v1-contract.md` §3）：
+     - **`lastError`（G1-A）**←有 sid 的 `session.error` 经脱敏后的 `{name,message,at}`（`at`=sidecar 收到 epoch-ms）。**三态 wire**（与 sticky 共存，互不矛盾；权威见 `docs/specs/v1-contract.md` §3）：
        - **对象** `{name,message,at}`：本窗口新 error，或 flush 时该 sid 仍有 sticky（其它字段触发的后续 digest 会继续带出对象，直至 clear/deleted）；error 到达时**立即 flush**（不等 250ms）
        - **显式 `null`**：clear 帧——该 session 出现新 `status=busy` 时 pop sticky 并立即 flush
        - **省略**：本 digest 没有本窗口新 error 对象、也没有显式 clear（`null`），**且** 该 sid 当前不存在 sticky error；`deleted=true` 的 digest **强制省略**（pop sticky，**不**发 null）
        - abort（`error.name=="MessageAbortedError"`）静默丢弃（不写 lastError、不发 G1-B 帧）
      - `session.updated` 创建 pending 项；若 `info.time.archived` 有值则设 `archived`（见上）；无其它字段变化时 emit `{sessionID,directory}` 让客户端 refetch `/sessions`
-     - 同 session 多次变化 → 合并取最新；窗口 flush 后清 pending（lastError sticky 经独立持久层跨窗口保留，见 `docs/v1-impl-spec.md` §7）。
-  2. **`event: session.error`（G1-B）**——**无** `sessionID` 时**立即直推**（不进 debounce）：`data: {"directory"?,"name","message","at"}`。有 sid 的 `session.error` **不**走本帧，走 digest `lastError`（G1-A）。abort（`MessageAbortedError`）静默丢弃。实现细节见 `docs/v1-impl-spec.md` §7；wire 权威见 `docs/v1-contract.md` §3。
+     - 同 session 多次变化 → 合并取最新；窗口 flush 后清 pending（lastError sticky 经独立持久层跨窗口保留，见 `docs/specs/v1-impl-spec.md` §7）。
+  2. **`event: session.error`（G1-B）**——**无** `sessionID` 时**立即直推**（不进 debounce）：`data: {"directory"?,"name","message","at"}`。有 sid 的 `session.error` **不**走本帧，走 digest `lastError`（G1-A）。abort（`MessageAbortedError`）静默丢弃。实现细节见 `docs/specs/v1-impl-spec.md` §7；wire 权威见 `docs/specs/v1-contract.md` §3。
   3. **`question.*` / `permission.*`**——**立即推**（不进 debounce）：`question.asked`/`question.v2.asked`/`permission.asked`/`permission.resolved`/`permission.v2.asked`/`permission.v2.resolved`，原样 `{"directory":..,"type":..,"properties":..}`。
   4. `event: server.connected`（订阅即吐首帧）+ `event: server.heartbeat`（10s）+ `event: resync` `{"reason":"reconnect_no_replay"}`（上游重连或客户端带 `Last-Event-ID` 时）。
-- **全部丢弃**：`message.part.delta`/`.updated`/`.removed`（逐 token）、`tool.*`、`message.removed`、未知类型——省流核心。上游 `session.error` **不**在此列：经 G1 处理（有 sid→digest `lastError`；无 sid→`event: session.error`；abort 过滤），见上吐出帧 + `docs/v1-contract.md` §3 / `docs/v1-impl-spec.md` §7。
+- **全部丢弃**：`message.part.delta`/`.updated`/`.removed`（逐 token）、`tool.*`、`message.removed`、未知类型——省流核心。上游 `session.error` **不**在此列：经 G1 处理（有 sid→digest `lastError`；无 sid→`event: session.error`；abort 过滤），见上吐出帧 + `docs/specs/v1-contract.md` §3 / `docs/specs/v1-impl-spec.md` §7。
 - **背压**：每订阅 `asyncio.Queue`（item 上限 + 字节预算）；溢出时 **立即断开慢消费者**：标记 `closed` → **清空全部旧 queue 帧** → 入队 `event: resync` `{"reason":"subscriber_backpressure"}` → 入队 `STOP`（**不**交付此前积压帧，**不**「丢最旧续发」）。
 - **不承诺 replay**：无 event store；重连接收 `resync` 后走冷启动流程（sessions + questions + permissions + `/since/{ts}`）或前台 catch-up。
 - **生命周期**：首 subscriber 到达→启动 upstream 任务；末 subscriber 离开后 30s grace 再取消任务；`HubRegistry.close()` 取消所有任务。

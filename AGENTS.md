@@ -18,11 +18,11 @@ ocdroid ──(stunnel mTLS 14096)──▶ opencode :4096   # 直连回退，�
 
 - **只**通过 HTTP 调 opencode **legacy** `/session/**`（及 `/global/event` 等），**不读** opencode SQLite。
 - 为 ocdroid 提供：消息 skeleton 投影、策展 SSE（`session.digest` + q/p 直推）、routeToken 写端点、T3 资源限制、`/slimapi/**` 版本门禁 + catch-all 反代。
-- **权威契约**：[`docs/v1-contract.md`](docs/v1-contract.md)（唯一 wire 基准；与 design / INTERFACE_MAP 冲突时以契约为准）。
-- **设计 / 接口追踪**：[`docs/design-v2.md`](docs/design-v2.md)、[`docs/INTERFACE_MAP.md`](docs/INTERFACE_MAP.md)。
-- **客户端配套说明**：[`docs/CLIENT_CHANGES.md`](docs/CLIENT_CHANGES.md)（给 ocdroid 开发者的改动清单）。
+- **权威契约**：[`docs/specs/v1-contract.md`](docs/specs/v1-contract.md)（唯一 wire 基准；与 design / INTERFACE_MAP 冲突时以契约为准）。
+- **设计 / 接口追踪**：[`docs/specs/design-v2.md`](docs/specs/design-v2.md)、[`docs/specs/INTERFACE_MAP.md`](docs/specs/INTERFACE_MAP.md)。
+- **客户端配套说明**：[`docs/specs/CLIENT_CHANGES.md`](docs/specs/CLIENT_CHANGES.md)（给 ocdroid 开发者的改动清单）。
 
-本仓库 **不** 是 ocdroid 的子模块；与 ocdroid **并列** 开发、独立发版。ocdroid 侧对接规约见 ocdroid 仓库内 `docs/slim-mode-api-routing.md`（路径/版本头以 **本仓库契约** 为准；若 ocdroid 文档滞后，以本仓库 `docs/v1-contract.md` + `CHANGELOG.md` 为准）。
+本仓库 **不** 是 ocdroid 的子模块；与 ocdroid **并列** 开发、独立发版。ocdroid 侧对接规约见 ocdroid 仓库内 `docs/slim-mode-api-routing.md`（路径/版本头以 **本仓库契约** 为准；若 ocdroid 文档滞后，以本仓库 `docs/specs/v1-contract.md` + `CHANGELOG.md` 为准）。
 
 ---
 
@@ -60,7 +60,7 @@ ocdroid ──(stunnel mTLS 14096)──▶ opencode :4096   # 直连回退，�
 | 改动后校验（必做） | `./scripts/check.sh` | 本文「硬规则」+ [`docs/release.md`](docs/release.md) §质量门禁 |
 | 发版（tag + changelog） | `./scripts/release.sh <patch\|minor\|major>` | **[`docs/release.md`](docs/release.md)**（发版规范权威） |
 | 接口行为变更记录 | 编辑 [`CHANGELOG.md`](CHANGELOG.md) | 每次**破坏/加性 wire 行为**变更必须记；ocdroid 对接以本文件为准 |
-| 契约 / 设计 | `docs/v1-contract.md`、`docs/design-v2.md`、`docs/INTERFACE_MAP.md` | 契约只在破坏性变更时 bump `X-Slimapi-Version` |
+| 契约 / 设计 | `docs/specs/v1-contract.md`、`docs/specs/design-v2.md`、`docs/specs/INTERFACE_MAP.md` | 契约只在破坏性变更时 bump `X-Slimapi-Version` |
 
 > 任何 release / tag / 版本号 / changelog 写入，都不得由 agent 自由发挥命令，必须走 `scripts/release.sh` 或 `docs/release.md` 写明的步骤。
 
@@ -69,13 +69,13 @@ ocdroid ──(stunnel mTLS 14096)──▶ opencode :4096   # 直连回退，�
 ## 硬规则（不可违反）
 
 - **改动校验必做**：每次改 Python / 契约相关行为后，必须 `./scripts/check.sh` 通过才算改动完成（当前 = `pytest tests/`）。
-- **契约权威**：wire 行为以 `docs/v1-contract.md` 为准；实现与契约冲突 → 先改实现或走正式契约 bump（见 `docs/release.md`），**禁止**静默偏离契约。
+- **契约权威**：wire 行为以 `docs/specs/v1-contract.md` 为准；实现与契约冲突 → 先改实现或走正式契约 bump（见 `docs/release.md`），**禁止**静默偏离契约。
 - **版本双轨**：
   - **包版本**（semver，git tag `vX.Y.Z` + `pyproject.toml`）：产品/发版版本。
   - **Wire API 版本**（整数头 `X-Slimapi-Version`，`versioning.py` 中 `ACCEPTED_CLIENT_VERSIONS`）：仅**破坏性**协议变更 bump；加性变更不 bump。
 - **Git 分支**：主线 `main`；发版在 `main` 上打 tag。
 - **禁止**：手写随意 tag 跳过 `release.sh`；在未更新 `CHANGELOG.md` 的情况下发布 wire 行为变更；把 secret / `.venv` / 本机路径密钥提交进仓。
-- **写域纪律**：多 agent 并行时严守文件归属；`docs/v1-contract.md` 非用户明确要求不要改。
+- **写域纪律**：多 agent 并行时严守文件归属；`docs/specs/v1-contract.md` 非用户明确要求不要改。
 
 ---
 
@@ -108,10 +108,10 @@ journalctl --user -u oc-slimapi -f
 
 | 文件 | 用途 |
 |---|---|
-| [`docs/v1-contract.md`](docs/v1-contract.md) | **Wire 契约权威** |
-| [`docs/design-v2.md`](docs/design-v2.md) | 当前态设计（接口/骨架/部署） |
-| [`docs/INTERFACE_MAP.md`](docs/INTERFACE_MAP.md) | 端点级实现追踪 |
-| [`docs/CLIENT_CHANGES.md`](docs/CLIENT_CHANGES.md) | ocdroid 侧配套改动清单 |
+| [`docs/specs/v1-contract.md`](docs/specs/v1-contract.md) | **Wire 契约权威** |
+| [`docs/specs/design-v2.md`](docs/specs/design-v2.md) | 当前态设计（接口/骨架/部署） |
+| [`docs/specs/INTERFACE_MAP.md`](docs/specs/INTERFACE_MAP.md) | 端点级实现追踪 |
+| [`docs/specs/CLIENT_CHANGES.md`](docs/specs/CLIENT_CHANGES.md) | ocdroid 侧配套改动清单 |
 | [`CHANGELOG.md`](CHANGELOG.md) | **接口行为变更记录**（给 ocdroid / 运维） |
 | [`docs/release.md`](docs/release.md) | **发版流程规范**（本仓库权威） |
 | [`docs/operations.md`](docs/operations.md) | **部署 / 运维 / 日志**（systemd、journald、排障） |

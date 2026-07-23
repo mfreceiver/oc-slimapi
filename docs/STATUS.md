@@ -27,13 +27,11 @@
 | 文档 | 角色 |
 |---|---|
 | `AGENTS.md`（根） | 入口索引 |
-| `docs/v1-contract.md` | **wire 契约权威**（rev J，`X-Slimapi-Version: 1`） |
-| `docs/design-token-stream.md` | token-stream 设计权威 |
-| `docs/design-v2.md` / `docs/INTERFACE_MAP.md` / `docs/CLIENT_CHANGES.md` | 设计/接口追踪/客户端改动 |
+| `docs/specs/v1-contract.md` | **wire 契约权威**（rev J，`X-Slimapi-Version: 1`） |
+| `docs/specs/design-token-stream.md` | token-stream 设计权威 |
+| `docs/specs/design-v2.md` / `docs/specs/INTERFACE_MAP.md` / `docs/specs/CLIENT_CHANGES.md` | 设计/接口追踪/客户端改动 |
 | `docs/release.md` / `docs/operations.md` / `docs/develop.md` | 发版/运维/开发 |
 | `CHANGELOG.md`（根） | 接口行为变更记录 |
-| `docs/ocdroid-token-stream-handoff.md` | R1 v0.5.0 双边 handoff（终态 wire） |
-| `docs/release-v0.5.0-token-stream.md` | v0.5.0 发版移交 |
 | `docs/ocdroid-cooperation-r2-handoff.md` | **R2 双边契约/协商**（D-MB-P/D-F-1/D-F-2 决策清单） |
 | `docs/ocmar/plans/2026-07-23-ocdroid-cooperation-r2.md` | **R2 完整任务计划** |
 | `docs/ocmar/plans/2026-07-23-token-stream-p3-p4.md` | R1 P3-P4 计划（backlog，S-1/S-3a/S-2/O1 已完成） |

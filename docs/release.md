@@ -42,9 +42,9 @@ Tag 格式：**`v` + semver**（例：`v0.1.0`），与 ocdroid 一致。
 ### 1.2 Wire API 版本（整数头）
 
 - 头名：`X-Slimapi-Version`
-- 当前接受区间：见 `src/oc_slimapi/versioning.py` 与 `docs/v1-contract.md` §1。
+- 当前接受区间：见 `src/oc_slimapi/versioning.py` 与 `docs/specs/v1-contract.md` §1。
 - **仅破坏性**变更 bump；加性变更 **同版本**。
-- Bump 时必须同步：`versioning.py`、`docs/v1-contract.md`、`CHANGELOG.md`（写明客户端必改点）。
+- Bump 时必须同步：`versioning.py`、`docs/specs/v1-contract.md`、`CHANGELOG.md`（写明客户端必改点）。
 
 ---
 
@@ -174,7 +174,7 @@ git push origin main && git push origin vX.Y.Z
 | [`scripts/check.sh`](../scripts/check.sh) | 质量门禁 |
 | [`scripts/release.sh`](../scripts/release.sh) | 发版唯一入口 |
 | [`pyproject.toml`](../pyproject.toml) | 包版本号源 |
-| [`docs/v1-contract.md`](v1-contract.md) | Wire 契约 |
+| [`docs/specs/v1-contract.md`](specs/v1-contract.md) | Wire 契约 |
 | `src/oc_slimapi/versioning.py` | Wire API 接受区间 |
 
 ---

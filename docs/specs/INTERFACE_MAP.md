@@ -42,7 +42,7 @@
 
 ### 3.1 Token stream SSE（**Stages A–E 落地，opt-in 实时流**）
 
-> 行为权威：`docs/design-token-stream.md` §5.1（端点）/ §5.4（批式）/ §5.5（握手）/ §5.6（wire 帧，**杠杆1 done:true marker 无 text**）/ §5.8（背压/重连）/ §6（T3 信封，**Option B 拆 4+4**）/ §7（**杠杆2 gzip 首个 SSE 例外**）。wire 契约：`docs/v1-contract.md` §3.x + §6.x。下表为已落地行为。
+> 行为权威：`docs/specs/design-token-stream.md` §5.1（端点）/ §5.4（批式）/ §5.5（握手）/ §5.6（wire 帧，**杠杆1 done:true marker 无 text**）/ §5.8（背压/重连）/ §6（T3 信封，**Option B 拆 4+4**）/ §7（**杠杆2 gzip 首个 SSE 例外**）。wire 契约：`docs/specs/v1-contract.md` §3.x + §6.x。下表为已落地行为。
 
 | sidecar 入口（须带 `X-Slimapi-Version`） | 构造上游请求 | 上游预期返回 | sidecar 处理 | 返回请求方 | 坑 / 约束 |
 |---|---|---|---|---|---|

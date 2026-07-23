@@ -4,7 +4,7 @@
 opencode legacy API，不读取 SQLite；对历史消息生成保持
 `List<MessageWithParts>` 形状的 skeleton，并向手机提供 curated SSE。
 
-权威契约为 [`docs/v1-contract.md`](docs/v1-contract.md)。
+权威契约为 [`docs/specs/v1-contract.md`](docs/specs/v1-contract.md)。
 
 ## 拓扑
 
@@ -57,6 +57,6 @@ curl --fail -H 'X-Slimapi-Version: 1' http://127.0.0.1:4097/slimapi/health
 curl -H 'X-Slimapi-Version: 1' http://127.0.0.1:4097/slimapi/health
 ```
 
-设计与接口见 [`docs/design-v2.md`](docs/design-v2.md) 和
-[`docs/INTERFACE_MAP.md`](docs/INTERFACE_MAP.md)；客户端配套见
-[`docs/CLIENT_CHANGES.md`](docs/CLIENT_CHANGES.md)。
+设计与接口见 [`docs/specs/design-v2.md`](docs/specs/design-v2.md) 和
+[`docs/specs/INTERFACE_MAP.md`](docs/specs/INTERFACE_MAP.md)；客户端配套见
+[`docs/specs/CLIENT_CHANGES.md`](docs/specs/CLIENT_CHANGES.md)。

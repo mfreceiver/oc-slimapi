@@ -1,7 +1,7 @@
 # oc-slimapi v1 契约实现状态报告
 
-- **基准契约**：[`docs/v1-contract.md`](./v1-contract.md)（唯一 wire 基准）
-- **审计对象**：oc-slimapi 仓库 @ main（含至 **v0.4.0** / 契约 rev I 累计；现行状态见 `docs/v1-contract.md` 修订日志）
+- **基准契约**：[`docs/specs/v1-contract.md`](specs/v1-contract.md)（唯一 wire 基准）
+- **审计对象**：oc-slimapi 仓库 @ main（含至 **v0.4.0** / 契约 rev I 累计；现行状态见 `docs/specs/v1-contract.md` 修订日志）
 - **审计方法**：逐条对照契约 §0–§11，交叉核验源码（`src/oc_slimapi/**`）+ 测试（`tests/`，**544 passed** @ 2026-07-22 v0.4.0）+ 配套文档（v1-impl-spec / INTERFACE_MAP / CHANGELOG / CLIENT_CHANGES）
 - **状态图例**：✅ 完全实现 · 🟡 部分实现 · ⚫ 未实现 · 🔄 变更（相对契约前的行为变化）
 - **给**：ocdroid 项目组
@@ -129,7 +129,7 @@ sidecar 监听 host 范围由 `config.validate()` 控制：loopback（`127.0.0.1
 
 **6. thin 路由错误体 `{"detail":...}` → `{"code":...}`**（contract §7）
 - 所有 `/slimapi/**` 路由的错误响应统一为 `{"code":string, "message"?:string, ...fields}`。
-- **客户端影响**：**破坏性解析变更**——须把 `response.json()["detail"]` 改为 `response.json()["code"]` 分发。详见 [`docs/CLIENT_CHANGES.md`](./CLIENT_CHANGES.md)。
+- **客户端影响**：**破坏性解析变更**——须把 `response.json()["detail"]` 改为 `response.json()["code"]` 分发。详见 [`docs/specs/CLIENT_CHANGES.md`](specs/CLIENT_CHANGES.md)。
 
 ### §2 写路径（B2）— ✅ 完全实现
 - routeToken：`tokens.py` HMAC 签发/校验，绑 `kind+requestID+sessionID+directory`，~1h TTL。
@@ -230,7 +230,7 @@ sidecar 监听 host 范围由 `config.validate()` 控制：loopback（`127.0.0.1
 
 按风险降序：
 
-1. **错误体形状变更（最高优先）**：thin 路由 `{"detail":...}` → `{"code":...}`。**破坏性解析**——所有错误分发须改 `json()["code"]`。详见 `docs/CLIENT_CHANGES.md`。
+1. **错误体形状变更（最高优先）**：thin 路由 `{"detail":...}` → `{"code":...}`。**破坏性解析**——所有错误分发须改 `json()["code"]`。详见 `docs/specs/CLIENT_CHANGES.md`。
 2. **`/slimapi/sessions/{sid}/status` 三态分裂**：原统一 502，现 404(`session_not_found`)/502(`upstream_http_N`)/503(`upstream_unavailable`)。建议按 `code` 而非 HTTP 状态分发。
 3. **`/slimapi/projects` 5xx 状态码 502→503**：circuit breaker 不应硬编码 502。
 4. **messages 四路由 query `directory` 转发**（list / since / full/{mid} / **G6 full?ids=**）：`directory` **可选**——未传不拦（upstream 默认）；显式传则 normalize 后透传（**v0.3.0** 不再 gate allowlist）；与 `X-Opencode-Directory` 头冲突会 400 `directory_not_allowed`。
@@ -246,10 +246,10 @@ sidecar 监听 host 范围由 `config.validate()` 控制：loopback（`127.0.0.1
 - **routeToken-allowlist 时序**：**v0.3.0** slimapi 已**完全移除 directory allowlist gate**；`_token` 仅校验 HMAC + normalize directory，不再查 allowlist、不再调 `load_products`。冷启动空 allowlist 不再影响 routeToken 路径。`warm_allowlist` 保留用于 `/projects` 展示与 q/p null-directory 聚合 fan-out。
 
 ## 审计产物
-- 契约：`docs/v1-contract.md`（含头部「变更记录」+ §7 加性小节，wire 权威同步实现）
-- 实现细节追踪：`docs/v1-impl-spec.md`（§11 双行：顶层/envelope）
-- 端点级坑表：`docs/INTERFACE_MAP.md`
-- 客户端改动清单：`docs/CLIENT_CHANGES.md`
+- 契约：`docs/specs/v1-contract.md`（含头部「变更记录」+ §7 加性小节，wire 权威同步实现）
+- 实现细节追踪：`docs/specs/v1-impl-spec.md`（§11 双行：顶层/envelope）
+- 端点级坑表：`docs/specs/INTERFACE_MAP.md`
+- 客户端改动清单：`docs/specs/CLIENT_CHANGES.md`
 - 接口行为变更记录：`CHANGELOG.md`（2026-07-18 v1 B1 条目）
 - 交付报告：`docs/ocmar/reports/2026-07-18-v1-b0-b1.md`
 

@@ -2,7 +2,7 @@
 
 > 部署、服务管理、日志策略、排障。  
 > 面向 **oc-slimapi 操作者**（运行 sidecar 的人）与 **ocdroid 项目组**（理解客户端如何接入）。  
-> Wire 契约见 [`v1-contract.md`](v1-contract.md)；发版见 [`release.md`](release.md)。
+> Wire 契约见 [`v1-contract.md`](specs/v1-contract.md)；发版见 [`release.md`](release.md)。
 
 ---
 
@@ -119,7 +119,7 @@ Ops 可通过两种方式注入部署修订标识（如 git SHA / 版本号）�
 1. **环境变量**：在 service 的 `[Service]` 区加 `Environment=OC_SLIMAPI_DEPLOYMENT_REVISION=<git-sha-or-release>`（如 `v0.3.1-beta`）。
 2. **凭据文件**（类似 route secret）：创建文件 `~/.config/oc-slimapi/deployment-revision` 写入字符串（无换行），并在 service `[Service]` 加 `LoadCredential=deployment-revision:%h/.config/oc-slimapi/deployment-revision`；sidecar 自动读取 `CREDENTIALS_DIRECTORY` 下的同名文件。
 
-该值出现在 `GET /slimapi/health` 响应 `server.deploymentRevision` 字段（仅当设置时出现；未设置则整字段省略）。参考 [`docs/v1-contract.md`](v1-contract.md) §4。
+该值出现在 `GET /slimapi/health` 响应 `server.deploymentRevision` 字段（仅当设置时出现；未设置则整字段省略）。参考 [`docs/specs/v1-contract.md`](specs/v1-contract.md) §4。
 
 ### 3.4 启用与开机自启
 
@@ -277,8 +277,8 @@ ocdroid 客户端**不直接操作** sidecar 进程，只通过 stunnel mTLS 接
 | 所有 `/slimapi/**` 请求必带头 | `X-Slimapi-Version: 1`（缺/非整数 → `400 version_required`；越界 → `400 version_incompatible`） |
 | 非 `/slimapi/**` | 透明反代 opencode，**不带**版本头 |
 | 健康自检（客户端侧） | `GET /slimapi/health` 读 `server.api_version` / `accepted_client_versions` 做运行时兼容判断 |
-| Wire 行为变更来源 | 本仓 [`CHANGELOG.md`](../CHANGELOG.md)（路径/头/错误码以本仓 + [`v1-contract.md`](v1-contract.md) 为准） |
-| 客户端配套改动清单 | [`CLIENT_CHANGES.md`](CLIENT_CHANGES.md) |
+| Wire 行为变更来源 | 本仓 [`CHANGELOG.md`](../CHANGELOG.md)（路径/头/错误码以本仓 + [`v1-contract.md`](specs/v1-contract.md) 为准） |
+| 客户端配套改动清单 | [`CLIENT_CHANGES.md`](specs/CLIENT_CHANGES.md) |
 
 sidecar 进程的启停、日志、升级由 **服务端运维** 负责，ocdroid 侧无需介入；但理解拓扑有助于排障（例如 sidecar 重启时 SSE 会断、客户端应收 `resync` 重连）。
 
@@ -300,7 +300,7 @@ sidecar 进程的启停、日志、升级由 **服务端运维** 负责，ocdroi
 
 | 文件 | 用途 |
 |---|---|---|
-| [`v1-contract.md`](v1-contract.md) | Wire 契约权威 |
+| [`v1-contract.md`](specs/v1-contract.md) | Wire 契约权威 |
 | [`release.md`](release.md) | 发版流程 |
 | [`../CHANGELOG.md`](../CHANGELOG.md) | 接口行为变更记录 |
 | [`develop.md`](develop.md) | 配置项速查 + 开发运行 |

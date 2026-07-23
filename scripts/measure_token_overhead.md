@@ -1,6 +1,6 @@
 # Token-stream SSE overhead — §11 measurement report (levers applied)
 
-> Source: `scripts/measure_token_overhead.py` (self-contained harness mirroring `sse_frame` / `hub.py:110`, batching per §5.4, wire frames per §5.6). Methodology and assumptions are documented in the script's module docstring and in `docs/design-token-stream.md` §11.
+> Source: `scripts/measure_token_overhead.py` (self-contained harness mirroring `sse_frame` / `hub.py:110`, batching per §5.4, wire frames per §5.6). Methodology and assumptions are documented in the script's module docstring and in `docs/specs/design-token-stream.md` §11.
 >
 > This is the **measurement fixture** referenced by §11, re-run with the two user-approved wire levers applied. The original run (terminal `snapshot{done:true}` WITH full text + gzip as a secondary column) measured ~12.05x batched median / ~1.61x gzip median and refuted both §1.3 hypotheses. This report replaces that framing with the lever-validated numbers.
 

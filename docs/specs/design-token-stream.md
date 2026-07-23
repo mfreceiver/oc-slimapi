@@ -2,7 +2,7 @@
 
 > 状态：**设计稿 v4 — 架构级 PASS**（联合 3 评委 grok 9.2 / opus 9.0 / bgpt 8.7 + 我方 backstop bgpt 7.4；**双边共识**）。残留 fold 为 §16 阶段契约，转入每阶段 9.5 门控。
 > 性质：**加性 wire 行为**（新端点 + 新 event 类型 + health 加性字段），**不 bump `X-Slimapi-Version`**。
-> 关联：契约 `docs/v1-contract.md` §3/§6（落地需新增 §3.x + §6 token 信封）；实现 `src/oc_slimapi/sse/hub.py`。
+> 关联：契约 `docs/specs/v1-contract.md` §3/§6（落地需新增 §3.x + §6 token 信封）；实现 `src/oc_slimapi/sse/hub.py`。
 
 ## v3 修订记录（回应 v2 三方复审：grok 8.6 / opus 8.2 / bgpt 7.1，均 FAIL→收敛修法）
 
@@ -335,7 +335,7 @@ TOKEN_ACC_IDLE_MS = 60_000; TOKEN_HEARTBEAT_SECONDS = 15
 | r6 | **Stage C**（flush+wire） | fixer + 单评委门控 | **PASS 9.5**——`flush_loop`(100ms/4KiB/sorted) + `DeltaAccumulator` + 订阅握手 flush-sid-then-snapshot(C2) + `sse_frame`(snapshot/delta/truncated/resync/heartbeat/server.connected) + `safe_put` + **杠杆1**（finish_part 终态帧 = `snapshot{done:true}` marker 无 text）+ **杠杆2**（token stream 默认流式 gzip，首个 SSE gzip 例外）+ truncate 扇给该 sid 全部订阅者 |
 | r7 | **Stage D**（端点+admission） | fixer + 单评委门控 | **PASS 9.6**（经 B-D1 修复）——`routes/token_stream.py` + `TokenStreamRegistry`（独立 admission + sessionID 注入 Subscriber 子类）+ health 根级 `features.tokenStream`(Q1) + metrics + backpressure resync 恒带 sessionID |
 | r8 | **Stage E**（契约/文档+预算裁定） | fixer（docs+code 双 lane）+ rev-glm 9.3 CONDITIONAL → fold | **PASS（fold 净）**——契约 §3.x/§6.x 加性 rev J；预算 Option B 4+4 落地（763 tests）；fold `part_too_large` 虚假契约（reason 集 = 代码实际发出 5 个）；CLIENT_CHANGES lever1 对齐；CHANGELOG gzip 例外；INTERFACE_MAP 刷新 |
-| r9 | 双边兼容核验 | explorer 读 ocdroid 源码 | **可进联合终审**——7 项中 5 兼容；**风险** done:true 空白窗口（C-1）；**缺口** session_deleted/session_idle 未识别（C-2）；详见 `docs/ocdroid-token-stream-handoff.md` §5 |
+| r9 | 双边兼容核验 | explorer 读 ocdroid 源码 | **可进联合终审**——7 项中 5 兼容；**风险** done:true 空白窗口（C-1）；**缺口** session_deleted/session_idle 未识别（C-2）；详见 `CHANGELOG.md` `[0.5.0]` + 本文件 §3.x（原 handoff 文档已移除） |
 | now | 评委池 | 用户指定 | 后续评审用 **rev-bgpt**（弃 grok；glm 仅 Stage E 用过） |
 | r10 | ocdroid 回传裁定 | 用户转发 | C-1=**A**、C-2=**修**、C-3/C-4=做；联合终审 **blocked** 至 ocdroid 落地 C-1+C-2；V-B 服务端侧：15s heartbeat + 无 HTTP 缓冲（见 handoff §8.3） |
 | r11 | ocdroid ready + 联合终审 | d4b22da + rev-bgpt | C-1/C-2/C-3 PASS；**NO-GO 8.4** — 阻塞：`token_memory_limit` clear-only 不重连 → 后续 delta orphan（handoff §9）；修：`triggersReconnect=true` for memory limit |
@@ -358,7 +358,7 @@ TOKEN_ACC_IDLE_MS = 60_000; TOKEN_HEARTBEAT_SECONDS = 15
 - **[Stage D]** backpressure resync 恒带 sessionID（backstop + cross-plane#3）：`TokenSubscriber` 子类覆写溢出帧。
 
 **Stage E（docs lane）范围契约**
-- **契约 §3.x + §6.x 加性**（`docs/v1-contract.md`）：新端点行（§2 表）+ token stream SSE 子节（端点 / wire 帧 / no-id-no-replay / 终态顺序不变式 / `/since` 真值 / gzip 杠杆2）+ token T3 信封 addendum（独立账本 / 预算「同时最多 1 条前台 stream」/ Option B 拆 4+4 不双计 / admission 溢出 503 + Retry-After / gzip 例外）；§7 加 `sse_token_subscriber_limit` code；health 根级 `features.tokenStream`（Q1）。**不 bump** `X-Slimapi-Version`（加性 wire）。
+- **契约 §3.x + §6.x 加性**（`docs/specs/v1-contract.md`）：新端点行（§2 表）+ token stream SSE 子节（端点 / wire 帧 / no-id-no-replay / 终态顺序不变式 / `/since` 真值 / gzip 杠杆2）+ token T3 信封 addendum（独立账本 / 预算「同时最多 1 条前台 stream」/ Option B 拆 4+4 不双计 / admission 溢出 503 + Retry-After / gzip 例外）；§7 加 `sse_token_subscriber_limit` code；health 根级 `features.tokenStream`（Q1）。**不 bump** `X-Slimapi-Version`（加性 wire）。
 - **CLIENT_CHANGES lever1 对齐**（`:217`）：pre-lever 旧文「done:true 带 text」→ 「marker 仅完成标记，无 text；权威全文走 `/since`」（与 §5.6 杠杆1 一致）。
 - **预算裁定 Option B 4+4**（§6 + §16 Stage C NB-C1）：`TOKEN_LIVEPARTS_MAX_BYTES=4MiB`（live）+ `TOKEN_PENDING_MAX_BYTES=4MiB`（pending），不双计；rationale = pending 独立上限更防御；worst-case 12MiB 不变；NB-C1 = src/ lane 同步 live 4MiB。
 - **CHANGELOG gzip 例外**：[Unreleased] 加 token-stream feature 条目——端点、opt-in（health 根级 `features.tokenStream`）、杠杆1 done:true marker 无 text、**杠杆2 gzip 首个 SSE 例外**（注明控制面 `/slimapi/events` 仍不 gzip）、resync reason 集、独立 T3 账本、内存预算 Option B 4+4。加性 wire（不 bump `X-Slimapi-Version`）。

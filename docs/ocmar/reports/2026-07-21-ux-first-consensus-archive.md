@@ -114,7 +114,7 @@
 | slimapi `docs/ocmar/plans/2026-07-21-ux-first-collab-reply.md` **rev 3.1** | slimapi 联审确认（Opt-A 服务端规约 §2） |
 | slimapi `docs/ocmar/reviews/2026-07-21-rev-bgpt-ux-first-review.md` | rev-bgpt 终审纪要 |
 | slimapi `docs/ocmar/plans/2026-07-21-v0.3.0-joint-workplan.md` | 契约期背景（已标注体验优先覆盖） |
-| slimapi `docs/v1-contract.md` | Wire 契约权威（rev F；Opt-A 待写入） |
+| slimapi `docs/specs/v1-contract.md` | Wire 契约权威（rev F；Opt-A 待写入） |
 | **本文件** | **共识归档冻结点** |
 
 ---

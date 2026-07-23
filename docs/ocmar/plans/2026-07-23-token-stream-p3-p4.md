@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3 / FastAPI / asyncio / zlib 流式 gzip / pytest / `./scripts/check.sh`
 
-**Source of truth:** [`docs/release-v0.5.0-token-stream.md`](../../release-v0.5.0-token-stream.md) §6（细化版 backlog）
+**Source of truth:** `CHANGELOG.md` `[0.5.0]` + `docs/specs/v1-contract.md`（原 `release-v0.5.0-token-stream.md` §6 backlog 已随文档移除；细化版 backlog 见本文件 §5）
 
 **Out of scope（本计划不实施）:**
 - **S-4** — ocdroid 仓 flow 级测（跨仓）
@@ -20,7 +20,7 @@
 
 - Wire API：`X-Slimapi-Version` 仍为 `1`；P3 项**不** bump；P4 加性变更评估后仍优先不 bump，破坏性才走正式契约 bump（`docs/release.md`）。
 - 改 Python 后必须 `./scripts/check.sh` 通过（当前 = `pytest tests/`）。
-- 契约权威：`docs/v1-contract.md`；P4 改 wire 时同步 `CHANGELOG.md` + `CLIENT_CHANGES.md`。
+- 契约权威：`docs/specs/v1-contract.md`；P4 改 wire 时同步 `CHANGELOG.md` + `CLIENT_CHANGES.md`。
 - S-1 **纯结构、零行为**；行为改动另起 task/PR。
 - ocmar default：**不 commit**，除非用户明确要求。
 - 公开导入路径兼容：`from oc_slimapi.sse.token_hub import TokenStreamHub, TokenStreamRegistry, TokenSubscriber, TokenSubscriberCapacityError, STOP, _resync_frame` 必须继续可用（shim 或 re-export）。
@@ -220,7 +220,7 @@ return out
 git diff --stat
 ```
 
-**文档（同 task 折叠）：** 若 `docs/design-token-stream.md` metrics 表存在，加性补新 key 一行；**不**改 `v1-contract.md`（metrics 为运维面，非 wire 客户端契约，除非契约已列死集合——以契约为准）。
+**文档（同 task 折叠）：** 若 `docs/specs/design-token-stream.md` metrics 表存在，加性补新 key 一行；**不**改 `v1-contract.md`（metrics 为运维面，非 wire 客户端契约，除非契约已列死集合——以契约为准）。
 
 ---
 
@@ -325,7 +325,7 @@ for live_key, part in sorted(
 
 **Files:**
 - Modify: `…/frames.py` `_connected_frame` / `attach_subscriber`
-- Modify: `docs/v1-contract.md`（加性）+ `CLIENT_CHANGES.md` + `CHANGELOG.md`
+- Modify: `docs/specs/v1-contract.md`（加性）+ `CLIENT_CHANGES.md` + `CHANGELOG.md`
 - Test: attach 时 sid busy 且无 LivePart → connected 帧含 `busy: true`（或等价）
 
 **Acceptance Criteria:**
@@ -460,7 +460,7 @@ for live_key, part in sorted(
 
 ## 5. 与 release 文档的关系
 
-- Backlog 权威条目仍在 `docs/release-v0.5.0-token-stream.md` §6。
+- 原 `release-v0.5.0-token-stream.md` §6 backlog 已随文档移除；本文件为细化实施计划，回写状态到 `CHANGELOG.md` / `docs/specs/v1-contract.md`。
 - **本文件** = 本机可执行实施计划（任务拆解 / 依赖 / 验收）。
 - 实施完成后回写 release §6 对应 ID 状态为 ✅（与 D-1 同格式）。
 

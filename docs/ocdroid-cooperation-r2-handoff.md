@@ -1,9 +1,9 @@
 # oc-slimapi × ocdroid 配合与契约：Token Stream R2（handoff / 协商）
 
-> **对象**：ocdroid 侧（客户端集成 + 联合终审）。**服务端权威**：本文 §2 + [`docs/v1-contract.md`](v1-contract.md)（wire 基准；冲突以契约为准）。
+> **对象**：ocdroid 侧（客户端集成 + 联合终审）。**服务端权威**：本文 §2 + [`docs/specs/v1-contract.md`](specs/v1-contract.md)（wire 基准；冲突以契约为准）。
 > **生成**：2026-07-23　**服务端基线**：main `c21ca3b`（已 push）　**分支**：`dev`
 > **完整任务计划**（本仓侧）：[`docs/ocmar/plans/2026-07-23-ocdroid-cooperation-r2.md`](ocmar/plans/2026-07-23-ocdroid-cooperation-r2.md)
-> **R1 上下文**：v0.5.0 双边 handoff [`docs/ocdroid-token-stream-handoff.md`](ocdroid-token-stream-handoff.md)（R1 终审 GO 9.7，已发版）。
+> **R1 上下文**：v0.5.0 双边 handoff（R1 终审 GO 9.7，已发版；R1 handoff 文档已随归档清理移除，终态 wire 见 `docs/specs/v1-contract.md` rev J + `CHANGELOG.md` `[0.5.0]`）。
 
 ---
 
@@ -146,7 +146,7 @@ Wave 3 最大双边（独立窗口）:
 
 ## 9. 历史/参考
 
-- R1 v0.5.0 handoff（双边终态 wire + 联审轨迹）：[`ocdroid-token-stream-handoff.md`](ocdroid-token-stream-handoff.md)
-- wire 契约权威：[`v1-contract.md`](v1-contract.md)
-- 接口变更记录：[`CHANGELOG.md`](CHANGELOG.md) / [`docs/CLIENT_CHANGES.md`](CLIENT_CHANGES.md)
+- R1 v0.5.0 handoff（双边终态 wire + 联审轨迹）：已发版；handoff 文档已移除，终态见 `CHANGELOG.md` `[0.5.0]` + `docs/specs/v1-contract.md` rev J
+- wire 契约权威：[`v1-contract.md`](specs/v1-contract.md)
+- 接口变更记录：[`CHANGELOG.md`](CHANGELOG.md) / [`docs/specs/CLIENT_CHANGES.md`](specs/CLIENT_CHANGES.md)
 - 本仓 R2 完整计划：[`docs/ocmar/plans/2026-07-23-ocdroid-cooperation-r2.md`](ocmar/plans/2026-07-23-ocdroid-cooperation-r2.md)

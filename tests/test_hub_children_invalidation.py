@@ -43,7 +43,7 @@ Covers (per task spec items 1–9):
      ``question.asked`` forwarding behave exactly as before (no
      ``childrenVersion`` leakage into non-parent digests).
 
-Reference: ``docs/v1-contract.md`` §3 (digest ``childrenVersion?`` rev I) +
+Reference: ``docs/specs/v1-contract.md`` §3 (digest ``childrenVersion?`` rev I) +
 §16 (invalidate semantics / generation). Mirrors the fixture / publish
 paradigm of ``tests/test_hub.py`` and ``tests/test_hub_behavior_lock.py``.
 """
