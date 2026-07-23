@@ -30,7 +30,13 @@ ocdroid 对接时：
 
 > 开发中、尚未打 tag 的变更写在这里；`release.sh` 发版时把本节内容折叠进新版本标题下。
 
-### Added（规划中 / in-progress — 依赖服务端 Stages A–E，未随当前发版出货）
+---
+
+## [0.5.0] - 2026-07-23
+
+> Token 批式 SSE（opt-in 实时流）上线。**全加性 wire 行为**，**未 bump** `X-Slimapi-Version`（仍 `1`）。设计 `docs/design-token-stream.md` v4；契约 `docs/v1-contract.md` rev J。双边联合终审 re-gate **GO 9.7**（rev-bgpt）；ocdroid 已 shipped（commit `1986567`）。
+
+### Added
 
 - **Token 批式 SSE（opt-in 实时流）**：新可选端点 `GET /slimapi/sessions/{sid}/stream`——生成中实时推送 in-flight text part 的渐进文本，解决「打开 busy session 看到半截且冻住」（上游 `message.part.delta` 不落库，sidecar 此前丢弃）。**全加性 wire 行为**，**不 bump** `X-Slimapi-Version`（仍 `1`）。设计权威 `docs/design-token-stream.md` v4（架构级 PASS）；契约落地 `docs/v1-contract.md` §3.x（端点+帧+gzip）+ §6.x（token T3 信封）。
   - **端点**：`GET /slimapi/sessions/{sid}/stream?directory=<optional>`；`text/event-stream`；响应头 `Cache-Control:no-cache,no-transform`、`X-Accel-Buffering:no`、`X-Slimapi-Subscriber-ID:<ephemeral>`；版本门禁复用 `SlimapiVersionMiddleware`（无 route-level `Depends`）。directory 仅过滤进程级 GlobalBus 事件，**不开第二条上游连接**；sid 全局唯一、directory 无关（单用户 T3）。路由注册在 catch-all 反代之前。
@@ -43,7 +49,7 @@ ocdroid 对接时：
   - **T3 独立信封（Option B 拆 4+4）**：token 订阅独立账本（`token_stream_max_subscribers=8`、`token_stream_queue_items=64`、`token_stream_buffer_bytes=512KiB/sub`、`token_stream_max_frame_bytes=1MiB`），**不**消费既有 `MAX_TOTAL_SUBSCRIBERS=16`；**内存预算 Option B**（拆 4+4，**不双计**）：`TOKEN_LIVEPARTS_MAX_BYTES=4MiB`（live）+ `TOKEN_PENDING_MAX_BYTES=4MiB`（pending）；worst-case `8 × 512KiB 订阅队列 + 4MiB live + 4MiB pending = 12MiB`（与 Option A 同上限，但 pending 独立上限更防御）。admission 失败 → 503 `{"code":"sse_token_subscriber_limit","limit":8,"current":N}` + `Retry-After:5`。
   - **控制面零回归**：`/slimapi/events`（控制面）一行不改；token 流消费上游 `message.part.delta`/`updated`（控制面此前丢弃），与控制面队列隔离（避免 token 高吞吐挤掉 q/p 或误触 `subscriber_backpressure`）。
   - **P1 范围**：仅 text part（reasoning / tool-input 延后 P2+）；不做二进制流。
-  - **依赖与状态**：服务端 Stages A–E（§14）落地（A 地基 9.5 / B 生命周期 9.5 / C flush 9.5 / D 端点 9.6 / E 文档+预算 4+4）；未发版前不出货，本条目仅声明加性 wire 形状供 ocdroid 预读。ocdroid 配合清单见 `docs/CLIENT_CHANGES.md`「Token stream SSE」节。批式参数（`TOKEN_FLUSH_SECONDS`/`TOKEN_FLUSH_BYTES`）为服务端 env knob，**不进 wire**，ocdroid 无需跟随调整。
+  - **依赖与状态**：服务端 Stages A–E（§14）落地（A 地基 9.5 / B 生命周期 9.5 / C flush 9.5 / D 端点 9.6 / E 文档+预算 4+4）；本版本随 0.5.0 出货，双边联合终审 re-gate GO 9.7。ocdroid 配合清单见 `docs/CLIENT_CHANGES.md`「Token stream SSE」节。批式参数（`TOKEN_FLUSH_SECONDS`/`TOKEN_FLUSH_BYTES`）为服务端 env knob，**不进 wire**，ocdroid 无需跟随调整。
 
 ## [0.4.0] - 2026-07-22
 
