@@ -809,6 +809,47 @@ class TestReserve:
                 assert b"extra-chunk" not in f, \
                     "I1: delta frame must not re-send pending text already in snapshot"
 
+    def test_o1_evict_skips_current_key_being_reserved(self, monkeypatch):
+        """O1: ``_reserve → _evict_part_for_memory`` must skip (``skip_key``)
+        the key currently being reserved. Otherwise, when that key K's
+        snapshot frame exceeds ``max_frame_bytes``, K gets truncate +
+        ``drop_part`` mid-reserve while the caller still holds the stale
+        ``live`` reference (``_total_live_bytes`` drift + orphan delta)."""
+        # Per-part cap huge (K may exceed max_frame_bytes without per-part
+        # truncate); global LIVE cap small (K+A overflows → evict A).
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_PART_MAX_BYTES", 10 ** 9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_LIVEPARTS_MAX_BYTES", 200)
+        th = TokenStreamHub(max_frame_bytes=64)  # tiny cap → K's snapshot WOULD truncate
+        sub = _attach(th, "s1")  # handshake first: server.connected only (no live parts yet)
+        sub.frames.clear()
+        # Create K (150 bytes) + A (40 bytes, backdated older) AFTER attach, so
+        # neither is handshake-snapshotted (which would prematurely truncate K).
+        th.on_part_updated(_updated_props("s1", "m1", "pK", text="K" * 150))
+        th.on_part_updated(_updated_props("s1", "m1", "pA", text="A" * 40))
+        th.live_parts[("s1", "m1", "pA")].last_delta_ms = _now_ms() - 10000
+        assert th._total_live_bytes == 190  # 150 + 40
+
+        k_key = ("s1", "m1", "pK")
+        live_before = th.live_parts[k_key]
+
+        # Delta to K pushes global LIVE (190 + 50 = 240) over 200 → _reserve evicts A.
+        th.on_part_delta(_delta_props("s1", "m1", "pK", delta="X" * 50))
+
+        # O1: K survived the eviction (NOT truncated/dropped mid-reserve).
+        assert k_key in th.live_parts, \
+            "current key K must not be dropped by eviction re-snapshot"
+        assert k_key not in th._disabled_parts
+        assert th.live_parts[k_key] is live_before  # same object — no stale-ref swap
+        # A was the intended eviction victim.
+        assert ("s1", "m1", "pA") not in th.live_parts
+        # No gauge drift: K's 150 + new delta 50 = 200 (A's 40 removed).
+        assert th._total_live_bytes == 200
+        # O1 consequence: K survived, so its delta is delivered (not orphan).
+        sub.frames.clear()
+        th.flush()
+        assert th.orphan_deltas == 0, "K's delta must not be orphaned (K survived)"
+        assert any(b"X" in f for f in sub.frames), "K's delta must be delivered on flush"
+
 
 # ===========================================================================
 # attach_subscriber — §5.5 handshake ordering + C2 no-double-count

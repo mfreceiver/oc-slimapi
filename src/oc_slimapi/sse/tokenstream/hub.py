@@ -797,10 +797,12 @@ class TokenStreamHub:
                 self._truncate_part_for_all(key, done=False)
                 return False
             oldest = min(candidates, key=lambda k: self.live_parts[k].last_delta_ms)
-            self._evict_part_for_memory(oldest)
+            self._evict_part_for_memory(oldest, skip_key=key)
         return True
 
-    def _evict_part_for_memory(self, key: PartKey) -> None:
+    def _evict_part_for_memory(
+        self, key: PartKey, skip_key: PartKey | None = None
+    ) -> None:
         """LRU-evict a LivePart under global memory pressure (§6 / §16-C).
 
         Retires the part via :meth:`drop_part` (idempotent — late deltas
@@ -813,6 +815,15 @@ class TokenStreamHub:
         REMAINING live part of the same sid to every already-attached
         subscriber, so existing subscribers get a fresh snapshot anchor
         without needing to reconnect (S-2 method B).
+
+        ``skip_key`` (O1): the key the CALLER is currently reserving/admitting
+        for (e.g. ``_reserve``'s ``key``, ``_start_part``'s new ``key``). It is
+        EXCLUDED from the re-snapshot loop: re-snapshotting a near-cap part
+        mid-reserve can exceed ``max_frame_bytes`` → truncate → ``drop_part``
+        while the caller still holds the stale ``live`` reference (gauge drift
+        + orphan delta). The skipped key keeps its existing client anchor
+        (restored on the next reconnect handshake under the current
+        ``triggersReconnect=true`` model).
         """
         if not self.drop_part(key):
             return  # already disabled — eviction resync already fanned.
@@ -823,10 +834,13 @@ class TokenStreamHub:
         self._fanout_resync(sid, "token_memory_limit")
         self._metrics.token_memory_limit_total += 1
         # Re-snapshot remaining live parts of this sid to existing subs.
+        # O1: skip the key the caller is reserving for (see docstring).
         subs = list(self._subs_by_sid.get(sid, ()))
         if not subs:
             return
-        for live_key in sorted(k for k in self.live_parts if k[0] == sid):
+        for live_key in sorted(
+            k for k in self.live_parts if k[0] == sid and k != skip_key
+        ):
             live = self.live_parts[live_key]
             text = "".join(live.chunks)
             for sub in subs:
@@ -871,7 +885,7 @@ class TokenStreamHub:
             candidates = [k for k in self.live_parts if k != current_key]
             if candidates:
                 oldest = min(candidates, key=lambda k: self.live_parts[k].last_delta_ms)
-                self._evict_part_for_memory(oldest)
+                self._evict_part_for_memory(oldest, skip_key=current_key)
 
     # ------------------------------------------------------------------
     # Part lifecycle helpers
@@ -902,7 +916,7 @@ class TokenStreamHub:
         # Global part COUNT cap: evict oldest (LRU) before creating.
         while len(self.live_parts) >= TOKEN_LIVE_PARTS_MAX:
             oldest = min(self.live_parts, key=lambda k: self.live_parts[k].last_delta_ms)
-            self._evict_part_for_memory(oldest)
+            self._evict_part_for_memory(oldest, skip_key=key)
         live = LivePart()
         self.live_parts[key] = live
         if seed:
@@ -926,7 +940,7 @@ class TokenStreamHub:
                 if not candidates:
                     break
                 oldest = min(candidates, key=lambda k: self.live_parts[k].last_delta_ms)
-                self._evict_part_for_memory(oldest)
+                self._evict_part_for_memory(oldest, skip_key=key)
 
     def drop_part(self, key: PartKey) -> bool:
         """Retire a part (C4: truncated / finished / evicted).
