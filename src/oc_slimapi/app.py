@@ -14,6 +14,7 @@ from .proxy import install_proxy
 from .routes import events, health, messages, metrics, questions, sessions, sessions_children, token_stream
 from .sse.hub import HubRegistry
 from .sse.token_hub import TokenStreamHub, TokenStreamRegistry
+from .sse.tokenstream.hub import apply_debug_budget_overrides
 from .transform import TransformConfig, TransformPool
 from .upstream import create_client
 from .versioning import SlimapiVersionMiddleware
@@ -45,6 +46,9 @@ async def smoke(app: FastAPI) -> None:
 async def lifespan(app: FastAPI):
     settings.validate()
     app.state.config = settings
+    # Debug/联调-only: override token-stream memory budget caps from env
+    # (OC_SLIMAPI_TOKEN_STREAM_DEBUG_*). No-op when env vars are unset.
+    apply_debug_budget_overrides(settings)
     app.state.batch_ledger = BatchLedger(
         window_seconds=settings.opt_a_rollback_window_seconds
     )

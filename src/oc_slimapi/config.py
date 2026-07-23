@@ -13,10 +13,21 @@ from .versioning import ACCEPTED_CLIENT_VERSIONS, SERVER_API_VERSION
 # ---------------------------------------------------------------------------
 # Token-stream budget / timing constants (design-token-stream.md §6).
 #
-# These are code-level (not env-overridable) because they are wire-invariant
+# These are code-level defaults (not production ops knobs) because they are wire-invariant
 # tuning knobs: changing them does NOT change the wire contract, only server-
 # side batching/memory behaviour. The per-subscriber envelope knobs above
 # (token_stream_*) ARE env-overridable for ops break-glass.
+#
+# Debug/联调-only env overrides (``OC_SLIMAPI_TOKEN_STREAM_DEBUG_*``):
+# these three caps also support env override via
+# :func:`~oc_slimapi.sse.tokenstream.hub.apply_debug_budget_overrides`,
+# which is called once during app lifespan startup. The override is OFF by
+# default (env unset = code-level cap unchanged). Intended only for
+# development / integration testing where a small data volume must trigger
+# memory-limit eviction (MB-P-S1 current-key nodrop path). The env knobs
+# remain wire-invariant (they do not change the wire contract, only server-
+# side memory pressure thresholds). Production deployments should NOT set
+# these env vars.
 #
 # Stage E (§16-C residual): the memory budget is split 4+4 (Option B).
 # ``TOKEN_LIVEPARTS_MAX_BYTES`` bounds the authoritative LivePart text
@@ -64,6 +75,15 @@ def _version_range(value: str) -> tuple[int, int]:
     except (TypeError, ValueError) as exc:
         raise RuntimeError("OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS must be min,max") from exc
     return minimum, maximum
+
+
+def _opt_int_env(name: str) -> int | None:
+    """Parse an optional int env var for the debug/联调-only token-stream
+    budget overrides. Unset / empty / whitespace → ``None`` (treated as
+    unset); a present-but-non-integer value raises ``ValueError`` at startup
+    (fail-fast, mirroring the other ``int(os.getenv(...))`` knobs)."""
+    value = os.getenv(name)
+    return int(value) if value and value.strip() else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +135,21 @@ class Settings:
     )
     token_stream_max_frame_bytes: int = int(
         os.getenv("OC_SLIMAPI_TOKEN_STREAM_MAX_FRAME_BYTES", str(1024 * 1024))
+    )
+    # Debug/联调-only env overrides for token-stream memory budget caps.
+    # These are OFF by default (None).  When set, they are applied during app
+    # lifespan startup via apply_debug_budget_overrides(), overriding the
+    # code-level module globals in hub.py.  Intended only for development /
+    # integration testing where low data volume must trigger memory-limit
+    # eviction.  Not for production use.
+    token_stream_debug_live_budget_bytes: int | None = _opt_int_env(
+        "OC_SLIMAPI_TOKEN_STREAM_DEBUG_LIVE_BUDGET_BYTES"
+    )
+    token_stream_debug_part_max_bytes: int | None = _opt_int_env(
+        "OC_SLIMAPI_TOKEN_STREAM_DEBUG_PART_MAX_BYTES"
+    )
+    token_stream_debug_live_parts_max: int | None = _opt_int_env(
+        "OC_SLIMAPI_TOKEN_STREAM_DEBUG_LIVE_PARTS_MAX"
     )
     # Shell/PTY HTTP deny-list (spec §6). Default ON; the path table is
     # code-level in proxy.py (hardcoded from B0 §1.3 route scan of opencode
@@ -246,6 +281,20 @@ class Settings:
             raise RuntimeError("OC_SLIMAPI_TOKEN_STREAM_BUFFER_BYTES must be > 0")
         if self.token_stream_max_frame_bytes <= 0:
             raise RuntimeError("OC_SLIMAPI_TOKEN_STREAM_MAX_FRAME_BYTES must be > 0")
+
+        # Debug/联调-only budget overrides: if set, must be strictly positive.
+        if self.token_stream_debug_live_budget_bytes is not None and self.token_stream_debug_live_budget_bytes <= 0:
+            raise RuntimeError(
+                "OC_SLIMAPI_TOKEN_STREAM_DEBUG_LIVE_BUDGET_BYTES must be > 0 when set"
+            )
+        if self.token_stream_debug_part_max_bytes is not None and self.token_stream_debug_part_max_bytes <= 0:
+            raise RuntimeError(
+                "OC_SLIMAPI_TOKEN_STREAM_DEBUG_PART_MAX_BYTES must be > 0 when set"
+            )
+        if self.token_stream_debug_live_parts_max is not None and self.token_stream_debug_live_parts_max <= 0:
+            raise RuntimeError(
+                "OC_SLIMAPI_TOKEN_STREAM_DEBUG_LIVE_PARTS_MAX must be > 0 when set"
+            )
 
         # Opt-A rollback / retry-after guards (v0.3.1, additive).
         if self.opt_a_rollback_window_seconds < 1:

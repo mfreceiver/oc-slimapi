@@ -49,6 +49,10 @@ ocdroid 对接时：
 
 - **O1 `_reserve→evict` re-entrancy**：current key 在 eviction re-snapshot 时不再被超帧 truncate→`drop_part`（消除调用方 stale `live` 引用导致的 `_total_live_bytes` 漂移 + orphan delta）。
 
+### 运维/联调（非 wire 变更）
+
+- **Debug/联调-only 内存预算 env 覆盖**：新增 `OC_SLIMAPI_TOKEN_STREAM_DEBUG_LIVE_BUDGET_BYTES` / `_PART_MAX_BYTES` / `_LIVE_PARTS_MAX`（可选 int，默认 unset = off），在 app lifespan startup 经 `apply_debug_budget_overrides` 覆盖 token-stream 的 LIVE 预算 cap，使 memory-limit eviction 能用小数据量触发（联调 MB-P-S1 current-key nodrop 路径）。**默认 off = 零行为变化；生产不应设置**。纯服务端阈值，非 wire 变更，不 bump `X-Slimapi-Version`。联调须走真实 app lifespan（route 单测的 `_build_app` 不读 DEBUG env）。
+
 ---
 
 ## [0.5.0] - 2026-07-23

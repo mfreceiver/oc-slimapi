@@ -158,3 +158,66 @@ def test_validate_rejects_zero_token_stream_max_frame_bytes():
     settings = _base(token_stream_max_frame_bytes=0)
     with pytest.raises(RuntimeError, match=r"TOKEN_STREAM_MAX_FRAME_BYTES must be > 0"):
         settings.validate()
+
+
+# ---------------------------------------------------------------------------
+# Debug/联调-only budget overrides: default None; validate rejects 0/negative.
+# ---------------------------------------------------------------------------
+
+def test_debug_fields_default_none():
+    """When unset, the three debug fields must be None (no behaviour change)."""
+    s = _base()
+    assert s.token_stream_debug_live_budget_bytes is None
+    assert s.token_stream_debug_part_max_bytes is None
+    assert s.token_stream_debug_live_parts_max is None
+
+
+def test_validate_rejects_zero_debug_live_budget():
+    settings = _base(token_stream_debug_live_budget_bytes=0)
+    with pytest.raises(RuntimeError, match=r"DEBUG_LIVE_BUDGET_BYTES must be > 0"):
+        settings.validate()
+
+
+def test_validate_rejects_zero_debug_part_max():
+    settings = _base(token_stream_debug_part_max_bytes=0)
+    with pytest.raises(RuntimeError, match=r"DEBUG_PART_MAX_BYTES must be > 0"):
+        settings.validate()
+
+
+def test_validate_rejects_zero_debug_live_parts_max():
+    settings = _base(token_stream_debug_live_parts_max=0)
+    with pytest.raises(RuntimeError, match=r"DEBUG_LIVE_PARTS_MAX must be > 0"):
+        settings.validate()
+
+
+def test_validate_rejects_negative_debug_live_budget():
+    settings = _base(token_stream_debug_live_budget_bytes=-1)
+    with pytest.raises(RuntimeError, match=r"DEBUG_LIVE_BUDGET_BYTES must be > 0"):
+        settings.validate()
+
+
+def test_validate_rejects_negative_debug_part_max():
+    settings = _base(token_stream_debug_part_max_bytes=-1)
+    with pytest.raises(RuntimeError, match=r"DEBUG_PART_MAX_BYTES must be > 0"):
+        settings.validate()
+
+
+def test_validate_rejects_negative_debug_live_parts_max():
+    settings = _base(token_stream_debug_live_parts_max=-1)
+    with pytest.raises(RuntimeError, match=r"DEBUG_LIVE_PARTS_MAX must be > 0"):
+        settings.validate()
+
+
+@pytest.mark.parametrize("val", [1, 42, 1024])
+def test_validate_accepts_positive_debug_live_budget(val):
+    _base(token_stream_debug_live_budget_bytes=val).validate()  # must not raise
+
+
+@pytest.mark.parametrize("val", [1, 512, 65536])
+def test_validate_accepts_positive_debug_part_max(val):
+    _base(token_stream_debug_part_max_bytes=val).validate()  # must not raise
+
+
+@pytest.mark.parametrize("val", [1, 4, 16])
+def test_validate_accepts_positive_debug_live_parts_max(val):
+    _base(token_stream_debug_live_parts_max=val).validate()  # must not raise

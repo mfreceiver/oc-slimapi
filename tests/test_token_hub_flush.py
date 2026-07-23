@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import types
 
 import pytest
 
@@ -58,6 +59,7 @@ from oc_slimapi.sse.token_hub import (
     _now_ms,
     sse_frame,
 )
+from oc_slimapi.sse.tokenstream.hub import apply_debug_budget_overrides
 
 
 # ---------------------------------------------------------------------------
@@ -1523,3 +1525,88 @@ class TestPendingBudget:
         th.on_part_delta(_delta_props(delta="0123456789AB"))
         # Early-flush drained + decremented.
         assert th._total_pending_bytes == 0
+
+
+# ===========================================================================
+# Debug budget overrides (OC_SLIMAPI_TOKEN_STREAM_DEBUG_*) — apply mutates
+# module globals so memory-limit eviction triggers with small data (联调).
+# Default (None) = no change. Tests MUST restore the globals via try/finally
+# (module-global mutation via `global` assignment is NOT tracked by monkeypatch).
+# ===========================================================================
+
+class TestDebugBudgetOverrides:
+    """Debug/联调-only budget overrides: ``apply_debug_budget_overrides``
+    mutates the hub module globals (``TOKEN_LIVEPARTS_MAX_BYTES`` etc.) so
+    memory-limit eviction — the MB-P-S1 current-key nodrop trigger — fires
+    with a small data volume during integration testing. Default (all-None
+    settings) is a no-op."""
+
+    def test_apply_lowers_live_budget_and_leaves_none_fields_at_code_default(self):
+        import oc_slimapi.sse.tokenstream.hub as hubmod
+        orig_live = hubmod.TOKEN_LIVEPARTS_MAX_BYTES
+        try:
+            s = types.SimpleNamespace(
+                token_stream_debug_live_budget_bytes=200,
+                token_stream_debug_part_max_bytes=None,
+                token_stream_debug_live_parts_max=None,
+            )
+            hubmod.apply_debug_budget_overrides(s)
+            assert hubmod.TOKEN_LIVEPARTS_MAX_BYTES == 200
+            # None fields leave the code-level defaults UNCHANGED (meaningful
+            # check vs the known defaults, not the possibly-polluted start value).
+            assert hubmod.TOKEN_PART_MAX_BYTES == 1024 * 1024
+            assert hubmod.TOKEN_LIVE_PARTS_MAX == 32
+        finally:
+            hubmod.TOKEN_LIVEPARTS_MAX_BYTES = orig_live
+
+    def test_apply_all_none_is_noop(self):
+        import oc_slimapi.sse.tokenstream.hub as hubmod
+        orig_live = hubmod.TOKEN_LIVEPARTS_MAX_BYTES
+        orig_part = hubmod.TOKEN_PART_MAX_BYTES
+        orig_count = hubmod.TOKEN_LIVE_PARTS_MAX
+        try:
+            s = types.SimpleNamespace(
+                token_stream_debug_live_budget_bytes=None,
+                token_stream_debug_part_max_bytes=None,
+                token_stream_debug_live_parts_max=None,
+            )
+            hubmod.apply_debug_budget_overrides(s)
+            assert hubmod.TOKEN_LIVEPARTS_MAX_BYTES == orig_live
+            assert hubmod.TOKEN_PART_MAX_BYTES == orig_part
+            assert hubmod.TOKEN_LIVE_PARTS_MAX == orig_count
+        finally:
+            hubmod.TOKEN_LIVEPARTS_MAX_BYTES = orig_live
+            hubmod.TOKEN_PART_MAX_BYTES = orig_part
+            hubmod.TOKEN_LIVE_PARTS_MAX = orig_count
+
+    def test_debug_live_budget_triggers_eviction_with_small_data(self):
+        """End-to-end: a lowered debug live budget → a small delta triggers
+        ``_reserve`` eviction (the 联调 use-case for MB-P-S1). Restores the
+        mutated globals afterward (test isolation)."""
+        import oc_slimapi.sse.tokenstream.hub as hubmod
+        orig_live = hubmod.TOKEN_LIVEPARTS_MAX_BYTES
+        orig_part = hubmod.TOKEN_PART_MAX_BYTES
+        try:
+            s = types.SimpleNamespace(
+                token_stream_debug_live_budget_bytes=15,
+                token_stream_debug_part_max_bytes=10 ** 9,
+                token_stream_debug_live_parts_max=None,
+            )
+            hubmod.apply_debug_budget_overrides(s)
+            assert hubmod.TOKEN_LIVEPARTS_MAX_BYTES == 15
+            th = TokenStreamHub()
+            th.on_part_updated(_updated_props("s1", "m1", "p1", text=""))
+            th.on_part_updated(_updated_props("s1", "m1", "p2", text=""))
+            th.live_parts[("s1", "m1", "p1")].last_delta_ms = _now_ms() - 10000
+            th.on_part_delta(_delta_props("s1", "m1", "p1", delta="aaaa"))   # 4
+            th.on_part_delta(_delta_props("s1", "m1", "p2", delta="bbbbb"))  # 5 → total 9
+            sub = _attach(th, "s1")
+            sub.frames.clear()
+            # +7 to p2 → 9 + 7 = 16 > 15 cap → evict p1 (oldest), p2 survives.
+            th.on_part_delta(_delta_props("s1", "m1", "p2", delta="ccccccc"))
+            assert ("s1", "m1", "p1") not in th.live_parts
+            assert ("s1", "m1", "p2") in th.live_parts
+            assert th.token_memory_limit_total == 1
+        finally:
+            hubmod.TOKEN_LIVEPARTS_MAX_BYTES = orig_live
+            hubmod.TOKEN_PART_MAX_BYTES = orig_part

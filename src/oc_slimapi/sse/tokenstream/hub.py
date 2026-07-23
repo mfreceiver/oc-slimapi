@@ -102,6 +102,44 @@ _TTL_TICK_INTERVAL = max(1, int(round(60.0 / TOKEN_FLUSH_SECONDS)))
 _HEARTBEAT_TICK_INTERVAL = max(1, int(round(TOKEN_HEARTBEAT_SECONDS / TOKEN_FLUSH_SECONDS)))
 
 
+def apply_debug_budget_overrides(settings: Any) -> None:
+    """Debug/联调-only: override LIVE budget caps from env settings, so
+    memory-limit eviction (MB-P-S1 current-key nodrop path) can be triggered
+    with small data volumes during development / integration testing.
+
+    Overrides the module-level ``TOKEN_LIVEPARTS_MAX_BYTES``,
+    ``TOKEN_PART_MAX_BYTES``, and ``TOKEN_LIVE_PARTS_MAX`` globals — i.e.
+    the same names that :meth:`TokenStreamHub._reserve` and
+    :meth:`TokenStreamHub._start_part` read.  This approach preserves both:
+
+    * **Runtime effect**: the cap change takes effect for every hub instance
+      without plumbing a new constructor parameter through ``TokenStreamHub``,
+      ``TokenStreamRegistry``, and every app wiring point.
+    * **Test compatibility**: the ~10 existing tests that use
+      ``monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_...", val)``
+      continue to work because they patch the same module global.
+
+    Should be called **exactly once** during app lifespan startup, after
+    ``settings.validate()`` and before any hub method that reads these caps.
+    When a setting field is ``None`` (env unset), the corresponding code-level
+    default is left unchanged — zero behaviour change.
+
+    Integration testing MUST run through the real app lifespan (or call this
+    function explicitly); minimal app fixtures used by route/unit tests (e.g.
+    ``_build_app``) do NOT invoke it, so ``DEBUG_*`` env is ignored there.
+
+    Production deployments should NOT set ``OC_SLIMAPI_TOKEN_STREAM_DEBUG_*``
+    env vars.  This is a debug/ops break-glass tool only.
+    """
+    global TOKEN_LIVEPARTS_MAX_BYTES, TOKEN_PART_MAX_BYTES, TOKEN_LIVE_PARTS_MAX
+    if settings.token_stream_debug_live_budget_bytes is not None:
+        TOKEN_LIVEPARTS_MAX_BYTES = settings.token_stream_debug_live_budget_bytes
+    if settings.token_stream_debug_part_max_bytes is not None:
+        TOKEN_PART_MAX_BYTES = settings.token_stream_debug_part_max_bytes
+    if settings.token_stream_debug_live_parts_max is not None:
+        TOKEN_LIVE_PARTS_MAX = settings.token_stream_debug_live_parts_max
+
+
 class TokenStreamHub:
     """Part-lifecycle-gated accumulator + flush engine for the token stream.
 
