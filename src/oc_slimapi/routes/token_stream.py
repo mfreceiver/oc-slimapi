@@ -113,7 +113,11 @@ async def token_stream(request: Request, sid: str, directory: str | None = None)
         def encode(frame: bytes) -> bytes:
             if compressor is None:
                 return frame
-            return compressor.compress(frame) + compressor.flush(zlib.Z_SYNC_FLUSH)
+            raw_n = len(frame)
+            out = compressor.compress(frame) + compressor.flush(zlib.Z_SYNC_FLUSH)
+            subscriber.metrics.gzip_raw_bytes_total += raw_n
+            subscriber.metrics.gzip_compressed_bytes_total += len(out)
+            return out
 
         try:
             # §5.5 step 1: Last-Event-ID (value ignored) → leading

@@ -33,7 +33,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from oc_slimapi.config import Settings
+from oc_slimapi.config import Settings, TOKEN_FLUSH_SECONDS
 from oc_slimapi.errors import register_error_handlers
 from oc_slimapi.routes import events, health, metrics, token_stream
 from oc_slimapi.sse.hub import HubRegistry, Subscriber, sse_frame as hub_sse_frame
@@ -1038,6 +1038,9 @@ class TestMetricsTokenStream:
                     "pendingAccumulators", "flushedFramesTotal",
                     "droppedFramesTotal", "truncatedSnapshotsTotal",
                     "orphanDeltasTotal", "tokenMemoryLimitTotal",
+                    "gzipRawBytesTotal", "gzipCompressedBytesTotal",
+                    "flushDurationMsTotal", "flushTicksTotal",
+                    "maxSubscriberQueueDepth",
                 }
                 assert ts["current"] == 1
                 assert ts["limit"] == 3
@@ -1112,6 +1115,62 @@ class TestMetricsTokenStream:
             await hubs.close()
             await app.state.upstream.aclose()
 
+    async def test_gzip_flush_bumps_compression_counters(self):
+        """T2-C1: after a gzip flush, gzipRawBytesTotal>0 and
+        gzipCompressedBytesTotal>0."""
+        app = _build_app(_settings())
+        try:
+            th = app.state.token_hub
+            # Seed a part so the handshake snapshot has data.
+            th.on_part_updated(_updated_props("s1", "m1", "p1", text=""))
+            th.on_part_delta(_delta_props("s1", "m1", "p1", delta="hello" * 100))
+            # Drive the gzip stream.
+            _status, _headers, raw = await _drive_stream(
+                app, "/slimapi/sessions/s1/stream",
+                [("X-Slimapi-Version", "1"), ("Accept-Encoding", "gzip")],
+            )
+            # The stream round-tripped, so at least one raw frame was compressed.
+            response = await _get(app, "/slimapi/metrics")
+            ts = response.json()["sse"]["tokenStream"]
+            assert ts["gzipRawBytesTotal"] > 0
+            assert ts["gzipCompressedBytesTotal"] > 0
+        finally:
+            await _close_app(app)
+
+    async def test_non_gzip_does_not_bump_gzip_counters(self):
+        """T2-C2: identity (non-gzip) connection does NOT bump gzip counters."""
+        app = _build_app(_settings())
+        try:
+            th = app.state.token_hub
+            th.on_part_updated(_updated_props("s1", "m1", "p1", text=""))
+            th.on_part_delta(_delta_props("s1", "m1", "p1", delta="data"))
+            _status, _headers, _body = await _drive_stream(
+                app, "/slimapi/sessions/s1/stream",
+                [("X-Slimapi-Version", "1"), ("Accept-Encoding", "identity")],
+            )
+            response = await _get(app, "/slimapi/metrics")
+            ts = response.json()["sse"]["tokenStream"]
+            assert ts["gzipRawBytesTotal"] == 0
+            assert ts["gzipCompressedBytesTotal"] == 0
+        finally:
+            await _close_app(app)
+
+    async def test_flush_ticks_and_duration_metrics(self):
+        """T2-C3: after a flush, flushTicksTotal>=1 and flushDurationMsTotal>=0."""
+        app = _build_app(_settings())
+        try:
+            th = app.state.token_hub
+            # Start the flush loop (tick starts).
+            th.start()
+            # Wait for at least one tick.
+            await asyncio.sleep(TOKEN_FLUSH_SECONDS * 1.5)
+            response = await _get(app, "/slimapi/metrics")
+            ts = response.json()["sse"]["tokenStream"]
+            assert ts["flushTicksTotal"] >= 1
+            assert ts["flushDurationMsTotal"] >= 0
+        finally:
+            await _close_app(app)
+
 
 # ===========================================================================
 # NB-C1 — multi-part large-seed burst → global byte-cap LRU eviction
@@ -1125,8 +1184,8 @@ class TestNBC1MultiSeedEviction:
         never sees this (no delta appended) — _start_part must run the same
         LRU while-evict, never evicting the key being admitted."""
         # Per-part cap large (so each seed is legal); global cap small.
-        monkeypatch.setattr("oc_slimapi.sse.token_hub.TOKEN_PART_MAX_BYTES", 10 ** 9)
-        monkeypatch.setattr("oc_slimapi.sse.token_hub.TOKEN_LIVEPARTS_MAX_BYTES", 24)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_PART_MAX_BYTES", 10 ** 9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_LIVEPARTS_MAX_BYTES", 24)
         th = TokenStreamHub()
         sub_frames: list[bytes] = []
 
@@ -1158,8 +1217,8 @@ class TestNBC1MultiSeedEviction:
     def test_never_evicts_current_key_on_seed_admission(self, monkeypatch):
         """The admitted key is never evicted by its own seed (mirrors _reserve
         'never evict current key')."""
-        monkeypatch.setattr("oc_slimapi.sse.token_hub.TOKEN_PART_MAX_BYTES", 10 ** 9)
-        monkeypatch.setattr("oc_slimapi.sse.token_hub.TOKEN_LIVEPARTS_MAX_BYTES", 8)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_PART_MAX_BYTES", 10 ** 9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_LIVEPARTS_MAX_BYTES", 8)
         th = TokenStreamHub()
         # First part with a seed equal to the cap — admitted, nothing to evict.
         th.on_part_updated(_updated_props("s1", "m1", "p1", text="AAAAAAAA"))  # 8 == cap
@@ -1169,8 +1228,8 @@ class TestNBC1MultiSeedEviction:
     def test_single_seed_over_per_part_cap_truncates(self, monkeypatch):
         """Regression guard: the pre-existing single-seed > per-part cap path
         still truncates (NB-C1 did not remove it)."""
-        monkeypatch.setattr("oc_slimapi.sse.token_hub.TOKEN_PART_MAX_BYTES", 4)
-        monkeypatch.setattr("oc_slimapi.sse.token_hub.TOKEN_LIVEPARTS_MAX_BYTES", 10 ** 9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_PART_MAX_BYTES", 4)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_LIVEPARTS_MAX_BYTES", 10 ** 9)
         th = TokenStreamHub()
         th.on_part_updated(_updated_props("s1", "m1", "p1", text="ABCDEFGH"))  # 8 > 4
         assert ("s1", "m1", "p1") not in th.live_parts
