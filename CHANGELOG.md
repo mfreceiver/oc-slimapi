@@ -32,6 +32,25 @@ ocdroid 对接时：
 
 ---
 
+## [0.6.0] - 2026-07-23
+
+> Token-stream method-B 产品化（`token_memory_limit` clear-only 不重连恢复）+ O1 正确性闭合。**全加性 wire 行为**（memory-limit resync 现向既有 subscriber 同流重发 surviving + current-key snapshot/truncated），**未 bump** `X-Slimapi-Version`（仍 `1`）。ocdroid v0.13.2 flip `TOKEN_MEMORY_LIMIT.triggersReconnect` true→false 的服务端硬前置（双边 D-MB-P 已确认接受 S1 变体）。
+
+### Added
+
+- **Memory-limit 同流重发 surviving parts（S-2）**：`token_memory_limit` eviction 后，sidecar 现向该 sid 的**既有 subscriber**（非新 `attach_subscriber`）同流重发剩余 live part 的 `snapshot{done:false}`，使客户端在 resync 清态后于**同一连接**重建锚点（此前仅 handshake 重发）。这是 method-B（clear-only，不重连）的产品化基础。
+- **current-key 锚点闭合（MB-P-S1）**：eviction re-snapshot 现重新纳入「正在 reserve 的 current key」，经新增「截断不 drop」发射路径 `_emit_snapshot_or_truncated_nodrop`：
+  - current key 帧 ≤ `max_frame_bytes` → 真 `snapshot{done:false}`（保实时动画）。
+  - current key 帧 > `max_frame_bytes` → `snapshot{truncated:true}` + **不 `drop_part`**（客户端 `/since` 拉权威全文；帧走原 token stream 同 `sub.put` 通道，`event: message.part.snapshot` + `data:{…,truncated:true,done:false}` 无 text）。
+  - O1 不变量继续成立：current key 绝不被 `drop_part` mid-reserve（nodrop 路径保留 LivePart，不 invalidate 调用方持有的 `live` 引用 → 无 gauge 漂移、无 orphan delta）。
+  - large-part 取舍（ocdroid D-MB-P 已接受）：large current key 实时动画不可救（客户端收 `truncated` 后清该 part 停 append → 服务端后续 delta 在客户端 orphan，blank 至 `/since`）；仅 small current key 真 snapshot 分支保住动画。
+
+### Fixed
+
+- **O1 `_reserve→evict` re-entrancy**：current key 在 eviction re-snapshot 时不再被超帧 truncate→`drop_part`（消除调用方 stale `live` 引用导致的 `_total_live_bytes` 漂移 + orphan delta）。
+
+---
+
 ## [0.5.0] - 2026-07-23
 
 > Token 批式 SSE（opt-in 实时流）上线。**全加性 wire 行为**，**未 bump** `X-Slimapi-Version`（仍 `1`）。设计 `docs/design-token-stream.md` v4；契约 `docs/v1-contract.md` rev J。双边联合终审 re-gate **GO 9.7**（rev-bgpt）；ocdroid 已 shipped（commit `1986567`）。
