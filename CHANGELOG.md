@@ -30,6 +30,21 @@ ocdroid 对接时：
 
 > 开发中、尚未打 tag 的变更写在这里；`release.sh` 发版时把本节内容折叠进新版本标题下。
 
+### Added（规划中 / in-progress — 依赖服务端 Stages A–E，未随当前发版出货）
+
+- **Token 批式 SSE（opt-in 实时流）**：新可选端点 `GET /slimapi/sessions/{sid}/stream`——生成中实时推送 in-flight text part 的渐进文本，解决「打开 busy session 看到半截且冻住」（上游 `message.part.delta` 不落库，sidecar 此前丢弃）。**全加性 wire 行为**，**不 bump** `X-Slimapi-Version`（仍 `1`）。设计权威 `docs/design-token-stream.md` v4（架构级 PASS）；契约落地 `docs/v1-contract.md` §3.x（端点+帧+gzip）+ §6.x（token T3 信封）。
+  - **端点**：`GET /slimapi/sessions/{sid}/stream?directory=<optional>`；`text/event-stream`；响应头 `Cache-Control:no-cache,no-transform`、`X-Accel-Buffering:no`、`X-Slimapi-Subscriber-ID:<ephemeral>`；版本门禁复用 `SlimapiVersionMiddleware`（无 route-level `Depends`）。directory 仅过滤进程级 GlobalBus 事件，**不开第二条上游连接**；sid 全局唯一、directory 无关（单用户 T3）。路由注册在 catch-all 反代之前。
+  - **帧类型**（§5.6）：订阅首帧 `message.part.snapshot{done:false}`（累计全文锚点）+ 批式 `message.part.delta{text}`（100ms / 4KiB flush，§5.4）+ 终态 `message.part.snapshot{done:true}`（**杠杆1：仅完成 marker，无 text**——权威全文走 `/since`，取消 upstream `part.text` 终态重发）+ `message.part.snapshot{truncated:true}`（>1MiB，不静默 drop）+ `resync` + `server.connected` / `server.heartbeat`（15s）。**不发 SSE `id:` 字段**、**无 replay buffer**；`Last-Event-ID` 仅触发首帧 resync，值忽略。
+  - **resync reasons**（token 流均带 `sessionID`）：`reconnect_no_replay`（上游重连）、`subscriber_backpressure`（订阅者 T3 溢出）、`token_memory_limit`（全局累加器上限）、`session_idle`（生成结束清理）、`session_deleted`（会话被删除）。单 part >1MiB 走 `snapshot{truncated:true}`（非 resync）。
+  - **终态顺序不变式**（wire 强约束）：同一 `(sid,mid,pid)` 所有 `message.part.delta` 帧必先于对应 `snapshot{done:true}` 入队；`done:true` 后该 part 不再发 delta。
+  - **权威对齐**：stream `snapshot{done:true}` 是「流视角完成」（**marker 无 text**）；digest + `/since` 拉取的是「持久化真值」——不一致以 `/since` 为准（幂等覆盖）。客户端可接受 digest 完成先于/晚于 token 终态帧。
+  - **杠杆2：gzip 首个 SSE 例外**：token stream **默认 gzip**（流式 zlib `Z_SYNC_FLUSH`，`Content-Encoding: gzip`，按 `Accept-Encoding` 协商）。**首个 SSE gzip 例外**——此前「SSE 永不 gzip」（§9）的唯一破例；控制面 `/slimapi/events` **仍不 gzip**。实测（harness `scripts/measure_token_overhead.py`，12 trace、30 tok/s × 100ms）：原批式 ~12x → 杠杆1+2 后 gzip 中位 **1.47x**（达成 re-anchor ~1.5x 中位目标；1/3 trace <1.0x）；残余调参（flush 窗 / gzip cadence）可选 post-release。
+  - **health 加性字段**：`GET /slimapi/health` 根级 `features.tokenStream:true`（Q1 冻结路径：top-level `features`，与 `sidecar`/`server`/`schema` 并列；客户端可 dual-read root/server 过渡，服务端固定 root）。`features.tokenStream` 缺/404/405 → ocdroid 降级「完成后整条出现」（零回归）。
+  - **T3 独立信封（Option B 拆 4+4）**：token 订阅独立账本（`token_stream_max_subscribers=8`、`token_stream_queue_items=64`、`token_stream_buffer_bytes=512KiB/sub`、`token_stream_max_frame_bytes=1MiB`），**不**消费既有 `MAX_TOTAL_SUBSCRIBERS=16`；**内存预算 Option B**（拆 4+4，**不双计**）：`TOKEN_LIVEPARTS_MAX_BYTES=4MiB`（live）+ `TOKEN_PENDING_MAX_BYTES=4MiB`（pending）；worst-case `8 × 512KiB 订阅队列 + 4MiB live + 4MiB pending = 12MiB`（与 Option A 同上限，但 pending 独立上限更防御）。admission 失败 → 503 `{"code":"sse_token_subscriber_limit","limit":8,"current":N}` + `Retry-After:5`。
+  - **控制面零回归**：`/slimapi/events`（控制面）一行不改；token 流消费上游 `message.part.delta`/`updated`（控制面此前丢弃），与控制面队列隔离（避免 token 高吞吐挤掉 q/p 或误触 `subscriber_backpressure`）。
+  - **P1 范围**：仅 text part（reasoning / tool-input 延后 P2+）；不做二进制流。
+  - **依赖与状态**：服务端 Stages A–E（§14）落地（A 地基 9.5 / B 生命周期 9.5 / C flush 9.5 / D 端点 9.6 / E 文档+预算 4+4）；未发版前不出货，本条目仅声明加性 wire 形状供 ocdroid 预读。ocdroid 配合清单见 `docs/CLIENT_CHANGES.md`「Token stream SSE」节。批式参数（`TOKEN_FLUSH_SECONDS`/`TOKEN_FLUSH_BYTES`）为服务端 env knob，**不进 wire**，ocdroid 无需跟随调整。
+
 ## [0.4.0] - 2026-07-22
 
 > 透传收敛 + 重构（Batch 0–5）。多批加性 wire 行为变更，**未 bump** `X-Slimapi-Version`（仍 `1`）。契约权威 `docs/v1-contract.md` rev I。

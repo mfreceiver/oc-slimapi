@@ -24,6 +24,14 @@ async def metrics(request: Request):
         hubs_snapshot["batch"] = batch_ledger.snapshot()
     else:
         hubs_snapshot["batch"] = None
+    # Stage D (design §7): expose ``sse.tokenStream.*`` when a token-stream
+    # registry is wired. The block sits under the existing ``sse`` umbrella
+    # alongside the control-plane ``subscribers`` / ``hubs`` / ``clients``
+    # entries. Absent (no registry) in test apps that do not wire one, so
+    # the control-plane metrics shape is unchanged there.
+    token_registry = getattr(request.app.state, "token_registry", None)
+    if token_registry is not None:
+        hubs_snapshot["sse"]["tokenStream"] = token_registry.snapshot_token_metrics()
     return json_response(
         hubs_snapshot,
         accept_encoding=request.headers.get("accept-encoding"),

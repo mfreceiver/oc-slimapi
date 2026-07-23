@@ -193,6 +193,66 @@
 
 ---
 
+## Token stream SSE（Stages A–E 落地，opt-in 实时流 — design-token-stream.md §9/§10）
+
+> **状态**：服务端 Stages A–E 已落地（A 地基 9.5 / B 生命周期 9.5 / C flush 9.5 / D 端点 9.6 / E 文档+预算 4+4）。未随当前发版出货前 `GET /slimapi/health` 根级 `features.tokenStream` 缺省，ocdroid 走既有「完成后整条出现」路径，**零回归**。本节是 ocdroid 侧改动清单（对应设计 §9 的 8 项 + §10 硬约束），供客户端预读。设计权威以 `docs/design-token-stream.md` 为准；wire 以 `docs/v1-contract.md` §3.x + §6.x 为准。
+
+### capability 探测（必须）
+
+- `/slimapi/health` 根级 **`features.tokenStream === true`** 才启用 stream 客户端；缺字段 / 404 / 405 → 降级为既有「完成后整条出现」（`/since` 拉权威全文），**不得**尝试连 stream 端点。
+- 路径与版本头以**本仓库** `docs/v1-contract.md` + `CHANGELOG.md` 为准（端点 `GET /slimapi/sessions/{sid}/stream`，仍带 `X-Slimapi-Version: 1`，**不 bump**）。
+
+### stream 客户端生命周期（必须）
+
+- 前台 opt-in 连 `GET /slimapi/sessions/{sid}/stream`；切后台 / 换 session / 关页面 → **立即断开**（token 订阅独立 T3 账本，预算「同时最多 1 条前台 stream」）。
+- 连接独立于控制面 `/slimapi/events`——两条连接，互不替代。
+- `Last-Event-ID` 可带但**值被忽略**，仅触发首帧 `resync{reason:"reconnect_no_replay",sessionID}`。stream **不发 SSE `id:`、无 replay buffer**——客户端不得依赖 `id:` 续传。
+
+### streamOwned 渲染算法（必须）
+
+收到帧按 part（`(messageID, partID)`）维护本地「streamOwned」缓冲：
+
+- **`message.part.snapshot{done:false}`**（订阅首帧 / 握手锚点）→ **替换**该 part 本地缓冲为 `text`、标 `streamOwned=true`、未完成。
+- **`message.part.delta{text}`** → 仅当该 part 已 `streamOwned` **且未完成**时 **append** `text`；否则丢弃（不应发生；若发生视为乱序，忽略）。
+- **`message.part.snapshot{done:true}`**（终态，**杠杆1**）→ **仅完成 marker，无 text**——客户端**不再从该帧取 text**；标**完成**。权威全文走 `/since`（持久化真值，幂等且**凌驾**所有 token 帧）。此后该 part 不再收 delta（违反则忽略）。
+- **`/slimapi/messages/**` / `/since`**：part 已 `streamOwned` 且**未完成** → **忽略**持久化拉取的该 part text（stream 为准）；part 已 `streamOwned` 且**已完成** → 仅允许 `/since` 覆盖（`/since` 是持久化真值，幂等且**凌驾**所有 token 帧）。
+
+### truncated / 降级（必须）
+
+- 收 **`message.part.snapshot{truncated:true}`**（`done:false` 或 `done:true` 均可能）→ 清该 part `streamOwned`、停 append、走 `/since` 拉权威（可能被上游截断，但那是真值）。单 part >1MiB **不**走 resync，而是本路径。
+
+### resync 处理（必须）— 两档恢复
+
+收 **`resync{reason, sessionID}`** 时，**一律**先：丢弃该 sid 全部 token 渲染态（所有 streamOwned part 清空）→ `/since` 重拉权威。是否 **重订阅** stream 按 reason 分档：
+
+| reason | 清态 + `/since` | 重订阅 stream | 说明 |
+|---|---|---|---|
+| `reconnect_no_replay` | 是 | **是** | 无 replay；新连接拿 handshake snapshot |
+| `subscriber_backpressure` | 是 | **是** | 慢消费者被断；须重连 |
+| `token_memory_limit` | 是 | **是** | 服务端 LRU 驱逐一个 LivePart 后**保持连接**、**不**对现有 sub 重发 snapshot；仅清态会让后续 delta 成 orphan → **必须**重连以 `attach_subscriber` 重建锚点 |
+| `session_idle` | 是 | 否 | 上游 idle，该 sid live parts 已 retire；socket 可留 |
+| `session_deleted` | 是 | 否 | 会话终态；eviction 由 `/events` digest 独立驱动 |
+| 未知 reason（客户端 fallback） | 是 | 否（建议） | 与 idle 同保守路径；勿静默丢帧 |
+
+- token resync **恒带 `sessionID`**；若极端情况收到无 `sessionID` 的 resync，从**连接**推断 sid（token 流每连接绑单 sid）。
+- **不发** `part_too_large`（超限走 `snapshot{truncated:true}`）。
+
+### 终态对齐（必须）
+
+- digest `message.updated`（step-finish）→ `/slimapi/messages/{sid}/since/{ts}` 拉权威全文，**幂等覆盖**该 message 所有 part（含 token streamOwned 已完成的）。客户端可接受 digest 完成先于 / 晚于 token `snapshot{done:true}`；`/since` 替换幂等且凌驾所有 token 帧。
+
+### 预算与 UX（建议 / 可选）
+
+- **建议**：同时最多 1 条前台 stream 连接（独立于 `/events`）。
+- **可选**（busy-open UX）：打开 busy session 先占位（skeleton / 进度指示），直到 stream 首帧 `snapshot{done:false}` 到达再开始流式渲染。
+
+### 批大小调参：ocdroid 无需配合（§10 硬约束）
+
+- **不需要**任何 ocdroid 侧调整。`TOKEN_FLUSH_SECONDS`(100ms) / `TOKEN_FLUSH_BYTES`(4KiB) 是**服务端 env knob**，不进 wire，服务端可单方面调。
+- **硬约束**：渲染须**对任意 batch 稳健**——每帧 `message.part.delta` 当作「待追加文本段」处理（append `text`），**不按 token 计数**、**不假定帧间隔**、**不假定单帧 token 数**。批式参数服务端调，ocdroid 无需跟随改动。
+
+---
+
 ## status / active 轮询降频（收敛步骤 1 · 规划，slimapi 零改动）
 
 > **状态：规划中**（透传接口收敛 · 步骤 1）。slimapi 侧**无代码 / 契约 / wire 变更**；本节是 ocdroid 侧行为优化建议，待联合确认。依据：access log 7d 频次 + exp-1 上游事件源码确认（fork/status/active）。

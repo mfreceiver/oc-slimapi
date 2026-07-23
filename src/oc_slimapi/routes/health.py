@@ -26,6 +26,13 @@ async def health(request: Request):
             "clientMin": request.app.state.config.accepted_client_versions[0],
             "clientMax": request.app.state.config.accepted_client_versions[1],
         },
+        # Q1 冻结 (design-token-stream.md §7 / §8): token-stream capability
+        # is advertised at the ROOT level ``features.tokenStream`` (top-level,
+        # parallel to sidecar/server/schema — NOT nested under server.*).
+        # ocdroid dual-reads root/server during the rollout; the server is
+        # pinned to root. Absence → ocdroid degrades to "whole message on
+        # completion" with zero regression.
+        "features": {"tokenStream": True},
     }
     # S-E: optional deployment revision, omitted when None
     rev = request.app.state.deployment_revision

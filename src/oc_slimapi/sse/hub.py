@@ -40,6 +40,7 @@ import orjson
 
 if TYPE_CHECKING:
     from ..children_cache import ChildrenCache
+    from .token_hub import TokenStreamHub
 
 
 STOP = object()
@@ -298,6 +299,19 @@ class GlobalHub:
         self.ever_connected = False
         self.pending: dict[str, DigestFields] = {}
         self._children_cache: ChildrenCache | None = None
+        # Token-stream accumulator (design-token-stream.md). Injected from
+        # app.py via set_token_hub() exactly like _children_cache above.
+        # When None, message.part.delta/updated fall through to the
+        # catch-all drop (Stage A: hub still works without a token hub).
+        self._token_hub: TokenStreamHub | None = None
+        # Stage B (§16-B): per-epoch upstream-loss notification guard.
+        # Set to True the first time _notify_upstream_loss() fires after a
+        # successful connect; reset to False on every successful (re)connect.
+        # WHY: without this, the ``except Exception`` branch of run() would
+        # call _notify_upstream_loss() on EVERY retry-loop iteration, swamping
+        # subscribers with redundant resync frames + re-clearing the token
+        # hub on each retry. We want once-per-epoch-transition.
+        self._upstream_loss_notified: bool = False
         # G1 sticky lastError: sid -> lastError dict (cleared = popped).
         self.sticky_last_error: dict[str, dict] = {}
         # C⑩ tombstone: sids whose session.deleted digest has been emitted.
@@ -315,6 +329,27 @@ class GlobalHub:
         self.emitted_frames_total = 0
         self.reconnects_total = 0
 
+    def ensure_upstream(self) -> None:
+        """Start the run / flush / heartbeat tasks if not already running.
+
+        Extracted from :meth:`subscribe` so Stage-D token-subscribe
+        (:meth:`TokenStreamRegistry.subscribe`) can guarantee the single
+        ``/global/event`` connection is live before attaching a token
+        subscriber — WITHOUT adding a control-plane subscriber or emitting a
+        ``server.connected`` frame (design §5.2: token subscribe must
+        ``registry.get_global().ensure_upstream()``). Idempotent: a no-op
+        when the tasks are already running, and cancels any armed
+        ``stop_after_grace`` so a fresh consumer does not get torn down by a
+        grace timer fired a moment earlier.
+        """
+        if self.stop_task:
+            self.stop_task.cancel()
+            self.stop_task = None
+        if not self.task or self.task.done():
+            self.task = asyncio.create_task(self.run())
+            self.flush_task = asyncio.create_task(self.flush_loop())
+            self.heartbeat_task = asyncio.create_task(self.heartbeat_loop())
+
     def subscribe(self) -> Subscriber:
         subscriber = Subscriber(
             queue_items=self.queue_items,
@@ -324,23 +359,57 @@ class GlobalHub:
         # Welcome frame first so the client sees it before any digest/heartbeat.
         subscriber.put(sse_frame({}, event="server.connected"))
         self.subscribers.add(subscriber)
-        if self.stop_task:
-            self.stop_task.cancel()
-            self.stop_task = None
-        if not self.task or self.task.done():
-            self.task = asyncio.create_task(self.run())
-            self.flush_task = asyncio.create_task(self.flush_loop())
-            self.heartbeat_task = asyncio.create_task(self.heartbeat_loop())
+        self.ensure_upstream()
         return subscriber
 
     def unsubscribe(self, subscriber: Subscriber) -> None:
         self.subscribers.discard(subscriber)
-        if not self.subscribers and not self.stop_task:
+        if not self.has_consumers() and not self.stop_task:
             self.stop_task = asyncio.create_task(self.stop_after_grace())
+
+    def has_consumers(self) -> bool:
+        """Active curated subscribers OR token subscribers (design §5.2).
+
+        WHY a method, not a property: the design (§16-B + design v3 次要)
+        pins has_consumers as a method because it deliberately spans two
+        independent subscriber ledgers (control-plane ``self.subscribers``
+        + token-stream ``_token_hub.subscriber_count``). Call sites must
+        read it as "are we still needed by anyone across either ledger",
+        not as a cheap attribute peek — wrapping it in a property would
+        invite future callers to misuse it inside hot loops without
+        realizing it crosses ledgers.
+
+        Stage A/B: ``_token_hub.subscriber_count`` is stubbed to 0, so this
+        reduces to ``bool(self.subscribers)`` until Stage D wires real
+        per-session token subscribers.
+        """
+        if self.subscribers:
+            return True
+        th = self._token_hub
+        return th is not None and th.subscriber_count > 0
+
+    def _notify_upstream_loss(self) -> None:
+        """Canonical upstream-loss hook (design §5.2 + §16-B backstop).
+
+        WHY this exists: previously the success-reconnect and
+        exception branches of :meth:`run` each called ``resync_all()``
+        directly. Stage B needs the token hub to be cleared on the SAME
+        transitions (every stale LivePart is wrong after reconnect — the
+        GlobalBus has no replay). Centralizing the call here keeps both
+        call sites in sync as Stage C/D add more side effects (per-token-
+        subscriber ``resync{reconnect_no_replay, sessionID}`` fanout, etc.).
+
+        Called from BOTH run() reconnect paths; the per-epoch guard
+        (``_upstream_loss_notified``) ensures the exception path does not
+        fire on every retry-loop iteration.
+        """
+        self.resync_all()
+        if self._token_hub is not None:
+            self._token_hub.on_upstream_reconnect()
 
     async def stop_after_grace(self) -> None:
         await asyncio.sleep(GRACE_SECONDS)
-        if not self.subscribers:
+        if not self.has_consumers():
             for task in (self.task, self.flush_task, self.heartbeat_task):
                 if task:
                     task.cancel()
@@ -372,6 +441,16 @@ class GlobalHub:
                 subscriber.put(frame)
             if self.subscribers:
                 self.emitted_frames_total += len(self.subscribers)
+
+    def set_token_hub(self, token_hub: TokenStreamHub | None) -> None:
+        """Wire the TokenStreamHub so publish() can route
+        ``message.part.delta`` / ``message.part.updated`` into it.
+
+        Mirrors :meth:`HubRegistry.set_children_cache`: the registry owns
+        the canonical reference and pushes it onto the live GlobalHub (and
+        onto any hub constructed later via :meth:`HubRegistry.get`).
+        """
+        self._token_hub = token_hub
 
     def publish(self, global_event: dict[str, Any]) -> None:
         # Count every JSON-decoded upstream event we were asked to consider;
@@ -436,6 +515,20 @@ class GlobalHub:
                 archived_val = time_obj.get("archived")
                 if archived_val:
                     entry.archived = archived_val
+            # Stage B §16-B: PARALLEL route to the token hub. The digest
+            # work above is the control-plane contract (unchanged); this
+            # branch mirrors session.status / session.deleted into the
+            # token accumulator so it can maintain _busy_sids / retire
+            # abandoned LiveParts. It MUST NOT touch entry/flush/subscribers.
+            if self._token_hub is not None and event_type in (
+                "session.status", "session.deleted",
+            ):
+                if event_type == "session.status":
+                    status = props.get("status")
+                    if isinstance(status, str):
+                        self._token_hub.on_session_status(session_id, status)
+                else:  # session.deleted
+                    self._token_hub.on_session_deleted(session_id)
             return
 
         if event_type == "session.created":
@@ -524,6 +617,21 @@ class GlobalHub:
                     self.emitted_frames_total += len(self.subscribers)
             return
 
+        # Token-stream ingest (design-token-stream.md §5.3): route the
+        # per-token firehose into the TokenStreamHub BEFORE the catch-all
+        # drop. Stage A scope: ingest + data structures only — no flush,
+        # no subscribers, no fan-out (Stage B/C/D). Returning here keeps
+        # the control-plane branches above untouched AND prevents these
+        # high-frequency events from polluting the curated digest. When no
+        # token hub is wired, behaviour is unchanged (events are dropped).
+        if event_type in ("message.part.delta", "message.part.updated"):
+            if self._token_hub is not None:
+                if event_type == "message.part.delta":
+                    self._token_hub.on_part_delta(props)
+                else:
+                    self._token_hub.on_part_updated(props)
+            return
+
         # Drop text deltas, tool.*, message.part.*, and anything else.
 
     def resync_all(self) -> None:
@@ -559,7 +667,7 @@ class GlobalHub:
 
     async def run(self) -> None:
         delay = 1.0
-        while self.subscribers:
+        while self.has_consumers():
             try:
                 if self.client is None:
                     # Defensive: tests / misconfiguration should not hot-loop.
@@ -575,8 +683,17 @@ class GlobalHub:
                     response.raise_for_status()
                     if self.ever_connected:
                         self.reconnects_total += 1
-                        self.resync_all()
+                        # §16-B: notify token hub of upstream loss on the
+                        # successful-reconnect path. Once-per-epoch semantics
+                        # are preserved because the reconnect itself
+                        # establishes a new epoch (the previous loss, if any,
+                        # was already notified on the exception path; the
+                        # reconnect flag resets below).
+                        self._notify_upstream_loss()
                     self.ever_connected = True
+                    # New epoch begins — reset the per-epoch loss guard so
+                    # the NEXT disconnect's first exception can fire.
+                    self._upstream_loss_notified = False
                     delay = 1.0
                     data_lines: list[str] = []
                     async for line in response.aiter_lines():
@@ -591,8 +708,15 @@ class GlobalHub:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                if self.ever_connected:
-                    self.resync_all()
+                # §16-B: notify upstream loss on the exception path — but
+                # ONLY on the FIRST exception after a successful connect.
+                # Without ``_upstream_loss_notified`` the retry loop would
+                # fire on every iteration, swamping subscribers with
+                # redundant resync frames + re-clearing the token hub
+                # (each call is idempotent, but the fanout is not free).
+                if self.ever_connected and not self._upstream_loss_notified:
+                    self._notify_upstream_loss()
+                    self._upstream_loss_notified = True
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 30.0)
 
@@ -670,6 +794,10 @@ class HubRegistry:
         self.rejected_total = 0
         self._transforms: Any = None  # TransformPool, wired from app.py for metrics.
         self._children_cache: ChildrenCache | None = None
+        # Token-stream accumulator (design-token-stream.md); mirrors
+        # _children_cache injection — app.py owns construction, registry
+        # forwards the reference onto any lazily-created GlobalHub.
+        self._token_hub: TokenStreamHub | None = None
         self._removal_task: asyncio.Task | None = None
 
     def set_transforms(self, pool: Any) -> None:
@@ -685,6 +813,16 @@ class HubRegistry:
         if self._global is not None:
             self._global._children_cache = cache
 
+    def set_token_hub(self, token_hub: TokenStreamHub | None) -> None:
+        """Wire the TokenStreamHub onto the registry and any live GlobalHub.
+
+        Mirrors :meth:`set_children_cache`. ``None`` is accepted so Stage B
+        can detach the hub during shutdown if needed.
+        """
+        self._token_hub = token_hub
+        if self._global is not None:
+            self._global._token_hub = token_hub
+
     def get(self, directory: str | None = None) -> GlobalHub:
         if self._global is None:
             self._global = GlobalHub(
@@ -694,10 +832,52 @@ class HubRegistry:
                 max_frame_bytes=self.max_frame_bytes,
             )
             self._global._children_cache = self._children_cache
+            self._global._token_hub = self._token_hub
         return self._global
 
     def get_global(self) -> GlobalHub:
         return self.get(None)
+
+    def cancel_pending_removal(self) -> None:
+        """Cancel a pending grace-removal task (NB-B1, design §5.2 / §16-B).
+
+        Stage-D token-subscribe calls this so a token subscriber arriving
+        during the ``GRACE_SECONDS`` idle window does not get its hub torn
+        down by a ``_remove_hub_after_grace`` timer armed a moment earlier
+        by the last control-plane unsubscribe. Mirrors the cancel the control
+        plane does inside :meth:`GlobalHub.subscribe` / :meth:`ensure_upstream`,
+        but on the registry side (``_removal_task`` is owned by the registry,
+        not the hub). Idempotent.
+        """
+        if self._removal_task is not None:
+            self._removal_task.cancel()
+            self._removal_task = None
+
+    def maybe_arm_grace_if_idle(self) -> None:
+        """Arm the registry grace-removal iff the global hub has NO consumers.
+
+        Unified idle predicate for BOTH the control-plane and token-stream
+        last-detach paths (design §5.2 / §16-B). ``subscribe`` cancels
+        ``_removal_task`` (:meth:`cancel_pending_removal`, NB-B1) +
+        :meth:`ensure_upstream` arms the upstream connection; the matching
+        ``unsubscribe`` must RE-ARM grace when the last consumer across
+        EITHER ledger leaves — otherwise a token-only consumer (the common
+        opt-in stream path) detaches, ``GlobalHub.run()`` parks forever on
+        ``aiter_lines``, and the upstream ``/global/event`` connection + hub
+        tasks leak (B-D1).
+
+        Spans BOTH ledgers via :meth:`GlobalHub.has_consumers` so a token
+        subscriber keeps a control-plane-idle hub alive (and vice versa) —
+        symmetric with the cancel side, and avoids arming a doomed-to-no-op
+        task while any consumer remains (NB-D3). Idempotent: a no-op when
+        already armed, when the hub is gone, or when consumers remain.
+        """
+        hub = self._global
+        if hub is None or hub.has_consumers():
+            return
+        if self._removal_task is not None:
+            return
+        self._removal_task = asyncio.create_task(self._remove_hub_after_grace(hub))
 
     def notify_reconfigured_if_active(self, reason: str) -> int:
         """Push a ``server.reconfigured`` frame to active subscribers, if any.
@@ -764,8 +944,15 @@ class HubRegistry:
             # Defensive: should never happen given the idempotency check
             # above, but a misbehaving caller must not corrupt admission.
             self.total_subscribers = 0
-        if not hub.subscribers and self._removal_task is None:
-            self._removal_task = asyncio.create_task(self._remove_hub_after_grace(hub))
+        # NB-D3: arm on the unified has_consumers() predicate (spans BOTH
+        # ledgers), not just the control-plane set. When a token subscriber
+        # still keeps the hub alive, do NOT arm a doomed-to-no-op task — the
+        # token last-detach arms it via TokenStreamRegistry.unsubscribe
+        # (B-D1). Symmetric with subscribe's cancel_pending_removal /
+        # ensure_upstream. For pure control-plane flows this is behaviorally
+        # identical to the old ``not hub.subscribers`` guard (no token hub ⇒
+        # has_consumers() == bool(self.subscribers)).
+        self.maybe_arm_grace_if_idle()
 
     async def _remove_hub_after_grace(self, hub: GlobalHub) -> None:
         """Tear down an idle hub after GRACE_SECONDS and drop the reference.
@@ -780,9 +967,11 @@ class HubRegistry:
             await asyncio.sleep(GRACE_SECONDS)
         except asyncio.CancelledError:
             return
-        if hub is not self._global or hub.subscribers:
+        if hub is not self._global or hub.has_consumers():
             # Either a new hub replaced this one, or a new subscriber
             # arrived during grace and re-armed the upstream. Leave it.
+            # Stage B: has_consumers() spans BOTH ledgers — a token-only
+            # subscriber (Stage D) keeps the hub alive too (§16-B).
             self._removal_task = None
             return
         for task in (hub.task, hub.flush_task, hub.heartbeat_task, hub.stop_task):

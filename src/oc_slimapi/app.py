@@ -11,8 +11,9 @@ from .config import settings
 from .errors import register_error_handlers
 from .observability import BatchLedger
 from .proxy import install_proxy
-from .routes import events, health, messages, metrics, questions, sessions, sessions_children
+from .routes import events, health, messages, metrics, questions, sessions, sessions_children, token_stream
 from .sse.hub import HubRegistry
+from .sse.token_hub import TokenStreamHub, TokenStreamRegistry
 from .transform import TransformConfig, TransformPool
 from .upstream import create_client
 from .versioning import SlimapiVersionMiddleware
@@ -85,6 +86,28 @@ async def lifespan(app: FastAPI):
         max_frame_bytes=settings.sse_max_frame_bytes,
     )
     app.state.hubs.set_children_cache(app.state.children)
+    # Token-stream accumulator (design-token-stream.md §5.3). Constructed
+    # unconditionally so publish() can route message.part.delta/updated
+    # into it the moment the first upstream event arrives; subscriber /
+    # flush / fan-out wiring lands in Stage B/C/D. Independent ledger —
+    # does NOT consume MAX_TOTAL_SUBSCRIBERS.
+    app.state.token_hub = TokenStreamHub()
+    app.state.hubs.set_token_hub(app.state.token_hub)
+    # Stage D (design-token-stream.md §5.1 / §6): independent admission
+    # ledger for token-stream subscribers. Own cap
+    # (token_stream_max_subscribers) — does NOT consume
+    # MAX_TOTAL_SUBSCRIBERS. Holds a back-reference to HubRegistry so
+    # subscribe() can ensure_upstream() + cancel a pending grace-removal
+    # (NB-B1). The flush loop is started on first-attach / stopped on
+    # last-detach (NB-C4); see TokenStreamRegistry.subscribe/unsubscribe.
+    app.state.token_registry = TokenStreamRegistry(
+        app.state.token_hub,
+        app.state.hubs,
+        max_subscribers=settings.token_stream_max_subscribers,
+        queue_items=settings.token_stream_queue_items,
+        buffer_bytes=settings.token_stream_buffer_bytes,
+        max_frame_bytes=settings.token_stream_max_frame_bytes,
+    )
     # Wire the transform pool into the registry so /slimapi/metrics can
     # report activeTransforms / waitingTransforms without the hub module
     # importing transform.py (would be a circular import via skeleton.py).
@@ -97,6 +120,10 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await app.state.children.aclose()
+        # NB-C4: stop the token flush loop on shutdown (idempotent; no-op if
+        # already stopped on last-detach). Must precede hubs.close() so the
+        # registry / hub are still coherent while the loop drains.
+        app.state.token_hub.stop()
         await app.state.hubs.close()
         await app.state.upstream.aclose()
         # Drain in-flight transforms before letting the process exit so a
@@ -110,7 +137,11 @@ app.add_middleware(
     SlimapiVersionMiddleware,
     accepted_client_versions=settings.accepted_client_versions,
 )
-for router in (health.router, sessions.router, sessions_children.router, messages.router, questions.router, events.router, metrics.router):
+# token_stream is registered alongside the other /slimapi routers and BEFORE
+# install_proxy's catch-all (design §5.1: route must precede the reverse
+# proxy). Its path ``/slimapi/sessions/{sid}/stream`` does not shadow
+# ``/{sid}/status`` or ``/{sid}/children`` (different literal suffixes).
+for router in (health.router, sessions.router, sessions_children.router, messages.router, questions.router, events.router, metrics.router, token_stream.router):
     app.include_router(router)
 install_proxy(app)
 

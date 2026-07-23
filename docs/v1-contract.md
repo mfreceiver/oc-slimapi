@@ -6,6 +6,7 @@
 > |---|---|---|---|---|
 > | **2026-07-21** | **1（additive，未 bump）** | **F** | ocdroid v0.11.7 契约反馈落地（设计 v6 + 实现）：**§1** `/slimapi/sessions` 200 加三头 `X-Complete` / `X-Discovery-Directories` / `X-Discovery-Ready`；`start` 语义勘误为 epoch-ms 时间戳水位（非 offset）；非 list body→503；**roots 默认保持 False**。**§2** partId 跨 thin/`/full` 稳定（schema-valid）ratify；placeholder 保留为 message-level 兜底（去 placeholder 转 backlog）。**§3** 新 SSE 帧 `server.reconfigured{reason:"discovery_changed",at}`（仅 discovery 集合变或就绪态 false→true）；`resync` 路径完全不动；`load_products` 全程锁 + 双层 list shape 守卫 + last-known-good。**§4** `/health`+`/ready` schema 加 `version`/`clientMin`/`clientMax`。247 tests green。设计稿：`docs/ocmar/specs/2026-07-21-ocdroid-v0.11.7-feedback-design.md`。 | §1 / §2 / §3 / §4 / §5 / §13 |
 > | **2026-07-21** | **1（additive，未 bump）** | **G** | **Opt-A partial-envelope（体验优先 patch）**：能力头 `X-Slimapi-Capabilities`（grammar: comma-split,trim,single `=`,name case-insensitive,value literal,unknown/malformed ignored,dup-conflict fail-closed） + B2 六行响应矩阵（success/partial/errors-only/terminal-envelope-completion/top-503） + C1 累计 413 顶层一致（不返 partial）+ per-mid `upstream_unavailable` 映射（opt-in 仅，non-opt-in 仍顶层 503）+ Retry-After（顶层 HTTP + envelope `retryAfterMs` bounds）+ feature flag + rollback thresholds（5xx>2×baseline / baseline=0→>1% / unknown-code>5% / sample≥100 / 1h window）+ `/metrics` batch ledger（`optA{disabledLatched,disabledReason}`, `counters{...}`, `rollbackWindow{...}`, `byteSamples{...}`）。**Additive，未 bump** `X-Slimapi-Version`（仍为 `1`）。落地对照 §2（G6 批处理依赖能力头）、§7（`upstream_unavailable` per-mid envelope）、§6（指标 ledger 扩展）、**new §15**。**S-C** byte-ratio aggregation (median/P90) added to `byteSamples`; **S-E** optional deployment revision env-or-file injected into `/slimapi/health`. | §2 / §7 / §6 / §15 |
+> | **2026-07-23** | **1（additive，未 bump）** | **J** | **Token-stream SSE（opt-in 实时流）**：新可选端点 `GET /slimapi/sessions/{sid}/stream`（`text/event-stream`；progressive text-part 流式渲染）。加性 wire 帧：`message.part.snapshot{done:false}`（握手锚点）/ `message.part.delta{text}` / `message.part.snapshot{done:true}`（**杠杆1：仅完成 marker，无 text**——权威全文走 `/since`）/ `message.part.snapshot{truncated:true}` / `resync{reason,sessionID}`（reason ∈ `reconnect_no_replay`/`subscriber_backpressure`/`token_memory_limit`/`session_idle`/`session_deleted`）/ `server.connected{sessionID}` / `server.heartbeat{}`(15s)。**不发 SSE `id:`、无 replay buffer**；`Last-Event-ID` 值忽略、仅触发首帧 resync。终态顺序不变式：同 part 所有 delta 必先于 `snapshot{done:true}`。**§3.x**（端点 + 帧 + 不变式 + `/since` 真值 + gzip）+ **§6.x addendum**（token T3 信封：独立账本不占 `MAX_TOTAL_SUBSCRIBERS`、预算「同时最多 1 条前台 stream」、内存预算 **Option B 拆 4+4 不双计**（4MiB live + 4MiB pending）、admission 溢出 503 `sse_token_subscriber_limit` + `Retry-After`、**token stream 默认 gzip = 首个 SSE gzip 例外**——控制面 `/slimapi/events` 仍不 gzip）+ **§2** 端点表加 stream 行 + **§7** 加 `sse_token_subscriber_limit` code + health 根级 `features.tokenStream` 加性字段。**Additive，未 bump** `X-Slimapi-Version`（仍 `1`）。设计权威 `docs/design-token-stream.md` v4。落地对照 §2 / §3.x / §6.x / §7。受影响 CLIENT_CHANGES：Token stream SSE 节（杠杆1 done:true marker 无 text）。 |
 > | **2026-07-22** | **1（additive，未 bump）** | **I** | **session.created→父 digest childrenVersion（X-main 失效）**：hub 新增 `session.created` 处理——提取子 `info.parentID`→`children_cache.invalidate(parentID)`（bump generation + 驱逐父 cache）+ 触发**父** digest 带 `childrenVersion=generation_of(parentID)`；`DigestFields` 加 `children_version` 字段；`HubRegistry.set_children_cache` 接线（仿 `set_transforms`）。客户端 digest 收到更大 childrenVersion→重拉 `GET /slimapi/sessions/{sid}/children`（缓存已失效→fresh fetch）。**Additive，未 bump** `X-Slimapi-Version`。落地对照 §3（digest childrenVersion）/ §16（invalidate 语义）。受影响 CLIENT_CHANGES：session.digest childrenVersion 消费。 |
 > | **2026-07-22** | **1（additive，未 bump）** | **H** | **children 投影端点 + per-key 缓存**：新端点 `GET /slimapi/sessions/{sid}/children`（child skeleton **数组** + 响应头 `X-Children-Version`；sid 感知错误映射复用 §7；slimapi 侧稳定排序 `time.created DESC, id ASC`）；`GET /slimapi/sessions` 每条加性 `childrenIDs[]`/`childrenComplete` hint（纯缓存回填、budget 32、超限省略，杜绝 N× 放大）；`fetch_json_mapped` 加 `expect` 参数（默认 dict、children 用 list）；per-key 缓存（TTL 30s/空 5s、single-flight per-waiter Future、generation 守卫防旧覆盖新、shutdown 取消+await）。**Additive，未 bump** `X-Slimapi-Version`（仍 `1`）。落地对照 §2（children 行 + 小节）/ §7 / **新 §16**。受影响 CLIENT_CHANGES：children 端点消费 / sessions hint / childrenVersion 与 digest 比对（Batch4 接入）。 | §2 / §7 / §16 |
 > | **2026-07-20** | **1（无 wire 变更）** | **E** | ocdroid §6「slimapi 侧待确认事项」3 项 slimapi 侧源码级确认（纯核验，无行为变更）：(1) messageID 全路径 verbatim 透传（含 SSE digest fan-out：`skeleton.py:142` info deepcopy / `hub.py:415` `message_id=info.id` / `questions.py:60` q/p 不触碰 id）；(2) `Partial+scope.directories==0` 结构不可能（Partial ⇒ ≥1 fetch ⇒ N≥1）、`Success+N==0` 真实可达（冷启动空 allowlist，§2 + 单测锚定），ocdroid N==0 retain-prior gate 设计正确；(3) `/sessions` 最小错误消费深度（log code + rethrow 原始）= 契约正确，slimapi 不要求差异化（codes 为 observability 面，非分支契约）。**无 wire 变更，不 bump**。确认报告：`docs/ocmar/reports/2026-07-20-v0.2.2-ocdroid-handoff-confirmation.md`。 | 本条 changelog（ocdroid §6 反向确认；无 wire 变更） |
@@ -24,7 +25,7 @@
 > - **2026-07-20 / 2026-07-19 · v1（additive）**：`/slimapi/questions`+`/permissions` 的 `directory` 改可选（null=聚合 allowlist，**F1**）；`/slimapi/sessions/{sid}/status` 放宽 allowlist（sid 自洽，**F2**）；sidecar 启动主动 warm `/project` 暖 allowlist（**F3a**）；routeToken 应答路径 allowlist miss 自动刷新（**F3b**）；`CLIENT_CHANGES.md` SSE 节同步（**F4**）；§1 `accepted:[1,1]` 闭区间说明（**F5**）；新增 §12 directory 三态语义表 + §13 allowlist 机制（**§5**）；**G1** `session.digest` 加 `lastError?` 三态字段 + 新 `event: session.error` session-less 帧 + 脱敏算法；**G6** `GET /slimapi/messages/{sid}/full?ids=` 批量展开端点（envelope + mid 级部分失败 + chunk-ledger 累计预算）；D1–D8 文档同步（§11 标 closed）。受影响 CLIENT_CHANGES：SSE（`lastError` / `session.error`）、消息批量展开、q/p null directory、cold-start 顺序、错误体形状。
 > - **2026-07-18 · v1 B1（additive）**：`session_not_found`(404) / 顶层 `upstream_unavailable`(503) / 顶层 `upstream_http_N`(502) / `shell_not_allowed`(403) / `invalid_directory_count`(400) / `invalid_route_token`(400) / thin 路由错误体 `{"code":...}`（非 `{"detail":...}`） / G2 status 404-502-503 分裂 / projects 5xx 502→503。详见 §7。受影响 CLIENT_CHANGES：错误体形状。
 
-> 状态：契约收敛版（A1-A3/B1-B3/C1-C2 全定，A2=A 时间戳锚点；rev B F1–F5/§5/G1/G6/D1–D8；rev C Gap1–3 ratify；rev D ocdroid 客户端适配完成 + 部署 v0.11.5；rev E ocdroid §6 三项 slimapi 侧确认；**rev F ocdroid v0.11.7 反馈落地（sessions 三头 + discovery_changed SSE + health schema + partId ratify）**；**rev G Opt-A partial-envelope（体验优先 patch）**；**rev H children 投影端点 + per-key 缓存**；**rev I session.created→父 digest childrenVersion（X-main 失效）**）。配套原型与正式实现已覆盖；本文 🔒=已覆盖、🆕=历史缺口标注（§11 已闭环）。
+> 状态：契约收敛版（A1-A3/B1-B3/C1-C2 全定，A2=A 时间戳锚点；rev B F1–F5/§5/G1/G6/D1–D8；rev C Gap1–3 ratify；rev D ocdroid 客户端适配完成 + 部署 v0.11.5；rev E ocdroid §6 三项 slimapi 侧确认；**rev F ocdroid v0.11.7 反馈落地（sessions 三头 + discovery_changed SSE + health schema + partId ratify）**；**rev G Opt-A partial-envelope（体验优先 patch）**；**rev H children 投影端点 + per-key 缓存**；**rev I session.created→父 digest childrenVersion（X-main 失效）**；**rev J token-stream SSE（opt-in 实时流；杠杆1 done:true marker 无 text + 杠杆2 gzip 首个 SSE 例外 + 独立 T3 账本 + 内存预算 Option B 4+4）**）。配套原型与正式实现已覆盖；本文 🔒=已覆盖、🆕=历史缺口标注（§11 已闭环）。
 > 权威性：本文件是正式实现的唯一基准。与 design-v2/INTERFACE_MAP 冲突时以本文件为准；后者需随后同步。
 
 ## §0 范围与架构
@@ -66,6 +67,7 @@
 | POST | `/slimapi/questions/{qid}/reject` | A | 🔒 | 同上 |
 | POST | `/slimapi/sessions/{sid}/permissions/{pid}` | A | 🔒 | 同上（`response: once/always/reject`） |
 | GET | `/slimapi/events` | A | 🔒 (archived 🆕；rev F reconfigured 🆕) | 实例级策展 SSE（见 §3；含 `server.reconfigured`） |
+| GET | `/slimapi/sessions/{sid}/stream` | A | 🆕 rev J | opt-in 实时 token stream SSE（见 §3.x；**gzip 默认[lever2，首个 SSE gzip 例外]**、独立 T3 账本[§6.x]、终态 done:true marker 无 text[lever1]） |
 | * | `/{path}` (catch-all) | B | 🔒 | 透传 opencode（含发消息等写）；客户端发 `X-Opencode-Directory` 头过透传 |
 
 ### 写路径（B2）🔒
@@ -151,6 +153,63 @@
 - **连接建立期 coalescing（rev F）**：带 `Last-Event-ID` 重连时，同连接可能先收 `resync{reconnect_no_replay}` 再收队列内 `server.connected`（既有行为）。客户端 **SHOULD** 对同一 SSE 连接建立期的 cold-start 触发帧做 once-latch coalescing（至多一次 reconcile；reconcile 幂等）。
 - **heartbeat ≠ 上游健康**：`server.heartbeat` 仅证 sidecar + 订阅连接存活；上游 outage 探测委托 `GET /slimapi/ready` 或自然 fetch/write 失败。sidecar 进程重启 = 连接断开；客户端重连收 `server.connected`，**应**视为 cold-start 触发。
 
+## §3.x Token stream SSE（opt-in 实时流，rev J 🆕）
+
+> **状态**：加性 wire 行为，**不 bump** `X-Slimapi-Version`（仍 `1`）。设计权威 `docs/design-token-stream.md` v4。客户端能力探测：`GET /slimapi/health` 根级 `features.tokenStream===true`（Q1 冻结路径：top-level `features`，与 `sidecar`/`server`/`schema` 并列）；缺/404/405 → 降级既有「完成后整条出现」（`/since` 拉权威全文），**零回归**。
+
+### §3.x.1 端点
+
+- `GET /slimapi/sessions/{sid}/stream?directory=<optional>`；`text/event-stream`；响应头 `Cache-Control:no-cache,no-transform`、`X-Accel-Buffering:no`、`X-Slimapi-Subscriber-ID:<ephemeral>`。
+- `/slimapi/**` 版本门禁复用 `SlimapiVersionMiddleware`（仍 `X-Slimapi-Version:1`，**不 bump**）；无 route-level `Depends`。
+- `directory` 可选 query；`normalize_directory()`；query 与 `X-Opencode-Directory` 头冲突（trailing-slash 归一后不等）→ 400 `directory_not_allowed`。directory 仅过滤进程级 GlobalBus 事件，**不开第二条上游连接**；sid 全局唯一、directory 无关（单用户 T3）。路由注册在 catch-all 反代之前；不遮蔽 `/{sid}/status`、`/{sid}/children`。
+- **opt-in**：客户端前台/动画层才连；切后台/换 session 应断开（详见 §6.x token T3 信封「同时最多 1 条前台 stream」）。连接独立于控制面 `/slimapi/events`——两条连接，互不替代。
+- **P1 范围**：仅 text part（reasoning / tool-input 延后 P2+）；不做二进制流。
+
+### §3.x.2 Wire 帧
+
+```
+# 1) 订阅首帧：活跃 part 累计全文锚点
+event: message.part.snapshot
+data: {"sessionID":"…","messageID":"…","partID":"…","text":"<累计全文>","done":false}
+
+# 2) 批式增量（100ms / 4KiB flush；§5.4 design）
+event: message.part.delta
+data: {"sessionID":"…","messageID":"…","partID":"…","text":"<本窗拼接>"}
+
+# 3) 终态 marker（杠杆1：去终态全文——仅完成标记，无 text；权威全文走 /since）
+event: message.part.snapshot
+data: {"sessionID":"…","messageID":"…","partID":"…","done":true}
+
+# 4) 大 part 超 1MiB（done:false 或 done:true 均可能）——不静默 drop
+event: message.part.snapshot
+data: {"sessionID":"…","messageID":"…","partID":"…","truncated":true,"done":false|true}
+
+# 5) resync（背压/重连/超大/内存上限/生成结束清理；token resync 恒带 sessionID）
+event: resync
+data: {"reason":"subscriber_backpressure|reconnect_no_replay|token_memory_limit|session_idle|session_deleted","sessionID":"…"}
+
+# 6) server.connected{sessionID} / server.heartbeat{}（15s）
+```
+
+- **不发 SSE `id:` 字段**、**无 replay buffer**；`Last-Event-ID` 仅触发首帧 `resync{reconnect_no_replay,sessionID}`，**值忽略**。
+- **终态顺序不变式（wire 强约束）**：对同一 `(sid,mid,pid)`，所有 `message.part.delta` 帧必先于对应 `snapshot{done:true}` 入队；`done:true` 后该 part 不许再发 delta。
+- **杠杆1（决定性）**：终态 `snapshot{done:true}` 是**仅完成 marker，不带 text**——取消上游 `part.text` 终态重发。**权威全文走 `/since`**（持久化真值）；token stream 是动画层，`/since` 幂等覆盖且凌驾所有 token 帧。客户端可接受 digest 完成先于/晚于 token 终态帧。
+- **resync reasons**（token 流均带 `sessionID`）：`reconnect_no_replay`（上游重连）/ `subscriber_backpressure`（订阅者 T3 溢出）/ `token_memory_limit`（全局累加器上限）/ `session_idle`（生成结束清理）/ `session_deleted`（会话被删除）。**单 part >1MiB 不走 resync**，而是 `message.part.snapshot{truncated:true}`（见上）——客户端清该 part streamOwned、走 `/since`。
+- **truncated 处理**：收 `snapshot{truncated:true}`（done:false 或 done:true 均可能）→ 客户端清该 part streamOwned、停 append、走 `/since`。
+- **reasoning/tool part**（`part.type!="text"`）的 delta **静默 drop+计数**（C3），不 resync；field≠"text" 的 delta 丢弃。
+
+### §3.x.3 gzip（杠杆2 — 首个 SSE gzip 例外）
+
+- token stream **默认 gzip**（流式 zlib `Z_SYNC_FLUSH`，`Content-Encoding: gzip`）；按 `Accept-Encoding` 协商。
+- **首个 SSE gzip 例外**：此前「SSE 永不 gzip」（§9 + §1 [0.1.0]）的唯一破例；控制面 `/slimapi/events` **仍不 gzip**。
+- **实测性能**（详见 `docs/design-token-stream.md` §11，harness `scripts/measure_token_overhead.py`，12 trace、30 tok/s × 100ms）：原批式 ~12x 开销 → 杠杆1+2 后 gzip 中位 **1.47x**（**达成 re-anchor ~1.5x 中位目标**；1/3 trace <1.0x）。残余 ~0.3x（短消息/低冗余内容）记 Stage E 可选调参（flush 窗 100→200ms、gzip flush cadence、level），post-release。
+
+### §3.x.4 与控制面 / `/since` 的关系
+
+- 控制面 `/slimapi/events`（§3）**一行不改**——token 流消费上游 `message.part.delta`/`updated`（控制面此前丢弃），与控制面队列隔离（独立 T3 账本，§6.x）。
+- part/message 完成仍走既有路径：`message.updated`(step-finish) → digest → 客户端 `/since` 拉权威全文。
+- token stream `snapshot{done:true}` 是「流视角完成」；digest + `/since` 是「持久化真值」。不一致以 `/since` 为准（幂等覆盖，凌驾所有 token 帧）。
+
 ## §4 冷启动 & resync（A1 + A3）🔒
 - **sidecar 启动暖机**：lifespan 在 smoke 后 best-effort 调一次 `/project` 预热 `app.state.directory_allowlist` + `allowlist_ready`（`warm_allowlist`；失败仅吞错，不阻断启动，ready 保持 False）。**v0.3.0** allowlist 已不作 gate，暖机仅供 `/slimapi/projects` 展示与 q/p null-directory 聚合 fan-out；不再有"lazy `require_directory` 刷新"回退路径。
 - **客户端冷启动顺序**：
@@ -182,6 +241,22 @@
 - admission 在 `HubRegistry.subscribe` 单一无 await 临界段；超限→503 `sse_subscriber_limit_directory`/`_total`（带 `limit`/`current`/`Retry-After`）。
 - 转换池（fix-9 🔒）：`MAX_TRANSFORMS=1`，admission 在下载前，限长读 `MAX_RESPONSE_BYTES=64MiB`，parse/project/gzip offload worker thread。
 
+### §6.x Token stream T3 信封（rev J 🆕，加性）
+
+> 设计权威 `docs/design-token-stream.md` §6。token 订阅**独立账本**，与控制面 SSE T3 隔离——避免 token 高吞吐挤掉 q/p 或误触控制面 `subscriber_backpressure`。**控制面 `MAX_TOTAL_SUBSCRIBERS=16` / `MAX_SUBSCRIBERS_PER_DIRECTORY=8` 等既有上限一行不改**。
+
+- **独立 admission 账本**：token 订阅**不**占用控制面 `MAX_TOTAL_SUBSCRIBERS=16`；自有 `token_stream_max_subscribers=8`、`token_stream_queue_items=64`、`token_stream_buffer_bytes=512KiB/sub`、`token_stream_max_frame_bytes=1MiB`。
+- **同时最多 1 条前台 stream**（客户端预算，对应设计 §9 #7；token stream 每连接绑单 sid）。
+- **内存预算 = Option B（拆 4+4，不双计）**：
+  - `TOKEN_LIVEPARTS_MAX_BYTES=4MiB`（live `LivePart.chunks` 累计字节）
+  - `TOKEN_PENDING_MAX_BYTES=4MiB`（pending `DeltaAccumulator` 累计字节，与 live **不双计**——同一 delta chunk 不在两个池同时占额度）
+  - 单 part 上限 `TOKEN_PART_MAX_BYTES=1MiB`；全局活跃 part 数 `TOKEN_LIVE_PARTS_MAX=32`。
+  - **裁定**：Option B（拆 4+4）优于 Option A（合并 8MiB 单池），因 pending 独立上限更防御（pending 突发不挤掉 live 退役预算）；worst-case 与 Option A 同上限但内部更难同时打满。
+  - **worst-case**：`8 × 512KiB 订阅队列 + 4MiB live + 4MiB pending = 12MiB`。
+  - `_reserve` 处理 delta 超剩余预算 → 退役最旧 part（按 `last_delta_ms`）+ `resync{token_memory_limit,sessionID}`。
+- **admission 溢出** → 503 `{"code":"sse_token_subscriber_limit","limit":8,"current":N}` + `Retry-After:5`。
+- **gzip**：token stream 默认 gzip（杠杆2，§3.x.3，首个 SSE gzip 例外）；控制面 `/slimapi/events` 仍不 gzip。
+
 ## §7 错误码 🔒 + 🆕 (additive, no X-Slimapi-Version bump)
 
 > v1 B1（2026-07-18）扩充：thin 路由错误体由 FastAPI 默认 `{"detail":…}` 改为 `{"code":…}`，并新增以下 code；均为加性、不 bump `X-Slimapi-Version`。详见 `docs/v1-impl-spec.md` §11 + `docs/CLIENT_CHANGES.md`「错误体形状」。
@@ -202,6 +277,7 @@
   - **top-level**：G2 status / projects / G6 **discover** 等对 upstream **非 404 的 4xx** → 502（discover 5xx 走 503，见上）
   - **G6 envelope**：mid **≥400（含 5xx）** → `errors[]` `upstream_http_N`，**整请求仍 200**（mid 5xx **不**升级为整请求 5xx）
 - 503 `transform_busy`（`Retry-After`；含 G6 skeleton pool 饱和）/ `upstream_unavailable`（含 G6：discover 5xx·网络·坏 JSON；**任一 mid 网络失败**——且 **优先于** 累计 413）/ allowlist 刷新失败 / `sse_subscriber_limit_*` 🆕
+- 503 `sse_token_subscriber_limit`（rev J 🆕，token stream admission 溢出；带 `{"limit":8,"current":N}` + `Retry-After:5`；**独立账本**，不占控制面 `MAX_TOTAL_SUBSCRIBERS`，见 §6.x）
 - **`upstream_unavailable`（envelope per-mid，仅 Opt-A opt-in 且存在成功 item 或其它 envelope error）**：mid 网络失败（`httpx.RequestError`）在 envelope 中映射为此 code，同时可选携带 `retryAfterMs`（ms，≤10000）。整请求仍 200，items 含成功项。非 opt-in 或全部 mids 网络失败时仍为顶层 503 `upstream_unavailable`。详见 §15。
 - **`upstream_error`**：**G6 envelope** mid 2xx body 不可解析（坏 JSON）；亦见 q/p fan-out 单 dir 失败项。非整请求 500。
 - 504 `upstream_timeout`（q/p mutation）
@@ -213,6 +289,8 @@
 
 ## §9 gzip 🆕（小修）
 所有 JSON 路由的 `json_response` 调用转发 `accept_encoding=request.headers.get("accept-encoding")`。sessions/questions 已做；health/ready 等补齐。
+
+> **SSE gzip 例外（rev J 🆕）**：历史「SSE 永不 gzip」由 token stream 打破——`GET /slimapi/sessions/{sid}/stream` **默认 gzip**（杠杆2，首个 SSE gzip 例外，详见 §3.x.3）；控制面 `GET /slimapi/events` **仍不 gzip**。
 
 ## §10 延后（非 v1）
 skeleton 共享缓存（YAGNI，先指标）、多用户（独立 stack）、Part 展开 UI、sessions status 迁移、circuit breaker、metrics 之外的可观测。

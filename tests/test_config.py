@@ -117,3 +117,44 @@ def test_validate_rejects_inverted_version_range():
     settings = _base(server_api_version=1, accepted_client_versions=(2, 1))
     with pytest.raises(RuntimeError, match=r"slimapi version configuration is invalid"):
         settings.validate()
+
+
+# ---------------------------------------------------------------------------
+# Token-stream knobs (NB2 rev-2): Settings.validate() guards the token-stream
+# T3 envelope the same way it guards the control-plane envelope (design §6).
+# These run here so a future knob tweak cannot silently bypass validation.
+# ---------------------------------------------------------------------------
+
+def test_validate_accepts_default_token_stream_knobs():
+    """The §6 defaults (8 subs / 64 items / 512KiB / 1MiB) must validate."""
+    _base(
+        token_stream_max_subscribers=8,
+        token_stream_queue_items=64,
+        token_stream_buffer_bytes=512 * 1024,
+        token_stream_max_frame_bytes=1024 * 1024,
+    ).validate()  # must not raise
+
+
+def test_validate_rejects_zero_token_stream_subscribers():
+    settings = _base(token_stream_max_subscribers=0)
+    with pytest.raises(RuntimeError, match=r"TOKEN_STREAM_MAX_SUBSCRIBERS must be >= 1"):
+        settings.validate()
+
+
+def test_validate_rejects_single_item_token_stream_queue():
+    """Queue < 2 cannot hold both resync + STOP after overflow clear."""
+    settings = _base(token_stream_queue_items=1)
+    with pytest.raises(RuntimeError, match=r"TOKEN_STREAM_QUEUE_ITEMS must be >= 2"):
+        settings.validate()
+
+
+def test_validate_rejects_zero_token_stream_buffer_bytes():
+    settings = _base(token_stream_buffer_bytes=0)
+    with pytest.raises(RuntimeError, match=r"TOKEN_STREAM_BUFFER_BYTES must be > 0"):
+        settings.validate()
+
+
+def test_validate_rejects_zero_token_stream_max_frame_bytes():
+    settings = _base(token_stream_max_frame_bytes=0)
+    with pytest.raises(RuntimeError, match=r"TOKEN_STREAM_MAX_FRAME_BYTES must be > 0"):
+        settings.validate()

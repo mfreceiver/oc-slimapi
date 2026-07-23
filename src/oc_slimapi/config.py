@@ -10,6 +10,54 @@ from urllib.parse import urlsplit
 from .versioning import ACCEPTED_CLIENT_VERSIONS, SERVER_API_VERSION
 
 
+# ---------------------------------------------------------------------------
+# Token-stream budget / timing constants (design-token-stream.md §6).
+#
+# These are code-level (not env-overridable) because they are wire-invariant
+# tuning knobs: changing them does NOT change the wire contract, only server-
+# side batching/memory behaviour. The per-subscriber envelope knobs above
+# (token_stream_*) ARE env-overridable for ops break-glass.
+#
+# Stage E (§16-C residual): the memory budget is split 4+4 (Option B).
+# ``TOKEN_LIVEPARTS_MAX_BYTES`` bounds the authoritative LivePart text
+# (seed + committed deltas); ``TOKEN_PENDING_MAX_BYTES`` bounds the
+# transient DeltaAccumulator flush window (unflushed chunks). The same
+# delta byte physically occupies BOTH buffers simultaneously (LivePart.chunks
+# is the persistent authoritative copy; DeltaAccumulator.chunks is the
+# transient pre-flush shadow), so each budget independently protects its
+# OWN buffer — no double-count of a single buffer. Total worst-case
+# accumulator memory = 4 + 4 = 8 MiB (unchanged from the pre-split merged
+# cap, but now each growth mode is bounded independently).
+# ---------------------------------------------------------------------------
+TOKEN_PART_MAX_BYTES = 1024 * 1024             # 1 MiB — single part accumulation cap
+TOKEN_LIVE_PARTS_MAX = 32                      # global active LivePart count cap (C5)
+TOKEN_LIVEPARTS_MAX_BYTES = 4 * 1024 * 1024    # 4 MiB — global LivePart byte cap (C5, Stage E split)
+TOKEN_PENDING_MAX_BYTES = 4 * 1024 * 1024      # 4 MiB — global pending (unflushed) byte cap (Stage E split)
+TOKEN_FLUSH_SECONDS = 0.1                      # 100 ms flush window
+TOKEN_FLUSH_BYTES = 4096                       # 4 KiB early-flush threshold per accumulator
+TOKEN_ACC_IDLE_MS = 60_000                     # 60 s idle TTL for orphan LivePart retirement
+TOKEN_HEARTBEAT_SECONDS = 15                   # keepalive vs stunnel / proxy idle timeout
+# Stage B bounded tombstones (§16-B): _disabled_parts / _nontext_parts are
+# insertion-ordered bounded maps so a long-running sidecar cannot leak memory
+# across many truncated / non-text parts. 4096 entries / 300 s TTL mirrors the
+# kind of budget a single opencode process run is ever likely to produce; prune
+# is on-insert (oldest first) — see TokenStreamHub._prune_bounded.
+TOKEN_DISABLED_MAX = 4096                      # cap on _disabled_parts / _nontext_parts
+TOKEN_DISABLED_TTL_S = 300                     # 5 min TTL on tombstone entries
+TOKEN_DISABLED_TTL_MS = TOKEN_DISABLED_TTL_S * 1000
+# Stage C (NB-B2): bound on _pending_session_resinks queue. A single sid that
+# cycles busy→idle (or a flap of session.deleted events) must not let the
+# queue grow unbounded across a long-running sidecar; oldest entries are
+# dropped when the cap is exceeded (the newest resync reason is the most
+# relevant — clients cold-start on any resync regardless).
+TOKEN_RESYNC_QUEUE_CAP = 64
+# Default per-frame byte ceiling for token-stream frames (design §6). Mirrors
+# Settings.token_stream_max_frame_bytes; Stage D wires the env-overridable
+# value through TokenStreamHub's constructor. Code-level here so TokenStreamHub
+# has a sensible default for tests / unwired state.
+DEFAULT_TOKEN_MAX_FRAME_BYTES = 1024 * 1024    # 1 MiB
+
+
 def _version_range(value: str) -> tuple[int, int]:
     try:
         minimum, maximum = (int(item.strip()) for item in value.split(",", 1))
@@ -52,6 +100,22 @@ class Settings:
     sse_queue_items: int = int(os.getenv("OC_SLIMAPI_SSE_QUEUE_ITEMS", "256"))
     sse_buffer_bytes: int = int(os.getenv("OC_SLIMAPI_SSE_BUFFER_BYTES", str(2 * 1024 * 1024)))
     sse_max_frame_bytes: int = int(os.getenv("OC_SLIMAPI_SSE_MAX_FRAME_BYTES", str(256 * 1024)))
+    # Token-stream SSE (design-token-stream.md §6): independent per-session
+    # opt-in stream for live text-part deltas. Own ledger — does NOT consume
+    # MAX_TOTAL_SUBSCRIBERS. Worst case 8 × 512KiB queues + 8MiB accumulators
+    # (4 live + 4 pending, Stage E split) = 12MiB (contract §6 addendum).
+    # Module-level budget constants (flush / heartbeat / memory caps) live
+    # below this class.
+    token_stream_max_subscribers: int = int(
+        os.getenv("OC_SLIMAPI_TOKEN_STREAM_MAX_SUBSCRIBERS", "8")
+    )
+    token_stream_queue_items: int = int(os.getenv("OC_SLIMAPI_TOKEN_STREAM_QUEUE_ITEMS", "64"))
+    token_stream_buffer_bytes: int = int(
+        os.getenv("OC_SLIMAPI_TOKEN_STREAM_BUFFER_BYTES", str(512 * 1024))
+    )
+    token_stream_max_frame_bytes: int = int(
+        os.getenv("OC_SLIMAPI_TOKEN_STREAM_MAX_FRAME_BYTES", str(1024 * 1024))
+    )
     # Shell/PTY HTTP deny-list (spec §6). Default ON; the path table is
     # code-level in proxy.py (hardcoded from B0 §1.3 route scan of opencode
     # v1.18.3). This toggle exists for ops break-glass only — turning it OFF is
@@ -164,6 +228,24 @@ class Settings:
             raise RuntimeError("OC_SLIMAPI_SSE_BUFFER_BYTES must be > 0")
         if self.sse_max_frame_bytes <= 0:
             raise RuntimeError("OC_SLIMAPI_SSE_MAX_FRAME_BYTES must be > 0")
+
+        # Token-stream guards (design-token-stream.md §6). Same shape as the
+        # control-plane SSE guards above: queue_items must be >= 2 so the
+        # Stage-D overflow terminal path can land resync + STOP after a clear,
+        # and the byte / subscriber caps must be strictly positive.
+        if self.token_stream_max_subscribers < 1:
+            raise RuntimeError("OC_SLIMAPI_TOKEN_STREAM_MAX_SUBSCRIBERS must be >= 1")
+        if self.token_stream_queue_items < 2:
+            raise RuntimeError(
+                "OC_SLIMAPI_TOKEN_STREAM_QUEUE_ITEMS must be >= 2 "
+                "(overflow terminal path enqueues resync + STOP after clearing; "
+                "a queue of size 1 cannot hold both, which would drop STOP and "
+                "violate the token-stream backpressure contract)"
+            )
+        if self.token_stream_buffer_bytes <= 0:
+            raise RuntimeError("OC_SLIMAPI_TOKEN_STREAM_BUFFER_BYTES must be > 0")
+        if self.token_stream_max_frame_bytes <= 0:
+            raise RuntimeError("OC_SLIMAPI_TOKEN_STREAM_MAX_FRAME_BYTES must be > 0")
 
         # Opt-A rollback / retry-after guards (v0.3.1, additive).
         if self.opt_a_rollback_window_seconds < 1:
