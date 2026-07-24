@@ -9,7 +9,10 @@ from .access_log import setup_access_log
 from .capabilities import parse_capabilities
 from .children_cache import ChildrenCache
 from .config import settings
+from .discovery import warm_allowlist
 from .errors import register_error_handlers
+from .logging_config import get_logger, setup_logging
+from .middleware.request_id import RequestIdMiddleware
 from .middleware.traffic_accounting import TrafficAccountingMiddleware
 from .observability import BatchLedger
 from .proxy import install_proxy
@@ -29,7 +32,8 @@ async def smoke(app: FastAPI) -> None:
         try:
             sessions = (await app.state.upstream.get("/session", params={"limit": 1})).json()
             sid = sessions[0].get("id") if sessions else None
-        except Exception:
+        except Exception as exc:
+            get_logger("app").warning("smoke: failed to fetch sessions list", exc_info=exc)
             sid = None
     if not sid:
         return
@@ -41,12 +45,18 @@ async def smoke(app: FastAPI) -> None:
             valid = valid and isinstance(payload[0].get("info", {}).get("id"), str)
             valid = valid and all(isinstance(part.get("type"), str) for part in payload[0].get("parts", []))
         app.state.schema_degraded = not valid
-    except Exception:
+    except Exception as exc:
+        get_logger("app").warning("smoke: schema validation failed", exc_info=exc)
         app.state.schema_degraded = True
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Application logging (stderr StreamHandler on the oc_slimapi root logger).
+    # Must come before any other logging setup so sub-loggers see the level /
+    # handler from the start.  Also before settings.validate() so config errors
+    # are also logged.
+    setup_logging()
     settings.validate()
     app.state.config = settings
     # Structured access log (RotatingFileHandler on the oc_slimapi.access
@@ -96,7 +106,8 @@ async def lifespan(app: FastAPI):
     # S-E: best-effort deployment revision (env or file, swallow errors)
     try:
         app.state.deployment_revision = settings.read_deployment_revision()
-    except Exception:
+    except Exception as exc:
+        get_logger("app").warning("failed to read deployment revision", exc_info=exc)
         app.state.deployment_revision = None
     # T3-hardened hub registry (contract §6): per-subscriber byte budget,
     # per-frame ceiling, and per-directory / total admission caps all flow
@@ -141,9 +152,29 @@ async def lifespan(app: FastAPI):
     # importing transform.py (would be a circular import via skeleton.py).
     app.state.hubs.set_transforms(app.state.transforms)
     await smoke(app)
+    # ------------------------------------------------------------------
+    # Startup banner: log concise operational summary (redacting secrets).
+    # ------------------------------------------------------------------
+    logger = get_logger("app")
+    logger.info(
+        "oc-slimapi %s starting: host=%s port=%s upstream=%s "
+        "max_transforms=%s shell_deny_list_enabled=%s "
+        "token_stream_max_subscribers=%s traffic_ledger_enabled=%s "
+        "access_log_path=%s",
+        __version__,
+        settings.host,
+        settings.port,
+        settings.upstream,
+        settings.max_transforms,
+        settings.shell_deny_list_enabled,
+        settings.token_stream_max_subscribers,
+        settings.traffic_metrics_enabled,
+        settings.access_log_path if settings.access_log_enabled else "disabled",
+    )
+    logger.info("route_secret=<redacted>")
     # F3: best-effort allowlist warm-up so the first routeToken-bearing reply
     # does not hit a cold allowlist. Failure is non-fatal (lazy refresh fallback).
-    await sessions.warm_allowlist(app)
+    await warm_allowlist(app)
     try:
         yield
     finally:
@@ -171,6 +202,8 @@ app.add_middleware(
 # proxy. Pure-ASGI (NOT BaseHTTPMiddleware) so SSE / StreamingResponse keep
 # streaming untouched.
 app.add_middleware(TrafficAccountingMiddleware)
+# Request-id middleware (outermost — wraps everything including traffic accounting).
+app.add_middleware(RequestIdMiddleware)
 # token_stream is registered alongside the other /slimapi routers and BEFORE
 # install_proxy's catch-all (design §5.1: route must precede the reverse
 # proxy). Its path ``/slimapi/sessions/{sid}/stream`` does not shadow

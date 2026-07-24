@@ -8,12 +8,13 @@ from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel
 from starlette.responses import Response
 
+from ..directory import validate_directory
+from ..discovery import load_products
 from ..errors import CodedHTTPException
 from ..gzip_util import json_response
 from ..tokens import RouteTokenError, issue_route_token, verify_route_token
 from ..traffic import stash_up_in, stash_up_out
 from ..upstream import decoded_body_headers, forward_directory_headers
-from ..directory import normalize_directory
 
 router = APIRouter(prefix="/slimapi", tags=["pending"])
 
@@ -28,7 +29,7 @@ async def _aggregate(request: Request, kind: Literal["question", "permission"], 
         # Normalize BEFORE dedupe: `/app` and `/app/` are the same directory
         # once trailing slashes are stripped. Deduping on raw strings would
         # fan-out duplicate upstream calls and inflate scope.directories.
-        normalized = [normalize_directory(d) for d in directories]
+        normalized = [validate_directory(d) for d in directories]
         unique = list(dict.fromkeys(normalized))
         if not unique or len(unique) > 32:
             raise CodedHTTPException(400, code="invalid_directory_count")
@@ -44,7 +45,6 @@ async def _aggregate(request: Request, kind: Literal["question", "permission"], 
         allowlist = request.app.state.directory_allowlist
         if not allowlist:
             try:
-                from .sessions import load_products
                 await load_products(request.app, traffic_request=request)
             except Exception:
                 pass
@@ -133,7 +133,7 @@ async def _token(
     # slimapi no longer gates the token's directory — normalize and forward.
     # The token was issued by slimapi for a specific directory, so we honour
     # that signature; upstream opencode decides whether it can serve the dir.
-    return normalize_directory(payload["directory"])
+    return validate_directory(payload["directory"])
 
 
 async def _post(request: Request, path: str, directory: str, body: dict):

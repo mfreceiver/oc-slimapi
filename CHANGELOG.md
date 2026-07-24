@@ -30,6 +30,38 @@ ocdroid 对接时：
 
 > 开发中、尚未打 tag 的变更写在这里；`release.sh` 发版时把本节内容折叠进新版本标题下。
 
+### Added
+
+- *(none yet)*
+
+---
+
+## [0.9.0] - 2026-07-24
+
+> 可观测性地基（应用日志 + `X-Request-ID` 关联 + access log `requestId` + startup banner）+ 安全加固（catch-all 路径归一闭合 `//session//shell` 绕过、directory 校验、剥 `X-Forwarded-*`/cookie）+ 指标增强（traffic 每桶 latency 分位 / 错误计数、sessions 列表 transform admission）+ 架构整洁（路由解耦、配置收编、异常链）。**全加性 wire 行为，`X-Slimapi-Version` 仍 `1`，不 bump**；ocdroid 对接：新增 400 `invalid_path`/`invalid_directory`、sessions 列表高并发可能 503 `transform_busy`、`X-Request-ID` 头与 access `requestId`（诊断用，非契约依赖）。
+
+### Added
+
+- **可观测性地基**：新增应用级日志（env `OC_SLIMAPI_LOG_LEVEL`，默认 INFO，stderr handler；不触碰 access JSONL logger）；**`X-Request-ID`** 关联——最外层纯 ASGI 中间件为每请求生成/透传 `X-Request-ID`（入站值含 CR/LF/控制字符/空白/超 128 则丢弃改生成 uuid），响应头回显（去重），并作为上游头透传 opencode；access log（`logs/access.jsonl`）每条记录新增 `requestId` 字段；startup banner 记录生效配置（route secret 输出 `<redacted>`）；多处静默 `except` 补 `logger.warning` 与 `raise … from exc`。**加性运维/诊断，不 bump `X-Slimapi-Version`**。
+- **`proxy.py` 路径归一化与防遍历（S2）**：catch-all 反代新增 `_normalize_path()`，折叠 `//` 并拒绝 `..`/`.` 段（→ **400 `invalid_path`**）；deny-list 检查与上游转发共用同一归一化路径，闭合 `//session//{sid}/shell` 等逃逸缺口；`/slimapi/` 命名空间判断移至归一化之后。**加性安全加固，不 bump `X-Slimapi-Version`**。
+- **`directory.py` `validate_directory()` 校验（S5）**：新增 `validate_directory()`，拒绝 `..`/NUL/控制字符/超长（>4096）→ **400 `invalid_directory`**，替代 `normalize_directory()` 作为路由层入参守卫。路由层 6 处入口（sessions/messages/questions/token_stream/children/catch-all proxy）均已迁移。**加性安全加固，不 bump `X-Slimapi-Version`**。
+- **`upstream.py` 扩展 `strip_hop_by_hop`（M1）**：新增剥去 `x-forwarded-*`、`x-real-*`、`x-real-ip` 及 `cookie` 头（opencode 不依赖 cookie）。保留 `x-request-id`（批次1 关联头）。**加性安全加固，不 bump `X-Slimapi-Version`**。
+- **`/slimapi/metrics` 流量分位与错误计数（M5）**：traffic ledger 新增每桶 `errors4xx`/`errors5xx` 计数与 `latencyMs`（`p50`/`p90`/`p99`/`count`，取自最近 1024 个 `duration_ms` 样本）。**加性诊断字段，不 bump `X-Slimapi-Version`**。
+
+### Changed
+
+- **sessions 列表纳入 transform admission（M8）**：`/slimapi/sessions` 列表的 upstream 取数→解析→投影现由 `TransformPool`（`max_transforms`）门控，skeleton 投影卸载到 worker 池；池饱和时返回 **503 `transform_busy`**（与 messages 路径一致）。客户端：高并发列表可能收到 `transform_busy`，按既有重试语义处理。**非破坏性（新增饱和退路），不 bump `X-Slimapi-Version`**。
+
+### Security
+
+- **S2/S5/M1**：拒绝畸形 path/directory、不冒传伪造客户端 IP/转发链头、不冒传 cookie。均为加性安全加固，不影响合法客户端，不需 bump wire API 版本。
+- **catch-all directory 校验语义**：catch-all 反代对 `?directory=` query / `X-Opencode-Directory` 头做**安全门**校验（拒绝 `..`/NUL/控制字符/超长），但作为透明反代**原样转发**原始值（不归一化）；thin 路由因自行构造上游调用而归一化。合法 directory 二者语义一致。
+
+### Known Limitations
+
+- **`/slimapi/sessions` 列表单响应 body 未做 `read_with_cap`**：TransformPool admission 限制**并发**列表请求数（`max_transforms`），但不限制单个 upstream 响应体大小；`max_transforms=1` 时单个超大 `/session` 响应仍可能占用较多内存。后续可对齐 messages 的流式 `read_with_cap`。
+- **`latencyMs` 分位口径**：`/slimapi/metrics` 的 `p50`/`p90`/`p99` 采用**高偏 nearest-rank**（`samples[min(n-1, int(n*p/100))]`，`int` 截断），非线性插值；跨系统比较时注意口径差异。
+
 ---
 
 ## [0.8.0] - 2026-07-24

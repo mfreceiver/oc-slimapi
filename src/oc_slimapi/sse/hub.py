@@ -38,6 +38,10 @@ from typing import TYPE_CHECKING, Any
 import httpx
 import orjson
 
+from oc_slimapi.logging_config import get_logger
+
+logger = get_logger(__name__)
+
 if TYPE_CHECKING:
     from ..children_cache import ChildrenCache
     from ..traffic import TrafficLedger
@@ -271,6 +275,8 @@ class Subscriber:
         self.closed = True
         self.forced_disconnects += 1
         self._clear_queue()
+        logger.warning("sse subscriber forced disconnect (backpressure)",
+                      extra={"subscriber_id": self.id})
         resync = sse_frame({"reason": "subscriber_backpressure"}, event="resync")
         with contextlib.suppress(asyncio.QueueFull):
             self.queue.put_nowait(resync)
@@ -385,10 +391,12 @@ class GlobalHub:
         subscriber.put(sse_frame({}, event="server.connected"))
         self.subscribers.add(subscriber)
         self.ensure_upstream()
+        logger.info("sse subscriber attach", extra={"subscriber_id": subscriber.id})
         return subscriber
 
     def unsubscribe(self, subscriber: Subscriber) -> None:
         self.subscribers.discard(subscriber)
+        logger.info("sse subscriber detach", extra={"subscriber_id": subscriber.id})
         if not self.has_consumers() and not self.stop_task:
             self.stop_task = asyncio.create_task(self.stop_after_grace())
 
@@ -740,14 +748,14 @@ class GlobalHub:
                                     bytes_in=_upstream_line_bytes(line),
                                 )
                             except Exception:
-                                pass
+                                logger.warning("sse traffic accounting failed", exc_info=True)
                         if line.startswith("data:"):
                             data_lines.append(line[5:].lstrip())
                         elif not line and data_lines:
                             try:
                                 self.publish(orjson.loads("\n".join(data_lines)))
                             except orjson.JSONDecodeError:
-                                pass
+                                logger.debug("upstream sse malformed frame dropped", exc_info=True)
                             data_lines.clear()
             except asyncio.CancelledError:
                 raise
@@ -761,6 +769,10 @@ class GlobalHub:
                 if self.ever_connected and not self._upstream_loss_notified:
                     self._notify_upstream_loss()
                     self._upstream_loss_notified = True
+                logger.warning(
+                    "upstream sse disconnected, reconnecting in %.1fs",
+                    delay, exc_info=True,
+                )
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 30.0)
 

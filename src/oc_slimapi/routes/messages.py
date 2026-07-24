@@ -32,8 +32,8 @@ from ..upstream import (
     strip_hop_by_hop,
 )
 from ..upstream_errors import fetch_json_mapped
-from ..directory import normalize_directory
-from .sessions import _raise_upstream_status
+from ..directory import validate_directory
+from ..upstream_errors import raise_upstream_status as _raise_upstream_status
 
 router = APIRouter(prefix="/slimapi/messages/{sid}", tags=["messages"])
 
@@ -224,7 +224,7 @@ async def _resolve_messages_directory(request: Request, directory: str | None) -
     if header_dir:  # treat empty header as absent
         if (header_dir.rstrip("/") or "/") != (directory.rstrip("/") or "/"):
             raise CodedHTTPException(400, code="directory_not_allowed")
-    return normalize_directory(directory)
+    return validate_directory(directory)
 
 
 async def _stream_upstream(
@@ -241,8 +241,8 @@ async def _stream_upstream(
     )
     try:
         return await request.app.state.upstream.send(upstream_request, stream=True)
-    except httpx.RequestError:
-        raise CodedHTTPException(503, code="upstream_unavailable")
+    except httpx.RequestError as exc:
+        raise CodedHTTPException(503, code="upstream_unavailable") from exc
 
 
 async def _drain_error(response, request: Request | None = None) -> Response:
@@ -462,8 +462,8 @@ async def messages(
         )
         try:
             response = await request.app.state.upstream.send(upstream_request, stream=True)
-        except httpx.RequestError:
-            raise CodedHTTPException(503, code="upstream_unavailable")
+        except httpx.RequestError as exc:
+            raise CodedHTTPException(503, code="upstream_unavailable") from exc
         # Wrap the upstream iterator so the response body bytes are counted
         # (``upIn`` for the messages bucket). ``len(chunk)`` only — body is
         # not buffered.
@@ -580,7 +580,7 @@ async def message_batch(
         resp = await request.app.state.upstream.get(
             f"/session/{sid}", headers=forward_directory_headers(directory),
         )
-    except httpx.RequestError:
+    except httpx.RequestError as exc:
         if opt_in:
             accept_enc = request.headers.get("accept-encoding")
             # Intentionally not recorded to Opt-A ledger: discover is pre-envelope /
@@ -591,7 +591,7 @@ async def message_batch(
                 accept_encoding=accept_enc,
                 retry_after_seconds=max(1, math.ceil(config.opt_a_retry_after_ms_conservative / 1000)),
             )
-        raise CodedHTTPException(503, code="upstream_unavailable")
+        raise CodedHTTPException(503, code="upstream_unavailable") from exc
     # Traffic accounting: discover response body (small, but counts toward
     # the messages bucket upIn — the discover GET is part of the batch
     # request's upstream work).
@@ -626,7 +626,7 @@ async def message_batch(
     # 200 + malformed body must not proceed to mid expand (→ 503).
     try:
         resp.json()
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError) as exc:
         if opt_in:
             accept_enc = request.headers.get("accept-encoding")
             # Intentionally not recorded to Opt-A ledger: discover is pre-envelope /
@@ -637,7 +637,7 @@ async def message_batch(
                 accept_encoding=accept_enc,
                 retry_after_seconds=None,
             )
-        raise CodedHTTPException(503, code="upstream_unavailable")
+        raise CodedHTTPException(503, code="upstream_unavailable") from exc
 
     sem = asyncio.Semaphore(4)
     # Shared ledger: total is debited per decoded chunk under a no-await
@@ -909,8 +909,8 @@ async def message(
         )
         try:
             response = await request.app.state.upstream.send(upstream_request, stream=True)
-        except httpx.RequestError:
-            raise CodedHTTPException(503, code="upstream_unavailable")
+        except httpx.RequestError as exc:
+            raise CodedHTTPException(503, code="upstream_unavailable") from exc
         try:
             # Wrap mid-stream upstream I/O failures (httpx.RequestError raised by
             # _drain_error.aread() or read_with_cap.aiter_bytes()) into a structured
@@ -922,8 +922,8 @@ async def message(
                 body, n_read = await read_with_cap(
                     response, request.app.state.config.max_message_bytes,
                 )
-            except httpx.RequestError:
-                raise CodedHTTPException(503, code="upstream_unavailable")
+            except httpx.RequestError as exc:
+                raise CodedHTTPException(503, code="upstream_unavailable") from exc
             # Traffic accounting: cap-read upstream bytes.
             stash_up_in(request, n_read)
             if body is None:

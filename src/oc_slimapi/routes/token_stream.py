@@ -36,7 +36,7 @@ import zlib
 from fastapi import APIRouter, Request
 from starlette.responses import StreamingResponse
 
-from ..directory import normalize_directory
+from ..directory import validate_directory
 from ..errors import CodedHTTPException
 from ..gzip_util import json_response
 from ..sse.token_hub import STOP, TokenSubscriberCapacityError, _resync_frame
@@ -66,7 +66,7 @@ def _resolve_directory_conflict(request: Request, directory: str | None) -> None
         if (header_dir.rstrip("/") or "/") != (directory.rstrip("/") or "/"):
             raise CodedHTTPException(400, code="directory_not_allowed")
     # Normalise for parity (unused — directory does not filter fanout).
-    normalize_directory(directory)
+    validate_directory(directory)
 
 
 @router.get("/sessions/{sid}/stream")

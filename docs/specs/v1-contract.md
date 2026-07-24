@@ -264,10 +264,13 @@ data: {"reason":"subscriber_backpressure|reconnect_no_replay|token_memory_limit|
 > 2026-07-19 加性：G6 `invalid_ids` / envelope `message_not_found` / envelope `upstream_error`（mid 坏 JSON）；F2 收窄 `directory_not_allowed` 适用范围。
 > 2026-07-20 加性（rev C）：`GET /slimapi/sessions` 列表端点失败路径对齐 §7（原静默偏离：upstream 4xx/5xx 原样透传 body、网络错落 FastAPI 默认 `{"detail":...}` 500；现统一 4xx→502 `upstream_http_N`、5xx/网络→503 `upstream_unavailable`，body 为 `{"code":...}`）。
 > **v0.3.0** 加性：**完全移除 directory allowlist gate**——directory ∉ allowlist 不再 400；slimapi 把 normalized directory 作为 `X-Opencode-Directory` + `?directory=` 透传，由上游 opencode 决定能否服务。`directory_not_allowed` 错误码保留，仅用于 messages `/**` query `directory` 与 `X-Opencode-Directory` 头冲突的结构性歧义。
+> **v0.9.0** 加性：新增 catch-all `invalid_path`（400）、`invalid_directory`（400）安全守卫；`/slimapi/sessions` 列表纳入 transform admission（池饱和→503 `transform_busy`）；`X-Request-ID` 关联头 + access log `requestId` + 应用日志/startup banner（运维诊断）。均为加性，不 bump `X-Slimapi-Version`。
 >
 > **top-level vs envelope**：下列 code 默认指 thin 路由 **HTTP 状态 + body `{"code":…}`**。G6 另有 **envelope 语境**（整请求通常仍 200，code 出现在 `errors[]` 的 mid 项）。**同一 code 名两语境含义不同**，见各条标注。
 
 - 400 `version_required` / `version_incompatible` / `directory_not_allowed` / `invalid_directory_count` / `invalid_route_token` / **`invalid_ids`**（G6 top-level：`ids` 空 / 超 20 / 解析后无有效 mid）
+  - **`invalid_path`** 🆕（catch-all 反代）：归一化后路径含 `..` / `.` 段 → 400（与 `//` 折叠同在 `_normalize_path`；defense-in-depth，合法路径不含此类段）。
+  - **`invalid_directory`** 🆕：thin 路由与 catch-all 的 `?directory=` query / `X-Opencode-Directory` 头含 `..` 段 / NUL / 控制字符 / 长度 > 4096 → 400（`validate_directory()`；加性安全守卫，不 gate 合法 directory）。
   - **`directory_not_allowed` 适用范围**（**v0.3.0** 收窄）：**仅** messages `/**`（list / since / full/{mid} / full?ids=）当 query `directory` 与 `X-Opencode-Directory` 头同时存在且冲突时返 400——这是结构性歧义（slimapi 不能猜该透传哪个），与上游能否服务无关。**不再**因 directory ∉ allowlist 触发；其它结构性守卫（`invalid_directory_count` 显式 list 0 / >32、`invalid_route_token`、版本门禁）不变。
 - 403 `shell_not_allowed`（catch-all shell/PTY deny-list；ops 可关，非安全保证）
 - 404 `session_not_found`（`GET /slimapi/sessions/{sid}/status` 与 G6 **discover** 的 upstream 404；top-level，带 `sessionID`）；`thin_route_not_found`
@@ -277,13 +280,14 @@ data: {"reason":"subscriber_backpressure|reconnect_no_replay|token_memory_limit|
 - 502 `upstream_http_N`
   - **top-level**：G2 status / projects / G6 **discover** 等对 upstream **非 404 的 4xx** → 502（discover 5xx 走 503，见上）
   - **G6 envelope**：mid **≥400（含 5xx）** → `errors[]` `upstream_http_N`，**整请求仍 200**（mid 5xx **不**升级为整请求 5xx）
-- 503 `transform_busy`（`Retry-After`；含 G6 skeleton pool 饱和）/ `upstream_unavailable`（含 G6：discover 5xx·网络·坏 JSON；**任一 mid 网络失败**——且 **优先于** 累计 413）/ allowlist 刷新失败 / `sse_subscriber_limit_*` 🆕
+- 503 `transform_busy`（`Retry-After`；含 G6 skeleton pool 饱和、**`/slimapi/sessions` 列表 projection 池饱和** 🆕）/ `upstream_unavailable`（含 G6：discover 5xx·网络·坏 JSON；**任一 mid 网络失败**——且 **优先于** 累计 413）/ allowlist 刷新失败 / `sse_subscriber_limit_*` 🆕
 - 503 `sse_token_subscriber_limit`（rev J 🆕，token stream admission 溢出；带 `{"limit":8,"current":N}` + `Retry-After:5`；**独立账本**，不占控制面 `MAX_TOTAL_SUBSCRIBERS`，见 §6.x）
 - **`upstream_unavailable`（envelope per-mid，仅 Opt-A opt-in 且存在成功 item 或其它 envelope error）**：mid 网络失败（`httpx.RequestError`）在 envelope 中映射为此 code，同时可选携带 `retryAfterMs`（ms，≤10000）。整请求仍 200，items 含成功项。非 opt-in 或全部 mids 网络失败时仍为顶层 503 `upstream_unavailable`。详见 §15。
 - **`upstream_error`**：**G6 envelope** mid 2xx body 不可解析（坏 JSON）；亦见 q/p fan-out 单 dir 失败项。非整请求 500。
 - 504 `upstream_timeout`（q/p mutation）
 - thin 路由错误体统一：`{"code":string, "message"?:string, ...}`（非 `{"detail":...}`）
 - FastAPI 参数缺失/类型错误仍为 422（如 G6 缺 `ids`）
+- 🆕 **可观测性（加性，不 bump、不构成协议契约依赖）**：每请求由最外层中间件生成/透传 `X-Request-ID`（请求头 + 响应头回显，并透传上游 opencode；入站值含 CR/LF/控制字符/空白/超 128 则丢弃改生成）；access log（`logs/access.jsonl`）每条记录含 `requestId` 字段。客户端可 echo 该头做跨 sidecar↔opencode 关联诊断。
 
 ## §8 客户端 v1 最小集（C1，暂停 — ocdroid）
 连接(R8)+版本头+health 自检(M2/fail-closed)+冷启动(sessions+q/p 快照，见 §4)+SSE(digest+q/p+`lastError`/`session.error`)+digest 触发拉消息(`/since`)+全文(`/full/{mid}` 或 G6 batch)+发消息(X-Opencode-Directory 透传)+q/p 应答(routeToken)+resync=冷启动。**+ C3 health 改 `/slimapi/health`（fix-7 已落地）**。

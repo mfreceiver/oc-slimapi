@@ -16,7 +16,8 @@ import time
 import orjson
 import pytest
 
-from oc_slimapi.skeleton import SKELETON_INLINE_OUTPUT_MAX_BYTES, skeleton_messages
+from oc_slimapi.config import settings as _skel_config
+from oc_slimapi.skeleton import skeleton_messages
 from oc_slimapi.transform import (
     TransformBusy,
     TransformConfig,
@@ -43,7 +44,7 @@ def _sample_messages() -> list[dict]:
                     "state": {
                         "status": "completed",
                         "input": {"command": "ls", "debug": "drop me"},
-                        "output": "x" * (SKELETON_INLINE_OUTPUT_MAX_BYTES + 1000),
+                        "output": "x" * (_skel_config.skeleton_inline_output_max_bytes + 1000),
                     },
                 },
             ],

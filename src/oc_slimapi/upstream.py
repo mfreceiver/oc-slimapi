@@ -13,6 +13,16 @@ HOP_BY_HOP = {
 }
 DIRECTORY_HEADER = "X-Opencode-Directory"
 
+# Additional headers that must not be forwarded from client to upstream.
+# These are security-sensitive or may be spoofed by untrusted clients.
+FORBIDDEN_PREFIXES = {
+    "x-forwarded-",
+    "x-real-",
+}
+FORBIDDEN_EXACT = {
+    "x-real-ip",
+}
+
 
 def create_client(config: Settings) -> httpx.AsyncClient:
     return httpx.AsyncClient(
@@ -30,7 +40,23 @@ def strip_hop_by_hop(headers: Mapping[str, str]) -> dict[str, str]:
         if item.strip()
     }
     blocked = HOP_BY_HOP | connection_tokens
-    return {key: value for key, value in headers.items() if key.lower() not in blocked}
+
+    # Also strip forbidden forwarded headers
+    result: dict[str, str] = {}
+    for key, value in headers.items():
+        key_lower = key.lower()
+        if key_lower in blocked:
+            continue
+        if key_lower in FORBIDDEN_EXACT:
+            continue
+        if any(key_lower.startswith(prefix) for prefix in FORBIDDEN_PREFIXES):
+            continue
+        # Strip cookie header — opencode does not rely on cookies and it is
+        # security-sensitive to forward potentially-session-fixing cookies.
+        if key_lower == "cookie":
+            continue
+        result[key] = value
+    return result
 
 
 def decoded_body_headers(headers: Mapping[str, str]) -> dict[str, str]:

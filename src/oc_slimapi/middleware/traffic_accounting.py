@@ -38,7 +38,11 @@ import time
 from typing import Any, Awaitable, Callable
 
 from ..access_log import get_access_logger, write_access_log
+from ..logging_config import get_logger
 from ..traffic import SSE_BUCKETS, _read_state_int, _UP_IN_KEY, _UP_OUT_KEY, bucketize
+from .request_id import REQUEST_ID_KEY
+
+logger = get_logger("middleware.traffic_accounting")
 
 Receive = Callable[[], Awaitable[dict[str, Any]]]
 Send = Callable[[dict[str, Any]], Awaitable[None]]
@@ -183,6 +187,7 @@ def _record(
     # Access log: always (when the logger is enabled). For SSE buckets we log
     # the wire-level down_out so an operator sees the real connection payload.
     try:
+        request_id = scope.get("state", {}).get(REQUEST_ID_KEY)
         write_access_log(
             logger,
             method=method,
@@ -194,9 +199,10 @@ def _record(
             down_out=down_out,
             up_in=up_in,
             up_out=up_out,
+            request_id=request_id,
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("write_access_log failed", exc_info=exc)
 
     ledger = _ledger_from_scope(scope)
     if ledger is None:
@@ -242,5 +248,5 @@ def _record(
                 req_bytes=up_out,
                 resp_bytes=up_in,
             )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("record_upstream failed", exc_info=exc)

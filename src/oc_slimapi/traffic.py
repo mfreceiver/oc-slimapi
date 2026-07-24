@@ -31,7 +31,12 @@ When ``enabled=False`` (``OC_SLIMAPI_TRAFFIC_METRICS_ENABLED=false``) every
 from __future__ import annotations
 
 import threading
+from collections import deque
 from typing import Any, Final
+
+# Bound on retained per-bucket latency samples (oldest evicted once exceeded).
+# Keeps /slimapi/metrics snapshot percentile cost bounded.
+_LATENCY_SAMPLES: Final[int] = 1024
 
 
 # Logical bucket names. The SSE buckets are owned by ``record_sse_*``; the
@@ -137,8 +142,9 @@ class TrafficLedger:
     __slots__ = (
         "_lock",
         "_enabled",
-        "_buckets",  # bucket -> {requests, downIn, downOut, upIn, upOut}
-        "_sse",      # bucket -> {bytesIn, bytesOut, framesEmitted}
+        "_buckets",     # bucket -> {requests, downIn, downOut, upIn, upOut, errors4xx, errors5xx}
+        "_sse",         # bucket -> {bytesIn, bytesOut, framesEmitted}
+        "_latencies",   # bucket -> deque[float] (bounded duration_ms samples)
     )
 
     def __init__(self, *, enabled: bool = True) -> None:
@@ -146,6 +152,7 @@ class TrafficLedger:
         self._enabled = enabled
         self._buckets: dict[str, dict[str, int]] = {}
         self._sse: dict[str, dict[str, int]] = {}
+        self._latencies: dict[str, deque] = {}
 
     @property
     def enabled(self) -> bool:
@@ -170,10 +177,10 @@ class TrafficLedger:
         For SSE buckets the middleware passes ``resp_bytes=0`` so the SSE
         per-frame counters own ``downOut``.
 
-        .. note::
-           ``method``, ``status`` and ``duration_ms`` are accepted but
-           **reserved/unused** — status is logged separately via the access
-           log; no per-method/per-status bucket split exists.
+        ``status`` drives per-bucket error counters (``errors4xx`` /
+        ``errors5xx``) and ``duration_ms`` is retained as a bounded sample for
+        per-bucket latency percentiles in :meth:`snapshot`. ``method`` remains
+        unused (no per-method split).
         """
         if not self._enabled:
             return
@@ -182,6 +189,11 @@ class TrafficLedger:
             entry["requests"] += 1
             entry["downIn"] += max(0, req_bytes)
             entry["downOut"] += max(0, resp_bytes)
+            if 400 <= status < 500:
+                entry["errors4xx"] += 1
+            elif status >= 500:
+                entry["errors5xx"] += 1
+            self._latencies.setdefault(bucket, deque(maxlen=_LATENCY_SAMPLES)).append(duration_ms)
 
     # ---- HTTP upstream (called by ASGI middleware from stashed state) ----
 
@@ -251,7 +263,15 @@ class TrafficLedger:
 
     @staticmethod
     def _new_bucket() -> dict[str, int]:
-        return {"requests": 0, "downIn": 0, "downOut": 0, "upIn": 0, "upOut": 0}
+        return {
+            "requests": 0,
+            "downIn": 0,
+            "downOut": 0,
+            "upIn": 0,
+            "upOut": 0,
+            "errors4xx": 0,
+            "errors5xx": 0,
+        }
 
     @staticmethod
     def _new_sse() -> dict[str, int]:
@@ -278,6 +298,10 @@ class TrafficLedger:
               "totals":  {"requests", "downIn", "downOut", "upIn", "upOut"},
               "ratios":  {bucket: {"downOutOverUpIn": float}, ...},
             }
+
+        Each bucket view also carries ``errors4xx`` / ``errors5xx`` counts and,
+        when latency samples exist, ``latencyMs`` (``p50`` / ``p90`` / ``p99`` /
+        ``count`` from a bounded deque of recent ``duration_ms`` samples).
 
         ``ratios`` only includes buckets with ``upIn > 0``. For SSE buckets,
         ``downOutOverUpIn`` is the *aggregate-delivery / shared-upstream-cost*
@@ -354,9 +378,21 @@ class TrafficLedger:
                     "downOut": down_out,
                     "upIn": up_in,
                     "upOut": up_out,
+                    "errors4xx": entry.get("errors4xx", 0),
+                    "errors5xx": entry.get("errors5xx", 0),
                 }
                 if "framesEmitted" in entry:
                     view["framesEmitted"] = entry["framesEmitted"]
+                samples = list(self._latencies.get(name, ()))
+                if samples:
+                    samples.sort()
+                    n = len(samples)
+                    view["latencyMs"] = {
+                        "p50": samples[min(n - 1, int(n * 0.50))],
+                        "p90": samples[min(n - 1, int(n * 0.90))],
+                        "p99": samples[min(n - 1, int(n * 0.99))],
+                        "count": n,
+                    }
                 out_buckets[name] = view
                 if up_in > 0:
                     ratios[name] = {"downOutOverUpIn": down_out / up_in}

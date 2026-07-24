@@ -297,12 +297,19 @@ class TestSnapshotEnabled:
         snap = ledger.snapshot()
         assert snap["enabled"] is True
         b = snap["buckets"]["messages"]
-        assert set(b) == {"requests", "downIn", "downOut", "upIn", "upOut"}
+        assert set(b) == {
+            "requests", "downIn", "downOut", "upIn", "upOut",
+            "errors4xx", "errors5xx", "latencyMs",
+        }
         assert b["requests"] == 1
         assert b["downIn"] == 10
         assert b["downOut"] == 20
         assert b["upIn"] == 100
         assert b["upOut"] == 5
+        # status 200 -> no errors; one latency sample (duration_ms=1.0)
+        assert b["errors4xx"] == 0
+        assert b["errors5xx"] == 0
+        assert b["latencyMs"] == {"p50": 1.0, "p90": 1.0, "p99": 1.0, "count": 1}
         # totals are the sum across buckets
         assert snap["totals"] == {
             "requests": 1, "downIn": 10, "downOut": 20, "upIn": 100, "upOut": 5,
@@ -384,9 +391,10 @@ class TestSnapshotSseMerge:
         ledger.record_sse_downstream(bucket="events_sse", bytes_out=20)
         snap = ledger.snapshot()
         b = snap["buckets"]["events_sse"]
-        # framesEmitted is SSE-only
+        # framesEmitted is SSE-only; errors + latencyMs come from record_downstream
         assert set(b) == {
             "requests", "downIn", "downOut", "upIn", "upOut", "framesEmitted",
+            "errors4xx", "errors5xx", "latencyMs",
         }
         assert b["requests"] == 1
         assert b["upIn"] == 500          # from SSE bytesIn

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import os
 from copy import deepcopy
 from typing import Any
 
 import orjson
+
+from .config import settings
 
 PLACEHOLDER_TEXT = "[内容已折叠，点开查看]"
 PART_IDS = {"id", "type", "messageID", "sessionID"}
@@ -30,21 +31,16 @@ COMPACTION_PART_LIMIT = 64 * 1024
 # truncated. ``structured``/``result``/``raw``/``attachments`` stay always-omit
 # (giant nested JSON has no inline value to the user).
 #
-# Two caps (env-overridable tuning knobs, the config.py env pattern — they do
+# Two caps (env-overridable tuning knobs, centralised in ``Settings`` — they do
 # NOT touch the wire contract, so ``X-Slimapi-Version`` is NOT bumped):
-#   * per-field:   inline iff JSON-byte size <= SKELETON_INLINE_OUTPUT_MAX_BYTES
+#   * per-field:   inline iff JSON-byte size
+#                  <= Settings.skeleton_inline_output_max_bytes
 #   * per-message: cumulative inlined bytes across all parts in one message
-#                  <= SKELETON_INLINE_OUTPUT_MAX_MESSAGE_BYTES (once the cap is
-#                  spent, later fields in part order fall back to omit).
+#                  <= Settings.skeleton_inline_output_max_message_bytes (once
+#                  the cap is spent, later fields in part order fall back to omit).
 # The outer response still honours ``Settings.max_response_bytes`` regardless —
 # thresholding never bypasses the global body cap. Defaults: 4 KiB / 16 KiB.
 # ---------------------------------------------------------------------------
-SKELETON_INLINE_OUTPUT_MAX_BYTES = int(
-    os.getenv("OC_SLIMAPI_SKELETON_INLINE_OUTPUT_MAX_BYTES", str(4 * 1024))
-)
-SKELETON_INLINE_OUTPUT_MAX_MESSAGE_BYTES = int(
-    os.getenv("OC_SLIMAPI_SKELETON_INLINE_OUTPUT_MAX_MESSAGE_BYTES", str(16 * 1024))
-)
 # Fields eligible for inlining (small tool results / errors). Everything in
 # SKELETON_ALWAYS_OMIT_FIELDS stays omitted unconditionally.
 SKELETON_INLINE_FIELDS = ("output", "error")
@@ -87,8 +83,9 @@ def _maybe_inline_state_field(
     budget: dict[str, int] | None,
 ) -> None:
     """Inline ``state[key]`` into ``thin_state`` iff it fits BOTH the per-field
-    cap (:data:`SKELETON_INLINE_OUTPUT_MAX_BYTES`) and the remaining per-message
-    budget (:data:`SKELETON_INLINE_OUTPUT_MAX_MESSAGE_BYTES`); otherwise record
+    cap (``Settings.skeleton_inline_output_max_bytes``) and the remaining
+    per-message budget (``Settings.skeleton_inline_output_max_message_bytes``);
+    otherwise record
     ``state.<key>`` in ``omitted`` (no partial truncation — the field is either
     fully present or fully expandable via ``/full``). Mutates ``thin_state`` /
     ``omitted`` / ``budget`` in place. Only called for
@@ -97,10 +94,10 @@ def _maybe_inline_state_field(
     if key not in state:
         return
     size = _field_byte_size(state[key])
-    field_ok = size <= SKELETON_INLINE_OUTPUT_MAX_BYTES
+    field_ok = size <= settings.skeleton_inline_output_max_bytes
     budget_ok = (
         budget is None
-        or budget["used"] + size <= SKELETON_INLINE_OUTPUT_MAX_MESSAGE_BYTES
+        or budget["used"] + size <= settings.skeleton_inline_output_max_message_bytes
     )
     if field_ok and budget_ok:
         thin_state[key] = deepcopy(state[key])

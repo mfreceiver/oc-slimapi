@@ -4,8 +4,10 @@ from fastapi import FastAPI, Request, WebSocket
 from starlette.background import BackgroundTask
 from starlette.responses import JSONResponse, StreamingResponse
 
+from .directory import validate_directory
+from .errors import CodedHTTPException
 from .traffic import stash_up_in, stash_up_out
-from .upstream import strip_hop_by_hop
+from .upstream import strip_hop_by_hop, DIRECTORY_HEADER
 
 # B0 §1.3 shell/PTY route table (opencode v1.18.3). Hardcoded — do NOT infer.
 # - POST /session/{sid}/shell: legacy direct command execution (spawn).
@@ -14,6 +16,25 @@ from .upstream import strip_hop_by_hop
 # WebSocket PTY (/pty/{id}/connect upgrade) is already blocked by the global
 # WS catch-all (→ 501) below; this guard covers the HTTP-method variants.
 _SHELL_PATH_RE = re.compile(r"^/session/[^/]+/shell/?$")
+
+
+def _normalize_path(path: str) -> str:
+    """Collapse duplicate slashes and reject path traversal segments.
+
+    Mirrors opencode's ``ignoreDuplicateSlashes:true`` behaviour and adds
+    security rejection of ``..`` / ``.`` segments. Ensures the result
+    starts with ``/``.
+    """
+    # Ensure leading slash
+    if not path.startswith("/"):
+        path = "/" + path
+    # Collapse consecutive slashes
+    normalized = re.sub(r"/+", "/", path)
+    # Check for path traversal segments
+    for segment in normalized.split("/"):
+        if segment in {".", ".."}:
+            raise CodedHTTPException(400, code="invalid_path")
+    return normalized
 
 
 def _is_shell_path(path: str) -> bool:
@@ -33,9 +54,33 @@ def install_proxy(app: FastAPI) -> None:
 
     @app.api_route("/{path:path}", methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
     async def proxy(request: Request, path: str):
-        if request.url.path.startswith("/slimapi/"):
+        # Use the fully-normalized URL.path (FastAPI already collapses //)
+        raw_path = request.url.path
+        # Normalize the path (reject .. / .)
+        try:
+            norm_path = _normalize_path(raw_path)
+        except CodedHTTPException:
+            return JSONResponse({"code": "invalid_path"}, status_code=400)
+
+        if norm_path.startswith("/slimapi/"):
             return JSONResponse({"code": "thin_route_not_found"}, status_code=404)
-        if request.app.state.config.shell_deny_list_enabled and _is_shell_path(request.url.path):
+
+        # Validate X-Opencode-Directory header if present
+        dir_header = request.headers.get(DIRECTORY_HEADER)
+        if dir_header is not None:
+            try:
+                validate_directory(dir_header)
+            except CodedHTTPException:
+                return JSONResponse({"code": "invalid_directory"}, status_code=400)
+
+        # Validate ?directory= query params (catch-all forwards them upstream)
+        for dir_val in request.query_params.getlist("directory"):
+            try:
+                validate_directory(dir_val)
+            except CodedHTTPException:
+                return JSONResponse({"code": "invalid_directory"}, status_code=400)
+
+        if request.app.state.config.shell_deny_list_enabled and _is_shell_path(norm_path):
             return JSONResponse({"code": "shell_not_allowed"}, status_code=403)
         client = request.app.state.upstream
         # Wrap the downstream request body stream so we count the bytes
@@ -54,15 +99,19 @@ def install_proxy(app: FastAPI) -> None:
                 if n > 0:
                     stash_up_out(request, n)
 
+        proxy_headers = strip_hop_by_hop(request.headers)
+        rid = request.scope.get("state", {}).get("request_id")
+        if rid is not None:
+            proxy_headers["X-Request-ID"] = rid
         upstream_request = client.build_request(
             request.method,
-            f"/{path}",
+            norm_path,  # norm_path already starts with /
             params=request.query_params.multi_items(),
-            headers=strip_hop_by_hop(request.headers),
+            headers=proxy_headers,
             content=_counted_req_stream(),
         )
-        is_sse = request.url.path in {"/event", "/global/event"}
-        is_command = request.url.path.endswith("/command")
+        is_sse = norm_path in {"/event", "/global/event"}
+        is_command = norm_path.endswith("/command")
         upstream_request.extensions["timeout"] = {
             "connect": 5.0,
             "read": None if is_sse else (300.0 if is_command else 30.0),

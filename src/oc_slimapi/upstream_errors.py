@@ -4,17 +4,36 @@ Provides :func:`fetch_json_mapped` — a single-call helper that wraps upstream
 GET + error mapping + JSON parsing + shape validation, raising
 :class:`CodedHTTPException` on any issue. Success returns the parsed JSON dict.
 
+Also provides :func:`raise_upstream_status` — mapping an HTTPStatusError to a
+:class:`CodedHTTPException` (used by sessions and messages routes).
+
 Used by batch status (no sid) and by Batch 3 children endpoints (with sid).
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, NoReturn
 
 import httpx
 
 from .errors import CodedHTTPException
 from .traffic import stash_up_in
+
+
+def raise_upstream_status(exc: httpx.HTTPStatusError, *, sid: str | None = None) -> NoReturn:
+    """Map an upstream HTTPStatusError to a structured CodedHTTPException.
+
+    404 on a session-discover call (sid provided) → session_not_found;
+    other 4xx → 502 upstream_http_N; 5xx → 503 upstream_unavailable.
+    """
+    status = exc.response.status_code
+    if status == 404 and sid is not None:
+        raise CodedHTTPException(404, code="session_not_found", sessionID=sid) from exc
+    if status < 500:
+        raise CodedHTTPException(502, code=f"upstream_http_{status}") from exc
+    raise CodedHTTPException(503, code="upstream_unavailable") from exc
+
+
 
 
 async def fetch_json_mapped(
@@ -45,8 +64,8 @@ async def fetch_json_mapped(
     """
     try:
         response = await upstream.get(path, params=params, headers=headers)
-    except httpx.RequestError:
-        raise CodedHTTPException(503, code="upstream_unavailable")
+    except httpx.RequestError as exc:
+        raise CodedHTTPException(503, code="upstream_unavailable") from exc
     # Stash the upstream response body length BEFORE error mapping and
     # parsing (httpx has already buffered it for a non-streaming .get()).
     # Best-effort; ignore callers that pass traffic_request without a
@@ -55,24 +74,24 @@ async def fetch_json_mapped(
     if traffic_request is not None:
         try:
             stash_up_in(traffic_request, len(response.content))
-        except Exception:
-            pass
+        except Exception as exc:
+            pass  # swallow logging; no structured error needed
     if response.status_code >= 400:
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
             if status == 404 and sid is not None:
-                raise CodedHTTPException(404, code="session_not_found", sessionID=sid)
+                raise CodedHTTPException(404, code="session_not_found", sessionID=sid) from exc
             if status < 500:
-                raise CodedHTTPException(502, code=f"upstream_http_{status}")
-            raise CodedHTTPException(503, code="upstream_unavailable")
-        except Exception:
-            raise CodedHTTPException(503, code="upstream_unavailable")
+                raise CodedHTTPException(502, code=f"upstream_http_{status}") from exc
+            raise CodedHTTPException(503, code="upstream_unavailable") from exc
+        except Exception as exc:
+            raise CodedHTTPException(503, code="upstream_unavailable") from exc
     try:
         payload = response.json()
-    except Exception:
-        raise CodedHTTPException(503, code="upstream_unavailable")
+    except Exception as exc:
+        raise CodedHTTPException(503, code="upstream_unavailable") from exc
     if not isinstance(payload, expect):
         raise CodedHTTPException(503, code="upstream_unavailable")
     return payload

@@ -207,6 +207,16 @@ class Settings:
     )
     access_log_backups: int = int(os.getenv("OC_SLIMAPI_ACCESS_LOG_BACKUPS", "5"))
 
+    # Skeleton projection inline caps (thresholded; config.env overridable).
+    # Per-field cap: inline iff JSON-byte size <= this. Per-message cap: cumulative
+    # inlined bytes across all parts in one message <= this. Defaults: 4 KiB / 16 KiB.
+    skeleton_inline_output_max_bytes: int = int(
+        os.getenv("OC_SLIMAPI_SKELETON_INLINE_OUTPUT_MAX_BYTES", str(4 * 1024))
+    )
+    skeleton_inline_output_max_message_bytes: int = int(
+        os.getenv("OC_SLIMAPI_SKELETON_INLINE_OUTPUT_MAX_MESSAGE_BYTES", str(16 * 1024))
+    )
+
     def read_deployment_revision(self) -> str | None:
         """Best-effort deployment revision (env or file). Returns None if unset.
         Swallows read errors (non-fatal — health simply omits the field)."""
@@ -255,6 +265,26 @@ class Settings:
             raise RuntimeError("OC_SLIMAPI_TRANSFORM_WAIT_SECONDS must be > 0")
         if self.max_response_bytes <= 0:
             raise RuntimeError("OC_SLIMAPI_MAX_RESPONSE_BYTES must be > 0")
+        # Skeleton projection inline caps: per-field and per-message.
+        if self.skeleton_inline_output_max_bytes <= 0:
+            raise RuntimeError(
+                "OC_SLIMAPI_SKELETON_INLINE_OUTPUT_MAX_BYTES must be > 0"
+            )
+        if self.skeleton_inline_output_max_message_bytes <= 0:
+            raise RuntimeError(
+                "OC_SLIMAPI_SKELETON_INLINE_OUTPUT_MAX_MESSAGE_BYTES must be > 0"
+            )
+        # Capping at 16 MiB to prevent unintentional OOM (mirrors max_response_bytes
+        # but the skeleton thresholds are per-field / per-message, so a looser cap is
+        # fine — the outer response still honours Settings.max_response_bytes regardless).
+        if self.skeleton_inline_output_max_bytes > 16 * 1024 * 1024:
+            raise RuntimeError(
+                "OC_SLIMAPI_SKELETON_INLINE_OUTPUT_MAX_BYTES must be <= 16 MiB"
+            )
+        if self.skeleton_inline_output_max_message_bytes > 16 * 1024 * 1024:
+            raise RuntimeError(
+                "OC_SLIMAPI_SKELETON_INLINE_OUTPUT_MAX_MESSAGE_BYTES must be <= 16 MiB"
+            )
         # T3 subscriber / SSE-buffer guards (contract §6). All positive and
         # the global cap must be at least as large as the per-directory cap,
         # otherwise admission could never admit ``max_per_directory`` clients

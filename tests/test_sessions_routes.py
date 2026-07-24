@@ -11,6 +11,7 @@ from oc_slimapi.config import Settings
 from oc_slimapi.proxy import install_proxy
 from oc_slimapi.routes import messages, questions, sessions
 from oc_slimapi.errors import register_error_handlers
+from oc_slimapi.transform import TransformConfig, TransformPool
 
 VERSION_HEADERS = {"X-Slimapi-Version": "1"}
 
@@ -43,6 +44,12 @@ def _build_app(
     app.state.allowlist_ready = allowlist_ready
     app.state.allowlist_lock = asyncio.Lock()
     app.state.schema_degraded = False
+    # Transform pool (mirrors the real app's setup; required for offload).
+    app.state.transforms = TransformPool(TransformConfig(
+        max_transforms=app.state.config.max_transforms,
+        transform_wait_seconds=app.state.config.transform_wait_seconds,
+        max_response_bytes=app.state.config.max_response_bytes,
+    ))
     # Optional HubRegistry: when supplied, ``load_products`` notification
     # hits the spy / real hub instead of being a silent ``getattr(...,None)``.
     if hubs is not None:
@@ -441,14 +448,14 @@ async def test_load_products_takes_app_state(upstream_factory):
 
 
 async def test_warm_allowlist_swallows_upstream_error(upstream_factory):
-    from oc_slimapi.routes import sessions as sessions_mod
+    from oc_slimapi.discovery import warm_allowlist
 
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("simulated", request=request)
 
     upstream = upstream_factory(handler)
     app = _build_app(upstream)
-    await sessions_mod.warm_allowlist(app)
+    await warm_allowlist(app)
     assert app.state.directory_allowlist == set()
 
 

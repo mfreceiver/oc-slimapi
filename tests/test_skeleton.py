@@ -3,10 +3,9 @@ from pathlib import Path
 
 import orjson
 
+from oc_slimapi.config import settings as _skel_config
 from oc_slimapi.skeleton import (
     PLACEHOLDER_TEXT,
-    SKELETON_INLINE_OUTPUT_MAX_BYTES,
-    SKELETON_INLINE_OUTPUT_MAX_MESSAGE_BYTES,
     _field_byte_size,
     skeleton_messages,
 )
@@ -84,7 +83,7 @@ def test_tool_state_is_reduced_to_contract_whitelists():
         # fits the per-field cap.
         for key in ("output", "error"):
             if key in state:
-                assert _field_byte_size(state[key]) <= SKELETON_INLINE_OUTPUT_MAX_BYTES
+                assert _field_byte_size(state[key]) <= _skel_config.skeleton_inline_output_max_bytes
 
 
 def test_data_urls_are_removed_and_marked_but_short_http_urls_survive():
@@ -178,7 +177,7 @@ def test_small_tool_output_is_inlined_without_hasfull():
 def test_large_tool_output_is_omitted_with_hasfull():
     """Large output (> per-field cap) → output omitted, hasFull true, omitted
     contains state.output."""
-    output = _ascii_str_of_json_bytes(SKELETON_INLINE_OUTPUT_MAX_BYTES + 4096)
+    output = _ascii_str_of_json_bytes(_skel_config.skeleton_inline_output_max_bytes + 4096)
     source = [{"info": {"id": "m1"}, "parts": [_tool_part(output=output)]}]
     tool = skeleton_messages(source)[0]["parts"][0]
 
@@ -189,7 +188,7 @@ def test_large_tool_output_is_omitted_with_hasfull():
 
 def test_boundary_output_exactly_at_threshold_is_inlined():
     """Output whose JSON byte size == the cap is inlined (≤ is inclusive)."""
-    output = _ascii_str_of_json_bytes(SKELETON_INLINE_OUTPUT_MAX_BYTES)
+    output = _ascii_str_of_json_bytes(_skel_config.skeleton_inline_output_max_bytes)
     source = [{"info": {"id": "m1"}, "parts": [_tool_part(output=output)]}]
     tool = skeleton_messages(source)[0]["parts"][0]
 
@@ -199,7 +198,7 @@ def test_boundary_output_exactly_at_threshold_is_inlined():
 
 def test_boundary_output_one_byte_over_threshold_is_omitted():
     """Output at cap+1 JSON bytes is omitted."""
-    output = _ascii_str_of_json_bytes(SKELETON_INLINE_OUTPUT_MAX_BYTES + 1)
+    output = _ascii_str_of_json_bytes(_skel_config.skeleton_inline_output_max_bytes + 1)
     source = [{"info": {"id": "m1"}, "parts": [_tool_part(output=output)]}]
     tool = skeleton_messages(source)[0]["parts"][0]
 
@@ -214,8 +213,8 @@ def test_per_message_budget_falls_back_to_omit():
     # Each output is well under the per-field cap, but together they exceed the
     # per-message cap. Parts are processed in order; the first N fit, the rest
     # fall back to omit + hasFull.
-    per_field = SKELETON_INLINE_OUTPUT_MAX_BYTES  # 4096
-    per_message = SKELETON_INLINE_OUTPUT_MAX_MESSAGE_BYTES  # 16384
+    per_field = _skel_config.skeleton_inline_output_max_bytes  # 4096
+    per_message = _skel_config.skeleton_inline_output_max_message_bytes  # 16384
     # 8 parts × ~3000 JSON bytes each ≈ 24 KiB > 16 KiB per-message cap.
     n = 8
     size_each = per_field - 1000  # comfortably under per-field; sums > per_message
@@ -272,9 +271,9 @@ def test_utf8_multibyte_output_byte_counting_is_consistent():
     # Grow the string until its JSON byte size exceeds the per-field cap; its
     # CHAR count stays well below the cap, proving we count bytes not chars.
     emoji = "😀"
-    output = emoji * (SKELETON_INLINE_OUTPUT_MAX_BYTES // 4 + 1)
-    assert _field_byte_size(output) > SKELETON_INLINE_OUTPUT_MAX_BYTES
-    assert len(output) < SKELETON_INLINE_OUTPUT_MAX_BYTES  # chars << bytes
+    output = emoji * (_skel_config.skeleton_inline_output_max_bytes // 4 + 1)
+    assert _field_byte_size(output) > _skel_config.skeleton_inline_output_max_bytes
+    assert len(output) < _skel_config.skeleton_inline_output_max_bytes  # chars << bytes
 
     source = [{"info": {"id": "m1"}, "parts": [_tool_part(output=output)]}]
     tool = skeleton_messages(source)[0]["parts"][0]
@@ -283,7 +282,7 @@ def test_utf8_multibyte_output_byte_counting_is_consistent():
 
     # And a small multibyte output is inlined byte-identically.
     small = "画像処理"  # multibyte but tiny
-    assert _field_byte_size(small) <= SKELETON_INLINE_OUTPUT_MAX_BYTES
+    assert _field_byte_size(small) <= _skel_config.skeleton_inline_output_max_bytes
     source2 = [{"info": {"id": "m1"}, "parts": [_tool_part(output=small)]}]
     assert skeleton_messages(source2)[0]["parts"][0]["state"]["output"] == small
 
@@ -298,7 +297,7 @@ def test_small_state_error_is_inlined():
     # Whitelisted input only → no omission → no hasFull.
     assert "hasFull" not in tool
 
-    big_err = _ascii_str_of_json_bytes(SKELETON_INLINE_OUTPUT_MAX_BYTES + 1)
+    big_err = _ascii_str_of_json_bytes(_skel_config.skeleton_inline_output_max_bytes + 1)
     source2 = [{"info": {"id": "m1"}, "parts": [_tool_part(error=big_err)]}]
     tool2 = skeleton_messages(source2)[0]["parts"][0]
     assert "error" not in tool2["state"]

@@ -169,7 +169,7 @@ async def test_batch_status_upstream_4xx_returns_502(upstream_factory, status):
     ``session_not_found`` and **without** a ``sessionID`` field. The
     ``session_not_found`` code is reserved by §7 for **sid-scoped**
     discovers (``GET /slimapi/sessions/{sid}/status`` and G6 discover),
-    and ``_raise_upstream_status`` (``sessions.py:213-224``) only takes the
+    and ``raise_upstream_status`` (``upstream_errors.py``) only takes the
     404→``session_not_found`` branch when ``sid is not None``. CHANGELOG B1
     scopes the 404→``session_not_found`` split explicitly to
     ``/sessions/{sid}/status`` (single, with sid). 409 (and any other

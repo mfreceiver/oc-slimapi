@@ -101,6 +101,7 @@ def write_access_log(
     down_out: int,
     up_in: int,
     up_out: int,
+    request_id: str | None = None,
 ) -> None:
     """Emit one JSON-lines access record.
 
@@ -127,5 +128,6 @@ def write_access_log(
         "downOut": int(down_out),
         "upIn": int(up_in),
         "upOut": int(up_out),
+        "requestId": request_id,
     }
     logger.info(json.dumps(record, separators=(",", ":")))

@@ -136,3 +136,191 @@ async def test_slimapi_unknown_still_404(upstream_factory):
         response = await client.get("/slimapi/nope")
     assert response.status_code == 404
     assert response.json()["code"] == "thin_route_not_found"
+
+
+async def test_forward_injects_request_id_header(upstream_factory):
+    """Proxy request to upstream includes X-Request-ID when scope.state has it."""
+    from oc_slimapi.middleware.request_id import REQUEST_ID_KEY, RequestIdMiddleware
+
+    seen_headers: dict[str, str] = {}
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        nonlocal seen_headers
+        seen_headers = dict(request.headers)
+        async def body():
+            yield b'{"ok":true}'
+        return httpx.Response(
+            200,
+            stream=httpx._content.AsyncIteratorByteStream(body()),
+            headers={"Content-Type": "application/json"},
+        )
+
+    handler, _ = _upstream_passthrough()
+    # Replace the handler with one that captures headers
+    upstream = upstream_factory(_handler)
+    app = _build_app(_settings(), upstream)
+    # Add the request-id middleware so scope.state gets populated
+    app.add_middleware(RequestIdMiddleware)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/session")
+    assert response.status_code == 200
+    # Verify the upstream request carried X-Request-ID
+    assert "x-request-id" in {k.lower(): k for k in seen_headers}
+    assert len(seen_headers.get("x-request-id", "")) > 0
+
+
+# ── S2: path normalization ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("raw_path,expect_status,expect_code", [
+    ("/session/ses_x/shell", 403, "shell_not_allowed"),
+    ("/pty/p1/connect", 403, "shell_not_allowed"),
+])
+async def test_s2_path_normalization(upstream_factory, raw_path, expect_status, expect_code):
+    """S2: deny-list working with normalized paths."""
+    handler, seen = _upstream_passthrough()
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(raw_path)
+    assert response.status_code == expect_status
+    if expect_code:
+        assert response.json()["code"] == expect_code
+    # Upstream should NOT have been reached for deny cases
+    assert seen["path"] is None
+
+
+async def test_s2_normalized_path_is_passed_to_upstream(upstream_factory):
+    """S2: a path is forwarded correctly after normalization."""
+    handler, seen = _upstream_passthrough()
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/session")  # single slash
+    assert response.status_code == 200
+    # Upstream should have received the same path
+    assert seen["path"] == "/session"
+
+
+async def test_s2_sse_timeout_uses_normalized_path(upstream_factory):
+    """S2: SSE and command timeout detection use normalized path."""
+    from oc_slimapi.proxy import _normalize_path
+
+    # Verify the function works for known cases
+    assert _normalize_path("/event") == "/event"
+    assert _normalize_path("//event") == "/event"
+    assert _normalize_path("/global/event") == "/global/event"
+    assert _normalize_path("//global//event") == "/global/event"
+    assert _normalize_path("/command") == "/command"
+    assert _normalize_path("//command") == "/command"
+
+
+# ── S2: _normalize_path pure function tests ────────────────────────────────────
+
+
+@pytest.mark.parametrize("input_path,expected", [
+    ("/a/b", "/a/b"),
+    ("//a//b", "/a/b"),
+    ("///a///b", "/a/b"),
+    ("a/b", "/a/b"),
+    ("", "/"),
+    ("/", "/"),
+])
+def test_normalize_path_basic(input_path, expected):
+    from oc_slimapi.proxy import _normalize_path
+    assert _normalize_path(input_path) == expected
+
+
+@pytest.mark.parametrize("input_path", [
+    "/a/./b",
+    "/a/../b",
+    "/..",
+    "/.",
+    "//a///..///b",
+])
+def test_normalize_path_rejects_traversal(input_path):
+    from oc_slimapi.proxy import _normalize_path
+    from oc_slimapi.errors import CodedHTTPException
+    with pytest.raises(CodedHTTPException) as exc:
+        _normalize_path(input_path)
+    assert exc.value.status_code == 400
+    assert exc.value.code == "invalid_path"
+
+
+
+
+
+def test_normalize_path_shell_semantics():
+    """Combination: deny-list check after normalization works."""
+    from oc_slimapi.proxy import _normalize_path, _is_shell_path
+    # //session//sid//shell → /session/sid/shell → True
+    assert _is_shell_path(_normalize_path("//session//sid//shell"))
+    # //pty//pid//connect → /pty/pid/connect → True
+    assert _is_shell_path(_normalize_path("//pty//pid//connect"))
+    # normal message path → False
+    assert not _is_shell_path(_normalize_path("//session//sid//message"))
+
+
+def test_normalize_path_slimapi_bypass():
+    """Normalized //slimapi/nope is detected as slimapi route."""
+    from oc_slimapi.proxy import _normalize_path
+    norm = _normalize_path("//slimapi/nope")
+    assert norm.startswith("/slimapi/")
+    norm2 = _normalize_path("/slimapi/nope")
+    assert norm2.startswith("/slimapi/")
+
+
+# ── S5: directory header validation in proxy ───────────────────────────────────
+
+
+async def test_s5_invalid_directory_header_rejected(upstream_factory):
+    """S5: X-Opencode-Directory with invalid value → 400."""
+    from oc_slimapi.upstream import DIRECTORY_HEADER
+
+    handler, _ = _upstream_passthrough()
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/some-path",
+            headers={DIRECTORY_HEADER: "/../etc"},
+        )
+    assert response.status_code == 400
+    assert response.json()["code"] == "invalid_directory"
+
+
+async def test_s5_valid_directory_header_passed(upstream_factory):
+    """S5: valid X-Opencode-Directory header is forwarded."""
+    from oc_slimapi.upstream import DIRECTORY_HEADER
+
+    handler, seen = _upstream_passthrough()
+    # Modify handler to capture headers
+    captured_headers: dict[str, str] = {}
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        nonlocal captured_headers
+        captured_headers = dict(request.headers)
+        async def body():
+            yield b'{"ok":true}'
+        return httpx.Response(
+            200,
+            stream=httpx._content.AsyncIteratorByteStream(body()),
+            headers={"Content-Type": "application/json"},
+        )
+
+    upstream = upstream_factory(_handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/some-path",
+            headers={DIRECTORY_HEADER: "/app"},
+        )
+    assert response.status_code == 200
+    # Upstream should have received the directory header (case-insensitive)
+    header_lower = {k.lower(): v for k, v in captured_headers.items()}
+    assert header_lower.get(DIRECTORY_HEADER.lower()) == "/app"

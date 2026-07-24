@@ -57,6 +57,7 @@ def _kwargs():
         down_out=7,
         up_in=9,
         up_out=11,
+        request_id="req-123",
     )
 
 
@@ -81,7 +82,7 @@ def test_write_emits_one_json_line_with_all_fields(tmp_path):
     # Every documented field is present with the exact coerced value.
     assert set(record) == {
         "ts", "method", "path", "bucket", "status", "durationMs",
-        "downIn", "downOut", "upIn", "upOut",
+        "downIn", "downOut", "upIn", "upOut", "requestId",
     }
     assert record["method"] == "GET"
     assert record["path"] == "/slimapi/messages/ses_x"
