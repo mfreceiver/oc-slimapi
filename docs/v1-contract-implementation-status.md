@@ -90,8 +90,8 @@ sidecar 监听 host 范围由 `config.validate()` 控制：loopback（`127.0.0.1
 | `GET /slimapi/sessions/{sid}/status` | 🔄 | **B1：404/502/503 三态分裂**；**🔄 F2：放宽 allowlist**（`normalize_directory` 不 gate） |
 | `GET /slimapi/messages/{sid}` | 🔄 | 骨架分页；**B1：query `directory` 软 allowlist**（见下） |
 | `GET /slimapi/messages/{sid}/since/{ts}` | ✅ + 🔄 | A2=A 语义（§11.2 闭环）；B1 directory 可选透传（**v0.3.0 无 allowlist gate**） |
-| `GET /slimapi/messages/{sid}/full/{mid}` | 🔄 | **B1：oversized → 413 流式 cap**（不再整缓冲，见下） |
-| `GET /slimapi/messages/{sid}/full?ids=` | 🆕 G6 | **批量展开**（1–20 mid，discover 先行，mid 级 envelope `errors[]`，累计 413） |
+| `GET /slimapi/messages/{sid}/full/{mid}` | 🔄 | **B1：oversized → 413 流式 cap**（不再整缓冲，见下）；full 剥 `state.metadata.diagnostics`（加性，经 TransformPool admission；见 CHANGELOG [Unreleased]） |
+| `GET /slimapi/messages/{sid}/full?ids=` | 🆕 G6 | **批量展开**（1–20 mid，discover 先行，mid 级 envelope `errors[]`，累计 413）；full items 已剥 `state.metadata.diagnostics`（见 CHANGELOG [Unreleased]） |
 | `GET /slimapi/questions` | 🔄 F1 + v0.2.1 | 跨目录聚合；**directory 可选**（null=聚合 allowlist；显式**规范化后去重** 1–32），每条带 `routeToken`；200 envelope 含 `scope.directories`（区分 scope 未就绪/权威空） |
 | `GET /slimapi/permissions` | 🔄 F1 | 同上 |
 | `POST /slimapi/questions/{qid}/reply` | ✅ | routeToken 校验 + directory 注入 + 转发 |

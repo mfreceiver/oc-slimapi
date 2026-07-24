@@ -816,14 +816,14 @@ async def test_messages_list_empty_path_does_not_307(app_and_client):
 
 
 # ---------------------------------------------------------------------------
-# ③c — /full/{mid} default mode is full (verbatim passthrough).
+# ③c — /full/{mid} default mode is full: strips diagnostics, keeps the rest.
 # ---------------------------------------------------------------------------
 
-async def test_full_message_default_mode_is_full_passthrough(upstream_factory):
-    """GET /slimapi/messages/s1/full/m1 (no ?mode=) defaults to full mode:
-    verbatim passthrough of upstream's single-message body — no skeleton
-    projection, so tool output / debug fields are preserved. The path
-    migration must not have silently changed the default projection."""
+async def test_full_message_default_mode_strips_diagnostics_preserves_rest(upstream_factory):
+    """GET /slimapi/messages/s1/full/m1 (no ?mode=) defaults to full mode: the
+    complete part is preserved (no skeleton projection — debug input + tool
+    output + metadata siblings all kept) EXCEPT the never-consumed LSP
+    ``state.metadata.diagnostics`` map, which is stripped server-side."""
     payload = orjson.dumps({
         "info": {"id": "m1", "role": "user"},
         "parts": [
@@ -833,6 +833,11 @@ async def test_full_message_default_mode_is_full_passthrough(upstream_factory):
                 "state": {
                     "status": "completed",
                     "input": {"command": "ls", "debug": "skeleton would drop me"},
+                    "metadata": {
+                        "sessionId": "s1",
+                        "description": "ran ls",
+                        "diagnostics": [{"severity": 1, "message": "unused"}],
+                    },
                     "output": "huge output that skeleton would omit but full keeps",
                 },
             },
@@ -856,12 +861,229 @@ async def test_full_message_default_mode_is_full_passthrough(upstream_factory):
             )
         assert response.status_code == 200
         body = orjson.loads(response.content)
-        # Full mode: NO skeleton projection — debug input + tool output kept.
         tool_part = body["parts"][1]
+        # diagnostics stripped ...
+        assert "diagnostics" not in tool_part["state"]["metadata"]
+        # ... but metadata siblings + debug input + full tool output kept.
+        assert tool_part["state"]["metadata"] == {"sessionId": "s1", "description": "ran ls"}
         assert tool_part["state"]["input"] == {
             "command": "ls", "debug": "skeleton would drop me",
         }
         assert "output" in tool_part["state"]
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_full_list_strips_diagnostics_preserves_rest(upstream_factory):
+    """GET /slimapi/messages/s1?mode=full strips diagnostics from each message
+    while preserving every other field (incl. full tool output). The re-serialised
+    body carries a sidecar-owned header set (Vary / Content-Type / Cache-Control)."""
+    payload = orjson.dumps([{
+        "info": {"id": "m1"},
+        "parts": [{
+            "id": "p1", "type": "tool", "messageID": "m1", "tool": "edit",
+            "state": {
+                "status": "completed",
+                "metadata": {"description": "d", "diagnostics": [{"severity": 1}]},
+                "output": "full output kept",
+            },
+        }],
+    }])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=payload, headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
+                "/slimapi/messages/s1?mode=full", headers=VERSION_HEADERS,
+            )
+        assert response.status_code == 200
+        body = orjson.loads(response.content)
+        state = body[0]["parts"][0]["state"]
+        assert "diagnostics" not in state["metadata"]
+        assert state["metadata"] == {"description": "d"}
+        assert state["output"] == "full output kept"
+        # sidecar owns content headers for the re-serialised body.
+        assert response.headers["Content-Type"].startswith("application/json")
+        assert response.headers["Vary"] == "Accept-Encoding"
+        assert response.headers["Cache-Control"] == "no-store"
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_full_list_passes_through_upstream_link_header(upstream_factory):
+    """Full-mode list preserves opencode's ``Link`` header verbatim (full-mode
+    pagination contract) and does NOT translate it to ``X-Next-Cursor``
+    (that translation is skeleton-mode only)."""
+    payload = orjson.dumps([{"info": {"id": "m1"}, "parts": []}])
+    link = '<http://127.0.0.1:4096/session/s1/message?before=CUR&limit=40>; rel="next"'
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, content=payload,
+            headers={"Content-Type": "application/json", "Link": link},
+        )
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
+                "/slimapi/messages/s1?mode=full", headers=VERSION_HEADERS,
+            )
+        assert response.status_code == 200
+        assert response.headers.get("Link") == link
+        # full keeps Link; it does not emit X-Next-Cursor.
+        assert "X-Next-Cursor" not in response.headers
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_full_single_returns_transform_busy_with_no_upstream_get(upstream_factory):
+    """Admission is acquired BEFORE the upstream GET: with the pool saturated,
+    /full/{mid} returns 503 transform_busy and never hits upstream."""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, content=b"{}")
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    pool = app.state.transforms
+    try:
+        async with pool:  # saturate the single admission slot
+            transport = httpx.ASGITransport(app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                response = await client.get(
+                    "/slimapi/messages/s1/full/m1", headers=VERSION_HEADERS,
+                )
+            assert response.status_code == 503
+            assert response.json()["code"] == "transform_busy"
+            assert response.headers["Retry-After"] == "2"
+        # admission-before-GET → zero upstream calls.
+        assert calls["n"] == 0
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_full_list_returns_transform_busy_with_no_upstream_get(upstream_factory):
+    """Same admission-before-GET invariant for list full."""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, content=b"[]")
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    pool = app.state.transforms
+    try:
+        async with pool:
+            transport = httpx.ASGITransport(app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                response = await client.get(
+                    "/slimapi/messages/s1?mode=full", headers=VERSION_HEADERS,
+                )
+            assert response.status_code == 503
+            assert response.json()["code"] == "transform_busy"
+        assert calls["n"] == 0
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_full_single_wrong_shape_2xx_served(upstream_factory):
+    """A malformed-shape 200 body (non-dict) is served as-is — the strip is a
+    no-op on shapes it can't scrub, matching prior verbatim passthrough (no 500)."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
+                "/slimapi/messages/s1/full/m1", headers=VERSION_HEADERS,
+            )
+        assert response.status_code == 200
+        assert response.json() == []
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_full_batch_strips_diagnostics(upstream_factory):
+    """G6 batch full strips diagnostics from each item while keeping every
+    other field (metadata siblings + output)."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session/s1":
+            return httpx.Response(200, content=orjson.dumps({"id": "s1"}))
+        mid = request.url.path.rsplit("/", 1)[-1]
+        return httpx.Response(200, content=orjson.dumps({
+            "info": {"id": mid},
+            "parts": [{
+                "id": f"p-{mid}", "type": "tool", "messageID": mid, "tool": "edit",
+                "state": {
+                    "status": "completed",
+                    "metadata": {"description": "d", "diagnostics": [{"severity": 1}]},
+                    "output": "kept",
+                },
+            }],
+        }))
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
+                "/slimapi/messages/s1/full?ids=m1,m2", headers=VERSION_HEADERS,
+            )
+        assert response.status_code == 200
+        body = response.json()
+        assert len(body["items"]) == 2
+        for item in body["items"]:
+            state = item["parts"][0]["state"]
+            assert "diagnostics" not in state["metadata"]
+            assert state["metadata"] == {"description": "d"}
+            assert state["output"] == "kept"
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_full_batch_transform_busy_no_mid_fetch_when_saturated(upstream_factory):
+    """Batch holds admission around the mid-gather (after discover). With the
+    pool saturated, /full?ids= returns 503 transform_busy; discover may run
+    (existing pre-admission pattern — tiny probe, no large body) but NO mid
+    body is fetched."""
+    calls = {"discover": 0, "mids": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session/s1":
+            calls["discover"] += 1
+            return httpx.Response(200, content=orjson.dumps({"id": "s1"}))
+        calls["mids"] += 1
+        return httpx.Response(200, content=orjson.dumps({"info": {"id": "m"}, "parts": []}))
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    pool = app.state.transforms
+    try:
+        async with pool:  # saturate
+            transport = httpx.ASGITransport(app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                response = await client.get(
+                    "/slimapi/messages/s1/full?ids=m1,m2", headers=VERSION_HEADERS,
+                )
+            assert response.status_code == 503
+            assert response.json()["code"] == "transform_busy"
+        # mid fetches are inside admission → zero when saturated.
+        assert calls["mids"] == 0
     finally:
         app.state.transforms.shutdown()
 

@@ -41,7 +41,12 @@ from typing import Any, Callable
 
 import orjson
 
-from .skeleton import skeleton_message, skeleton_messages
+from .skeleton import (
+    skeleton_message,
+    skeleton_messages,
+    strip_diagnostics_message,
+    strip_diagnostics_messages,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +103,29 @@ def project_messages_and_pack(
     ``orjson.loads`` and goes straight to projection + serialize + gzip.
     """
     return _pack_json(skeleton_messages(messages), accept_encoding)
+
+
+def strip_diagnostics_and_pack(
+    body: bytes, *, single: bool, accept_encoding: str | None,
+) -> tuple[bytes, dict[str, str]]:
+    """Worker entrypoint for ``mode=full`` routes: ``orjson.loads`` → strip the
+    never-consumed LSP ``diagnostics`` map from every part → ``dumps`` → (gzip).
+
+    Mirrors :func:`project_and_pack` but applies the light
+    :func:`strip_diagnostics_message` projection instead of the skeleton
+    thinning, so a client expanding a thin skeleton fetches the WHOLE part
+    (output / text / files / metadata siblings / ...) minus only the
+    ``state.metadata.diagnostics`` map it never reads. Like the other worker
+    entrypoints this is pure-CPU and runs in the bounded transform executor so
+    the event loop stays free for SSE heartbeats.
+    """
+    parsed = orjson.loads(body)
+    projected = (
+        strip_diagnostics_message(parsed)
+        if single
+        else strip_diagnostics_messages(parsed)
+    )
+    return _pack_json(projected, accept_encoding)
 
 
 async def read_with_cap(

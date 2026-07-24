@@ -110,7 +110,7 @@ B4  服务端 P1（可与 B1 并行）
 - **full 与 skeleton 均**使用累计字节 cap（对齐 `read_with_cap`）。
 - **超过 `max_message_bytes` 立即中止 upstream 读取** → `413 {"code":"message_too_large","limitBytes":…}`。
 - **禁止**「先完整下载再查 32MiB」。
-- cap 计量：解压后逻辑 JSON 字节（与 list/since 口径一致，写死）。实现期确定 full 边读边按解压字节计数的流式实现（full 现为 passthrough，需在流上解压计数）。
+- cap 计量：解压后逻辑 JSON 字节（与 list/since 口径一致，写死）。full 边读边按解压字节计数（`read_with_cap` + 早停）；read 完成后缓冲解析以剥 `state.metadata.diagnostics`（ocdroid 不消费），其余字段原样。
 - 超限后须关闭 upstream response（防连接泄漏）。
 - **transform-busy 归一**：~~现状 `full/{mid}` skeleton 转换忙返回 **502**（INTERFACE_MAP line 23），与 list/since 及统一错误码表的 **503 `transform_busy`** 冲突；~~ G8 顺带把 `full/{mid}` transform-busy ~~从 502 **归一为 503 `transform_busy`**~~（文字同步实际代码；真相见下方现实校正）。
   - **现实校正（v1 B1 run, 2026-07-18）**：代码层 `full/{mid}` transform-busy **实际一直返 503**（`_busy_response()` 写死 503；测试 `test_messages_route_returns_503_for_single_message_when_admission_saturated` 已断言 503）。即"502→503 归一"在代码层**本就完成**，G8 仅需同步更新 `docs/specs/INTERFACE_MAP.md` line 23 文字。详见 `docs/ocmar/specs/2026-07-18-v1-b0-b1-design.md` §2 reality 表（行 B）+ §3.2。✅ B1 文档已同步。

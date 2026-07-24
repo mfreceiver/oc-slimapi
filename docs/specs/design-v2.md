@@ -44,9 +44,9 @@
 ### 1.4 `GET /slimapi/messages/{sid}`（历史分页，核心省流）
 - **参数**：`sid`；`limit`(int **1–200** 默认40，**0→422** FastAPI ge=1)；`before`(str?, opaque, 原样透传)；`mode`(enum `skeleton`|`full` 默认 skeleton；`lite` 延后)；`directory`(透传)。
 - **upstream**：`GET /session/{sid}/message?limit=&before=` + `X-Opencode-Directory`。
-- **响应**：`List<MessageWithParts>` **裸数组**（不套 envelope）；skeleton 模式 sidecar **解析上游 `Link: <...?before=CURSOR>; rel="next"` 头** → 下发 `X-Next-Cursor`（opaque base64url 字符串，不 decode/re-encode），**不再把 upstream `Link` 头原样复制给客户端**；full 模式流式透传（含 upstream `Link` 原样）；`Cache-Control:no-store`。
+- **响应**：`List<MessageWithParts>` **裸数组**（不套 envelope）；skeleton 模式 sidecar **解析上游 `Link: <...?before=CURSOR>; rel="next"` 头** → 下发 `X-Next-Cursor`（opaque base64url 字符串，不 decode/re-encode），**不再把 upstream `Link` 头原样复制给客户端**；full 模式缓冲+解析后剥 `state.metadata.diagnostics`（ocdroid 不消费，其余字段原样），原样透传上游 `Link` 头（full 分页契约）；`Cache-Control:no-store`。
 - **裁剪**：顺序/id/数量不变；按 §2 规则；`info` 保留 `tokens/cost`（上下文用量）。
-- **保护**：upstream body >64MB 或转换并发超限 → 413/503；`mode=full` 流式透传不缓冲。
+- **保护**：upstream body >64MB 或转换并发超限 → 413/503；`mode=full` 经 TransformPool admission 缓冲+剥 diagnostics（同 skeleton 路径，admission 在 upstream GET 之前获取），池饱和→503 `transform_busy`。
 
 ### 1.5 `GET /slimapi/messages/{sid}/since/{ts}`（增量，A2=A 时间戳锚点）
 - **参数**：`ts`(path, epoch ms，客户端本地该 ses 最大 `updatedAt`)；`limit`(int 1–200 默认50)；`before`(str?, opaque, 来自上一响应 `X-Next-Cursor`，原样透传)；`mode`(enum `skeleton`|`full` 默认 skeleton)；`directory`(透传)。
@@ -59,7 +59,7 @@
 ### 1.6 `GET /slimapi/messages/{sid}/full/{mid}`（按需展开）
 - **参数**：`sid`、`mid`、`mode`(默认 `full`——展开场景)。
 - **upstream**：`GET /session/{sid}/message/{mid}`。
-- **响应**：单 `MessageWithParts`；full 原样；`Cache-Control:no-store`、禁 body 日志、限并发。
+- **响应**：单 `MessageWithParts`；full 剥 `state.metadata.diagnostics`（其余原样）；`Cache-Control:no-store`、禁 body 日志、限并发。
 - **超限**：>32MB（对齐客户端 `ResponseSizeGuardInterceptor`）→`413 {"code":"message_too_large","limitBytes":..}`。
 - **客户端合并**：按 `messageId+partId` 替换（非追加）。
 - **路径段 `full`**：仅作"展开全文"语义占位，并非 `mode=full` 的默认——`mode` 仍由 query 控制，默认 `full`。

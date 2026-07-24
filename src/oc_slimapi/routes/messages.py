@@ -12,24 +12,23 @@ from datetime import timezone
 import orjson
 import httpx
 from fastapi import APIRouter, Query, Request
-from starlette.background import BackgroundTask
-from starlette.responses import Response, StreamingResponse
+from starlette.responses import Response
 
 from ..capabilities import parse_capabilities
 from ..errors import CodedHTTPException
 from ..gzip_util import error_response, json_response
-from ..skeleton import skeleton_message
+from ..skeleton import skeleton_message, strip_diagnostics_message
 from ..traffic import stash_up_in
 from ..transform import (
     TransformBusy,
     project_and_pack,
     project_messages_and_pack,
     read_with_cap,
+    strip_diagnostics_and_pack,
 )
 from ..upstream import (
     decoded_body_headers,
     forward_directory_headers,
-    strip_hop_by_hop,
 )
 from ..upstream_errors import fetch_json_mapped
 from ..directory import validate_directory
@@ -454,34 +453,66 @@ async def messages(
     if before:
         params["before"] = before
     if mode == "full":
-        # Full mode is a verbatim streaming passthrough; no transform work,
-        # so admission is not needed and the event loop stays free.
-        upstream_request = request.app.state.upstream.build_request(
-            "GET", f"/session/{sid}/message", params=params,
-            headers=forward_directory_headers(directory),
-        )
+        # Full mode strips the never-consumed LSP ``state.metadata.diagnostics``
+        # map from every part (ocdroid deletes it on deserialise anyway) but
+        # otherwise preserves the complete part — clients expanding a thin
+        # skeleton still get every output/text/files field. The strip is a real
+        # transform (buffer + parse + re-serialize), so it runs through the
+        # TransformPool under admission acquired BEFORE the upstream GET,
+        # exactly like skeleton mode: the event loop stays free for SSE
+        # heartbeats and pool saturation surfaces as 503 transform_busy.
+        # Pagination is preserved by passing opencode's ``Link`` header through
+        # verbatim (full-mode pagination contract — unchanged). Because the body
+        # is re-serialised by the sidecar, the response uses a sidecar-owned
+        # header set (matching skeleton mode): upstream body-content headers
+        # (ETag / Content-MD5 / Content-Length / encoding) would be stale against
+        # the mutated body and are dropped.
+        pool = request.app.state.transforms
+        config = request.app.state.config
+        accept_encoding = request.headers.get("accept-encoding")
         try:
-            response = await request.app.state.upstream.send(upstream_request, stream=True)
-        except httpx.RequestError as exc:
-            raise CodedHTTPException(503, code="upstream_unavailable") from exc
-        # Wrap the upstream iterator so the response body bytes are counted
-        # (``upIn`` for the messages bucket). ``len(chunk)`` only — body is
-        # not buffered.
-        async def _counted_full_messages():
-            n = 0
-            try:
-                async for chunk in response.aiter_raw():
-                    n += len(chunk)
-                    yield chunk
-            finally:
-                if n > 0:
-                    stash_up_in(request, n)
-
-        return StreamingResponse(
-            _counted_full_messages(), status_code=response.status_code,
-            headers={**strip_hop_by_hop(response.headers), "Cache-Control": "no-store"},
-            background=BackgroundTask(response.aclose),
-        )
+            async with pool:
+                response = await _stream_upstream(
+                    request, f"/session/{sid}/message", params, directory,
+                )
+                link_header: str | None = None
+                status_code = 200
+                try:
+                    if response.status_code >= 400:
+                        return await _drain_error(response, request)
+                    status_code = response.status_code
+                    body, n_read = await read_with_cap(
+                        response, config.max_response_bytes,
+                    )
+                    # Traffic accounting first: the bytes read up to the cap
+                    # were still pulled from upstream, so they count toward upIn
+                    # even when we then refuse the oversize body (matches the
+                    # single-message convention; the old streaming counter only
+                    # saw what it yielded).
+                    stash_up_in(request, n_read)
+                    if body is None:
+                        return error_response(
+                            "response_too_large", 413,
+                            limit=config.max_response_bytes,
+                            accept_encoding=accept_encoding,
+                        )
+                    link_header = response.headers.get("Link")
+                    encoded, extra = await pool.offload(
+                        strip_diagnostics_and_pack, body,
+                        single=False,
+                        accept_encoding=accept_encoding,
+                    )
+                finally:
+                    await response.aclose()
+            base_headers: dict[str, str] = {"Cache-Control": "no-store"}
+            if link_header:
+                base_headers["Link"] = link_header
+            return Response(
+                encoded, status_code=status_code, media_type="application/json",
+                headers={**base_headers, **extra},
+            )
+        except TransformBusy:
+            return _busy_response(accept_encoding)
     config = request.app.state.config
     pool = request.app.state.transforms
     try:
@@ -781,13 +812,25 @@ async def message_batch(
                 return
             succeeded[mid] = parsed
         else:
-            succeeded[mid] = raw
+            # Full mode: strip the never-consumed LSP
+            # ``state.metadata.diagnostics`` map (ocdroid deletes it on
+            # deserialise) but keep every other field. Offloaded to the worker
+            # pool like the skeleton branch so the deepcopy stays off the event
+            # loop; mirrors skeleton's offload → abort-check → assign pattern.
+            stripped = await pool.offload(lambda r=raw: strip_diagnostics_message(r))
+            if _aborted():  # offload 是 await 点
+                return
+            succeeded[mid] = stripped
 
     try:
-        if mode == "skeleton":
-            async with pool:
-                await asyncio.gather(*(fetch_one(mid) for mid in order))
-        else:
+        # Both modes hold a single transform-pool admission for the whole
+        # gather: skeleton projects, full strips diagnostics — both offload CPU
+        # work to the bounded worker pool so the event loop stays free for SSE
+        # heartbeats. (discover runs before admission by existing design — a
+        # tiny session-existence probe with no large body; admission wraps the
+        # large-body mid fetches, which is what the memory-bounding invariant
+        # targets. Shared with the pre-existing skeleton-batch path.)
+        async with pool:
             await asyncio.gather(*(fetch_one(mid) for mid in order))
     except TransformBusy:
         return _busy_response(request.headers.get("accept-encoding"))
@@ -898,48 +941,67 @@ async def message(
     directory = await _resolve_messages_directory(request, directory)
     if request.app.state.schema_degraded:
         mode = "full"
+    config = request.app.state.config
+    pool = request.app.state.transforms
     if mode == "full":
         # G8: stream + cap-read so a single oversized upstream body cannot spike
         # sidecar RSS (MemoryMax=384M). Cap metric = decompressed logical bytes
         # (httpx auto-decompresses), matching list/since. Aborting the read
         # early requires closing the upstream response — done in the finally.
-        upstream_request = request.app.state.upstream.build_request(
-            "GET", f"/session/{sid}/message/{mid}",
-            headers=forward_directory_headers(directory),
-        )
+        # The body is buffered + parsed to strip the never-consumed LSP
+        # ``state.metadata.diagnostics`` map (ocdroid deletes it on deserialise);
+        # every other field is preserved. The strip runs off-thread under the
+        # same admission as skeleton mode (acquired before the upstream GET) so
+        # the event loop stays free and saturation surfaces as 503 transform_busy.
+        accept_encoding = request.headers.get("accept-encoding")
         try:
-            response = await request.app.state.upstream.send(upstream_request, stream=True)
-        except httpx.RequestError as exc:
-            raise CodedHTTPException(503, code="upstream_unavailable") from exc
-        try:
-            # Wrap mid-stream upstream I/O failures (httpx.RequestError raised by
-            # _drain_error.aread() or read_with_cap.aiter_bytes()) into a structured
-            # 503 instead of bubbling up as an unhandled FastAPI 500. The finally
-            # below still runs to release the connection.
-            try:
-                if response.status_code >= 400:
-                    return await _drain_error(response, request)
-                body, n_read = await read_with_cap(
-                    response, request.app.state.config.max_message_bytes,
+            async with pool:
+                upstream_request = request.app.state.upstream.build_request(
+                    "GET", f"/session/{sid}/message/{mid}",
+                    headers=forward_directory_headers(directory),
                 )
-            except httpx.RequestError as exc:
-                raise CodedHTTPException(503, code="upstream_unavailable") from exc
-            # Traffic accounting: cap-read upstream bytes.
-            stash_up_in(request, n_read)
-            if body is None:
-                return error_response(
-                    "message_too_large", 413,
-                    limitBytes=request.app.state.config.max_message_bytes,
-                    accept_encoding=request.headers.get("accept-encoding"),
-                )
+                try:
+                    response = await request.app.state.upstream.send(upstream_request, stream=True)
+                except httpx.RequestError as exc:
+                    raise CodedHTTPException(503, code="upstream_unavailable") from exc
+                status_code = 200
+                try:
+                    # Wrap mid-stream upstream I/O failures (httpx.RequestError
+                    # raised by _drain_error.aread() or read_with_cap
+                    # .aiter_bytes()) into a structured 503 instead of bubbling
+                    # up as an unhandled FastAPI 500. The finally below still
+                    # runs to release the connection.
+                    try:
+                        if response.status_code >= 400:
+                            return await _drain_error(response, request)
+                        status_code = response.status_code
+                        body, n_read = await read_with_cap(
+                            response, config.max_message_bytes,
+                        )
+                    except httpx.RequestError as exc:
+                        raise CodedHTTPException(503, code="upstream_unavailable") from exc
+                    # Traffic accounting: cap-read upstream bytes (counted even
+                    # on cap-bail, matching the list convention).
+                    stash_up_in(request, n_read)
+                    if body is None:
+                        return error_response(
+                            "message_too_large", 413,
+                            limitBytes=config.max_message_bytes,
+                            accept_encoding=accept_encoding,
+                        )
+                    encoded, extra = await pool.offload(
+                        strip_diagnostics_and_pack, body,
+                        single=True,
+                        accept_encoding=accept_encoding,
+                    )
+                finally:
+                    await response.aclose()
             return Response(
-                body, response.status_code,
-                headers={**decoded_body_headers(response.headers), "Cache-Control": "no-store"},
+                encoded, status_code=status_code, media_type="application/json",
+                headers={"Cache-Control": "no-store", **extra},
             )
-        finally:
-            await response.aclose()
-    config = request.app.state.config
-    pool = request.app.state.transforms
+        except TransformBusy:
+            return _busy_response(accept_encoding)
     try:
         async with pool:
             response = await _stream_upstream(

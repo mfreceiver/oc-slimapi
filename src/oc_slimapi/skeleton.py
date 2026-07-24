@@ -255,6 +255,67 @@ def skeleton_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [skeleton_message(message) for message in messages]
 
 
+# ---------------------------------------------------------------------------
+# /full diagnostics strip (additive; wire version UNCHANGED — stays 1).
+#
+# opencode's ``edit``/``write`` tools attach LSP diagnostics to every affected
+# part's ``state.metadata.diagnostics``. ocdroid NEVER consumes them —
+# ``Message.kt#parsePartState`` unconditionally deletes the ``diagnostics``
+# key (comment: "is never read here"). For a slim client they are pure
+# down-wire traffic + parse/heap cost with zero UI value, so the ``mode=full``
+# routes strip them server-side.
+#
+# This is NOT a skeleton projection: every other field (output / text / files /
+# metadata siblings / ...) is preserved verbatim so clients expanding a thin
+# skeleton still fetch the WHOLE part — only the never-read diagnostics map is
+# removed. ``diagnostics`` is the sole key touched; sibling keys and the
+# container itself are left intact (an emptied ``metadata`` stays as ``{}``,
+# never dropped), keeping ``/full`` semantics field-faithful.
+# ---------------------------------------------------------------------------
+def strip_diagnostics_message(message: dict[str, Any]) -> dict[str, Any]:
+    """Return a deep copy of ``message`` with the never-consumed LSP
+    ``diagnostics`` map removed from every part.
+
+    Two locations are considered per part, but ONLY
+    ``state.metadata.diagnostics`` (where opencode's ``edit``/``write`` tools
+    attach LSP diagnostics — the sole named target) is removed. A top-level
+    ``metadata.diagnostics`` is intentionally NOT touched: it is outside the
+    stated target and its consumption is unproven, so stripping it would be
+    speculative overreach beyond "remove only ``diagnostics`` from the part".
+
+    Non-mutating: the input dict and its nested dicts are untouched (pure
+    projection, consistent with :func:`skeleton_message`). Used by the
+    ``mode=full`` routes via :func:`transform.strip_diagnostics_and_pack` and
+    by the G6 batch full path.
+
+    Shape-robust: a non-dict body (e.g. a list/scalar from a malformed upstream
+    200) is returned deep-copied as-is — there are no parts to scrub — so the
+    route still serves the body, matching the prior verbatim passthrough for
+    non-conforming shapes rather than turning a weird upstream 200 into a 500.
+    """
+    out = deepcopy(message)
+    if not isinstance(out, dict):
+        return out
+    parts = out.get("parts")
+    if isinstance(parts, list):
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            state = part.get("state")
+            if isinstance(state, dict):
+                metadata = state.get("metadata")
+                if isinstance(metadata, dict):
+                    metadata.pop("diagnostics", None)
+    return out
+
+
+def strip_diagnostics_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not isinstance(messages, list):
+        # Non-list body (malformed upstream 200): nothing to iterate.
+        return deepcopy(messages)
+    return [strip_diagnostics_message(message) for message in messages]
+
+
 def _is_renderable(part: dict[str, Any]) -> bool:
     part_type = part.get("type")
     if part_type in {"text", "reasoning"}:

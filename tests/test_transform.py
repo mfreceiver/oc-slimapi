@@ -25,6 +25,7 @@ from oc_slimapi.transform import (
     project_and_pack,
     project_messages_and_pack,
     read_with_cap,
+    strip_diagnostics_and_pack,
 )
 
 
@@ -92,6 +93,106 @@ def test_project_and_pack_single_round_trips_skeleton_message():
 
     payload, _ = project_and_pack(body, single=True, accept_encoding=None)
     assert orjson.loads(payload) == skeleton_message(_sample_messages()[0])
+
+
+# ---------------------------------------------------------------------------
+# strip_diagnostics_and_pack — /full LSP diagnostics strip
+# ---------------------------------------------------------------------------
+
+
+def _msg_with_diagnostics() -> dict:
+    return {
+        "info": {"id": "m1", "role": "assistant"},
+        "parts": [
+            {"id": "p1", "type": "text", "messageID": "m1", "text": "hello"},
+            {
+                "id": "p2", "type": "tool", "messageID": "m1", "tool": "edit",
+                "state": {
+                    "status": "completed",
+                    "metadata": {
+                        "sessionId": "s1",
+                        "description": "edit file",
+                        "diagnostics": [
+                            {"range": {"start": 0, "end": 1}, "severity": 1,
+                             "message": "unused import"},
+                        ],
+                    },
+                    "output": "the edited file contents",
+                },
+            },
+        ],
+    }
+
+
+def test_strip_diagnostics_and_pack_single_removes_only_diagnostics():
+    body = orjson.dumps(_msg_with_diagnostics())
+
+    payload, headers = strip_diagnostics_and_pack(body, single=True, accept_encoding=None)
+
+    decoded = orjson.loads(payload)
+    tool_state = decoded["parts"][1]["state"]
+    # diagnostics removed ...
+    assert "diagnostics" not in tool_state["metadata"]
+    # ... but every metadata sibling + the full output/text are preserved
+    # (/full semantics — only diagnostics is touched).
+    assert tool_state["metadata"] == {"sessionId": "s1", "description": "edit file"}
+    assert tool_state["output"] == "the edited file contents"
+    assert decoded["parts"][0]["text"] == "hello"
+    assert headers["Vary"] == "Accept-Encoding"
+    assert "Content-Encoding" not in headers
+
+
+def test_strip_diagnostics_and_pack_list_removes_diagnostics_from_each():
+    body = orjson.dumps([_msg_with_diagnostics(), _msg_with_diagnostics()])
+
+    payload, _ = strip_diagnostics_and_pack(body, single=False, accept_encoding=None)
+
+    decoded = orjson.loads(payload)
+    assert len(decoded) == 2
+    for msg in decoded:
+        for part in msg["parts"]:
+            state = part.get("state") or {}
+            assert "diagnostics" not in (state.get("metadata") or {})
+
+
+def test_strip_diagnostics_and_pack_applies_gzip_when_client_accepts_it():
+    body = orjson.dumps(_msg_with_diagnostics())
+
+    payload, headers = strip_diagnostics_and_pack(body, single=True, accept_encoding="gzip")
+
+    assert payload[:2] == b"\x1f\x8b"
+    assert headers["Content-Encoding"] == "gzip"
+    decoded = orjson.loads(gzip.decompress(payload))
+    assert "diagnostics" not in decoded["parts"][1]["state"]["metadata"]
+
+
+def test_strip_diagnostics_message_is_non_mutating_and_keeps_empty_metadata():
+    from oc_slimapi.skeleton import strip_diagnostics_message
+
+    src = {
+        "info": {"id": "m1"},
+        "parts": [{
+            "id": "p1", "type": "tool", "messageID": "m1",
+            "state": {"metadata": {"diagnostics": [{"severity": 1}]}},
+        }],
+    }
+    out = strip_diagnostics_message(src)
+    # The emptied metadata container stays as {} (never dropped) — only the
+    # diagnostics key is removed.
+    assert out["parts"][0]["state"]["metadata"] == {}
+    # Non-mutating: the source dict is untouched.
+    assert src["parts"][0]["state"]["metadata"] == {"diagnostics": [{"severity": 1}]}
+
+
+def test_strip_diagnostics_message_wrong_shape_passthrough():
+    from oc_slimapi.skeleton import strip_diagnostics_message, strip_diagnostics_messages
+
+    # A non-dict / non-list body (malformed upstream 200) has nothing to scrub —
+    # returned as-is so the /full route still serves it, matching the prior
+    # verbatim passthrough for non-conforming shapes (no 500).
+    assert strip_diagnostics_message([]) == []
+    assert strip_diagnostics_message("scalar") == "scalar"
+    assert strip_diagnostics_messages({"not": "a list"}) == {"not": "a list"}
 
 
 # ---------------------------------------------------------------------------

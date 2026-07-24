@@ -36,6 +36,16 @@ ocdroid 对接时：
 
 ---
 
+## [0.10.0] - 2026-07-24
+
+> `/full` 路径服务端剥离 LSP `state.metadata.diagnostics`（ocdroid `Message.kt#parsePartState` 反序列化时本就无条件删除、从不消费）——纯下行流量 + parse/heap 节省，客户端功能零影响。`/full` 由「verbatim 流式透传」改为「缓冲 → 解析 → 剥 diagnostics → 重序列化（经 `TransformPool` admission，与 skeleton 同路径；admission 在 upstream GET 之前获取）」。**全加性 wire 行为，`X-Slimapi-Version` 仍 `1`，不 bump**；ocdroid 对接：list/single/batch 的 `mode=full` 现可能 503 `transform_busy`（池饱和，与 skeleton 一致）、`/full` 响应头改由 sidecar 拥有、list-full 仍透传上游 `Link` 头。
+
+### Added
+
+- **`/full` 路径剥离 LSP `diagnostics`**：所有 `mode=full` 消息路径（`GET /slimapi/messages/{sid}?mode=full`、`GET /slimapi/messages/{sid}/full/{mid}`、`GET /slimapi/messages/{sid}/full?ids=`）现从每个 part 剥去 `state.metadata.diagnostics`（opencode `edit`/`write` 工具写入、ocdroid `Message.kt#parsePartState` 反序列化时无条件删除、从不消费的 LSP 诊断图）；其余字段（output/text/files/metadata 其它键等）原样保留，`/full`「完整 part」语义不变。`/full` 由「verbatim 流式透传」改为「缓冲 → 解析 → 剥 diagnostics → 重序列化（经 `TransformPool` admission，与 skeleton 同路径；admission 在 upstream GET 之前获取）」。**加性裁剪，wire 向后兼容，不 bump `X-Slimapi-Version`**。客户端影响：(1) list/single 的 `mode=full` 现可能返回 **503 `transform_busy`**（池饱和时，与 skeleton 一致，带 `Retry-After`）；(2) full 响应头现由 sidecar 拥有（`Content-Type: application/json`、按 `Accept-Encoding` 决定的 `Content-Encoding`、`Vary: Accept-Encoding`），不再原样透传上游 body-content 头（body 已被改写，上游 ETag/Content-Length 等会 stale）；(3) list full 仍原样透传上游 `Link` 头（full 分页契约不变，不下发 `X-Next-Cursor`）；(4) 上游 200 但非 MessageWithParts 形状（如非 dict/list）原样服务（strip 对无可剥 shape 为 no-op，不升 500，与原 passthrough 一致）。
+
+---
+
 ## [0.9.0] - 2026-07-24
 
 > 可观测性地基（应用日志 + `X-Request-ID` 关联 + access log `requestId` + startup banner）+ 安全加固（catch-all 路径归一闭合 `//session//shell` 绕过、directory 校验、剥 `X-Forwarded-*`/cookie）+ 指标增强（traffic 每桶 latency 分位 / 错误计数、sessions 列表 transform admission）+ 架构整洁（路由解耦、配置收编、异常链）。**全加性 wire 行为，`X-Slimapi-Version` 仍 `1`，不 bump**；ocdroid 对接：新增 400 `invalid_path`/`invalid_directory`、sessions 列表高并发可能 503 `transform_busy`、`X-Request-ID` 头与 access `requestId`（诊断用，非契约依赖）。
