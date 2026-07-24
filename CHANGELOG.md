@@ -30,6 +30,12 @@ ocdroid 对接时：
 
 > 开发中、尚未打 tag 的变更写在这里；`release.sh` 发版时把本节内容折叠进新版本标题下。
 
+---
+
+## [0.8.0] - 2026-07-24
+
+> 阈值化 skeleton（缺陷 B 服务端修复：tool/patch 的 `state.output`/`state.error` 按字节阈值内联，ocdroid slim 用户重见工具输出）+ T3 ops 桶名归一（`qp`→`quiz`、`proxy_passthrough`→`passthrough`）+ 路由↔文档漂移门禁（`scripts/check_routes_doc.py`，接入 `check.sh`）。**全加性 wire 行为，`X-Slimapi-Version` 仍 `1`，不 bump**；ocdroid 对接：默认常开、无 opt-in，`/slimapi/health` 加性诊断键 `features.thresholdedSkeleton`/`skeletonInlineOutputMaxBytes`（仅诊断，行为不依赖客户端识别）。
+
 ### Added
 
 - **阈值化 skeleton（加性，wire 版本仍 `1`，不 bump `X-Slimapi-Version`）**：tool/patch 部件的 `state.output`/`state.error` 不再无条件剥离——按 **JSON 字节**（`orjson.dumps` 序列化长度 = 上线字节，含引号/多字节）阈值化：per-field ≤ 4 KiB **且** 该 message 累计内联 ≤ 16 KiB → **原样内联**进 thin state；超任一阈值 → **整字段 omit**（**绝不半截断**）+ `omitted`，可经 `/full` 取回完整值。`state.structured/result/raw/attachments` **始终 omit**。修复 ocdroid slim 用户看不到任何工具输出（diff/文件内容/命令结果/子任务结果）的缺陷。
