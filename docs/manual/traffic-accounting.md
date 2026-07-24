@@ -102,8 +102,8 @@ curl -s -H "$H" $BASE/slimapi/metrics | jq '
 | `events_sse` | `/slimapi/events`（控制面 SSE） | **策展**：上游全量 token/tool 流 → `session.digest`+q/p 小帧（最大省流点） |
 | `token_stream_sse` | `/slimapi/sessions/{sid}/stream` | gzip + done-marker（见 §4 注意） |
 | `sessions` | `/slimapi/sessions/**`（列表/`/status`/`/children`） | session/child skeleton 投影 |
-| `qp` | `/slimapi/questions`、`/slimapi/permissions` | 聚合 + 投影 |
-| `proxy_passthrough` | catch-all `/**`（发消息等写） | **不省流**，透传（基线，比值≈1） |
+| `quiz` | `/slimapi/questions`、`/slimapi/permissions` | 聚合 + 投影 |
+| `passthrough` | catch-all `/**`（发消息等写） | **不省流**，透传（基线，比值≈1） |
 | `health` / `metrics` / `projects` / `other` | 各自端点 | 元数据/探活 |
 
 ---
@@ -114,7 +114,7 @@ curl -s -H "$H" $BASE/slimapi/metrics | jq '
 |---|---|---|
 | **历史对话拉取省了多少** | `ratios.messages.downOutOverUpIn` | 单值；如 `0.2` = 下发只有成本的 20%（省 80%） |
 | **SSE 策展省了多少** | `events_sse` 的 `upIn` vs `downOut` | 单订阅时 `downOut ≪ upIn`（digest 几百 B vs token 流几十 KB） |
-| **透传基线对照** | `ratios.proxy_passthrough` | 应 ≈ `1.0`（不省流，用来验证账本没系统性偏差） |
+| **透传基线对照** | `ratios.passthrough` | 应 ≈ `1.0`（不省流，用来验证账本没系统性偏差） |
 | **累计节省字节** | 各桶 `upIn - downOut` 之和，或 `totals.upIn - totals.downOut` | 绝对量 |
 
 ### ⚠️ SSE fanout 例外（务必先读）
@@ -189,7 +189,7 @@ access log 的 `downOut` 是 **wire 级**字节（中间件视角，含 SSE 连�
 - **SSE `requests`/`downIn` 在连接关闭时才落账**：长连接 SSE 活跃期间取快照会看到"有 `downOut` 但 `requests=0`"——连接断开才补记。
 - **SSE upstream 字节按 LF 行尾估算**：`+1` 假定 `\n`；若上游用 CRLF 每行少计 1 字节（**保守偏向**，让省流比看起来更少，不夸大）。opencode `/global/event` 预期为 LF。
 - **children-cache fetch 不入 per-bucket `upIn`**：single-flight coalescing 下归属不公（多请求共享一次 fetch），有意不计 → `sessions`/`children` 桶的省流比**略偏乐观**。要绝对上游总量需另加全局计数器（未来工作）。
-- **`totals` 跨桶字节口径异质**：`proxy_passthrough.upIn` 可能是 gzip wire 字节，curated 桶是解码后逻辑字节。`totals` 粗糙，**per-bucket `ratios` 比 `totals` 更有意义**。
+- **`totals` 跨桶字节口径异质**：`passthrough.upIn` 可能是 gzip wire 字节，curated 桶是解码后逻辑字节。`totals` 粗糙，**per-bucket `ratios` 比 `totals` 更有意义**。
 
 ---
 

@@ -1016,7 +1016,10 @@ class TestHealthFeaturesTokenStream:
             assert response.status_code == 200
             body = response.json()
             assert "features" in body
-            assert body["features"] == {"tokenStream": True}
+            # tokenStream is a top-level feature key (sibling of the
+            # additive thresholdedSkeleton diagnostic — not an exact-dict
+            # equality so future additive feature keys don't break this).
+            assert body["features"]["tokenStream"] is True
             # It is a sibling of sidecar/server/schema (not nested).
             assert set(body) >= {"sidecar", "server", "schema", "features"}
         finally:

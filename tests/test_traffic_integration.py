@@ -15,7 +15,7 @@ Scenarios:
    proves no impact on the existing 792-test suite).
 2. **proxy passthrough baseline** (no 省流): a ``/session/...`` GET through
    ``install_proxy()`` records ``upIn == downOut == len(upstream body)`` in
-   the ``proxy_passthrough`` bucket — the catch-all reverse proxy is a 1:1
+   the ``passthrough`` bucket — the catch-all reverse proxy is a 1:1
    byte relay, so the ratio is ~1.0 (proves the baseline bucket is honest).
 3. **messages skeleton 省流实证** (the headline): a
    ``GET /slimapi/messages/{sid}`` skeleton-mode GET records
@@ -230,9 +230,9 @@ async def test_metrics_without_ledger_omits_traffic_block_zero_impact(upstream_f
 # Scenario 2 — proxy passthrough baseline (no 省流; ratio ≈ 1.0).
 # ===========================================================================
 
-async def test_proxy_passthrough_records_equal_up_and_down_bytes(upstream_factory):
+async def test_passthrough_records_equal_up_and_down_bytes(upstream_factory):
     """A /session/... GET through install_proxy() is a 1:1 byte relay: the
-    ``proxy_passthrough`` bucket records ``upIn == downOut == len(upstream body)``.
+    ``passthrough`` bucket records ``upIn == downOut == len(upstream body)``.
 
     Uses ``stream=`` for the MockTransport response because the proxy iterates
     ``aiter_raw`` (httpx marks ``content=`` responses as stream-consumed at
@@ -264,15 +264,15 @@ async def test_proxy_passthrough_records_equal_up_and_down_bytes(upstream_factor
 
         snap = ledger.snapshot()
         assert snap["enabled"] is True
-        # The /session path bucketizes to proxy_passthrough.
-        assert "proxy_passthrough" in snap["buckets"]
-        bucket = snap["buckets"]["proxy_passthrough"]
+        # The /session path bucketizes to passthrough.
+        assert "passthrough" in snap["buckets"]
+        bucket = snap["buckets"]["passthrough"]
         # 1:1 relay — upstream bytes in == downstream bytes out == body length.
         assert bucket["upIn"] == len(body)
         assert bucket["downOut"] == len(body)
         assert bucket["requests"] == 1
         # Ratio ≈ 1.0 (no 省流 on the catch-all proxy).
-        ratio = snap["ratios"]["proxy_passthrough"]["downOutOverUpIn"]
+        ratio = snap["ratios"]["passthrough"]["downOutOverUpIn"]
         assert ratio == pytest.approx(1.0)
     finally:
         await _shutdown(app)
@@ -286,12 +286,14 @@ def _fat_upstream_messages_payload() -> bytes:
     """A sizeable upstream full-messages body whose skeleton projection is
     dramatically smaller.
 
-    Each of the 3 messages carries a tool part with a 4 KiB ``state.output``
-    blob — skeleton strips ``state.output`` (see skeleton._tool), so the full
-    upstream body (~12 KiB+ of output alone) collapses to a small skeleton
+    Each of the 3 messages carries a tool part with an 8 KiB ``state.output``
+    blob. That exceeds the skeleton inline threshold (4 KiB per-field cap), so
+    skeleton omits ``state.output`` + sets ``hasFull`` (the field is fetched
+    whole via ``/full`` — never half-truncated). The full upstream body
+    (~24 KiB+ of output alone) therefore collapses to a small skeleton
     envelope downstream. That gap is the 省流 the sidecar exists to deliver.
     """
-    big_output = "O" * 4096  # skeleton drops state.output entirely
+    big_output = "O" * 8192  # > inline threshold (4096) → omitted + hasFull
     msgs = []
     for i in range(3):
         msgs.append({
@@ -303,7 +305,7 @@ def _fat_upstream_messages_payload() -> bytes:
                     "state": {
                         "status": "completed",
                         "input": {"command": "ls"},
-                        "output": big_output,  # dropped by skeleton
+                        "output": big_output,  # > threshold → omitted + hasFull
                     },
                 },
             ],
@@ -346,8 +348,9 @@ async def test_messages_skeleton_proves_traffic_saving(upstream_factory):
             )
         assert response.status_code == 200
         assert response.headers.get("Content-Encoding") is None
-        # The skeleton body must be non-empty and actually project (tool output
-        # gone) — otherwise the byte comparison would be meaningless.
+        # The skeleton body must be non-empty and actually project (the 8 KiB
+        # tool output exceeds the inline threshold and is omitted) — otherwise
+        # the byte comparison would be meaningless.
         body = orjson.loads(response.content)
         assert len(body) == 3
         for item in body:

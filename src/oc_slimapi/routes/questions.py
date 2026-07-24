@@ -58,7 +58,7 @@ async def _aggregate(request: Request, kind: Literal["question", "permission"], 
                 headers=forward_directory_headers(directory), timeout=2.0,
             )
             # Traffic accounting: per-directory fan-out GET body. Stashed
-            # on the parent request so the qp bucket sees aggregate upIn.
+            # on the parent request so the quiz bucket sees aggregate upIn.
             # Must happen BEFORE the 4xx early return so error response
             # bodies are also counted (not just 2xx).
             stash_up_in(request, len(response.content))

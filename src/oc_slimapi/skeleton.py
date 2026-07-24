@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import os
 from copy import deepcopy
 from typing import Any
+
+import orjson
 
 PLACEHOLDER_TEXT = "[内容已折叠，点开查看]"
 PART_IDS = {"id", "type", "messageID", "sessionID"}
@@ -15,6 +18,37 @@ TOOL_INPUT_KEYS = {
 TOOL_METADATA_KEYS = {"sessionId", "sessionID", "description", "agent"}
 FILE_URL_LIMIT = 8 * 1024
 COMPACTION_PART_LIMIT = 64 * 1024
+
+# ---------------------------------------------------------------------------
+# Thresholded skeleton (additive; wire version UNCHANGED — stays 1).
+#
+# Small ``state.output`` (and ``state.error``) on tool/patch parts is inlined
+# into the thin skeleton so ocdroid slim users actually see short tool results
+# (diffs, file reads, command output, errors) without a ``/full`` round-trip.
+# Large fields are still omitted + ``hasFull`` so the expand path fetches them
+# WHOLE — a field is either fully inlined or fully expandable, never half-
+# truncated. ``structured``/``result``/``raw``/``attachments`` stay always-omit
+# (giant nested JSON has no inline value to the user).
+#
+# Two caps (env-overridable tuning knobs, the config.py env pattern — they do
+# NOT touch the wire contract, so ``X-Slimapi-Version`` is NOT bumped):
+#   * per-field:   inline iff JSON-byte size <= SKELETON_INLINE_OUTPUT_MAX_BYTES
+#   * per-message: cumulative inlined bytes across all parts in one message
+#                  <= SKELETON_INLINE_OUTPUT_MAX_MESSAGE_BYTES (once the cap is
+#                  spent, later fields in part order fall back to omit).
+# The outer response still honours ``Settings.max_response_bytes`` regardless —
+# thresholding never bypasses the global body cap. Defaults: 4 KiB / 16 KiB.
+# ---------------------------------------------------------------------------
+SKELETON_INLINE_OUTPUT_MAX_BYTES = int(
+    os.getenv("OC_SLIMAPI_SKELETON_INLINE_OUTPUT_MAX_BYTES", str(4 * 1024))
+)
+SKELETON_INLINE_OUTPUT_MAX_MESSAGE_BYTES = int(
+    os.getenv("OC_SLIMAPI_SKELETON_INLINE_OUTPUT_MAX_MESSAGE_BYTES", str(16 * 1024))
+)
+# Fields eligible for inlining (small tool results / errors). Everything in
+# SKELETON_ALWAYS_OMIT_FIELDS stays omitted unconditionally.
+SKELETON_INLINE_FIELDS = ("output", "error")
+SKELETON_ALWAYS_OMIT_FIELDS = ("structured", "result", "raw", "attachments")
 
 
 def _pick(value: dict[str, Any], keys: set[str]) -> dict[str, Any]:
@@ -28,7 +62,55 @@ def _mark(part: dict[str, Any], omitted: list[str]) -> dict[str, Any]:
     return part
 
 
-def _tool(part: dict[str, Any]) -> dict[str, Any]:
+def _field_byte_size(value: Any) -> int:
+    """Wire byte size of a state field value.
+
+    Uses the SAME serialiser as the response body (:func:`orjson.dumps`) so the
+    measured size is exactly what lands on the wire — including nested
+    structure and JSON quoting/escaping for strings (an ASCII string of length
+    ``N`` serialises to ``N+2`` bytes; a 4-byte emoji to 6). Multibyte UTF-8 is
+    therefore counted consistently with wire cost. Non-JSON-serialisable values
+    fall back to ``str(value)`` UTF-8 length. This is the SINGLE byte-accounting
+    primitive for skeleton thresholding — do not re-implement at call sites.
+    """
+    try:
+        return len(orjson.dumps(value))
+    except TypeError:
+        return len(str(value).encode("utf-8"))
+
+
+def _maybe_inline_state_field(
+    thin_state: dict[str, Any],
+    state: dict[str, Any],
+    key: str,
+    omitted: list[str],
+    budget: dict[str, int] | None,
+) -> None:
+    """Inline ``state[key]`` into ``thin_state`` iff it fits BOTH the per-field
+    cap (:data:`SKELETON_INLINE_OUTPUT_MAX_BYTES`) and the remaining per-message
+    budget (:data:`SKELETON_INLINE_OUTPUT_MAX_MESSAGE_BYTES`); otherwise record
+    ``state.<key>`` in ``omitted`` (no partial truncation — the field is either
+    fully present or fully expandable via ``/full``). Mutates ``thin_state`` /
+    ``omitted`` / ``budget`` in place. Only called for
+    :data:`SKELETON_INLINE_FIELDS` (``output`` / ``error``).
+    """
+    if key not in state:
+        return
+    size = _field_byte_size(state[key])
+    field_ok = size <= SKELETON_INLINE_OUTPUT_MAX_BYTES
+    budget_ok = (
+        budget is None
+        or budget["used"] + size <= SKELETON_INLINE_OUTPUT_MAX_MESSAGE_BYTES
+    )
+    if field_ok and budget_ok:
+        thin_state[key] = deepcopy(state[key])
+        if budget is not None:
+            budget["used"] += size
+    else:
+        omitted.append(f"state.{key}")
+
+
+def _tool(part: dict[str, Any], *, budget: dict[str, int] | None = None) -> dict[str, Any]:
     result = _pick(part, TOOL_KEYS)
     omitted: list[str] = []
     state = part.get("state")
@@ -53,7 +135,13 @@ def _tool(part: dict[str, Any]) -> dict[str, Any]:
                 f"state.metadata.{key}"
                 for key in source_metadata if key not in TOOL_METADATA_KEYS
             )
-        for key in ("output", "structured", "result", "raw", "attachments", "error"):
+        # Thresholded: inline small output/error (per-field + per-message caps),
+        # omit large or budget-spent ones. A field is fully inlined or fully
+        # omitted — never half-truncated.
+        for key in SKELETON_INLINE_FIELDS:
+            _maybe_inline_state_field(thin_state, state, key, omitted, budget)
+        # Always-omit heavy nested fields (giant JSON / binary-ish payloads).
+        for key in SKELETON_ALWAYS_OMIT_FIELDS:
             if key in state:
                 omitted.append(f"state.{key}")
         result["state"] = thin_state
@@ -63,7 +151,7 @@ def _tool(part: dict[str, Any]) -> dict[str, Any]:
     return _mark(result, omitted)
 
 
-def _patch(part: dict[str, Any]) -> dict[str, Any]:
+def _patch(part: dict[str, Any], *, budget: dict[str, int] | None = None) -> dict[str, Any]:
     result = _pick(part, PART_IDS)
     omitted: list[str] = []
     files = part.get("files")
@@ -87,8 +175,11 @@ def _patch(part: dict[str, Any]) -> dict[str, Any]:
                 f"state.input.{key}"
                 for key in source_input if key not in {"path", "filePath", "file_path"}
             )
-        if "output" in state:
-            omitted.append("state.output")
+        # Thresholded like _tool: inline small output/error, omit large or
+        # budget-spent. Patch parts share the per-message budget with tool
+        # parts (part order) so neither can starve the other.
+        for key in SKELETON_INLINE_FIELDS:
+            _maybe_inline_state_field(thin_state, state, key, omitted, budget)
         result["state"] = thin_state
     for key in part:
         if key not in PART_IDS | {"files", "metadata", "state"}:
@@ -113,7 +204,7 @@ def _file(part: dict[str, Any]) -> dict[str, Any]:
     return _mark(result, omitted)
 
 
-def skeleton_part(part: dict[str, Any]) -> dict[str, Any]:
+def skeleton_part(part: dict[str, Any], *, budget: dict[str, int] | None = None) -> dict[str, Any]:
     part_type = part.get("type")
     if part_type == "text":
         return deepcopy(part)
@@ -121,9 +212,9 @@ def skeleton_part(part: dict[str, Any]) -> dict[str, Any]:
         result = _pick(part, PART_IDS | {"text"})
         return _mark(result, [key for key in part if key not in PART_IDS | {"text"}])
     if part_type == "tool":
-        return _tool(part)
+        return _tool(part, budget=budget)
     if part_type == "patch":
-        return _patch(part)
+        return _patch(part, budget=budget)
     if part_type == "file":
         return _file(part)
     if part_type in {"step-start", "step-finish"}:
@@ -131,7 +222,6 @@ def skeleton_part(part: dict[str, Any]) -> dict[str, Any]:
     if part_type == "compaction":
         copied = deepcopy(part)
         # Compaction is retained unless the single part violates its explicit cap.
-        import orjson
         if len(orjson.dumps(copied)) <= COMPACTION_PART_LIMIT:
             return copied
         return _mark(_pick(part, PART_IDS), ["*"])
@@ -141,7 +231,15 @@ def skeleton_part(part: dict[str, Any]) -> dict[str, Any]:
 def skeleton_message(message: dict[str, Any]) -> dict[str, Any]:
     result = {"info": deepcopy(message.get("info", {}))}
     source_parts = message.get("parts")
-    thin_parts = [skeleton_part(part) for part in source_parts or [] if isinstance(part, dict)]
+    # Per-message cumulative inline-byte budget shared across all parts in part
+    # order. Bounds total inlined output/error so a single message cannot
+    # balloon even when many small fields each individually pass the per-field
+    # cap. Created here (per-message) and threaded through skeleton_part.
+    budget = {"used": 0}
+    thin_parts = [
+        skeleton_part(part, budget=budget)
+        for part in source_parts or [] if isinstance(part, dict)
+    ]
     if not any(_is_renderable(part) for part in thin_parts):
         message_id = result["info"].get("id", "unknown")
         thin_parts.append({

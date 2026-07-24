@@ -55,11 +55,11 @@ class TestBucketize:
             # projects
             ("/slimapi/projects", "projects"),
             ("/slimapi/projects/foo", "projects"),
-            # questions / permissions -> qp
-            ("/slimapi/questions", "qp"),
-            ("/slimapi/questions/foo", "qp"),
-            ("/slimapi/permissions", "qp"),
-            ("/slimapi/permissions/foo", "qp"),
+            # questions / permissions -> quiz
+            ("/slimapi/questions", "quiz"),
+            ("/slimapi/questions/foo", "quiz"),
+            ("/slimapi/permissions", "quiz"),
+            ("/slimapi/permissions/foo", "quiz"),
             # messages
             ("/slimapi/messages", "messages"),
             ("/slimapi/messages/foo", "messages"),
@@ -72,10 +72,10 @@ class TestBucketize:
             ("/slimapi/unknown", "other"),
             ("/slimapi/", "other"),
             # proxy passthrough (anything not under /slimapi/)
-            ("/session", "proxy_passthrough"),
-            ("/session/x", "proxy_passthrough"),
-            ("/", "proxy_passthrough"),
-            ("/global/event", "proxy_passthrough"),
+            ("/session", "passthrough"),
+            ("/session/x", "passthrough"),
+            ("/", "passthrough"),
+            ("/global/event", "passthrough"),
         ],
     )
     def test_buckets(self, path, expected):

@@ -21,6 +21,9 @@ MODE="${1:-default}"
 echo "==> pytest tests/"
 "$PY" -m pytest tests/ -q
 
+echo "==> 路由↔文档一致性（防漂移）"
+"$PY" "$ROOT/scripts/check_routes_doc.py"
+
 case "$MODE" in
   --full)
     echo "==> compileall src"

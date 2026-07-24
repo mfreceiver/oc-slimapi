@@ -3,7 +3,7 @@
 Scenarios (per reviewer findings):
 
 1. **questions 4xx stash** (MUST-PASS): upstream returns 4xx on a q/p
-   directory fan-out → the ``qp`` bucket's ``upIn`` includes the error
+   directory fan-out → the ``quiz`` bucket's ``upIn`` includes the error
    response body bytes (was silently discarded before the fix).
 
 2. **ready stash** (MUST-PASS): ``/slimapi/ready`` pings upstream
@@ -142,7 +142,7 @@ async def _shutdown(app: FastAPI) -> None:
 # ===========================================================================
 
 async def test_questions_4xx_stashes_upin(upstream_factory):
-    """A q/p fan-out where upstream returns 4xx on every directory → the ``qp``
+    """A q/p fan-out where upstream returns 4xx on every directory → the ``quiz``
     bucket's ``upIn`` includes the 4xx response body bytes (were silently
     discarded before the fix that moved ``stash_up_in`` before the early return).
 
@@ -176,10 +176,10 @@ async def test_questions_4xx_stashes_upin(upstream_factory):
 
         snap = ledger.snapshot()
         assert snap["enabled"] is True
-        assert "qp" in snap["buckets"], (
-            f"expected qp bucket, got {set(snap['buckets'])}"
+        assert "quiz" in snap["buckets"], (
+            f"expected quiz bucket, got {set(snap['buckets'])}"
         )
-        bucket = snap["buckets"]["qp"]
+        bucket = snap["buckets"]["quiz"]
         # The 404 error body must be counted.
         assert bucket["upIn"] == len(ERROR_BODY), (
             f"upIn ({bucket['upIn']}) should equal the 404 body length "
@@ -192,7 +192,7 @@ async def test_questions_4xx_stashes_upin(upstream_factory):
 
 async def test_questions_partial_4xx_stashes_upin(upstream_factory):
     """Partial failure: one directory returns 2xx, another returns 4xx. The
-    ``qp`` bucket's ``upIn`` includes BOTH response bodies, not only the 2xx.
+    ``quiz`` bucket's ``upIn`` includes BOTH response bodies, not only the 2xx.
     """
     OK_BODY = orjson.dumps([{"id": "q1", "sessionID": "ses_1"}])
     ERR_BODY = b'{"error":"not found"}'
@@ -230,8 +230,8 @@ async def test_questions_partial_4xx_stashes_upin(upstream_factory):
 
         snap = ledger.snapshot()
         assert snap["enabled"] is True
-        assert "qp" in snap["buckets"]
-        bucket = snap["buckets"]["qp"]
+        assert "quiz" in snap["buckets"]
+        bucket = snap["buckets"]["quiz"]
         # Both bodies counted: 2xx body + 4xx body
         expected_upin = len(OK_BODY) + len(ERR_BODY)
         assert bucket["upIn"] == expected_upin, (
@@ -436,7 +436,7 @@ async def test_proxy_counted_req_stream_happy_path_stashes_upout(
 
     What this test DOES cover (the happy path):
       * A normal proxied POST with a request body lands ``upOut == len(body)``
-        in the ``proxy_passthrough`` bucket — proving the stash code path is
+        in the ``passthrough`` bucket — proving the stash code path is
         reached and the ``finally`` block fires on clean completion.
       * The upstream response body is passed through 1:1 into ``upIn``.
 
@@ -485,8 +485,8 @@ async def test_proxy_counted_req_stream_happy_path_stashes_upout(
 
     snap = ledger.snapshot()
     assert snap["enabled"] is True
-    assert "proxy_passthrough" in snap["buckets"]
-    bucket = snap["buckets"]["proxy_passthrough"]
+    assert "passthrough" in snap["buckets"]
+    bucket = snap["buckets"]["passthrough"]
     # upOut should include the request body bytes (stashed by
     # _counted_req_stream's finally block).
     assert bucket["upOut"] == len(request_body), (

@@ -30,6 +30,7 @@ from oc_slimapi.observability import BatchLedger
 from oc_slimapi.proxy import install_proxy
 from oc_slimapi.routes import events, health, messages, questions, sessions
 from oc_slimapi.sse.hub import HubRegistry
+from oc_slimapi.skeleton import SKELETON_INLINE_OUTPUT_MAX_BYTES
 from oc_slimapi.transform import TransformConfig, TransformPool
 from oc_slimapi.versioning import SlimapiVersionMiddleware
 
@@ -108,7 +109,7 @@ def _sample_upstream_payload() -> bytes:
                     "state": {
                         "status": "completed",
                         "input": {"command": "ls", "debug": "drop me"},
-                        "output": "huge output that skeleton must omit",
+                        "output": "x" * (SKELETON_INLINE_OUTPUT_MAX_BYTES + 1000),
                     },
                 },
             ],
@@ -191,7 +192,7 @@ async def test_skeleton_single_message_route_returns_projected_json(upstream_fac
                 "state": {
                     "status": "completed",
                     "input": {"command": "ls", "debug": "drop me"},
-                    "output": "huge output that skeleton must omit",
+                    "output": "x" * (SKELETON_INLINE_OUTPUT_MAX_BYTES + 1000),
                 },
             },
         ],

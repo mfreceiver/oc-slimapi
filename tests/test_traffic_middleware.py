@@ -94,7 +94,7 @@ def _bucket(snap: dict, name: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 1. Normal JSON-ish GET → proxy_passthrough bucket, downOut=len(body)
+# 1. Normal JSON-ish GET → passthrough bucket, downOut=len(body)
 # ---------------------------------------------------------------------------
 
 
@@ -114,8 +114,8 @@ async def test_get_response_counts_downout_and_zero_downin():
     assert resp.status_code == 200
     assert resp.content == body
     snap = ledger.snapshot()
-    # /data is not under /slimapi/ → catch-all proxy_passthrough bucket.
-    entry = _bucket(snap, "proxy_passthrough")
+    # /data is not under /slimapi/ → catch-all passthrough bucket.
+    entry = _bucket(snap, "passthrough")
     assert entry["requests"] == 1
     assert entry["downOut"] == len(body)
     assert entry["downIn"] == 0  # no request body on GET
@@ -142,7 +142,7 @@ async def test_post_request_body_counts_downin():
         resp = await client.post("/submit", content=payload)
 
     assert resp.status_code == 200
-    entry = _bucket(ledger.snapshot(), "proxy_passthrough")
+    entry = _bucket(ledger.snapshot(), "passthrough")
     assert entry["requests"] == 1
     assert entry["downIn"] == len(payload)
     # response body is tiny but non-zero
@@ -174,7 +174,7 @@ async def test_streaming_response_body_intact_and_counted():
     assert resp.status_code == 200
     # Body fully reassembled — streaming was NOT broken by the middleware.
     assert resp.content == b"".join(chunks)
-    entry = _bucket(ledger.snapshot(), "proxy_passthrough")
+    entry = _bucket(ledger.snapshot(), "passthrough")
     assert entry["requests"] == 1
     assert entry["downOut"] == expected_total
 
@@ -339,9 +339,9 @@ async def test_exception_path_records_status_500_and_one_request():
     # Exactly one downstream record, attributed status 500.
     assert len(ledger.downstream_calls) == 1
     assert ledger.downstream_calls[0]["status"] == 500
-    assert ledger.downstream_calls[0]["bucket"] == "proxy_passthrough"
+    assert ledger.downstream_calls[0]["bucket"] == "passthrough"
     # The bucket also reflects one completed request.
-    entry = _bucket(ledger.snapshot(), "proxy_passthrough")
+    entry = _bucket(ledger.snapshot(), "passthrough")
     assert entry["requests"] == 1
 
 
@@ -386,13 +386,13 @@ async def test_stash_up_in_flows_to_record_upstream():
         resp = await client.get("/proxy/upstream")
 
     assert resp.status_code == 200
-    # /proxy/upstream → proxy_passthrough (non-SSE) → record_upstream called.
+    # /proxy/upstream → passthrough (non-SSE) → record_upstream called.
     assert len(ledger.upstream_calls) == 1
     up = ledger.upstream_calls[0]
-    assert up["bucket"] == "proxy_passthrough"
+    assert up["bucket"] == "passthrough"
     # stash_up_in(N) → record_upstream(resp_bytes=N) → bucket upIn += N.
     assert up["resp_bytes"] == n
-    entry = _bucket(ledger.snapshot(), "proxy_passthrough")
+    entry = _bucket(ledger.snapshot(), "passthrough")
     assert entry["upIn"] == n
 
 

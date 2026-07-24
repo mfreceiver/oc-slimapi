@@ -3,7 +3,13 @@ from pathlib import Path
 
 import orjson
 
-from oc_slimapi.skeleton import PLACEHOLDER_TEXT, skeleton_messages
+from oc_slimapi.skeleton import (
+    PLACEHOLDER_TEXT,
+    SKELETON_INLINE_OUTPUT_MAX_BYTES,
+    SKELETON_INLINE_OUTPUT_MAX_MESSAGE_BYTES,
+    _field_byte_size,
+    skeleton_messages,
+)
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "msg40.json"
@@ -59,15 +65,26 @@ def test_tool_state_is_reduced_to_contract_whitelists():
 
     for tool in parts(result, "tool"):
         state = tool.get("state", {})
-        assert "output" not in state
+        # Always-omit heavy fields never appear in thin state.
         assert "structured" not in state
         assert "result" not in state
         assert "raw" not in state
         assert "attachments" not in state
         assert set(state.get("input", {})) <= allowed_input
         assert set(state.get("metadata", {})) <= allowed_metadata
-        assert tool["hasFull"] is True
-        assert tool["omitted"]
+        # _mark invariant: hasFull/omitted are present iff something was
+        # omitted. A tool whose only omitted field was a small output (now
+        # inlined) and has no other omissions must NOT carry hasFull.
+        if tool.get("omitted"):
+            assert tool["hasFull"] is True
+        else:
+            assert "hasFull" not in tool
+        # output/error are either inlined (small, ≤ per-field cap) or in the
+        # omitted list — never half-truncated. If present, the inlined value
+        # fits the per-field cap.
+        for key in ("output", "error"):
+            if key in state:
+                assert _field_byte_size(state[key]) <= SKELETON_INLINE_OUTPUT_MAX_BYTES
 
 
 def test_data_urls_are_removed_and_marked_but_short_http_urls_survive():
@@ -107,5 +124,204 @@ def test_golden_skeleton_is_bounded_by_the_content_preservation_floor():
     # The v2 contract requires preserving text and reasoning.text. Those two
     # strings alone are 34.70% of this fixture, so the requested 15% raw-byte
     # target is mathematically impossible. 55% remains a strict, reproducible
-    # bound while honoring the authoritative field contract.
+    # bound while honoring the authoritative field contract. Thresholding now
+    # inlines small tool outputs too (additive bytes), but the bound still holds.
     assert len(encoded) < len(raw) * 0.55
+
+
+# ---------------------------------------------------------------------------
+# Thresholded skeleton (additive). Small state.output/state.error is inlined;
+# large or budget-spent fields are omitted + hasFull. hasFull is set ONLY when
+# something is actually omitted — a fully-inlined tool shows no expand mark.
+# ---------------------------------------------------------------------------
+
+def _tool_part(output=None, error=None, *, tool="bash", extra_input=None):
+    """Build a minimal tool part with whitelisted-only input (so the ONLY thing
+    that can be omitted is the output/error itself — isolating thresholding)."""
+    state = {"status": "completed", "title": "ran bash", "input": {"command": "ls"}}
+    if output is not None:
+        state["output"] = output
+    if error is not None:
+        state["error"] = error
+    if extra_input:
+        state["input"].update(extra_input)
+    return {
+        "id": "p1", "type": "tool", "messageID": "m1", "tool": tool,
+        "state": state,
+    }
+
+
+def _ascii_str_of_json_bytes(target_bytes: int) -> str:
+    """ASCII string whose orjson JSON byte size == target_bytes.
+
+    orjson.dumps(s) == len(s) + 2 for ASCII (the surrounding quotes), so we
+    build ``'x' * (target - 2)`` and assert the invariant to stay robust
+    against any future change in the byte-counting primitive."""
+    assert target_bytes >= 2
+    s = "x" * (target_bytes - 2)
+    assert _field_byte_size(s) == target_bytes
+    return s
+
+
+def test_small_tool_output_is_inlined_without_hasfull():
+    """Small output (≤ per-field cap) with no other omissions → output present
+    in thin state and NO hasFull/omitted (nothing to expand)."""
+    output = _ascii_str_of_json_bytes(100)
+    source = [{"info": {"id": "m1"}, "parts": [_tool_part(output=output)]}]
+    tool = skeleton_messages(source)[0]["parts"][0]
+
+    assert tool["state"]["output"] == output
+    assert "hasFull" not in tool
+    assert "omitted" not in tool
+
+
+def test_large_tool_output_is_omitted_with_hasfull():
+    """Large output (> per-field cap) → output omitted, hasFull true, omitted
+    contains state.output."""
+    output = _ascii_str_of_json_bytes(SKELETON_INLINE_OUTPUT_MAX_BYTES + 4096)
+    source = [{"info": {"id": "m1"}, "parts": [_tool_part(output=output)]}]
+    tool = skeleton_messages(source)[0]["parts"][0]
+
+    assert "output" not in tool["state"]
+    assert tool["hasFull"] is True
+    assert "state.output" in tool["omitted"]
+
+
+def test_boundary_output_exactly_at_threshold_is_inlined():
+    """Output whose JSON byte size == the cap is inlined (≤ is inclusive)."""
+    output = _ascii_str_of_json_bytes(SKELETON_INLINE_OUTPUT_MAX_BYTES)
+    source = [{"info": {"id": "m1"}, "parts": [_tool_part(output=output)]}]
+    tool = skeleton_messages(source)[0]["parts"][0]
+
+    assert tool["state"]["output"] == output
+    assert "hasFull" not in tool
+
+
+def test_boundary_output_one_byte_over_threshold_is_omitted():
+    """Output at cap+1 JSON bytes is omitted."""
+    output = _ascii_str_of_json_bytes(SKELETON_INLINE_OUTPUT_MAX_BYTES + 1)
+    source = [{"info": {"id": "m1"}, "parts": [_tool_part(output=output)]}]
+    tool = skeleton_messages(source)[0]["parts"][0]
+
+    assert "output" not in tool["state"]
+    assert tool["hasFull"] is True
+    assert "state.output" in tool["omitted"]
+
+
+def test_per_message_budget_falls_back_to_omit():
+    """Cumulative inlined bytes across parts are capped per-message; once the
+    cap is spent, later parts (in order) omit even small outputs."""
+    # Each output is well under the per-field cap, but together they exceed the
+    # per-message cap. Parts are processed in order; the first N fit, the rest
+    # fall back to omit + hasFull.
+    per_field = SKELETON_INLINE_OUTPUT_MAX_BYTES  # 4096
+    per_message = SKELETON_INLINE_OUTPUT_MAX_MESSAGE_BYTES  # 16384
+    # 8 parts × ~3000 JSON bytes each ≈ 24 KiB > 16 KiB per-message cap.
+    n = 8
+    size_each = per_field - 1000  # comfortably under per-field; sums > per_message
+    assert size_each * n > per_message
+    parts_ = [
+        {"id": f"p{i}", "type": "tool", "messageID": "m1", "tool": "bash",
+         "state": {"status": "completed", "input": {"command": "ls"},
+                   "output": _ascii_str_of_json_bytes(size_each)}}
+        for i in range(n)
+    ]
+    source = [{"info": {"id": "m1"}, "parts": parts_}]
+    tools = skeleton_messages(source)[0]["parts"]
+
+    inlined = [t for t in tools if "output" in t["state"]]
+    omitted = [t for t in tools if "output" not in t["state"]]
+    # Budget is exhausted somewhere in the middle: at least one inlined and at
+    # least one omitted (the tail). Total inlined bytes stay within the cap.
+    assert inlined and omitted
+    total_inlined = sum(_field_byte_size(t["state"]["output"]) for t in inlined)
+    assert total_inlined <= per_message
+    # Omitted ones carry hasFull + state.output.
+    for t in omitted:
+        assert t["hasFull"] is True
+        assert "state.output" in t["omitted"]
+    # Inlined ones have no output-driven omission (whitelisted input only).
+    for t in inlined:
+        assert "state.output" not in t.get("omitted", [])
+
+
+def test_structured_result_raw_attachments_are_always_omitted():
+    """Heavy nested fields are never inlined regardless of size."""
+    state = {
+        "status": "completed", "input": {"command": "ls"},
+        "structured": {"a": 1}, "result": {"b": 2}, "raw": "c", "attachments": [],
+        "output": "small",
+    }
+    source = [{"info": {"id": "m1"},
+               "parts": [{"id": "p1", "type": "tool", "messageID": "m1",
+                          "tool": "bash", "state": state}]}]
+    tool = skeleton_messages(source)[0]["parts"][0]
+
+    thin = tool["state"]
+    assert thin["output"] == "small"  # small enough to inline
+    for key in ("structured", "result", "raw", "attachments"):
+        assert key not in thin
+        assert f"state.{key}" in tool["omitted"]
+    assert tool["hasFull"] is True
+
+
+def test_utf8_multibyte_output_byte_counting_is_consistent():
+    """Multibyte / emoji output is measured by UTF-8 wire bytes, not char
+    count — a field that looks short in chars but is large in bytes is omitted."""
+    # One emoji == 4 UTF-8 bytes (orjson emits raw UTF-8, not \uXXXX escapes).
+    # Grow the string until its JSON byte size exceeds the per-field cap; its
+    # CHAR count stays well below the cap, proving we count bytes not chars.
+    emoji = "😀"
+    output = emoji * (SKELETON_INLINE_OUTPUT_MAX_BYTES // 4 + 1)
+    assert _field_byte_size(output) > SKELETON_INLINE_OUTPUT_MAX_BYTES
+    assert len(output) < SKELETON_INLINE_OUTPUT_MAX_BYTES  # chars << bytes
+
+    source = [{"info": {"id": "m1"}, "parts": [_tool_part(output=output)]}]
+    tool = skeleton_messages(source)[0]["parts"][0]
+    assert "output" not in tool["state"]
+    assert "state.output" in tool["omitted"]
+
+    # And a small multibyte output is inlined byte-identically.
+    small = "画像処理"  # multibyte but tiny
+    assert _field_byte_size(small) <= SKELETON_INLINE_OUTPUT_MAX_BYTES
+    source2 = [{"info": {"id": "m1"}, "parts": [_tool_part(output=small)]}]
+    assert skeleton_messages(source2)[0]["parts"][0]["state"]["output"] == small
+
+
+def test_small_state_error_is_inlined():
+    """Small state.error (e.g. a short failure message) is inlined; a large
+    one is omitted exactly like output."""
+    small_err = "FileNotFoundError: /tmp/x"
+    source = [{"info": {"id": "m1"}, "parts": [_tool_part(error=small_err)]}]
+    tool = skeleton_messages(source)[0]["parts"][0]
+    assert tool["state"]["error"] == small_err
+    # Whitelisted input only → no omission → no hasFull.
+    assert "hasFull" not in tool
+
+    big_err = _ascii_str_of_json_bytes(SKELETON_INLINE_OUTPUT_MAX_BYTES + 1)
+    source2 = [{"info": {"id": "m1"}, "parts": [_tool_part(error=big_err)]}]
+    tool2 = skeleton_messages(source2)[0]["parts"][0]
+    assert "error" not in tool2["state"]
+    assert "state.error" in tool2["omitted"]
+    assert tool2["hasFull"] is True
+
+
+def test_inlined_output_still_reports_hasfull_when_other_fields_omitted():
+    """hasFull means 'more fields are fetchable via /full', NOT 'this content
+    is hidden'. A tool with an inlined (small) output AND an omitted structured
+    field carries hasFull for the structured field while output stays visible."""
+    state = {
+        "status": "completed", "input": {"command": "ls"},
+        "output": "small visible result",
+        "structured": {"huge": "x" * 100},
+    }
+    source = [{"info": {"id": "m1"},
+               "parts": [{"id": "p1", "type": "tool", "messageID": "m1",
+                          "tool": "bash", "state": state}]}]
+    tool = skeleton_messages(source)[0]["parts"][0]
+
+    # Output is visible AND hasFull is set (because structured is omitted).
+    assert tool["state"]["output"] == "small visible result"
+    assert tool["hasFull"] is True
+    assert "state.output" not in tool["omitted"]
+    assert "state.structured" in tool["omitted"]

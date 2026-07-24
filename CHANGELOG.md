@@ -30,6 +30,20 @@ ocdroid 对接时：
 
 > 开发中、尚未打 tag 的变更写在这里；`release.sh` 发版时把本节内容折叠进新版本标题下。
 
+### Added
+
+- **阈值化 skeleton（加性，wire 版本仍 `1`，不 bump `X-Slimapi-Version`）**：tool/patch 部件的 `state.output`/`state.error` 不再无条件剥离——按 **JSON 字节**（`orjson.dumps` 序列化长度 = 上线字节，含引号/多字节）阈值化：per-field ≤ 4 KiB **且** 该 message 累计内联 ≤ 16 KiB → **原样内联**进 thin state；超任一阈值 → **整字段 omit**（**绝不半截断**）+ `omitted`，可经 `/full` 取回完整值。`state.structured/result/raw/attachments` **始终 omit**。修复 ocdroid slim 用户看不到任何工具输出（diff/文件内容/命令结果/子任务结果）的缺陷。
+  - **`hasFull` 语义收紧**：仅当该 part 仍有 omitted 字段才置 `true`；某 part 所有 output/error 都内联且无其他删字段 → **不设** `hasFull`（客户端 UI 不出现展开按钮）。`hasFull` 只表示"还有可经 full 取回的字段"，**绝不**表示"当前内容不可见"。
+  - **默认常开，无 opt-in**（单用户产品；行为不依赖客户端识别 flag）。
+  - **`GET /slimapi/health` 加性诊断键**：`features.thresholdedSkeleton=true` + `features.skeletonInlineOutputMaxBytes=4096`（与 `tokenStream` 并列于 root `features`）。**仅诊断/日志**，不参与能力协商，不 bump 版本。
+  - **env 调参（不改契约）**：`OC_SLIMAPI_SKELETON_INLINE_OUTPUT_MAX_BYTES`（默认 `4096`）、`OC_SLIMAPI_SKELETON_INLINE_OUTPUT_MAX_MESSAGE_BYTES`（默认 `16384`）。外层响应仍受 `max_response_bytes` 约束（阈值化不绕过）。
+  - **expand 路径不变**：仍 `GET /slimapi/messages/{sid}/full?ids=`（message-level，part id 透传 upstream，无 slimPartKey）；full 响应含完整 `state.output`、无骨架标记、`hasFull` 清除。upstream `part.id` 全程稳定。
+
+### Changed
+
+- **`GET /slimapi/metrics` `traffic.buckets` 桶名 `qp` → `quiz`**：questions / permissions 路由前缀归入的桶标识符改名（"快问快答"，覆盖 question 待答 + permission 快速批准/拒绝两类交互）。**破坏性 key 改名，但 `/slimapi/metrics` 为 T3 ops 端点、非客户端契约（ocdroid 不消费），依 [0.7.0] 先例不 bump `X-Slimapi-Version`（仍 `1`）**；读取该 key 的 ops 工具/仪表盘需改键名。`ratios` / `totals` 口径不变。
+- **`GET /slimapi/metrics` `traffic.buckets` 桶名 `proxy_passthrough` → `passthrough`**：catch-all 反代路由（`/**` 写操作等透传）桶标识符改名。同上：T3 ops 端点、非客户端契约，**不 bump** `X-Slimapi-Version`（仍 `1`）；读取该 key 的 ops 工具/仪表盘需改键名。`ratios` / `totals` 口径不变。
+
 ---
 
 ## [0.7.0] - 2026-07-24

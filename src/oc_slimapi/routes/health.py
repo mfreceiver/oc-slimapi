@@ -4,6 +4,7 @@ from fastapi import APIRouter, Request
 
 from .. import __version__
 from ..gzip_util import json_response
+from ..skeleton import SKELETON_INLINE_OUTPUT_MAX_BYTES
 from ..traffic import stash_up_in
 
 router = APIRouter(prefix="/slimapi", tags=["health"])
@@ -33,7 +34,18 @@ async def health(request: Request):
         # ocdroid dual-reads root/server during the rollout; the server is
         # pinned to root. Absence → ocdroid degrades to "whole message on
         # completion" with zero regression.
-        "features": {"tokenStream": True},
+        #
+        # ``thresholdedSkeleton`` is a DIAGNOSTIC-only flag (single-user
+        # product; default-on, no opt-in / capability negotiation). The
+        # behaviour does NOT depend on a client acknowledging it — small
+        # ``state.output``/``state.error`` is inlined regardless. The numeric
+        # ``skeletonInlineOutputMaxBytes`` lets ops confirm the tuned cap; it
+        # does not bump ``X-Slimapi-Version`` (additive wire shape change).
+        "features": {
+            "tokenStream": True,
+            "thresholdedSkeleton": True,
+            "skeletonInlineOutputMaxBytes": SKELETON_INLINE_OUTPUT_MAX_BYTES,
+        },
     }
     # S-E: optional deployment revision, omitted when None
     rev = request.app.state.deployment_revision

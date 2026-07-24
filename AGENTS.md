@@ -57,10 +57,11 @@ ocdroid ──(stunnel mTLS 14096)──▶ opencode :4096   # 直连回退，�
 
 | 任务 | 入口 | 规则 / 细节 |
 |---|---|---|
-| 改动后校验（必做） | `./scripts/check.sh` | 本文「硬规则」+ [`docs/release.md`](docs/release.md) §质量门禁 |
+| 改动后校验（必做） | `./scripts/check.sh` | pytest + **路由↔文档一致性**（[`scripts/check_routes_doc.py`](scripts/check_routes_doc.py)：每个 `/slimapi` 路由须在 INTERFACE_MAP 有记录，**防漂移**）+ [`docs/release.md`](docs/release.md) §质量门禁 |
 | 发版（tag + changelog） | `./scripts/release.sh <patch\|minor\|major>` | **[`docs/release.md`](docs/release.md)**（发版规范权威） |
 | 接口行为变更记录 | 编辑 [`CHANGELOG.md`](CHANGELOG.md) | 每次**破坏/加性 wire 行为**变更必须记；ocdroid 对接以本文件为准 |
 | 契约 / 设计 | `docs/specs/v1-contract.md`、`docs/specs/design-v2.md`、`docs/specs/INTERFACE_MAP.md` | 契约只在破坏性变更时 bump `X-Slimapi-Version` |
+| 省流 / 路由审计（advisory） | access log `logs/access.jsonl` + [`docs/specs/INTERFACE_MAP.md`](docs/specs/INTERFACE_MAP.md) | 查“哪些请求未省流”：按 `bucket=="passthrough"` 过滤 access log、聚合 `method+path`，再对照 INTERFACE_MAP 看有无 `/slimapi` 等价省流路由；新增 `/slimapi` 路由必须同步进 INTERFACE_MAP（否则 check.sh 失败） |
 
 > 任何 release / tag / 版本号 / changelog 写入，都不得由 agent 自由发挥命令，必须走 `scripts/release.sh` 或 `docs/release.md` 写明的步骤。
 

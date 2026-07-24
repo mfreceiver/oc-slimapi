@@ -408,3 +408,25 @@ async def test_health_schema_reflects_schema_degraded_state(upstream_factory):
     assert body["schema"]["degraded"] is True
     # Other keys still present.
     assert body["schema"]["version"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Thresholded skeleton diagnostic (additive; default-on, no version bump).
+# features.thresholdedSkeleton + skeletonInlineOutputMaxBytes are diagnostic
+# only — behaviour does not depend on a client reading them.
+# ---------------------------------------------------------------------------
+
+async def test_health_advertises_thresholded_skeleton_feature(upstream_factory):
+    """``features.thresholdedSkeleton`` is True and the numeric cap is reported
+    alongside tokenStream (root-level, parallel — not nested under server.*)."""
+    upstream = upstream_factory(_make_upstream_ok())
+    app = _build_app(_settings(), upstream)
+
+    response = await _get(app, "/slimapi/health")
+    assert response.status_code == 200
+    features = response.json()["features"]
+    # tokenStream still present (unchanged).
+    assert features["tokenStream"] is True
+    # New diagnostic keys.
+    assert features["thresholdedSkeleton"] is True
+    assert features["skeletonInlineOutputMaxBytes"] == 4096

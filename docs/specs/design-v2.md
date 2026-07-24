@@ -149,13 +149,20 @@
 |---|---|---|---|
 | `text` | 全留 | 全部 | — |
 | `reasoning` | **留 `text`** | `id,type,messageID,sessionID,text` | （不删 text，否则触发消息过滤） |
-| `tool` | 瘦 `state.input`+留元数据 | `id,type,tool,callID,messageID,sessionID`；`state{status,title,time}`；**`state.input` 白名单键**(path/filePath/file_path/command/agent/description/subagent_type/todos)；`state.metadata{sessionId,sessionID,description,agent}` | `state.output/structured/result/raw/attachments`、`state.input.{newString,oldString,content,patchText}`、`metadata.diagnostics` |
-| `patch` | 留 files+路径 | `files[{path,additions,deletions,status}]`、`metadata.path`、瘦 `state.input.path` | `state.output` |
+| `tool` | 瘦 `state.input`+留元数据+**阈值化 output/error** | `id,type,tool,callID,messageID,sessionID`；`state{status,title,time}`；**`state.input` 白名单键**(path/filePath/file_path/command/agent/description/subagent_type/todos)；`state.metadata{sessionId,sessionID,description,agent}`；**`state.output`/`state.error` 阈值内联**（见下"阈值化 skeleton"） | `state.structured/result/raw/attachments`（**始终删**）、`state.input.{newString,oldString,content,patchText}`、`metadata.diagnostics`；output/error 超阈值（或 message 预算耗尽）时亦入 omitted |
+| `patch` | 留 files+路径+**阈值化 output/error** | `files[{path,additions,deletions,status}]`、`metadata.path`、瘦 `state.input.path`；**`state.output`/`state.error` 阈值内联**（同 tool） | output/error 超阈值 → omitted+`hasFull` |
 | `file` | 按 url 类型 | `filename,mime`；`url`：`http(s)`短则留、`data:`则 null + `hasFull` | `source`(base64) |
 | `step-start` | ids | `id,type,messageID,sessionID` | snapshot |
 | `step-finish` | ids | `id,type,messageID,sessionID`（finish 可留 reason/cost/tokens） | snapshot |
 | `compaction` | 全留（设单 part 上限） | 全部 | — |
 | 未知 | ids+标记 | `id,type,messageID,sessionID` | 大字段（受总响应上限保护） |
+
+**阈值化 skeleton（加性，wire 版本仍 1；默认常开，无 opt-in）**：tool/patch 的 `state.output` 与 `state.error` 按 **JSON 字节**（`orjson.dumps` 序列化长度，即上线字节，含引号/多字节）计：
+- per-field ≤ `SKELETON_INLINE_OUTPUT_MAX_BYTES`（默认 4 KiB）**且** 该 message 累计内联 ≤ `SKELETON_INLINE_OUTPUT_MAX_MESSAGE_BYTES`（默认 16 KiB）→ **原样内联**进 thin state（不进 omitted）。
+- 超任一阈值 → **整字段 omit**（**绝不半截断**）+ `omitted` 记 `state.output`/`state.error`，可经 `/full` 取回完整值。
+- `state.structured/result/raw/attachments` **始终 omit**（巨型嵌套 JSON 无内联价值）。
+- **`hasFull` 语义**：仅当该 part 仍有 omitted 字段才置 `true`；某 part 所有 output/error 都内联且无其他删字段 → **不设** `hasFull`（客户端 UI 不出现展开按钮）。`hasFull` 只表示"还有可经 full 取回的字段"，**绝不**表示"当前内容不可见"。
+- env 调参（不改契约）：`OC_SLIMAPI_SKELETON_INLINE_OUTPUT_MAX_BYTES` / `OC_SLIMAPI_SKELETON_INLINE_OUTPUT_MAX_MESSAGE_BYTES`。外层仍受 `max_response_bytes` 约束（阈值化不绕过）。`/slimapi/health` 的 `features.thresholdedSkeleton`/`skeletonInlineOutputMaxBytes` 仅供诊断，行为不依赖客户端识别。
 
 **所有被裁剪的 part 加标记**（需客户端扩模型，见 §3）：
 ```json

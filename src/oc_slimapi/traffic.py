@@ -46,7 +46,7 @@ def bucketize(method: str, path: str) -> str:
 
     Order matters: more specific prefixes are tested first. The catch-all
     reverse-proxy paths (anything not under ``/slimapi/**``) collapse to
-    ``proxy_passthrough`` so an operator sees aggregate passthrough traffic
+    ``passthrough`` so an operator sees aggregate passthrough traffic
     separately from the curated thin API.
     """
     if not path:
@@ -66,7 +66,7 @@ def bucketize(method: str, path: str) -> str:
         if path == "/slimapi/projects" or path.startswith("/slimapi/projects/"):
             return "projects"
         if path.startswith("/slimapi/questions") or path.startswith("/slimapi/permissions"):
-            return "qp"
+            return "quiz"
         if path.startswith("/slimapi/messages"):
             return "messages"
         # Generic /slimapi/sessions/** (list, /status, /children, etc.).
@@ -74,7 +74,7 @@ def bucketize(method: str, path: str) -> str:
             return "sessions"
         return "other"
     # Anything else is the catch-all reverse proxy.
-    return "proxy_passthrough"
+    return "passthrough"
 
 
 # Per-request upstream-byte stash keys (stored under ``scope["state"]`` by
@@ -291,7 +291,7 @@ class TrafficLedger:
         .. note::
            **Totals heterogeneity**: ``totals`` sums byte counters across all
            buckets, but the byte semantics are **heterogeneous**.  Proxy
-           buckets (``proxy_passthrough``) may have ``upIn`` counted as
+           buckets (``passthrough``) may have ``upIn`` counted as
            gzip-compressed wire bytes, while curated buckets count decoded
            logical bytes.  Therefore per-bucket ``downOutOverUpIn`` ratios are
            more meaningful than the aggregate ``totals`` ratio.
