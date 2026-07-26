@@ -1,0 +1,308 @@
+==> 质量门禁
+==> pytest tests/
+........................................................................ [  7%]
+........................................................................ [ 14%]
+........................................................................ [ 21%]
+........................................................................ [ 28%]
+........................................................................ [ 35%]
+........................................................................ [ 42%]
+........................................................................ [ 49%]
+........................................................................ [ 56%]
+........................................................................ [ 63%]
+........................................................................ [ 70%]
+........................................................................ [ 77%]
+........................................................................ [ 84%]
+........................................................................ [ 91%]
+........................................................................ [ 98%]
+..............                                                           [100%]
+=============================== warnings summary ===============================
+tests/test_hub_behavior_lock.py:378
+  /home/mar/personal_projects/oc-slimapi/tests/test_hub_behavior_lock.py:378: PytestUnknownMarkWarning: Unknown pytest.mark.integration - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.integration
+
+.venv/lib/python3.14/site-packages/fastapi/testclient.py:1
+  /home/mar/personal_projects/oc-slimapi/.venv/lib/python3.14/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+
+tests/test_access_log.py::test_write_emits_one_json_line_with_all_fields
+  /home/mar/personal_projects/oc-slimapi/.venv/lib/python3.14/site-packages/pytest_asyncio/plugin.py:1216: DeprecationWarning: 'asyncio.get_event_loop_policy' is deprecated and slated for removal in Python 3.16
+    return asyncio.get_event_loop_policy()
+
+tests/test_children_cache.py: 25 warnings
+tests/test_errors.py: 2 warnings
+tests/test_g_f1_cursor.py: 6 warnings
+tests/test_health.py: 14 warnings
+tests/test_hub.py: 48 warnings
+tests/test_hub_behavior_lock.py: 97 warnings
+tests/test_hub_children_invalidation.py: 10 warnings
+tests/test_messages_routes.py: 116 warnings
+tests/test_metrics.py: 5 warnings
+tests/test_proxy.py: 25 warnings
+tests/test_questions_routes.py: 13 warnings
+tests/test_request_id.py: 7 warnings
+tests/test_sessions_children_hint.py: 5 warnings
+tests/test_sessions_children_route.py: 27 warnings
+tests/test_sessions_routes.py: 43 warnings
+tests/test_sse_logging.py: 4 warnings
+tests/test_token_hub.py: 9 warnings
+tests/test_token_hub_flush.py: 6 warnings
+tests/test_token_hub_lifecycle.py: 13 warnings
+tests/test_token_stream_route.py: 38 warnings
+tests/test_traffic_integration.py: 4 warnings
+tests/test_traffic_middleware.py: 13 warnings
+tests/test_traffic_sse.py: 3 warnings
+tests/test_traffic_upin_gaps.py: 6 warnings
+tests/test_transform.py: 7 warnings
+tests/test_upstream_error_boundary.py: 18 warnings
+  /home/mar/personal_projects/oc-slimapi/.venv/lib/python3.14/site-packages/pytest_asyncio/plugin.py:874: DeprecationWarning: 'asyncio.get_event_loop_policy' is deprecated and slated for removal in Python 3.16
+    _restore_event_loop_policy(asyncio.get_event_loop_policy()),
+
+tests/test_children_cache.py: 25 warnings
+tests/test_errors.py: 2 warnings
+tests/test_g_f1_cursor.py: 6 warnings
+tests/test_health.py: 14 warnings
+tests/test_hub.py: 48 warnings
+tests/test_hub_behavior_lock.py: 97 warnings
+tests/test_hub_children_invalidation.py: 10 warnings
+tests/test_messages_routes.py: 116 warnings
+tests/test_metrics.py: 5 warnings
+tests/test_proxy.py: 25 warnings
+tests/test_questions_routes.py: 13 warnings
+tests/test_request_id.py: 7 warnings
+tests/test_sessions_children_hint.py: 5 warnings
+tests/test_sessions_children_route.py: 27 warnings
+tests/test_sessions_routes.py: 43 warnings
+tests/test_sse_logging.py: 4 warnings
+tests/test_token_hub.py: 9 warnings
+tests/test_token_hub_flush.py: 6 warnings
+tests/test_token_hub_lifecycle.py: 13 warnings
+tests/test_token_stream_route.py: 38 warnings
+tests/test_traffic_integration.py: 4 warnings
+tests/test_traffic_middleware.py: 13 warnings
+tests/test_traffic_sse.py: 3 warnings
+tests/test_traffic_upin_gaps.py: 6 warnings
+tests/test_transform.py: 7 warnings
+tests/test_upstream_error_boundary.py: 18 warnings
+  /home/mar/personal_projects/oc-slimapi/.venv/lib/python3.14/site-packages/pytest_asyncio/plugin.py:772: DeprecationWarning: 'asyncio.get_event_loop_policy' is deprecated and slated for removal in Python 3.16
+    old_loop_policy = asyncio.get_event_loop_policy()
+
+tests/test_children_cache.py: 25 warnings
+tests/test_errors.py: 2 warnings
+tests/test_g_f1_cursor.py: 6 warnings
+tests/test_health.py: 14 warnings
+tests/test_hub.py: 48 warnings
+tests/test_hub_behavior_lock.py: 97 warnings
+tests/test_hub_children_invalidation.py: 10 warnings
+tests/test_messages_routes.py: 116 warnings
+tests/test_metrics.py: 5 warnings
+tests/test_proxy.py: 25 warnings
+tests/test_questions_routes.py: 13 warnings
+tests/test_request_id.py: 7 warnings
+tests/test_sessions_children_hint.py: 5 warnings
+tests/test_sessions_children_route.py: 27 warnings
+tests/test_sessions_routes.py: 43 warnings
+tests/test_sse_logging.py: 4 warnings
+tests/test_token_hub.py: 9 warnings
+tests/test_token_hub_flush.py: 6 warnings
+tests/test_token_hub_lifecycle.py: 13 warnings
+tests/test_token_stream_route.py: 38 warnings
+tests/test_traffic_integration.py: 4 warnings
+tests/test_traffic_middleware.py: 13 warnings
+tests/test_traffic_sse.py: 3 warnings
+tests/test_traffic_upin_gaps.py: 6 warnings
+tests/test_transform.py: 7 warnings
+tests/test_upstream_error_boundary.py: 18 warnings
+  /home/mar/personal_projects/oc-slimapi/.venv/lib/python3.14/site-packages/pytest_asyncio/plugin.py:777: DeprecationWarning: 'asyncio.set_event_loop_policy' is deprecated and slated for removal in Python 3.16
+    asyncio.set_event_loop_policy(policy)
+
+tests/test_children_cache.py: 25 warnings
+tests/test_errors.py: 2 warnings
+tests/test_g_f1_cursor.py: 6 warnings
+tests/test_health.py: 14 warnings
+tests/test_hub.py: 48 warnings
+tests/test_hub_behavior_lock.py: 97 warnings
+tests/test_hub_children_invalidation.py: 10 warnings
+tests/test_messages_routes.py: 116 warnings
+tests/test_metrics.py: 5 warnings
+tests/test_proxy.py: 25 warnings
+tests/test_questions_routes.py: 13 warnings
+tests/test_request_id.py: 7 warnings
+tests/test_sessions_children_hint.py: 5 warnings
+tests/test_sessions_children_route.py: 27 warnings
+tests/test_sessions_routes.py: 43 warnings
+tests/test_sse_logging.py: 4 warnings
+tests/test_token_hub.py: 9 warnings
+tests/test_token_hub_flush.py: 6 warnings
+tests/test_token_hub_lifecycle.py: 13 warnings
+tests/test_token_stream_route.py: 38 warnings
+tests/test_traffic_integration.py: 4 warnings
+tests/test_traffic_middleware.py: 13 warnings
+tests/test_traffic_sse.py: 3 warnings
+tests/test_traffic_upin_gaps.py: 6 warnings
+tests/test_transform.py: 7 warnings
+tests/test_upstream_error_boundary.py: 18 warnings
+  /home/mar/personal_projects/oc-slimapi/.venv/lib/python3.14/site-packages/pytest_asyncio/plugin.py:1183: DeprecationWarning: 'asyncio.get_event_loop_policy' is deprecated and slated for removal in Python 3.16
+    loop = asyncio.get_event_loop_policy().new_event_loop()
+
+tests/test_children_cache.py: 25 warnings
+tests/test_errors.py: 2 warnings
+tests/test_g_f1_cursor.py: 6 warnings
+tests/test_health.py: 14 warnings
+tests/test_hub.py: 48 warnings
+tests/test_hub_behavior_lock.py: 97 warnings
+tests/test_hub_children_invalidation.py: 10 warnings
+tests/test_messages_routes.py: 116 warnings
+tests/test_metrics.py: 5 warnings
+tests/test_proxy.py: 25 warnings
+tests/test_questions_routes.py: 13 warnings
+tests/test_request_id.py: 7 warnings
+tests/test_sessions_children_hint.py: 5 warnings
+tests/test_sessions_children_route.py: 27 warnings
+tests/test_sessions_routes.py: 43 warnings
+tests/test_sse_logging.py: 4 warnings
+tests/test_token_hub.py: 9 warnings
+tests/test_token_hub_flush.py: 6 warnings
+tests/test_token_hub_lifecycle.py: 13 warnings
+tests/test_token_stream_route.py: 38 warnings
+tests/test_traffic_integration.py: 4 warnings
+tests/test_traffic_middleware.py: 13 warnings
+tests/test_traffic_sse.py: 3 warnings
+tests/test_traffic_upin_gaps.py: 6 warnings
+tests/test_transform.py: 7 warnings
+tests/test_upstream_error_boundary.py: 18 warnings
+  /home/mar/personal_projects/oc-slimapi/.venv/lib/python3.14/site-packages/pytest_asyncio/plugin.py:889: DeprecationWarning: 'asyncio.get_event_loop_policy' is deprecated and slated for removal in Python 3.16
+    policy = asyncio.get_event_loop_policy()
+
+tests/test_children_cache.py: 25 warnings
+tests/test_errors.py: 2 warnings
+tests/test_g_f1_cursor.py: 6 warnings
+tests/test_health.py: 14 warnings
+tests/test_hub.py: 48 warnings
+tests/test_hub_behavior_lock.py: 97 warnings
+tests/test_hub_children_invalidation.py: 10 warnings
+tests/test_messages_routes.py: 116 warnings
+tests/test_metrics.py: 5 warnings
+tests/test_proxy.py: 25 warnings
+tests/test_questions_routes.py: 13 warnings
+tests/test_request_id.py: 7 warnings
+tests/test_sessions_children_hint.py: 5 warnings
+tests/test_sessions_children_route.py: 27 warnings
+tests/test_sessions_routes.py: 43 warnings
+tests/test_sse_logging.py: 4 warnings
+tests/test_token_hub.py: 9 warnings
+tests/test_token_hub_flush.py: 6 warnings
+tests/test_token_hub_lifecycle.py: 13 warnings
+tests/test_token_stream_route.py: 38 warnings
+tests/test_traffic_integration.py: 4 warnings
+tests/test_traffic_middleware.py: 13 warnings
+tests/test_traffic_sse.py: 3 warnings
+tests/test_traffic_upin_gaps.py: 6 warnings
+tests/test_transform.py: 7 warnings
+tests/test_upstream_error_boundary.py: 18 warnings
+  /home/mar/personal_projects/oc-slimapi/.venv/lib/python3.14/site-packages/pytest_asyncio/plugin.py:794: DeprecationWarning: 'asyncio.set_event_loop_policy' is deprecated and slated for removal in Python 3.16
+    asyncio.set_event_loop_policy(old_loop_policy)
+
+tests/test_children_cache.py: 25 warnings
+tests/test_errors.py: 2 warnings
+tests/test_g_f1_cursor.py: 6 warnings
+tests/test_health.py: 14 warnings
+tests/test_hub.py: 48 warnings
+tests/test_hub_behavior_lock.py: 97 warnings
+tests/test_hub_children_invalidation.py: 10 warnings
+tests/test_messages_routes.py: 116 warnings
+tests/test_metrics.py: 5 warnings
+tests/test_proxy.py: 25 warnings
+tests/test_questions_routes.py: 13 warnings
+tests/test_request_id.py: 7 warnings
+tests/test_sessions_children_hint.py: 5 warnings
+tests/test_sessions_children_route.py: 27 warnings
+tests/test_sessions_routes.py: 43 warnings
+tests/test_sse_logging.py: 4 warnings
+tests/test_token_hub.py: 9 warnings
+tests/test_token_hub_flush.py: 6 warnings
+tests/test_token_hub_lifecycle.py: 13 warnings
+tests/test_token_stream_route.py: 38 warnings
+tests/test_traffic_integration.py: 4 warnings
+tests/test_traffic_middleware.py: 13 warnings
+tests/test_traffic_sse.py: 3 warnings
+tests/test_traffic_upin_gaps.py: 6 warnings
+tests/test_transform.py: 7 warnings
+tests/test_upstream_error_boundary.py: 18 warnings
+  /home/mar/personal_projects/oc-slimapi/.venv/lib/python3.14/site-packages/pytest_asyncio/plugin.py:942: DeprecationWarning: 'asyncio.get_event_loop_policy' is deprecated and slated for removal in Python 3.16
+    policy = asyncio.get_event_loop_policy()
+
+tests/test_children_cache.py: 25 warnings
+tests/test_errors.py: 2 warnings
+tests/test_g_f1_cursor.py: 6 warnings
+tests/test_health.py: 14 warnings
+tests/test_hub.py: 48 warnings
+tests/test_hub_behavior_lock.py: 97 warnings
+tests/test_hub_children_invalidation.py: 10 warnings
+tests/test_messages_routes.py: 116 warnings
+tests/test_metrics.py: 5 warnings
+tests/test_proxy.py: 25 warnings
+tests/test_questions_routes.py: 13 warnings
+tests/test_request_id.py: 7 warnings
+tests/test_sessions_children_hint.py: 5 warnings
+tests/test_sessions_children_route.py: 27 warnings
+tests/test_sessions_routes.py: 43 warnings
+tests/test_sse_logging.py: 4 warnings
+tests/test_token_hub.py: 9 warnings
+tests/test_token_hub_flush.py: 6 warnings
+tests/test_token_hub_lifecycle.py: 13 warnings
+tests/test_token_stream_route.py: 38 warnings
+tests/test_traffic_integration.py: 4 warnings
+tests/test_traffic_middleware.py: 13 warnings
+tests/test_traffic_sse.py: 3 warnings
+tests/test_traffic_upin_gaps.py: 6 warnings
+tests/test_transform.py: 7 warnings
+tests/test_upstream_error_boundary.py: 18 warnings
+  /home/mar/personal_projects/oc-slimapi/.venv/lib/python3.14/site-packages/pytest_asyncio/plugin.py:966: DeprecationWarning: 'asyncio.set_event_loop_policy' is deprecated and slated for removal in Python 3.16
+    asyncio.set_event_loop_policy(previous_policy)
+
+tests/test_children_cache.py: 25 warnings
+tests/test_errors.py: 2 warnings
+tests/test_g_f1_cursor.py: 6 warnings
+tests/test_health.py: 14 warnings
+tests/test_hub.py: 48 warnings
+tests/test_hub_behavior_lock.py: 97 warnings
+tests/test_hub_children_invalidation.py: 10 warnings
+tests/test_messages_routes.py: 116 warnings
+tests/test_metrics.py: 5 warnings
+tests/test_proxy.py: 25 warnings
+tests/test_questions_routes.py: 13 warnings
+tests/test_request_id.py: 7 warnings
+tests/test_sessions_children_hint.py: 5 warnings
+tests/test_sessions_children_route.py: 27 warnings
+tests/test_sessions_routes.py: 43 warnings
+tests/test_sse_logging.py: 4 warnings
+tests/test_token_hub.py: 9 warnings
+tests/test_token_hub_flush.py: 6 warnings
+tests/test_token_hub_lifecycle.py: 13 warnings
+tests/test_token_stream_route.py: 38 warnings
+tests/test_traffic_integration.py: 4 warnings
+tests/test_traffic_middleware.py: 13 warnings
+tests/test_traffic_sse.py: 3 warnings
+tests/test_traffic_upin_gaps.py: 6 warnings
+tests/test_transform.py: 7 warnings
+tests/test_upstream_error_boundary.py: 18 warnings
+  /home/mar/personal_projects/oc-slimapi/.venv/lib/python3.14/site-packages/pytest_asyncio/plugin.py:978: DeprecationWarning: 'asyncio.get_event_loop_policy' is deprecated and slated for removal in Python 3.16
+    policy = asyncio.get_event_loop_policy()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+1022 passed, 5079 warnings in 27.56s
+==> 路由↔文档一致性（防漂移）
+✅ 路由↔文档一致：19 条 /slimapi 路由均已在 INTERFACE_MAP.md 记录。
+✅ check.sh 通过
+==> 版本：0.10.0 → 0.11.0（tag v0.11.0）
+[main 8b1a96d] release: v0.11.0
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+✅ Tag 创建: v0.11.0
+
+════════════════════════════════════════════════════════════
+✅ 仓库发版准备完成: 0.11.0 (tag v0.11.0)
+
+确认无误后执行:
+  git push origin main && git push origin v0.11.0
+（可选）在 Gitea 为 tag 建 Release，body 贴 CHANGELOG 该节
+════════════════════════════════════════════════════════════
