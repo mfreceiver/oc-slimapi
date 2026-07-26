@@ -273,8 +273,7 @@ def skeleton_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 # never dropped), keeping ``/full`` semantics field-faithful.
 # ---------------------------------------------------------------------------
 def strip_diagnostics_message(message: dict[str, Any]) -> dict[str, Any]:
-    """Return a deep copy of ``message`` with the never-consumed LSP
-    ``diagnostics`` map removed from every part.
+    """Strip the never-consumed LSP ``diagnostics`` map from every part **in place**.
 
     Two locations are considered per part, but ONLY
     ``state.metadata.diagnostics`` (where opencode's ``edit``/``write`` tools
@@ -283,20 +282,20 @@ def strip_diagnostics_message(message: dict[str, Any]) -> dict[str, Any]:
     stated target and its consumption is unproven, so stripping it would be
     speculative overreach beyond "remove only ``diagnostics`` from the part".
 
-    Non-mutating: the input dict and its nested dicts are untouched (pure
-    projection, consistent with :func:`skeleton_message`). Used by the
+    In-place: production callers feed a freshly ``orjson.loads``'d tree with no
+    shared aliases, so a full ``deepcopy`` would only burn CPU/RSS. The input
+    dict is mutated (``metadata.pop("diagnostics")``) and returned. Used by the
     ``mode=full`` routes via :func:`transform.strip_diagnostics_and_pack` and
     by the G6 batch full path.
 
     Shape-robust: a non-dict body (e.g. a list/scalar from a malformed upstream
-    200) is returned deep-copied as-is — there are no parts to scrub — so the
-    route still serves the body, matching the prior verbatim passthrough for
-    non-conforming shapes rather than turning a weird upstream 200 into a 500.
+    200) is returned as-is — there are no parts to scrub — so the route still
+    serves the body, matching the prior verbatim passthrough for non-conforming
+    shapes rather than turning a weird upstream 200 into a 500.
     """
-    out = deepcopy(message)
-    if not isinstance(out, dict):
-        return out
-    parts = out.get("parts")
+    if not isinstance(message, dict):
+        return message
+    parts = message.get("parts")
     if isinstance(parts, list):
         for part in parts:
             if not isinstance(part, dict):
@@ -306,14 +305,16 @@ def strip_diagnostics_message(message: dict[str, Any]) -> dict[str, Any]:
                 metadata = state.get("metadata")
                 if isinstance(metadata, dict):
                     metadata.pop("diagnostics", None)
-    return out
+    return message
 
 
 def strip_diagnostics_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not isinstance(messages, list):
         # Non-list body (malformed upstream 200): nothing to iterate.
-        return deepcopy(messages)
-    return [strip_diagnostics_message(message) for message in messages]
+        return messages
+    for message in messages:
+        strip_diagnostics_message(message)
+    return messages
 
 
 def _is_renderable(part: dict[str, Any]) -> bool:

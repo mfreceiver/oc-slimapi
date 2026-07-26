@@ -103,6 +103,9 @@ SESSION_EVENTS = frozenset({
 })
 
 # Message-scoped events folded into the digest window.
+# ``message.appended`` is retained for wire compatibility; current opencode
+# GlobalBus primarily emits ``message.updated`` for new messages, but treating
+# appended the same is cheap and harmless.
 MESSAGE_EVENTS = frozenset({
     "message.updated", "message.appended",
 })
@@ -452,7 +455,27 @@ class GlobalHub:
             await asyncio.sleep(DEBOUNCE_SECONDS)
             self.flush()
 
+    def flush_sid(self, session_id: str) -> None:
+        """Flush only the pending digest for ``session_id`` (immediate paths).
+
+        Used by G1-A ``session.error`` and busy-clears-sticky so other sids'
+        pending digests stay in the debounce window. Sticky lastError merge
+        matches :meth:`flush` for a single entry.
+        """
+        fields = self.pending.pop(session_id, None)
+        if fields is None:
+            return
+        # Merge sticky lastError only when entry did not set/clear it this window.
+        if fields.last_error is _UNSET and session_id in self.sticky_last_error:
+            fields.last_error = self.sticky_last_error[session_id]
+        frame = sse_frame(fields.to_payload(session_id), event="session.digest")
+        for subscriber in tuple(self.subscribers):
+            subscriber.put(frame)
+        if self.subscribers:
+            self.emitted_frames_total += len(self.subscribers)
+
     def flush(self) -> None:
+        """Flush every pending digest (debounce loop)."""
         if not self.pending:
             return
         snapshot, self.pending = self.pending, {}
@@ -522,10 +545,11 @@ class GlobalHub:
                 if isinstance(status, str):
                     entry.status = status
                 # G1: busy clears sticky lastError with explicit null digest.
+                # Per-sid flush only — other sessions stay in the debounce window.
                 if props.get("status") == "busy" and session_id in self.sticky_last_error:
                     self.sticky_last_error.pop(session_id, None)
                     entry.last_error = None  # explicit null → clear frame
-                    self.flush()
+                    self.flush_sid(session_id)
             elif event_type == "session.deleted":
                 entry.deleted = True
                 # C⑩: record a tombstone that survives pending eviction so a
@@ -539,14 +563,19 @@ class GlobalHub:
                 # (epoch-ms int). Pass-through — same handling as
                 # info.time.updated/created in the MESSAGE_EVENTS branch below
                 # (opencode emits epoch-ms ints; we trust the upstream format
-                # and do not coerce). Sticky: a falsy/missing value does NOT
-                # clear an already-observed timestamp (archived is permanent,
-                # mirroring the deleted-stickiness philosophy). Other
-                # session.updated fields flow through subsequent events.
+                # and do not coerce). Use ``is not None`` so epoch 0 is kept
+                # (``if archived_val:`` would drop it). Sticky: a missing
+                # value does NOT clear an already-observed timestamp
+                # (archived is permanent, mirroring deleted-stickiness).
+                # Other session.updated fields flow through subsequent events.
                 info = props.get("info") if isinstance(props.get("info"), dict) else {}
                 time_obj = info.get("time") if isinstance(info.get("time"), dict) else {}
                 archived_val = time_obj.get("archived")
-                if archived_val:
+                # Reject bool explicitly: bool is a subclass of int, so a
+                # spurious ``archived: true`` from upstream must not be coerced
+                # to epoch-ms 1 and emitted to clients. Only real epoch-ms ints
+                # (including 0) pass through.
+                if isinstance(archived_val, int) and not isinstance(archived_val, bool):
                     entry.archived = archived_val
             # Stage B §16-B: PARALLEL route to the token hub. The digest
             # work above is the control-plane contract (unchanged); this
@@ -594,7 +623,8 @@ class GlobalHub:
 
         # G1: session.error — immediate digest (with sid) or session.error frame (session-less).
         # Sid MUST be props.get("sessionID") only — do NOT use _extract_session_id
-        # (it falls back to payload.id = GlobalBus event id).
+        # (session.error may lack props.sessionID / info; helper is for session.*
+        # / message.* shapes only).
         if event_type == "session.error":
             err = props.get("error") if isinstance(props, dict) else None
             err = err if isinstance(err, dict) else {}
@@ -633,7 +663,7 @@ class GlobalHub:
                 self.sticky_last_error[sid] = last_error_obj
                 if isinstance(directory, str):
                     entry.directory = directory
-                self.flush()  # G1-A immediate
+                self.flush_sid(sid)  # G1-A immediate, this sid only
             else:
                 # G1-B session-less: immediate direct push (no debounce)
                 frame_payload: dict[str, Any] = {
@@ -778,6 +808,15 @@ class GlobalHub:
 
 
 def _extract_session_id(payload: dict[str, Any], props: dict[str, Any]) -> str | None:
+    """Resolve session id from a GlobalBus event payload.
+
+    Order: ``properties.sessionID`` → ``properties.info.sessionID`` → for
+    ``session.*`` events only, ``properties.info.id`` (the session row id).
+
+    Deliberately does **not** fall back to ``payload.id``: on GlobalBus that
+    field is the *event* id, not a session id. Using it would hang digests
+    under random event UUIDs and corrupt sticky lastError / pending maps.
+    """
     sid = props.get("sessionID")
     if isinstance(sid, str):
         return sid
@@ -785,9 +824,6 @@ def _extract_session_id(payload: dict[str, Any], props: dict[str, Any]) -> str |
     candidate = info.get("sessionID")
     if isinstance(candidate, str):
         return candidate
-    raw_id = payload.get("id")
-    if isinstance(raw_id, str):
-        return raw_id
     event_type = payload.get("type")
     if (
         isinstance(event_type, str)

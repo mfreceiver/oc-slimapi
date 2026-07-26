@@ -303,24 +303,41 @@ async def messages_since(
 ):
     """A2=A (contract §5): return skeleton messages with ``(info.time.updated or info.time.created) >= ts``.
 
-    Walks opencode's newest-first ``/session/{sid}/message`` listing backward
-    via the ``before`` cursor (opencode's own opaque base64url cursor,
-    forwarded verbatim — never decoded/re-encoded by sidecar). A single
-    transform-pool admission covers the whole multi-page scan, and a single
-    cumulative ``max_response_bytes`` budget is enforced across pages so a
-    runaway timestamp scan cannot accumulate more than the cap of upstream
-    bodies (413 ``response_too_large`` on overflow — contract §7).
+    Walks opencode's ``/session/{sid}/message`` listing via the ``before``
+    cursor (opencode's own opaque base64url cursor, forwarded verbatim —
+    never decoded/re-encoded by sidecar). A single transform-pool admission
+    covers the whole multi-page scan, and a single cumulative
+    ``max_response_bytes`` budget is enforced across pages so a runaway
+    timestamp scan cannot accumulate more than the cap of upstream bodies
+    (413 ``response_too_large`` on overflow — contract §7).
 
-    Because upstream pages are sorted newest→oldest, the scan stops at the
-    first item with ``(time.updated or time.created) < ts``: every subsequent item in this page
-    and any older page is also below the floor. The boundary (``== ts``) is
-    included — clients dedup by messageID.
+    **Page order (opencode MessageV2.page, v1.18.4+):** DB window is taken
+    newest-first, then ``items.reverse()`` so each **page is oldest-first**
+    (``items[0]`` = oldest in the window, ``items[-1]`` = newest). The next
+    ``before`` cursor points at the unreversed slice tail (oldest-in-window)
+    so following Link yields **strictly older** pages.
 
-    Pagination cursor: opencode advertises more pages via the RFC 5988
-    ``Link: <...?before=<opaque>; rel="next"`` response header. We extract
-    that opaque cursor and surface it verbatim as our own ``X-Next-Cursor``
-    response header — emitted only when we filled the client's limit AND
-    never tripped the ts floor AND opencode actually advertised another page.
+    Scan rules:
+    - Every page is **fully** filtered with ``_passes_ts_filter`` (no
+      "first non-match stops the page" heuristic — that emptied oldest-first
+      windows when the head was below ``ts``).
+    - After filtering a non-empty page, if the **page head** (oldest item)
+      has a comparable watermark ``< ts``, every older page is also ``< ts``
+      → set the ts floor and stop following Link.
+    - Also stop on empty page, no Link, ``collected >= limit``, or
+      ``max_since_pages`` exhaustion.
+    - Boundary ``== ts`` is included; clients dedup by messageID.
+    - Newest-first fixtures still work: full-page filter never drops a later
+      ``>= ts`` row just because an earlier row failed.
+
+    Response headers:
+    - ``X-Next-Cursor``: opencode's opaque Link cursor, only when we filled
+      ``limit`` AND did not hit the ts floor AND upstream advertised next.
+    - ``X-Since-Complete`` (additive): ``true`` when the scan ended for a
+      semantic reason (ts floor, no more upstream pages, empty page, or
+      client limit filled with correct pagination). ``false`` only when
+      ``max_since_pages`` exhausted without proving a ts floor while
+      upstream may still have pages.
     """
     directory = await _resolve_messages_directory(request, directory)
     if request.app.state.schema_degraded:
@@ -340,7 +357,9 @@ async def messages_since(
             # our X-Next-Cursor iff we end the scan without tripping the ts
             # floor and the limit is filled.
             last_page_cursor: str | None = None
-            _exhausted = True
+            # True only if the for-loop runs to max_since_pages without an
+            # early semantic stop (floor / empty / no Link / limit full).
+            stopped_for_max_pages = True
             for _ in range(config.max_since_pages):
                 params = {"limit": limit}
                 if cursor:
@@ -364,10 +383,9 @@ async def messages_since(
                     # Traffic accounting: per-page upstream bytes.
                     stash_up_in(request, n)
                     # Per-page parse stays inline because we must inspect
-                    # info.time.updated per item to apply the A2=A filter and
-                    # decide whether older pages still need scanning. The
-                    # expensive skeleton projection of the merged list runs
-                    # off-thread below.
+                    # watermarks to apply the A2=A filter and decide whether
+                    # older pages still need scanning. The expensive skeleton
+                    # projection of the merged list runs off-thread below.
                     page = orjson.loads(body)
                     # opencode advertises more pages via the Link header
                     # (RFC 5988 rel="next"). Extract the opaque before cursor
@@ -380,33 +398,38 @@ async def messages_since(
                 finally:
                     await response.aclose()
                 if not page:
-                    _exhausted = False
+                    # Empty page → no more data; scan is complete.
+                    stopped_for_max_pages = False
                     break
-                page_full = False
+                # Full-page filter: never early-break on first non-match
+                # (oldest-first pages often start below ts).
                 for item in page:
                     if _passes_ts_filter(item, ts):
                         collected.append(item)
                         if len(collected) >= limit:
-                            page_full = True
                             break
-                    else:
-                        # Pages are newest→oldest; the first item below the
-                        # ts floor means every older item (this page tail and
-                        # any further page) is also below ts. Stop scanning.
-                        hit_ts_floor = True
-                        page_full = True
-                        break
-                if page_full:
-                    _exhausted = False
+                # Ts floor (oldest-first): page head is the oldest-in-window.
+                # If its comparable watermark is < ts, every older page is
+                # also below the floor — stop following Link.
+                head_wm = _item_updated(page[0])
+                if head_wm is not None and head_wm < ts:
+                    hit_ts_floor = True
+                    stopped_for_max_pages = False
+                    break
+                if len(collected) >= limit:
+                    stopped_for_max_pages = False
                     break
                 if not last_page_cursor:
-                    _exhausted = False
+                    stopped_for_max_pages = False
                     break
                 cursor = last_page_cursor
             # Emit X-Next-Cursor only when ALL of:
             #   • we filled the limit (more matching items may exist),
             #   • we never tripped the ts floor (older items would be < ts),
-            #   • opencode actually advertised another page (opaque cursor).
+            #   • opencode actually advertised another page (opaque cursor),
+            #   • we did not only stop because max_since_pages exhausted
+            #     without a natural page boundary (same as historical
+            #     ``not _exhausted`` guard).
             # The cursor is opencode's opaque string — passed through verbatim,
             # never decoded or re-encoded.
             base_headers: dict[str, str] = {"Cache-Control": "no-store"}
@@ -415,9 +438,19 @@ async def messages_since(
                 and len(collected) >= limit
                 and not hit_ts_floor
                 and last_page_cursor
-                and not _exhausted
+                and not stopped_for_max_pages
             ):
                 base_headers["X-Next-Cursor"] = last_page_cursor
+            # X-Since-Complete: false only when we hit max_since_pages without
+            # proving a ts floor and upstream may still have pages.
+            since_incomplete = (
+                stopped_for_max_pages
+                and not hit_ts_floor
+                and last_page_cursor is not None
+            )
+            base_headers["X-Since-Complete"] = (
+                "false" if since_incomplete else "true"
+            )
             if mode == "skeleton":
                 encoded, extra = await pool.offload(
                     project_messages_and_pack, collected,
@@ -478,12 +511,22 @@ async def messages(
                 link_header: str | None = None
                 status_code = 200
                 try:
-                    if response.status_code >= 400:
-                        return await _drain_error(response, request)
-                    status_code = response.status_code
-                    body, n_read = await read_with_cap(
-                        response, config.max_response_bytes,
-                    )
+                    # Align with /full/{mid}: mid-stream upstream I/O failures
+                    # (httpx.RequestError from _drain_error.aread() or
+                    # read_with_cap.aiter_bytes()) → structured 503, not a bare
+                    # FastAPI 500. send() itself is already mapped by
+                    # _stream_upstream.
+                    try:
+                        if response.status_code >= 400:
+                            return await _drain_error(response, request)
+                        status_code = response.status_code
+                        body, n_read = await read_with_cap(
+                            response, config.max_response_bytes,
+                        )
+                    except httpx.RequestError as exc:
+                        raise CodedHTTPException(
+                            503, code="upstream_unavailable",
+                        ) from exc
                     # Traffic accounting first: the bytes read up to the cap
                     # were still pulled from upstream, so they count toward upIn
                     # even when we then refuse the oversize body (matches the
@@ -497,11 +540,18 @@ async def messages(
                             accept_encoding=accept_encoding,
                         )
                     link_header = response.headers.get("Link")
-                    encoded, extra = await pool.offload(
-                        strip_diagnostics_and_pack, body,
-                        single=False,
-                        accept_encoding=accept_encoding,
-                    )
+                    # Empty / non-JSON upstream 200 → 503 upstream_unavailable
+                    # (same code as sessions bad-JSON), never a bare 500.
+                    try:
+                        encoded, extra = await pool.offload(
+                            strip_diagnostics_and_pack, body,
+                            single=False,
+                            accept_encoding=accept_encoding,
+                        )
+                    except orjson.JSONDecodeError as exc:
+                        raise CodedHTTPException(
+                            503, code="upstream_unavailable",
+                        ) from exc
                 finally:
                     await response.aclose()
             base_headers: dict[str, str] = {"Cache-Control": "no-store"}
@@ -815,8 +865,9 @@ async def message_batch(
             # Full mode: strip the never-consumed LSP
             # ``state.metadata.diagnostics`` map (ocdroid deletes it on
             # deserialise) but keep every other field. Offloaded to the worker
-            # pool like the skeleton branch so the deepcopy stays off the event
-            # loop; mirrors skeleton's offload → abort-check → assign pattern.
+            # pool like the skeleton branch (in-place pop on the owned parse
+            # tree; no deepcopy); mirrors skeleton's offload → abort-check →
+            # assign pattern.
             stripped = await pool.offload(lambda r=raw: strip_diagnostics_message(r))
             if _aborted():  # offload 是 await 点
                 return
@@ -989,11 +1040,18 @@ async def message(
                             limitBytes=config.max_message_bytes,
                             accept_encoding=accept_encoding,
                         )
-                    encoded, extra = await pool.offload(
-                        strip_diagnostics_and_pack, body,
-                        single=True,
-                        accept_encoding=accept_encoding,
-                    )
+                    # Empty / non-JSON upstream 200 → 503 upstream_unavailable
+                    # (same code as sessions bad-JSON), never a bare 500.
+                    try:
+                        encoded, extra = await pool.offload(
+                            strip_diagnostics_and_pack, body,
+                            single=True,
+                            accept_encoding=accept_encoding,
+                        )
+                    except orjson.JSONDecodeError as exc:
+                        raise CodedHTTPException(
+                            503, code="upstream_unavailable",
+                        ) from exc
                 finally:
                     await response.aclose()
             return Response(

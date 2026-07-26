@@ -30,9 +30,28 @@ ocdroid 对接时：
 
 > 开发中、尚未打 tag 的变更写在这里；`release.sh` 发版时把本节内容折叠进新版本标题下。
 
+（暂无）
+
+---
+
+## [0.11.0] - 2026-07-26
+
+> Slim 会话消息可靠性联合计划 **阶段 A 第1类**（oc-slimapi 单方，无需 ocdroid 配合即可受益）：`/since/{ts}` 页序/早停修复（按 opencode v1.18.4 `MessageV2.page` 页内 oldest-first 整页过滤）、加性响应头 `X-Since-Complete`、SSE per-sid immediate flush、`archived` bool 防护、`/full` 非法/空 JSON 与中途读取失败统一 503 `upstream_unavailable`、full strip in-place（去多余 deepcopy）。**全加性/修复性 wire，`X-Slimapi-Version` 仍 `1`，不 bump**。第2类（消息内容 watermark revision/partCount/generation、token idle/resync 清态、SSE 开/关统一 reconcile 三分法）**未合入本仓 wire**，待双方阶段 B 联调；本轮亦未实施阶段 B。计划：`docs/ocmar/plans/2026-07-26-slim-message-reliability-joint-plan.md`、`docs/ocmar/plans/2026-07-26-slim-state-message-repair.md`；评审：`docs/ocmar/reviews/2026-07-26-rev-gpt-class1-slim-repair.md`（有条件通过→收尾项已处理）。
+
 ### Added
 
-- *(none yet)*
+- **`X-Since-Complete: true|false`（`GET /slimapi/messages/{sid}/since/{ts}`，加性响应头）**：标明本次增量扫描是否完整结束（`true`）或因 `max_since_pages` 截断且可能仍有匹配页（`false`）。旧客户端可忽略。**不 bump** `X-Slimapi-Version`（仍 `1`）。设计/对接：`docs/specs/design-v2.md` §1.5、`docs/specs/CLIENT_CHANGES.md`；计划与评审：`docs/ocmar/plans/2026-07-26-slim-state-message-repair.md`、`docs/ocmar/reports/2026-07-26-slim-state-sse-review.md`。
+
+### Fixed
+
+- **`/since/{ts}` 页序与早停（第1类）**：纠正「upstream 页内 newest→oldest、首项 watermark `< ts` 即停」的错误假定。opencode `MessageV2.page` 为 **页内 oldest-first**（DB newest-first 取窗后 reverse）；sidecar **整页过滤**匹配项，并用**页内最旧 watermark** 判断是否值得再扫更旧页。修复升序页上增量常空、丢消息的问题。**加性/修复性 wire，不 bump** `X-Slimapi-Version`。
+- **`/full` 上游非法/空 JSON 与读取中断统一 503 `upstream_unavailable`**：`GET /slimapi/messages/{sid}?mode=full` 与 `/full/{mid}` 的 `read_with_cap` 异步 body 迭代过程中发生的 `httpx.RequestError`（上游响应已返回后流中断，非 `send` 阶段）现统一映射为 503 `upstream_unavailable`（与空/坏 JSON 同 code），不再逃逸为 FastAPI 默认 500。**加性/修复性 wire，不 bump** `X-Slimapi-Version`。
+- **SSE per-sid flush（G1-A `session.error` / busy clear）**：`hub.publish()` 对 `session.error`（有 sid）和 `status=busy`（清 sticky lastError）改为调用 `flush_sid(sid)` 仅排空该 sid 的 pending digest，其余 sid 仍留在 250ms debounce 窗口内，避免全局 flush 把未到期 digest 提前吐给订阅者。**纯服务端行为，不 bump** `X-Slimapi-Version`。
+- **archived bool 防护**：`session.updated` 的 `info.time.archived` 接受整数 epoch-ms（含 0），但显式拒绝 `bool`（`bool` 是 `int` 子类，`True` 不再被错当 epoch-ms 1 写入 digest）。**防御性修复，不 bump** `X-Slimapi-Version`。
+
+### Notes（第2类，未合入本仓 wire）
+
+- 消息内容变更 watermark（revision / partCount / generation）、token idle/resync 清态安全语义、SSE 开/关统一 reconcile 三分法仍需 **ocdroid** 配合；本仓**未**改协议 revision 字段。handoff：`docs/ocmar/reports/2026-07-26-ocdroid-class2-handoff-prompt.md`。
 
 ---
 

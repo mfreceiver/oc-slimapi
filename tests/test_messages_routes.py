@@ -299,14 +299,16 @@ def _msg(mid: str, updated: int | None, *, text: str = "x" * 200) -> dict:
 
 
 async def test_messages_since_returns_only_items_at_or_above_ts(upstream_factory):
-    """① A2=A filter (contract §5): only items with ``time.updated >= ts``
-    are returned; the scan stops at the first item below the ts floor."""
+    """① A2=A filter (contract §5): only items with watermark ``>= ts``
+    are returned. Newest-first fixtures must still keep every matching item
+    (full-page filter — no early break that drops later ``>= ts`` rows)."""
+    # Newest-first page (defensive fixture; real opencode is oldest-first).
     page = [
         _msg("m1", updated=200),
         _msg("m2", updated=150),
         _msg("m3", updated=100),  # == ts, included (boundary, see ②)
-        _msg("m4", updated=50),   # < ts, excluded — also stops the scan
-        _msg("m5", updated=10),   # < ts, never reached
+        _msg("m4", updated=50),   # < ts, excluded
+        _msg("m5", updated=10),   # < ts, excluded (still scanned — not early-break)
     ]
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -328,8 +330,117 @@ async def test_messages_since_returns_only_items_at_or_above_ts(upstream_factory
         assert response.status_code == 200
         body = orjson.loads(response.content)
         assert [item["info"]["id"] for item in body] == ["m1", "m2", "m3"]
-        # Hit the ts floor → no next cursor (no more matching items possible).
+        # No Link + under limit → no client cursor; scan is semantically complete.
         assert "X-Next-Cursor" not in response.headers
+        assert response.headers.get("X-Since-Complete") == "true"
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_messages_since_oldest_first_page_collects_all_at_or_above_ts(
+    upstream_factory,
+):
+    """opencode MessageV2.page is in-page oldest-first. A mid watermark must
+    return every item with ``>= ts`` (old newest-first early-break emptied
+    the page because the first row was below the floor)."""
+    # Oldest-first window: m1 oldest … m5 newest.
+    page = [
+        _msg("m1", updated=10),
+        _msg("m2", updated=50),
+        _msg("m3", updated=100),  # mid / boundary
+        _msg("m4", updated=150),
+        _msg("m5", updated=200),  # newest
+    ]
+    calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        return httpx.Response(
+            200, content=orjson.dumps(page),
+            headers={"Content-Type": "application/json"},
+        )
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            # ts = mid → m3, m4, m5 (all >= 100); m1/m2 dropped.
+            r_mid = await client.get(
+                "/slimapi/messages/s1/since/100?mode=skeleton",
+                headers=VERSION_HEADERS,
+            )
+            assert r_mid.status_code == 200
+            body_mid = orjson.loads(r_mid.content)
+            assert [item["info"]["id"] for item in body_mid] == ["m3", "m4", "m5"]
+            assert r_mid.headers.get("X-Since-Complete") == "true"
+
+            # ts = newest boundary → non-empty, includes equality.
+            r_new = await client.get(
+                "/slimapi/messages/s1/since/200?mode=skeleton",
+                headers=VERSION_HEADERS,
+            )
+            assert r_new.status_code == 200
+            body_new = orjson.loads(r_new.content)
+            assert [item["info"]["id"] for item in body_new] == ["m5"]
+
+            # ts = 0 → full window.
+            r_all = await client.get(
+                "/slimapi/messages/s1/since/0?mode=skeleton",
+                headers=VERSION_HEADERS,
+            )
+            assert r_all.status_code == 200
+            body_all = orjson.loads(r_all.content)
+            assert [item["info"]["id"] for item in body_all] == [
+                "m1", "m2", "m3", "m4", "m5",
+            ]
+        # Three independent GETs; each is a single upstream page (no Link).
+        assert calls["count"] == 3
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_messages_since_oldest_first_page_head_below_ts_still_collects_tail(
+    upstream_factory,
+):
+    """Oldest-first: page head (oldest) ``< ts`` but later rows ``>= ts`` must
+    still be collected. After the page is filtered, page-head < ts proves the
+    ts floor → suppress a meaningless older-page cursor even if Link is set."""
+    # Head below floor; mid/tail match.
+    page = [
+        _msg("m_old", updated=50),   # page head < ts → floor after full filter
+        _msg("m_mid", updated=150),
+        _msg("m_new", updated=200),
+    ]
+    link = (
+        '<http://127.0.0.1:4096/session/s1/message?before=olderPage&limit=50>; '
+        'rel="next"'
+    )
+    upstream_calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        upstream_calls["count"] += 1
+        return httpx.Response(
+            200, content=orjson.dumps(page),
+            headers={"Content-Type": "application/json", "Link": link},
+        )
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
+                "/slimapi/messages/s1/since/100?mode=skeleton",
+                headers=VERSION_HEADERS,
+            )
+        assert response.status_code == 200
+        body = orjson.loads(response.content)
+        assert [item["info"]["id"] for item in body] == ["m_mid", "m_new"]
+        # Floor hit → do not follow Link to older pages; no client cursor.
+        assert "X-Next-Cursor" not in response.headers
+        assert response.headers.get("X-Since-Complete") == "true"
+        assert upstream_calls["count"] == 1
     finally:
         app.state.transforms.shutdown()
 
@@ -337,9 +448,17 @@ async def test_messages_since_returns_only_items_at_or_above_ts(upstream_factory
 def _msg_created_only(mid: str, created: int, *, text: str = "x" * 200) -> dict:
     """Upstream-shape message with only ``info.time.created`` (no ``updated``).
 
-    Mirrors opencode v1.18.3 message schema: User.time={created},
+    Mirrors opencode v1.18.3/v1.18.4 message schema: User.time={created},
     Assistant.time={created, completed?}. Used to lock the Gap-1 regression
     where ``_item_updated`` only read ``updated`` and made /since a no-op.
+
+    Floor dependency: ``/since``'s ts-floor logic (page-head watermark < ts →
+    stop following Link) relies on upstream v1.18.4 exposing a stable
+    message-level ``created`` field AND on upstream keeping ``orderBy`` +
+    in-page order consistent across pages. ``limit`` is treated as a
+    server-side invariant guaranteed by upstream (sidecar passes it through
+    via ``?limit=`` without capping). No revision bump or class-2 protocol
+    change is implied — these are upstream guarantees, not slimapi contracts.
     """
     return {
         "info": {
@@ -1017,6 +1136,118 @@ async def test_full_single_wrong_shape_2xx_served(upstream_factory):
         app.state.transforms.shutdown()
 
 
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        ("/slimapi/messages/s1/full/m1", b""),
+        ("/slimapi/messages/s1/full/m1", b"not-json{{{"),
+        ("/slimapi/messages/s1?mode=full", b""),
+        ("/slimapi/messages/s1?mode=full", b"not-json{{{"),
+    ],
+    ids=["single-empty", "single-garbage", "list-empty", "list-garbage"],
+)
+async def test_full_invalid_json_returns_503_upstream_unavailable(
+    upstream_factory, path, body,
+):
+    """Upstream 200 with empty / non-JSON body must not escape as a bare 500.
+
+    ``strip_diagnostics_and_pack`` raises ``orjson.JSONDecodeError``; the full
+    branches map it to 503 ``upstream_unavailable`` (same code as sessions
+    bad-JSON handling).
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, content=body, headers={"Content-Type": "application/json"},
+        )
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(path, headers=VERSION_HEADERS)
+        assert response.status_code == 503
+        assert response.json() == {"code": "upstream_unavailable"}
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_full_list_midstream_request_error_returns_503(upstream_factory):
+    """Full-list mid-stream ``httpx.RequestError`` (read_with_cap / drain) →
+    503 ``upstream_unavailable``, aligned with ``/full/{mid}``."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadError("simulated mid-stream", request=request)
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
+                "/slimapi/messages/s1?mode=full", headers=VERSION_HEADERS,
+            )
+        assert response.status_code == 503
+        assert response.json() == {"code": "upstream_unavailable"}
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_full_list_body_iteration_request_error_returns_503(upstream_factory):
+    """Full-list path: ``httpx.RequestError`` raised DURING ``read_with_cap``'s
+    async body iteration (after the upstream response has been returned), not
+    at the ``send()`` stage — must still map to 503 ``upstream_unavailable``.
+
+    This is distinct from ``test_full_list_midstream_request_error_returns_503``
+    where the transport handler itself raises (send phase). Here the response is
+    delivered with HTTP 200 and the failure occurs while sidecar reads the body
+    stream (simulating a connection drop mid-stream). The exception must be
+    caught by the ``except httpx.RequestError`` guard around ``read_with_cap``
+    in ``messages()`` and translated to a structured 503, never a bare 500.
+    """
+
+    class _MidStreamFailure(httpx.AsyncByteStream):
+        """Yield a partial body then raise ``httpx.ReadError`` mid-iteration.
+
+        A real upstream failure after headers have been delivered would surface
+        exactly this way: the response is 200, but reading the body bytes fails.
+        """
+        def __init__(self, partial: bytes, exc: BaseException):
+            self._partial = partial
+            self._exc = exc
+
+        async def __aiter__(self):
+            # Yield one chunk first so ``read_with_cap`` proceeds past the
+            # initial chunk and is genuinely iterating when the failure hits.
+            yield self._partial
+            raise self._exc
+
+        async def aclose(self):
+            return None
+
+    partial = b'{"info": {"id": "m1", "role": '  # incomplete JSON body
+    stream_exc = httpx.ReadError("simulated body-stream drop")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=_MidStreamFailure(partial, stream_exc),
+            headers={"Content-Type": "application/json"},
+        )
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
+                "/slimapi/messages/s1?mode=full", headers=VERSION_HEADERS,
+            )
+        assert response.status_code == 503
+        assert response.json() == {"code": "upstream_unavailable"}
+    finally:
+        app.state.transforms.shutdown()
+
+
 async def test_full_batch_strips_diagnostics(upstream_factory):
     """G6 batch full strips diagnostics from each item while keeping every
     other field (metadata siblings + output)."""
@@ -1157,11 +1388,14 @@ async def test_messages_list_no_link_header_means_no_cursor(upstream_factory):
 
 
 async def test_messages_since_omits_cursor_when_ts_floor_hit(upstream_factory):
-    """Case 3 (/since ts floor): opencode advertises a next page (Link header
-    present), but the current page already contains items below the ts floor.
-    Sidecar must NOT advertise a cursor — older pages would only carry items
-    with time.updated < ts."""
-    page = [_msg("m1", 200), _msg("m2", 50)]  # m2 < ts=100 → floor
+    """Case 3 (/since ts floor, oldest-first): after full-page filter, page
+    head (oldest) watermark ``< ts`` proves every older page is also below
+    the floor. Even if opencode advertises Link, suppress ``X-Next-Cursor``."""
+    # Oldest-first: head below floor, later rows match.
+    page = [
+        _msg("m_old", 50),   # page head < ts=100 → floor
+        _msg("m_new", 200),  # kept
+    ]
     link = (
         '<http://127.0.0.1:4096/session/s1/message?before=ZZZopaque&limit=50>; '
         'rel="next"'
@@ -1184,11 +1418,90 @@ async def test_messages_since_omits_cursor_when_ts_floor_hit(upstream_factory):
             )
         assert response.status_code == 200
         body = orjson.loads(response.content)
-        # m1 kept (>= ts=100); m2 dropped (< ts).
-        assert [item["info"]["id"] for item in body] == ["m1"]
-        # opencode said "more pages exist" but the floor guarantees older
-        # items are all sub-ts → suppress the cursor.
+        # Full-page filter keeps matching tail; head dropped.
+        assert [item["info"]["id"] for item in body] == ["m_new"]
+        # Floor guarantees older pages are all sub-ts → suppress the cursor.
         assert "X-Next-Cursor" not in response.headers
+        assert response.headers.get("X-Since-Complete") == "true"
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_messages_since_complete_false_when_max_pages_exhausted(
+    upstream_factory,
+):
+    """``X-Since-Complete: false`` only when the scan stops because
+    ``max_since_pages`` was exhausted without proving a ts floor while
+    upstream still advertises another page."""
+    # Every page: all items >= ts, oldest-first, always has Link → never floors.
+    page = [_msg("m_keep", 500)]
+    link = (
+        '<http://127.0.0.1:4096/session/s1/message?before=more&limit=50>; '
+        'rel="next"'
+    )
+    calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        return httpx.Response(
+            200, content=orjson.dumps(page),
+            headers={"Content-Type": "application/json", "Link": link},
+        )
+
+    upstream = upstream_factory(handler)
+    # Small page budget so we hit the cap before any natural stop.
+    app = _build_app(_settings(max_since_pages=2), upstream)
+    transport = httpx.ASGITransport(app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
+                # limit large so we do not stop for client limit either.
+                "/slimapi/messages/s1/since/100?limit=50&mode=skeleton",
+                headers=VERSION_HEADERS,
+            )
+        assert response.status_code == 200
+        body = orjson.loads(response.content)
+        # Two pages collected (one item each), still may have more upstream.
+        assert [item["info"]["id"] for item in body] == ["m_keep", "m_keep"]
+        assert calls["count"] == 2
+        assert response.headers.get("X-Since-Complete") == "false"
+        # Limit not filled → no client cursor (existing emission rule).
+        assert "X-Next-Cursor" not in response.headers
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_messages_since_complete_true_when_limit_filled_with_cursor(
+    upstream_factory,
+):
+    """Filling the client limit with a next cursor is still ``X-Since-Complete:
+    true`` — pagination is correct; the client continues via ``X-Next-Cursor``."""
+    page = [_msg("m1", 300), _msg("m2", 250), _msg("m3", 200)]
+    link = (
+        '<http://127.0.0.1:4096/session/s1/message?before=XYZopaque&limit=2>; '
+        'rel="next"'
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, content=orjson.dumps(page),
+            headers={"Content-Type": "application/json", "Link": link},
+        )
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
+                "/slimapi/messages/s1/since/100?limit=2&mode=skeleton",
+                headers=VERSION_HEADERS,
+            )
+        assert response.status_code == 200
+        body = orjson.loads(response.content)
+        assert [item["info"]["id"] for item in body] == ["m1", "m2"]
+        assert response.headers.get("X-Next-Cursor") == "XYZopaque"
+        assert response.headers.get("X-Since-Complete") == "true"
     finally:
         app.state.transforms.shutdown()
 

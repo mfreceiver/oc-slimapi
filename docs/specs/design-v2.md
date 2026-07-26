@@ -50,11 +50,13 @@
 
 ### 1.5 `GET /slimapi/messages/{sid}/since/{ts}`（增量，A2=A 时间戳锚点）
 - **参数**：`ts`(path, epoch ms，客户端本地该 ses 最大 `updatedAt`)；`limit`(int 1–200 默认50)；`before`(str?, opaque, 来自上一响应 `X-Next-Cursor`，原样透传)；`mode`(enum `skeleton`|`full` 默认 skeleton)；`directory`(透传)。
-- **行为**：在**单个 transform admission + 单个累计字节预算**（`max_response_bytes`）下翻最多 `max_since_pages` 页（不暴露）；过滤条件 **`(info.time.updated or info.time.created) >= ts`**（含边界；客户端按 messageID 去重边界；v0.2.1 勘误：opencode v1.18.3 无 message 级 `time.updated`，实读 `created`，与 digest `updatedAt` 同源）；skeleton 时调 `skeleton_messages()`。
-- **`X-Next-Cursor`**：透传 opencode 响应 `Link: <...?before=CURSOR>; rel="next"` 头里的 **opaque base64url cursor**（原样字符串，不 decode/re-encode）。仅在"填满 limit 且未撞 ts 地板且 opencode 给了 Link"时下发；客户端回传的 `X-Next-Cursor` 经 `?before=` 原样转发给 opencode。
-- **ts 地板**：扫描中遇到 `(time.updated or time.created) < ts` 的项 → 停（后续都更旧），抑制 `X-Next-Cursor`。
-- **响应**：200 骨架裸数组 + `Cache-Control:no-store` + `X-Next-Cursor`（仅当有续且未撞地板），gzip+`Vary`；累计字节超限→413 `response_too_large`。
-- **注**：A2=A 锚点（时间戳），覆盖该 ses 自 `ts` 起所有更新；中段变更（revert/compaction）靠 SSE digest 或回前台 full resync。
+- **行为**：在**单个 transform admission + 单个累计字节预算**（`max_response_bytes`）下翻最多 `max_since_pages` 页（不暴露）；过滤条件 **`(info.time.updated or info.time.created) >= ts`**（含边界；客户端按 messageID 去重边界；v0.2.1 勘误：opencode 当前对齐版本无 message 级 `time.updated`，实读 `created`，与 digest `updatedAt` 同源）；skeleton 时调 `skeleton_messages()`。
+- **上游页序（勘误，第1类）**：opencode `MessageV2.page()` 先以 DB `orderBy(desc(time_created), desc(id))` 取最新窗，再 **`items.reverse()` → 页内 oldest-first**（窗内最旧在前、最新在后；`Link`/`before` cursor 仍指向更旧页）。**禁止**假定「页内 newest→oldest、首项低于 ts 即 break 且后续皆更旧」——该假设在升序页上会恒空丢消息。见 `docs/ocmar/plans/2026-07-26-slim-state-message-repair.md`、`docs/ocmar/reports/2026-07-26-slim-state-sse-review.md`。
+- **扫描/停扫**：sidecar **整页过滤** `_passes_ts_filter`（收集本页全部 `watermark >= ts` 项，不因页首 `<ts` 丢弃页尾匹配项）。是否再扫更旧页：用**页内最旧 watermark**（升序页 = 页首可比较项）判断——本页非空且最旧项可比较且 `< ts`（本页已过滤完）→ 撞 ts 地板，停扫更旧页；否则若有 `Link`、未满 `limit`、未耗尽 `max_since_pages` → 继续。另：无 Link / `collected >= limit` / 达 `max_since_pages` 亦停。
+- **`X-Next-Cursor`**：透传 opencode 响应 `Link: <...?before=CURSOR>; rel="next"` 头里的 **opaque base64url cursor**（原样字符串，不 decode/re-encode）。仅在「填满 limit 且未撞 ts 地板且 opencode 给了 Link 且仍可能有更新匹配项」时下发；撞地板后抑制。客户端回传的 `X-Next-Cursor` 经 `?before=` 原样转发给 opencode。
+- **`X-Since-Complete: true|false`（加性响应头，第1类）**：`true` = 本次扫描完整结束（撞 ts 地板 / 无更多页 / 达到 limit 且仍有续页等语义停扫），**不**表示结果集耗尽，仍可能有 `X-Next-Cursor`；`false` = 因 `max_since_pages` 截断且**未**证明已撞 ts 地板、可能仍有匹配页未扫。旧客户端可忽略。**不 bump** `X-Slimapi-Version`（仍 `1`）。
+- **响应**：200 骨架裸数组 + `Cache-Control:no-store` + `X-Next-Cursor`（仅当有续且未撞地板）+ `X-Since-Complete`，gzip+`Vary`；累计字节超限→413 `response_too_large`。
+- **注**：A2=A 锚点（时间戳），覆盖该 ses 自 `ts` 起所有更新；中段变更（revert/compaction）靠 SSE digest 或回前台 full resync。**第2类**（消息内容 revision / partCount watermark、token idle/resync 清态安全语义）仍需 ocdroid 配合，本仓**未**改协议 revision 字段；handoff 见 `docs/ocmar/reports/2026-07-26-ocdroid-class2-handoff-prompt.md`。
 
 ### 1.6 `GET /slimapi/messages/{sid}/full/{mid}`（按需展开）
 - **参数**：`sid`、`mid`、`mode`(默认 `full`——展开场景)。

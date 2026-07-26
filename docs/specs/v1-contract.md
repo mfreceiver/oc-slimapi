@@ -230,6 +230,7 @@ data: {"reason":"subscriber_backpressure|reconnect_no_replay|token_memory_limit|
   2. 时间相等时 strict 比 `messageID`（`MessageID = msg_+ascending()` 单调递增、字典序可排序 → 新消息 id 字典序更大 → 严格 `>` 才推进 id 维）。
   - 此规则与上游 `(time_created DESC, id DESC)` + cursor `older()` 全序**完全对齐**，复用上游单调 `MessageID` 作天然 tie-break，零契约创新。
 - 分页：`?limit` + `?before` 游标。
+- **`X-Since-Complete: true|false`（加性响应头，不 bump `X-Slimapi-Version`）**：`true` 表示本次扫描完整结束（撞 ts 地板 / 无更多上游页 / 达到 `limit` 且仍有续页等语义停扫）——**不**表示结果集耗尽，仍可能有 `X-Next-Cursor`；`false` 仅表示因达到 `max_since_pages` 上限而停扫、且未证明 ts 地板、上游可能仍有更旧匹配页。旧客户端可忽略该头。详见 §2 `/since` 行、`design-v2.md` §1.5。
 - **无 watermark 的初始拉取推荐 cursor drain（`?before` 游标分页）而非 `/since/0`**（rev C，ocdroid 缺口 3 裁定）：focus digest + resync 统一走 cursor drain 共享 reconciler；`/since/{ts}` 语义为"基于 watermark 的增量过滤"，`ts=0` 虽合法（返回全部）但非推荐路径。
 - 全文：单条 `/full/{mid}`；批量 `/full?ids=`（§2 G6）。
 - **partId 稳定性（rev F ratify）**：schema-valid 的 `MessageWithParts` 下，thin skeleton（`mode=skeleton`）经 `_pick(part, PART_IDS)` 保留每个 part 的真实 `id`，与 `/full/{mid}`（单条）及 `/full?ids=`（batch）中的 part `id` **跨端点稳定**。sidecar **不**校验缺失/坏 shape id（仅复制存在的字段）。

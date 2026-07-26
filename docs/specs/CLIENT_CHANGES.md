@@ -16,9 +16,16 @@
 - **placeholder → real 对齐（修「展开失败」）**：thin 在无可渲染 part 时仍可能注入 `id=thin_placeholder_{messageID}`。该 id **不会**出现在 `/full`。客户端判定：`partId.startsWith("thin_placeholder_")` → **message-level 整体替换**该 message 的 parts（禁止按 placeholder id 做 part-level lookup / `replaced=false`）。推荐同时迁 G6 batch（`/full?ids=`）。
 - **`/full` 剥离 LSP `diagnostics`（v0.10.0，加性，`X-Slimapi-Version` 不 bump，仍 1）**：所有 `mode=full` 路径（`/messages/{sid}?mode=full`、`/full/{mid}`、`/full?ids=`）服务端剥掉每个 part 的 `state.metadata.diagnostics`（opencode `edit`/`write` 写入的 LSP 诊断图）。**ocdroid 无需改动**——`Message.kt#parsePartState` 反序列化时本就无条件删除该键、从不消费；此变更对客户端功能零影响，纯下行流量 + parse/heap 节省。其余字段（output/text/files/metadata 其它键）原样保留，`/full`「完整 part」语义不变。`mode=skeleton` 路径不受影响（本就不带 diagnostics）。**唯一需留意**：`mode=full` 三路（list/single/batch）现可能返回 **503 `transform_busy` + `Retry-After: 2`**（转换池饱和，与 skeleton 路径同语义）——若 `/full` 调用路径已有 skeleton 的 503 重试兜底，确认 full 路径走同一兜底即可。另：`/full` 响应头改由 sidecar 拥有（`Content-Type: application/json`、按 `Accept-Encoding` 的 `Content-Encoding`、`Vary: Accept-Encoding`；不再透传上游 body-content 头）；list-full **仍原样透传**上游 `Link` 头（分页契约不变，不下发 `X-Next-Cursor`）。
 - foreground catch-up 使用 `/slimapi/messages/{sid}/since/{lastSeenUpdatedAt}`
-  （`(info.time.updated or info.time.created) >= ts`，含边界；v1.18.3 无 message 级 `time.updated`，服务端实读 `created`，与 digest `updatedAt` 同源）；客户端按 messageID 本地去重边界；翻页用
+  （`(info.time.updated or info.time.created) >= ts`，含边界；opencode 当前对齐版本无 message 级 `time.updated`，服务端实读 `created`，与 digest `updatedAt` 同源）；客户端按 messageID 本地去重边界；翻页用
   `X-Next-Cursor`（透传 opencode `Link` 头 opaque cursor）。无 409 resync。
-- **per-session watermark 升级为 `(updatedAt, messageID)` 二元组字典序**（v0.2.1，ocdroid 缺口 1）：先 strict 比 `updatedAt`（严格 > 才推进时间维），相等时 strict 比 `messageID`（`msg_+ascending()` 单调，新消息 id 字典序更大 → 严格 > 才推进 id 维）。对齐上游 `(time_created DESC, id DESC)` 全序，解 strict-advance 在等时间戳不同 id 时的残留 bug。
+- **上游页序与 `/since` 扫描（第1类勘误）**：opencode `MessageV2.page` 为**页内 oldest-first**（DB newest-first 取窗后 reverse）。sidecar **整页过滤**；用页内最旧 watermark 判断是否再扫更旧页——**不是**「页内 newest→oldest / 首项 `<ts` 即停」。客户端仍按 messageID 去重即可。
+- **`X-Since-Complete: true|false`（加性响应头，第1类；可忽略）**：`true` = 服务端本次扫描完整结束（撞 ts 地板 / 无更多页 / 达到 limit 且仍有续页等语义停扫），**不**表示结果集耗尽，仍可能有 `X-Next-Cursor`；`false` = 因 `max_since_pages` 截断且可能仍有匹配项未扫。**旧客户端忽略该头仍可工作**；**推荐语义**：
+  - `complete=true` 且 `items=[]` 且 remote watermark 不再领先 → 可收敛 dirty；
+  - `complete=false` 或头缺失且 remote 仍领先 → **不得**把空结果当补传成功；保留 dirty / 可见内容，走 bounded cursor drain fallback（见 G-F1）；
+  - 失败（503/429/413/timeout）≠ 空结果，不清已有消息。
+  本批 **不 bump** `X-Slimapi-Version`（仍 `1`）。详见 `docs/ocmar/plans/2026-07-26-slim-state-message-repair.md`、`docs/ocmar/reports/2026-07-26-slim-state-sse-review.md`。
+- **第2类仍需 ocdroid**（本仓未改协议 revision 字段）：消息内容变更 watermark（revision / partCount / generation）、token stream idle/resync 不清空唯一可见内容、SSE 开/关统一 reconcile 三分法（空结果 vs 截断 vs 失败）。交接提示词：`docs/ocmar/reports/2026-07-26-ocdroid-class2-handoff-prompt.md`。
+- **per-session watermark 升级为 `(updatedAt, messageID)` 二元组字典序**（v0.2.1，ocdroid 缺口 1）：先 strict 比 `updatedAt`（严格 > 才推进时间维），相等时 strict 比 `messageID`（`msg_+ascending()` 单调，新消息 id 字典序更大 → 严格 > 才推进 id 维）。对齐上游 `(time_created, id)` 全序（DB 取窗 newest-first，页内 reverse 后 oldest-first），解 strict-advance 在等时间戳不同 id 时的残留 bug。
 - **无 watermark 的初始拉取推荐 cursor drain**（`?before` 游标分页，与 focus digest / resync 共享 reconciler）；`/since/0` 虽合法但非推荐路径（ocdroid 缺口 3 裁定）。
 
 ## sessions 列表完整性头（rev F，新）
@@ -186,7 +193,7 @@
 - **端点**：`GET /slimapi/messages/{sid}`（`?before` cursor，无 timestamp 过滤）。
 - **机制**：复用已有 `fetchSlimInitialWindowBounded`（T11 round-4，`bumpBookmarkOnPartialFailure=false`）。maxPages 公式、wall-clock 30s、dedup by messageID HashSet。
 - **触发源**：digest-probe 不一致、`server.connected` 新 generation、`server.reconfigured`、用户手动刷新。自动合并触发（同 connection generation 最多 1 in-flight + 1 trailing，最小间隔 15min）。
-- **诚实标注**：该 endpoint 与 `/since` 共用上游 newest-first 排序/tie-break，故仅规避 `/since` 的 timestamp-filter 边界，不抵御上游排序 bug——由 G-F1 fixture + 周期 re-sync 兜底。
+- **诚实标注**：该 endpoint 与 `/since` 共用上游 `(time,id)` 全序与页内 oldest-first 分页，故仅规避 `/since` 的 timestamp-filter 边界，不抵御上游排序 bug——由 G-F1 fixture + 周期 re-sync 兜底。可结合 `X-Since-Complete` 区分「完整空」与「截断/未扫完」。
 
 ---
 

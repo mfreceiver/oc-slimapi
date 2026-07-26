@@ -166,7 +166,9 @@ def test_strip_diagnostics_and_pack_applies_gzip_when_client_accepts_it():
     assert "diagnostics" not in decoded["parts"][1]["state"]["metadata"]
 
 
-def test_strip_diagnostics_message_is_non_mutating_and_keeps_empty_metadata():
+def test_strip_diagnostics_message_is_in_place_and_keeps_empty_metadata():
+    """Production path: orjson.loads trees have no shared aliases, so strip
+    mutates in place (no deepcopy). Emptied ``metadata`` stays as ``{}``."""
     from oc_slimapi.skeleton import strip_diagnostics_message
 
     src = {
@@ -177,11 +179,12 @@ def test_strip_diagnostics_message_is_non_mutating_and_keeps_empty_metadata():
         }],
     }
     out = strip_diagnostics_message(src)
+    # Same object returned (in-place).
+    assert out is src
     # The emptied metadata container stays as {} (never dropped) — only the
     # diagnostics key is removed.
     assert out["parts"][0]["state"]["metadata"] == {}
-    # Non-mutating: the source dict is untouched.
-    assert src["parts"][0]["state"]["metadata"] == {"diagnostics": [{"severity": 1}]}
+    assert src["parts"][0]["state"]["metadata"] == {}
 
 
 def test_strip_diagnostics_message_wrong_shape_passthrough():
@@ -193,6 +196,15 @@ def test_strip_diagnostics_message_wrong_shape_passthrough():
     assert strip_diagnostics_message([]) == []
     assert strip_diagnostics_message("scalar") == "scalar"
     assert strip_diagnostics_messages({"not": "a list"}) == {"not": "a list"}
+
+
+def test_strip_diagnostics_and_pack_rejects_empty_and_invalid_json():
+    """Empty / garbage upstream bodies raise orjson.JSONDecodeError so the
+    route layer can map them to 503 upstream_unavailable (no bare 500)."""
+    with pytest.raises(orjson.JSONDecodeError):
+        strip_diagnostics_and_pack(b"", single=True, accept_encoding=None)
+    with pytest.raises(orjson.JSONDecodeError):
+        strip_diagnostics_and_pack(b"not-json", single=False, accept_encoding=None)
 
 
 # ---------------------------------------------------------------------------

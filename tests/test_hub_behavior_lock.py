@@ -351,6 +351,17 @@ class TestDigestAccumulation:
         hub.flush()
         assert "archived" not in only_digests(await drain(sub))[0]
 
+    async def test_archived_zero_is_emitted(self, pair):
+        """archived=0 must survive (isinstance int / is not None, not truthy)."""
+        hub, sub = pair
+        hub.publish(ev("/p", "session.updated", {
+            "sessionID": "s1", "info": {"time": {"archived": 0}},
+        }))
+        hub.flush()
+        d = only_digests(await drain(sub))[0]
+        assert d["archived"] == 0
+        assert isinstance(d["archived"], int)
+
     async def test_directory_passed_through_when_present(self, pair):
         hub, sub = pair
         hub.publish(ev("/custom/dir", "session.status", {"sessionID": "s1", "status": "busy"}))
@@ -526,6 +537,28 @@ class TestDeletedClearsSticky:
         ]
         assert any(d["lastError"] is None for d in clear_digests)
 
+    async def test_busy_clear_flush_sid_preserves_other_pending(self, pair):
+        """Immediate busy-clear flush is per-sid; other pending stays."""
+        hub, sub = pair
+        hub.publish(ev("/p", "session.error", {
+            "sessionID": "s1",
+            "error": {"name": "UnknownError", "data": {"message": "boom"}},
+        }))
+        await drain(sub)
+
+        hub.publish(ev("/p", "session.status", {"sessionID": "s2", "status": "idle"}))
+        assert "s2" in hub.pending
+
+        hub.publish(ev("/p", "session.status", {"sessionID": "s1", "status": "busy"}))
+        frames = await drain(sub)
+        assert any(
+            d.get("sessionID") == "s1" and d.get("lastError") is None
+            for e, d in (parse(f) for f in frames)
+            if e == "session.digest"
+        )
+        assert "s2" in hub.pending
+        assert "s1" not in hub.pending
+
 
 # ===========================================================================
 # Section 3: session.error handling (G1-A sticky / G1-B direct / abort filter
@@ -551,6 +584,22 @@ class TestSessionError:
         assert le["message"] == "boom"  # stack frame stripped
         assert isinstance(le["at"], int)
         assert digests[0]["sessionID"] == "s1"
+
+    async def test_error_flush_sid_preserves_other_pending(self, pair):
+        """G1-A immediate flush pops only the errored sid; others stay pending."""
+        hub, sub = pair
+        hub.publish(ev("/p", "session.status", {"sessionID": "s2", "status": "idle"}))
+        assert "s2" in hub.pending
+
+        hub.publish(ev("/p", "session.error", {
+            "sessionID": "s1",
+            "error": {"name": "UnknownError", "data": {"message": "boom"}},
+        }))
+        digests = only_digests(await drain(sub))
+        assert len(digests) == 1
+        assert digests[0]["sessionID"] == "s1"
+        assert "s2" in hub.pending
+        assert "s1" not in hub.pending
 
     async def test_with_sid_sets_sticky_for_subsequent_windows(self, pair):
         """sticky_last_error carries the error into later windows for the same
@@ -684,6 +733,46 @@ class TestSessionError:
         d = only_digests(await drain(sub))[0]
         assert d["lastError"]["name"] == ""
         assert d["lastError"]["message"] == "(no detail)"
+
+
+class TestExtractSessionId:
+    """_extract_session_id must not treat GlobalBus payload.id as sessionID."""
+
+    async def test_payload_id_alone_does_not_create_digest(self, pair):
+        hub, sub = pair
+        hub.publish(ev(
+            "/p",
+            "session.status",
+            {"status": "busy"},
+            payload_id="evt_not_a_session",
+        ))
+        hub.flush()
+        assert only_digests(await drain(sub, timeout=0.05)) == []
+        assert hub.pending == {}
+        assert "evt_not_a_session" not in hub.pending
+
+    async def test_session_info_id_used_when_no_sessionID(self, pair):
+        hub, sub = pair
+        hub.publish(ev("/p", "session.updated", {
+            "info": {"id": "ses_row", "time": {"archived": 42}},
+        }))
+        hub.flush()
+        d = only_digests(await drain(sub))[0]
+        assert d["sessionID"] == "ses_row"
+        assert d["archived"] == 42
+
+    async def test_message_event_ignores_payload_id_without_session(self, pair):
+        """message.* without sessionID / info.sessionID must not use event id."""
+        hub, sub = pair
+        hub.publish(ev(
+            "/p",
+            "message.updated",
+            {"info": {"id": "msg_1", "time": {"updated": 1}}},
+            payload_id="evt_msg_bus",
+        ))
+        hub.flush()
+        assert only_digests(await drain(sub, timeout=0.05)) == []
+        assert hub.pending == {}
 
 
 class TestSanitize:

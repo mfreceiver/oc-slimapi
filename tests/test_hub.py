@@ -479,6 +479,208 @@ async def test_session_updated_without_archived_omits_field(fresh_hub):
     assert "archived" not in data
 
 
+async def test_archived_zero_is_emitted(fresh_hub):
+    """archived=0 (epoch-ms) must be written — ``if archived_val:`` would
+    drop it; the correct guard is ``is not None`` / isinstance int."""
+    hub, subscriber = fresh_hub
+
+    hub.publish(make_global_event("/proj", "session.updated", {
+        "sessionID": "s1",
+        "info": {"time": {"archived": 0}},
+    }))
+    hub.flush()
+
+    frames = await drain_queue(subscriber)
+    digests = [
+        data for event, data in (parse_event(f) for f in frames)
+        if event == "session.digest"
+    ]
+    assert len(digests) == 1
+    assert digests[0]["archived"] == 0
+    assert isinstance(digests[0]["archived"], int)
+
+
+async def test_archived_bool_is_rejected(fresh_hub):
+    """``bool`` is a subclass of int — a spurious ``archived: true`` from
+    upstream must NOT be coerced to epoch-ms 1 and emitted to clients.
+    Only real epoch-ms ints (including 0) pass through; True/False are
+    silently dropped and the field is omitted from the digest."""
+    hub, subscriber = fresh_hub
+
+    hub.publish(make_global_event("/proj", "session.updated", {
+        "sessionID": "s1",
+        "info": {"time": {"archived": True}},
+    }))
+    hub.flush()
+
+    frames = await drain_queue(subscriber)
+    digests = [
+        data for event, data in (parse_event(f) for f in frames)
+        if event == "session.digest"
+    ]
+    assert len(digests) == 1
+    # True must NOT be stored as epoch-ms 1.
+    assert "archived" not in digests[0]
+
+    # Also verify False is rejected (not stored as 0).
+    hub.publish(make_global_event("/proj", "session.updated", {
+        "sessionID": "s2",
+        "info": {"time": {"archived": False}},
+    }))
+    hub.flush()
+
+    frames = await drain_queue(subscriber)
+    digests = [
+        data for event, data in (parse_event(f) for f in frames)
+        if event == "session.digest"
+    ]
+    assert len(digests) == 1
+    assert digests[0]["sessionID"] == "s2"
+    assert "archived" not in digests[0]
+
+
+async def test_archived_zero_passes_while_bool_rejected(fresh_hub):
+    """Combined regression guard: archived=0 (valid epoch-ms) passes through,
+    archived=True/False are rejected — covers the full matrix in one shot so
+    the two guards cannot drift independently."""
+    hub, subscriber = fresh_hub
+
+    for sid, val in [("s_zero", 0), ("s_true", True), ("s_false", False)]:
+        hub.publish(make_global_event("/proj", "session.updated", {
+            "sessionID": sid,
+            "info": {"time": {"archived": val}},
+        }))
+    hub.flush()
+
+    frames = await drain_queue(subscriber)
+    digests = {
+        data["sessionID"]: data
+        for event, data in (parse_event(f) for f in frames)
+        if event == "session.digest"
+    }
+    assert len(digests) == 3
+    # epoch 0 kept.
+    assert digests["s_zero"].get("archived") == 0
+    assert isinstance(digests["s_zero"]["archived"], int)
+    # bools dropped.
+    assert "archived" not in digests["s_true"]
+    assert "archived" not in digests["s_false"]
+
+
+async def test_immediate_flush_sid_leaves_other_pending_intact(fresh_hub):
+    """G1-A session.error immediate flush must only pop the target sid;
+    other sids' pending digests stay until the debounce flush."""
+    hub, subscriber = fresh_hub
+
+    # Seed a pending digest for s2 (not yet flushed).
+    hub.publish(make_global_event("/proj", "session.status", {
+        "sessionID": "s2", "status": "idle",
+    }))
+    assert "s2" in hub.pending
+
+    # session.error on s1 → immediate flush_sid("s1") only.
+    hub.publish(make_global_event("/proj", "session.error", {
+        "sessionID": "s1",
+        "error": {"name": "UnknownError", "data": {"message": "boom"}},
+    }))
+
+    frames = await drain_queue(subscriber)
+    digests = [
+        data for event, data in (parse_event(f) for f in frames)
+        if event == "session.digest"
+    ]
+    assert len(digests) == 1
+    assert digests[0]["sessionID"] == "s1"
+    assert digests[0]["lastError"]["name"] == "UnknownError"
+    # s2 still pending — not prematurely emitted.
+    assert "s2" in hub.pending
+    assert "s1" not in hub.pending
+
+    hub.flush()
+    frames2 = await drain_queue(subscriber)
+    digests2 = [
+        data for event, data in (parse_event(f) for f in frames2)
+        if event == "session.digest"
+    ]
+    assert len(digests2) == 1
+    assert digests2[0]["sessionID"] == "s2"
+    assert digests2[0]["status"] == "idle"
+    assert hub.pending == {}
+
+
+async def test_busy_clear_sticky_flush_sid_leaves_other_pending(fresh_hub):
+    """session.status=busy clearing sticky lastError flushes only that sid."""
+    hub, subscriber = fresh_hub
+
+    hub.publish(make_global_event("/proj", "session.error", {
+        "sessionID": "s1",
+        "error": {"name": "UnknownError", "data": {"message": "boom"}},
+    }))
+    await drain_queue(subscriber)  # consume G1-A immediate digest
+
+    hub.publish(make_global_event("/proj", "session.status", {
+        "sessionID": "s2", "status": "idle",
+    }))
+    assert "s2" in hub.pending
+
+    hub.publish(make_global_event("/proj", "session.status", {
+        "sessionID": "s1", "status": "busy",
+    }))
+    frames = await drain_queue(subscriber)
+    clear_digests = [
+        data for event, data in (parse_event(f) for f in frames)
+        if event == "session.digest" and data.get("sessionID") == "s1"
+    ]
+    assert any(d.get("lastError") is None for d in clear_digests)
+    assert "s2" in hub.pending
+    assert "s1" not in hub.pending
+
+
+async def test_extract_session_id_ignores_payload_event_id(fresh_hub):
+    """payload.id is the GlobalBus *event* id — must not become sessionID.
+
+    A session.status without properties.sessionID / info.sessionID / info.id
+    (for session.*) must not hang a digest under the event UUID.
+    """
+    hub, subscriber = fresh_hub
+
+    hub.publish(make_global_event(
+        "/proj",
+        "session.status",
+        {"status": "busy"},  # no sessionID
+        payload_id="evt_global_bus_uuid_xyz",
+    ))
+    hub.flush()
+
+    frames = await drain_queue(subscriber, timeout=0.1)
+    digests = [
+        data for event, data in (parse_event(f) for f in frames)
+        if event == "session.digest"
+    ]
+    assert digests == []
+    assert "evt_global_bus_uuid_xyz" not in hub.pending
+    assert hub.pending == {}
+
+
+async def test_extract_session_id_uses_info_id_for_session_events(fresh_hub):
+    """session.* may carry the session row id at properties.info.id."""
+    hub, subscriber = fresh_hub
+
+    hub.publish(make_global_event("/proj", "session.updated", {
+        "info": {"id": "ses_from_info", "time": {"archived": 1700000000000}},
+    }))
+    hub.flush()
+
+    frames = await drain_queue(subscriber)
+    digests = [
+        data for event, data in (parse_event(f) for f in frames)
+        if event == "session.digest"
+    ]
+    assert len(digests) == 1
+    assert digests[0]["sessionID"] == "ses_from_info"
+    assert digests[0]["archived"] == 1700000000000
+
+
 # ---------------------------------------------------------------------------
 # Lane-H / Gap 3: Subscriber overflow — immediate clear + resync + STOP
 # (contract §6)

@@ -111,14 +111,23 @@ def strip_diagnostics_and_pack(
     """Worker entrypoint for ``mode=full`` routes: ``orjson.loads`` → strip the
     never-consumed LSP ``diagnostics`` map from every part → ``dumps`` → (gzip).
 
-    Mirrors :func:`project_and_pack` but applies the light
-    :func:`strip_diagnostics_message` projection instead of the skeleton
-    thinning, so a client expanding a thin skeleton fetches the WHOLE part
-    (output / text / files / metadata siblings / ...) minus only the
-    ``state.metadata.diagnostics`` map it never reads. Like the other worker
+    Mirrors :func:`project_and_pack` but applies the light in-place
+    :func:`strip_diagnostics_message` scrub instead of the skeleton thinning,
+    so a client expanding a thin skeleton fetches the WHOLE part (output /
+    text / files / metadata siblings / ...) minus only the
+    ``state.metadata.diagnostics`` map it never reads. The parse tree is
+    owned solely by this worker (fresh ``orjson.loads``), so strip mutates
+    it in place and skips a full ``deepcopy``.
+
+    Raises :exc:`orjson.JSONDecodeError` on empty / non-JSON bodies — callers
+    (the ``mode=full`` routes) map that to 503 ``upstream_unavailable`` so a
+    bad upstream 200 never escapes as a bare 500. Like the other worker
     entrypoints this is pure-CPU and runs in the bounded transform executor so
     the event loop stays free for SSE heartbeats.
     """
+    # Empty body and garbage both raise JSONDecodeError (orjson treats
+    # zero-length input as an empty document). Do not swallow here — the
+    # route layer turns it into a structured 503.
     parsed = orjson.loads(body)
     projected = (
         strip_diagnostics_message(parsed)
