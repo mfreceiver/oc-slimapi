@@ -1,3 +1,13 @@
+> **⚠️ DEPRECATED — Historical Reference Only**
+>
+> This document describes the **v1 wire contract** (pre-lite-v2). It is retained
+> for historical reference only. The current authoritative contract is
+> [`v2-contract.md`](v2-contract.md).
+>
+> **Do not** use this document for client integration. Key differences from v2:
+> 10+ endpoints deleted, routeToken/discovery/children/Opt-A removed,
+> digest fields changed, version gate bumped to (2,2).
+
 # oc-slimapi v1 契约（唯一基准）
 
 > **文档修订日志**

@@ -14,15 +14,40 @@
 ocdroid 对接时：
 
 1. 读本文件了解**行为**变更；
-2. 读 `docs/specs/v1-contract.md` 了解**当前完整契约**；
+2. 读 `docs/specs/v2-contract.md` 了解**当前完整契约**；
 3. 用 `/slimapi/health` 的 `server.api_version` / `accepted_client_versions` 做运行时兼容自检。
 
 ### 维护规约
 
 - **每次**用户可见 / 客户端可观测的 wire 行为变更，必须在对应版本下增加条目（Added / Changed / Fixed / Removed / Security）。
 - 条目写**行为与路径**，不写实现细节（避免“改了哪行 Python”）。
-- 破坏性变更：同时更新 `docs/specs/v1-contract.md` + bump wire API 版本 + 在本文件 **Changed** 中显式写 `X-Slimapi-Version` 与客户端必改点。
+- 破坏性变更：同时更新 `docs/specs/v2-contract.md` + bump wire API 版本 + 在本文件 **Changed** 中显式写 `X-Slimapi-Version` 与客户端必改点。
 - 发版时由 `./scripts/release.sh` 校验本文件含有目标版本标题（见 `docs/release.md`）。
+
+---
+
+## [Unreleased] — lite-v2 major cleanup
+
+### Breaking (wire behavior)
+- Wire version bumped: `X-Slimapi-Version: 2` required (ACCEPTED_CLIENT_VERSIONS = (2,2))
+- Deleted 10+ endpoints (all return 404): projects, questions, permissions, since,
+  session children/status, batch expand (G6), and all POST q/p reply/reject
+- `/slimapi/messages/{sid}/full/{mid}`: removed 304/ETag/X-Message-Event-Seq,
+  removed ?known.* params, always returns 200
+- `/slimapi/messages/{sid}`: ?mode=full silently ignored, always skeleton;
+  list now sorted by time.created ascending
+- Digest fields: removed `childrenVersion`, `contentRevisions`;
+  `updatedAt` now sidecar wall-clock (was upstream info.time)
+- Removed headers: X-Discovery-Directories, X-Discovery-Ready
+- Metrics: `batch` key always null (BatchLedger removed)
+
+### Removed (internal, no wire impact)
+- Deleted source: routes/questions.py, routes/sessions_children.py, tokens.py,
+  discovery.py, children_cache.py, observability.py
+- Deleted config: route_secret, max_since_pages, 8 opt_a_* fields
+- Deleted SSE: server.reconfigured frame, notify_reconfigured
+- Deleted transform: project_and_pack, project_messages_and_pack, single=False branches
+- Stage B part-level tracking removed (_part_state, fingerprint, contentRevisions)
 
 ---
 
@@ -447,6 +472,6 @@ ocdroid 对接时：
 
 ## 链接
 
-- 契约：[`docs/specs/v1-contract.md`](docs/specs/v1-contract.md)
+- 契约：[`docs/specs/v2-contract.md`](docs/specs/v2-contract.md)（`docs/specs/v1-contract.md` deprecated）
 - 发版：[`docs/release.md`](docs/release.md)
 - 客户端清单：[`docs/specs/CLIENT_CHANGES.md`](docs/specs/CLIENT_CHANGES.md)
