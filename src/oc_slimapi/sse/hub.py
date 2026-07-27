@@ -136,7 +136,7 @@ def bump_updated_at(entry: "DigestFields") -> None:
     the same value. We take ``max(now, previous + 1)``.
     """
     now = _now_ms()
-    previous = entry.updated_at if isinstance(entry.updated_at, int) else 0
+    previous = entry.updated_at if isinstance(entry.updated_at, int) and not isinstance(entry.updated_at, bool) else 0
     entry.updated_at = max(now, previous + 1)
 
 
@@ -670,14 +670,15 @@ class GlobalHub:
                 return
             info = props.get("info") if isinstance(props.get("info"), dict) else {}
             message_id = info.get("id") if isinstance(info.get("id"), str) else props.get("messageID")
-            time_obj = info.get("time") if isinstance(info.get("time"), dict) else {}
-            updated_at = time_obj.get("updated") or time_obj.get("created") or _now_ms()
             entry = self.pending.setdefault(session_id, DigestFields())
             if isinstance(directory, str):
                 entry.directory = directory
             if isinstance(message_id, str):
                 entry.message_id = message_id
-            entry.updated_at = updated_at
+            # lite-v2 §4.2: updatedAt is the sidecar's wall-clock observation
+            # time, NOT the upstream message timestamp. Using bump_updated_at
+            # ensures strict monotonicity within the debounce window.
+            bump_updated_at(entry)
             return
 
         # G1: session.error — immediate digest (with sid) or session.error frame (session-less).
