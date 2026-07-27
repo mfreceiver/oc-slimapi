@@ -594,14 +594,12 @@ class TestPublishIntegration:
         assert len(frames) == 1, f"expected one digest, got {frames!r}"
         event_name, data = parse_event(frames[0])
         assert event_name == "session.digest"
-        # Only sessionID + updatedAt — no token-routing leakage
-        # (no status / messageID / directory / contentRevisions).
+        # Exact key set: ONLY sessionID + updatedAt — no token-routing leakage.
+        assert set(data) == {"sessionID", "updatedAt"}, (
+            f"expected exactly {{sessionID, updatedAt}}, got {set(data)}"
+        )
         assert data["sessionID"] == "s1"
-        assert isinstance(data.get("updatedAt"), int)
-        assert "contentRevisions" not in data
-        assert "status" not in data
-        assert "messageID" not in data
-        assert "directory" not in data
+        assert isinstance(data["updatedAt"], int)
 
     async def test_message_part_delta_alone_produces_no_digest(self, bare_hub):
         """``message.part.delta`` (token stream only) must NOT touch the

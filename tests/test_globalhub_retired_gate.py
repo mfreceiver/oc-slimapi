@@ -90,12 +90,17 @@ async def test_late_part_updated_after_removed_does_not_resurrect(hub: GlobalHub
     ))
     assert (sid, mid) in hub._retired_messages
 
-    # 3. Late message.part.updated → must NOT resurrect (gate prevents
-    #    any digest modification).
+    # 2b. Flush to evict the pending entry — late event must start clean.
+    hub.flush()
+    assert sid not in hub.pending
+
+    # 3. Late message.part.updated → gate fires BEFORE setdefault/bump/token.
+    #    Must NOT create a new pending entry or bump anything.
     hub.publish(make_global_event(
         "/p", "message.part.updated", _part_updated_props(sid, mid, pid),
     ))
-    # Gate still held — the early return means no new pending entry / bump.
+    # Gate prevented setdefault — no pending entry created.
+    assert sid not in hub.pending
     assert (sid, mid) in hub._retired_messages
 
 

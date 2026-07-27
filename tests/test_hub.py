@@ -1501,10 +1501,25 @@ async def subscriber_first_after_welcome(sub):
 # ---------------------------------------------------------------------------
 
 async def test_digest_fields_converged(fresh_hub):
-    """§9.3: digest frame JSON must only contain the expected fields:
-    {sessionID, directory, status, messageID, updatedAt, archived, deleted,
-    lastError}.  Fields removed in lite-v2 (contentRevisions, childrenVersion)
-    must NOT appear."""
+    """§9.3: digest frame JSON must only contain the expected fields.
+    Verifies both the integration path (publish → flush → frame) and the
+    unit path (DigestFields.to_payload() with all fields populated)."""
+    from oc_slimapi.sse.hub import DigestFields
+
+    # --- Unit test: to_payload() with all fields populated ---
+    full = DigestFields(
+        directory="/proj", status="busy", message_id="msg_1",
+        updated_at=1700000000000, archived=1700000001000,
+        deleted=True, last_error="boom",
+    )
+    unit_payload = full.to_payload("s1")
+    # Every field that is set must appear; None/default fields are omitted.
+    for key in ("directory", "status", "messageID", "updatedAt", "archived", "deleted", "lastError"):
+        assert key in unit_payload, f"expected {key} in to_payload output"
+    assert "contentRevisions" not in unit_payload
+    assert "childrenVersion" not in unit_payload
+
+    # --- Integration test: actual digest frame from publish ---
     hub, subscriber = fresh_hub
 
     hub.publish(make_global_event("/proj", "session.status", {
@@ -1531,22 +1546,34 @@ async def test_digest_fields_converged(fresh_hub):
     assert "childrenVersion" not in payload
 
 
-async def test_part_updated_bumps_updatedAt_strictly(fresh_hub):
-    """§9.3: two consecutive message.part.updated events (separate debounce
-    windows) must produce strictly increasing digest.updatedAt.
-    bump_updated_at guarantees monotonicity even within the same wall-clock ms.
+async def test_part_updated_bumps_updatedAt_strictly(fresh_hub, monkeypatch):
+    """§9.3: two message.part.updated events in the SAME debounce window
+    must produce strictly increasing updatedAt within that window.
 
-    Upstream payload: higher-level event properties carry ``part`` nested dict
-    (mirroring the on_part_updated token-hub schema)."""
+    Uses a fixed clock to deterministically verify bump_updated_at's
+    max(now, previous+1) guarantee.
+
+    Note: cross-window (post-flush) strict monotonicity is NOT guaranteed
+    — the client's digest reset protocol handles that edge case."""
     hub, subscriber = fresh_hub
 
-    def part_updated(part_sid: str, part_mid: str, part_id: str) -> dict:
+    FIXED = 1700000000000
+    monkeypatch.setattr("oc_slimapi.sse.hub._now_ms", lambda: FIXED)
+
+    def part_updated(part_sid, part_mid, part_id):
         return make_global_event("/proj", "message.part.updated", {
             "part": {"sessionID": part_sid, "messageID": part_mid, "id": part_id},
             "sessionID": part_sid, "messageID": part_mid,
         })
 
+    # First part.updated: updated_at = max(FIXED, 0+1) = FIXED
     hub.publish(part_updated("s1", "m1", "p1"))
+    assert hub.pending["s1"].updated_at == FIXED
+
+    # Second part.updated (same window): max(FIXED, FIXED+1) = FIXED+1
+    hub.publish(part_updated("s1", "m1", "p2"))
+    assert hub.pending["s1"].updated_at == FIXED + 1
+
     hub.flush()
     frames = await drain_queue(subscriber)
     digests = [
@@ -1554,74 +1581,60 @@ async def test_part_updated_bumps_updatedAt_strictly(fresh_hub):
         if event == "session.digest" and data.get("sessionID") == "s1"
     ]
     assert len(digests) == 1
-    first_ua = digests[0]["updatedAt"]
-    assert isinstance(first_ua, int)
-    assert first_ua > 0
-
-    # Second part.updated in a new debounce window → strictly larger.
-    hub.publish(part_updated("s1", "m1", "p2"))
-    hub.flush()
-    frames2 = await drain_queue(subscriber)
-    digests2 = [
-        data for event, data in (parse_event(f) for f in frames2)
-        if event == "session.digest" and data.get("sessionID") == "s1"
-    ]
-    assert len(digests2) == 1
-    assert digests2[0]["updatedAt"] > first_ua
+    assert digests[0]["updatedAt"] == FIXED + 1
 
 
-async def test_part_removed_bumps_updatedAt_strictly(fresh_hub):
+async def test_part_removed_bumps_updatedAt_strictly(fresh_hub, monkeypatch):
     """§9.3: message.part.removed must also bump updatedAt (strictly
-    increasing), analogous to message.part.updated."""
+    increasing within the same debounce window), analogous to part.updated."""
     hub, subscriber = fresh_hub
 
+    FIXED = 1700000000000
+    monkeypatch.setattr("oc_slimapi.sse.hub._now_ms", lambda: FIXED)
+
+    # First part.removed: updated_at = max(FIXED, 0+1) = FIXED
     hub.publish(make_global_event("/proj", "message.part.removed", {
         "sessionID": "s1", "messageID": "m1", "partID": "p1",
     }))
-    hub.flush()
+    assert hub.pending["s1"].updated_at == FIXED
 
+    # Second part.removed (same window): max(FIXED, FIXED+1) = FIXED+1
+    hub.publish(make_global_event("/proj", "message.part.removed", {
+        "sessionID": "s1", "messageID": "m1", "partID": "p2",
+    }))
+    assert hub.pending["s1"].updated_at == FIXED + 1
+
+    hub.flush()
     frames = await drain_queue(subscriber)
     digests = [
         data for event, data in (parse_event(f) for f in frames)
         if event == "session.digest" and data.get("sessionID") == "s1"
     ]
     assert len(digests) == 1
-    first_ua = digests[0]["updatedAt"]
-    assert isinstance(first_ua, int)
-    assert first_ua > 0
-
-    # Second part.removed in a new window → strictly larger.
-    hub.publish(make_global_event("/proj", "message.part.removed", {
-        "sessionID": "s1", "messageID": "m1", "partID": "p2",
-    }))
-    hub.flush()
-    frames2 = await drain_queue(subscriber)
-    digests2 = [
-        data for event, data in (parse_event(f) for f in frames2)
-        if event == "session.digest" and data.get("sessionID") == "s1"
-    ]
-    assert len(digests2) == 1
-    assert digests2[0]["updatedAt"] > first_ua
+    assert digests[0]["updatedAt"] == FIXED + 1
 
 
-async def test_bump_updated_at_same_ms_collision():
-    """§9.3: when the new wall-clock ms equals the previous value,
-    bump_updated_at sets entry.updated_at = previous + 1, guaranteeing
-    strict monotonicity even within one ms."""
+async def test_bump_updated_at_same_ms_collision(monkeypatch):
+    """§9.3: deterministic same-ms collision + clock rollback coverage.
+    bump_updated_at uses max(now, previous+1) — never goes backward."""
     from oc_slimapi.sse.hub import DigestFields, bump_updated_at
 
-    entry = DigestFields()
-    # Simulate two consecutive calls in the same millisecond.
-    bump_updated_at(entry)
-    first = entry.updated_at
-    bump_updated_at(entry)
-    second = entry.updated_at
-    assert second > first, f"expected second > first, got {second} <= {first}"
+    FIXED = 1234567890
+    monkeypatch.setattr("oc_slimapi.sse.hub._now_ms", lambda: FIXED)
 
-    # Edge case: previous exactly equals now → second = now + 1.
-    # This happens when the two calls land in the same wall-clock ms and
-    # _now_ms() returns the same value for both.
-    assert second >= first + 1
+    entry = DigestFields()
+    # Fresh: previous=0 → max(FIXED, 1) = FIXED
+    bump_updated_at(entry)
+    assert entry.updated_at == FIXED
+
+    # Same-ms: previous=FIXED, now=FIXED → max(FIXED, FIXED+1) = FIXED+1
+    bump_updated_at(entry)
+    assert entry.updated_at == FIXED + 1
+
+    # Clock rollback: now=FIXED-1000, previous=FIXED+1 → max(FIXED-1000, FIXED+2) = FIXED+2
+    monkeypatch.setattr("oc_slimapi.sse.hub._now_ms", lambda: FIXED - 1000)
+    bump_updated_at(entry)
+    assert entry.updated_at == FIXED + 2
 
 
 async def test_message_removed_does_not_bump_updatedAt(fresh_hub):
@@ -1650,4 +1663,7 @@ async def test_message_removed_does_not_bump_updatedAt(fresh_hub):
         if event == "session.digest" and data.get("sessionID") == "s1"
     ]
     # message.removed does NOT create a pending digest entry — no frame emitted.
+    assert len(digests) == 0
+    # But the retirement IS recorded for the safety gate.
+    assert ("s1", "msg_1") in hub._retired_messages
     assert digests == [], f"message.removed should not emit a digest, got: {digests}"

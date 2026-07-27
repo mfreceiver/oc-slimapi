@@ -1,7 +1,13 @@
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from oc_slimapi.versioning import SlimapiVersionMiddleware
+from oc_slimapi.versioning import ACCEPTED_CLIENT_VERSIONS, SlimapiVersionMiddleware
+
+
+def test_production_default_accepted_versions():
+    """lite-v2 §9.3: the production default constant MUST be (2, 2) —
+    v2-only, no back-compat with v1."""
+    assert ACCEPTED_CLIENT_VERSIONS == (2, 2)
 
 
 def make_client() -> TestClient:
