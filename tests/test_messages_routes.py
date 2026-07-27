@@ -51,16 +51,7 @@ def _settings(**overrides) -> Settings:
         smoke_session_id=None,
         server_api_version=1,
         accepted_client_versions=(1, 1),
-        # Opt-A fields are still defined on Settings; kept here so the dataclass
-        # validates even though messages.py no longer consumes them.
-        opt_a_partial_envelope_enabled=True,
-        opt_a_auto_rollback_enabled=True,
-        opt_a_rollback_window_seconds=3600,
-        opt_a_rollback_min_sample=100,
-        opt_a_rollback_envelope_5xx_zero_baseline_rate=0.01,
-        opt_a_rollback_unknown_code_rate=0.05,
-        opt_a_retry_after_ms_conservative=200,
-        opt_a_retry_after_ms_cap=10000,
+
     )
     base.update(overrides)
     return Settings(**base)

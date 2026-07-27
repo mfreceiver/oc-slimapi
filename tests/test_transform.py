@@ -21,55 +21,9 @@ from oc_slimapi.transform import (
     TransformBusy,
     TransformConfig,
     TransformPool,
-    project_and_pack,
     read_with_cap,
     strip_diagnostics_and_pack,
 )
-
-
-# ---------------------------------------------------------------------------
-# Worker entrypoints
-# ---------------------------------------------------------------------------
-
-
-def _sample_messages() -> list[dict]:
-    return [
-        {
-            "info": {"id": "m1", "role": "user"},
-            "parts": [
-                {"id": "p1", "type": "text", "messageID": "m1", "text": "hello"},
-                {
-                    "id": "p2", "type": "tool", "messageID": "m1", "tool": "bash",
-                    "state": {
-                        "status": "completed",
-                        "input": {"command": "ls", "debug": "drop me"},
-                        "output": "x" * (_skel_config.skeleton_inline_output_max_bytes + 1000),
-                    },
-                },
-            ],
-        }
-    ]
-
-
-def test_project_and_pack_round_trips_skeleton_message():
-    body = orjson.dumps(_sample_messages()[0])
-    from oc_slimapi.skeleton import skeleton_message
-
-    payload, _ = project_and_pack(body, accept_encoding=None)
-    assert orjson.loads(payload) == skeleton_message(_sample_messages()[0])
-
-
-def test_project_and_pack_applies_gzip_when_client_accepts_it():
-    body = orjson.dumps(_sample_messages()[0])
-
-    payload, headers = project_and_pack(body, accept_encoding="gzip, br")
-
-    # gzip magic bytes.
-    assert payload[:2] == b"\x1f\x8b"
-    assert headers["Content-Encoding"] == "gzip"
-    # Round-trip back to the skeleton contract.
-    decoded = orjson.loads(gzip.decompress(payload))
-    assert decoded["parts"][1]["state"]["input"] == {"command": "ls"}
 
 
 # ---------------------------------------------------------------------------

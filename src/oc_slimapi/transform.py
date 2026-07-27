@@ -21,7 +21,7 @@ The pool's async-context-manager protocol means a route can write::
     async with request.app.state.transforms as pool:
         response = await upstream.send(..., stream=True)
         body, _ = await read_with_cap(response, pool.config.max_response_bytes)
-        encoded, extra = await pool.offload(project_and_pack, body, ...)
+        encoded, extra = await pool.offload(strip_diagnostics_and_pack, body, ...)
 
 and the admission slot is released on exit even if the upstream errors out.
 
@@ -42,7 +42,6 @@ from typing import Any, Callable
 import orjson
 
 from .skeleton import (
-    skeleton_message,
     strip_diagnostics_message,
 )
 
@@ -74,20 +73,6 @@ def _pack_json(value: Any, accept_encoding: str | None) -> tuple[bytes, dict[str
         encoded = gzip.compress(encoded, compresslevel=6)
         headers["Content-Encoding"] = "gzip"
     return encoded, headers
-
-
-def project_and_pack(
-    body: bytes, *, accept_encoding: str | None,
-) -> tuple[bytes, dict[str, str]]:
-    """Worker entrypoint: ``orjson.loads`` -> projection -> ``dumps`` -> (gzip).
-
-    Used by the single-shot skeleton route (``GET /messages/{mid}``) where
-    the upstream body arrives as raw bytes and the full chain — including
-    parsing — can run in one worker context.
-    """
-    parsed = orjson.loads(body)
-    projected = skeleton_message(parsed)
-    return _pack_json(projected, accept_encoding)
 
 
 def strip_diagnostics_and_pack(

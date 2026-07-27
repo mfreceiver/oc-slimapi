@@ -87,9 +87,9 @@ async def test_metrics_route_returns_snapshot_with_version_header():
             response = await client.get("/slimapi/metrics", headers=VERSION_HEADERS)
         assert response.status_code == 200
         data = response.json()
-        # Contract §2/§6 shape.
-        # Since the test app may or may not have a batch_ledger, accept both.
-        assert set(data) <= {"sse", "skeleton", "batch"}
+        # Contract §2/§6 shape. batch is always present (null post-Track-A).
+        assert set(data) == {"sse", "skeleton", "batch"}
+        assert data["batch"] is None
         sse = data["sse"]
         assert set(sse) == {"subscribers", "hubs", "clients"}
         assert sse["subscribers"] == {
