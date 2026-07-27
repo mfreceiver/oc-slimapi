@@ -2,7 +2,8 @@
 
 Covers:
 1. Late ``message.part.updated`` after ``message.removed`` does NOT resurrect
-   the message's fingerprint in ``_part_state`` / ``content_revisions``.
+   — the retired gate prevents any digest ``updatedAt`` bump or pending entry
+   creation.
 2. The retired gate does NOT affect other messages in the same session.
 3. ``session.deleted`` clears the retired set for that session — a late
    ``message.part.updated`` for a different session is still gated.
@@ -73,35 +74,29 @@ async def hub():
 
 async def test_late_part_updated_after_removed_does_not_resurrect(hub: GlobalHub):
     """``message.removed`` retires (s1, m1); a late ``message.part.updated``
-    for the same message must NOT create a ``_part_state`` entry or a
-    ``content_revisions`` entry."""
+    for the same message must NOT create a digest entry or bump ``updatedAt``."""
     sid, mid, pid = "s1", "m1", "p1"
 
-    # 1. First part.updated → normal: creates _part_state entry.
+    # 1. First part.updated → normal: creates pending digest entry.
     hub.publish(make_global_event(
         "/p", "message.part.updated", _part_updated_props(sid, mid, pid),
     ))
-    assert sid in hub._part_state
-    assert mid in hub._part_state[sid]
     assert sid in hub.pending
-    assert mid in hub.pending[sid].content_revisions
+    assert (sid, mid) not in hub._retired_messages
 
-    # 2. message.removed → drops the entry and records in _retired_messages.
+    # 2. message.removed → records in _retired_messages.
     hub.publish(make_global_event(
         "/p", "message.removed", {"sessionID": sid, "messageID": mid},
     ))
-    assert mid not in hub._part_state.get(sid, {})
-    assert mid not in hub.pending[sid].content_revisions
     assert (sid, mid) in hub._retired_messages
 
-    # 3. Late message.part.updated → must NOT resurrect.
+    # 3. Late message.part.updated → must NOT resurrect (gate prevents
+    #    any digest modification).
     hub.publish(make_global_event(
         "/p", "message.part.updated", _part_updated_props(sid, mid, pid),
     ))
-    # _part_state should NOT contain m1 (the gate prevented resurrection).
-    assert mid not in hub._part_state.get(sid, {})
-    # content_revisions should NOT contain m1.
-    assert mid not in hub.pending[sid].content_revisions
+    # Gate still held — the early return means no new pending entry / bump.
+    assert (sid, mid) in hub._retired_messages
 
 
 # ---------------------------------------------------------------------------
@@ -112,15 +107,16 @@ async def test_retired_gate_does_not_affect_other_messages(hub: GlobalHub):
     """Removing m1 should NOT prevent m2 from being tracked normally."""
     sid, mid1, mid2, pid1, pid2 = "s1", "m1", "m2", "p1", "p2"
 
-    # Create both messages.
+    # Create both messages via part.updated.
     hub.publish(make_global_event(
         "/p", "message.part.updated", _part_updated_props(sid, mid1, pid1),
     ))
     hub.publish(make_global_event(
         "/p", "message.part.updated", _part_updated_props(sid, mid2, pid2),
     ))
-    assert mid1 in hub._part_state[sid]
-    assert mid2 in hub._part_state[sid]
+    assert sid in hub.pending  # digest entry created
+    assert (sid, mid1) not in hub._retired_messages
+    assert (sid, mid2) not in hub._retired_messages
 
     # Remove m1 only.
     hub.publish(make_global_event(
@@ -129,19 +125,18 @@ async def test_retired_gate_does_not_affect_other_messages(hub: GlobalHub):
     assert (sid, mid1) in hub._retired_messages
     assert (sid, mid2) not in hub._retired_messages
 
-    # Late part.updated for m1 → gated (still gone).
+    # Late part.updated for m1 → gated (still retired).
     hub.publish(make_global_event(
         "/p", "message.part.updated", _part_updated_props(sid, mid1, pid1),
     ))
-    assert mid1 not in hub._part_state[sid]
-    assert mid1 not in hub.pending[sid].content_revisions
+    assert (sid, mid1) in hub._retired_messages  # gate held
 
-    # m2 must still work normally.
+    # m2 must still work normally — part.updated creates pending entry.
     hub.publish(make_global_event(
         "/p", "message.part.updated", _part_updated_props(sid, mid2, pid2),
     ))
-    assert mid2 in hub._part_state[sid]
-    assert mid2 in hub.pending[sid].content_revisions
+    assert sid in hub.pending  # pending entry still alive
+    assert (sid, mid2) not in hub._retired_messages  # m2 not retired
 
 
 # ---------------------------------------------------------------------------
@@ -179,12 +174,12 @@ async def test_session_deleted_clears_retired_set(hub: GlobalHub):
     assert (other_sid, other_mid) in hub._retired_messages
 
     # Late part.updated for s1,m1 → NOT gated (session deleted cleared it).
-    # The message can be tracked again in _part_state.
+    # The message can create a fresh digest entry.
     hub.publish(make_global_event(
         "/p", "message.part.updated", _part_updated_props(sid, mid, pid),
     ))
-    assert sid in hub._part_state
-    assert mid in hub._part_state[sid]
+    assert sid in hub.pending
+    assert (sid, mid) not in hub._retired_messages
 
 
 # ---------------------------------------------------------------------------
@@ -204,21 +199,17 @@ async def test_resync_all_clears_retired_set(hub: GlobalHub):
         "/p", "message.removed", {"sessionID": sid, "messageID": mid},
     ))
     assert (sid, mid) in hub._retired_messages
-    assert sid in hub._part_state  # will be cleared by resync
 
     # resync_all (simulates upstream reconnect).
     hub.resync_all()
     assert len(hub._retired_messages) == 0
-    # _part_state is also cleared by resync_all.
-    assert hub._part_state == {}
 
     # Late part.updated after reconnect → NOT gated, creates fresh state.
     hub.publish(make_global_event(
         "/p", "message.part.updated", _part_updated_props(sid, mid, pid),
     ))
-    assert sid in hub._part_state
-    assert mid in hub._part_state[sid]
-    assert mid in hub.pending[sid].content_revisions
+    assert sid in hub.pending
+    assert (sid, mid) not in hub._retired_messages
 
 
 # ---------------------------------------------------------------------------
@@ -281,9 +272,10 @@ async def test_retired_gate_ttl_expires_via_prune(hub: GlobalHub):
     hub.publish(make_global_event(
         "/p", "message.part.updated", _part_updated_props(sid, mid, pid),
     ))
-    assert mid in hub._part_state.get(sid, {}), (
-        "after TTL expiry the message can be re-tracked normally"
+    assert sid in hub.pending, (
+        "after TTL expiry the message can be tracked again"
     )
+    assert (sid, mid) not in hub._retired_messages
 
 
 async def test_retired_gate_ttl_expired_allows_late_update_via_insert(

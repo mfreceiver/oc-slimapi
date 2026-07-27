@@ -213,12 +213,15 @@ class TestDigestAccumulation:
 
         digests = only_digests(await drain(sub))
         assert len(digests) == 1
+        # updatedAt is sidecar wall-clock (not upstream timestamp)
+        assert isinstance(digests[0]["updatedAt"], int)
+        assert digests[0]["updatedAt"] > 0
         assert digests[0] == {
             "sessionID": "s1",
             "directory": "/proj",
             "status": "busy",
             "messageID": "msg_1",
-            "updatedAt": 1700000000000,
+            "updatedAt": digests[0]["updatedAt"],
         }
 
     async def test_two_separate_windows_produce_two_digests(self, pair):
@@ -269,34 +272,45 @@ class TestDigestAccumulation:
         hub.flush()
         assert only_digests(await drain(sub))[0]["messageID"] == "from_props"
 
-    async def test_updatedAt_priority_updated_then_created_then_now(self, pair):
+    async def test_updatedAt_is_sidecar_wall_clock(self, pair):
+        """lite-v2 §4.2: updatedAt is always sidecar wall-clock, never
+        the upstream message timestamp. Priority order
+        (updated > created > now) no longer applies."""
         hub, sub = pair
-        # updated wins over created.
+
+        # Scenario 1: message has updated + created — both ignored for wall-clock.
         hub.publish(ev("/p", "message.updated", {
             "sessionID": "s1",
             "info": {"id": "m1", "time": {"updated": 111, "created": 222}},
         }))
         hub.flush()
-        assert only_digests(await drain(sub))[0]["updatedAt"] == 111
+        ua1 = only_digests(await drain(sub))[0]["updatedAt"]
+        assert isinstance(ua1, int)
+        assert ua1 > 0
+        # Must NOT be 111 (upstream timestamp) or 222.
+        assert ua1 > 222
 
-        # created fallback when updated missing.
+        # Scenario 2: only created — still wall-clock, not 333.
         hub.publish(ev("/p", "message.updated", {
             "sessionID": "s1", "info": {"id": "m2", "time": {"created": 333}},
         }))
         hub.flush()
-        assert only_digests(await drain(sub))[0]["updatedAt"] == 333
+        ua2 = only_digests(await drain(sub))[0]["updatedAt"]
+        assert isinstance(ua2, int)
+        assert ua2 > 333
 
-        # now() fallback when both missing.
-        before = int(time.time() * 1000)
+        # Scenario 3: no time fields — must be positive int.
         hub.publish(ev("/p", "message.updated", {
             "sessionID": "s1", "info": {"id": "m3"},
         }))
         hub.flush()
-        after = int(time.time() * 1000)
-        ua = only_digests(await drain(sub))[0]["updatedAt"]
-        assert before <= ua <= after
+        ua3 = only_digests(await drain(sub))[0]["updatedAt"]
+        assert isinstance(ua3, int)
+        assert ua3 > 0
 
-    async def test_message_appended_carries_created_timestamp(self, pair):
+    async def test_message_appended_carries_sidecar_wall_clock(self, pair):
+        """lite-v2 §4.2: message.appended updatedAt is sidecar wall-clock,
+        not the upstream ``time.created``."""
         hub, sub = pair
         hub.publish(ev("/proj", "message.appended", {
             "sessionID": "s1",
@@ -305,7 +319,10 @@ class TestDigestAccumulation:
         hub.flush()
         d = only_digests(await drain(sub))[0]
         assert d["messageID"] == "msg_app"
-        assert d["updatedAt"] == 1700000001000
+        assert isinstance(d["updatedAt"], int)
+        assert d["updatedAt"] > 0
+        # Must NOT be the upstream created timestamp.
+        assert d["updatedAt"] != 1700000001000
 
     async def test_archived_sticky_within_window_across_other_events(self, pair):
         """Once archived is observed, subsequent same-window events must not

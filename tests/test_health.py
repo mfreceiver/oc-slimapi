@@ -23,7 +23,7 @@ from oc_slimapi.errors import register_error_handlers
 from oc_slimapi.routes import health
 from oc_slimapi.versioning import SlimapiVersionMiddleware
 
-VERSION_HEADERS = {"X-Slimapi-Version": "1"}
+VERSION_HEADERS = {"X-Slimapi-Version": "2"}
 
 
 def _settings(**overrides) -> Settings:
@@ -39,7 +39,7 @@ def _settings(**overrides) -> Settings:
         route_secret_file=None,
         smoke_session_id=None,
         server_api_version=1,
-        accepted_client_versions=(1, 1),
+        accepted_client_versions=(2, 2),
     )
     base.update(overrides)
     return Settings(**base)
@@ -126,8 +126,9 @@ async def test_health_with_accept_encoding_gzip_returns_gzip(upstream_factory):
     # Decoding the (already decompressed) content must match a fresh gzip round-trip.
     body = orjson.loads(response.content)
     assert body["sidecar"]["ok"] is True
-    assert body["server"]["accepted_client_versions"] == [1, 1]
+    assert body["server"]["accepted_client_versions"] == [2, 2]
     assert body["schema"]["degraded"] is False
+    assert body["slimapi_contract"] == 2
 
 
 async def test_health_without_accept_encoding_is_not_gzipped(upstream_factory):
@@ -284,7 +285,7 @@ async def test_health_gzip_body_is_genuinely_gzip_encoded(upstream_factory):
 
     status, headers, raw_bytes = await _asgi_call_raw(
         app, "GET", "/slimapi/health",
-        [("X-Slimapi-Version", "1"), ("Accept-Encoding", "gzip")],
+        [("X-Slimapi-Version", "2"), ("Accept-Encoding", "gzip")],
     )
 
     assert status == 200
@@ -305,7 +306,7 @@ async def test_health_identity_body_is_not_gzip_encoded(upstream_factory):
 
     status, headers, raw_bytes = await _asgi_call_raw(
         app, "GET", "/slimapi/health",
-        [("X-Slimapi-Version", "1"), ("Accept-Encoding", "identity")],
+        [("X-Slimapi-Version", "2"), ("Accept-Encoding", "identity")],
     )
 
     assert status == 200
@@ -334,12 +335,14 @@ async def test_health_schema_includes_version_and_client_range(upstream_factory)
     assert body["schema"] == {
         "degraded": False,
         "version": 1,
-        "clientMin": 1,
-        "clientMax": 1,
+        "clientMin": 2,
+        "clientMax": 2,
     }
     # Old ``server.*`` keys still there for back-compat.
     assert body["server"]["api_version"] == 1
-    assert body["server"]["accepted_client_versions"] == [1, 1]
+    assert body["server"]["accepted_client_versions"] == [2, 2]
+    # lite-v2: static contract revision.
+    assert body["slimapi_contract"] == 2
 
 
 async def test_health_schema_reflects_non_default_config(upstream_factory):
@@ -371,8 +374,8 @@ async def test_ready_schema_includes_version_and_client_range(upstream_factory):
     assert body["schema"] == {
         "degraded": False,
         "version": 1,
-        "clientMin": 1,
-        "clientMax": 1,
+        "clientMin": 2,
+        "clientMax": 2,
     }
 
 
@@ -389,11 +392,11 @@ async def test_ready_503_path_preserves_schema_fields(upstream_factory):
     assert response.status_code == 503
     body = response.json()
     assert body["schema"]["version"] == 1
-    assert body["schema"]["clientMin"] == 1
-    assert body["schema"]["clientMax"] == 1
+    assert body["schema"]["clientMin"] == 2
+    assert body["schema"]["clientMax"] == 2
     # Old fields still there.
     assert body["server"]["api_version"] == 1
-    assert body["server"]["accepted_client_versions"] == [1, 1]
+    assert body["server"]["accepted_client_versions"] == [2, 2]
 
 
 async def test_health_schema_reflects_schema_degraded_state(upstream_factory):

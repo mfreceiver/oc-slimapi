@@ -147,12 +147,15 @@ async def test_digest_merges_status_and_message_into_one_frame(fresh_hub):
     ]
     assert len(digests) == 1
     _, data = digests[0]
+    # updatedAt is sidecar wall-clock (not upstream timestamp) — validate type + monotonic.
+    assert isinstance(data["updatedAt"], int)
+    assert data["updatedAt"] > 0
     assert data == {
         "sessionID": "s1",
         "directory": "/proj",
         "status": "busy",
         "messageID": "msg_1",
-        "updatedAt": 1700000000000,
+        "updatedAt": data["updatedAt"],
     }
 
 
@@ -281,7 +284,9 @@ async def test_message_appended_updates_message_id(fresh_hub):
     frames = await drain_queue(subscriber)
     _, data = parse_event(frames[0])
     assert data["messageID"] == "msg_2"
-    assert data["updatedAt"] == 1700000001000
+    # updatedAt is sidecar wall-clock (not upstream created timestamp)
+    assert isinstance(data["updatedAt"], int)
+    assert data["updatedAt"] > 0
 
 
 async def test_deleted_flag_persists_across_subsequent_status_changes(fresh_hub):
@@ -1489,3 +1494,160 @@ async def subscriber_first_after_welcome(sub):
     event_name, data = parse_event(second)
     assert event_name == "server.reconfigured"
     assert data["reason"] == "discovery_changed"
+
+
+# ---------------------------------------------------------------------------
+# §9.3: Digest field convergence / updatedAt monotonicity / bump boundary
+# ---------------------------------------------------------------------------
+
+async def test_digest_fields_converged(fresh_hub):
+    """§9.3: digest frame JSON must only contain the expected fields:
+    {sessionID, directory, status, messageID, updatedAt, archived, deleted,
+    lastError}.  Fields removed in lite-v2 (contentRevisions, childrenVersion)
+    must NOT appear."""
+    hub, subscriber = fresh_hub
+
+    hub.publish(make_global_event("/proj", "session.status", {
+        "sessionID": "s1", "status": "busy",
+    }))
+    hub.publish(make_global_event("/proj", "message.updated", {
+        "sessionID": "s1",
+        "info": {"id": "msg_1", "time": {"updated": 1700000000000}},
+    }))
+    hub.flush()
+
+    frames = await drain_queue(subscriber)
+    digests = [
+        data for event, data in (parse_event(f) for f in frames)
+        if event == "session.digest"
+    ]
+    assert len(digests) == 1
+    payload = digests[0]
+
+    allowed = {"sessionID", "directory", "status", "messageID",
+               "updatedAt", "archived", "deleted", "lastError"}
+    assert set(payload) <= allowed, f"Unexpected keys: {set(payload) - allowed}"
+    assert "contentRevisions" not in payload
+    assert "childrenVersion" not in payload
+
+
+async def test_part_updated_bumps_updatedAt_strictly(fresh_hub):
+    """§9.3: two consecutive message.part.updated events (separate debounce
+    windows) must produce strictly increasing digest.updatedAt.
+    bump_updated_at guarantees monotonicity even within the same wall-clock ms.
+
+    Upstream payload: higher-level event properties carry ``part`` nested dict
+    (mirroring the on_part_updated token-hub schema)."""
+    hub, subscriber = fresh_hub
+
+    def part_updated(part_sid: str, part_mid: str, part_id: str) -> dict:
+        return make_global_event("/proj", "message.part.updated", {
+            "part": {"sessionID": part_sid, "messageID": part_mid, "id": part_id},
+            "sessionID": part_sid, "messageID": part_mid,
+        })
+
+    hub.publish(part_updated("s1", "m1", "p1"))
+    hub.flush()
+    frames = await drain_queue(subscriber)
+    digests = [
+        data for event, data in (parse_event(f) for f in frames)
+        if event == "session.digest" and data.get("sessionID") == "s1"
+    ]
+    assert len(digests) == 1
+    first_ua = digests[0]["updatedAt"]
+    assert isinstance(first_ua, int)
+    assert first_ua > 0
+
+    # Second part.updated in a new debounce window → strictly larger.
+    hub.publish(part_updated("s1", "m1", "p2"))
+    hub.flush()
+    frames2 = await drain_queue(subscriber)
+    digests2 = [
+        data for event, data in (parse_event(f) for f in frames2)
+        if event == "session.digest" and data.get("sessionID") == "s1"
+    ]
+    assert len(digests2) == 1
+    assert digests2[0]["updatedAt"] > first_ua
+
+
+async def test_part_removed_bumps_updatedAt_strictly(fresh_hub):
+    """§9.3: message.part.removed must also bump updatedAt (strictly
+    increasing), analogous to message.part.updated."""
+    hub, subscriber = fresh_hub
+
+    hub.publish(make_global_event("/proj", "message.part.removed", {
+        "sessionID": "s1", "messageID": "m1", "partID": "p1",
+    }))
+    hub.flush()
+
+    frames = await drain_queue(subscriber)
+    digests = [
+        data for event, data in (parse_event(f) for f in frames)
+        if event == "session.digest" and data.get("sessionID") == "s1"
+    ]
+    assert len(digests) == 1
+    first_ua = digests[0]["updatedAt"]
+    assert isinstance(first_ua, int)
+    assert first_ua > 0
+
+    # Second part.removed in a new window → strictly larger.
+    hub.publish(make_global_event("/proj", "message.part.removed", {
+        "sessionID": "s1", "messageID": "m1", "partID": "p2",
+    }))
+    hub.flush()
+    frames2 = await drain_queue(subscriber)
+    digests2 = [
+        data for event, data in (parse_event(f) for f in frames2)
+        if event == "session.digest" and data.get("sessionID") == "s1"
+    ]
+    assert len(digests2) == 1
+    assert digests2[0]["updatedAt"] > first_ua
+
+
+async def test_bump_updated_at_same_ms_collision():
+    """§9.3: when the new wall-clock ms equals the previous value,
+    bump_updated_at sets entry.updated_at = previous + 1, guaranteeing
+    strict monotonicity even within one ms."""
+    from oc_slimapi.sse.hub import DigestFields, bump_updated_at
+
+    entry = DigestFields()
+    # Simulate two consecutive calls in the same millisecond.
+    bump_updated_at(entry)
+    first = entry.updated_at
+    bump_updated_at(entry)
+    second = entry.updated_at
+    assert second > first, f"expected second > first, got {second} <= {first}"
+
+    # Edge case: previous exactly equals now → second = now + 1.
+    # This happens when the two calls land in the same wall-clock ms and
+    # _now_ms() returns the same value for both.
+    assert second >= first + 1
+
+
+async def test_message_removed_does_not_bump_updatedAt(fresh_hub):
+    """§9.3: message.removed must NOT bump digest.updatedAt (design
+    decision: message.removed is a pure retirement signal that does not
+    touch the digest's pending entry or updatedAt)."""
+    hub, subscriber = fresh_hub
+
+    # Seed a digest with a known updatedAt via message.updated.
+    hub.publish(make_global_event("/proj", "message.updated", {
+        "sessionID": "s1",
+        "info": {"id": "msg_1", "time": {"updated": 1700000000000}},
+    }))
+    hub.flush()
+    await drain_queue(subscriber)  # drain the first digest
+    assert hub.pending == {}  # evicted
+
+    # Now send message.removed — must NOT create a pending entry or emit a digest.
+    hub.publish(make_global_event("/proj", "message.removed", {
+        "sessionID": "s1", "messageID": "msg_1",
+    }))
+    hub.flush()
+    frames = await drain_queue(subscriber, timeout=0.1)
+    digests = [
+        data for event, data in (parse_event(f) for f in frames)
+        if event == "session.digest" and data.get("sessionID") == "s1"
+    ]
+    # message.removed does NOT create a pending digest entry — no frame emitted.
+    assert digests == [], f"message.removed should not emit a digest, got: {digests}"

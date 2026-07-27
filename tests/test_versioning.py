@@ -8,7 +8,7 @@ def make_client() -> TestClient:
     app = FastAPI()
     app.add_middleware(
         SlimapiVersionMiddleware,
-        accepted_client_versions=(1, 1),
+        accepted_client_versions=(2, 2),
     )
 
     @app.get("/slimapi/health")
@@ -28,14 +28,14 @@ def test_missing_version_header_is_rejected():
     assert response.status_code == 400
     assert response.json() == {
         "code": "version_required",
-        "accepted": [1, 1],
+        "accepted": [2, 2],
     }
 
 
 def test_supported_version_is_allowed():
     response = make_client().get(
         "/slimapi/health",
-        headers={"X-Slimapi-Version": "1"},
+        headers={"X-Slimapi-Version": "2"},
     )
 
     assert response.status_code == 200
@@ -45,7 +45,7 @@ def test_supported_version_is_allowed():
 def test_out_of_range_versions_are_rejected():
     client = make_client()
 
-    for version in (0, 2):
+    for version in (1, 3):
         response = client.get(
             "/slimapi/health",
             headers={"X-Slimapi-Version": str(version)},
@@ -54,7 +54,7 @@ def test_out_of_range_versions_are_rejected():
         assert response.json() == {
             "code": "version_incompatible",
             "client": version,
-            "accepted": [1, 1],
+            "accepted": [2, 2],
         }
 
 
@@ -67,7 +67,7 @@ def test_non_integer_version_is_reported_as_required():
     assert response.status_code == 400
     assert response.json() == {
         "code": "version_required",
-        "accepted": [1, 1],
+        "accepted": [2, 2],
     }
 
 

@@ -561,14 +561,12 @@ class TestPublishIntegration:
     async def test_token_routing_no_digest_pollution(self, bare_hub):
         """Token ingest must NOT produce any TOKEN control-plane frame.
 
-        Stage B v0.4 (CRITICAL 2 fix) clarified the invariant: a
-        ``message.part.updated`` upstream event now legitimately updates
-        ``_part_state`` + writes ``contentRevisions`` into the debounce
-        window's digest entry (control-plane feature for R1/R2 recovery
-        and ``/full?known=`` 304, carrying the message-level
-        ``messageEventSeq``). The curated-stream subscriber WILL see a
-        digest — but it must carry ONLY ``contentRevisions`` (no status /
-        messageID / etc. fields invented from token routing).
+        lite-v2 removes per-message ``_part_state`` / ``contentRevisions``
+        from the digest. ``message.part.updated`` now writes ``updatedAt``
+        (sidecar wall-clock) instead of ``contentRevisions``. The
+        curated-stream subscriber sees a digest with ONLY ``sessionID`` +
+        ``updatedAt`` — no status / messageID / directory / contentRevisions
+        invented from token routing.
 
         ``message.part.delta`` (token-stream-only) still produces NO
         digest entry whatsoever — that half of the Stage-A invariant
@@ -596,13 +594,14 @@ class TestPublishIntegration:
         assert len(frames) == 1, f"expected one digest, got {frames!r}"
         event_name, data = parse_event(frames[0])
         assert event_name == "session.digest"
-        # Only sessionID + contentRevisions — no token-routing leakage
-        # (no status / messageID / directory / updatedAt invented).
-        # messageEventSeq: first event for this message → seq=1.
-        assert data == {
-            "sessionID": "s1",
-            "contentRevisions": {"m1": 1},
-        }
+        # Only sessionID + updatedAt — no token-routing leakage
+        # (no status / messageID / directory / contentRevisions).
+        assert data["sessionID"] == "s1"
+        assert isinstance(data.get("updatedAt"), int)
+        assert "contentRevisions" not in data
+        assert "status" not in data
+        assert "messageID" not in data
+        assert "directory" not in data
 
     async def test_message_part_delta_alone_produces_no_digest(self, bare_hub):
         """``message.part.delta`` (token stream only) must NOT touch the
@@ -626,13 +625,10 @@ class TestPublishIntegration:
         """Without a token hub, ``message.part.*`` events do not crash and
         do not route to any token accumulator.
 
-        Stage B v0.4 refinement: ``message.part.updated`` STILL maintains
-        ``_part_state`` + emits a digest carrying ``contentRevisions``
-        (this is a CONTROL-plane feature, not a token-stream feature — it
-        must work with no token hub wired so the digest's recovery
-        watermark and ``/full?known=`` 304 are available even when the
-        token stream is opted out). ``message.part.delta`` alone remains
-        a full drop (no digest, no state) — that half is unchanged.
+        lite-v2: ``message.part.updated`` emits a digest carrying
+        ``updatedAt`` (sidecar wall-clock) instead of ``contentRevisions``.
+        ``message.part.delta`` alone remains a full drop (no digest, no
+        state) — that half is unchanged.
         """
         subscriber = Subscriber()
         bare_hub.subscribers.add(subscriber)
@@ -651,19 +647,14 @@ class TestPublishIntegration:
         }))
         bare_hub.flush()
         frames = await drain_queue(subscriber, timeout=0.1)
-        # Stage B: the message.part.updated emits a digest carrying only
-        # contentRevisions. message.part.delta contributes nothing.
+        # The message.part.updated emits a digest carrying updatedAt.
+        # message.part.delta contributes nothing.
         assert len(frames) == 1, f"expected one digest, got {frames!r}"
         event_name, data = parse_event(frames[0])
         assert event_name == "session.digest"
-        assert data == {
-            "sessionID": "s1",
-            "contentRevisions": {"m1": 1},
-        }
-        # And the _part_state cache was populated despite no token hub,
-        # so /full?known= 304 short-circuit works without token opt-in.
-        fp = bare_hub.get_part_fingerprint("s1", "m1")
-        assert fp == ("p1", 1, 1)
+        assert data["sessionID"] == "s1"
+        assert isinstance(data.get("updatedAt"), int)
+        assert "contentRevisions" not in data
 
     async def test_control_plane_branches_untouched(self, bare_hub):
         """Sanity: the curated branches above the token-routing still
