@@ -9,7 +9,7 @@ from fastapi import FastAPI
 
 from oc_slimapi.config import Settings
 from oc_slimapi.proxy import install_proxy
-from oc_slimapi.routes import messages, questions, sessions
+from oc_slimapi.routes import sessions
 from oc_slimapi.errors import register_error_handlers
 from oc_slimapi.transform import TransformConfig, TransformPool
 
@@ -55,8 +55,6 @@ def _build_app(
     if hubs is not None:
         app.state.hubs = hubs
     app.include_router(sessions.router)
-    app.include_router(messages.router)
-    app.include_router(questions.router)
     register_error_handlers(app)
     install_proxy(app)
     return app
@@ -69,150 +67,10 @@ def _upstream(handler):
     )
 
 
-async def test_status_upstream_404_returns_session_not_found(upstream_factory):
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(404, content=b'{"error":"not found"}')
-
-    upstream = upstream_factory(handler)
-    app = _build_app(upstream)
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get("/slimapi/sessions/ses_x/status", headers=VERSION_HEADERS)
-    assert response.status_code == 404
-    body = response.json()
-    assert body["code"] == "session_not_found"
-    assert body["sessionID"] == "ses_x"
 
 
-async def test_status_upstream_409_returns_502(upstream_factory):
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(409, content=b'{"error":"conflict"}')
-
-    upstream = upstream_factory(handler)
-    app = _build_app(upstream)
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get("/slimapi/sessions/ses_x/status", headers=VERSION_HEADERS)
-    assert response.status_code == 502
-    assert response.json()["code"] == "upstream_http_409"
 
 
-async def test_status_upstream_500_returns_503(upstream_factory):
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(500, content=b"boom")
-
-    upstream = upstream_factory(handler)
-    app = _build_app(upstream)
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get("/slimapi/sessions/ses_x/status", headers=VERSION_HEADERS)
-    assert response.status_code == 503
-    assert response.json()["code"] == "upstream_unavailable"
-
-
-async def test_status_discover_bad_json_returns_503(upstream_factory):
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=b"not-json", headers={"Content-Type": "application/json"})
-
-    upstream = upstream_factory(handler)
-    app = _build_app(upstream)
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get("/slimapi/sessions/ses_x/status", headers=VERSION_HEADERS)
-    assert response.status_code == 503
-    assert response.json()["code"] == "upstream_unavailable"
-
-
-async def test_status_allowlist_miss_relaxed_returns_status(upstream_factory):
-    """T4-C1/F2: per-session status 放宽 allowlist —— sid 自洽即能力。
-    discover 得 /secret（非白名单）+ status map 有效 → 200，不再 400。"""
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/session/ses_x":
-            return httpx.Response(200, content=orjson.dumps({"id": "ses_x", "directory": "/secret"}),
-                                  headers={"Content-Type": "application/json"})
-        if request.url.path == "/session/status":
-            return httpx.Response(200, content=orjson.dumps({"ses_x": {"type": "busy"}}),
-                                  headers={"Content-Type": "application/json"})
-        return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
-
-    upstream = upstream_factory(handler)
-    app = _build_app(upstream)  # allowlist 默认空；/secret 不在内
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get("/slimapi/sessions/ses_x/status", headers=VERSION_HEADERS)
-    assert response.status_code == 200
-    assert response.json() == {"type": "busy"}
-
-
-async def test_status_map_missing_sid_returns_idle(upstream_factory):
-    """discover ok + allowlist ok + status map has no sid → 200 idle."""
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/session/ses_x":
-            return httpx.Response(200, content=orjson.dumps({"id": "ses_x", "directory": "/app"}),
-                                  headers={"Content-Type": "application/json"})
-        if request.url.path == "/session/status":
-            return httpx.Response(200, content=orjson.dumps({"ses_other": {"type": "busy"}}),
-                                  headers={"Content-Type": "application/json"})
-        return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
-
-    upstream = upstream_factory(handler)
-    app = _build_app(upstream, allowlist={"/app"})
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get("/slimapi/sessions/ses_x/status", headers=VERSION_HEADERS)
-    assert response.status_code == 200
-    assert response.json() == {"type": "idle"}
-
-
-async def test_status_map_4xx_returns_502(upstream_factory):
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/session/ses_x":
-            return httpx.Response(200, content=orjson.dumps({"id": "ses_x", "directory": "/app"}),
-                                  headers={"Content-Type": "application/json"})
-        if request.url.path == "/session/status":
-            return httpx.Response(403, content=b"forbidden")
-        return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
-
-    upstream = upstream_factory(handler)
-    app = _build_app(upstream, allowlist={"/app"})
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get("/slimapi/sessions/ses_x/status", headers=VERSION_HEADERS)
-    assert response.status_code == 502
-    assert response.json()["code"] == "upstream_http_403"
-
-
-async def test_status_map_non_mapping_json_returns_503(upstream_factory):
-    """Status-map returns valid-but-non-mapping JSON (e.g. null/array) → 503 upstream_unavailable."""
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/session/ses_x":
-            return httpx.Response(200, content=orjson.dumps({"id": "ses_x", "directory": "/app"}),
-                                  headers={"Content-Type": "application/json"})
-        if request.url.path == "/session/status":
-            return httpx.Response(200, content=orjson.dumps([]),
-                                  headers={"Content-Type": "application/json"})
-        return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
-
-    upstream = upstream_factory(handler)
-    app = _build_app(upstream, allowlist={"/app"})
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get("/slimapi/sessions/ses_x/status", headers=VERSION_HEADERS)
-    assert response.status_code == 503
-    assert response.json() == {"code": "upstream_unavailable"}
-
-
-async def test_projects_failure_renders_code(upstream_factory):
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(500, content=b"boom")
-
-    upstream = upstream_factory(handler)
-    app = _build_app(upstream)
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get("/slimapi/projects", headers=VERSION_HEADERS)
-    assert response.status_code == 503
-    assert response.json()["code"] == "upstream_unavailable"
 
 
 async def test_sessions_list_upstream_4xx_returns_502(upstream_factory):
@@ -321,130 +179,16 @@ async def test_sessions_list_upstream_200_non_array_json_returns_503(upstream_fa
     assert response.json()["code"] == "upstream_unavailable"
 
 
-async def test_status_discover_network_error_returns_503(upstream_factory):
-    """G2 discover raises httpx.RequestError (network) → 503 upstream_unavailable."""
-    def handler(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("simulated", request=request)
-
-    upstream = upstream_factory(handler)
-    app = _build_app(upstream)
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get("/slimapi/sessions/ses_x/status", headers=VERSION_HEADERS)
-    assert response.status_code == 503
-    assert response.json()["code"] == "upstream_unavailable"
 
 
-async def test_status_discover_missing_directory_returns_503(upstream_factory):
-    """G2 discover 200 but body lacks `directory` key → 503 upstream_unavailable."""
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=orjson.dumps({"id": "ses_x"}),
-                              headers={"Content-Type": "application/json"})
-
-    upstream = upstream_factory(handler)
-    app = _build_app(upstream)
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get("/slimapi/sessions/ses_x/status", headers=VERSION_HEADERS)
-    assert response.status_code == 503
-    assert response.json()["code"] == "upstream_unavailable"
 
 
-async def test_status_discover_non_string_directory_returns_503(upstream_factory):
-    """G2 discover 200 but `directory` is non-string → 503 upstream_unavailable."""
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=orjson.dumps({"id": "ses_x", "directory": 123}),
-                              headers={"Content-Type": "application/json"})
-
-    upstream = upstream_factory(handler)
-    app = _build_app(upstream)
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get("/slimapi/sessions/ses_x/status", headers=VERSION_HEADERS)
-    assert response.status_code == 503
-    assert response.json()["code"] == "upstream_unavailable"
 
 
-async def test_status_map_5xx_returns_503(upstream_factory):
-    """discover ok + allowlist ok + status-map 5xx → 503 upstream_unavailable."""
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/session/ses_x":
-            return httpx.Response(200, content=orjson.dumps({"id": "ses_x", "directory": "/app"}),
-                                  headers={"Content-Type": "application/json"})
-        if request.url.path == "/session/status":
-            return httpx.Response(500, content=b"boom")
-        return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
-
-    upstream = upstream_factory(handler)
-    app = _build_app(upstream, allowlist={"/app"})
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get("/slimapi/sessions/ses_x/status", headers=VERSION_HEADERS)
-    assert response.status_code == 503
-    assert response.json()["code"] == "upstream_unavailable"
 
 
-async def test_projects_4xx_returns_502_upstream_http_n(upstream_factory):
-    """projects() 4xx (non-404) → 502 upstream_http_N (T2-C6)."""
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(409, content=b'{"error":"conflict"}')
-
-    upstream = upstream_factory(handler)
-    app = _build_app(upstream)
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get("/slimapi/projects", headers=VERSION_HEADERS)
-    assert response.status_code == 502
-    assert response.json() == {"code": "upstream_http_409"}
 
 
-async def test_batch_status_passthrough_unknown_directory(upstream_factory):
-    """slimapi no longer gates directories — ``?directory=/nope`` is forwarded
-    to upstream opencode normalized; whatever opencode returns (status map +
-    status code) passes through unchanged. Allowlist miss used to 400 with
-    ``directory_not_allowed``; that gate is removed and opencode now decides.
-
-    The handler below returns an empty status map with 200, mirroring what a
-    real opencode would respond for an unknown directory it cannot serve
-    politely; slimapi surfaces it verbatim.
-    """
-    captured: dict[str, str | None] = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/session/status":
-            captured["dir"] = request.headers.get("x-opencode-directory")
-            captured["query"] = request.url.params.get("directory")
-            return httpx.Response(200, content=b"{}",
-                                  headers={"Content-Type": "application/json"})
-        return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
-
-    upstream = upstream_factory(handler)
-    app = _build_app(upstream)  # allowlist 默认空；不再 gate
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get("/slimapi/sessions/status?directory=/nope", headers=VERSION_HEADERS)
-    assert response.status_code == 200
-    # Directory is normalised and forwarded both as query and header.
-    assert captured["query"] == "/nope"
-    assert captured["dir"] == "/nope"
-
-
-async def test_load_products_takes_app_state(upstream_factory):
-    from oc_slimapi.routes import sessions as sessions_mod
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/project":
-            return httpx.Response(200, content=orjson.dumps([{"id": "p1", "worktree": "/app"}]),
-                                  headers={"Content-Type": "application/json"})
-        if request.url.path == "/project/p1/directories":
-            return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
-        return httpx.Response(404, content=b"[]")
-
-    upstream = upstream_factory(handler)
-    app = _build_app(upstream)
-    result = await sessions_mod.load_products(app)
-    assert any(p["id"] == "p1" for p in result)
-    assert app.state.directory_allowlist == {"/app"}
 
 
 async def test_warm_allowlist_swallows_upstream_error(upstream_factory):
@@ -522,34 +266,9 @@ async def test_sessions_list_normalizes_trailing_slash_before_forward(upstream_f
 # ---------------------------------------------------------------------------
 # v6 §1.1: GET /slimapi/sessions response headers
 #   * X-Complete        : "true" iff len(sessions) < limit (200 only)
-#   * X-Discovery-Directories : len(directory_allowlist)
-#   * X-Discovery-Ready : allowlist_ready (last-known-good boolean)
-# Error responses (502 / 503) must NOT carry these.
+# (lite-v2: X-Discovery-Directories / X-Discovery-Ready removed per §6)
+# Error responses (502 / 503) must NOT carry X-Complete.
 # ---------------------------------------------------------------------------
-
-async def test_sessions_response_has_completeness_headers(upstream_factory):
-    """200 OK: all three headers present with sensible values."""
-    def handler(request: httpx.Request) -> httpx.Response:
-        # Return 3 items so X-Complete is "true" for limit=5.
-        return httpx.Response(200, content=orjson.dumps([
-            {"id": "s1", "directory": "/a"},
-            {"id": "s2", "directory": "/a"},
-            {"id": "s3", "directory": "/a"},
-        ]), headers={"Content-Type": "application/json"})
-
-    upstream = upstream_factory(handler)
-    app = _build_app(upstream, allowlist={"/a", "/b"})
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get(
-            "/slimapi/sessions?limit=5", headers=VERSION_HEADERS,
-        )
-    assert response.status_code == 200
-    assert response.headers["X-Complete"] == "true"
-    assert response.headers["X-Discovery-Directories"] == "2"
-    # Default fixture has allowlist_ready=False; X-Discovery-Ready must say so.
-    assert response.headers["X-Discovery-Ready"] == "false"
-
 
 async def test_sessions_completeness_headers_absent_on_5xx(upstream_factory):
     """503 / 502 responses do NOT carry the completeness trio — the contract
@@ -566,8 +285,6 @@ async def test_sessions_completeness_headers_absent_on_5xx(upstream_factory):
         assert response.status_code in (502, 503)
         # 503 path: "upstream_unavailable" with no completeness headers.
         assert "X-Complete" not in response.headers
-        assert "X-Discovery-Directories" not in response.headers
-        assert "X-Discovery-Ready" not in response.headers
 
 
 async def test_sessions_x_complete_true_when_below_limit(upstream_factory):
@@ -606,40 +323,6 @@ async def test_sessions_x_complete_false_at_limit(upstream_factory):
         )
     assert response.status_code == 200
     assert response.headers["X-Complete"] == "false"
-
-
-async def test_sessions_discovery_ready_three_states(upstream_factory):
-    """X-Discovery-Ready mirrors the three states the field can hold:
-    False (initial), True with non-empty allowlist, True with empty allowlist
-    (last-known-good, "权威空" — startup warm-up failed then found nothing)."""
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
-
-    upstream = upstream_factory(handler)
-
-    # State 1: ready=False, allowlist empty → "false" / "0".
-    app = _build_app(upstream, allowlist=set(), allowlist_ready=False)
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        r = await client.get("/slimapi/sessions", headers=VERSION_HEADERS)
-    assert r.headers["X-Discovery-Ready"] == "false"
-    assert r.headers["X-Discovery-Directories"] == "0"
-
-    # State 2: ready=True, allowlist non-empty.
-    app = _build_app(upstream, allowlist={"/a", "/b", "/c"}, allowlist_ready=True)
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        r = await client.get("/slimapi/sessions", headers=VERSION_HEADERS)
-    assert r.headers["X-Discovery-Ready"] == "true"
-    assert r.headers["X-Discovery-Directories"] == "3"
-
-    # State 3: ready=True, allowlist empty (last-known-good found nothing).
-    app = _build_app(upstream, allowlist=set(), allowlist_ready=True)
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        r = await client.get("/slimapi/sessions", headers=VERSION_HEADERS)
-    assert r.headers["X-Discovery-Ready"] == "true"
-    assert r.headers["X-Discovery-Directories"] == "0"
 
 
 async def test_sessions_roots_default_unchanged_false(upstream_factory):
@@ -691,358 +374,13 @@ async def test_sessions_non_list_payload_returns_503_no_completeness_headers(ups
         assert response.status_code == 503, f"body={bad_body!r}"
         assert response.json()["code"] == "upstream_unavailable"
         assert "X-Complete" not in response.headers
-        assert "X-Discovery-Directories" not in response.headers
-        assert "X-Discovery-Ready" not in response.headers
 
 
-# ---------------------------------------------------------------------------
-# v6 §3.3: load_products failure isolation
-#   * Top-level /project non-list → refresh failure, last-known-good preserved
-#   * Per-directory /project/{id}/directories non-list → refresh failure,
-#     last-known-good preserved
-# ---------------------------------------------------------------------------
 
-async def test_load_products_top_level_non_list_is_refresh_failure(upstream_factory):
-    """A non-list body on /project must NOT overwrite allowlist or flip
-    allowlist_ready=True. Pre-v5 this would have set the empty set as
-    authoritative and possibly emitted a fake discovery_changed."""
-    from oc_slimapi.routes import sessions as sessions_mod
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/project":
-            return httpx.Response(200, content=b'{"not": "a list"}',
-                                  headers={"Content-Type": "application/json"})
-        return httpx.Response(200, content=b"[]")
 
-    upstream = upstream_factory(handler)
-    app = _build_app(upstream, allowlist={"/preexisting"}, allowlist_ready=True)
-    # Pre-refresh: state is exactly what we set.
-    assert app.state.directory_allowlist == {"/preexisting"}
-    assert app.state.allowlist_ready is True
 
-    with pytest.raises(ValueError, match=r"not a list"):
-        await sessions_mod.load_products(app)
 
-    # Refresh failed → state preserved untouched.
-    assert app.state.directory_allowlist == {"/preexisting"}
-    assert app.state.allowlist_ready is True
 
 
-async def test_load_products_top_level_non_list_keeps_ready_false_on_first_call(upstream_factory):
-    """First call: ready starts False; bad shape must NOT flip it to True."""
-    from oc_slimapi.routes import sessions as sessions_mod
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/project":
-            return httpx.Response(200, content=b"null",
-                                  headers={"Content-Type": "application/json"})
-        return httpx.Response(200, content=b"[]")
-
-    upstream = upstream_factory(handler)
-    app = _build_app(upstream)  # allowlist_ready defaults to False
-    assert app.state.allowlist_ready is False
-
-    with pytest.raises(ValueError, match=r"not a list"):
-        await sessions_mod.load_products(app)
-
-    # Still cold.
-    assert app.state.allowlist_ready is False
-    assert app.state.directory_allowlist == set()
-
-
-async def test_load_products_per_directory_non_list_is_refresh_failure(upstream_factory):
-    """v6 §3.3 #4 per-directory: any /project/{id}/directories returning a
-    non-list aborts the WHOLE refresh (gather propagates). Pre-v6 this
-    silently treated bad shape as empty dirs, fabricating a possibly
-    incomplete new_set and triggering a fake discovery_changed."""
-    from oc_slimapi.routes import sessions as sessions_mod
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/project":
-            return httpx.Response(200, content=orjson.dumps([
-                {"id": "p1", "worktree": "/app"},
-                {"id": "p2", "worktree": "/other"},
-            ]), headers={"Content-Type": "application/json"})
-        if request.url.path == "/project/p1/directories":
-            return httpx.Response(200, content=orjson.dumps([
-                {"directory": "/app/sub"},
-            ]), headers={"Content-Type": "application/json"})
-        if request.url.path == "/project/p2/directories":
-            # Bad shape: dict instead of list. Should abort the refresh.
-            return httpx.Response(200, content=b'{"oops": true}',
-                                  headers={"Content-Type": "application/json"})
-        return httpx.Response(404, content=b"")
-
-    upstream = upstream_factory(handler)
-    app = _build_app(upstream, allowlist={"/preexisting"}, allowlist_ready=True)
-
-    with pytest.raises(ValueError, match=r"directories body is not a list"):
-        await sessions_mod.load_products(app)
-
-    # Last-known-good preserved — neither p1's /app+sub nor p2's /other
-    # leaked into the allowlist.
-    assert app.state.directory_allowlist == {"/preexisting"}
-    assert app.state.allowlist_ready is True
-
-
-async def test_load_products_per_directory_non_list_keeps_state_cold(upstream_factory):
-    """Same as above but on the very first call: ready must stay False."""
-    from oc_slimapi.routes import sessions as sessions_mod
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/project":
-            return httpx.Response(200, content=orjson.dumps([{"id": "p1"}]),
-                                  headers={"Content-Type": "application/json"})
-        if request.url.path == "/project/p1/directories":
-            return httpx.Response(200, content=b'"not a list"',
-                                  headers={"Content-Type": "application/json"})
-        return httpx.Response(404)
-
-    upstream = upstream_factory(handler)
-    app = _build_app(upstream)
-    assert app.state.allowlist_ready is False
-
-    with pytest.raises(ValueError, match=r"directories body is not a list"):
-        await sessions_mod.load_products(app)
-
-    assert app.state.allowlist_ready is False
-    assert app.state.directory_allowlist == set()
-
-
-# ---------------------------------------------------------------------------
-# v6 §3.1 + §3.2: load_products → server.reconfigured
-#   * set changes → notify (when a subscriber is listening)
-#   * ready False→True (even with empty set) → notify
-#   * set same + ready already True → no notify
-#   * no hub / no subscribers → no-op (no lazy hub creation)
-# ---------------------------------------------------------------------------
-
-class _SpyHubs:
-    """Spy HubRegistry: records every ``notify_reconfigured_if_active`` call.
-
-    Mirrors only the methods ``load_products`` actually uses; the real
-    ``HubRegistry`` is exercised by ``test_hub.py``."""
-    def __init__(self) -> None:
-        self.calls: list[str] = []
-
-    def notify_reconfigured_if_active(self, reason: str) -> int:
-        self.calls.append(reason)
-        return 0
-
-
-async def test_load_products_set_change_emits_discovery_changed(upstream_factory):
-    """Successful refresh with a *changed* allowlist calls
-    ``notify_reconfigured_if_active("discovery_changed")`` exactly once."""
-    from oc_slimapi.routes import sessions as sessions_mod
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/project":
-            return httpx.Response(200, content=orjson.dumps([
-                {"id": "p1", "worktree": "/app"},
-            ]), headers={"Content-Type": "application/json"})
-        if request.url.path == "/project/p1/directories":
-            return httpx.Response(200, content=orjson.dumps([
-                {"directory": "/app/sub"},
-            ]), headers={"Content-Type": "application/json"})
-        return httpx.Response(404)
-
-    upstream = upstream_factory(handler)
-    spy = _SpyHubs()
-    app = _build_app(
-        upstream, allowlist=set(), allowlist_ready=True, hubs=spy,
-    )
-    await sessions_mod.load_products(app)
-
-    assert spy.calls == ["discovery_changed"]
-    # State after first refresh.
-    assert app.state.directory_allowlist == {"/app", "/app/sub"}
-
-
-async def test_load_products_ready_false_to_true_with_empty_set_still_emits(upstream_factory):
-    """v6 §3.3 #2: ready False→True (with an empty set) MUST still notify —
-    otherwise a startup that found no projects would leave clients
-    permanently stale."""
-    from oc_slimapi.routes import sessions as sessions_mod
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/project":
-            # Valid list, but empty → set stays empty AND ready flips.
-            return httpx.Response(200, content=b"[]",
-                                  headers={"Content-Type": "application/json"})
-        return httpx.Response(404)
-
-    upstream = upstream_factory(handler)
-    spy = _SpyHubs()
-    app = _build_app(
-        upstream, allowlist=set(), allowlist_ready=False, hubs=spy,
-    )
-    await sessions_mod.load_products(app)
-
-    # Notification fires on the readiness transition, not on set diff.
-    assert spy.calls == ["discovery_changed"]
-    assert app.state.directory_allowlist == set()
-    assert app.state.allowlist_ready is True
-
-
-async def test_load_products_no_change_no_notify(upstream_factory):
-    """Same set + already ready=True → no notify (the main suppression path
-    from v6 §3.2; protects against spurious re-fires on harmless refreshes)."""
-    from oc_slimapi.routes import sessions as sessions_mod
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/project":
-            return httpx.Response(200, content=orjson.dumps([
-                {"id": "p1", "worktree": "/app"},
-            ]), headers={"Content-Type": "application/json"})
-        if request.url.path == "/project/p1/directories":
-            return httpx.Response(200, content=b"[]",
-                                  headers={"Content-Type": "application/json"})
-        return httpx.Response(404)
-
-    upstream = upstream_factory(handler)
-    spy = _SpyHubs()
-    # Pre-seed with the exact set the refresh will produce, plus ready=True.
-    app = _build_app(
-        upstream, allowlist={"/app"}, allowlist_ready=True, hubs=spy,
-    )
-    await sessions_mod.load_products(app)
-
-    # Set is unchanged AND ready was already True → no notification.
-    assert spy.calls == []
-    # And the set/ready survived untouched.
-    assert app.state.directory_allowlist == {"/app"}
-    assert app.state.allowlist_ready is True
-
-
-async def test_load_products_first_success_with_set_change_emits_once(upstream_factory):
-    """First call from cold (ready=False) when the new set is non-empty
-    matches BOTH conditions (set changed AND ready False→True) — but the
-    notification must still fire exactly once (not twice)."""
-    from oc_slimapi.routes import sessions as sessions_mod
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/project":
-            return httpx.Response(200, content=orjson.dumps([
-                {"id": "p1", "worktree": "/app"},
-            ]), headers={"Content-Type": "application/json"})
-        if request.url.path == "/project/p1/directories":
-            return httpx.Response(200, content=b"[]",
-                                  headers={"Content-Type": "application/json"})
-        return httpx.Response(404)
-
-    upstream = upstream_factory(handler)
-    spy = _SpyHubs()
-    app = _build_app(
-        upstream, allowlist=set(), allowlist_ready=False, hubs=spy,
-    )
-    await sessions_mod.load_products(app)
-
-    # Exactly one notification — both predicate arms may be true but the
-    # implementation must coalesce to a single emit.
-    assert spy.calls == ["discovery_changed"]
-    assert app.state.directory_allowlist == {"/app"}
-    assert app.state.allowlist_ready is True
-
-
-async def test_load_products_no_hubs_attr_is_silent_noop(upstream_factory):
-    """If ``app.state.hubs`` is missing (legacy / future code path) the
-    notification must NOT crash — discovery state is still written,
-    ``getattr(..., None)`` short-circuits the call."""
-    from oc_slimapi.routes import sessions as sessions_mod
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/project":
-            return httpx.Response(200, content=orjson.dumps([
-                {"id": "p1", "worktree": "/app"},
-            ]), headers={"Content-Type": "application/json"})
-        if request.url.path == "/project/p1/directories":
-            return httpx.Response(200, content=b"[]",
-                                  headers={"Content-Type": "application/json"})
-        return httpx.Response(404)
-
-    upstream = upstream_factory(handler)
-    app = _build_app(upstream, allowlist=set(), allowlist_ready=False)
-    # Explicitly REMOVE hubs so we hit the ``getattr(...,None)`` branch.
-    if hasattr(app.state, "hubs"):
-        delattr(app.state, "hubs")
-    # Must not raise.
-    await sessions_mod.load_products(app)
-    assert app.state.directory_allowlist == {"/app"}
-    assert app.state.allowlist_ready is True
-
-
-async def test_load_products_lock_serializes_concurrent_calls(upstream_factory):
-    """v6 §3.3 #1: ``allowlist_lock`` is held for the full fetch + commit
-    window, so two coroutines that both want to refresh cannot tear the
-    allowlist into a half-written intermediate state. Concrete: hold the
-    lock in coroutine A, then start B. B cannot enter the critical section
-    until A releases. After both complete, the final set is one of the
-    two committed values, not a torn mix of the two paths."""
-    app = _build_app(upstream_factory(lambda req: httpx.Response(200, b"[]")),
-                     allowlist=set(), allowlist_ready=False)
-
-    async def fake_load(allowlist_value: str) -> None:
-        async with app.state.allowlist_lock:
-            await asyncio.sleep(0)  # yield so the other coroutine interleaves
-            app.state.directory_allowlist = {allowlist_value}
-            app.state.allowlist_ready = True
-
-    await asyncio.gather(fake_load("/a"), fake_load("/b"))
-    # Final state is one of the two commits, not a torn mix.
-    assert app.state.directory_allowlist in ({"/a"}, {"/b"})
-    assert app.state.allowlist_ready is True
-
-
-# ---------------------------------------------------------------------------
-# v6 §3.1: end-to-end reconfigured frame via load_products
-# ---------------------------------------------------------------------------
-
-async def test_load_products_reconfigured_frame_lands_on_subscriber(upstream_factory):
-    """With a real HubRegistry and one active subscriber, a successful
-    ``load_products`` that changes the set pushes a ``server.reconfigured``
-    frame onto that subscriber's queue. End-to-end wire test (not just the
-    notify_reconfigured call count)."""
-    from oc_slimapi.routes import sessions as sessions_mod
-    from oc_slimapi.sse.hub import GlobalHub, HubRegistry, Subscriber
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/project":
-            return httpx.Response(200, content=orjson.dumps([
-                {"id": "p1", "worktree": "/app"},
-            ]), headers={"Content-Type": "application/json"})
-        if request.url.path == "/project/p1/directories":
-            return httpx.Response(200, content=orjson.dumps([
-                {"directory": "/app/sub"},
-            ]), headers={"Content-Type": "application/json"})
-        return httpx.Response(404)
-
-    upstream = upstream_factory(handler)
-    registry = HubRegistry(client=None)
-    # Pre-create the hub + one subscriber so the notify has someone to push to.
-    sub = registry.subscribe()
-    hub = registry.get_global()
-
-    app = _build_app(
-        upstream, allowlist=set(), allowlist_ready=False, hubs=registry,
-    )
-
-    await sessions_mod.load_products(app)
-
-    # Drain the welcome frame.
-    welcome = await asyncio.wait_for(sub.queue.get(), timeout=0.5)
-    assert b"event: server.connected" in welcome
-
-    # Next frame is the reconfigured notification.
-    frame = await asyncio.wait_for(sub.queue.get(), timeout=0.5)
-    assert b"event: server.reconfigured" in frame
-    # orjson dumps without whitespace between key and value.
-    assert b'"reason":"discovery_changed"' in frame
-    # ``at`` is an int — just check the key is present.
-    assert b'"at":' in frame
-    # State after.
-    assert app.state.directory_allowlist == {"/app", "/app/sub"}
-    assert app.state.allowlist_ready is True
-
-    # Cleanup the hub so the test event loop doesn't yell about pending tasks.
-    await registry.close()
 

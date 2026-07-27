@@ -13,6 +13,14 @@ router = APIRouter(prefix="/slimapi", tags=["health"])
 @router.get("/health")
 async def health(request: Request):
     resp = {
+        # lite-v2: expose the slim API contract revision as a top-level
+        # static field. Ocdroid dual-reads ``slimapi_contract`` during the
+        # cutover and pins its protocol behaviour (digest 6 字段 /
+        # digest.updatedAt 严格单调 / skeleton 升序 / token stream 透传 /
+        # /full/{mid} 无 304) to value 2 (ocdroid-lite-aggressive-plan §2.5).
+        # Bumped ONLY on contract-breaking changes; additive wire changes
+        # (e.g. optional fields) do NOT bump this.
+        "slimapi_contract": 2,
         "sidecar": {"ok": True, "version": __version__},
         "server": {
             "api_version": request.app.state.config.server_api_version,

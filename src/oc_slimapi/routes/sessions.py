@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import asyncio
 from typing import Any, NoReturn
-from urllib.parse import quote
 
 import httpx
 from fastapi import APIRouter, FastAPI, Query, Request
@@ -12,19 +10,15 @@ from oc_slimapi.logging_config import get_logger
 logger = get_logger(__name__)
 
 from ..directory import validate_directory
-from ..discovery import load_products
 from ..errors import CodedHTTPException
 from ..gzip_util import json_response
 from ..skeleton import skeleton_session
 from ..traffic import stash_up_in
 from ..transform import TransformBusy
 from ..upstream import forward_directory_headers
-from ..upstream_errors import fetch_json_mapped, raise_upstream_status
+from ..upstream_errors import raise_upstream_status
 
 router = APIRouter(prefix="/slimapi", tags=["sessions"])
-
-
-
 
 
 @router.get("/sessions")
@@ -88,62 +82,14 @@ async def sessions(
             )
     except TransformBusy as exc:
         raise CodedHTTPException(503, code="transform_busy") from exc
-    # v6 §1.1: completeness + discovery readiness signal headers. These are
-    # 200-only — the 503 / 502 paths above do not emit them, by design.
+    # v6 §1.1: completeness signal header (200-only — 503 / 502 paths above
+    # do not emit it, by design).
     complete = len(sessions) < limit
-    discovery_directories = len(request.app.state.directory_allowlist)
-    discovery_ready = bool(getattr(request.app.state, "allowlist_ready", False))
-    # children hint (rev H): per-session additive fields, pure cache peek
-    children = getattr(request.app.state, "children", None)
-    if children is not None:
-        for session in sessions:
-            sid = session.get("id")
-            if sid is not None:
-                hint = children.peek(sid, directory)
-                if hint is not None:
-                    ids, compl = hint
-                    session["childrenComplete"] = compl
-                    if compl:
-                        session["childrenIDs"] = ids
-                else:
-                    session["childrenComplete"] = False
-                # else: cache miss → omit both keys (childrenComplete defaults false)
     return json_response(
         sessions,
         headers={
             "X-Complete": "true" if complete else "false",
-            "X-Discovery-Directories": str(discovery_directories),
-            "X-Discovery-Ready": "true" if discovery_ready else "false",
         },
-        accept_encoding=request.headers.get("accept-encoding"),
-    )
-
-
-@router.get("/projects")
-async def projects(request: Request):
-    try:
-        payload = await load_products(request.app, traffic_request=request)
-    except httpx.HTTPStatusError as exc:
-        raise_upstream_status(exc)
-    except Exception as exc:
-        raise CodedHTTPException(503, code="upstream_unavailable") from exc
-    return json_response(payload, accept_encoding=request.headers.get("accept-encoding"))
-
-
-@router.get("/sessions/status")
-async def statuses(request: Request, directory: str):
-    # slimapi no longer gates directories — normalize and forward. opencode
-    # decides whether it can serve the directory (returns its own 4xx if not).
-    directory = validate_directory(directory)
-    payload = await fetch_json_mapped(
-        request.app.state.upstream,
-        "/session/status",
-        params={"directory": directory},
-        headers=forward_directory_headers(directory),
-        traffic_request=request,
-    )
-    return json_response(
-        payload,
         accept_encoding=request.headers.get("accept-encoding"),
     )
 
@@ -153,52 +99,4 @@ def _project_sessions(payload: list[dict]) -> list[dict]:
     return [skeleton_session(item) for item in payload]
 
 
-@router.get("/sessions/{sid}/status")
-async def session_status(request: Request, sid: str):
-    # Discover: GET /session/{sid}
-    try:
-        session_response = await request.app.state.upstream.get(f"/session/{sid}")
-    except httpx.RequestError as exc:
-        raise CodedHTTPException(503, code="upstream_unavailable") from exc
-    # Traffic accounting: discover body.
-    stash_up_in(request, len(session_response.content))
-    try:
-        session_response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        raise_upstream_status(exc, sid=sid)
-    try:
-        directory = session_response.json().get("directory")
-    except Exception as exc:
-        raise CodedHTTPException(503, code="upstream_unavailable") from exc
-    if not isinstance(directory, str):
-        raise CodedHTTPException(503, code="upstream_unavailable")
-    # F2 (historic): per-session status is a read keyed by sid (capability).
-    # slimapi no longer gates directories at all — normalize purely for
-    # forwarding consistency with the rest of the surface. Batch
-    # /sessions/status likewise only normalizes now.
-    directory = validate_directory(directory)
 
-    # Status map: GET /session/status?directory=...
-    try:
-        result = await request.app.state.upstream.get(
-            "/session/status", params={"directory": directory},
-            headers=forward_directory_headers(directory),
-        )
-    except httpx.RequestError as exc:
-        raise CodedHTTPException(503, code="upstream_unavailable") from exc
-    # Traffic accounting: status-map body.
-    stash_up_in(request, len(result.content))
-    try:
-        result.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        raise_upstream_status(exc)
-    try:
-        mapping = result.json()
-    except Exception as exc:
-        raise CodedHTTPException(503, code="upstream_unavailable") from exc
-    if not isinstance(mapping, dict):
-        raise CodedHTTPException(503, code="upstream_unavailable")
-
-    if sid in mapping:
-        return json_response(mapping[sid], accept_encoding=request.headers.get("accept-encoding"))
-    return json_response({"type": "idle"}, accept_encoding=request.headers.get("accept-encoding"))

@@ -1,28 +1,20 @@
 from __future__ import annotations
 
-import asyncio
-import math
+import gzip
 import re
-import time
-from typing import Literal
 from urllib.parse import urlparse
-from email.utils import parsedate_to_datetime
-from datetime import timezone
 
 import orjson
 import httpx
 from fastapi import APIRouter, Query, Request
 from starlette.responses import Response
 
-from ..capabilities import parse_capabilities
 from ..errors import CodedHTTPException
-from ..gzip_util import error_response, json_response
-from ..skeleton import skeleton_message, strip_diagnostics_message
+from ..gzip_util import error_response
+from ..skeleton import skeleton_messages
 from ..traffic import stash_up_in
 from ..transform import (
     TransformBusy,
-    project_and_pack,
-    project_messages_and_pack,
     read_with_cap,
     strip_diagnostics_and_pack,
 )
@@ -30,9 +22,7 @@ from ..upstream import (
     decoded_body_headers,
     forward_directory_headers,
 )
-from ..upstream_errors import fetch_json_mapped
 from ..directory import validate_directory
-from ..upstream_errors import raise_upstream_status as _raise_upstream_status
 
 router = APIRouter(prefix="/slimapi/messages/{sid}", tags=["messages"])
 
@@ -40,46 +30,81 @@ router = APIRouter(prefix="/slimapi/messages/{sid}", tags=["messages"])
 # so tests and the route agree on the wire contract.
 TRANSFORM_RETRY_AFTER_SECONDS = 2
 
-# G6 batch stream chunk size for the shared cumulative-byte ledger. Smaller than
-# transform.read_with_cap's default (64KiB) so concurrent mids debit the budget
-# at finer granularity (pay-as-you-read).
-BATCH_CHUNK_SIZE = 16 * 1024
+
+# ---------------------------------------------------------------------------
+# lite-v2 §8 — skeleton list ordering contract.
+# ---------------------------------------------------------------------------
+#
+# The list endpoint MUST return messages sorted by ``info.time.created`` ASC.
+# Sidecar sorts defensively after parse and before skeleton projection — it
+# does NOT rely on upstream opencode's default ordering. The contract holds
+# even if opencode's ``orderBy`` ever changes; clients merging paginated
+# skeleton pages depend on the strict-ASC guarantee.
+
+def _created_sort_key(msg: dict) -> int:
+    """Sort key: ``info.time.created`` ASC.
+
+    Defaults to ``0`` for missing / malformed fields so degenerate upstream
+    rows sort first under Python's stable sort instead of crashing the worker.
+    """
+    info = msg.get("info") if isinstance(msg, dict) else None
+    if not isinstance(info, dict):
+        return 0
+    time_obj = info.get("time")
+    if not isinstance(time_obj, dict):
+        return 0
+    raw = time_obj.get("created")
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        return raw
+    return 0
 
 
-def _parse_upstream_retry_after_seconds(value: str | None) -> int | None:
-    """Parse upstream Retry-After header to whole seconds (int). Returns None on
-    absent/unparseable. Supports delta-seconds (int) and HTTP-date (RFC 7231).
-    Never raises."""
-    if not value:
-        return None
-    value = value.strip()
-    try:
-        # Try delta-seconds (integer)
-        return int(value)
-    except ValueError:
-        pass
-    # Try HTTP-date (RFC 7231)
-    try:
-        dt = parsedate_to_datetime(value)
-        if dt is not None:
-            # Normalize naive datetime to UTC before timestamp computation.
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            now = time.time()
-            return max(0, int((dt.timestamp() - now) + 0.5))  # ceil rounding
-    except (TypeError, ValueError, OverflowError):
-        pass
-    return None
+def _project_list_sorted_and_pack(
+    body: bytes, *, accept_encoding: str | None,
+) -> tuple[bytes, dict[str, str]]:
+    """Worker entry: parse + sort by ``info.time.created`` ASC + skeleton
+    project + serialize (+ optional gzip).
+
+    lite-v2 §8: skeleton list endpoint must return messages sorted by
+    ``info.time.created`` ASC. Sort defensively rather than relying on
+    upstream opencode's default ordering. Mirrors ``transform._pack_json``
+    inline (kept private to that module) so this stays self-contained.
+    """
+    parsed = orjson.loads(body)
+    if isinstance(parsed, list):
+        parsed.sort(key=_created_sort_key)
+    projected = skeleton_messages(parsed)
+    encoded = orjson.dumps(projected)
+    headers: dict[str, str] = {"Vary": "Accept-Encoding"}
+    if "gzip" in (accept_encoding or "").lower():
+        encoded = gzip.compress(encoded, compresslevel=6)
+        headers["Content-Encoding"] = "gzip"
+    return encoded, headers
 
 
-def _opt_a_top_level_503(
-    request: Request, *, accept_encoding: str | None, retry_after_seconds: int | None,
-) -> Response:
-    """Return a 503 upstream_unavailable response with optional Retry-After for opt-in."""
-    response = error_response("upstream_unavailable", 503, accept_encoding=accept_encoding)
-    if retry_after_seconds is not None:
-        response.headers["Retry-After"] = str(retry_after_seconds)
-    return response
+_REL_PARAM_RE = re.compile(
+    # Match the ``rel`` link-param anywhere in a Link entry's attribute
+    # string. Pre-anchor on start/whitespace/``;`` so we don't false-match
+    # a ``rel=`` substring tucked inside another param's quoted value
+    # (e.g. ``title="rel=next"``). IGNORECASE covers the param NAME;
+    # value tokens are lowercased by the caller per RFC 5988 §3.
+    r'(?:^|[\s;])rel\s*=\s*(?:"([^"]*)"|([^;\s]+))',
+    re.IGNORECASE,
+)
+
+
+def _link_rel_tokens(attrs: str) -> list[str]:
+    """Extract the ``rel`` link-param value as a list of lowercased tokens.
+
+    RFC 5988 §3 allows multiple whitespace-separated relation types
+    (``rel="prev next"``) and treats relation types as case-insensitive.
+    Returns ``[]`` when ``rel`` is absent or has no value.
+    """
+    match = _REL_PARAM_RE.search(attrs)
+    if not match:
+        return []
+    raw = match.group(1) if match.group(1) is not None else match.group(2)
+    return [tok.lower() for tok in raw.split() if tok]
 
 
 def _extract_before_verbatim(query: str) -> str | None:
@@ -108,31 +133,6 @@ def _extract_before_verbatim(query: str) -> str | None:
             # percent-escapes / ``+`` are preserved verbatim.
             return part[len("before="):]
     return None
-
-
-_REL_PARAM_RE = re.compile(
-    # Match the ``rel`` link-param anywhere in a Link entry's attribute
-    # string. Pre-anchor on start/whitespace/``;`` so we don't false-match
-    # a ``rel=`` substring tucked inside another param's quoted value
-    # (e.g. ``title="rel=next"``). IGNORECASE covers the param NAME;
-    # value tokens are lowercased by the caller per RFC 5988 §3.
-    r'(?:^|[\s;])rel\s*=\s*(?:"([^"]*)"|([^;\s]+))',
-    re.IGNORECASE,
-)
-
-
-def _link_rel_tokens(attrs: str) -> list[str]:
-    """Extract the ``rel`` link-param value as a list of lowercased tokens.
-
-    RFC 5988 §3 allows multiple whitespace-separated relation types
-    (``rel="prev next"``) and treats relation types as case-insensitive.
-    Returns ``[]`` when ``rel`` is absent or has no value.
-    """
-    match = _REL_PARAM_RE.search(attrs)
-    if not match:
-        return []
-    raw = match.group(1) if match.group(1) is not None else match.group(2)
-    return [tok.lower() for tok in raw.split() if tok]
 
 
 def _parse_link_next_cursor(link_header: str | None) -> str | None:
@@ -261,308 +261,28 @@ async def _drain_error(response, request: Request | None = None) -> Response:
     )
 
 
-def _item_updated(item: dict) -> int | None:
-    """Extract message watermark as ``info.time.updated or info.time.created``.
-
-    Mirrors digest ``updatedAt`` derivation (hub.py) without the ``_now_ms()``
-    fallback — filtering must compare against the message's real timestamps.
-    opencode v1.18.3 message schema has no ``time.updated`` (only ``created``,
-    plus ``completed`` on assistant); without the ``created`` fallback the
-    A2=A ``/since/{ts}`` filter is a no-op.
-    """
-    info = item.get("info") or {}
-    time_obj = info.get("time") or {}
-    raw = time_obj.get("updated") or time_obj.get("created")
-    return raw if isinstance(raw, int) and not isinstance(raw, bool) else None
-
-
-def _passes_ts_filter(item: dict, ts: int) -> bool:
-    """A2=A filter (contract §5): include items with watermark ``>= ts``.
-
-    Watermark is ``info.time.updated or info.time.created`` (see
-    ``_item_updated``). Items with neither (or a non-int) are included
-    defensively — the client dedups by messageID anyway, and we'd rather
-    over-deliver a malformed edge item than silently hide it. Only a
-    definitively comparable ``watermark < ts`` excludes an item.
-    """
-    updated = _item_updated(item)
-    if updated is None:
-        return True
-    return updated >= ts
-
-
-@router.get("/since/{ts}")
-async def messages_since(
-    request: Request,
-    sid: str,
-    ts: int,
-    limit: int = Query(50, ge=1, le=200),
-    before: str | None = None,
-    mode: Literal["skeleton", "full"] = "skeleton",
-    directory: str | None = None,
-):
-    """A2=A (contract §5): return skeleton messages with ``(info.time.updated or info.time.created) >= ts``.
-
-    Walks opencode's ``/session/{sid}/message`` listing via the ``before``
-    cursor (opencode's own opaque base64url cursor, forwarded verbatim —
-    never decoded/re-encoded by sidecar). A single transform-pool admission
-    covers the whole multi-page scan, and a single cumulative
-    ``max_response_bytes`` budget is enforced across pages so a runaway
-    timestamp scan cannot accumulate more than the cap of upstream bodies
-    (413 ``response_too_large`` on overflow — contract §7).
-
-    **Page order (opencode MessageV2.page, v1.18.4+):** DB window is taken
-    newest-first, then ``items.reverse()`` so each **page is oldest-first**
-    (``items[0]`` = oldest in the window, ``items[-1]`` = newest). The next
-    ``before`` cursor points at the unreversed slice tail (oldest-in-window)
-    so following Link yields **strictly older** pages.
-
-    Scan rules:
-    - Every page is **fully** filtered with ``_passes_ts_filter`` (no
-      "first non-match stops the page" heuristic — that emptied oldest-first
-      windows when the head was below ``ts``).
-    - After filtering a non-empty page, if the **page head** (oldest item)
-      has a comparable watermark ``< ts``, every older page is also ``< ts``
-      → set the ts floor and stop following Link.
-    - Also stop on empty page, no Link, ``collected >= limit``, or
-      ``max_since_pages`` exhaustion.
-    - Boundary ``== ts`` is included; clients dedup by messageID.
-    - Newest-first fixtures still work: full-page filter never drops a later
-      ``>= ts`` row just because an earlier row failed.
-
-    Response headers:
-    - ``X-Next-Cursor``: opencode's opaque Link cursor, only when we filled
-      ``limit`` AND did not hit the ts floor AND upstream advertised next.
-    - ``X-Since-Complete`` (additive): ``true`` when the scan ended for a
-      semantic reason (ts floor, no more upstream pages, empty page, or
-      client limit filled with correct pagination). ``false`` only when
-      ``max_since_pages`` exhausted without proving a ts floor while
-      upstream may still have pages.
-    """
-    directory = await _resolve_messages_directory(request, directory)
-    if request.app.state.schema_degraded:
-        mode = "full"
-    config = request.app.state.config
-    pool = request.app.state.transforms
-    # Single admission covers the whole multi-page scan; cumulative byte
-    # budget is enforced across pages so a runaway timestamp scan cannot
-    # accumulate more than ``max_response_bytes`` of upstream bodies.
-    try:
-        async with pool:
-            collected: list[dict] = []
-            cursor = before
-            total_bytes = 0
-            hit_ts_floor = False
-            # opencode's opaque cursor from the last fetched page. Becomes
-            # our X-Next-Cursor iff we end the scan without tripping the ts
-            # floor and the limit is filled.
-            last_page_cursor: str | None = None
-            # True only if the for-loop runs to max_since_pages without an
-            # early semantic stop (floor / empty / no Link / limit full).
-            stopped_for_max_pages = True
-            for _ in range(config.max_since_pages):
-                params = {"limit": limit}
-                if cursor:
-                    params["before"] = cursor
-                response = await _stream_upstream(
-                    request, f"/session/{sid}/message", params, directory,
-                )
-                try:
-                    if response.status_code >= 400:
-                        return await _drain_error(response, request)
-                    body, n = await read_with_cap(
-                        response, config.max_response_bytes - total_bytes,
-                    )
-                    if body is None:
-                        return error_response(
-                            "response_too_large", 413,
-                            limit=config.max_response_bytes,
-                            accept_encoding=request.headers.get("accept-encoding"),
-                        )
-                    total_bytes += n
-                    # Traffic accounting: per-page upstream bytes.
-                    stash_up_in(request, n)
-                    # Per-page parse stays inline because we must inspect
-                    # watermarks to apply the A2=A filter and decide whether
-                    # older pages still need scanning. The expensive skeleton
-                    # projection of the merged list runs off-thread below.
-                    page = orjson.loads(body)
-                    # opencode advertises more pages via the Link header
-                    # (RFC 5988 rel="next"). Extract the opaque before cursor
-                    # verbatim — never synthesise one from a messageID
-                    # (opencode's cursor is a base64url JSON envelope, and
-                    # passing a bare id would 400 at upstream).
-                    last_page_cursor = _parse_link_next_cursor(
-                        response.headers.get("Link")
-                    )
-                finally:
-                    await response.aclose()
-                if not page:
-                    # Empty page → no more data; scan is complete.
-                    stopped_for_max_pages = False
-                    break
-                # Full-page filter: never early-break on first non-match
-                # (oldest-first pages often start below ts).
-                for item in page:
-                    if _passes_ts_filter(item, ts):
-                        collected.append(item)
-                        if len(collected) >= limit:
-                            break
-                # Ts floor (oldest-first): page head is the oldest-in-window.
-                # If its comparable watermark is < ts, every older page is
-                # also below the floor — stop following Link.
-                head_wm = _item_updated(page[0])
-                if head_wm is not None and head_wm < ts:
-                    hit_ts_floor = True
-                    stopped_for_max_pages = False
-                    break
-                if len(collected) >= limit:
-                    stopped_for_max_pages = False
-                    break
-                if not last_page_cursor:
-                    stopped_for_max_pages = False
-                    break
-                cursor = last_page_cursor
-            # Emit X-Next-Cursor only when ALL of:
-            #   • we filled the limit (more matching items may exist),
-            #   • we never tripped the ts floor (older items would be < ts),
-            #   • opencode actually advertised another page (opaque cursor),
-            #   • we did not only stop because max_since_pages exhausted
-            #     without a natural page boundary (same as historical
-            #     ``not _exhausted`` guard).
-            # The cursor is opencode's opaque string — passed through verbatim,
-            # never decoded or re-encoded.
-            base_headers: dict[str, str] = {"Cache-Control": "no-store"}
-            if (
-                collected
-                and len(collected) >= limit
-                and not hit_ts_floor
-                and last_page_cursor
-                and not stopped_for_max_pages
-            ):
-                base_headers["X-Next-Cursor"] = last_page_cursor
-            # X-Since-Complete: false only when we hit max_since_pages without
-            # proving a ts floor and upstream may still have pages.
-            since_incomplete = (
-                stopped_for_max_pages
-                and not hit_ts_floor
-                and last_page_cursor is not None
-            )
-            base_headers["X-Since-Complete"] = (
-                "false" if since_incomplete else "true"
-            )
-            if mode == "skeleton":
-                encoded, extra = await pool.offload(
-                    project_messages_and_pack, collected,
-                    accept_encoding=request.headers.get("accept-encoding"),
-                )
-                return Response(
-                    encoded, status_code=200,
-                    media_type="application/json",
-                    headers={**base_headers, **extra},
-                )
-            return json_response(
-                collected,
-                accept_encoding=request.headers.get("accept-encoding"),
-                headers=base_headers,
-            )
-    except TransformBusy:
-        return _busy_response(request.headers.get("accept-encoding"))
-
-
 @router.get("")
 async def messages(
     request: Request,
     sid: str,
     limit: int = Query(40, ge=1, le=200),
     before: str | None = None,
-    mode: Literal["skeleton", "full"] = "skeleton",
     directory: str | None = None,
 ):
+    """Skeleton projection of upstream opencode's message listing.
+
+    lite-v2 §2: ``?mode=full`` list branch removed; only skeleton projection
+    remains. ``?mode`` query parameter is silently ignored (clients in
+    transition may still send it). ``?limit=`` and ``?before=`` pagination
+    are preserved (cursor forwarded verbatim).
+
+    lite-v2 §8: response is sorted by ``info.time.created`` ASC — see
+    ``_project_list_sorted_and_pack``.
+    """
     directory = await _resolve_messages_directory(request, directory)
-    if request.app.state.schema_degraded:
-        mode = "full"
     params = {"limit": limit}
     if before:
         params["before"] = before
-    if mode == "full":
-        # Full mode strips the never-consumed LSP ``state.metadata.diagnostics``
-        # map from every part (ocdroid deletes it on deserialise anyway) but
-        # otherwise preserves the complete part — clients expanding a thin
-        # skeleton still get every output/text/files field. The strip is a real
-        # transform (buffer + parse + re-serialize), so it runs through the
-        # TransformPool under admission acquired BEFORE the upstream GET,
-        # exactly like skeleton mode: the event loop stays free for SSE
-        # heartbeats and pool saturation surfaces as 503 transform_busy.
-        # Pagination is preserved by passing opencode's ``Link`` header through
-        # verbatim (full-mode pagination contract — unchanged). Because the body
-        # is re-serialised by the sidecar, the response uses a sidecar-owned
-        # header set (matching skeleton mode): upstream body-content headers
-        # (ETag / Content-MD5 / Content-Length / encoding) would be stale against
-        # the mutated body and are dropped.
-        pool = request.app.state.transforms
-        config = request.app.state.config
-        accept_encoding = request.headers.get("accept-encoding")
-        try:
-            async with pool:
-                response = await _stream_upstream(
-                    request, f"/session/{sid}/message", params, directory,
-                )
-                link_header: str | None = None
-                status_code = 200
-                try:
-                    # Align with /full/{mid}: mid-stream upstream I/O failures
-                    # (httpx.RequestError from _drain_error.aread() or
-                    # read_with_cap.aiter_bytes()) → structured 503, not a bare
-                    # FastAPI 500. send() itself is already mapped by
-                    # _stream_upstream.
-                    try:
-                        if response.status_code >= 400:
-                            return await _drain_error(response, request)
-                        status_code = response.status_code
-                        body, n_read = await read_with_cap(
-                            response, config.max_response_bytes,
-                        )
-                    except httpx.RequestError as exc:
-                        raise CodedHTTPException(
-                            503, code="upstream_unavailable",
-                        ) from exc
-                    # Traffic accounting first: the bytes read up to the cap
-                    # were still pulled from upstream, so they count toward upIn
-                    # even when we then refuse the oversize body (matches the
-                    # single-message convention; the old streaming counter only
-                    # saw what it yielded).
-                    stash_up_in(request, n_read)
-                    if body is None:
-                        return error_response(
-                            "response_too_large", 413,
-                            limit=config.max_response_bytes,
-                            accept_encoding=accept_encoding,
-                        )
-                    link_header = response.headers.get("Link")
-                    # Empty / non-JSON upstream 200 → 503 upstream_unavailable
-                    # (same code as sessions bad-JSON), never a bare 500.
-                    try:
-                        encoded, extra = await pool.offload(
-                            strip_diagnostics_and_pack, body,
-                            single=False,
-                            accept_encoding=accept_encoding,
-                        )
-                    except orjson.JSONDecodeError as exc:
-                        raise CodedHTTPException(
-                            503, code="upstream_unavailable",
-                        ) from exc
-                finally:
-                    await response.aclose()
-            base_headers: dict[str, str] = {"Cache-Control": "no-store"}
-            if link_header:
-                base_headers["Link"] = link_header
-            return Response(
-                encoded, status_code=status_code, media_type="application/json",
-                headers={**base_headers, **extra},
-            )
-        except TransformBusy:
-            return _busy_response(accept_encoding)
     config = request.app.state.config
     pool = request.app.state.transforms
     try:
@@ -594,10 +314,10 @@ async def messages(
                 # pagination contract is X-Next-Cursor, so clients see one
                 # consistent shape whether they consume list or since.
                 next_cursor = _parse_link_next_cursor(response.headers.get("Link"))
-                # Full parse/project/serialize/gzip chain in the worker pool.
+                # Full parse + sort (§8) + project + serialize/gzip chain in
+                # the worker pool.
                 encoded, extra = await pool.offload(
-                    project_and_pack, body,
-                    single=False,
+                    _project_list_sorted_and_pack, body,
                     accept_encoding=request.headers.get("accept-encoding"),
                 )
             finally:
@@ -613,571 +333,91 @@ async def messages(
         return _busy_response(request.headers.get("accept-encoding"))
 
 
-@router.get("/full")
-async def message_batch(
-    request: Request,
-    sid: str,
-    ids: str,
-    mode: Literal["skeleton", "full"] = "full",
+@router.get("/full/{mid}")
+async def message(
+    request: Request, sid: str, mid: str,
     directory: str | None = None,
 ):
-    """G6 batch multi-mid expand (impl-spec §8). discover-first; mid-level
-    partial failures into errors[]; cumulative byte budget 413 via a shared
-    chunk ledger (pay-as-you-read). Registered BEFORE /full/{mid} per spec
-    MUST (segment count differs so no actual collision, but order is
-    spec-mandated)."""
-    directory = await _resolve_messages_directory(request, directory)
-    if request.app.state.schema_degraded:
-        mode = "full"
-    # ids parse: split + strip + dedupe保序 + 1–20 guard (no charset check)
-    order = list(dict.fromkeys(s.strip() for s in ids.split(",") if s.strip()))
-    if not order or len(order) > 20:
-        raise CodedHTTPException(400, code="invalid_ids")
+    """Single-message on-demand expand — full projection (strip LSP
+    diagnostics only) of one upstream opencode message.
 
+    lite-v2 §2: downgraded to a pure on-demand expand endpoint.
+    - No 304 short-circuit (removed: ``?known.*`` Query params, fingerprint
+      cache lookup, ``None, status_code=304`` path).
+    - No ``X-Message-Event-Seq`` response header (removed: ``seq_pre`` /
+      ``seq_post`` double-sampling logic).
+    - Always returns 200 on success (no cache-validation path).
+    - ``mode`` parameter removed; behaviour is hard-coded to full projection
+      (clients sending ``?mode=...`` are silently tolerated — the param is
+      ignored). ``?known.*`` query params from prior callers are likewise
+      ignored rather than rejected, so a client in transition does not see
+      a 422.
+    """
+    directory = await _resolve_messages_directory(request, directory)
     config = request.app.state.config
     pool = request.app.state.transforms
-    ledger = getattr(request.app.state, "batch_ledger", None)
-    cap = parse_capabilities(request.headers.get("x-slimapi-capabilities"))
-    if ledger is not None:
-        ledger.record_capability_parse(conflict=cap.duplicate_conflict, malformed_tokens=cap.malformed_tokens)
-    opt_in = bool(
-        config.opt_a_partial_envelope_enabled
-        and cap.opt_in
-        and not cap.duplicate_conflict
-    )
-    if opt_in and ledger is not None:
-        if config.opt_a_auto_rollback_enabled:
-            ledger.evaluate_rollback(
-                auto_enabled=True,
-                min_sample=config.opt_a_rollback_min_sample,
-                envelope_5xx_zero_baseline_rate=config.opt_a_rollback_envelope_5xx_zero_baseline_rate,
-                unknown_code_rate_threshold=config.opt_a_rollback_unknown_code_rate,
-            )
-        if ledger.disabled:
-            opt_in = False
-
-    # discover 先行（带 directory 头，spec §8 L266）
+    accept_encoding = request.headers.get("accept-encoding")
     try:
-        resp = await request.app.state.upstream.get(
-            f"/session/{sid}", headers=forward_directory_headers(directory),
-        )
-    except httpx.RequestError as exc:
-        if opt_in:
-            accept_enc = request.headers.get("accept-encoding")
-            # Intentionally not recorded to Opt-A ledger: discover is pre-envelope /
-            # orthogonal to Opt-A (shared infra); rollback envelope_5xx measures
-            # Opt-A-specific regressions only.
-            return _opt_a_top_level_503(
-                request,
-                accept_encoding=accept_enc,
-                retry_after_seconds=max(1, math.ceil(config.opt_a_retry_after_ms_conservative / 1000)),
-            )
-        raise CodedHTTPException(503, code="upstream_unavailable") from exc
-    # Traffic accounting: discover response body (small, but counts toward
-    # the messages bucket upIn — the discover GET is part of the batch
-    # request's upstream work).
-    stash_up_in(request, len(resp.content))
-    try:
-        resp.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        if exc.response.status_code == 404:
-            _raise_upstream_status(exc, sid=sid)
-        elif exc.response.status_code >= 500:
-            if opt_in:
-                accept_enc = request.headers.get("accept-encoding")
-                parsed_s = _parse_upstream_retry_after_seconds(
-                    exc.response.headers.get("retry-after")
-                )
-                retry_s = (
-                    max(1, parsed_s)
-                    if parsed_s is not None
-                    else max(1, math.ceil(config.opt_a_retry_after_ms_conservative / 1000))
-                )
-                # Intentionally not recorded to Opt-A ledger: discover is pre-envelope /
-                # orthogonal to Opt-A (shared infra); rollback envelope_5xx measures
-                # Opt-A-specific regressions only.
-                return _opt_a_top_level_503(
-                    request,
-                    accept_encoding=accept_enc,
-                    retry_after_seconds=retry_s,
-                )
-            _raise_upstream_status(exc, sid=sid)
-        else:
-            _raise_upstream_status(exc, sid=sid)
-    # 200 + malformed body must not proceed to mid expand (→ 503).
-    try:
-        resp.json()
-    except (ValueError, UnicodeDecodeError) as exc:
-        if opt_in:
-            accept_enc = request.headers.get("accept-encoding")
-            # Intentionally not recorded to Opt-A ledger: discover is pre-envelope /
-            # orthogonal to Opt-A (shared infra); rollback envelope_5xx measures
-            # Opt-A-specific regressions only.
-            return _opt_a_top_level_503(
-                request,
-                accept_encoding=accept_enc,
-                retry_after_seconds=None,
-            )
-        raise CodedHTTPException(503, code="upstream_unavailable") from exc
-
-    sem = asyncio.Semaphore(4)
-    # Shared ledger: total is debited per decoded chunk under a no-await
-    # critical section so concurrent mids cannot TOCTOU the cumulative cap.
-    # network_failed and budget_exceeded are distinct: 503 beats 413.
-    state = {
-        "total": 0,
-        "network_failed": False,
-        "budget_exceeded": False,
-        "network_mids": set(),
-    }
-    succeeded: dict[str, dict] = {}
-    errors: list[dict] = []
-
-    def _aborted() -> bool:
-        if state["budget_exceeded"]:
-            return True
-        return (not opt_in) and state["network_failed"]
-
-    async def fetch_one(mid: str) -> None:
-        if _aborted():
-            return  # 阻止尚未排队的任务
-        await sem.acquire()
-        response = None
-        # body is set only on a complete successful stream read. Early
-        # exits (404 / 4xx / too-large / aborted / network) leave it None
-        # so the post-finally path never submits a partial into succeeded.
-        body: bytes | None = None
-        try:
-            if _aborted():  # 获取 sem 后必须二次检查
-                return
+        # G8: stream + cap-read so a single oversized upstream body cannot
+        # spike sidecar RSS (MemoryMax=384M). Cap metric = decompressed
+        # logical bytes (httpx auto-decompresses). Aborting the read early
+        # requires closing the upstream response — done in the finally. The
+        # body is buffered + parsed to strip the never-consumed LSP
+        # ``state.metadata.diagnostics`` map (ocdroid deletes it on
+        # deserialise); every other field is preserved. The strip runs
+        # off-thread under admission acquired before the upstream GET so the
+        # event loop stays free and saturation surfaces as 503 transform_busy.
+        async with pool:
             upstream_request = request.app.state.upstream.build_request(
                 "GET", f"/session/{sid}/message/{mid}",
                 headers=forward_directory_headers(directory),
             )
             try:
-                response = await request.app.state.upstream.send(
-                    upstream_request, stream=True,
-                )
-            except httpx.RequestError:
-                if opt_in:
-                    state["network_mids"].add(mid)
-                else:
-                    state["network_failed"] = True
-                return
-            if _aborted():  # send() 是 await 点
-                return
-            if response.status_code == 404:
-                # Drain the streaming response body so it contributes to
-                # traffic accounting (upIn) and releases the connection.
-                err_body = await response.aread()
-                stash_up_in(request, len(err_body))
-                errors.append({"messageID": mid, "code": "message_not_found"})
-                return
-            if response.status_code >= 400:
-                # Drain the streaming response body so it contributes to
-                # traffic accounting (upIn) and releases the connection.
-                err_body = await response.aread()
-                stash_up_in(request, len(err_body))
-                code = f"upstream_http_{response.status_code}"
-                entry = {"messageID": mid, "code": code}
-                if response.status_code == 429 or response.status_code >= 500:
-                    if opt_in:
-                        parsed_s = _parse_upstream_retry_after_seconds(
-                            response.headers.get("retry-after")
-                        )
-                        ms = (
-                            (parsed_s * 1000)
-                            if parsed_s is not None
-                            else config.opt_a_retry_after_ms_conservative
-                        )
-                        entry["retryAfterMs"] = min(max(0, ms), config.opt_a_retry_after_ms_cap)
-                errors.append(entry)
-                return
-            buf = bytearray()
-            mid_total = 0
+                response = await request.app.state.upstream.send(upstream_request, stream=True)
+            except httpx.RequestError as exc:
+                raise CodedHTTPException(503, code="upstream_unavailable") from exc
+            status_code = 200
             try:
-                async for chunk in response.aiter_bytes(BATCH_CHUNK_SIZE):
-                    # ↓↓↓ 从此处到 buf.extend 之间严禁 await（同步临界段）↓↓↓
-                    if _aborted():
-                        return
-                    next_batch_total = state["total"] + len(chunk)
-                    # 1) budget 优先（累计超限 → terminal；此 chunk 不计入）
-                    if next_batch_total > config.max_response_bytes:
-                        state["budget_exceeded"] = True
-                        return
-                    # 2) 先扣账（chunk 已读 → 计入累计预算，即使随后 per-mid 超限）
-                    state["total"] = next_batch_total
-                    # 3) 再查 per-mid（超限 → message_too_large envelope，字节已计入）
-                    next_mid_total = mid_total + len(chunk)
-                    if next_mid_total > config.max_message_bytes:
-                        errors.append({
-                            "messageID": mid, "code": "message_too_large",
-                        })
-                        return
-                    mid_total = next_mid_total
-                    buf.extend(chunk)
-                    # ↑↑↑ 临界段结束 ↑↑↑
-            except httpx.RequestError:
-                if opt_in:
-                    state["network_mids"].add(mid)
-                else:
-                    state["network_failed"] = True
-                return
-            body = bytes(buf)
-        finally:
-            if response is not None:
-                await response.aclose()
-            sem.release()
-        if body is None or _aborted():  # aclose/sem 释放都是调度边界
-            return
-        # Mid-level malformed JSON / bad shape → envelope errors[] (whole
-        # request still 200). C⑨: valid JSON that is NOT a usable
-        # MessageWithParts shape (non-dict, or dict with missing/malformed
-        # info/parts) must NOT escape as HTTP 500 — skeleton_message raises
-        # KeyError/TypeError/AttributeError on such shapes, which the prior
-        # ``except (orjson.JSONDecodeError, ValueError)`` did not catch. Map
-        # every such case to the EXISTING upstream_error code (no new code).
-        try:
-            raw = orjson.loads(body)
-        except (orjson.JSONDecodeError, ValueError):
-            errors.append({"messageID": mid, "code": "upstream_error"})
-            return
-        if not (
-            isinstance(raw, dict)
-            and isinstance(raw.get("info"), dict)
-            and isinstance(raw.get("parts"), list)
-        ):
-            errors.append({"messageID": mid, "code": "upstream_error"})
-            return
-        if mode == "skeleton":
-            try:
-                parsed = await pool.offload(lambda r=raw: skeleton_message(r))
-            except (KeyError, TypeError, AttributeError):
-                # Defense-in-depth: the shape guard above catches every known
-                # bad shape, but any residual failure still maps to
-                # upstream_error rather than escaping as a 500.
-                errors.append({"messageID": mid, "code": "upstream_error"})
-                return
-            if _aborted():  # offload 是 await 点
-                return
-            succeeded[mid] = parsed
-        else:
-            # Full mode: strip the never-consumed LSP
-            # ``state.metadata.diagnostics`` map (ocdroid deletes it on
-            # deserialise) but keep every other field. Offloaded to the worker
-            # pool like the skeleton branch (in-place pop on the owned parse
-            # tree; no deepcopy); mirrors skeleton's offload → abort-check →
-            # assign pattern.
-            stripped = await pool.offload(lambda r=raw: strip_diagnostics_message(r))
-            if _aborted():  # offload 是 await 点
-                return
-            succeeded[mid] = stripped
-
-    try:
-        # Both modes hold a single transform-pool admission for the whole
-        # gather: skeleton projects, full strips diagnostics — both offload CPU
-        # work to the bounded worker pool so the event loop stays free for SSE
-        # heartbeats. (discover runs before admission by existing design — a
-        # tiny session-existence probe with no large body; admission wraps the
-        # large-body mid fetches, which is what the memory-bounding invariant
-        # targets. Shared with the pre-existing skeleton-batch path.)
-        async with pool:
-            await asyncio.gather(*(fetch_one(mid) for mid in order))
-    except TransformBusy:
-        return _busy_response(request.headers.get("accept-encoding"))
-
-    # Traffic accounting: the batch's shared cumulative upstream byte counter
-    # already sums every fetched mid body chunk (BATCH_CHUNK_SIZE granularity,
-    # pay-as-you-read). Stash it once here so the middleware attributes the
-    # full batch upIn to this request's bucket.
-    stash_up_in(request, state["total"])
-
-    KNOWN_ENVELOPE_CODES = {"message_not_found", "message_too_large", "upstream_error", "upstream_unavailable"}
-    accept = request.headers.get("accept-encoding")
-
-    if not opt_in:
-        # LEGACY — wire-equivalent to pre-deploy (only ledger recording added).
-        if state["network_failed"]:
-            if ledger is not None:
-                ledger.record_legacy_outcome(top_level_503=True, mode=mode)
-            return error_response("upstream_unavailable", 503, accept_encoding=accept)
-        if state["budget_exceeded"]:
-            if ledger is not None:
-                ledger.record_legacy_outcome(top_level_503=False, mode=mode)
-            return error_response("response_too_large", 413, limit=config.max_response_bytes, accept_encoding=accept)
-        items = [succeeded[mid] for mid in order if mid in succeeded]
-        resp = json_response({"items": items, "errors": errors}, headers={"Cache-Control":"no-store"}, accept_encoding=accept)
-        if ledger is not None:
-            ledger.record_legacy_outcome(top_level_503=False, mode=mode)
-        return resp
-
-    # OPT-IN path
-    # C1: cumulative 413 stays top-level for opt-in too.
-    if state["budget_exceeded"]:
-        resp = error_response("response_too_large", 413, limit=config.max_response_bytes, accept_encoding=accept)
-        if ledger is not None:
-            ledger.record_opt_in_outcome(outcome="top_level_413", envelope_5xx=False,
-                unknown_codes=0, network_mid_errors=len(state["network_mids"]),
-                items_count=0, errors_count=0, bytes_fetched=state["total"],
-                bytes_delivered_skeleton=len(resp.body), mode=mode, retry_after_ms_emitted=0)
-        return resp
-
-    # Row 6: ALL requested IDs network-failed, no items, no other errors → top-level 503.
-    all_network = len(state["network_mids"]) == len(order)
-    if all_network and not succeeded and not errors:
-        retry_s = max(1, -(-config.opt_a_retry_after_ms_conservative // 1000))  # ceil
-        resp = _opt_a_top_level_503(request, accept_encoding=accept, retry_after_seconds=retry_s)
-        if ledger is not None:
-            ledger.record_opt_in_outcome(outcome="top_level_503", envelope_5xx=True,
-                unknown_codes=0, network_mid_errors=len(state["network_mids"]),
-                items_count=0, errors_count=0, bytes_fetched=state["total"],
-                bytes_delivered_skeleton=len(resp.body), mode=mode, retry_after_ms_emitted=0)
-        return resp
-
-    # 200 envelope (success / partial / errors-only). Materialize network mids.
-    conservative_ms = config.opt_a_retry_after_ms_conservative
-    cap_ms = config.opt_a_retry_after_ms_cap
-    retry_after_emitted = 0
-    for mid in state["network_mids"]:
-        errors.append({"messageID": mid, "code": "upstream_unavailable",
-                       "retryAfterMs": min(conservative_ms, cap_ms)})
-        retry_after_emitted += 1
-    # Defensive cap pass for upstream_http_N entries (already set in fetch_one)
-    if opt_in:
-        for entry in errors:
-            code = entry.get("code", "")
-            if code.startswith("upstream_http_") and entry.get("retryAfterMs") is not None:
-                entry["retryAfterMs"] = min(int(entry["retryAfterMs"]), cap_ms)
-                retry_after_emitted += 1
-
-    # Build items
-    items = [succeeded[mid] for mid in order if mid in succeeded]
-
-    # Invariant assertion
-    succeeded_ids = set(succeeded.keys())
-    error_ids = {e["messageID"] for e in errors}
-    if not succeeded_ids.isdisjoint(error_ids):
-        raise RuntimeError(f"invariant violation: {succeeded_ids & error_ids}")
-
-    # Classify outcome
-    if not items and not errors:
-        outcome = "errors_only"
-    elif items and errors:
-        outcome = "partial"
-    elif items and not errors:
-        outcome = "success"
-    else:  # not items and errors
-        outcome = "errors_only"
-
-    unknown_codes = sum(1 for e in errors if e.get("code") not in KNOWN_ENVELOPE_CODES
-                    and not e.get("code","").startswith("upstream_http_"))
-
-    resp = json_response({"items": items, "errors": errors},
-                         headers={"Cache-Control":"no-store"}, accept_encoding=accept)
-    if ledger is not None:
-        ledger.record_opt_in_outcome(outcome=outcome, envelope_5xx=False,
-            unknown_codes=unknown_codes, network_mid_errors=len(state["network_mids"]),
-            items_count=len(items), errors_count=len(errors),
-            bytes_fetched=state["total"], bytes_delivered_skeleton=len(resp.body),
-            mode=mode, retry_after_ms_emitted=retry_after_emitted)
-    return resp
-
-
-@router.get("/full/{mid}")
-async def message(
-    request: Request, sid: str, mid: str,
-    mode: Literal["skeleton", "full"] = "full",
-    directory: str | None = None,
-    known_max_part_id: str | None = Query(None, alias="known.maxPartId"),
-    known_part_count: int | None = Query(None, alias="known.partCount", ge=0),
-    known_message_event_seq: int | None = Query(
-        None, alias="known.messageEventSeq", ge=0,
-    ),
-):
-    directory = await _resolve_messages_directory(request, directory)
-    # Resolve the global hub ONCE up front: both the 304 short-circuit and
-    # the X-Message-Event-Seq header on the 200 path need it. Access the
-    # registry's ``_global`` attribute directly so a cache miss does NOT
-    # lazily create a hub (a request must not have the side effect of
-    # spinning up the upstream subscription just to read the fingerprint).
-    registry = getattr(request.app.state, "hubs", None)
-    hub = getattr(registry, "_global", None) if registry is not None else None
-    # Stage B v0.4 (CRITICAL 1 fix): single-message fingerprint 304
-    # short-circuit. The client sends ``known.maxPartId`` +
-    # ``known.partCount`` + ``known.messageEventSeq`` representing the
-    # part fingerprint + message-level monotonic seq it already has; if
-    # the sidecar's ``_part_state`` cache agrees EXACTLY on all three,
-    # return 304 (no body) so the client reuses its local copy. Any
-    # mismatch / partial params / no cache hit → fall through to the
-    # normal full body flow.
-    #
-    # Why all three are required: maxPartId+partCount alone cannot detect
-    # a same-part text append (count + max unchanged, but content did)
-    # nor a part-swap (count unchanged, max coincidentally same).
-    # messageEventSeq is a strict-monotone counter bumped by every
-    # message.part.updated / message.part.removed — it catches every
-    # content-affecting event even when the (maxPartId, partCount)
-    # projection coincidentally matches. ``mode`` is intentionally
-    # orthogonal (a skeleton-mode caller may still 304 — the fingerprint
-    # is about upstream state, not the projection); schema_degraded
-    # forcing ``mode = "full"`` runs after this guard so the 304 path is
-    # honoured regardless of degraded state.
-    if (
-        known_max_part_id is not None
-        and known_part_count is not None
-        and known_message_event_seq is not None
-        and hub is not None
-    ):
-        fp = hub.get_part_fingerprint(sid, mid)
-        if fp is not None and fp == (
-            known_max_part_id, known_part_count, known_message_event_seq,
-        ):
-            return Response(
-                None, status_code=304,
-                headers={"Cache-Control": "no-store"},
-            )
-        # Mismatch or no cache hit → continue with normal full body.
-    # Stage B v0.5 §M (MAJOR 3 fix): X-Message-Event-Seq header stability.
-    # Sample seq BEFORE the body fetch, then again AFTER (transform done,
-    # before Response construction). If they match, emit seq_post
-    # (trustworthy snapshot for the body we're returning). If they differ,
-    # a part event arrived during the await (body fetch / transform) and
-    # the body no longer corresponds to the pre-await seq — emit ``0``
-    # (clients treat 0 as "no trustworthy baseline" → R1). Without this
-    # check the header would silently describe a stale seq while the body
-    # reflected newer content (or vice versa).
-    #
-    # ``0`` is also the cold-start / no-cache value (no fingerprint), so
-    # the ``seq_pre == seq_post == 0`` case naturally maps to "no
-    # information, R1" — symmetric with reconnect / post-deleted.
-    seq_pre = 0
-    if hub is not None:
-        fp_pre = hub.get_part_fingerprint(sid, mid)
-        if fp_pre is not None:
-            seq_pre = fp_pre[2]
-    if request.app.state.schema_degraded:
-        mode = "full"
-    config = request.app.state.config
-    pool = request.app.state.transforms
-    if mode == "full":
-        # G8: stream + cap-read so a single oversized upstream body cannot spike
-        # sidecar RSS (MemoryMax=384M). Cap metric = decompressed logical bytes
-        # (httpx auto-decompresses), matching list/since. Aborting the read
-        # early requires closing the upstream response — done in the finally.
-        # The body is buffered + parsed to strip the never-consumed LSP
-        # ``state.metadata.diagnostics`` map (ocdroid deletes it on deserialise);
-        # every other field is preserved. The strip runs off-thread under the
-        # same admission as skeleton mode (acquired before the upstream GET) so
-        # the event loop stays free and saturation surfaces as 503 transform_busy.
-        accept_encoding = request.headers.get("accept-encoding")
-        try:
-            async with pool:
-                upstream_request = request.app.state.upstream.build_request(
-                    "GET", f"/session/{sid}/message/{mid}",
-                    headers=forward_directory_headers(directory),
-                )
+                # Wrap mid-stream upstream I/O failures (httpx.RequestError
+                # raised by _drain_error.aread() or read_with_cap
+                # .aiter_bytes()) into a structured 503 instead of bubbling
+                # up as an unhandled FastAPI 500. The finally below still
+                # runs to release the connection.
                 try:
-                    response = await request.app.state.upstream.send(upstream_request, stream=True)
+                    if response.status_code >= 400:
+                        return await _drain_error(response, request)
+                    status_code = response.status_code
+                    body, n_read = await read_with_cap(
+                        response, config.max_message_bytes,
+                    )
                 except httpx.RequestError as exc:
                     raise CodedHTTPException(503, code="upstream_unavailable") from exc
-                status_code = 200
-                try:
-                    # Wrap mid-stream upstream I/O failures (httpx.RequestError
-                    # raised by _drain_error.aread() or read_with_cap
-                    # .aiter_bytes()) into a structured 503 instead of bubbling
-                    # up as an unhandled FastAPI 500. The finally below still
-                    # runs to release the connection.
-                    try:
-                        if response.status_code >= 400:
-                            return await _drain_error(response, request)
-                        status_code = response.status_code
-                        body, n_read = await read_with_cap(
-                            response, config.max_message_bytes,
-                        )
-                    except httpx.RequestError as exc:
-                        raise CodedHTTPException(503, code="upstream_unavailable") from exc
-                    # Traffic accounting: cap-read upstream bytes (counted even
-                    # on cap-bail, matching the list convention).
-                    stash_up_in(request, n_read)
-                    if body is None:
-                        return error_response(
-                            "message_too_large", 413,
-                            limitBytes=config.max_message_bytes,
-                            accept_encoding=accept_encoding,
-                        )
-                    # Empty / non-JSON upstream 200 → 503 upstream_unavailable
-                    # (same code as sessions bad-JSON), never a bare 500.
-                    try:
-                        encoded, extra = await pool.offload(
-                            strip_diagnostics_and_pack, body,
-                            single=True,
-                            accept_encoding=accept_encoding,
-                        )
-                    except orjson.JSONDecodeError as exc:
-                        raise CodedHTTPException(
-                            503, code="upstream_unavailable",
-                        ) from exc
-                finally:
-                    await response.aclose()
-            # Stage B v0.5 §M: re-sample AFTER the body fetch + transform.
-            # If a part event arrived during the await, seq_post ≠ seq_pre
-            # → emit 0 so the client R1s rather than trusting a stale
-            # header that does not correspond to the returned body.
-            seq_post = 0
-            if hub is not None:
-                fp_post = hub.get_part_fingerprint(sid, mid)
-                if fp_post is not None:
-                    seq_post = fp_post[2]
-            msg_event_seq = seq_post if seq_pre == seq_post else 0
-            return Response(
-                encoded, status_code=status_code, media_type="application/json",
-                headers={
-                    "Cache-Control": "no-store",
-                    "X-Message-Event-Seq": str(msg_event_seq),
-                    **extra,
-                },
-            )
-        except TransformBusy:
-            return _busy_response(accept_encoding)
-    try:
-        async with pool:
-            response = await _stream_upstream(
-                request, f"/session/{sid}/message/{mid}", {}, directory,
-            )
-            try:
-                if response.status_code >= 400:
-                    return await _drain_error(response, request)
-                body, n_read = await read_with_cap(response, config.max_response_bytes)
+                # Traffic accounting: cap-read upstream bytes (counted even
+                # on cap-bail, matching the list convention).
+                stash_up_in(request, n_read)
                 if body is None:
                     return error_response(
-                        "response_too_large", 413,
-                        limit=config.max_response_bytes,
-                        accept_encoding=request.headers.get("accept-encoding"),
+                        "message_too_large", 413,
+                        limitBytes=config.max_message_bytes,
+                        accept_encoding=accept_encoding,
                     )
-                # Traffic accounting: skeleton-mode upstream bytes.
-                stash_up_in(request, n_read)
-                encoded, extra = await pool.offload(
-                    project_and_pack, body,
-                    single=True,
-                    accept_encoding=request.headers.get("accept-encoding"),
-                )
+                # Empty / non-JSON upstream 200 → 503 upstream_unavailable
+                # (same code as sessions bad-JSON), never a bare 500.
+                try:
+                    encoded, extra = await pool.offload(
+                        strip_diagnostics_and_pack, body,
+                        single=True,
+                        accept_encoding=accept_encoding,
+                    )
+                except orjson.JSONDecodeError as exc:
+                    raise CodedHTTPException(
+                        503, code="upstream_unavailable",
+                    ) from exc
             finally:
                 await response.aclose()
-        # Stage B v0.5 §M: re-sample AFTER the body fetch + transform
-        # (skeleton path). Same stability check as the full-mode branch.
-        seq_post = 0
-        if hub is not None:
-            fp_post = hub.get_part_fingerprint(sid, mid)
-            if fp_post is not None:
-                seq_post = fp_post[2]
-        msg_event_seq = seq_post if seq_pre == seq_post else 0
         return Response(
-            encoded, status_code=200, media_type="application/json",
-            headers={
-                "Cache-Control": "no-store",
-                "X-Message-Event-Seq": str(msg_event_seq),
-                **extra,
-            },
+            encoded, status_code=status_code, media_type="application/json",
+            headers={"Cache-Control": "no-store", **extra},
         )
     except TransformBusy:
-        return _busy_response(request.headers.get("accept-encoding"))
+        return _busy_response(accept_encoding)

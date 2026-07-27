@@ -2,25 +2,24 @@
 
 Scenarios (per reviewer findings):
 
-1. **questions 4xx stash** (MUST-PASS): upstream returns 4xx on a q/p
-   directory fan-out → the ``quiz`` bucket's ``upIn`` includes the error
-   response body bytes (was silently discarded before the fix).
-
-2. **ready stash** (MUST-PASS): ``/slimapi/ready`` pings upstream
+1. **ready stash** (MUST-PASS): ``/slimapi/ready`` pings upstream
    ``/global/health`` → the ``health`` bucket's ``upIn`` includes the
    health-check response body (was fully missing before the fix).
 
-3. **batch 4xx drain** (BEST-EFFORT): a G6 batch ``fetch_one`` where a
+2. **batch 4xx drain** (BEST-EFFORT): a G6 batch ``fetch_one`` where a
    per-mid upstream returns 404 → the 404 response body is drained and
    counted in ``messages`` bucket ``upIn``.
 
-4. **disconnect finally** (BEST-EFFORT): a streaming proxy request where
+3. **disconnect finally** (BEST-EFFORT): a streaming proxy request where
    the client disconnects mid-stream → already-forwarded bytes are still
    stashed (``finally`` guard on ``proxy._counted_req_stream``).
 
 Hard constraint: this file is self-contained (no conftest changes) and
 follows the ``_build_app`` + ``upstream_factory`` pattern established in
-``test_traffic_integration.py`` / ``test_questions_routes.py``.
+``test_traffic_integration.py``.
+
+NOTE: lite-v2 removed the ``/slimapi/questions`` family of endpoints;
+the former "questions 4xx stash" scenario has been removed accordingly.
 """
 
 from __future__ import annotations
@@ -36,7 +35,7 @@ from oc_slimapi.config import Settings
 from oc_slimapi.errors import register_error_handlers
 from oc_slimapi.middleware.traffic_accounting import TrafficAccountingMiddleware
 from oc_slimapi.proxy import install_proxy
-from oc_slimapi.routes import health, messages, questions, sessions
+from oc_slimapi.routes import health, messages, sessions
 from oc_slimapi.sse.hub import HubRegistry
 from oc_slimapi.traffic import TrafficLedger
 from oc_slimapi.transform import TransformConfig, TransformPool
@@ -82,7 +81,6 @@ def _build_app(
     upstream: httpx.AsyncClient,
     *,
     include_health: bool = False,
-    include_questions: bool = False,
     include_messages: bool = False,
     include_proxy: bool = False,
 ) -> tuple[FastAPI, TrafficLedger]:
@@ -117,9 +115,6 @@ def _build_app(
 
     if include_health:
         app.include_router(health.router)
-    if include_questions:
-        app.include_router(sessions.router)
-        app.include_router(questions.router)
     if include_messages:
         app.include_router(sessions.router)
         app.include_router(messages.router)
@@ -138,113 +133,7 @@ async def _shutdown(app: FastAPI) -> None:
 
 
 # ===========================================================================
-# Scenario 1 — questions 4xx stash (MUST-PASS)
-# ===========================================================================
-
-async def test_questions_4xx_stashes_upin(upstream_factory):
-    """A q/p fan-out where upstream returns 4xx on every directory → the ``quiz``
-    bucket's ``upIn`` includes the 4xx response body bytes (were silently
-    discarded before the fix that moved ``stash_up_in`` before the early return).
-
-    The response is a 503 (all directories failed), but upIn must still reflect
-    the upstream bytes that were consumed.
-    """
-    ERROR_BODY = b'{"error":"not found"}'
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path in ("/question", "/permission"):
-            return httpx.Response(404, content=ERROR_BODY,
-                                  headers={"Content-Type": "application/json"})
-        return httpx.Response(200, content=b"[]",
-                              headers={"Content-Type": "application/json"})
-
-    upstream = upstream_factory(handler)
-    app, ledger = _build_app(
-        _settings(), upstream, include_questions=True,
-    )
-    assert ledger is not None
-    transport = httpx.ASGITransport(app)
-    try:
-        async with httpx.AsyncClient(transport=transport,
-                                     base_url="http://test") as client:
-            response = await client.get(
-                "/slimapi/questions?directory=/app",
-                headers=VERSION_HEADERS,
-            )
-        # All directories failed → 503, no scope key.
-        assert response.status_code == 503
-
-        snap = ledger.snapshot()
-        assert snap["enabled"] is True
-        assert "quiz" in snap["buckets"], (
-            f"expected quiz bucket, got {set(snap['buckets'])}"
-        )
-        bucket = snap["buckets"]["quiz"]
-        # The 404 error body must be counted.
-        assert bucket["upIn"] == len(ERROR_BODY), (
-            f"upIn ({bucket['upIn']}) should equal the 404 body length "
-            f"({len(ERROR_BODY)}) — error response bytes were not stashed"
-        )
-        assert bucket["requests"] == 1
-    finally:
-        await _shutdown(app)
-
-
-async def test_questions_partial_4xx_stashes_upin(upstream_factory):
-    """Partial failure: one directory returns 2xx, another returns 4xx. The
-    ``quiz`` bucket's ``upIn`` includes BOTH response bodies, not only the 2xx.
-    """
-    OK_BODY = orjson.dumps([{"id": "q1", "sessionID": "ses_1"}])
-    ERR_BODY = b'{"error":"not found"}'
-
-    call_count = {"n": 0}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/question":
-            call_count["n"] += 1
-            if call_count["n"] == 1:
-                # First call succeeds
-                return httpx.Response(200, content=OK_BODY,
-                                      headers={"Content-Type": "application/json"})
-            # Second call fails
-            return httpx.Response(404, content=ERR_BODY,
-                                  headers={"Content-Type": "application/json"})
-        return httpx.Response(200, content=b"[]",
-                              headers={"Content-Type": "application/json"})
-
-    upstream = upstream_factory(handler)
-    app, ledger = _build_app(
-        _settings(), upstream, include_questions=True,
-    )
-    assert ledger is not None
-    transport = httpx.ASGITransport(app)
-    try:
-        async with httpx.AsyncClient(transport=transport,
-                                     base_url="http://test") as client:
-            response = await client.get(
-                "/slimapi/questions?directory=/app&directory=/other",
-                headers=VERSION_HEADERS,
-            )
-        # Partial success → 200 with errors[]
-        assert response.status_code == 200
-
-        snap = ledger.snapshot()
-        assert snap["enabled"] is True
-        assert "quiz" in snap["buckets"]
-        bucket = snap["buckets"]["quiz"]
-        # Both bodies counted: 2xx body + 4xx body
-        expected_upin = len(OK_BODY) + len(ERR_BODY)
-        assert bucket["upIn"] == expected_upin, (
-            f"upIn ({bucket['upIn']}) should equal 2xx body + 4xx body "
-            f"({expected_upin})"
-        )
-        assert bucket["requests"] == 1
-    finally:
-        await _shutdown(app)
-
-
-# ===========================================================================
-# Scenario 2 — ready stash (MUST-PASS)
+# Scenario 1 — ready stash (MUST-PASS)
 # ===========================================================================
 
 async def test_ready_stashes_upin(upstream_factory):
@@ -334,92 +223,7 @@ async def test_ready_503_path_stashes_upin(upstream_factory):
 
 
 # ===========================================================================
-# Scenario 3 — batch 4xx drain (BEST-EFFORT)
-# ===========================================================================
-
-async def test_batch_per_mid_404_stashes_upin(upstream_factory):
-    """A G6 batch where one per-mid upstream returns 404 → the 404 response
-    body is drained and counted in ``messages`` bucket ``upIn``.
-
-    This is BEST-EFFORT: if the batch path restructures, this test may need
-    adjustment. The core assertion is that the 404 body bytes appear in upIn.
-    """
-    # Session discover returns 200 with valid session data.
-    SESSION_BODY = orjson.dumps({"id": "ses_1", "directory": "/app"})
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        path = request.url.path
-        if path == "/session/ses_1":
-            return httpx.Response(200, content=SESSION_BODY,
-                                  headers={"Content-Type": "application/json"})
-        if path.startswith("/session/ses_1/message/"):
-            # Return a 404 for a specific message mid
-            mid = path.rsplit("/", 1)[-1]
-            if mid == "mid_404":
-                return httpx.Response(404, content=b'{"error":"not found"}',
-                                      headers={"Content-Type": "application/json"})
-        # Default: 200 with message data
-        return httpx.Response(200, content=b"[]",
-                              headers={"Content-Type": "application/json"})
-
-    upstream = upstream_factory(handler)
-    settings = _settings(
-        max_response_bytes=1024 * 1024,
-        max_message_bytes=256 * 1024,
-    )
-    # Need both messages router AND the upstream mock for streaming.
-    # For a streaming mock, we must use AsyncIteratorByteStream or the
-    # proxy-like streaming path. But for messages.py batch, the per-mid
-    # fetch uses `response = await upstream.send(upstream_request, stream=True)`.
-    # MockTransport with content= works for the discover (non-streaming),
-    # but for streaming per-mid responses we need stream=.
-
-    # Actually, the per-mid fetch_one path:
-    #   response = await request.app.state.upstream.send(upstream_request, stream=True)
-    # With MockTransport, httpx.Response(content=...) marks is_stream_consumed
-    # which causes issues. But for 404, we call response.aread() which should
-    # work with content= ...
-    # Let's just use content= and see.
-
-    app, ledger = _build_app(
-        settings, upstream, include_messages=True,
-    )
-    assert ledger is not None
-    transport = httpx.ASGITransport(app)
-    try:
-        async with httpx.AsyncClient(transport=transport,
-                                     base_url="http://test") as client:
-            response = await client.get(
-                "/slimapi/messages/ses_1/full?ids=mid_404",
-                headers=VERSION_HEADERS,
-            )
-        # Batch expand: discover returns 200, mid_404 returns 404.
-        # The response should be 200 with an error in the envelope.
-        assert response.status_code == 200, (
-            f"expected 200 envelope, got {response.status_code}: "
-            f"{response.text[:200]}"
-        )
-
-        snap = ledger.snapshot()
-        assert snap["enabled"] is True
-        assert "messages" in snap["buckets"]
-        bucket = snap["buckets"]["messages"]
-
-        # upIn must include at least the session discover body + 404 body.
-        expected_min = len(SESSION_BODY) + len(b'{"error":"not found"}')
-        # The discover body is stashed at line 598; the 404 body is stashed
-        # at the new `stash_up_in(request, len(err_body))` in fetch_one.
-        assert bucket["upIn"] >= expected_min, (
-            f"upIn ({bucket['upIn']}) should be >= discover body + 404 body "
-            f"({expected_min}) — batch 4xx bytes were not stashed"
-        )
-        assert bucket["requests"] == 1
-    finally:
-        await _shutdown(app)
-
-
-# ===========================================================================
-# Scenario 4 — proxy try/finally upOut stash (structural + happy-path)
+# Scenario 3 — proxy try/finally upOut stash (structural + happy-path)
 # ===========================================================================
 
 async def test_proxy_counted_req_stream_happy_path_stashes_upout(
