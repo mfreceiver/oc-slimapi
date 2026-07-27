@@ -1472,7 +1472,7 @@ async def test_part_updated_bumps_updatedAt_strictly(fresh_hub, monkeypatch):
     hub, subscriber = fresh_hub
 
     FIXED = 1700000000000
-    monkeypatch.setattr("oc_slimapi.sse.hub._now_ms", lambda: FIXED)
+    monkeypatch.setattr("oc_slimapi.sse.global_hub._now_ms", lambda: FIXED)
 
     def part_updated(part_sid, part_mid, part_id):
         return make_global_event("/proj", "message.part.updated", {
@@ -1504,7 +1504,7 @@ async def test_part_removed_bumps_updatedAt_strictly(fresh_hub, monkeypatch):
     hub, subscriber = fresh_hub
 
     FIXED = 1700000000000
-    monkeypatch.setattr("oc_slimapi.sse.hub._now_ms", lambda: FIXED)
+    monkeypatch.setattr("oc_slimapi.sse.global_hub._now_ms", lambda: FIXED)
 
     # First part.removed: updated_at = max(FIXED, 0+1) = FIXED
     hub.publish(make_global_event("/proj", "message.part.removed", {
@@ -1535,7 +1535,7 @@ async def test_bump_updated_at_same_ms_collision(monkeypatch, fresh_hub):
     hub, _ = fresh_hub
 
     FIXED = 1234567890
-    monkeypatch.setattr("oc_slimapi.sse.hub._now_ms", lambda: FIXED)
+    monkeypatch.setattr("oc_slimapi.sse.global_hub._now_ms", lambda: FIXED)
 
     from oc_slimapi.sse.hub import DigestFields
 
@@ -1551,7 +1551,7 @@ async def test_bump_updated_at_same_ms_collision(monkeypatch, fresh_hub):
     assert hub._last_updated_at_by_sid.get("s1") == FIXED + 1
 
     # Clock rollback: now=FIXED-1000, previous=FIXED+1 → max(FIXED-1000, FIXED+2) = FIXED+2
-    monkeypatch.setattr("oc_slimapi.sse.hub._now_ms", lambda: FIXED - 1000)
+    monkeypatch.setattr("oc_slimapi.sse.global_hub._now_ms", lambda: FIXED - 1000)
     hub._bump_updated_at("s1", entry)
     assert entry.updated_at == FIXED + 2
     assert hub._last_updated_at_by_sid.get("s1") == FIXED + 2

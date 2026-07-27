@@ -603,7 +603,8 @@ class TestTokenStreamRegistryAdmission:
         ``test_token_subscriber_overflow.py`` covers the flush-stop with a
         stub hub; here we verify the full chain including grace re-arm.
         """
-        monkeypatch.setattr("oc_slimapi.sse.hub.GRACE_SECONDS", 0.0)
+        monkeypatch.setattr("oc_slimapi.sse.global_hub.GRACE_SECONDS", 0.0)
+        monkeypatch.setattr("oc_slimapi.sse.registry.GRACE_SECONDS", 0.0)
         app = _build_app(_settings())
         try:
             reg = app.state.token_registry
@@ -738,7 +739,8 @@ class TestBGraceSymmetry:
         ensure_upstream → unsubscribe → flush stop → ``run()`` would otherwise
         park on ``aiter_lines`` forever. The token last-detach must arm the
         registry grace so the hub tasks + ``_global`` reference are released."""
-        monkeypatch.setattr("oc_slimapi.sse.hub.GRACE_SECONDS", 0.0)
+        monkeypatch.setattr("oc_slimapi.sse.global_hub.GRACE_SECONDS", 0.0)
+        monkeypatch.setattr("oc_slimapi.sse.registry.GRACE_SECONDS", 0.0)
         app = _build_app(_settings())
         try:
             hubs = app.state.hubs
@@ -766,7 +768,8 @@ class TestBGraceSymmetry:
         """B-D1 scenario B: control-plane last-unsub arms grace → token arrives
         during grace (cancels it, NB-B1) → token last-detach must RE-ARM grace
         → teardown. The pre-fix bug: token last-detach never re-armed → leak."""
-        monkeypatch.setattr("oc_slimapi.sse.hub.GRACE_SECONDS", 0.0)
+        monkeypatch.setattr("oc_slimapi.sse.global_hub.GRACE_SECONDS", 0.0)
+        monkeypatch.setattr("oc_slimapi.sse.registry.GRACE_SECONDS", 0.0)
         app = _build_app(_settings())
         try:
             hubs = app.state.hubs

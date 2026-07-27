@@ -38,7 +38,7 @@ def _capture_logger(name: str):
 async def test_subscriber_attach_detach_logs():
     """subscribe and unsubscribe emit logger.info with subscriber_id."""
     hub = GlobalHub(client=None)
-    logger, handler, buf = _capture_logger("oc_slimapi.sse.hub")
+    logger, handler, buf = _capture_logger("oc_slimapi.sse.global_hub")
     try:
         sub = hub.subscribe()
         hub.unsubscribe(sub)
@@ -57,7 +57,7 @@ async def test_subscriber_attach_detach_logs():
 async def test_backpressure_forced_disconnect_logs():
     """Backpressure overflow → logger.warning with subscriber_id."""
     hub = GlobalHub(client=None)
-    logger, handler, buf = _capture_logger("oc_slimapi.sse.hub")
+    logger, handler, buf = _capture_logger("oc_slimapi.sse.hub_types")
     try:
         sub = hub.subscribe()
         # Fill the queue with many frames each under max_frame_bytes but
@@ -100,7 +100,7 @@ async def test_json_decode_error_logs(caplog):
         await hub.task
 
     # Verify the debug log was emitted.
-    hub_logs = [r for r in caplog.records if r.name == "oc_slimapi.sse.hub"]
+    hub_logs = [r for r in caplog.records if r.name == "oc_slimapi.sse.global_hub"]
     assert any(
         "upstream sse malformed frame dropped" in r.message
         and r.levelno == logging.DEBUG
@@ -130,7 +130,7 @@ async def test_traffic_accounting_failure_logs(caplog):
     with contextlib.suppress(asyncio.CancelledError):
         await hub.task
 
-    hub_logs = [r for r in caplog.records if r.name == "oc_slimapi.sse.hub"]
+    hub_logs = [r for r in caplog.records if r.name == "oc_slimapi.sse.global_hub"]
     assert any(
         "sse traffic accounting failed" in r.message
         and r.levelno == logging.WARNING

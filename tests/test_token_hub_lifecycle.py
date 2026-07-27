@@ -260,7 +260,7 @@ class TestStopAfterGrace:
         async def _fast(_):
             return  # skip GRACE_SECONDS wait inside stop_after_grace
 
-        monkeypatch.setattr("oc_slimapi.sse.hub.asyncio.sleep", _fast)
+        monkeypatch.setattr("oc_slimapi.sse.global_hub.asyncio.sleep", _fast)
 
         hub = GlobalHub(client=None)
 
@@ -286,7 +286,7 @@ class TestStopAfterGrace:
         async def _fast(_):
             return
 
-        monkeypatch.setattr("oc_slimapi.sse.hub.asyncio.sleep", _fast)
+        monkeypatch.setattr("oc_slimapi.sse.global_hub.asyncio.sleep", _fast)
 
         hub = GlobalHub(client=None)
 
@@ -364,7 +364,7 @@ class TestRunReconnectWiring:
         async def _fast(_):
             await real_sleep(0)
 
-        monkeypatch.setattr("oc_slimapi.sse.hub.asyncio.sleep", _fast)
+        monkeypatch.setattr("oc_slimapi.sse.global_hub.asyncio.sleep", _fast)
 
         th = TokenStreamHub()
         calls: list[int] = []
@@ -409,7 +409,7 @@ class TestRunReconnectWiring:
         async def _fast(_):
             await real_sleep(0)
 
-        monkeypatch.setattr("oc_slimapi.sse.hub.asyncio.sleep", _fast)
+        monkeypatch.setattr("oc_slimapi.sse.global_hub.asyncio.sleep", _fast)
 
         th = TokenStreamHub()
         calls: list[int] = []
