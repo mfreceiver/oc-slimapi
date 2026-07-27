@@ -1,4 +1,3 @@
-import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -6,15 +5,11 @@ import uvicorn
 
 from . import __version__
 from .access_log import setup_access_log
-from .capabilities import parse_capabilities
-from .children_cache import ChildrenCache
 from .config import settings
-from .discovery import warm_allowlist
 from .errors import register_error_handlers
 from .logging_config import get_logger, setup_logging
 from .middleware.request_id import RequestIdMiddleware
 from .middleware.traffic_accounting import TrafficAccountingMiddleware
-from .observability import BatchLedger
 from .proxy import install_proxy
 from .routes import events, health, messages, metrics, sessions, token_stream
 from .sse.hub import HubRegistry
@@ -76,15 +71,8 @@ async def lifespan(app: FastAPI):
     app.state.traffic_ledger = TrafficLedger(enabled=settings.traffic_metrics_enabled)
     # Debug/联调-only: override token-stream memory budget caps from env
     # (OC_SLIMAPI_TOKEN_STREAM_DEBUG_*). No-op when env vars are unset.
-    # (placed before parse_capabilities import; here for proximity to other
-    # budget-tuning.)
     apply_debug_budget_overrides(settings)
-    app.state.batch_ledger = BatchLedger(
-        window_seconds=settings.opt_a_rollback_window_seconds
-    )
-    app.state.route_secret = settings.read_route_secret()
     app.state.upstream = create_client(settings)
-    app.state.children = ChildrenCache(app.state.upstream)
     # Transform pool: admission semaphore + bounded worker executor, both
     # sized by OC_SLIMAPI_MAX_TRANSFORMS. Acquired by the skeleton routes
     # *before* their upstream GET so memory pressure stays bounded and the
@@ -94,14 +82,6 @@ async def lifespan(app: FastAPI):
         transform_wait_seconds=settings.transform_wait_seconds,
         max_response_bytes=settings.max_response_bytes,
     ))
-    app.state.directory_allowlist = set()
-    # discovery readiness signal (v6 §1.1): False until first successful
-    # load_products; subsequent failures retain last-known-good (do not reset).
-    app.state.allowlist_ready = False
-    # serialises concurrent load_products callers (warm_allowlist,
-    # /projects, q-p null-dir fan-out) so a slow stale fetch cannot
-    # overwrite a fast fresh one.
-    app.state.allowlist_lock = asyncio.Lock()
     app.state.schema_degraded = False
     # S-E: best-effort deployment revision (env or file, swallow errors)
     try:
@@ -124,7 +104,6 @@ async def lifespan(app: FastAPI):
         max_frame_bytes=settings.sse_max_frame_bytes,
         traffic_ledger=app.state.traffic_ledger,
     )
-    app.state.hubs.set_children_cache(app.state.children)
     # Token-stream accumulator (design-token-stream.md §5.3). Constructed
     # unconditionally so publish() can route message.part.delta/updated
     # into it the moment the first upstream event arrives; subscriber /
@@ -171,14 +150,9 @@ async def lifespan(app: FastAPI):
         settings.traffic_metrics_enabled,
         settings.access_log_path if settings.access_log_enabled else "disabled",
     )
-    logger.info("route_secret=<redacted>")
-    # F3: best-effort allowlist warm-up so the first routeToken-bearing reply
-    # does not hit a cold allowlist. Failure is non-fatal (lazy refresh fallback).
-    await warm_allowlist(app)
     try:
         yield
     finally:
-        await app.state.children.aclose()
         # NB-C4: stop the token flush loop on shutdown (idempotent; no-op if
         # already stopped on last-detach). Must precede hubs.close() so the
         # registry / hub are still coherent while the loop drains.

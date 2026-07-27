@@ -1,13 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, NoReturn
-
 import httpx
-from fastapi import APIRouter, FastAPI, Query, Request
-
-from oc_slimapi.logging_config import get_logger
-
-logger = get_logger(__name__)
+from fastapi import APIRouter, Query, Request
 
 from ..directory import validate_directory
 from ..errors import CodedHTTPException

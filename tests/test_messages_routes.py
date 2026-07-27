@@ -1285,19 +1285,82 @@ async def test_messages_list_skeleton_returns_created_ascending(upstream_factory
         app.state.transforms.shutdown()
 
 
+async def test_messages_list_skeleton_malformed_created_sorts_safely(upstream_factory):
+    """lite-v2 §8 edge cases: malformed ``time.created`` values MUST NOT
+    crash the sort. Items with missing/non-int ``created`` get sort key 0
+    and cluster at the front (before any real epoch > 0). Same-``created``
+    items preserve upstream order (Python stable sort)."""
+    items = [
+        # epoch 2000 — valid
+        {"info": {"id": "valid", "role": "user", "time": {"created": 2000}},
+         "parts": [{"id": "p1", "type": "text", "messageID": "valid", "text": "x" * 200}]},
+        # missing time → key 0
+        {"info": {"id": "no_time", "role": "user"},
+         "parts": [{"id": "p2", "type": "text", "messageID": "no_time", "text": "x" * 200}]},
+        # missing created → key 0
+        {"info": {"id": "no_created", "role": "user", "time": {}},
+         "parts": [{"id": "p3", "type": "text", "messageID": "no_created", "text": "x" * 200}]},
+        # string created → key 0 (non-int rejected)
+        {"info": {"id": "str_created", "role": "user", "time": {"created": "oops"}},
+         "parts": [{"id": "p4", "type": "text", "messageID": "str_created", "text": "x" * 200}]},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, content=orjson.dumps(items),
+            headers={"Content-Type": "application/json"},
+        )
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
+                "/slimapi/messages/s1?mode=skeleton", headers=VERSION_HEADERS,
+            )
+        assert response.status_code == 200
+        body = orjson.loads(response.content)
+        ids = [m["info"]["id"] for m in body]
+        # Malformed items (key=0) cluster before valid epoch 2000.
+        # Stable sort preserves upstream order within the key=0 cluster.
+        assert ids == ["no_time", "no_created", "str_created", "valid"], (
+            f"malformed created should sort to front (key 0), got {ids}"
+        )
+    finally:
+        app.state.transforms.shutdown()
+
+
 @pytest.mark.parametrize(
-    ("path", "description"),
+    ("method", "path", "description"),
     [
-        ("/slimapi/messages/s1/full?ids=m1,m2", "batch multi-mid expand (/full?ids=)"),
-        ("/slimapi/messages/s1/since/100", "incremental sync (/since/{ts})"),
+        # messages.py deletions (§1)
+        ("GET", "/slimapi/messages/s1/full?ids=m1,m2", "batch multi-mid expand (/full?ids=)"),
+        ("GET", "/slimapi/messages/s1/since/100", "incremental sync (/since/{ts})"),
+        # sessions.py deletions (§1)
+        ("GET", "/slimapi/sessions/s1/children", "session children"),
+        ("GET", "/slimapi/sessions/s1/status", "single session status"),
+        ("GET", "/slimapi/sessions/status", "batch session status"),
+        ("GET", "/slimapi/projects", "projects discovery"),
+        # questions.py deletions (§1, entire file retired)
+        ("GET", "/slimapi/questions", "questions list"),
+        ("GET", "/slimapi/permissions", "permissions list"),
+        ("POST", "/slimapi/questions/q1/reply", "question reply"),
+        ("POST", "/slimapi/questions/q1/reject", "question reject"),
+        ("POST", "/slimapi/sessions/s1/permissions/p1", "permission reply"),
     ],
-    ids=["full-ids", "since-ts"],
+    ids=[
+        "full-ids", "since-ts",
+        "session-children", "session-status", "sessions-status", "projects",
+        "questions", "permissions",
+        "question-reply", "question-reject", "permission-reply",
+    ],
 )
-async def test_deleted_messages_endpoints_return_404(upstream_factory, path, description):
-    """lite-v2 §1 + §9.3: removed endpoints return 404 because the handlers
-    are no longer registered. Covers both ``/full?ids=`` (batch) and
-    ``/since/{ts}`` (incremental sync) — the two endpoints deleted from
-    messages.py per the lite-v2 plan."""
+async def test_deleted_endpoints_return_404(upstream_factory, method, path, description):
+    """lite-v2 §1 + §9.3: ALL removed endpoints return 404 because the
+    handlers are no longer registered (or the entire router file was deleted).
+    Covers GET and POST methods across messages, sessions, and questions
+    families — 11 paths total, one per HTTP route template in §1."""
     # Handler should never be called: the route does not exist.
     def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
         return httpx.Response(200, content=b"[]")
@@ -1307,10 +1370,11 @@ async def test_deleted_messages_endpoints_return_404(upstream_factory, path, des
     transport = httpx.ASGITransport(app=app)
     try:
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            response = await client.get(path, headers=VERSION_HEADERS)
+            if method == "GET":
+                response = await client.get(path, headers=VERSION_HEADERS)
+            else:
+                response = await client.post(path, headers=VERSION_HEADERS)
         # Unregistered route → FastAPI's default 404 (no handler matched).
-        # Note: this is 404, NOT 405, because the path template itself is
-        # gone — there is no method mismatch, the resource does not exist.
         assert response.status_code == 404, (
             f"{description}: expected 404 for deleted endpoint, got "
             f"{response.status_code}"
