@@ -19,11 +19,7 @@ router = APIRouter(prefix="/slimapi", tags=["metrics"])
 @router.get("/metrics")
 async def metrics(request: Request):
     hubs_snapshot = request.app.state.hubs.snapshot_metrics()
-    batch_ledger = getattr(request.app.state, "batch_ledger", None)
-    if batch_ledger is not None:
-        hubs_snapshot["batch"] = batch_ledger.snapshot()
-    else:
-        hubs_snapshot["batch"] = None
+    hubs_snapshot["batch"] = None
     # Stage D (design §7): expose ``sse.tokenStream.*`` when a token-stream
     # registry is wired. The block sits under the existing ``sse`` umbrella
     # alongside the control-plane ``subscribers`` / ``hubs`` / ``clients``

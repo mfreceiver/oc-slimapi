@@ -199,12 +199,11 @@ class TokenStreamHub:
         # Background flush task (None until start(); cancelled by stop()).
         self._flush_task: asyncio.Task | None = None
         # Stage B v0.6 §Q (per_part_revision independent): per-part
-        # revision maintained LOCALLY by the token hub (GlobalHub's
-        # ``_part_state`` value is NOT consumed — it can be clobbered by
-        # GlobalHub's LRU cap eviction mid-generation). Typed as an
-        # ``OrderedDict`` so the FIFO cap (``TOKEN_DISABLED_MAX``) can be
-        # enforced (MAJOR 5: cap/TTL aligned with ``_nontext_parts`` /
-        # ``_disabled_parts``).
+        # revision maintained LOCALLY by the token hub to resist being
+        # clobbered by GlobalHub's LRU cap eviction mid-generation).
+        # Typed as an ``OrderedDict`` so the FIFO cap
+        # (``TOKEN_DISABLED_MAX``) can be enforced (MAJOR 5: cap/TTL
+        # aligned with ``_nontext_parts`` / ``_disabled_parts``).
         #
         # rev-ogpt CRITICAL 1 (Option B — per-FRAME semantics): every
         # token frame with independent delivery semantics (snapshot /
@@ -447,8 +446,7 @@ class TokenStreamHub:
         ``part_revision`` parameter is **IGNORED** — kept in the signature
         for source back-compat with v0.5 callers. The token hub maintains
         ``_part_revisions[key]`` itself, decoupled from GlobalHub's
-        ``_part_state`` cache (whose per_part_rev value is vulnerable to
-        LRU-cap-eviction-then-re-touch clobbering).
+        part-level state (removed in lite-v2).
 
         rev-ogpt CRITICAL 1 (Option B — per-FRAME): ``on_part_updated``
         does NOT bump ``_part_revisions`` itself — bumps happen lazily

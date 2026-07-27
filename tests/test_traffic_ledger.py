@@ -52,14 +52,6 @@ class TestBucketize:
             # events SSE
             ("/slimapi/events", "events_sse"),
             ("/slimapi/events/foo", "events_sse"),
-            # projects
-            ("/slimapi/projects", "projects"),
-            ("/slimapi/projects/foo", "projects"),
-            # questions / permissions -> quiz
-            ("/slimapi/questions", "quiz"),
-            ("/slimapi/questions/foo", "quiz"),
-            ("/slimapi/permissions", "quiz"),
-            ("/slimapi/permissions/foo", "quiz"),
             # messages
             ("/slimapi/messages", "messages"),
             ("/slimapi/messages/foo", "messages"),

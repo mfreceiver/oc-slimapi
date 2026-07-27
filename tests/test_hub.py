@@ -1398,8 +1398,8 @@ def test_subscriber_put_stop_sentinel_returns_false_on_queue_full():
     """STOP can still fail to enqueue when the queue is full → False.
 
     The pre-v6 implementation suppressed QueueFull and returned None; v6
-    makes that explicit so callers (e.g. notify_reconfigured) do not
-    double-count a dropped STOP as a real emit.
+    makes that explicit so callers do not double-count a dropped STOP as a
+    real emit.
     """
     subscriber = Subscriber(
         queue_items=1, buffer_bytes=4096, max_frame_bytes=4096,
@@ -1408,92 +1408,6 @@ def test_subscriber_put_stop_sentinel_returns_false_on_queue_full():
     assert subscriber.put(sse_frame({"i": 1}, event="test")) is True
     assert subscriber.put(STOP) is False
     assert not subscriber.closed  # the original frame is still queued
-
-
-# ---------------------------------------------------------------------------
-# v6 §3.1 + §3.2: GlobalHub.notify_reconfigured pushes a
-# ``server.reconfigured`` frame per active subscriber; HubRegistry variant
-# does not lazily create a hub when nobody is listening.
-# ---------------------------------------------------------------------------
-
-async def test_notify_reconfigured_pushes_frame_to_active_subscribers(fresh_hub):
-    """Each active subscriber gets one ``server.reconfigured`` frame with the
-    declared ``reason`` and an epoch-ms ``at``; the count is the number of
-    subscribers that actually received it (put returned True)."""
-    hub, subscriber = fresh_hub
-
-    before = hub.emitted_frames_total
-    emitted = hub.notify_reconfigured("discovery_changed")
-    assert emitted == 1
-
-    frame = await asyncio.wait_for(subscriber.queue.get(), timeout=0.2)
-    event_name, data = parse_event(frame)
-    assert event_name == "server.reconfigured"
-    assert data["reason"] == "discovery_changed"
-    assert isinstance(data["at"], int)
-    # Counter increments by the number of *successfully* emitted frames.
-    assert hub.emitted_frames_total == before + 1
-
-
-async def test_notify_reconfigured_returns_zero_when_no_subscribers(fresh_hub):
-    """Empty subscriber set → 0 emitted, counter untouched, no exception."""
-    hub, _ = fresh_hub
-    # Remove the only subscriber so the hub is empty.
-    hub.subscribers.clear()
-    assert hub.notify_reconfigured("discovery_changed") == 0
-    assert hub.emitted_frames_total == 0
-
-
-async def test_hub_registry_notify_reconfigured_if_active_no_hub_is_noop():
-    """If no hub has been created yet, the registry must NOT lazily spin one
-    up just to push a reconfigured notification (v6 §3.2)."""
-    registry = HubRegistry(client=None)
-    try:
-        assert registry._global is None
-        assert registry.notify_reconfigured_if_active("discovery_changed") == 0
-        # Crucially still None — no lazy hub creation.
-        assert registry._global is None
-    finally:
-        await registry.close()
-
-
-async def test_hub_registry_notify_reconfigured_if_active_hub_with_no_subscribers_noop():
-    """Hub exists but nobody is subscribed → 0, no work done."""
-    registry = HubRegistry(client=None)
-    try:
-        # Force-create a hub without subscribing.
-        hub = registry.get_global()
-        assert hub.subscribers == set()
-        assert registry.notify_reconfigured_if_active("discovery_changed") == 0
-        assert hub.emitted_frames_total == 0
-    finally:
-        await registry.close()
-
-
-async def test_hub_registry_notify_reconfigured_if_active_fans_out_to_subscribers():
-    """Hub exists with one subscriber → exactly one frame emitted, counter +1."""
-    registry = HubRegistry(client=None)
-    try:
-        sub = registry.subscribe()
-        hub = registry.get_global()
-        before = hub.emitted_frames_total
-        emitted = registry.notify_reconfigured_if_active("discovery_changed")
-        assert emitted == 1
-        assert hub.emitted_frames_total == before + 1
-        # Subscriber's first queued frame (after the welcome at index 0) is
-        # the reconfigured notification.
-        await subscriber_first_after_welcome(sub)
-    finally:
-        await registry.close()
-
-
-async def subscriber_first_after_welcome(sub):
-    # The welcome frame is index 0; index 1 is whatever the test pushed.
-    _ = await asyncio.wait_for(sub.queue.get(), timeout=0.2)  # welcome
-    second = await asyncio.wait_for(sub.queue.get(), timeout=0.2)
-    event_name, data = parse_event(second)
-    assert event_name == "server.reconfigured"
-    assert data["reason"] == "discovery_changed"
 
 
 # ---------------------------------------------------------------------------
@@ -1550,11 +1464,11 @@ async def test_part_updated_bumps_updatedAt_strictly(fresh_hub, monkeypatch):
     """§9.3: two message.part.updated events in the SAME debounce window
     must produce strictly increasing updatedAt within that window.
 
-    Uses a fixed clock to deterministically verify bump_updated_at's
+    Uses a fixed clock to deterministically verify _bump_updated_at's
     max(now, previous+1) guarantee.
 
-    Note: cross-window (post-flush) strict monotonicity is NOT guaranteed
-    — the client's digest reset protocol handles that edge case."""
+    lite-v2-dev (🟠-2): cross-window (post-flush) strict monotonicity IS
+    now guaranteed per-session via _last_updated_at_by_sid."""
     hub, subscriber = fresh_hub
 
     FIXED = 1700000000000
@@ -1614,27 +1528,46 @@ async def test_part_removed_bumps_updatedAt_strictly(fresh_hub, monkeypatch):
     assert digests[0]["updatedAt"] == FIXED + 1
 
 
-async def test_bump_updated_at_same_ms_collision(monkeypatch):
+async def test_bump_updated_at_same_ms_collision(monkeypatch, fresh_hub):
     """§9.3: deterministic same-ms collision + clock rollback coverage.
-    bump_updated_at uses max(now, previous+1) — never goes backward."""
-    from oc_slimapi.sse.hub import DigestFields, bump_updated_at
+    _bump_updated_at uses max(now, previous+1) — never goes backward.
+    Now testing per-session cross-debounce monotonicity (🟠-2)."""
+    hub, _ = fresh_hub
 
     FIXED = 1234567890
     monkeypatch.setattr("oc_slimapi.sse.hub._now_ms", lambda: FIXED)
 
+    from oc_slimapi.sse.hub import DigestFields
+
     entry = DigestFields()
     # Fresh: previous=0 → max(FIXED, 1) = FIXED
-    bump_updated_at(entry)
+    hub._bump_updated_at("s1", entry)
     assert entry.updated_at == FIXED
+    assert hub._last_updated_at_by_sid.get("s1") == FIXED
 
     # Same-ms: previous=FIXED, now=FIXED → max(FIXED, FIXED+1) = FIXED+1
-    bump_updated_at(entry)
+    hub._bump_updated_at("s1", entry)
     assert entry.updated_at == FIXED + 1
+    assert hub._last_updated_at_by_sid.get("s1") == FIXED + 1
 
     # Clock rollback: now=FIXED-1000, previous=FIXED+1 → max(FIXED-1000, FIXED+2) = FIXED+2
     monkeypatch.setattr("oc_slimapi.sse.hub._now_ms", lambda: FIXED - 1000)
-    bump_updated_at(entry)
+    hub._bump_updated_at("s1", entry)
     assert entry.updated_at == FIXED + 2
+    assert hub._last_updated_at_by_sid.get("s1") == FIXED + 2
+
+    # Cross-debounce (🟠-2): fresh DigestFields for same session must still
+    # produce a value > last session high-water mark.
+    entry2 = DigestFields()
+    hub._bump_updated_at("s1", entry2)
+    assert entry2.updated_at == FIXED + 3  # max(FIXED-1000, max(0, FIXED+2) + 1) = FIXED+3
+    assert entry2.updated_at > FIXED + 2
+    assert hub._last_updated_at_by_sid.get("s1") == entry2.updated_at
+
+    # Different session is independent.
+    entry3 = DigestFields()
+    hub._bump_updated_at("s2", entry3)
+    assert entry3.updated_at == FIXED - 1000  # fresh start for s2
 
 
 async def test_message_removed_does_not_bump_updatedAt(fresh_hub):

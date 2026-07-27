@@ -32,8 +32,6 @@ def _base(**overrides) -> Settings:
         host="127.0.0.1",
         port=4097,
         upstream="http://127.0.0.1:4096",
-        route_secret="x" * 32,
-        route_secret_file=None,
         server_api_version=1,
         accepted_client_versions=(1, 1),
     )

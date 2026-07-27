@@ -155,8 +155,6 @@ class Settings:
     max_transforms: int = int(os.getenv("OC_SLIMAPI_MAX_TRANSFORMS", "1"))
     transform_wait_seconds: float = float(os.getenv("OC_SLIMAPI_TRANSFORM_WAIT_SECONDS", "2"))
     max_response_bytes: int = int(os.getenv("OC_SLIMAPI_MAX_RESPONSE_BYTES", str(64 * 1024 * 1024)))
-    route_secret: str | None = os.getenv("OC_SLIMAPI_ROUTE_SECRET")
-    route_secret_file: str | None = os.getenv("OC_SLIMAPI_ROUTE_SECRET_FILE")
     smoke_session_id: str | None = os.getenv("OC_SLIMAPI_SMOKE_SESSION_ID")
     server_api_version: int = int(os.getenv("OC_SLIMAPI_SERVER_API_VERSION", str(SERVER_API_VERSION)))
     accepted_client_versions: tuple[int, int] = _version_range(
@@ -165,7 +163,6 @@ class Settings:
             f"{ACCEPTED_CLIENT_VERSIONS[0]},{ACCEPTED_CLIENT_VERSIONS[1]}",
         )
     )
-    max_since_pages: int = 5
     # T3 subscriber / SSE-buffer guards (v1 contract §6). All must be strictly
     # positive; total >= per-directory so the broader cap can never be the
     # binding constraint in a single-hub world without making admission
@@ -283,7 +280,7 @@ class Settings:
     def read_deployment_revision(self) -> str | None:
         """Best-effort deployment revision (env or file). Returns None if unset.
         Swallows read errors (non-fatal — health simply omits the field)."""
-        # env wins; else file (support CREDENTIALS_DIRECTORY fallback like route_secret);
+        # env wins; else file (support CREDENTIALS_DIRECTORY fallback);
         # strip whitespace; no length requirement (it's a deploy label, not a secret).
         value: str | None = self.deployment_revision
         if value:
@@ -450,20 +447,5 @@ class Settings:
             raise RuntimeError("OC_SLIMAPI_ACCESS_LOG_MAX_BYTES must be > 0")
         if self.access_log_backups < 0:
             raise RuntimeError("OC_SLIMAPI_ACCESS_LOG_BACKUPS must be >= 0")
-
-    def read_route_secret(self) -> bytes:
-        if self.route_secret:
-            value = self.route_secret.encode()
-        else:
-            path = self.route_secret_file
-            if path is None and os.getenv("CREDENTIALS_DIRECTORY"):
-                path = str(Path(os.environ["CREDENTIALS_DIRECTORY"]) / "route-secret")
-            if not path:
-                raise RuntimeError("route secret is required (env or systemd LoadCredential)")
-            value = Path(path).read_bytes().strip()
-        if len(value) < 32:
-            raise RuntimeError("route secret must contain at least 32 bytes")
-        return value
-
 
 settings = Settings()

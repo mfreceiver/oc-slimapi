@@ -68,13 +68,9 @@ def bucketize(method: str, path: str) -> str:
             return "token_stream_sse"
         if path == "/slimapi/events" or path.startswith("/slimapi/events/"):
             return "events_sse"
-        if path == "/slimapi/projects" or path.startswith("/slimapi/projects/"):
-            return "projects"
-        if path.startswith("/slimapi/questions") or path.startswith("/slimapi/permissions"):
-            return "quiz"
         if path.startswith("/slimapi/messages"):
             return "messages"
-        # Generic /slimapi/sessions/** (list, /status, /children, etc.).
+        # Generic /slimapi/sessions/**.
         if path.startswith("/slimapi/sessions"):
             return "sessions"
         return "other"
@@ -328,19 +324,6 @@ class TrafficLedger:
            accumulators.  Consequently a snapshot taken during an active SSE
            session shows ``downOut > 0`` with ``requests == 0``.  This is a
            known口径 difference, not a bug.
-
-        .. note::
-           **Children-cache blind spot (upIn)**: the per-bucket ``upIn`` for
-           ``sessions`` / ``children`` does **not** include the fetch bytes of
-           the children cache (the single-flight coalesced upstream
-           ``/session/<id>/children`` lookups). Those fetches are not routed
-           through a request whose bucket is ``sessions``/``children``, and
-           attributing them per-bucket would be unfair under single-flight
-           coalescing (one fetch serves many callers). As a result the
-           ``downOutOverUpIn`` ratio for ``sessions``/``children`` is slightly
-           *optimistic* (upstream cost understated). Operators needing the
-           full upstream cost should be aware of this blind spot; it is
-           intentional, not a bug.
 
         Returns ``{"enabled": False}`` when the ledger is disabled.
         """

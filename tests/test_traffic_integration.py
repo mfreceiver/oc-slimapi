@@ -35,7 +35,6 @@ helper lives here (not in ``conftest.py``), and NO source / conftest changes.
 
 from __future__ import annotations
 
-import asyncio
 import os
 
 import httpx
@@ -69,8 +68,6 @@ def _settings(**overrides) -> Settings:
         max_transforms=1,
         transform_wait_seconds=0.5,
         max_response_bytes=64 * 1024,
-        route_secret="x" * 32,
-        route_secret_file=None,
         smoke_session_id=None,
         server_api_version=1,
         accepted_client_versions=(1, 1),
@@ -111,17 +108,12 @@ def _build_app_with_traffic(
         accepted_client_versions=settings.accepted_client_versions,
     )
     app.state.config = settings
-    app.state.route_secret = settings.route_secret.encode()
     app.state.upstream = upstream
     app.state.transforms = TransformPool(TransformConfig(
         max_transforms=settings.max_transforms,
         transform_wait_seconds=settings.transform_wait_seconds,
         max_response_bytes=settings.max_response_bytes,
     ))
-    app.state.directory_allowlist = set()
-    # messages router reads allowlist_ready / schema_degraded off app.state.
-    app.state.allowlist_ready = False
-    app.state.allowlist_lock = asyncio.Lock()
     app.state.schema_degraded = False
     app.state.deployment_revision = None
     app.state.hubs = HubRegistry(upstream)
@@ -409,7 +401,7 @@ def test_traffic_settings_defaults_are_on():
     try:
         s = Settings(
             host="127.0.0.1", port=4097, upstream="http://127.0.0.1:4096",
-            route_secret="x" * 32, route_secret_file=None, smoke_session_id=None,
+            smoke_session_id=None,
             server_api_version=1, accepted_client_versions=(1, 1),
         )
         assert s.traffic_metrics_enabled is True
@@ -446,7 +438,7 @@ def test_traffic_ledger_disabled_via_env_makes_snapshot_disabled(monkeypatch):
     enabled = raw.lower() in ("1", "true", "yes", "on")
     s = Settings(
         host="127.0.0.1", port=4097, upstream="http://127.0.0.1:4096",
-        route_secret="x" * 32, route_secret_file=None, smoke_session_id=None,
+        smoke_session_id=None,
         server_api_version=1, accepted_client_versions=(1, 1),
         traffic_metrics_enabled=enabled,
     )

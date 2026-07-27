@@ -120,8 +120,6 @@ def _settings(**overrides) -> Settings:
         max_transforms=1,
         transform_wait_seconds=0.5,
         max_response_bytes=64 * 1024,
-        route_secret="x" * 32,
-        route_secret_file=None,
         smoke_session_id=None,
         server_api_version=1,
         accepted_client_versions=(1, 1),

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import asyncio
-
 import httpx
 import orjson
 import pytest
@@ -21,7 +19,7 @@ def _settings() -> Settings:
         host="127.0.0.1", port=4097, upstream="http://127.0.0.1:4096",
         max_message_bytes=32 * 1024 * 1024,
         max_transforms=1, transform_wait_seconds=0.5, max_response_bytes=64 * 1024,
-        route_secret="x" * 32, route_secret_file=None, smoke_session_id=None,
+        smoke_session_id=None,
         server_api_version=1, accepted_client_versions=(1, 1),
     )
 
@@ -29,20 +27,11 @@ def _settings() -> Settings:
 def _build_app(
     upstream: httpx.AsyncClient,
     *,
-    allowlist: set[str] | None = None,
     hubs: object | None = None,
-    allowlist_ready: bool = False,
 ) -> FastAPI:
     app = FastAPI(title="oc-slimapi-sessions-test")
     app.state.config = _settings()
-    app.state.route_secret = app.state.config.route_secret.encode()
     app.state.upstream = upstream
-    app.state.directory_allowlist = set(allowlist or ())
-    # v6 §1.3 fixture sync: initialise the same way lifespan does so the
-    # ``load_products`` lock + readiness flag the routes read are always
-    # present (avoids AttributeError on ``allowlist_lock`` / ``allowlist_ready``).
-    app.state.allowlist_ready = allowlist_ready
-    app.state.allowlist_lock = asyncio.Lock()
     app.state.schema_degraded = False
     # Transform pool (mirrors the real app's setup; required for offload).
     app.state.transforms = TransformPool(TransformConfig(
@@ -214,7 +203,7 @@ async def test_sessions_list_unknown_directory_passes_through(upstream_factory):
         return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
 
     upstream = upstream_factory(handler)
-    app = _build_app(upstream, allowlist=set())  # discovery allowlist empty
+    app = _build_app(upstream)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get(
@@ -240,7 +229,7 @@ async def test_sessions_list_normalizes_trailing_slash_before_forward(upstream_f
         return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
 
     upstream = upstream_factory(handler)
-    app = _build_app(upstream, allowlist=set())
+    app = _build_app(upstream)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get(
@@ -355,7 +344,7 @@ async def test_sessions_non_list_payload_returns_503_no_completeness_headers(ups
                                   headers={"Content-Type": "application/json"})
 
         upstream = upstream_factory(handler)
-        app = _build_app(upstream, allowlist={"/a"}, allowlist_ready=True)
+        app = _build_app(upstream)
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.get("/slimapi/sessions", headers=VERSION_HEADERS)

@@ -24,8 +24,6 @@ the former "questions 4xx stash" scenario has been removed accordingly.
 
 from __future__ import annotations
 
-import asyncio
-
 import httpx
 import orjson
 import pytest
@@ -57,8 +55,6 @@ def _settings(**overrides) -> Settings:
         max_transforms=1,
         transform_wait_seconds=0.5,
         max_response_bytes=64 * 1024,
-        route_secret="x" * 32,
-        route_secret_file=None,
         smoke_session_id=None,
         server_api_version=1,
         accepted_client_versions=(1, 1),
@@ -95,11 +91,7 @@ def _build_app(
         accepted_client_versions=settings.accepted_client_versions,
     )
     app.state.config = settings
-    app.state.route_secret = settings.route_secret.encode()
     app.state.upstream = upstream
-    app.state.directory_allowlist = set()
-    app.state.allowlist_ready = False
-    app.state.allowlist_lock = asyncio.Lock()
     app.state.schema_degraded = False
     app.state.deployment_revision = None
     app.state.hubs = HubRegistry(upstream)
@@ -108,7 +100,6 @@ def _build_app(
         transform_wait_seconds=settings.transform_wait_seconds,
         max_response_bytes=settings.max_response_bytes,
     ))
-    app.state.batch_ledger = None
 
     ledger = TrafficLedger()
     app.state.traffic_ledger = ledger

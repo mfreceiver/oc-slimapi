@@ -1288,32 +1288,6 @@ class TestLifecycle:
         finally:
             hub.unsubscribe(sub)
 
-    async def test_notify_reconfigured_pushes_frame_to_active_subscribers(self, pair):
-        """server.reconfigured fans out one frame per active subscriber."""
-        hub, sub = pair
-        emitted = hub.notify_reconfigured("discovery_changed")
-        assert emitted == 1
-        f = await asyncio.wait_for(sub.queue.get(), timeout=0.2)
-        ev_name, data = parse(f)
-        assert ev_name == "server.reconfigured"
-        assert data["reason"] == "discovery_changed"
-        assert isinstance(data["at"], int)
-
-    async def test_notify_reconfigured_zero_when_no_subscribers(self, pair):
-        hub, _ = pair
-        hub.subscribers.clear()
-        assert hub.notify_reconfigured("discovery_changed") == 0
-
-    async def test_registry_notify_reconfigured_if_active_no_hub_is_noop(self):
-        """No hub yet -> registry must NOT lazily spin one up (contract §3)."""
-        registry = HubRegistry(client=None)
-        try:
-            assert registry.snapshot_metrics()["sse"]["hubs"] == []
-            assert registry.notify_reconfigured_if_active("discovery_changed") == 0
-            # Still no hub (public observable) — no lazy creation.
-            assert registry.snapshot_metrics()["sse"]["hubs"] == []
-        finally:
-            await registry.close()
 
 
 # ===========================================================================

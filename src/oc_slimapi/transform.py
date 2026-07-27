@@ -21,7 +21,7 @@ The pool's async-context-manager protocol means a route can write::
     async with request.app.state.transforms as pool:
         response = await upstream.send(..., stream=True)
         body, _ = await read_with_cap(response, pool.config.max_response_bytes)
-        encoded, extra = await pool.offload(project_and_pack, body, single=False, ...)
+        encoded, extra = await pool.offload(project_and_pack, body, ...)
 
 and the admission slot is released on exit even if the upstream errors out.
 
@@ -43,9 +43,7 @@ import orjson
 
 from .skeleton import (
     skeleton_message,
-    skeleton_messages,
     strip_diagnostics_message,
-    strip_diagnostics_messages,
 )
 
 
@@ -79,49 +77,36 @@ def _pack_json(value: Any, accept_encoding: str | None) -> tuple[bytes, dict[str
 
 
 def project_and_pack(
-    body: bytes, *, single: bool, accept_encoding: str | None,
+    body: bytes, *, accept_encoding: str | None,
 ) -> tuple[bytes, dict[str, str]]:
     """Worker entrypoint: ``orjson.loads`` -> projection -> ``dumps`` -> (gzip).
 
-    Used by the single-shot skeleton routes (``GET /messages``,
-    ``GET /messages/{mid}``) where the upstream body arrives as raw bytes and
-    the full chain — including parsing — can run in one worker context.
+    Used by the single-shot skeleton route (``GET /messages/{mid}``) where
+    the upstream body arrives as raw bytes and the full chain — including
+    parsing — can run in one worker context.
     """
     parsed = orjson.loads(body)
-    projected = skeleton_message(parsed) if single else skeleton_messages(parsed)
+    projected = skeleton_message(parsed)
     return _pack_json(projected, accept_encoding)
 
 
-def project_messages_and_pack(
-    messages: list[dict[str, Any]], *, accept_encoding: str | None,
-) -> tuple[bytes, dict[str, str]]:
-    """Worker entrypoint for already-parsed lists (e.g. ``messages_since``).
-
-    ``messages_since`` must parse each page inline to locate the anchor and
-    snapshot id, so by the time it has the merged item list the bytes are
-    already deserialised. This entrypoint skips the redundant
-    ``orjson.loads`` and goes straight to projection + serialize + gzip.
-    """
-    return _pack_json(skeleton_messages(messages), accept_encoding)
-
-
 def strip_diagnostics_and_pack(
-    body: bytes, *, single: bool, accept_encoding: str | None,
+    body: bytes, *, accept_encoding: str | None,
 ) -> tuple[bytes, dict[str, str]]:
-    """Worker entrypoint for ``mode=full`` routes: ``orjson.loads`` → strip the
-    never-consumed LSP ``diagnostics`` map from every part → ``dumps`` → (gzip).
+    """Worker entrypoint for the ``/full`` route: ``orjson.loads`` → strip the
+    never-consumed LSP ``diagnostics`` map from the single message →
+    ``dumps`` → (gzip).
 
-    Mirrors :func:`project_and_pack` but applies the light in-place
-    :func:`strip_diagnostics_message` scrub instead of the skeleton thinning,
-    so a client expanding a thin skeleton fetches the WHOLE part (output /
-    text / files / metadata siblings / ...) minus only the
-    ``state.metadata.diagnostics`` map it never reads. The parse tree is
-    owned solely by this worker (fresh ``orjson.loads``), so strip mutates
-    it in place and skips a full ``deepcopy``.
+    Applies the light in-place :func:`strip_diagnostics_message` scrub instead
+    of the skeleton thinning, so a client expanding a thin skeleton fetches
+    the WHOLE part (output / text / files / metadata siblings / ...) minus
+    only the ``state.metadata.diagnostics`` map it never reads. The parse
+    tree is owned solely by this worker (fresh ``orjson.loads``), so strip
+    mutates it in place and skips a full ``deepcopy``.
 
     Raises :exc:`orjson.JSONDecodeError` on empty / non-JSON bodies — callers
-    (the ``mode=full`` routes) map that to 503 ``upstream_unavailable`` so a
-    bad upstream 200 never escapes as a bare 500. Like the other worker
+    (the ``/full`` route) map that to 503 ``upstream_unavailable`` so a bad
+    upstream 200 never escapes as a bare 500. Like the other worker
     entrypoints this is pure-CPU and runs in the bounded transform executor so
     the event loop stays free for SSE heartbeats.
     """
@@ -129,11 +114,7 @@ def strip_diagnostics_and_pack(
     # zero-length input as an empty document). Do not swallow here — the
     # route layer turns it into a structured 503.
     parsed = orjson.loads(body)
-    projected = (
-        strip_diagnostics_message(parsed)
-        if single
-        else strip_diagnostics_messages(parsed)
-    )
+    projected = strip_diagnostics_message(parsed)
     return _pack_json(projected, accept_encoding)
 
 

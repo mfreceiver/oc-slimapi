@@ -406,7 +406,6 @@ async def message(
                 try:
                     encoded, extra = await pool.offload(
                         strip_diagnostics_and_pack, body,
-                        single=True,
                         accept_encoding=accept_encoding,
                     )
                 except orjson.JSONDecodeError as exc:

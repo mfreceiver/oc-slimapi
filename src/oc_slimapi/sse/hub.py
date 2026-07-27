@@ -128,18 +128,6 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def bump_updated_at(entry: "DigestFields") -> None:
-    """Guarantee ``entry.updated_at`` is strictly monotonic within a session.
-
-    lite-v2 §4.3: client uses strict ``>`` on ``digest.updatedAt`` to trigger
-    skeleton reload, so two events in the same wall-clock ms MUST NOT produce
-    the same value. We take ``max(now, previous + 1)``.
-    """
-    now = _now_ms()
-    previous = entry.updated_at if isinstance(entry.updated_at, int) and not isinstance(entry.updated_at, bool) else 0
-    entry.updated_at = max(now, previous + 1)
-
-
 def _upstream_line_bytes(line: str) -> int:
     """Byte length to attribute to one ``aiter_lines()`` line from the shared
     upstream ``/global/event`` stream.
@@ -350,6 +338,10 @@ class GlobalHub:
         # When None, message.part.delta/updated fall through to the
         # catch-all drop (Stage A: hub still works without a token hub).
         self._token_hub: TokenStreamHub | None = None
+        # lite-v2-dev (🟠-2): per-session monotonic updated_at tracker for
+        # cross-debounce-window sequentiality. Allows _bump_updated_at to
+        # guarantee strict monotonicity even across debounce windows.
+        self._last_updated_at_by_sid: dict[str, int] = {}
         # Stage B (§16-B): per-epoch upstream-loss notification guard.
         # Set to True the first time _notify_upstream_loss() fires after a
         # successful connect; reset to False on every successful (re)connect.
@@ -391,6 +383,27 @@ class GlobalHub:
         # deleted and upstream reconnect (``resync_all``) — same lifetime
         # semantics as the token hub's ``_retired_messages``.
         self._retired_messages: OrderedDict[tuple[str, str], int] = OrderedDict()
+
+    def _bump_updated_at(self, session_id: str, entry: "DigestFields") -> None:
+        """Guarantee ``entry.updated_at`` is strictly monotonic per-session.
+
+        lite-v2 §4.3: client uses strict ``>`` on ``digest.updatedAt`` to trigger
+        skeleton reload, so two events in the same wall-clock ms MUST NOT produce
+        the same value. We take ``max(now, previous + 1)``.
+
+        lite-v2-dev (🟠-2): the monotonicity is now per-session and crosses
+        debounce windows, not just within a single DigestFields entry. The
+        per-session high-water mark ``self._last_updated_at_by_sid[session_id]``
+        ensures that events separated by wall-clock time still produce strictly
+        increasing values.
+        """
+        now = _now_ms()
+        entry_prev = entry.updated_at if isinstance(entry.updated_at, int) and not isinstance(entry.updated_at, bool) else 0
+        session_prev = self._last_updated_at_by_sid.get(session_id, 0)
+        previous = max(entry_prev, session_prev)
+        updated_at = max(now, previous + 1)
+        entry.updated_at = updated_at
+        self._last_updated_at_by_sid[session_id] = updated_at
 
     def ensure_upstream(self) -> None:
         """Start the run / flush / heartbeat tasks if not already running.
@@ -629,6 +642,10 @@ class GlobalHub:
                 # its messages can arrive, and the gate set would leak.
                 for key in [k for k in self._retired_messages if k[0] == session_id]:
                     self._retired_messages.pop(key, None)
+                # lite-v2-dev (🟠-3): pop per-session updated_at high-water
+                # mark — a deleted session's clock state is no longer needed
+                # and would otherwise leak unbounded.
+                self._last_updated_at_by_sid.pop(session_id, None)
             elif event_type == "session.updated":
                 # Contract §3: archived ← session.updated's info.time.archived
                 # (epoch-ms int). Pass-through — same handling as
@@ -676,9 +693,10 @@ class GlobalHub:
             if isinstance(message_id, str):
                 entry.message_id = message_id
             # lite-v2 §4.2: updatedAt is the sidecar's wall-clock observation
-            # time, NOT the upstream message timestamp. Using bump_updated_at
+            # time, NOT the upstream message timestamp. Using _bump_updated_at
             # ensures strict monotonicity within the debounce window.
-            bump_updated_at(entry)
+            # lite-v2-dev (🟠-2): now per-session cross-debounce monotonic.
+            self._bump_updated_at(session_id, entry)
             return
 
         # G1: session.error — immediate digest (with sid) or session.error frame (session-less).
@@ -795,7 +813,8 @@ class GlobalHub:
                         # lite-v2 §4.2/§4.3: bump updatedAt so the client's
                         # strict-``>`` check reloads the skeleton on part
                         # changes. Monotonic within the same wall-clock ms.
-                        bump_updated_at(entry)
+                        # lite-v2-dev (🟠-2): now per-session cross-debounce.
+                        self._bump_updated_at(psid, entry)
                         if self._token_hub is not None:
                             self._token_hub.on_part_updated(props)
                         return
@@ -813,8 +832,9 @@ class GlobalHub:
                     # lite-v2 §4.2/§4.3: bump updatedAt so the client's
                     # strict-``>`` check reloads the skeleton on part
                     # removal. Monotonic within the same wall-clock ms.
+                    # lite-v2-dev (🟠-2): now per-session cross-debounce.
                     entry = self.pending.setdefault(psid, DigestFields())
-                    bump_updated_at(entry)
+                    self._bump_updated_at(psid, entry)
                     # rev-ogpt MAJOR 4: route to the token hub so it can
                     # retire the corresponding LivePart / pending
                     # accumulator / revision. Without this routing the
@@ -881,26 +901,6 @@ class GlobalHub:
             subscriber.put(frame)
         if self.subscribers:
             self.emitted_frames_total += len(self.subscribers)
-
-    def notify_reconfigured(self, reason: str) -> int:
-        """Push one ``server.reconfigured`` frame to every active subscriber.
-
-        Counter increment is keyed on :meth:`Subscriber.put` returning True
-        (frame actually landed on the queue) so a closed/overflowed
-        subscriber does not get counted as an emit. Returns the number of
-        subscribers that successfully received the frame. Used by
-        ``HubRegistry.notify_reconfigured_if_active`` (the only intended
-        caller) to signal a discovery-state change; subscribers must treat
-        it as a cold-start trigger.
-        """
-        frame = sse_frame({"reason": reason, "at": _now_ms()}, event="server.reconfigured")
-        emitted = 0
-        for subscriber in tuple(self.subscribers):
-            if subscriber.put(frame):
-                emitted += 1
-        if emitted:
-            self.emitted_frames_total += emitted
-        return emitted
 
     async def run(self) -> None:
         delay = 1.0
@@ -1140,19 +1140,6 @@ class HubRegistry:
         if self._removal_task is not None:
             return
         self._removal_task = asyncio.create_task(self._remove_hub_after_grace(hub))
-
-    def notify_reconfigured_if_active(self, reason: str) -> int:
-        """Push a ``server.reconfigured`` frame to active subscribers, if any.
-
-        Returns 0 (and **does not** lazily create a GlobalHub) when no hub
-        exists yet or no one is listening. External callers (e.g.
-        ``load_products``) use this so a discovery-state change between
-        connects does not spin up a hub just to push into an empty room.
-        """
-        hub = self._global
-        if hub is not None and hub.subscribers:
-            return hub.notify_reconfigured(reason)
-        return 0
 
     def subscribe(self) -> Subscriber:
         """Admit a new subscriber under T3 caps, then start / reuse the hub.

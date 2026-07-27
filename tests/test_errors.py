@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import asyncio
-
 import httpx
 import pytest
 from fastapi import FastAPI
@@ -17,7 +15,7 @@ def _settings() -> Settings:
         host="127.0.0.1", port=4097, upstream="http://127.0.0.1:4096",
         max_message_bytes=32 * 1024 * 1024,
         max_transforms=1, transform_wait_seconds=0.5, max_response_bytes=64 * 1024,
-        route_secret="x" * 32, route_secret_file=None, smoke_session_id=None,
+        smoke_session_id=None,
         server_api_version=1, accepted_client_versions=(1, 1),
     )
 
@@ -25,13 +23,7 @@ def _settings() -> Settings:
 def _build_app(upstream: httpx.AsyncClient) -> FastAPI:
     app = FastAPI(title="oc-slimapi-errors-test")
     app.state.config = _settings()
-    app.state.route_secret = app.state.config.route_secret.encode()
     app.state.upstream = upstream
-    app.state.directory_allowlist = set()
-    # v6 §1.3 fixture sync: sessions() now reads ``allowlist_ready`` for
-    # the X-Discovery-Ready header; mirror the lifespan initialisation.
-    app.state.allowlist_ready = False
-    app.state.allowlist_lock = asyncio.Lock()
     app.state.schema_degraded = False
     app.include_router(sessions.router)
     # messages router is needed for the directory query/header conflict path,

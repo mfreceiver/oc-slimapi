@@ -685,7 +685,7 @@ class TestPublishIntegration:
 
 
 # ---------------------------------------------------------------------------
-# HubRegistry injection wiring (mirror set_children_cache pattern)
+# HubRegistry injection wiring (mirror set_token_hub pattern)
 # ---------------------------------------------------------------------------
 
 class TestRegistryInjection:

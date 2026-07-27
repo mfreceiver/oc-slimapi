@@ -308,15 +308,6 @@ def strip_diagnostics_message(message: dict[str, Any]) -> dict[str, Any]:
     return message
 
 
-def strip_diagnostics_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    if not isinstance(messages, list):
-        # Non-list body (malformed upstream 200): nothing to iterate.
-        return messages
-    for message in messages:
-        strip_diagnostics_message(message)
-    return messages
-
-
 def _is_renderable(part: dict[str, Any]) -> bool:
     part_type = part.get("type")
     if part_type in {"text", "reasoning"}:

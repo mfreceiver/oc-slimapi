@@ -8,8 +8,8 @@ import pytest
 async def upstream_factory():
     """Build a MockTransport-backed AsyncClient; handler is set per-test.
 
-    Shared across test_errors / test_sessions_routes / test_proxy /
-    test_questions_routes. Mirrors oc_slimapi.upstream.create_client."""
+    Shared across test_errors / test_sessions_routes / test_proxy.
+    Mirrors oc_slimapi.upstream.create_client."""
     clients: list[httpx.AsyncClient] = []
 
     def _make(handler, *, base_url: str = "http://127.0.0.1:4096"):

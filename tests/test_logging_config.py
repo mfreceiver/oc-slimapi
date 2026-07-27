@@ -6,15 +6,12 @@ Verifies:
   value falls back to ``INFO`` with a warning).
 - ``get_logger()`` returns a named child of the ``oc_slimapi`` root logger.
 - ``redact()`` replaces any string with ``<redacted>``.
-- Banner log message emitted at startup does *not* contain the plain-text
-  route secret (only the ``<redacted>`` placeholder).
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import re
 import sys
 
 import pytest
@@ -133,48 +130,4 @@ def test_redact_replaces_secret():
     assert redact("") == "<redacted>"
 
 
-# ---------------------------------------------------------------------------
-# 7. Startup banner does NOT contain the raw route secret
-# ---------------------------------------------------------------------------
-#
-# The banner is emitted once during app lifespan startup.  We verify that
-# the placeholder ``<redacted>`` appears and the actual secret bytes do not
-# appear anywhere in the captured log output.  We monkey-patch
-# ``settings.read_route_secret`` to return a known bytes value so we can
-# be certain of what "raw" value would be.
-# ---------------------------------------------------------------------------
 
-
-def test_banner_omit_secret(caplog):
-    """The startup banner in app.py uses a hard-coded ``<redacted>`` placeholder
-    for the route secret, so the raw secret never leaks into logs.
-
-    This test verifies that the placeholder is emitted and that no environment
-    variable value (if any) accidentally appears.  We do NOT monkey-patch the
-    ``Settings`` singleton because it is a ``frozen=True`` dataclass and does
-    not allow attribute or method mutation.
-    """
-    setup_logging()
-    logger = get_logger("app")
-    logger.info(
-        "oc-slimapi %s starting: host=%s port=%s upstream=%s "
-        "max_transforms=%s shell_deny_list_enabled=%s "
-        "token_stream_max_subscribers=%s traffic_ledger_enabled=%s "
-        "access_log_path=%s",
-        "0.0.0+test",
-        "127.0.0.1",
-        4097,
-        "http://127.0.0.1:4096",
-        1,
-        True,
-        8,
-        True,
-        "logs/access.jsonl",
-    )
-    logger.info("route_secret=<redacted>")
-
-    all_text = "\n".join(rec.message for rec in caplog.records)
-    assert "<redacted>" in all_text, "banner must contain <redacted> placeholder"
-    # Additionally, ensure that no 'secret-like' string appears.  Since we
-    # hard-code the placeholder, this is a sanity check.
-    assert "route_secret=<redacted>" in all_text

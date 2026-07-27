@@ -1,8 +1,7 @@
 """Directory normalisation (core helper).
 
-Lives at package root so both core modules (e.g. ``children_cache``) and
-route handlers can import it without a layering inversion (core importing
-from routes).
+Lives at package root so both core modules and route handlers can import
+it without a layering inversion (core importing from routes).
 """
 
 from __future__ import annotations

@@ -14,7 +14,7 @@ def _settings(**overrides) -> Settings:
         host="127.0.0.1", port=4097, upstream="http://127.0.0.1:4096",
         max_message_bytes=32 * 1024 * 1024,
         max_transforms=1, transform_wait_seconds=0.5, max_response_bytes=64 * 1024,
-        route_secret="x" * 32, route_secret_file=None, smoke_session_id=None,
+        smoke_session_id=None,
         server_api_version=1, accepted_client_versions=(1, 1),
     )
     base.update(overrides)
@@ -24,9 +24,7 @@ def _settings(**overrides) -> Settings:
 def _build_app(settings: Settings, upstream: httpx.AsyncClient) -> FastAPI:
     app = FastAPI(title="oc-slimapi-proxy-test")
     app.state.config = settings
-    app.state.route_secret = settings.route_secret.encode()
     app.state.upstream = upstream
-    app.state.directory_allowlist = set()
     register_error_handlers(app)
     install_proxy(app)
     return app
