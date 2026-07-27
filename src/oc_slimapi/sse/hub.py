@@ -309,6 +309,9 @@ class Subscriber:
         self.queued_bytes = 0
 
 
+_LAST_UPDATED_AT_BY_SID_MAX = 10_000
+
+
 class GlobalHub:
     """One process-wide upstream subscription fanning out curated frames."""
 
@@ -341,7 +344,7 @@ class GlobalHub:
         # lite-v2-dev (🟠-2): per-session monotonic updated_at tracker for
         # cross-debounce-window sequentiality. Allows _bump_updated_at to
         # guarantee strict monotonicity even across debounce windows.
-        self._last_updated_at_by_sid: dict[str, int] = {}
+        self._last_updated_at_by_sid: OrderedDict[str, int] = OrderedDict()
         # Stage B (§16-B): per-epoch upstream-loss notification guard.
         # Set to True the first time _notify_upstream_loss() fires after a
         # successful connect; reset to False on every successful (re)connect.
@@ -404,6 +407,7 @@ class GlobalHub:
         updated_at = max(now, previous + 1)
         entry.updated_at = updated_at
         self._last_updated_at_by_sid[session_id] = updated_at
+        self._last_updated_at_by_sid.move_to_end(session_id)
 
     def ensure_upstream(self) -> None:
         """Start the run / flush / heartbeat tasks if not already running.
@@ -527,6 +531,7 @@ class GlobalHub:
         """
         # Opportunistic TTL/cap prune (no-op when nothing expired).
         self._prune_retired_messages(_now_ms())
+        self._prune_last_updated_at()
         if not self.pending:
             return
         snapshot, self.pending = self.pending, {}
@@ -586,6 +591,21 @@ class GlobalHub:
         # FIFO cap: evict oldest until under limit.
         while len(self._retired_messages) > TOKEN_REMOVED_MESSAGES_MAX:
             self._retired_messages.popitem(last=False)
+
+    def _prune_last_updated_at(self) -> None:
+        """FIFO cap on ``_last_updated_at_by_sid`` to prevent unbounded growth.
+
+        Sessions that produced message/part events but never observed a
+        ``session.deleted`` would accumulate indefinitely. The cap evicts
+        least-recently-updated entries (LRU via ``move_to_end`` in
+        :meth:`_bump_updated_at`); the next event for an evicted session
+        starts a fresh high-water mark — cross-window monotonicity is not
+        guaranteed per contract, so this is safe.
+
+        Called from :meth:`flush` at debounce frequency (4 Hz).
+        """
+        while len(self._last_updated_at_by_sid) > _LAST_UPDATED_AT_BY_SID_MAX:
+            self._last_updated_at_by_sid.popitem(last=False)
 
     def publish(self, global_event: dict[str, Any]) -> None:
         # Count every JSON-decoded upstream event we were asked to consider;
@@ -896,6 +916,7 @@ class GlobalHub:
         # a new epoch; late part events from the dead epoch must be free
         # to create fresh state once the new epoch's events arrive.
         self._retired_messages.clear()
+        self._last_updated_at_by_sid.clear()
         frame = sse_frame({"reason": "reconnect_no_replay"}, event="resync")
         for subscriber in tuple(self.subscribers):
             subscriber.put(frame)
