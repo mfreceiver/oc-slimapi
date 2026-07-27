@@ -563,6 +563,134 @@ class TestTokenStreamRegistryAdmission:
         finally:
             await _close_app(app)
 
+    async def test_attach_failure_does_not_increment_ledger(self):
+        """MAJOR 4: if attach_subscriber leaves sub.closed=True (defensive
+        early-exit, oversized-frame guard armed mid-handshake, or a future
+        Lane-A change), subscribe() must NOT increment total_subscribers —
+        the sub never entered fanout so unsubscribe() would be a no-op
+        against the membership guard and the slot would leak forever
+        (registry drift / admission skew). The route maps the raised
+        capacity error to 503 + Retry-After."""
+        app = _build_app(_settings())
+        try:
+            reg = app.state.token_registry
+            th = app.state.token_hub
+            original_attach = th.attach_subscriber
+
+            def closing_attach(sid, sub):
+                original_attach(sid, sub)
+                sub.closed = True  # simulate post-attach defensive close
+
+            th.attach_subscriber = closing_attach  # type: ignore[method-assign]
+            try:
+                with pytest.raises(TokenSubscriberCapacityError):
+                    reg.subscribe("s1")
+                # MAJOR 4: ledger NOT incremented.
+                assert reg.total_subscribers == 0
+                # The rejection IS counted (parity with cap-overflow path).
+                assert reg.rejected_total == 1
+            finally:
+                th.attach_subscriber = original_attach  # type: ignore[method-assign]
+        finally:
+            await _close_app(app)
+
+    async def test_attach_failure_rolls_back_flush_loop_and_grace(self, monkeypatch):
+        """MAJOR 5: attach failure must roll back the subscribe preamble's
+        side effects — flush loop stop (iff no other subs) + GlobalHub grace
+        re-arm — so no ghost subscriber / leaked flush loop / orphaned
+        upstream connection remains (B-D1 ghost-resource leak).
+
+        This is the integration-level proof (real HubRegistry + GlobalHub):
+        the unit-level ``test_attach_failure_rolls_back_flush_loop`` in
+        ``test_token_subscriber_overflow.py`` covers the flush-stop with a
+        stub hub; here we verify the full chain including grace re-arm.
+        """
+        monkeypatch.setattr("oc_slimapi.sse.hub.GRACE_SECONDS", 0.0)
+        app = _build_app(_settings())
+        try:
+            reg = app.state.token_registry
+            th = app.state.token_hub
+            hubs = app.state.hubs
+            original_attach = th.attach_subscriber
+
+            def closing_attach(sid, sub):
+                original_attach(sid, sub)
+                sub.closed = True
+
+            th.attach_subscriber = closing_attach  # type: ignore[method-assign]
+            try:
+                # Pre-attach: no flush task, no global hub yet.
+                assert th._flush_task is None
+
+                with pytest.raises(TokenSubscriberCapacityError):
+                    reg.subscribe("s1")
+
+                # MAJOR 4: ledger not incremented.
+                assert reg.total_subscribers == 0
+                # MAJOR 5: flush loop STOPPED (no ghost flush task).
+                assert th._flush_task is None, (
+                    "MAJOR 5: flush loop must stop after attach failure"
+                )
+                # MAJOR 5: no ghost subscriber in _subs_by_sid.
+                assert not th._subs_by_sid, (
+                    "MAJOR 5: _subs_by_sid must be empty after attach failure"
+                )
+                # MAJOR 5: GlobalHub grace RE-ARMED (subscribe cancelled it
+                # on entry; rollback must re-arm so the hub tears down
+                # instead of parking on aiter_lines forever).
+                # The upstream ensure created a hub; rollback re-armed
+                # grace → _removal_task scheduled (0.0s grace → fires
+                # immediately on await).
+                removal = hubs._removal_task
+                assert removal is not None, (
+                    "MAJOR 5: grace-removal must be re-armed after attach failure"
+                )
+                await removal  # grace fires → teardown
+                # Hub torn down (no leak).
+                assert hubs._global is None, (
+                    "MAJOR 5: GlobalHub must be torn down after grace re-arm"
+                )
+            finally:
+                th.attach_subscriber = original_attach  # type: ignore[method-assign]
+        finally:
+            await _close_app(app)
+
+    async def test_attach_failure_keeps_flush_loop_if_sibling_subscriber(self):
+        """MAJOR 5: if another token subscriber is already attached, the
+        flush loop must keep running on a sibling's attach failure (the
+        sibling does not affect the attached sub's lifecycle)."""
+        app = _build_app(_settings(token_stream_max_subscribers=3))
+        try:
+            reg = app.state.token_registry
+            th = app.state.token_hub
+            # First sub attaches successfully.
+            ok_sub = reg.subscribe("s1")
+            try:
+                assert th._flush_task is not None
+                original_attach = th.attach_subscriber
+
+                def closing_attach(sid, sub):
+                    original_attach(sid, sub)
+                    sub.closed = True
+
+                th.attach_subscriber = closing_attach  # type: ignore[method-assign]
+                try:
+                    # Second sub attach fails.
+                    with pytest.raises(TokenSubscriberCapacityError):
+                        reg.subscribe("s2")
+                    # MAJOR 4: failed sub did not increment ledger.
+                    assert reg.total_subscribers == 1
+                    # MAJOR 5: flush loop STILL running (s1 keeps it alive).
+                    assert th._flush_task is not None, (
+                        "MAJOR 5: flush loop must NOT stop while a sibling is attached"
+                    )
+                finally:
+                    th.attach_subscriber = original_attach  # type: ignore[method-assign]
+            finally:
+                reg.unsubscribe(ok_sub)
+        finally:
+            await _close_app(app)
+
 
 # ===========================================================================
 # NB-B1 — token subscribe cancels a pending registry grace-removal
@@ -850,6 +978,38 @@ class TestTokenStreamHandshake:
                 assert body["current"] == 1
             finally:
                 reg.unsubscribe(holder)
+        finally:
+            await _close_app(app)
+
+    async def test_handshake_overflow_returns_sse_token_handshake_overflow(
+        self, monkeypatch,
+    ):
+        """Handshake buffer overflow → 503 with ``sse_token_handshake_overflow``
+        code (not ``sse_token_subscriber_limit``)."""
+        from oc_slimapi.sse.tokenstream.subscriber import _SubscriberQueue
+
+        original_init = _SubscriberQueue.__init__
+
+        def tiny_handshake_init(self, *, runtime_max_items, handshake_max_items, handshake_max_bytes):
+            original_init(
+                self,
+                runtime_max_items=runtime_max_items,
+                handshake_max_items=0,         # force handshake overflow on first put
+                handshake_max_bytes=handshake_max_bytes,
+            )
+
+        monkeypatch.setattr(_SubscriberQueue, "__init__", tiny_handshake_init)
+        app = _build_app(_settings(token_stream_max_subscribers=2))
+        try:
+            response = await _get(app, "/slimapi/sessions/s1/stream",
+                                  extra_headers={"Accept-Encoding": "identity"})
+            assert response.status_code == 503
+            assert response.headers["Retry-After"] == "5"
+            body = response.json()
+            assert body["code"] == "sse_token_handshake_overflow"
+            assert body["limit"] == 2
+            assert body["current"] == 0
+            assert body["bufferBytes"] == 8 * 1024 * 1024
         finally:
             await _close_app(app)
 
@@ -1232,6 +1392,23 @@ class TestNBC1MultiSeedEviction:
         sub_frames: list[bytes] = []
 
         class _Spy:
+            """Minimal sub stub for NB-C1 hub-level eviction tests.
+
+            Mirrors the hub→sub contract (``begin_handshake`` /
+            ``end_handshake`` / ``put`` / ``closed``); the CRITICAL 3
+            handshake/runtime queue physical separation lives inside
+            ``TokenSubscriber`` and is exercised separately by
+            ``test_token_subscriber_overflow.py``.
+            """
+            _in_handshake = False
+            closed = False
+
+            def begin_handshake(self):
+                self._in_handshake = True
+
+            def end_handshake(self):
+                self._in_handshake = False
+
             def put(self, frame):
                 sub_frames.append(frame)
                 return True

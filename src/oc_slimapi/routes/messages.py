@@ -988,8 +988,73 @@ async def message(
     request: Request, sid: str, mid: str,
     mode: Literal["skeleton", "full"] = "full",
     directory: str | None = None,
+    known_max_part_id: str | None = Query(None, alias="known.maxPartId"),
+    known_part_count: int | None = Query(None, alias="known.partCount", ge=0),
+    known_message_event_seq: int | None = Query(
+        None, alias="known.messageEventSeq", ge=0,
+    ),
 ):
     directory = await _resolve_messages_directory(request, directory)
+    # Resolve the global hub ONCE up front: both the 304 short-circuit and
+    # the X-Message-Event-Seq header on the 200 path need it. Access the
+    # registry's ``_global`` attribute directly so a cache miss does NOT
+    # lazily create a hub (a request must not have the side effect of
+    # spinning up the upstream subscription just to read the fingerprint).
+    registry = getattr(request.app.state, "hubs", None)
+    hub = getattr(registry, "_global", None) if registry is not None else None
+    # Stage B v0.4 (CRITICAL 1 fix): single-message fingerprint 304
+    # short-circuit. The client sends ``known.maxPartId`` +
+    # ``known.partCount`` + ``known.messageEventSeq`` representing the
+    # part fingerprint + message-level monotonic seq it already has; if
+    # the sidecar's ``_part_state`` cache agrees EXACTLY on all three,
+    # return 304 (no body) so the client reuses its local copy. Any
+    # mismatch / partial params / no cache hit → fall through to the
+    # normal full body flow.
+    #
+    # Why all three are required: maxPartId+partCount alone cannot detect
+    # a same-part text append (count + max unchanged, but content did)
+    # nor a part-swap (count unchanged, max coincidentally same).
+    # messageEventSeq is a strict-monotone counter bumped by every
+    # message.part.updated / message.part.removed — it catches every
+    # content-affecting event even when the (maxPartId, partCount)
+    # projection coincidentally matches. ``mode`` is intentionally
+    # orthogonal (a skeleton-mode caller may still 304 — the fingerprint
+    # is about upstream state, not the projection); schema_degraded
+    # forcing ``mode = "full"`` runs after this guard so the 304 path is
+    # honoured regardless of degraded state.
+    if (
+        known_max_part_id is not None
+        and known_part_count is not None
+        and known_message_event_seq is not None
+        and hub is not None
+    ):
+        fp = hub.get_part_fingerprint(sid, mid)
+        if fp is not None and fp == (
+            known_max_part_id, known_part_count, known_message_event_seq,
+        ):
+            return Response(
+                None, status_code=304,
+                headers={"Cache-Control": "no-store"},
+            )
+        # Mismatch or no cache hit → continue with normal full body.
+    # Stage B v0.5 §M (MAJOR 3 fix): X-Message-Event-Seq header stability.
+    # Sample seq BEFORE the body fetch, then again AFTER (transform done,
+    # before Response construction). If they match, emit seq_post
+    # (trustworthy snapshot for the body we're returning). If they differ,
+    # a part event arrived during the await (body fetch / transform) and
+    # the body no longer corresponds to the pre-await seq — emit ``0``
+    # (clients treat 0 as "no trustworthy baseline" → R1). Without this
+    # check the header would silently describe a stale seq while the body
+    # reflected newer content (or vice versa).
+    #
+    # ``0`` is also the cold-start / no-cache value (no fingerprint), so
+    # the ``seq_pre == seq_post == 0`` case naturally maps to "no
+    # information, R1" — symmetric with reconnect / post-deleted.
+    seq_pre = 0
+    if hub is not None:
+        fp_pre = hub.get_part_fingerprint(sid, mid)
+        if fp_pre is not None:
+            seq_pre = fp_pre[2]
     if request.app.state.schema_degraded:
         mode = "full"
     config = request.app.state.config
@@ -1054,9 +1119,23 @@ async def message(
                         ) from exc
                 finally:
                     await response.aclose()
+            # Stage B v0.5 §M: re-sample AFTER the body fetch + transform.
+            # If a part event arrived during the await, seq_post ≠ seq_pre
+            # → emit 0 so the client R1s rather than trusting a stale
+            # header that does not correspond to the returned body.
+            seq_post = 0
+            if hub is not None:
+                fp_post = hub.get_part_fingerprint(sid, mid)
+                if fp_post is not None:
+                    seq_post = fp_post[2]
+            msg_event_seq = seq_post if seq_pre == seq_post else 0
             return Response(
                 encoded, status_code=status_code, media_type="application/json",
-                headers={"Cache-Control": "no-store", **extra},
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-Message-Event-Seq": str(msg_event_seq),
+                    **extra,
+                },
             )
         except TransformBusy:
             return _busy_response(accept_encoding)
@@ -1084,9 +1163,21 @@ async def message(
                 )
             finally:
                 await response.aclose()
+        # Stage B v0.5 §M: re-sample AFTER the body fetch + transform
+        # (skeleton path). Same stability check as the full-mode branch.
+        seq_post = 0
+        if hub is not None:
+            fp_post = hub.get_part_fingerprint(sid, mid)
+            if fp_post is not None:
+                seq_post = fp_post[2]
+        msg_event_seq = seq_post if seq_pre == seq_post else 0
         return Response(
             encoded, status_code=200, media_type="application/json",
-            headers={"Cache-Control": "no-store", **extra},
+            headers={
+                "Cache-Control": "no-store",
+                "X-Message-Event-Seq": str(msg_event_seq),
+                **extra,
+            },
         )
     except TransformBusy:
         return _busy_response(request.headers.get("accept-encoding"))

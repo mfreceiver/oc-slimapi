@@ -62,11 +62,68 @@ TOKEN_DISABLED_TTL_MS = TOKEN_DISABLED_TTL_S * 1000
 # dropped when the cap is exceeded (the newest resync reason is the most
 # relevant — clients cold-start on any resync regardless).
 TOKEN_RESYNC_QUEUE_CAP = 64
+# Stage B v0.6 §P.2 (MAJOR 4 方案 C): bounded replay queue for upstream
+# ``message.removed`` tombstones — lets a token-stream subscriber that
+# attaches AFTER a removal (or reconnects post-upstream-loss) learn about
+# it during the handshake. Global FIFO cap + 24h TTL bound memory across
+# a long-running sidecar; on-insert prune + ttl_sweep hook keep both
+# invariants enforced (see TokenStreamHub._prune_removed_messages /
+# ttl_sweep).
+TOKEN_REMOVED_MESSAGES_MAX = 1000                # global FIFO cap
+TOKEN_REMOVED_MESSAGES_TTL_MS = 24 * 60 * 60 * 1000   # 24 h TTL
 # Default per-frame byte ceiling for token-stream frames (design §6). Mirrors
 # Settings.token_stream_max_frame_bytes; Stage D wires the env-overridable
 # value through TokenStreamHub's constructor. Code-level here so TokenStreamHub
 # has a sensible default for tests / unwired state.
 DEFAULT_TOKEN_MAX_FRAME_BYTES = 1024 * 1024    # 1 MiB
+
+# CRITICAL 2 (rev-ogpt round-3): handshake buffer caps for the per-subscriber
+# _SubscriberQueue handshake deque.
+#   * Item cap (2048): MUST accommodate the full §5.5 handshake quantity
+#     upper bound — server.connected + tombstone replay batch
+#     (TOKEN_REMOVED_MESSAGES_MAX, all matching the sid worst case)
+#     + 1 snapshot per active LivePart (TOKEN_LIVE_PARTS_MAX).
+#     A static assertion below enforces this.
+#   * Byte cap (8 MiB): a fail-safe resource limit, NOT guaranteed to
+#     always cover the full §5.5 pre-fill. In extreme scenarios (32 near-
+#     1 MiB snapshot frames with JSON escaping amplification) it may be
+#     insufficient — overflow triggers a safe 503
+#     ``sse_token_handshake_overflow`` (no silent frame loss).
+# The previous default (256 items) was DETERMINISTICALLY too small: a sid
+# with 256+ removed messages caused drop-oldest to evict server.connected
+# (the FIRST frame), leaving the subscriber in an unrecoverable state (no
+# connection-establishment frame, no resync marker). Overflow now FAILS
+# LOUD (sub.closed → attach bails → 503 retry) rather than silently dropping.
+TOKEN_HANDSHAKE_ITEMS = 2048
+TOKEN_HANDSHAKE_BUFFER_BYTES = 8 * 1024 * 1024    # 8 MiB
+
+# Guard: the revision cap (_part_revisions, bounded by TOKEN_DISABLED_MAX)
+# must never be smaller than the LivePart count cap, otherwise a still-alive
+# LivePart's revision can be evicted under FIFO pressure, causing the next
+# update to reset it to 0 (revision regression bug). Defaults satisfy this
+# easily (32 <= 4096); the assertion catches misconfigured code-level edits.
+assert TOKEN_LIVE_PARTS_MAX <= TOKEN_DISABLED_MAX, (
+    f"TOKEN_LIVE_PARTS_MAX ({TOKEN_LIVE_PARTS_MAX}) must be <= "
+    f"TOKEN_DISABLED_MAX ({TOKEN_DISABLED_MAX}) to prevent revision-cap "
+    "eviction of still-living PartKeys"
+)
+# CRITICAL 2 guard: the handshake item cap must accommodate the FULL §5.5
+# pre-fill — server.connected + the entire tombstone replay batch
+# (TOKEN_REMOVED_MESSAGES_MAX, all matching the sid worst case) + one
+# snapshot per active LivePart (TOKEN_LIVE_PARTS_MAX). A cap smaller than
+# this sum deterministically evicts server.connected on a tombstone-heavy
+# sid → unrecoverable subscriber state.
+assert TOKEN_HANDSHAKE_ITEMS >= (
+    TOKEN_REMOVED_MESSAGES_MAX + 1 + TOKEN_LIVE_PARTS_MAX
+), (
+    f"TOKEN_HANDSHAKE_ITEMS ({TOKEN_HANDSHAKE_ITEMS}) must be >= "
+    f"TOKEN_REMOVED_MESSAGES_MAX ({TOKEN_REMOVED_MESSAGES_MAX}) + 1 "
+    f"(server.connected) + TOKEN_LIVE_PARTS_MAX ({TOKEN_LIVE_PARTS_MAX}) "
+    "= full §5.5 handshake pre-fill ceiling (CRITICAL 2)"
+)
+assert TOKEN_HANDSHAKE_BUFFER_BYTES > 0, (
+    "TOKEN_HANDSHAKE_BUFFER_BYTES must be > 0"
+)
 
 
 def _version_range(value: str) -> tuple[int, int]:
@@ -122,8 +179,14 @@ class Settings:
     sse_max_frame_bytes: int = int(os.getenv("OC_SLIMAPI_SSE_MAX_FRAME_BYTES", str(256 * 1024)))
     # Token-stream SSE (design-token-stream.md §6): independent per-session
     # opt-in stream for live text-part deltas. Own ledger — does NOT consume
-    # MAX_TOTAL_SUBSCRIBERS. Worst case 8 × 512KiB queues + 8MiB accumulators
-    # (4 live + 4 pending, Stage E split) = 12MiB (contract §6 addendum).
+    # MAX_TOTAL_SUBSCRIBERS. Worst case:
+    #   8 × (512KiB queue + 8MiB handshake buffer) + 4MiB live + 4MiB pending
+    #   = 76 MiB
+    # (MAJOR 2) Handshake buffer (8 MiB) may be insufficient in extreme
+    #   scenarios: 32 near-1 MiB snapshot frames (TOKEN_LIVE_PARTS_MAX) with
+    #   JSON escaping amplification. In practice 32 near-1 MiB text parts in
+    #   a single session is extremely rare — when it happens the handshake
+    #   overflow fails safe (503, not silent drop).
     # Module-level budget constants (flush / heartbeat / memory caps) live
     # below this class.
     token_stream_max_subscribers: int = int(
@@ -341,6 +404,17 @@ class Settings:
         if self.token_stream_debug_live_parts_max is not None and self.token_stream_debug_live_parts_max <= 0:
             raise RuntimeError(
                 "OC_SLIMAPI_TOKEN_STREAM_DEBUG_LIVE_PARTS_MAX must be > 0 when set"
+            )
+        if (
+            self.token_stream_debug_live_parts_max is not None
+            and self.token_stream_debug_live_parts_max > TOKEN_DISABLED_MAX
+        ):
+            raise RuntimeError(
+                f"OC_SLIMAPI_TOKEN_STREAM_DEBUG_LIVE_PARTS_MAX "
+                f"({self.token_stream_debug_live_parts_max}) must be <= "
+                f"TOKEN_DISABLED_MAX ({TOKEN_DISABLED_MAX}) — otherwise "
+                "the revision cap can evict a still-living PartKey, "
+                "causing revision regression (MINOR 6)"
             )
 
         # Opt-A rollback / retry-after guards (v0.3.1, additive).

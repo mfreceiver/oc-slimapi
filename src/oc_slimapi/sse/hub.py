@@ -28,6 +28,7 @@ populated from :class:`oc_slimapi.config.Settings`.
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from dataclasses import dataclass, field
 import contextlib
 import re
@@ -38,6 +39,10 @@ from typing import TYPE_CHECKING, Any
 import httpx
 import orjson
 
+from oc_slimapi.config import (
+    TOKEN_REMOVED_MESSAGES_MAX,
+    TOKEN_REMOVED_MESSAGES_TTL_MS,
+)
 from oc_slimapi.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -114,6 +119,15 @@ DEBOUNCE_SECONDS = 0.25
 HEARTBEAT_SECONDS = 10.0
 GRACE_SECONDS = 30.0
 
+# Stage B v0.4 (MAJOR 5 fix): per-session LRU cap on the part-state cache.
+# Each entry is small (~tens of bytes per part + per-message overhead), but
+# unbounded growth across a long-running session with many messages would
+# leak. When a session accumulates more than this many message entries, the
+# oldest-inserted message (FIFO ≈ LRU for creation-order traffic) is
+# evicted. 500 messages/session is comfortably above any realistic
+# "current open session" working set.
+_PART_STATE_MAX_MESSAGES_PER_SESSION = 500
+
 
 def sse_frame(payload: dict[str, Any], event: str | None = None) -> bytes:
     prefix = f"event: {event}\n" if event else ""
@@ -172,6 +186,13 @@ class DigestFields:
     children_version: int | None = None
     deleted: bool = False
     last_error: Any = _UNSET  # three-state: _UNSET=omit, None=explicit clear, dict=object
+    # Stage B v0.4 (CRITICAL 2 fix): debounce window → touched messageID →
+    # ``messageEventSeq`` (message-level monotonic event counter, NOT the
+    # v1 ``max(per-part revision)`` which was non-monotonic across parts).
+    # Wire field renamed ``partEventRevisions`` → ``contentRevisions``.
+    # Empty dict → ``to_payload`` omits the field (back-compat: a digest
+    # with no part events keeps the historical wire shape).
+    content_revisions: dict[str, int] = field(default_factory=dict)
 
     def to_payload(self, session_id: str) -> dict[str, Any]:
         payload: dict[str, Any] = {"sessionID": session_id}
@@ -191,6 +212,10 @@ class DigestFields:
             payload["deleted"] = True
         if self.last_error is not _UNSET:
             payload["lastError"] = self.last_error
+        if self.content_revisions:
+            # Copy so later mutations to the entry do not retroactively
+            # change the already-emitted frame dict (defensive isolation).
+            payload["contentRevisions"] = dict(self.content_revisions)
         return payload
 
 
@@ -362,6 +387,59 @@ class GlobalHub:
         self.upstream_events_total = 0
         self.emitted_frames_total = 0
         self.reconnects_total = 0
+        # Stage B v0.4 (P0-3 messageEventSeq + MAJOR 5 cap): per-session
+        # per-message part state cache, fed from ``message.part.updated`` /
+        # ``message.part.removed`` events. Drives:
+        #   * digest ``contentRevisions`` (message-level messageEventSeq)
+        #   * ``/full/{mid}?known=`` 304 fingerprint (maxPartId, partCount,
+        #     messageEventSeq) + ``X-Message-Event-Seq`` response header
+        # Structure: {sessionID: {messageID: {"parts": {partID: per_part_rev},
+        #                                       "seq": messageEventSeq_int}}}
+        # ``seq`` (v0.5 §K): assigned from the per-session GLOBAL counter
+        # ``_session_event_seq`` — monotonic across all messages in the
+        # session, survives LRU eviction of individual messages. v0.4
+        # bumped seq per-message which broke monotonicity after eviction
+        # + re-touch (CRITICAL 1).
+        # ``per_part_rev`` (parts map) is independent: new part = 0, that
+        # part's updated += 1. This counter is a GlobalHub-internal
+        # redundant counter — it is NO longer forwarded to the token hub
+        # or used for token-frame dedup. Token-frame dedup uses
+        # per-frame revision (``TokenStreamHub._next_part_revision``).
+        # reconnect → ``.clear()`` so clients R1 /full-rebuild (no replay).
+        # Per-session LRU cap (``_PART_STATE_MAX_MESSAGES_PER_SESSION``):
+        # evict the oldest-inserted message when over cap (FIFO ≈ LRU for
+        # the creation-order pattern) — bounds memory across long sessions.
+        self._part_state: dict[str, dict[str, dict[str, Any]]] = {}
+        # Stage B v0.5 §K (CRITICAL 1 fix): per-session GLOBAL monotonic
+        # event counter. Bumped by every ``message.part.updated`` /
+        # ``message.part.removed`` for ANY message in the session. The
+        # current value is assigned to ``_part_state[sid][mid]["seq"]``
+        # (and to ``content_revisions[mid]`` in the debounce window).
+        # Because the counter is per-session (not per-message), evicting
+        # an individual message from the LRU cap and re-touching it later
+        # assigns the NEXT global value (strictly greater than any
+        # previously observed seq) — v0.4's per-message counter restarted
+        # at 1, breaking client strict-``>`` drift detection.
+        # ``resync_all()`` clears this (reconnect = new epoch, client
+        # treats subsequent seq as untrusted → R1).
+        self._session_event_seq: dict[str, int] = {}
+        # rev-ogpt MAJOR 3 + MAJOR 4 (3rd-round terminal audit): bounded
+        # gate of retired (sessionID, messageID) tuples. Populated by
+        # ``message.removed``; checked by ``message.part.updated`` to
+        # prevent late part events from resurrecting a deleted message's
+        # fingerprint in ``_part_state`` and ``content_revisions``.
+        #
+        # Typed as an ``OrderedDict`` keyed by (sid, mid) → insertion
+        # timestamp (epoch-ms) so the gate can be capped + TTL-evicted
+        # in lockstep with the token hub's bounded replay queue (same
+        # ``TOKEN_REMOVED_MESSAGES_MAX`` FIFO cap and
+        # ``TOKEN_REMOVED_MESSAGES_TTL_MS`` TTL). v0.5 used a plain
+        # ``set`` which leaked unbounded across long-running processes.
+        # Pruned on-insert (see :meth:`_prune_retired_messages`) and
+        # opportunistically from :meth:`flush`. Cleared on session
+        # deleted and upstream reconnect (``resync_all``) — same lifetime
+        # semantics as the token hub's ``_retired_messages``.
+        self._retired_messages: OrderedDict[tuple[str, str], int] = OrderedDict()
 
     def ensure_upstream(self) -> None:
         """Start the run / flush / heartbeat tasks if not already running.
@@ -475,7 +553,16 @@ class GlobalHub:
             self.emitted_frames_total += len(self.subscribers)
 
     def flush(self) -> None:
-        """Flush every pending digest (debounce loop)."""
+        """Flush every pending digest (debounce loop).
+
+        rev-ogpt MAJOR 4 (3rd-round): opportunistically prunes the
+        ``_retired_messages`` gate so its TTL is enforced even when no
+        new ``message.removed`` arrives for a long time. The prune is
+        O(N) but ``N`` is capped at ``TOKEN_REMOVED_MESSAGES_MAX`` (1000)
+        and the loop runs at 4 Hz (DEBOUNCE_SECONDS=0.25s) — negligible.
+        """
+        # Opportunistic TTL/cap prune (no-op when nothing expired).
+        self._prune_retired_messages(_now_ms())
         if not self.pending:
             return
         snapshot, self.pending = self.pending, {}
@@ -507,6 +594,135 @@ class GlobalHub:
         onto any hub constructed later via :meth:`HubRegistry.get`).
         """
         self._token_hub = token_hub
+
+    def get_part_fingerprint(self, sid: str, mid: str) -> tuple[str, int, int] | None:
+        """Return ``(maxPartId, partCount, messageEventSeq)`` or ``None``.
+
+        Used by ``/full/{mid}?known=`` (R2 single-message 304) and the
+        ``X-Message-Event-Seq`` response header. Three components:
+
+        * ``maxPartId`` — lexicographic max of partIDs (opencode
+          ``PartID = Identifier.ascending("part")`` produces IDs whose
+          string dictionary order equals creation order, so the
+          lexicographic max is also the newest part). ``""`` when the
+          message has no parts (all removed via ``message.part.removed``).
+        * ``partCount`` — number of partIDs known to the cache for this
+          message (0 when empty).
+        * ``messageEventSeq`` — message-level monotonic event counter
+          (CRITICAL 2 fix, v0.4): bumped by every
+          ``message.part.updated`` / ``message.part.removed`` event for
+          this message. Client uses strict ``>`` to detect drift
+          reliably even when ``maxPartId`` / ``partCount`` happen to
+          match (e.g. same part text-appended, or a part removed then a
+          new one created with the same count).
+
+        Returns ``None`` when the sidecar has no cached part state for
+        ``(sid, mid)`` (cold start, post reconnect, post
+        ``session.deleted``, post ``message.removed``) — caller falls
+        through to a normal 200 full body and emits
+        ``X-Message-Event-Seq: 0``.
+        """
+        msg_entry = self._part_state.get(sid, {}).get(mid)
+        if msg_entry is None:
+            return None
+        parts = msg_entry.get("parts") or {}
+        return (
+            max(parts.keys()) if parts else "",
+            len(parts),
+            int(msg_entry.get("seq", 0)),
+        )
+
+    def _bump_session_event_seq(self, session_id: str) -> int:
+        """Stage B v0.5 §K (CRITICAL 1 fix): bump the per-session GLOBAL
+        monotonic event counter and return the new value.
+
+        Used as the lower-level helper under :meth:`_bump_message_seq` AND
+        directly by ``message.part.removed`` for an unknown/evicted message
+        (§L MAJOR 2 fix) where we must advance the seq + emit digest
+        WITHOUT creating a ``_part_state`` entry for a message that no
+        longer exists upstream.
+
+        Monotonicity: the counter is per-session, never decreases, and is
+        NOT reset by LRU eviction of individual messages (only by
+        :meth:`resync_all` on reconnect). v0.4's per-message counter
+        restarted at 1 after eviction + re-touch, breaking client
+        strict-``>`` drift detection and enabling ABA false-304s.
+        """
+        new_seq = self._session_event_seq.get(session_id, 0) + 1
+        self._session_event_seq[session_id] = new_seq
+        return new_seq
+
+    def _prune_retired_messages(self, now_ms: int) -> None:
+        """rev-ogpt MAJOR 4 (3rd-round terminal audit): enforce FIFO cap +
+        TTL on the ``_retired_messages`` gate.
+
+        Mirrors :meth:`TokenStreamHub._prune_removed_messages` so the
+        GlobalHub gate and the token-hub replay queue share identical
+        lifetime semantics (``TOKEN_REMOVED_MESSAGES_MAX`` FIFO cap +
+        ``TOKEN_REMOVED_MESSAGES_TTL_MS`` TTL). Without this alignment the
+        GlobalHub gate was a plain ``set`` that leaked unbounded across
+        long-running processes (only ``session.deleted`` and
+        ``resync_all`` cleared it).
+
+        Called on-insert (from :meth:`publish` ``message.removed`` branch)
+        and opportunistically from :meth:`flush` so the TTL is enforced
+        even when no new ``message.removed`` arrives for a long time.
+        Oldest-first eviction relies on the ``OrderedDict`` preserving
+        insertion order (refreshed by ``move_to_end`` on duplicate
+        inserts for FIFO correctness).
+        """
+        cutoff = now_ms - TOKEN_REMOVED_MESSAGES_TTL_MS
+        # TTL: drop entries whose timestamp predates the cutoff.
+        expired = [k for k, ts in self._retired_messages.items() if ts < cutoff]
+        for k in expired:
+            self._retired_messages.pop(k, None)
+        # FIFO cap: evict oldest until under limit.
+        while len(self._retired_messages) > TOKEN_REMOVED_MESSAGES_MAX:
+            self._retired_messages.popitem(last=False)
+
+    def _bump_message_seq(self, session_id: str, message_id: str) -> dict[str, Any]:
+        """Get-or-create the ``_part_state[sessionID][messageID]`` entry,
+        bump the per-session GLOBAL seq (§K), assign that value to the
+        message's ``seq`` field, and enforce the per-session LRU cap.
+
+        Returns the message entry dict ``{"parts": {...}, "seq": int}`` so
+        callers can mutate ``parts`` (per-part revision) or read ``seq``.
+        The LRU cap evicts the oldest-inserted message when the session
+        exceeds ``_PART_STATE_MAX_MESSAGES_PER_SESSION`` (FIFO ≈ LRU for
+        creation-order traffic). Evicted messages' fingerprint is lost —
+        clients fall back to a 200 + R1 rebuild, which is correct (the
+        cache is informational, not authoritative).
+
+        Stage B v0.5 §K: ``seq`` is now assigned from the per-session
+        global counter (``_session_event_seq``), NOT incremented per-
+        message. Consequence: evicting a message from the LRU cap and
+        re-touching it later assigns the NEXT global value (strictly
+        greater than any previously observed seq for that session) — the
+        v0.4 per-message counter restarted at 1, breaking monotonicity
+        and enabling ABA false-304s.
+        """
+        new_seq = self._bump_session_event_seq(session_id)
+        session_msgs = self._part_state.setdefault(session_id, {})
+        msg_entry = session_msgs.get(message_id)
+        if msg_entry is None:
+            msg_entry = {"parts": {}, "seq": 0}
+            session_msgs[message_id] = msg_entry
+            # Enforce LRU cap ONLY on new-message insertion (existing
+            # messages updating in place do not grow the count). Evict
+            # oldest-inserted via dict iteration order (FIFO).
+            while len(session_msgs) > _PART_STATE_MAX_MESSAGES_PER_SESSION:
+                oldest_mid = next(iter(session_msgs))
+                # Defensive: never evict the message we just inserted —
+                # the cap is 500 so this branch is unreachable in
+                # practice, but keeps the loop terminating.
+                if oldest_mid == message_id:
+                    break
+                session_msgs.pop(oldest_mid, None)
+        # §K: assign from global counter (not local increment). The LRU
+        # eviction above does NOT touch ``_session_event_seq`` — that's
+        # the whole point of the v0.5 fix.
+        msg_entry["seq"] = new_seq
+        return msg_entry
 
     def publish(self, global_event: dict[str, Any]) -> None:
         # Count every JSON-decoded upstream event we were asked to consider;
@@ -558,6 +774,20 @@ class GlobalHub:
                 # G1: deleted pops sticky; digest omits lastError.
                 self.sticky_last_error.pop(session_id, None)
                 entry.last_error = _UNSET
+                # Stage B (P0-3 partEventRevision): drop part state for the
+                # deleted session so subsequent ``/full/{mid}?known=`` for
+                # its messages can no longer 304 (clients must rebuild via
+                # authoritative state once the session is gone).
+                self._part_state.pop(session_id, None)
+                # Stage B v0.5 §K: also drop the per-session global seq
+                # counter — the session is gone, its counter will never
+                # be needed again and would otherwise leak.
+                self._session_event_seq.pop(session_id, None)
+                # rev-ogpt MAJOR 3: clear retired-message gates for this
+                # session — the session is gone, no late part events for
+                # its messages can arrive, and the gate set would leak.
+                for key in [k for k in self._retired_messages if k[0] == session_id]:
+                    self._retired_messages.pop(key, None)
             elif event_type == "session.updated":
                 # Contract §3: archived ← session.updated's info.time.archived
                 # (epoch-ms int). Pass-through — same handling as
@@ -687,7 +917,176 @@ class GlobalHub:
         # the control-plane branches above untouched AND prevents these
         # high-frequency events from polluting the curated digest. When no
         # token hub is wired, behaviour is unchanged (events are dropped).
-        if event_type in ("message.part.delta", "message.part.updated"):
+        #
+        # Stage B v0.4 (CRITICAL 1+2 + MAJOR 5):
+        #   * ``message.part.updated`` maintains ``_part_state`` (per-part
+        #     revision — GlobalHub internal counter only, NOT forwarded to
+        #     token hub — AND message-level messageEventSeq) and writes
+        #     ``content_revisions[mid] = seq`` into the
+        #     debounce window so ``session.digest`` carries
+        #     ``contentRevisions`` and ``/full/{mid}?known=`` can
+        #     short-circuit a 304 against the 3-tuple fingerprint.
+        #   * ``message.part.removed`` pops the part, bumps seq, and
+        #     updates content_revisions so the digest notifies clients of
+        #     a partCount change (MAJOR 5).
+        #   * ``message.removed`` deletes the message from ``_part_state``
+        #     entirely (MAJOR 5) — subsequent ``/full?known=`` returns no
+        #     cache → 200.
+        # ``message.part.delta`` (token stream) does NOT touch the cache
+        # — clients see deltas in real time and need no fingerprint signal.
+        if event_type in (
+            "message.part.delta", "message.part.updated",
+            "message.part.removed", "message.removed",
+        ):
+            if event_type == "message.part.updated":
+                # Key extraction mirrors tokenstream ``on_part_updated``
+                # (properties.part.{sessionID, messageID, id}) and uses
+                # ``part.sessionID`` as the debounce key (same as
+                # ``_extract_session_id`` for MESSAGE_EVENTS).
+                part = props.get("part")
+                if isinstance(part, dict):
+                    psid = part.get("sessionID")
+                    pmid = part.get("messageID")
+                    ppid = part.get("id")
+                    if (
+                        isinstance(psid, str) and psid
+                        and isinstance(pmid, str) and pmid
+                        and isinstance(ppid, str) and ppid
+                    ):
+                        # rev-ogpt MAJOR 3: retired-message gate — if this
+                        # message was removed upstream, late
+                        # ``message.part.updated`` must NOT resurrect its
+                        # fingerprint in ``_part_state`` or
+                        # ``content_revisions``. The token hub gates the
+                        # same event on its own ``_retired_messages``, but
+                        # by that point GlobalHub has already rebuilt the
+                        # fingerprint. This early return prevents that.
+                        if (psid, pmid) in self._retired_messages:
+                            return
+                        # Bump message-level seq (creates the message
+                        # entry if first touch; enforces LRU cap).
+                        msg_entry = self._bump_message_seq(psid, pmid)
+                        parts = msg_entry["parts"]
+                        if ppid in parts:
+                            # Already-seen part: text append / state
+                            # change → per-part revision +1 (GlobalHub
+                            # internal counter only; NOT used for token-
+                            # frame dedup — per-frame revision is in
+                            # TokenStreamHub._next_part_revision).
+                            parts[ppid] += 1
+                        else:
+                            # New partID: creation → per-part revision 0.
+                            parts[ppid] = 0
+                        # Per-session debounce entry keyed on part.sessionID.
+                        entry = self.pending.setdefault(psid, DigestFields())
+                        entry.content_revisions[pmid] = msg_entry["seq"]
+                        # Stage B v0.6 §Q: do NOT forward per_part_rev —
+                        # TokenStreamHub self-increments its own
+                        # ``_part_revisions[key]`` (monotone for the
+                        # part's lifetime, decoupled from this cache).
+                        # Forwarding the value here would let an LRU-cap
+                        # eviction + re-touch clobber the token hub's
+                        # higher value mid-generation.
+                        if self._token_hub is not None:
+                            self._token_hub.on_part_updated(props)
+                        return
+            elif event_type == "message.part.removed":
+                # opencode v1.18.4 payload (schema session.ts:604-628):
+                # flat ``{sessionID, messageID, partID}`` (NOT nested).
+                psid = props.get("sessionID")
+                pmid = props.get("messageID")
+                ppid = props.get("partID")
+                if (
+                    isinstance(psid, str) and psid
+                    and isinstance(pmid, str) and pmid
+                    and isinstance(ppid, str) and ppid
+                ):
+                    msg_entry = (
+                        self._part_state.get(psid, {}).get(pmid)
+                    )
+                    if msg_entry is not None:
+                        # Known message: pop the part, then bump+assign the
+                        # global seq onto the existing entry.
+                        msg_entry["parts"].pop(ppid, None)
+                        msg_entry = self._bump_message_seq(psid, pmid)
+                        new_seq = msg_entry["seq"]
+                    else:
+                        # Stage B v0.5 §L (MAJOR 2 fix): unknown message
+                        # (LRU-evicted / never seen). v0.4 silently dropped
+                        # the event here, so a cap-evicted message's removed
+                        # part would never reach the client — it permanently
+                        # retained the deleted part locally. Now we ALWAYS
+                        # bump the per-session global seq + write a digest
+                        # entry so the client's strict-``>`` check fires
+                        # → R1 → ``/full/{mid}?known=`` cache miss → 200 +
+                        # fresh parts (self-healing). We deliberately do
+                        # NOT create a ``_part_state`` entry — the message
+                        # is gone upstream, tracking an empty entry would
+                        # be misleading.
+                        new_seq = self._bump_session_event_seq(psid)
+                    # Common: write the debounce-window digest entry so
+                    # the bump reaches the client.
+                    entry = self.pending.setdefault(psid, DigestFields())
+                    entry.content_revisions[pmid] = new_seq
+                    # rev-ogpt MAJOR 4: route to the token hub so it can
+                    # retire the corresponding LivePart / pending
+                    # accumulator / revision. Without this routing the
+                    # token hub would keep emitting stale delta / snapshot
+                    # frames for a part the upstream has removed.
+                    # ``on_part_removed`` is idempotent (``drop_part``
+                    # returns False on second call) and is gated by the
+                    # token hub's ``_retired_messages`` set when the
+                    # whole message has already been retired.
+                    if self._token_hub is not None:
+                        self._token_hub.on_part_removed(psid, pmid, ppid)
+                    return
+            elif event_type == "message.removed":
+                # opencode v1.18.4 payload: flat ``{sessionID, messageID}``.
+                psid = props.get("sessionID")
+                pmid = props.get("messageID")
+                if (
+                    isinstance(psid, str) and psid
+                    and isinstance(pmid, str) and pmid
+                ):
+                    # Drop the message entirely from the cache — the
+                    # message is gone upstream, so its fingerprint is no
+                    # longer meaningful. Subsequent ``/full?known=`` for
+                    # this (sid, mid) returns no cache → 200.
+                    self._part_state.get(psid, {}).pop(pmid, None)
+                    # Also drop any pending content_revisions entry for
+                    # this message: a ``message.part.updated`` that
+                    # arrived earlier in the same debounce window would
+                    # otherwise leak a contentRevisions signal for a now-
+                    # deleted message. The spec says "digest 不带该
+                    # message contentRevision (已删)" — this enforces it.
+                    entry = self.pending.get(psid)
+                    if entry is not None:
+                        entry.content_revisions.pop(pmid, None)
+                    # rev-ogpt MAJOR 3: record the retired message so late
+                    # ``message.part.updated`` cannot resurrect its
+                    # fingerprint in ``_part_state``.
+                    # rev-ogpt MAJOR 4 (3rd-round): the gate is a bounded
+                    # OrderedDict with FIFO cap (``TOKEN_REMOVED_MESSAGES_MAX``)
+                    # + TTL (``TOKEN_REMOVED_MESSAGES_TTL_MS``) aligned with
+                    # the token hub's replay queue. ``move_to_end`` keeps
+                    # duplicate-insert (re-removed message) at the tail so
+                    # the cap never evicts the freshest gate entry.
+                    now_ms = _now_ms()
+                    self._retired_messages[(psid, pmid)] = now_ms
+                    self._retired_messages.move_to_end((psid, pmid))
+                    self._prune_retired_messages(now_ms)
+                    # Stage B v0.6 §P.1 (MAJOR 4 方案 C): route to the
+                    # token hub so it can fan a ``message.removed`` frame
+                    # to current subscribers AND record the tombstone in
+                    # the bounded replay queue for future handshake
+                    # replay. Control-plane cache cleanup above is
+                    # unchanged; this is purely additive.
+                    if self._token_hub is not None:
+                        self._token_hub.on_message_removed(psid, pmid)
+                return
+            # message.part.delta, OR message.part.updated with a missing
+            # / malformed ``part`` dict → original Stage-A token-hub route
+            # (no part state mutation, no revision available).
             if self._token_hub is not None:
                 if event_type == "message.part.delta":
                     self._token_hub.on_part_delta(props)
@@ -702,6 +1101,35 @@ class GlobalHub:
         # anyway, so deleted tombstones are pruned to prevent unbounded growth
         # across reconnects (sids are unique per opencode process run).
         self.deleted_tombstones.clear()
+        # Stage B v0.4 (P0-3 messageEventSeq): the opencode GlobalBus has
+        # no replay — on reconnect every cached part is potentially stale.
+        # Clearing the map invalidates ``/full?known=`` 304s (clients fall
+        # back to 200 + R1 rebuild) and drops ``contentRevisions`` from
+        # subsequent digests until fresh ``message.part.updated`` /
+        # ``message.part.removed`` events repopulate the cache.
+        self._part_state.clear()
+        # Stage B v0.5 §K (CRITICAL 1 fix): clear the per-session GLOBAL
+        # seq counter too — reconnect begins a new epoch and clients must
+        # NOT compare post-reconnect seq values against pre-reconnect
+        # baselines (the new epoch's seq starts again from 1). Combined
+        # with the resync frame the client already receives, this forces
+        # a full R1 rebuild with no risk of ABA false-304.
+        self._session_event_seq.clear()
+        # Stage B v0.4 (MAJOR 3 fix): clear every pending digest's
+        # ``content_revisions`` too. A ``message.part.updated`` that
+        # landed in the debounce window just before the reconnect would
+        # otherwise leak into the post-resync flush — the client would
+        # see ``contentRevisions`` from the dead epoch after already
+        # having been told to R1 rebuild. Other digest fields (status /
+        # messageID / etc.) stay: those reflect upstream state that may
+        # still be relevant; only the part-state fingerprint is epoch-
+        # bounded.
+        for entry in self.pending.values():
+            entry.content_revisions.clear()
+        # rev-ogpt MAJOR 3: clear retired-message gates — reconnect begins
+        # a new epoch; late part events from the dead epoch must be free
+        # to create fresh state once the new epoch's events arrive.
+        self._retired_messages.clear()
         frame = sse_frame({"reason": "reconnect_no_replay"}, event="resync")
         for subscriber in tuple(self.subscribers):
             subscriber.put(frame)

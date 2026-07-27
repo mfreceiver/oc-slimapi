@@ -90,8 +90,11 @@ async def token_stream(request: Request, sid: str, directory: str | None = None)
     try:
         subscriber = registry.subscribe(sid)
     except TokenSubscriberCapacityError as exc:
+        body = {"code": exc.code, "limit": exc.limit, "current": exc.current}
+        if exc.buffer_bytes is not None:
+            body["bufferBytes"] = exc.buffer_bytes
         return json_response(
-            {"code": exc.code, "limit": exc.limit, "current": exc.current},
+            body,
             status_code=503,
             headers={"Retry-After": "5"},
             accept_encoding=request.headers.get("accept-encoding"),

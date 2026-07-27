@@ -108,14 +108,26 @@ def parse_event(raw: bytes) -> tuple[str | None, dict]:
 class _FakeSub:
     """Minimal subscriber: captures every put() frame in order.
 
-    Mirrors the subset of ``hub.Subscriber`` that TokenStreamHub calls
-    (just ``put``). Frames are kept in arrival order so tests can assert
-    on the wire sequence (terminal-order invariant, handshake ordering,
-    etc.).
+    Mirrors the subset of ``hub.Subscriber`` / ``TokenSubscriber`` that
+    TokenStreamHub calls: ``begin_handshake`` / ``end_handshake`` /
+    ``put`` / ``closed``. These four comprise the complete hub→sub
+    contract; the CRITICAL 3 handshake/runtime queue PHYSICAL separation
+    lives entirely INSIDE ``TokenSubscriber`` (its ``_SubscriberQueue``)
+    and is exercised by ``test_token_subscriber_overflow.py``, so this
+    stub does NOT need to mirror it — it just records the wire sequence
+    so hub-logic tests can assert on ordering / fanout shape.
     """
 
     def __init__(self) -> None:
         self.frames: list[bytes] = []
+        self._in_handshake: bool = False
+        self.closed: bool = False
+
+    def begin_handshake(self) -> None:
+        self._in_handshake = True
+
+    def end_handshake(self) -> None:
+        self._in_handshake = False
 
     def put(self, frame: bytes) -> bool:
         self.frames.append(frame)

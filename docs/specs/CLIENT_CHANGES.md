@@ -289,4 +289,108 @@
 - 无 wire / 契约变更；无 slimapi 代码改动。
 - 唯一前提：信任 SSE `session.status` 覆盖率（exp-1 已源码确认完整）+ 断连 fallback 不丢 busy。
 
+---
+
+## Stage B v0.6 — per_part_revision 独立递增 + message.removed tombstone 重放（2026-07-27 双方冻结）
+
+> 状态：sidecar 已实施（v0.5 → v0.6 delta 修订）。**加性 wire**，未 bump `X-Slimapi-Version`（仍 `1`）。delta spec：`docs/ocmar/specs/2026-07-27-stage-b-impl-spec-v0.6-delta.md`。修复 rev-ogpt 三审新 MAJOR（per_part_rev 回退）+ MAJOR 4 双方冻结方案 C 增强版。
+
+### per_part_revision 独立递增（新 MAJOR 修复）
+
+- v0.6 前 `GlobalHub.publish` 将其 `_part_state` 的 per_part_rev 转发给 token hub；GlobalHub 的 LRU cap 淘汰 message entry 后，同一 PartKey 再 `message.part.updated` 会把 per_part_rev 当成 0 → 覆盖 token hub 中更高的 revision → client strict `>` 漏帧。
+- v0.6 token hub 自己维护 `_part_revisions[key]`（key 已存在 +1，新 key = 0），**不依赖** GlobalHub 转发。
+- **`partEventRevision` 消费规则（Option B — per-frame revision）**：v0.6 中每个具有独立 delivery 语义的 token 帧（`message.part.snapshot{done:false}` / `message.part.delta` / `message.part.snapshot{done:true}` / `message.part.snapshot{truncated:true}`）在发射时获得**唯一递增**的 `partEventRevision`。客户端按 strict `>` 去重——只接受 revision 大于上一次已见帧的帧；由于每帧 revision 不同，strict `>` 不会误丢合法帧。此前的 per-event revision 语义（多帧共享同一 revision）已废弃。v0.6 修复的是 sidecar 内部不变量，wire 形态不变。
+
+### `message.removed` token stream tombstone + 重放队列（MAJOR 4 方案 C 增强版）
+
+- **新增 wire 帧** `message.removed`：payload `{sessionID, messageID}`。token stream subscriber 收到后应清该 message 本地 streamOwned 状态（若该 message 正在 stream 中）并视为完成（后续 `/since` 拉权威全文时该 message 已不存在）。
+- **握手期重放**：`attach_subscriber` 握手时序为 `server.connected` → 该 session 未过期 `message.removed` tombstones 按时间重放 → `flush_sid` → live snapshot → 入 fanout。客户端在握手期收到 `message.removed` 帧后应同样处理（清 streamOwned + 视为完成）。
+- **重放队列**：全局 FIFO cap 1000 + TTL 24h。不受 `resync{reconnect_no_replay}` 影响（重连后队列保留，重连的客户端在握手期收到重放）。
+- **与 `/since` 的关系**：客户端收到 `message.removed` 后，该 message 已从上游删除；下次 `/since` 拉权威全文时该 message 已不存在（自然从本地移除）。若客户端在收到 `message.removed` 前已 stream 了该 message 的部分内容，收到后应清该 message 的 streamOwned 缓冲（动画终止）。
+
+### ocdroid 改动清单（Stage B v0.6）
+
+1. **新增帧处理**：收 `message.removed{sessionID, messageID}` → 清该 message 本地 streamOwned 缓冲（若有）+ 标记该 message 为已完成（停止 append delta）。
+2. **握手期处理**：`attach_subscriber` 握手期可能在 `server.connected` 后、`snapshot{done:false}` 前收到 `message.removed` 帧；客户端应按同样语义处理（清 streamOwned + 视为完成），不得忽略。
+3. **per_part_revision**：无需改动。Option B per-frame revision 下客户端 strict `>` 去重是正确的——每帧有唯一 revision，不会误丢合法帧。wire 形态不变。
+4. **新 503 错误码 `sse_token_handshake_overflow`**（v0.6 🆕）：token stream 握手期间 handshake buffer 超 `TOKEN_HANDSHAKE_BUFFER_BYTES=8MiB` 时返回，payload `{"code":"sse_token_handshake_overflow","limit":8,"current":N,"bufferBytes":8388608}` + `Retry-After:5`。客户端按标准 503 重试逻辑处理（与 `sse_token_subscriber_limit` 同级，仅触发条件不同——握手帧集过大 vs 订阅者容量超限）。
+
+---
+
+## Stage B v0.5 — messageEventSeq 全局单调 + removal 自愈 + header 稳定性（2026-07-27 双方冻结）
+
+> 状态：sidecar 已实施（v0.4 → v0.5 delta 修订）。**加性 wire**，未 bump `X-Slimapi-Version`（仍 `1`）。delta spec：`docs/ocmar/specs/2026-07-27-stage-b-impl-spec-v0.5-delta.md`。修复 rev-ogpt 二审 CRITICAL 1 + MAJOR 2/3。**MAJOR 4（message.removed wire tombstone）待 ocdroid council**——sidecar 仍清缓存（不回退）。
+
+### messageEventSeq 改 per-session 全局单调（CRITICAL 1 修复）
+
+- v0.4 的 `messageEventSeq` 为 per-message 计数器；v0.5 改 **per-session 全局单调序号**（同一 session 内任意 message 的任意 part 事件 +1）。
+- **client 行为不变**：仍用 strict `>` 比较 `contentRevisions[mid]` 与本地 baseline，`>` 即触发 R1。v0.5 的全局单调强化了"严格 `>`"的可靠性（v0.4 在 cap 淘汰 + 重触及场景下会回归到 1，client 漏检；v0.5 永远递增）。
+- **client 视 `0` 为"无信息"**：`X-Message-Event-Seq: 0` 或缺失 `contentRevisions` 字段 → R1（既定）。v0.5 在 body 前后 seq 不一致时**主动**发 `0`（不可信，详见下）。
+
+### `message.part.removed` 自愈（MAJOR 2 修复）
+
+- v0.5 对未知 message（被 cap 淘汰 / 从未见）的 `message.part.removed` 也产生 digest（bump 全局 seq + `contentRevisions[mid] = seq`）。
+- **client 行为不变**：strict `>` 检测到 digest `contentRevisions[mid]` > 本地 → R1 → `/full/{mid}?known=` 无缓存 fingerprint（sidecar 不为已删 message 创建 `_part_state` 条目）→ 200 → client 拿最新 parts 自愈。
+- v0.4 此场景静默丢弃 → client 永久保留已删 part。v0.5 修复；client 无需改动，靠既定 strict `>` + R1 即自愈。
+
+### `X-Message-Event-Seq` body 前后稳定性（MAJOR 3 修复）
+
+- v0.5 `/full/{mid}` handler body 前取样 `seq_pre`，body 后（transform 完成、Response 构造前）取样 `seq_post`：
+  - `seq_pre == seq_post` → 发 `seq_post`（header 可信对应 body）
+  - 不一致（body 期间 part event 到达）→ 发 `0`（不可信，client 视 `0` 为无 baseline → R1）
+- **client 行为不变**：仍将 `0` 视为"sidecar 无信息"→ R1（既定语义）。v0.5 新增的"不稳定时发 0"路径复用此既定。
+- 304 短路路径不变（不涉及 body，fingerprint 已对齐）。
+- v0.4 此场景下发 stale seq → client 误信，下次请求带错误 known 可能 304 错过实际变更。v0.5 修复。
+
+### ocdroid 改动清单（Stage B v0.5）
+
+**无需改动**——v0.5 的修复均强化 sidecar 内部不变量，client 侧行为（strict `>` 比较 + 视 `0` 为 R1 触发）沿用 v0.4 已对接的语义。建议复跑 v0.4 对接的回归测试确认 strict `>` + R1 路径稳定。
+
+### 不含
+
+- **MAJOR 4（message.removed wire tombstone）**：待 ocdroid council 确认设计（/since 自愈 vs digest `removedMessages` 字段）。sidecar 在 v0.5 仍按 v0.4 清理 `_part_state` 中该 message 的条目（不回退）；wire tombstone 路径待定。
+
+---
+
+## Stage B v0.4 — messageEventSeq + /full 304 + removal（2026-07-27 双方冻结）
+
+> 状态：sidecar 已实施（fix-1 v1 → v0.4 delta 修订）。**加性 wire**，未 bump `X-Slimapi-Version`（仍 `1`）。delta spec：`docs/ocmar/specs/2026-07-27-stage-b-impl-spec-v0.4-delta.md`。ocdroid 侧改动清单（消息内容变更检测 + 单条消息 304 省流）。
+
+### digest `contentRevisions`（CRITICAL 2 修复）
+
+- **字段**：`session.digest` 加 optional `contentRevisions: {messageID → messageEventSeq_int}`。
+- **触发**：debounce 窗口内该 session 的 `message.part.updated` / `message.part.removed` 触及某 message → 该 message 进 map，value = `messageEventSeq`（message-level 严格单调事件序号；首次触及=1，每后续 part 事件 +1）。
+- **检测语义**：client 用 strict `>` 比较——收到 `contentRevisions[mid] > local` → 该 message 有内容变更 → 触发 R1 / `/full/{mid}` 重拉。**单调性**：不同于 v1 的 `max(per-part rev)`（多 part 下新 part 拉低 max），messageEventSeq 在该 message 任意 part 事件上 +1，**严格单调**。
+- **空 / 缺失**：本窗口无 part 事件 → digest 不带该字段（向后兼容，无 part 事件的 digest wire 形态不变）。client 视为"无新信号"。
+- **reconnect 行为**：sidecar reconnect 后 `_part_state` + pending `contentRevisions` 都清空——后续 digest 不带 `contentRevisions` 直至新事件抵达。client 已收 `resync{reconnect_no_replay}` → 触发 R1 全量重建即可，`contentRevisions` 缺失不会误导。
+- **`message.removed` 后**：digest 不带该 message 的 contentRevision（已删）。client 视为"该 message 已不存在"，移除本地副本。
+- **v1 → v0.4 字段重命名**：v1（fix-1）曾命名 `partEventRevisions`（value=`max(per-part rev)`）；v0.4 改 `contentRevisions`（value=`messageEventSeq`）。**client 必须从 `partEventRevisions` 切换到 `contentRevisions`** 并改用 strict `>` 比较。
+
+### `/full/{mid}?known.maxPartId=&known.partCount=&known.messageEventSeq=` 304（CRITICAL 1 修复）
+
+- **请求**：`GET /slimapi/messages/{sid}/full/{mid}?known.maxPartId=<str>&known.partCount=<int>&known.messageEventSeq=<int>`（**三者齐全**才考虑 304）。
+- **304 条件**：sidecar `_part_state` 缓存命中 + `(maxPartId, partCount, messageEventSeq)` 三元组**全一致**。返回 `304 Not Modified`（空 body，`Cache-Control: no-store`，**不发** `X-Message-Event-Seq`）。
+- **200 fallthrough**：任一参数缺失 / 不一致 / 无缓存（冷启动 / reconnect 后 / session.deleted / message.removed）→ 正常 200 full body。
+- **关键**：v1 的 `maxPartId+partCount` 二元组**不足以** 304（同 part 文本追加不改此二元组但内容已变；CRITICAL 1）。`messageEventSeq` 是单调序号，捕获所有 part 事件。client 每次拉 200 后从 `X-Message-Event-Seq` 头读 seq，下次请求带上做 304 比对。
+
+### `X-Message-Event-Seq: <int>` 响应头（§D）
+
+- **`/full/{mid}` 200 响应必带**，值 = 该 message 的 messageEventSeq。
+- **无缓存 → `0`**：client 视为"sidecar 无信息"→ R1（与重启归零语义一致）。**不要**把 0 当成"内容版本 0"做等值比对。
+- **304 路径不发该头**（无 body，fingerprint 已对齐；client 复用本地副本 + 本地 seq 即可）。
+
+### token stream `partEventRevision`（v0.6 Option B — per-frame revision）
+
+- **v0.6 Option B** 中，每个具有独立 delivery 语义的 token 帧（`message.part.snapshot{done:false}` / `message.part.delta` / `message.part.snapshot{done:true}` / `message.part.snapshot{truncated:true}`）在发射时获得**唯一递增**的 `partEventRevision`（per-frame revision），**不再**按 `message.part.updated` 事件递增。
+- `partEventRevision` 与 digest `contentRevisions`（messageEventSeq）**独立递增**——前者是 token 帧级 revision，后者是 message 级 digest 事件序号。
+- **客户端消费**：按 strict `>` 去重——只接受 revision 大于上一次已见帧的帧；由于每帧 revision 不同，不会误丢合法帧。
+- **无需客户端改动**：`partEventRevision` 字段名和 wire 形态不变，strict `>` 去重语义从 per-event 升级为 per-frame，客户端已有逻辑继续工作。
+
+### ocdroid 改动清单（Stage B v0.4）
+
+1. digest 解析：从 `partEventRevisions`（v1，如已对接）切换到 `contentRevisions`；client 用 strict `>` 比较 messageEventSeq。
+2. `/full/{mid}` 单条消息：发请求时带 `?known.maxPartId=&known.partCount=&known.messageEventSeq=`（三者齐全）；304 → 复用本地副本；200 → 替换 + 从响应头读 `X-Message-Event-Seq` 存为下次比对的 `known.messageEventSeq`。
+3. 收 `contentRevisions[mid] > local` 或 `X-Message-Event-Seq: 0` → 触发 R1 重拉。
+4. token stream 帧处理：**无需改动**（`partEventRevision` per-part 语义未变）。
+
 (End of file)

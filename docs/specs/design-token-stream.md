@@ -12,7 +12,7 @@
 | C2 | 订阅握手 double-count：snapshot 含未 flush pending，下次 flush 重复发 | 握手先 flush 给现有订阅者（新者未入 fanout）→snapshot 新者→再加入 fanout；无 await 临界段（§5.5） |
 | C3 | reasoning-delta 也 `field:"text"` 但无 text LivePart → 每 token 发 `part_state_missing` resync → 风暴 | `_nontext_parts` 跟踪；孤儿/非 text delta **静默 drop+计数**，绝不 resync（§5.3） |
 | C4 | truncated 后仍可能续发 delta（streamOwned 陷阱） | truncated=`drop_part`（pop `_pending`+`live_parts`+`_disabled_parts`）；后续该 key delta 静默 drop（§5.3/§5.8） |
-| C5 | 全局累加器无内存上限（跨 session 无界） | `TOKEN_LIVEPARTS_MAX_BYTES=8MiB`+`TOKEN_LIVE_PARTS_MAX=32`；超限退役最旧+`resync{token_memory_limit}`；worst-case 12MiB 写进 §6 |
+| C5 | 全局累加器无内存上限（跨 session 无界） | `TOKEN_LIVEPARTS_MAX_BYTES=8MiB`+`TOKEN_LIVE_PARTS_MAX=32`；超限退役最旧+`resync{token_memory_limit}`；worst-case 76MiB 写进 §6（含 handshake buffer 8MiB/sub） |
 | C6 | 终态 `done:true` 也可能 >1MiB 被 drop | truncated 适用 `done:false` **和** `done:true`（§5.6） |
 | — | 次要 | `has_consumers` 方法非 property；reconnect 调 `token_hub.on_upstream_reconnect()`；backpressure resync 带 sessionID；版本 gate=middleware 非 Depends；safe_put 先 size-check；15s 心跳必发（§5.2/§5.5/§5.6/§7） |
 
@@ -251,7 +251,7 @@ TOKEN_ACC_IDLE_MS = 60_000; TOKEN_HEARTBEAT_SECONDS = 15
   - **Option A**（合并 8MiB 单池）：单一 `TOKEN_LIVEPARTS_MAX_BYTES=8MiB` 覆盖 live + pending。
   - **Option B**（采纳）：`TOKEN_LIVEPARTS_MAX_BYTES=4MiB`（live）+ `TOKEN_PENDING_MAX_BYTES=4MiB`（pending），**不双计**（同一 delta chunk 不在两个池同时占额度；`_reserve` 入 live 池时 delta 也已在 pending，但记账只算一次——实现侧 NB-C1 同步 live 4MiB）。
   - **rationale**：pending 独立上限更防御——pending 突发（flush 阻塞 / 短窗大量 delta）不会挤掉 live 退役预算；两个池各自 4MiB 上限更难同时打满。worst-case 与 Option A 同上限。
-- **worst-case**（写进契约 §6.x）：订阅队列 `8 × 512KiB = 4MiB` + live `4MiB` + pending `4MiB` = **12MiB**。
+- **worst-case**（写进契约 §6.x）：订阅队列 `8 × 512KiB = 4MiB` + handshake `8 × 8MiB = 64MiB` + live `4MiB` + pending `4MiB` = **76MiB**（handshake buffer 为新增项，`TOKEN_HANDSHAKE_BUFFER_BYTES=8MiB/sub`；runtime 正常态无 handshake 占用时仅 `4MiB queue + 4MiB live + 4MiB pending = 12MiB`）。
 - C5 `_reserve`：append 前校验单 part 上限 + 全局 part 数 + live 池字节 + pending 池字节；超限退役最旧 part（按 `last_delta_ms`）+ `resync{token_memory_limit,sessionID}`。
 - admission 失败 → 503 `{"code":"sse_token_subscriber_limit","limit":8,"current":N}` + `Retry-After:5`。
 
@@ -273,7 +273,7 @@ TOKEN_ACC_IDLE_MS = 60_000; TOKEN_HEARTBEAT_SECONDS = 15
 |---|---|
 | `v1-contract.md` §3 L150 | 限定控制面："`/slimapi/events` 控制面丢弃：…`message.part.*`…（`message.part.delta`/`updated` 由独立 `/slimapi/sessions/{sid}/stream` 消费，见 §3.x）" |
 | `v1-contract.md` §3.x 🆕 | Token stream SSE 子节（端点/帧/no-replay-no-id/终态顺序不变式/`/since` 真值/新 resync reason） |
-| `v1-contract.md` §6 | token 信封 addendum（独立 cap + 12MiB worst-case + `token_memory_limit`） |
+| `v1-contract.md` §6 | token 信封 addendum（独立 cap + 76MiB worst-case + `token_memory_limit` + `sse_token_handshake_overflow`） |
 | `v1-contract.md` §4 health | 加性**根级** `features.tokenStream`（**Q1 冻结路径**：top-level `features`，非 `server.*` 下） |
 | `CHANGELOG`/`INTERFACE_MAP`/`CLIENT_CHANGES` | 同步 |
 | `X-Slimapi-Version` | **不 bump**（加性） |
@@ -360,7 +360,7 @@ TOKEN_ACC_IDLE_MS = 60_000; TOKEN_HEARTBEAT_SECONDS = 15
 **Stage E（docs lane）范围契约**
 - **契约 §3.x + §6.x 加性**（`docs/specs/v1-contract.md`）：新端点行（§2 表）+ token stream SSE 子节（端点 / wire 帧 / no-id-no-replay / 终态顺序不变式 / `/since` 真值 / gzip 杠杆2）+ token T3 信封 addendum（独立账本 / 预算「同时最多 1 条前台 stream」/ Option B 拆 4+4 不双计 / admission 溢出 503 + Retry-After / gzip 例外）；§7 加 `sse_token_subscriber_limit` code；health 根级 `features.tokenStream`（Q1）。**不 bump** `X-Slimapi-Version`（加性 wire）。
 - **CLIENT_CHANGES lever1 对齐**（`:217`）：pre-lever 旧文「done:true 带 text」→ 「marker 仅完成标记，无 text；权威全文走 `/since`」（与 §5.6 杠杆1 一致）。
-- **预算裁定 Option B 4+4**（§6 + §16 Stage C NB-C1）：`TOKEN_LIVEPARTS_MAX_BYTES=4MiB`（live）+ `TOKEN_PENDING_MAX_BYTES=4MiB`（pending），不双计；rationale = pending 独立上限更防御；worst-case 12MiB 不变；NB-C1 = src/ lane 同步 live 4MiB。
+- **预算裁定 Option B 4+4**（§6 + §16 Stage C NB-C1）：`TOKEN_LIVEPARTS_MAX_BYTES=4MiB`（live）+ `TOKEN_PENDING_MAX_BYTES=4MiB`（pending），不双计；rationale = pending 独立上限更防御；worst-case 76MiB（加入 handshake buffer 8MiB/sub 后，见 §6.x）；NB-C1 = src/ lane 同步 live 4MiB。
 - **CHANGELOG gzip 例外**：[Unreleased] 加 token-stream feature 条目——端点、opt-in（health 根级 `features.tokenStream`）、杠杆1 done:true marker 无 text、**杠杆2 gzip 首个 SSE 例外**（注明控制面 `/slimapi/events` 仍不 gzip）、resync reason 集、独立 T3 账本、内存预算 Option B 4+4。加性 wire（不 bump `X-Slimapi-Version`）。
 - **INTERFACE_MAP §3.1 刷新**：新 `/slimapi/sessions/{sid}/stream` 行（SSE，opt-in，gzip 默认[lever2]，独立 T3 账本，done:true 无 text marker[lever1]，4+4 预算）。
 - **§11 perf 确认**：1.47x 实测 + re-anchor ~1.5x 中位达成；残余调参（flush 窗 / gzip cadence）可选 post-release。

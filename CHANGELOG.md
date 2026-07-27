@@ -30,7 +30,79 @@ ocdroid 对接时：
 
 > 开发中、尚未打 tag 的变更写在这里；`release.sh` 发版时把本节内容折叠进新版本标题下。
 
-（暂无）
+### Stage B v0.6 — per_part_revision 独立递增 + message.removed tombstone 重放队列（加性 wire，未 bump `X-Slimapi-Version`，仍 `1`）
+
+> 双方 v0.6 冻结（2026-07-27）：rev-ogpt 三审 7.7/10 NEEDS-FIX（新 MAJOR per_part_rev 回退 + MAJOR 4 双方冻结方案 C）→ delta spec `docs/ocmar/specs/2026-07-27-stage-b-impl-spec-v0.6-delta.md`。叠加 v0.5 实现，冲突处 v0.6 为准。
+
+#### Changed
+
+- **per_part_revision 独立递增 + per-frame revision（新 MAJOR 修复）**：`TokenStreamHub.on_part_updated()` 忽略 `GlobalHub.publish` 传入的 `part_revision` 参数，自己维护 `_part_revisions[key]`。此前 GlobalHub 的 `_part_state` 在 LRU cap 淘汰 message entry 后，同一 PartKey 再 `message.part.updated` 会把 per_part_rev 当成 0 → 覆盖 token hub 中更高的 revision → client strict `>` 漏帧。修复后 token hub 独立维护 revision，且每个 token 帧（snapshot/delta/done/truncated）在发射时获得**唯一递增**的 `partEventRevision`（per-frame revision）。客户端 strict `>` 去重正确——每帧 revision 不同，不会误丢。**wire `partEventRevision` 字段名不变**。
+- **`message.removed` token stream tombstone + 重放队列（MAJOR 4 方案 C 增强版）**：`GlobalHub.publish` 收到 `message.removed`（flat props `{sessionID, messageID}`）时，除既有 `_part_state`/pending 清理外，路由到 `TokenStreamHub.on_message_removed(sid, mid)`。Token hub 向该 session 的当前 token subscribers 发送 SSE event `message.removed`（payload `{sessionID, messageID}`），并记入全局 FIFO 重放队列（cap 1000，TTL 24h）。`attach_subscriber` 握手时序改为：`server.connected` → 该 session 未过期 tombstones 按时间重放 → `flush_sid` → live snapshot → 入 fanout。`resync_all` / `on_upstream_reconnect` **不清**重放队列（队列专为 reconnect 服务，仍受 cap/TTL 限制）。新增 wire 帧 `message.removed`（event name `message.removed`，payload `{sessionID, messageID}`）。
+- **新 503 错误码 `sse_token_handshake_overflow`**：token stream handshake buffer overflow（handshake deque items/bytes 超 `TOKEN_HANDSHAKE_BUFFER_BYTES=8MiB`）。返回值同 `sse_token_subscriber_limit` 锁 503 但 payload 多 `bufferBytes` 字段，触发条件不同（握手帧集过大 vs 订阅者容量超限）。**加性 wire**，不 bump `X-Slimapi-Version`。
+
+#### 受影响 CLIENT_CHANGES / 路由↔文档
+
+- `docs/specs/v1-contract.md` §3.x token stream 帧加 `message.removed` + 握手时序加 tombstone 重放；§3.S 生命周期补充；§7 加 `sse_token_handshake_overflow`；§6.x 加 handshake overflow 行为。
+- `docs/specs/INTERFACE_MAP.md` `/slimapi/events` 行 + token stream 行（message.removed 路由 + 重放队列 + handshake overflow）。
+- `docs/specs/CLIENT_CHANGES.md` Stage B v0.6 段（client 收 `message.removed` 帧后清该 message 本地 streamOwned + 重拉 `/since`）+ 新增 `sse_token_handshake_overflow` 错误码说明。
+- 未新增 `/slimapi` 路由；`scripts/check_routes_doc.py` 仍一致。
+
+### Stage B v0.5 — messageEventSeq per-session 全局单调 + removal 自愈 + header 稳定性（加性 wire，未 bump `X-Slimapi-Version`，仍 `1`）
+
+> 双方 v0.5 重新冻结（2026-07-27）：rev-ogpt 二审 6.5/10 NEEDS-FIX（新 CRITICAL 1 + MAJOR 2/3）→ delta spec `docs/ocmar/specs/2026-07-27-stage-b-impl-spec-v0.5-delta.md`。叠加 v0.4 实现，冲突处 v0.5 为准。**MAJOR 4（message.removed wire tombstone）待 ocdroid council，v0.5 不含**——sidecar 仍按 v0.4 清缓存（不回退）。
+
+#### Changed
+
+- **`messageEventSeq` 改 per-session 全局单调序号（CRITICAL 1 修复）**：v0.4 的 `_bump_message_seq` 为 per-message 计数器，LRU 淘汰 message 后重触及 → seq 归 1，破坏单调（client 持 seq=10 → `1>10` false 漏检）+ ABA 错误 304（重建三元组等于旧 known）。v0.5 改用 per-session 全局 counter（`GlobalHub._session_event_seq: dict[str, int]`）：每次该 session 任意 message 的 `message.part.updated` / `message.part.removed` → 全局 counter +1；该 message 的 seq = 当前全局值（赋给 `_part_state[sid][mid]["seq"]` + `content_revisions[mid]`）。淘汰 message 不重置全局 counter；重触及 seq = 当前全局值（远大于旧，单调）。`resync_all()` 清 `_session_event_seq`（reconnect = 新 epoch，client 不信任 → R1）。`session.deleted` 也清该 sid 的全局 counter。**wire 形态不变**：`contentRevisions` value 仍 int（语义改全局单调）。per-part revision（token 帧去重）独立计数器不受影响。
+- **`message.part.removed` of unknown message 也产生 digest（MAJOR 2 修复）**：v0.4 仅当 `_part_state[sid][mid]` 存在时推进；cap 淘汰后 message 未知 → removal 静默丢弃 → client 永久保留已删 part。v0.5 即使 message 不存在（被淘汰/未知）也 bump 全局 seq + `entry.content_revisions[mid] = seq`（client strict `>` 检测 → R1 → `/full/{mid}?known=` 无缓存 fingerprint → 200，client 拿最新 parts 自愈）。msg_entry 存在时仍 pop partID（v0.4 逻辑）+ bump seq。
+
+#### Fixed
+
+- **`X-Message-Event-Seq` body 前后稳定性（MAJOR 3 修复）**：v0.4 header 在 upstream await 前取样；body 拉取/转换期间 part event → header seq 不对应返回 body。v0.5 `/full/{mid}` handler 改为 body 前 `seq_pre = fp[2] if (fp:=hub.get_part_fingerprint(sid,mid)) else 0`；body 后（transform 完成后、Response 构造前）`seq_post` 同样取样；`seq_pre == seq_post` → 发 `seq_post`（可信）；不一致 → 发 `0`（client 视为无 baseline → R1）。304 短路路径不变。两路（full + skeleton）均实现。
+
+#### 不含
+
+- **MAJOR 4（message.removed wire tombstone）**：待 ocdroid council 确认设计（/since 自愈 vs digest `removedMessages` 字段）。v0.5 保留 v0.4 的 message.removed sidecar cache 清理（不回退），仅 wire tombstone 待定。
+
+#### 受影响 CLIENT_CHANGES / 路由↔文档
+
+- `docs/specs/v1-contract.md` §3.S（messageEventSeq 改 per-session 全局；removal 自愈；header 稳定性）。
+- `docs/specs/INTERFACE_MAP.md` `/full/{mid}` + `/slimapi/events` 行（X-Message-Event-Seq 稳定性；unknown removal 自愈）。
+- `docs/specs/CLIENT_CHANGES.md` Stage B v0.5 段（client 严格 `>` 检测 messageEventSeq + 视 `0` 为不可信）。
+- 未新增 `/slimapi` 路由；`scripts/check_routes_doc.py` 仍 19 条一致。
+
+### Stage B v0.4 — partEventRevision → messageEventSeq + /full 304 fingerprint + removal（加性 wire，未 bump `X-Slimapi-Version`，仍 `1`）
+
+> 双方 v0.4 重新冻结（2026-07-27）：rev-ogpt 评审 5.0/10 NEEDS-FIX（2 CRITICAL + MAJOR 5）→ delta spec `docs/ocmar/specs/2026-07-27-stage-b-impl-spec-v0.4-delta.md`。叠加 fix-1 v1 实现，冲突处以 v0.4 为准。
+
+#### Added
+
+- **digest `contentRevisions`（CRITICAL 2 修复）**：`session.digest` 加 optional 字段 `contentRevisions: {messageID → messageEventSeq_int}`。`messageEventSeq` 是 message-level 严格单调事件序号（message 首次 part 事件触及 → 1；每 `message.part.updated` / `message.part.removed` +1），替代 v1 的 `max(per-part revision)`（多 part 下加新 part 会把 max 拉低，非单调——CRITICAL 2）。client 用 strict `>` 检测 message 内容变更。空 map → 字段省略（向后兼容：无 part 事件的 digest wire 形态不变）。
+- **`/full/{mid}?known.maxPartId=&known.partCount=&known.messageEventSeq=` 304 短路（CRITICAL 1 修复）**：三者齐全 + sidecar `_part_state` 缓存命中 + `(maxPartId, partCount, messageEventSeq)` 三元组全一致 → `304 Not Modified`（空 body，`Cache-Control: no-store`）。任一不一致 / 部分参数 / 无缓存 → 正常 200 full body。v1 的 `maxPartId+partCount` 二元组**不足以** 304（同 part 文本追加不改此二元组但内容已变；CRITICAL 1）。
+- **`X-Message-Event-Seq: <int>` 响应头（§D）**：`/full/{mid}` 200 响应必带；值=该 message 的 messageEventSeq；无缓存（冷启动 / reconnect / session.deleted / message.removed）→ `0`（client 视为"无信息"→ R1）。304 路径不发该头。
+- **`message.part.removed` / `message.removed` hub 路由（MAJOR 5 修复）**：上游 `message.part.removed`（flat props）→ `_part_state` parts.pop + seq+1 + digest `contentRevisions` 更新（通知 client partCount 变）；`message.removed`（flat props）→ `_part_state` 删该 message + 清 pending contentRevisions 该条目（digest 不带已删 message 的 contentRevision）。opencode v1.18.4 schema session.ts:604-628 确认。
+
+#### Changed
+
+- **digest wire 字段名**：v1 `partEventRevisions`（value=`max(per-part rev)`）→ v0.4 `contentRevisions`（value=`messageEventSeq`）。**字段重命名 + 语义变更**——client 必须从 `partEventRevisions` 切换到 `contentRevisions` 并改用 strict `>` 比较。ocdroid 对接以本字段为准。
+- **token 帧的 `partEventRevision` 字段语义**：保持 per-part revision（token 帧去重用），与 digest `contentRevisions`（messageEventSeq）**独立递增**——同名 wire 字段，不同 scope（per-part vs per-message）。client token stream 渲染仍按 partID 索引。
+
+#### Fixed
+
+- **truncated 帧顺序（MAJOR 4 修复）**：`_truncate_part_for_all` / oversized handshake 路径先捕获 per_part_rev 再 `drop_part`（后者清缓存），保证 truncated 帧携带 `partEventRevision`（v1 此处 silently dropped it）。
+- **reconnect pending 泄漏（MAJOR 3 修复）**：`resync_all()` 除清 `_part_state`，还清所有 pending entry 的 `contentRevisions`——防 `message.part.updated` 进 debounce 后 reconnect → client 收 resync 后再收旧 epoch 的 contentRevisions。
+- **`_part_state` LRU cap 500 message/session（MAJOR 5）**：超限淘汰最旧 message（FIFO ≈ LRU for creation-order traffic），防长会话无限增长。
+
+#### 受影响 CLIENT_CHANGES / 路由↔文档
+
+- `docs/specs/v1-contract.md` §3 digest payload 加 `contentRevisions?` + §3.S（R2 304 + X-Message-Event-Seq 详细）；§2 `/full/{mid}` 行加 `known.*` 三参数 + 304 + X-Message-Event-Seq 标注。
+- `docs/specs/INTERFACE_MAP.md` `/full/{mid}` 行 + `/slimapi/events` 行（digest 加 `contentRevisions?`、事件路由修订）。
+- `docs/specs/CLIENT_CHANGES.md` Stage B v0.4 wire 变更小节。
+- 未新增 `/slimapi` 路由（query 参数 + 头不算新路由）；`scripts/check_routes_doc.py` 仍 19 条一致。
+
+---
+
+（其它历史变更折叠在下方版本标题下。）
 
 ---
 
@@ -173,7 +245,7 @@ ocdroid 对接时：
   - **权威对齐**：stream `snapshot{done:true}` 是「流视角完成」（**marker 无 text**）；digest + `/since` 拉取的是「持久化真值」——不一致以 `/since` 为准（幂等覆盖）。客户端可接受 digest 完成先于/晚于 token 终态帧。
   - **杠杆2：gzip 首个 SSE 例外**：token stream **默认 gzip**（流式 zlib `Z_SYNC_FLUSH`，`Content-Encoding: gzip`，按 `Accept-Encoding` 协商）。**首个 SSE gzip 例外**——此前「SSE 永不 gzip」（§9）的唯一破例；控制面 `/slimapi/events` **仍不 gzip**。实测（harness `scripts/measure_token_overhead.py`，12 trace、30 tok/s × 100ms）：原批式 ~12x → 杠杆1+2 后 gzip 中位 **1.47x**（达成 re-anchor ~1.5x 中位目标；1/3 trace <1.0x）；残余调参（flush 窗 / gzip cadence）可选 post-release。
   - **health 加性字段**：`GET /slimapi/health` 根级 `features.tokenStream:true`（Q1 冻结路径：top-level `features`，与 `sidecar`/`server`/`schema` 并列；客户端可 dual-read root/server 过渡，服务端固定 root）。`features.tokenStream` 缺/404/405 → ocdroid 降级「完成后整条出现」（零回归）。
-  - **T3 独立信封（Option B 拆 4+4）**：token 订阅独立账本（`token_stream_max_subscribers=8`、`token_stream_queue_items=64`、`token_stream_buffer_bytes=512KiB/sub`、`token_stream_max_frame_bytes=1MiB`），**不**消费既有 `MAX_TOTAL_SUBSCRIBERS=16`；**内存预算 Option B**（拆 4+4，**不双计**）：`TOKEN_LIVEPARTS_MAX_BYTES=4MiB`（live）+ `TOKEN_PENDING_MAX_BYTES=4MiB`（pending）；worst-case `8 × 512KiB 订阅队列 + 4MiB live + 4MiB pending = 12MiB`（与 Option A 同上限，但 pending 独立上限更防御）。admission 失败 → 503 `{"code":"sse_token_subscriber_limit","limit":8,"current":N}` + `Retry-After:5`。
+  - **T3 独立信封（Option B 拆 4+4）**：token 订阅独立账本（`token_stream_max_subscribers=8`、`token_stream_queue_items=64`、`token_stream_buffer_bytes=512KiB/sub`、`token_stream_max_frame_bytes=1MiB`），**不**消费既有 `MAX_TOTAL_SUBSCRIBERS=16`；**内存预算 Option B**（拆 4+4，**不双计**）+ **handshake buffer**：`TOKEN_LIVEPARTS_MAX_BYTES=4MiB`（live）+ `TOKEN_PENDING_MAX_BYTES=4MiB`（pending）+ `TOKEN_HANDSHAKE_BUFFER_BYTES=8MiB/sub`；worst-case `8 × (512KiB queue + 8MiB handshake) + 4MiB live + 4MiB pending = 76MiB`（runtime 正常态无 handshake 占用时仅 12MiB）。admission 失败 → 503 `{"code":"sse_token_subscriber_limit","limit":8,"current":N}` + `Retry-After:5`。handshake buffer overflow → 503 `{"code":"sse_token_handshake_overflow","limit":8,"current":N,"bufferBytes":N}` + `Retry-After:5`。
   - **控制面零回归**：`/slimapi/events`（控制面）一行不改；token 流消费上游 `message.part.delta`/`updated`（控制面此前丢弃），与控制面队列隔离（避免 token 高吞吐挤掉 q/p 或误触 `subscriber_backpressure`）。
   - **P1 范围**：仅 text part（reasoning / tool-input 延后 P2+）；不做二进制流。
   - **依赖与状态**：服务端 Stages A–E（§14）落地（A 地基 9.5 / B 生命周期 9.5 / C flush 9.5 / D 端点 9.6 / E 文档+预算 4+4）；本版本随 0.5.0 出货，双边联合终审 re-gate GO 9.7。ocdroid 配合清单见 `docs/specs/CLIENT_CHANGES.md`「Token stream SSE」节。批式参数（`TOKEN_FLUSH_SECONDS`/`TOKEN_FLUSH_BYTES`）为服务端 env knob，**不进 wire**，ocdroid 无需跟随调整。
