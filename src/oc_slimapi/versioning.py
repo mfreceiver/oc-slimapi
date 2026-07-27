@@ -6,7 +6,7 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 SERVER_API_VERSION = 1
-ACCEPTED_CLIENT_VERSIONS: tuple[int, int] = (1, 1)
+ACCEPTED_CLIENT_VERSIONS: tuple[int, int] = (2, 2)
 VERSION_HEADER = "X-Slimapi-Version"
 
 

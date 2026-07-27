@@ -191,18 +191,6 @@ async def test_sessions_list_upstream_200_non_array_json_returns_503(upstream_fa
 
 
 
-async def test_warm_allowlist_swallows_upstream_error(upstream_factory):
-    from oc_slimapi.discovery import warm_allowlist
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("simulated", request=request)
-
-    upstream = upstream_factory(handler)
-    app = _build_app(upstream)
-    await warm_allowlist(app)
-    assert app.state.directory_allowlist == set()
-
-
 # ---------------------------------------------------------------------------
 # slimapi no longer gates directories (regression coverage)
 # ---------------------------------------------------------------------------
