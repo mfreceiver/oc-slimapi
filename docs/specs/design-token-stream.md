@@ -2,7 +2,7 @@
 
 > 状态：**设计稿 v4 — 架构级 PASS**（联合 3 评委 grok 9.2 / opus 9.0 / bgpt 8.7 + 我方 backstop bgpt 7.4；**双边共识**）。残留 fold 为 §16 阶段契约，转入每阶段 9.5 门控。
 > 性质：**加性 wire 行为**（新端点 + 新 event 类型 + health 加性字段），**不 bump `X-Slimapi-Version`**。
-> 关联：契约 `docs/specs/v1-contract.md` §3/§6（落地需新增 §3.x + §6 token 信封）；实现 `src/oc_slimapi/sse/hub.py`。
+> 关联：契约 `docs/specs/v2-contract.md` §3/§6（落地需新增 §3.x + §6 token 信封）；实现 `src/oc_slimapi/sse/hub.py`。
 
 ## v3 修订记录（回应 v2 三方复审：grok 8.6 / opus 8.2 / bgpt 7.1，均 FAIL→收敛修法）
 
@@ -271,10 +271,10 @@ TOKEN_ACC_IDLE_MS = 60_000; TOKEN_HEARTBEAT_SECONDS = 15
 ## 8. 契约 / 文档 / 版本影响
 | 项 | 处理 |
 |---|---|
-| `v1-contract.md` §3 L150 | 限定控制面："`/slimapi/events` 控制面丢弃：…`message.part.*`…（`message.part.delta`/`updated` 由独立 `/slimapi/sessions/{sid}/stream` 消费，见 §3.x）" |
-| `v1-contract.md` §3.x 🆕 | Token stream SSE 子节（端点/帧/no-replay-no-id/终态顺序不变式/`/since` 真值/新 resync reason） |
-| `v1-contract.md` §6 | token 信封 addendum（独立 cap + 76MiB worst-case + `token_memory_limit` + `sse_token_handshake_overflow`） |
-| `v1-contract.md` §4 health | 加性**根级** `features.tokenStream`（**Q1 冻结路径**：top-level `features`，非 `server.*` 下） |
+| `v2-contract.md` §3 L150 | 限定控制面："`/slimapi/events` 控制面丢弃：…`message.part.*`…（`message.part.delta`/`updated` 由独立 `/slimapi/sessions/{sid}/stream` 消费，见 §3.x）" |
+| `v2-contract.md` §3.x 🆕 | Token stream SSE 子节（端点/帧/no-replay-no-id/终态顺序不变式/`/since` 真值/新 resync reason） |
+| `v2-contract.md` §6 | token 信封 addendum（独立 cap + 76MiB worst-case + `token_memory_limit` + `sse_token_handshake_overflow`） |
+| `v2-contract.md` §4 health | 加性**根级** `features.tokenStream`（**Q1 冻结路径**：top-level `features`，非 `server.*` 下） |
 | `CHANGELOG`/`INTERFACE_MAP`/`CLIENT_CHANGES` | 同步 |
 | `X-Slimapi-Version` | **不 bump**（加性） |
 
@@ -358,7 +358,7 @@ TOKEN_ACC_IDLE_MS = 60_000; TOKEN_HEARTBEAT_SECONDS = 15
 - **[Stage D]** backpressure resync 恒带 sessionID（backstop + cross-plane#3）：`TokenSubscriber` 子类覆写溢出帧。
 
 **Stage E（docs lane）范围契约**
-- **契约 §3.x + §6.x 加性**（`docs/specs/v1-contract.md`）：新端点行（§2 表）+ token stream SSE 子节（端点 / wire 帧 / no-id-no-replay / 终态顺序不变式 / `/since` 真值 / gzip 杠杆2）+ token T3 信封 addendum（独立账本 / 预算「同时最多 1 条前台 stream」/ Option B 拆 4+4 不双计 / admission 溢出 503 + Retry-After / gzip 例外）；§7 加 `sse_token_subscriber_limit` code；health 根级 `features.tokenStream`（Q1）。**不 bump** `X-Slimapi-Version`（加性 wire）。
+- **契约 §3.x + §6.x 加性**（`docs/specs/v2-contract.md`）：新端点行（§2 表）+ token stream SSE 子节（端点 / wire 帧 / no-id-no-replay / 终态顺序不变式 / `/since` 真值 / gzip 杠杆2）+ token T3 信封 addendum（独立账本 / 预算「同时最多 1 条前台 stream」/ Option B 拆 4+4 不双计 / admission 溢出 503 + Retry-After / gzip 例外）；§7 加 `sse_token_subscriber_limit` code；health 根级 `features.tokenStream`（Q1）。**不 bump** `X-Slimapi-Version`（加性 wire）。
 - **CLIENT_CHANGES lever1 对齐**（`:217`）：pre-lever 旧文「done:true 带 text」→ 「marker 仅完成标记，无 text；权威全文走 `/since`」（与 §5.6 杠杆1 一致）。
 - **预算裁定 Option B 4+4**（§6 + §16 Stage C NB-C1）：`TOKEN_LIVEPARTS_MAX_BYTES=4MiB`（live）+ `TOKEN_PENDING_MAX_BYTES=4MiB`（pending），不双计；rationale = pending 独立上限更防御；worst-case 76MiB（加入 handshake buffer 8MiB/sub 后，见 §6.x）；NB-C1 = src/ lane 同步 live 4MiB。
 - **CHANGELOG gzip 例外**：[Unreleased] 加 token-stream feature 条目——端点、opt-in（health 根级 `features.tokenStream`）、杠杆1 done:true marker 无 text、**杠杆2 gzip 首个 SSE 例外**（注明控制面 `/slimapi/events` 仍不 gzip）、resync reason 集、独立 T3 账本、内存预算 Option B 4+4。加性 wire（不 bump `X-Slimapi-Version`）。
