@@ -28,12 +28,12 @@ sidecar 是 ocdroid 与 opencode 之间的字节中继。账本按**路由桶**�
 
 ## 2. 快速查询
 
-所有 `/slimapi/**` 端点都要版本头 `X-Slimapi-Version: 1`。
+所有 `/slimapi/**` 端点都要版本头 `X-Slimapi-Version: 2`。
 
 ```bash
 # 本机 loopback（服务默认绑 0.0.0.0:4097）
 BASE=http://127.0.0.1:4097
-H="X-Slimapi-Version: 1"
+H="X-Slimapi-Version: 2"
 
 # 整个 traffic 块
 curl -s -H "$H" $BASE/slimapi/metrics | jq '.traffic'
@@ -195,6 +195,6 @@ access log 的 `downOut` 是 **wire 级**字节（中间件视角，含 SSE 连�
 
 ## 8. 相关
 
-- 契约 / 设计：[`docs/specs/v1-contract.md`](../specs/v1-contract.md)（§2 `/slimapi/metrics`、§6 资源限制）
+- 契约 / 设计：[`docs/specs/v2-contract.md`](../specs/v2-contract.md)（§2 `/slimapi/metrics`、§6 资源限制）
 - 运维手册：[`docs/operations.md`](../operations.md)
 - 变更记录：[`CHANGELOG.md`](../CHANGELOG.md) `[0.7.0]`

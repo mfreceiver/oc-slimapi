@@ -42,9 +42,9 @@ Tag 格式：**`v` + semver**（例：`v0.1.0`），与 ocdroid 一致。
 ### 1.2 Wire API 版本（整数头）
 
 - 头名：`X-Slimapi-Version`
-- 当前接受区间：见 `src/oc_slimapi/versioning.py` 与 `docs/specs/v1-contract.md` §1。
+- 当前接受区间：见 `src/oc_slimapi/versioning.py` 与 `docs/specs/v2-contract.md` §1。
 - **仅破坏性**变更 bump；加性变更 **同版本**。
-- Bump 时必须同步：`versioning.py`、`docs/specs/v1-contract.md`、`CHANGELOG.md`（写明客户端必改点）。
+- Bump 时必须同步：`versioning.py`、`docs/specs/v2-contract.md`、`CHANGELOG.md`（写明客户端必改点）。
 
 ---
 
@@ -115,7 +115,7 @@ git push origin main && git push origin vX.Y.Z
    git pull
    .venv/bin/pip install -e '.[test]'   # 刷新 dist-info；否则 health.sidecar.version 仍报旧版
    systemctl --user restart oc-slimapi
-   curl -s -H 'X-Slimapi-Version: 1' http://127.0.0.1:4097/slimapi/health
+    curl -s -H 'X-Slimapi-Version: 2' http://127.0.0.1:4097/slimapi/health
    # 期望 sidecar.version == X.Y.Z
    ```
    原因：`__version__` 读自已安装包的 dist-info（`importlib.metadata`），不是运行时读 `pyproject.toml`。详见 [`operations.md`](operations.md) §2 / §4。
@@ -159,7 +159,7 @@ git push origin main && git push origin vX.Y.Z
 - 禁止在非 `main` 上 `release.sh`。
 - 禁止跳过版本号（如 `0.1.0 → 0.1.2`）除非用户明确要求。
 - 禁止复用已 push 的 tag。
-- 禁止把 route secret、证书、本机绝对密钥路径提交进仓。
+- 禁止把 secret、证书、本机绝对密钥路径提交进仓。
 - 禁止只 bump `pyproject.toml` 而不打 tag / 不写 CHANGELOG（拆开发版状态）。
 
 ---
@@ -174,7 +174,7 @@ git push origin main && git push origin vX.Y.Z
 | [`scripts/check.sh`](../scripts/check.sh) | 质量门禁 |
 | [`scripts/release.sh`](../scripts/release.sh) | 发版唯一入口 |
 | [`pyproject.toml`](../pyproject.toml) | 包版本号源 |
-| [`docs/specs/v1-contract.md`](specs/v1-contract.md) | Wire 契约 |
+| [`docs/specs/v2-contract.md`](specs/v2-contract.md) | Wire 契约 |
 | `src/oc_slimapi/versioning.py` | Wire API 接受区间 |
 
 ---
