@@ -7,6 +7,7 @@
 >
 > | 修订日期 | wire 版本 | 文档 rev | 变更摘要 | 落地对照 |
 > |---|---|---|---|---|
+> | **2026-07-29** | **2（不变）** | **v2+additive** | **流量日志持久化 + 客户端标识（加性）**：access log 文件发现规则改为按天切分 `access-YYYY-MM-DD.jsonl`；内存账本快照按天切分 `traffic-snapshot-YYYY-MM-DD.jsonl`（均 ops 面）；新增可选输入头 `X-Client-Name`/`X-Client-Version`/`X-Client-Id`（不透传上游、缺省忽略）；access log 新增 `client`/`clientVer`/`clientId` 字段（缺省 `null`）。**`X-Slimapi-Version` 不 bump**（加性输入 + ops 面文件名，非 wire 协议破坏）。详见 §7、§12。 | §7 / §12 |
 > | **2026-07-28** | **2（breaking bump）** | **v2** | **Rev v2 (lite-v2)**: deleted 10+ endpoints, removed routeToken/discovery/children/Stage-B-part-tracking/Opt-A/BatchLedger; simplified `/full/{mid}` and `/messages`; digest `updatedAt` now sidecar wall-clock; version gate `(2,2)`. **Breaking wire bump** from `X-Slimapi-Version: 1` → `2`.详见下文各节。 | §0 / §1 / §2 / §3 / §5 / §6 / §7 / §11 |
 >
 > **基准声明**：本文件是 v2 wire 基准。实现侧加性/修复性变更在对应小节就地标注，并在本头部「文档修订日志」汇总。所有加性变更**不 bump `X-Slimapi-Version`** 除非另行说明。与 design-v2/INTERFACE_MAP 冲突时以本文件为准；后者需随后同步。
@@ -253,7 +254,9 @@ data: {"reason":"subscriber_backpressure|reconnect_no_replay|token_memory_limit|
 - **v2 删除**：v1 的 `upstream_unavailable`（envelope per-mid，Opt-A opt-in）已删除（Opt-A 整体下线）；v1 的 `upstream_error`（G6 envelope mid 2xx body 不可解析 + q/p fan-out 单 dir 失败项）已删除（G6 / q/p 端点不存在）；v1 的 q/p mutation `upstream_timeout` 504 已删除（q/p 写端点不存在，所有写经 catch-all 反代时由上游 opencode 自身语义决定）。
 - thin 路由错误体统一：`{"code":string, "message"?:string, ...}`（非 `{"detail":...}`）
 - FastAPI 参数缺失/类型错误仍为 422。
-- **可观测性（v2 保留，加性，不 bump、不构成协议契约依赖）**：每请求由最外层中间件生成/透传 `X-Request-ID`（请求头 + 响应头回显，并透传上游 opencode；入站值含 CR/LF/控制字符/空白/超 128 则丢弃改生成）；access log（`logs/access.jsonl`）每条记录含 `requestId` 字段。客户端可 echo 该头做跨 sidecar↔opencode 关联诊断。
+- **可观测性（v2 保留，加性，不 bump、不构成协议契约依赖）**：每请求由最外层中间件生成/透传 `X-Request-ID`（请求头 + 响应头回显，并透传上游 opencode；入站值含 CR/LF/控制字符/空白/超 128 则丢弃改生成）；access log 每条记录含 `requestId` 字段。客户端可 echo 该头做跨 sidecar↔opencode 关联诊断。
+  - **access log 文件发现规则（2026-07-29 加性，ops 面，非 wire 协议）**：旧 `logs/access.jsonl`（`RotatingFileHandler`，size 10MiB×5）改为 **按天切分** `access-YYYY-MM-DD.jsonl`（`YYYY-MM-DD` = `date.today().isoformat()`）。启动时将**早于今天的**（日期 `< today`）未压缩 `.jsonl` 原子压缩为独立 `.gz`（写 `.gz.tmp` → rename），并迁移**当前 `access_log_dir` 内**的无日期文件（旧 `access.jsonl`/`access.jsonl.N`）为 `access-legacy-{mtimeYYYYMMDD}-{N}.jsonl.gz`（**不跨目录迁移**；生产从旧相对目录升到 `StateDirectory` 时旧位置历史日志需运维手动移动）。后台周期 maintenance loop 执行 compress + prune（`OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS`，默认 `0` = 不删；prune 严格匹配 `access-YYYY-MM-DD.jsonl(.gz)`，**不含** `access-legacy-*.jsonl.gz`——后者永久保留、由运维清理）。旧 env `OC_SLIMAPI_ACCESS_LOG_PATH`/`_MAX_BYTES`/`_BACKUPS` 标 **deprecated**（字段保留兼容；`_PATH` 若设非默认值，取其 parent dir 兜底）。本条是 **ops 面**（非客户端 wire 行为），因旧路径曾在本契约记录故同步更新；`X-Slimapi-Version` **不 bump**。
+  - **可选客户端标识输入头（2026-07-29 加性）**：客户端**可选**发送 `X-Client-Name`（app 名，如 `ocdroid`）、`X-Client-Version`（如 `1.2.3`）、`X-Client-Id`（设备标识）。sidecar 读取后落入 access log 的 `client` / `clientVer` / `clientId` 字段（缺省 `null`，向后兼容）。**这三个头不透传给 opencode**（catch-all 反代在 `strip_hop_by_hop` 之后显式 pop，大小写不敏感）。校验规则：空/空白 → 忽略；UTF-8 字节数 > 128 → 忽略（**拒绝不截断**，避免合并不同 id）；含控制字符（`<0x20` 或 `0x7f`）→ 忽略（防注入）；重复同名 header → 取第一个有效值（lenient）。设备 id（`clientId`）默认经 **SHA-256 截断 16 hex 字符** hash（`sha256(raw)[:16]`）后落盘（防日志明文直出）；设置 `OC_SLIMAPI_CLIENT_ID_SALT` 时升级为 **HMAC-SHA256 截断 16 hex 字符**（`hmac_sha256(salt, raw)[:16]`，更强）；`client`/`clientVer` **不 hash**（需明文筛选，可能含 PII）。**诚实标注**：默认级（无 salt）是「防明文直出」，非抗对手强匿名。**`X-Slimapi-Version` 不 bump**（加性输入，缺省忽略，不影响既有客户端）。
 
 ## §8 客户端 v2 最小集
 
@@ -299,10 +302,11 @@ skeleton 共享缓存（YAGNI，先指标）、多用户（独立 stack）、Par
 
 ## §12 流量/省流查询与 accounting（运维诊断）
 
-> 客户端 / 运维查询"哪些请求未省流"或"省流比率"的入口：access log `logs/access.jsonl`（每条记录含 `method` / `path` / `bucket`（`slimapi` / `passthrough`）/ `requestId` / `bytes` / `status` / 时延）+ `/slimapi/metrics`（T3 订阅者/queue/hub 指标，`batch` 恒 `null`）。
+> 客户端 / 运维查询"哪些请求未省流"或"省流比率"的入口：access log（按天切分 `access-YYYY-MM-DD.jsonl`，早于今天的文件启动压缩为 `.gz`；每条记录含 `method` / `path` / `bucket`（`slimapi` / `passthrough`）/ `requestId` / 可选 `client`/`clientVer`/`clientId` / `bytes` / `status` / 时延）+ `/slimapi/metrics`（T3 订阅者/queue/hub 指标，`batch` 恒 `null`）+ 内存账本周期快照 `traffic-snapshot-YYYY-MM-DD.jsonl`（按天切分、不经自动压缩/prune；cumulative，含 SSE 真实成本，跨进程靠 `bootTs`/`runId`/`uptimeS` 分段）。详见 §7 access log 文件发现规则与 `docs/manual/traffic-accounting.md`。
 
 - 查"哪些请求未省流"：按 `bucket=="passthrough"` 过滤 access log、聚合 `method+path`，再对照本契约 §2 端点表看有无 `/slimapi` 等价省流路由。
 - `/slimapi/metrics.traffic`（如有实现，加性诊断端点）提供聚合视角；本契约不强制要求该端点存在，详见 `docs/manual/traffic-accounting.md`。
+- access log 文件命名、压缩、retain 与 client header 详见 §7 可观测性条目；均为 ops 面，`X-Slimapi-Version` 不 bump。
 
 ---
 

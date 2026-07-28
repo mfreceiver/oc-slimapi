@@ -37,7 +37,7 @@ import logging
 import time
 from typing import Any, Awaitable, Callable
 
-from ..access_log import get_access_logger, write_access_log
+from ..access_log import get_access_logger, hash_client_id, write_access_log
 from ..logging_config import get_logger
 from ..traffic import SSE_BUCKETS, _read_state_int, _UP_IN_KEY, _UP_OUT_KEY, bucketize
 from .request_id import REQUEST_ID_KEY
@@ -57,6 +57,59 @@ def _ledger_from_scope(scope: dict[str, Any]) -> Any:
     if state is None:
         return None
     return getattr(state, "traffic_ledger", None)
+
+
+def _config_from_scope(scope: dict[str, Any]) -> Any | None:
+    """Best-effort lookup of the app Settings. Returns None if absent (fail-closed)."""
+    app = scope.get("app")
+    if app is None:
+        return None
+    state = getattr(app, "state", None)
+    if state is None:
+        return None
+    return getattr(state, "config", None)
+
+
+# Client-identity header names (bytes for case-insensitive ASGI scope lookup).
+_CLIENT_IDENT_HEADERS: dict[bytes, int] = {
+    b"x-client-name": 0,
+    b"x-client-version": 1,
+    b"x-client-id": 2,
+}
+
+
+def _read_client_headers(scope: dict[str, Any]) -> tuple[str | None, str | None, str | None]:
+    """Read and validate X-Client-Name / X-Client-Version / X-Client-Id from scope.
+
+    Returns ``(name, version, id_raw)`` — each is ``None`` when absent,
+    empty/whitespace-only, >128 UTF-8 bytes, invalid UTF-8, or containing
+    control characters.  Duplicate headers are lenient: the first valid value
+    wins.
+    """
+    headers: list[tuple[bytes, bytes]] = scope.get("headers") or []
+    result: list[str | None] = [None, None, None]
+    for name_bytes, value_bytes in headers:
+        index = _CLIENT_IDENT_HEADERS.get(name_bytes.lower())
+        if index is None:
+            continue
+        # Already found a valid value for this header → skip duplicates (lenient).
+        if result[index] is not None:
+            continue
+        # Reject overlong values by raw byte length (privacy: never truncate).
+        if len(value_bytes) > 128:
+            continue
+        try:
+            value = value_bytes.decode("utf-8")
+        except Exception:
+            continue
+        # Reject empty / whitespace-only.
+        if not value or not value.strip():
+            continue
+        # Reject control characters (header-injection guard).
+        if any(ord(c) < 0x20 or ord(c) == 0x7f for c in value):
+            continue
+        result[index] = value
+    return (result[0], result[1], result[2])
 
 
 class TrafficAccountingMiddleware:
@@ -83,6 +136,13 @@ class TrafficAccountingMiddleware:
         path = scope.get("path", "") or ""
         bucket = bucketize(method, path)
         is_sse = bucket in SSE_BUCKETS
+
+        # Read client-identity headers and stash into scope state for _record.
+        client_name, client_ver, client_id_raw = _read_client_headers(scope)
+        state = scope.setdefault("state", {})
+        state["traffic_client_name"] = client_name
+        state["traffic_client_ver"] = client_ver
+        state["traffic_client_id_raw"] = client_id_raw
 
         down_in = 0
         status_code = 0
@@ -187,7 +247,26 @@ def _record(
     # Access log: always (when the logger is enabled). For SSE buckets we log
     # the wire-level down_out so an operator sees the real connection payload.
     try:
-        request_id = scope.get("state", {}).get(REQUEST_ID_KEY)
+        state = scope.get("state", {}) or {}
+        request_id = state.get(REQUEST_ID_KEY)
+        client_name = state.get("traffic_client_name")
+        client_ver = state.get("traffic_client_ver")
+        client_id_raw = state.get("traffic_client_id_raw")
+
+        # Resolve client_id: hash vs plaintext (fail-closed: default hash).
+        client_id: str | None = None
+        if client_id_raw is not None:
+            config = _config_from_scope(scope)
+            # fail-closed: no config → hash=True (never accidentally plaintext).
+            should_hash = True if config is None else getattr(
+                config, "client_id_hash", True
+            )
+            salt = None if config is None else getattr(config, "client_id_salt", None)
+            if should_hash:
+                client_id = hash_client_id(client_id_raw, salt=salt)
+            else:
+                client_id = client_id_raw
+
         write_access_log(
             logger,
             method=method,
@@ -200,6 +279,9 @@ def _record(
             up_in=up_in,
             up_out=up_out,
             request_id=request_id,
+            client=client_name,
+            client_ver=client_ver,
+            client_id=client_id,
         )
     except Exception as exc:
         logger.warning("write_access_log failed", exc_info=exc)

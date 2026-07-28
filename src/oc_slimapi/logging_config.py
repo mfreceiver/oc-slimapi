@@ -5,7 +5,8 @@ configured from ``OC_SLIMAPI_LOG_LEVEL`` env var.  Idempotent — safe under
 uvicorn hot reload.
 
 This module does **not** touch the existing ``oc_slimapi.access`` logger
-(which has its own ``RotatingFileHandler`` in :mod:`oc_slimapi.access_log`).
+(which has its own :class:`~oc_slimapi.access_log.DailyAccessHandler` in
+:mod:`oc_slimapi.access_log`).
 """
 
 from __future__ import annotations

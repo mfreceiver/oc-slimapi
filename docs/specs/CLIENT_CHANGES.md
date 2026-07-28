@@ -45,6 +45,38 @@
 - GET circuit breaker：连续 3 次 transport/5xx 后禁 thin 5 分钟，再 half-open。
 - mutation 只发一次，不因超时向 direct 重发。
 
+## 客户端标识头（可选，加性 — 2026-07-29）
+
+> **加性 / 向后兼容**：不传这些头，行为完全不变。不需要 bump wire 版本。给 sidecar access log 提供来源区分（哪个 app / 哪个版本 / 哪台设备发的请求），用于运维排障与省流分析。
+
+ocdroid 可在每个请求（含 SSE）**可选**附加三个 request header：
+
+| 头 | 含义 | 示例 |
+|---|---|---|
+| `X-Client-Name` | app 名 | `ocdroid` |
+| `X-Client-Version` | app 版本 | `1.2.3` |
+| `X-Client-Id` | 设备标识（见下生成建议） | 随机 UUID 或用户自定义名 |
+
+### sidecar 侧处理（客户端无需关心细节，仅供理解）
+
+- sidecar 读取后落入 access log 的 `client` / `clientVer` / `clientId` 字段（缺省 `null`）。
+- **不透传给 opencode**（catch-all 反代显式剥离这三个头）。
+- **设备 id 默认 hash**：sidecar 默认对 `X-Client-Id` 做 **SHA-256 截断 16 hex 字符**（`sha256(raw)[:16]`）后落盘，防日志明文直出设备标识；运维侧分析时靠 hash 稳定区分设备（同一 raw id → 同一 hash）。
+- **`X-Client-Name` / `X-Client-Version` 不 hash**（需明文按版本筛选，注意可能含 PII，勿放敏感信息）。
+- 校验：空/空白 → 忽略；UTF-8 字节 > 128 → 忽略（拒绝不截断）；含控制字符 → 忽略。
+
+### 设备 id 生成与配置建议
+
+1. **首次启动生成 UUID v4**，持久化到 Android `DataStore` / `SharedPreferences`（卸载重装会变，单用户产品可接受）。
+2. **用户可在设置里自定义覆盖**（如 `mar-phone`、`tablet-2`，便于多设备命名区分）；留空则回退随机值。
+3. **不传** → sidecar 落 `clientId: null`（完全可接受，向后兼容）。
+
+### 不需要客户端做的事
+
+- 不需要 bump wire 版本。
+- 不需要校验响应中是否有这三个头的回显（sidecar 不回显）。
+- 不需要保证 id 全局唯一（hash 碰撞概率极低，且仅用于日志区分）。
+
 ## 错误体形状（thin routes）
 
 - **统一形状**：thin 路由（`/slimapi/sessions`、`/slimapi/messages/**`）的错误体由 FastAPI 默认的 `{"detail":"…"}` 改为：

@@ -45,6 +45,25 @@ def _is_shell_path(path: str) -> bool:
     return _SHELL_PATH_RE.match(path) is not None
 
 
+# Client-identity headers that must be stripped before forwarding upstream
+# (device id could leak PII to opencode if forwarded).
+_CLIENT_IDENT_HEADERS = {"x-client-name", "x-client-version", "x-client-id"}
+
+
+def _strip_client_ident_headers(headers: dict[str, str]) -> dict[str, str]:
+    """Remove X-Client-Name / X-Client-Version / X-Client-Id (case-insensitive).
+
+    Operates on the already-validated proxy headers dict (returned by
+    :func:`strip_hop_by_hop`). Returns a new dict with the client-ident headers
+    removed.
+    """
+    return {
+        k: v
+        for k, v in headers.items()
+        if k.lower() not in _CLIENT_IDENT_HEADERS
+    }
+
+
 def install_proxy(app: FastAPI) -> None:
     @app.websocket("/{path:path}")
     async def websocket_not_supported(websocket: WebSocket, path: str):
@@ -100,6 +119,7 @@ def install_proxy(app: FastAPI) -> None:
                     stash_up_out(request, n)
 
         proxy_headers = strip_hop_by_hop(request.headers)
+        proxy_headers = _strip_client_ident_headers(proxy_headers)
         rid = request.scope.get("state", {}).get("request_id")
         if rid is not None:
             proxy_headers["X-Request-ID"] = rid

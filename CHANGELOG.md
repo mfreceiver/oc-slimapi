@@ -26,7 +26,52 @@ ocdroid 对接时：
 
 ---
 
-## [Unreleased] — lite-v2 major cleanup
+## [1.0.0] - 2026-07-29 — lite-v2 major cleanup
+
+### 流量日志持久化 + 客户端标识（加性，未 bump `X-Slimapi-Version`，仍 `2`）
+
+> 评审权威：`.ocmar/workflows/traffic-log-persistence/lanes/design/review-task-2-orchestrator-20260729071740.md`。修复 access log 在 systemd `ProtectSystem=strict` 下不可写的部署 bug + 加性客户端标识 + 内存账本持久化快照。**全部加性 / 运维面，不影响既有客户端 wire 行为**。
+
+#### Added
+
+- **access log 新增 `client` / `clientVer` / `clientId` 字段（加性，缺省 `null`，向后兼容）**：三个字段均为可选；未发送客户端标识头时整字段为 `null`，旧解析逻辑容忍。
+- **新增可选输入头 `X-Client-Name` / `X-Client-Version` / `X-Client-Id`（加性）**：客户端可发送这三个 request header 标识来源 app / 版本 / 设备。sidecar 读取后落 access log；**不透传给 opencode**（catch-all 显式剥离）。校验：空/空白→忽略；UTF-8 字节 > 128→忽略（拒绝不截断）；含控制字符（`<0x20`/`0x7f`）→忽略；重复同名→取首个有效值。设备 id 默认 SHA-256 截断 16 hex 字符 hash（`OC_SLIMAPI_CLIENT_ID_SALT` 设置时升级 HMAC-SHA256）。详见 `docs/specs/v2-contract.md` §7。
+- **内存账本周期快照 `traffic-snapshot-YYYY-MM-DD.jsonl`（加性 ops 面）**：`TrafficSnapshotter` 后台周期（默认 300s）将内存 ledger 的 cumulative 视角（含 SSE 真实成本 `upIn`/`downOut`）写入 JSONL 文件，**按天切分** `traffic-snapshot-YYYY-MM-DD.jsonl`（命名与 access log `<stem>-YYYY-MM-DD.jsonl` 统一；`OC_SLIMAPI_TRAFFIC_SNAPSHOT_PATH` 为 stem）。每帧含 `ts`/`bootTs`（进程启动固定时间戳）/`runId`（进程内 16-hex）/`uptimeS`（`time.monotonic` 差，抗 NTP 回拨）/`pid`/`enabled`/`buckets`/`totals`/`ratios`。跨进程（重启）靠 `bootTs`/`runId`/`uptimeS` 分段，分析侧算 delta。shutdown 写终态帧。snapshot **不经 access log 的 compress/prune 维护**（不自动压缩/清理）。best-effort：**首帧写入失败 → inactive**（不创建后台 task、不周期重试，需重启恢复），不挂 lifespan。详见 `docs/manual/traffic-accounting.md`。
+
+#### Changed
+
+- **access log 切分策略：`RotatingFileHandler`（size 10MiB×5）→ 按天切分 `access-YYYY-MM-DD.jsonl`**：文件名含日期（`date.today().isoformat()`）。启动时将**早于今天的**（`< today`）未压缩 `.jsonl` 原子压缩为独立 `.gz`（`.gz.tmp` → rename，源删失败不回滚），并迁移**当前 `access_log_dir` 内**的无日期文件（`access.jsonl`/`access.jsonl.N`）为 `access-legacy-{mtimeYYYYMMDD}-{N}.jsonl.gz`（**不跨目录迁移**；生产从旧相对目录升到 `StateDirectory` 时旧位置历史日志需运维手动移动）。后台 maintenance loop（默认 1h 周期）执行 compress + prune；`access-legacy-*.jsonl.gz` **不受 retain 自动清理**（prune 严格匹配 `access-YYYY-MM-DD.jsonl(.gz)`），永久保留、由运维清理。**ops 面，非 wire 协议破坏**。
+- **旧 env 标 deprecated（保留兼容，不删字段）**：`OC_SLIMAPI_ACCESS_LOG_PATH`（若设非默认值 `logs/access.jsonl`，取其 parent dir 兜底）、`OC_SLIMAPI_ACCESS_LOG_MAX_BYTES`、`OC_SLIMAPI_ACCESS_LOG_BACKUPS`（后两者 unused since daily rotation，validate 校验保留无害）。
+
+#### 新增配置项
+
+| env | 默认 | 作用 |
+|---|---|---|
+| `OC_SLIMAPI_ACCESS_LOG_DIR` | `logs` | access log 目录（按天文件落在其下）；生产 systemd 覆盖为 `%S/oc-slimapi/logs` |
+| `OC_SLIMAPI_ACCESS_LOG_COMPRESS_ON_STARTUP` | `1` | 启动时压缩早于今天（`< today`）的 `.jsonl` → `.gz` |
+| `OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS` | `0` | prune 早于 N 天的 `access-YYYY-MM-DD.jsonl(.gz)`；`0`=不删。**不含** `access-legacy-*.jsonl.gz` |
+| `OC_SLIMAPI_ACCESS_LOG_MAINTENANCE_INTERVAL_S` | `3600` | 后台 compress+prune 周期（≥60） |
+| `OC_SLIMAPI_TRAFFIC_SNAPSHOT_ENABLED` | `1` | 内存账本快照总开关 |
+| `OC_SLIMAPI_TRAFFIC_SNAPSHOT_INTERVAL_S` | `300` | 快照周期（≥1） |
+| `OC_SLIMAPI_TRAFFIC_SNAPSHOT_PATH` | `logs/traffic-snapshot.jsonl` | 快照文件名 stem（按天生成 `<stem>-YYYY-MM-DD.jsonl`）；生产 systemd 覆盖为 `%S/oc-slimapi/logs/traffic-snapshot.jsonl` |
+| `OC_SLIMAPI_CLIENT_ID_HASH` | `1` | 设备 id hash 开关（fail-closed 默认开） |
+| `OC_SLIMAPI_CLIENT_ID_SALT` | `None` | HMAC salt（非空时升级 sha256→hmac_sha256） |
+
+#### 部署（systemd）
+
+- **unit 加 `StateDirectory=oc-slimapi`**：user service → systemd 自动建 `~/.local/state/oc-slimapi`，在 `ProtectSystem=strict` + `ProtectHome=read-only` 下允许写入。env 覆盖 access log 目录与 snapshot 路径到 `%S/oc-slimapi/logs`。修复此前 access log 在生产 sandbox 下不可写的 bug。代码默认仍为相对 `logs/`（本地开发 cwd 可写）。
+
+#### 受影响文档 / 路由
+
+- `docs/specs/v2-contract.md` §7（access log 文件发现规则 + client header）、§12（流量查询入口更新）。
+- `docs/specs/CLIENT_CHANGES.md`「客户端标识头（可选，加性）」节。
+- `docs/specs/INTERFACE_MAP.md` §0（client header 约定 + access log 文件名规则）。
+- `docs/operations.md` §5（日志策略修正：access log 与 snapshot 落 StateDirectory）。
+- `docs/manual/traffic-accounting.md`（snapshot 章节 + access log 更新 + 配置表）。
+- `deploy/oc-slimapi.service`（StateDirectory + env 覆盖）。
+- 未新增 `/slimapi` 路由；`scripts/check_routes_doc.py` 仍一致。**`X-Slimapi-Version` 不 bump**（加性输入 + ops 面文件名，非 wire 协议破坏）。
+
+---
 
 ### Breaking (wire behavior)
 - Wire version bumped: `X-Slimapi-Version: 2` required (ACCEPTED_CLIENT_VERSIONS = (2,2))

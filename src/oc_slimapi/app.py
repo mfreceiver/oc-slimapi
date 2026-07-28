@@ -1,10 +1,20 @@
+import asyncio
 from contextlib import asynccontextmanager
+from datetime import date
+from pathlib import Path
 
 from fastapi import FastAPI
 import uvicorn
 
 from . import __version__
-from .access_log import setup_access_log
+from .access_log import (
+    compress_old_access_logs,
+    get_access_logger,
+    migrate_legacy_access_log,
+    prune_old_access_logs,
+    run_access_log_maintenance_loop,
+    setup_access_log,
+)
 from .config import settings
 from .errors import register_error_handlers
 from .logging_config import get_logger, setup_logging
@@ -16,6 +26,7 @@ from .sse.hub import HubRegistry
 from .sse.token_hub import TokenStreamHub, TokenStreamRegistry
 from .sse.tokenstream.hub import apply_debug_budget_overrides
 from .traffic import TrafficLedger
+from .traffic_snapshot import TrafficSnapshotter
 from .transform import TransformConfig, TransformPool
 from .upstream import create_client
 from .versioning import SlimapiVersionMiddleware
@@ -54,21 +65,58 @@ async def lifespan(app: FastAPI):
     setup_logging()
     settings.validate()
     app.state.config = settings
-    # Structured access log (RotatingFileHandler on the oc_slimapi.access
-    # logger). Idempotent — safe under uvicorn hot reload. Disabled-logger
-    # path skips all filesystem work.
-    setup_access_log(
-        enabled=settings.access_log_enabled,
-        path=settings.access_log_path,
-        max_bytes=settings.access_log_max_bytes,
-        backups=settings.access_log_backups,
-    )
+    # Structured access log (DailyAccessHandler on the oc_slimapi.access
+    # logger). Files are named access-YYYY-MM-DD.jsonl under ``access_log_dir``,
+    # rotated by calendar day; startup compresses history and a background loop
+    # re-runs compress+prune. Best-effort — a failure degrades to a disabled
+    # logger and NEVER crashes lifespan (traffic-log-persistence task-2 阻断2).
+    # Backward-compat (阻断6): if the deprecated OC_SLIMAPI_ACCESS_LOG_PATH is
+    # set to a non-default value, honor its parent dir with a warning.
+    access_log_dir = settings.access_log_dir
+    # Backward-compat (阻断6) + priority clarity (终审重要项): the deprecated
+    # OC_SLIMAPI_ACCESS_LOG_PATH gets a say ONLY when the new
+    # OC_SLIMAPI_ACCESS_LOG_DIR is left at its default. An explicitly-set new
+    # dir always wins over the deprecated path (its parent is used as a
+    # fallback + warning). Without this guard a stale legacy env would
+    # silently override an explicit new dir.
+    if access_log_dir == "logs" and settings.access_log_path != "logs/access.jsonl":
+        legacy_dir = str(Path(settings.access_log_path).parent) or "."
+        get_logger("app").warning(
+            "OC_SLIMAPI_ACCESS_LOG_PATH is deprecated (ignored); using its "
+            "parent dir %r — set OC_SLIMAPI_ACCESS_LOG_DIR explicitly",
+            legacy_dir,
+        )
+        access_log_dir = legacy_dir
+    setup_access_log(enabled=settings.access_log_enabled, dir=access_log_dir)
+    # Daily-rotation maintenance at startup (best-effort): migrate any legacy
+    # RotatingFileHandler files, compress non-today history, prune by retain.
+    if settings.access_log_enabled:
+        try:
+            migrate_legacy_access_log(access_log_dir)
+            if settings.access_log_compress_on_startup:
+                compress_old_access_logs(access_log_dir, date.today())
+            prune_old_access_logs(
+                access_log_dir, settings.access_log_retain_days, date.today()
+            )
+        except Exception as exc:
+            get_logger("app").warning(
+                "access-log startup maintenance failed", exc_info=exc
+            )
     # Full bidirectional byte ledger (traffic accounting). Single shared
     # instance — read by the ASGI middleware (down/up per-request), the SSE
     # generators (SSE downstream per-frame), and GlobalHub.run (SSE upstream
     # per-line). When disabled, record_* are no-ops and snapshot reports
     # ``{"enabled": False}``.
     app.state.traffic_ledger = TrafficLedger(enabled=settings.traffic_metrics_enabled)
+    # Periodic cumulative snapshot of the in-memory ledger — the ONLY
+    # persistent source for real SSE upstream cost (lost on restart without
+    # this). Writes a total snapshot per tick; deltas are derived at analysis
+    # time. Best-effort: start/stop failures warn + degrade (task-2 阻断7).
+    app.state.traffic_snapshotter = TrafficSnapshotter(
+        ledger=app.state.traffic_ledger,
+        interval_s=settings.traffic_snapshot_interval_s,
+        path=settings.traffic_snapshot_path,
+    )
     # Debug/联调-only: override token-stream memory budget caps from env
     # (OC_SLIMAPI_TOKEN_STREAM_DEBUG_*). No-op when env vars are unset.
     apply_debug_budget_overrides(settings)
@@ -146,7 +194,7 @@ async def lifespan(app: FastAPI):
         "oc-slimapi %s starting: host=%s port=%s upstream=%s "
         "max_transforms=%s shell_deny_list_enabled=%s "
         "token_stream_max_subscribers=%s traffic_ledger_enabled=%s "
-        "access_log_path=%s",
+        "access_log_dir=%s",
         __version__,
         settings.host,
         settings.port,
@@ -155,20 +203,93 @@ async def lifespan(app: FastAPI):
         settings.shell_deny_list_enabled,
         settings.token_stream_max_subscribers,
         settings.traffic_metrics_enabled,
-        settings.access_log_path if settings.access_log_enabled else "disabled",
+        access_log_dir if settings.access_log_enabled else "disabled",
     )
+    # Start background tasks after all state is wired. The access-log
+    # maintenance loop (compress+prune) runs independent of restart so a
+    # long-running process still compresses history; the snapshotter writes
+    # its first frame immediately then ticks on interval.
+    if settings.access_log_enabled:
+        stop_event = asyncio.Event()
+        app.state._access_log_stop_event = stop_event
+        app.state._access_log_maintenance_task = asyncio.create_task(
+            run_access_log_maintenance_loop(
+                dir=access_log_dir,
+                retain_days=settings.access_log_retain_days,
+                interval_s=settings.access_log_maintenance_interval_s,
+                stop_event=stop_event,
+            )
+        )
+    if settings.traffic_snapshot_enabled and settings.traffic_metrics_enabled:
+        try:
+            await app.state.traffic_snapshotter.start()
+        except Exception as exc:
+            get_logger("app").warning(
+                "traffic snapshotter start failed", exc_info=exc
+            )
     try:
         yield
     finally:
-        # NB-C4: stop the token flush loop on shutdown (idempotent; no-op if
-        # already stopped on last-detach). Must precede hubs.close() so the
-        # registry / hub are still coherent while the loop drains.
-        app.state.token_hub.stop()
-        await app.state.hubs.close()
-        await app.state.upstream.aclose()
-        # Drain in-flight transforms before letting the process exit so a
-        # hot reload does not yank a worker out from under an active gzip.
-        app.state.transforms.shutdown()
+        # Stop the access-log maintenance loop first (signal + cancel) so it
+        # cannot race the ledger/hub teardown below.
+        stop_event = getattr(app.state, "_access_log_stop_event", None)
+        if stop_event is not None:
+            stop_event.set()
+        maint_task = getattr(app.state, "_access_log_maintenance_task", None)
+        if maint_task is not None and not maint_task.done():
+            maint_task.cancel()
+            try:
+                await maint_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        # Each cleanup component is isolated so one failure does NOT skip the
+        # others (task-2 阻断7: true per-component convergence, not a single
+        # try that short-circuits and leaks upstream/transform). The final-
+        # state snapshot below runs unconditionally after all are attempted.
+        # NB-C4: token flush loop stop must precede hubs.close() so the
+        # registry / hub stay coherent while the loop drains.
+        try:
+            app.state.token_hub.stop()
+        except Exception as exc:
+            get_logger("app").warning("token_hub.stop failed", exc_info=exc)
+        try:
+            await app.state.hubs.close()
+        except Exception as exc:
+            get_logger("app").warning("hubs.close failed", exc_info=exc)
+        try:
+            await app.state.upstream.aclose()
+        except Exception as exc:
+            get_logger("app").warning("upstream.aclose failed", exc_info=exc)
+        try:
+            # Drain in-flight transforms so a hot reload does not yank a
+            # worker out from under an active gzip.
+            app.state.transforms.shutdown()
+        except Exception as exc:
+            get_logger("app").warning("transforms.shutdown failed", exc_info=exc)
+        # Close the access-log DailyAccessHandler so file handles flush +
+        # release on graceful shutdown (re-init removes handlers, but a clean
+        # lifespan shutdown should not rely on interpreter GC — 终审重要项).
+        try:
+            access_logger = get_access_logger()
+            for h in list(access_logger.handlers):
+                try:
+                    h.close()
+                except Exception:
+                    pass
+                access_logger.removeHandler(h)
+        except Exception:
+            pass
+        # Final-state snapshot (innermost — always runs after all accounting
+        # components have been attempted, capturing the terminal ledger totals
+        # even if any cleanup above raised).
+        snapshotter = getattr(app.state, "traffic_snapshotter", None)
+        if snapshotter is not None:
+            try:
+                await snapshotter.stop()
+            except Exception as exc:
+                get_logger("app").warning(
+                    "final traffic snapshot failed", exc_info=exc
+                )
 
 
 app = FastAPI(title="oc-slimapi", version=__version__, lifespan=lifespan)

@@ -155,26 +155,46 @@ curl -s -H 'X-Slimapi-Version: 2' http://127.0.0.1:4097/slimapi/health
 
 ## 5. 日志策略
 
-### 5.1 决定：日志走 journald，**不**落项目内文件
+### 5.1 两类日志：journald（应用日志）+ 落盘文件（access log / traffic snapshot）
 
-oc-slimapi 应用本身**不配置任何 logging handler**——uvicorn 把 access log / app log 打到 stdout/stderr，systemd 接进 journald。这是有意的决定，理由：
+oc-slimapi 有两类日志输出，**分别处理**：
 
-| 维度 | journald 现状 |
-|---|---|
-| 持久化 | ✅ 落盘，`Linger=yes` 保证登出后存活 |
-| 按级别 | ✅ `journalctl -p warning` |
-| 按时间窗 | ✅ `--since "1 hour ago"` |
-| tail -f | ✅ `journalctl -f` |
-| 轮转/保留 | ✅ systemd 自动（按 size，`/etc/systemd/journald.conf` 可调） |
-| grep | ✅ `journalctl ... \| rg <pattern>` |
+| 类别 | 落点 | 内容 | 持久化策略 |
+|---|---|---|---|
+| **应用日志** | journald（stdout/stderr） | uvicorn access / app INFO/WARN/ERROR、startup banner | systemd journald 自动轮转 |
+| **access log**（结构化） | 落盘 JSONL | 每请求一行 `{ts,method,path,bucket,status,durationMs,bytes,requestId,client?,clientVer?,clientId?}` | **按天切分** `access-YYYY-MM-DD.jsonl`，启动压缩早于今天 → `.gz`，后台 retain |
+| **traffic snapshot**（内存账本） | 落盘 JSONL | 周期（默认 300s）cumulative 字节账本（含 SSE 真实成本） | 按天切分 `traffic-snapshot-YYYY-MM-DD.jsonl`，shutdown 写终态；不经自动压缩/prune |
 
-**反模式（已拒绝，勿再提）**：
-- `log-{level}-{date}-{hh}.log` 按级别分文件 → 一个请求的 INFO/WARN/ERROR 被撕进 3 个文件，重建时序极痛；每小时 5 文件 × 24 = 120 文件/天。
-- "启动时删 24h 前日志" → 保留期与重启频率耦合，本机长期不重启就堆积、频繁重启就丢历史。保留应时间触发，不是事件触发。
+**应用日志走 journald** 是有意的决定：一个请求的 INFO/WARN/ERROR 留在同一流里，重建时序方便。journald 提供持久化 / 按级别 / 按时间窗 / tail -f / 轮转 / grep，无需应用配置额外 handler。
 
-若未来确有 journald 满足不了的需求（远程收集、结构化 JSON 给 ELK/Loki），再走 `TimedRotatingFileHandler(when="midnight", backupCount=7)` 单文件方案，**不要**回到上面的分文件方案。
+**access log 与 traffic snapshot 落盘**（v0.7.0+ 引入 access log，2026-07-29 改为按天切分 + StateDirectory 可写）：用于离线省流分析与运维排障（"哪些请求未省流"按 `bucket==passthrough` 过滤、按 `clientId` 区分设备）。两者 best-effort、**不阻断服务启动**：access log handler 初始化失败 → disabled（纯 no-op）；snapshotter **首帧写入失败 → inactive**（不创建后台 task、不周期重试，需排查磁盘/路径后重启恢复）。
 
-### 5.2 查询手册
+### 5.2 access log / snapshot 落盘目录（生产 vs 本地开发）
+
+| 场景 | 目录 | 来源 |
+|---|---|---|
+| **systemd 生产** | `~/.local/state/oc-slimapi/logs/` | unit `StateDirectory=oc-slimapi` + env `OC_SLIMAPI_ACCESS_LOG_DIR=%S/oc-slimapi/logs`、`OC_SLIMAPI_TRAFFIC_SNAPSHOT_PATH=%S/oc-slimapi/logs/traffic-snapshot.jsonl`（`%S` = `~/.local/state`）。`ProtectSystem=strict` + `ProtectHome=read-only` 下，`StateDirectory` 显式允许写入此路径 |
+| **本地开发**（手动跑） | `<cwd>/logs/` | 代码默认（相对路径；cwd 可写） |
+
+> **为何需要 StateDirectory**：unit 的 `ProtectSystem=strict` 禁止写 `/`、`ProtectHome=read-only` 禁止写 home。此前 access log 默认写相对 `logs/`（解析为 `/home/.../oc-slimapi/logs/`）在 sandbox 下不可写 → handler 初始化失败。`StateDirectory=oc-slimapi` 让 systemd 自动建 `~/.local/state/oc-slimapi` 并在 sandbox 内显式允许写入；env 覆盖把 access log / snapshot 指向该可写目录。
+
+### 5.3 access log 维护（压缩 / retain / 后台 loop）
+
+- **按天切分**：文件名 `access-YYYY-MM-DD.jsonl`（`YYYY-MM-DD` = 当天日期）。跨天自动切新文件。
+- **启动压缩**：服务启动时将**早于今天的**（日期 `< today`）未压缩 `.jsonl` 原子压缩为 `.gz`（写 `.gz.tmp` → rename → 删源）。当天文件不压缩（活跃写入中）。
+- **legacy 迁移（仅当前目录）**：`migrate_legacy_access_log` 只处理**当前 `access_log_dir` 内**的无日期文件（旧 `access.jsonl`/`access.jsonl.N`），按 mtime 归档为 `access-legacy-{mtimeYYYYMMDD}-{N}.jsonl.gz`。**不跨目录迁移**：从旧相对目录（如 cwd 下 `logs/`）升级到 `StateDirectory`（`~/.local/state/oc-slimapi/logs`）时，旧位置的历史日志**不会自动迁移**——运维需手动移动。
+- **`access-legacy-*.jsonl.gz` 不受 retain 自动清理**：prune 的严格匹配只认 `access-YYYY-MM-DD.jsonl(.gz)`，迁移产物**永久保留**，清理由运维手动处理。
+- **后台 maintenance loop**（默认 1h 周期，`OC_SLIMAPI_ACCESS_LOG_MAINTENANCE_INTERVAL_S`）：周期执行 compress + prune，不依赖重启。
+- **prune**：`OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS`（默认 `0` = 不删）；设 `7` 则删除早于 7 天的 `access-YYYY-MM-DD.jsonl(.gz)`（**不含** `access-legacy-*.jsonl.gz`）。
+- **snapshot 不在此维护范围**：`traffic-snapshot-YYYY-MM-DD.jsonl` 不经 access log 的 compress/prune（后者只认 `access-` 前缀），不自动压缩、不自动清理。
+
+### 5.4 磁盘增长估算
+
+- **access log**：单日 raw 视请求量约 **50–100 MB**（每行 ~200–400 B × 请求数）；压缩后约 **1/8**（~6–12 MB/天）。
+- **traffic snapshot**：极小（每帧 ~1–2 KB × 每 300s = ~300 KB/天）；**不经自动压缩/prune**，长期累积需手动清理。
+- **建议**：长期运行的实例设 `OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS`（如 `30`）控制 access log 历史；snapshot 与 `access-legacy-*.jsonl.gz` 不受此控，需定期手动清理。journald 自身由 systemd 按 `/etc/systemd/journald.conf` 轮转，不在此列。
+
+### 5.5 journald 查询手册（应用日志）
 
 ```bash
 # 实时跟踪（最常用）
@@ -199,7 +219,7 @@ journalctl --user -u oc-slimapi --since today | rg cursor
 journalctl --user -u oc-slimapi --since today > oc-slimapi-today.log
 ```
 
-### 5.3 启动期日志样本（健康态）
+### 5.6 启动期日志样本（健康态）
 
 ```
 systemd[...]: Started oc-slimapi.service ...

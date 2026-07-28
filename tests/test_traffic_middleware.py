@@ -23,6 +23,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse, StreamingResponse
 
 from oc_slimapi.access_log import get_access_logger, setup_access_log
+from oc_slimapi.config import Settings
 from oc_slimapi.middleware.traffic_accounting import TrafficAccountingMiddleware
 from oc_slimapi.traffic import TrafficLedger, stash_up_in
 
@@ -425,10 +426,7 @@ async def test_stash_up_in_ignored_for_sse_bucket():
 
 
 async def test_access_log_written_one_line_per_request(tmp_path):
-    path = tmp_path / "acc.jsonl"
-    logger = setup_access_log(
-        enabled=True, path=str(path), max_bytes=1_000_000, backups=1
-    )
+    logger = setup_access_log(enabled=True, dir=str(tmp_path))
     ledger = TrafficLedger()
 
     def routes(app: FastAPI) -> None:
@@ -444,7 +442,10 @@ async def test_access_log_written_one_line_per_request(tmp_path):
     for handler in logger.handlers:
         handler.flush()
 
-    lines = path.read_text(encoding="utf-8").splitlines()
+    from datetime import date
+    today = date.today().isoformat()
+    log_path = tmp_path / f"access-{today}.jsonl"
+    lines = log_path.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1
     record = json.loads(lines[0])
     assert record["method"] == "GET"
@@ -486,3 +487,486 @@ async def test_non_http_scope_passes_through_untouched():
     assert "lifespan.startup.complete" in seen["sent"]
     # No http byte accounting happened for a non-http scope.
     assert ledger.snapshot()["buckets"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Helpers for client-identity access log tests
+# ---------------------------------------------------------------------------
+
+
+def _make_app_with_config_and_ledger(
+    *, config: Settings, ledger: TrafficLedger | None = None,
+    configure_routes,
+) -> FastAPI:
+    """Like _make_app but also sets app.state.config for client-id hash tests."""
+    app = FastAPI()
+    app.state.config = config
+    if ledger is not None:
+        app.state.traffic_ledger = ledger
+    configure_routes(app)
+    app.add_middleware(TrafficAccountingMiddleware)
+    return app
+
+
+def _default_test_config(**overrides) -> Settings:
+    """Minimal Settings for client-identity tests."""
+    base = dict(
+        host="127.0.0.1", port=4097, upstream="http://127.0.0.1:4096",
+        max_message_bytes=32 * 1024 * 1024,
+        max_transforms=1, transform_wait_seconds=0.5, max_response_bytes=64 * 1024,
+        smoke_session_id=None,
+        server_api_version=1, accepted_client_versions=(1, 1),
+    )
+    base.update(overrides)
+    return Settings(**base)
+
+
+def _read_access_log(dir_path) -> list[dict]:
+    from datetime import date
+    today = date.today().isoformat()
+    log_path = dir_path / f"access-{today}.jsonl"
+    return [
+        json.loads(line)
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+    ]
+
+
+# ---------------------------------------------------------------------------
+# 9. Access log — client-identity headers
+# ---------------------------------------------------------------------------
+
+
+async def test_access_log_with_client_headers(tmp_path):
+    """X-Client-Name / X-Client-Version / X-Client-Id → access log JSON
+    contains client/clientVer/clientId. clientId is a hash (not plaintext)."""
+    logger = setup_access_log(enabled=True, dir=str(tmp_path))
+    ledger = TrafficLedger()
+    # Default config: client_id_hash=True (hash ON), no salt.
+    config = _default_test_config()
+
+    def routes(app: FastAPI) -> None:
+        @app.get("/data")
+        async def data():
+            return PlainTextResponse(b"ok", media_type="text/plain")
+
+    app = _make_app_with_config_and_ledger(
+        config=config, ledger=ledger, configure_routes=routes,
+    )
+    async with await _client(app) as client:
+        resp = await client.get(
+            "/data",
+            headers={
+                "X-Client-Name": "ocdroid",
+                "X-Client-Version": "2.1.0",
+                "X-Client-Id": "dev123",
+            },
+        )
+    assert resp.status_code == 200
+    for handler in logger.handlers:
+        handler.flush()
+    records = _read_access_log(tmp_path)
+    assert len(records) == 1
+    rec = records[0]
+    assert rec["client"] == "ocdroid"
+    assert rec["clientVer"] == "2.1.0"
+    # clientId must be a 16-char hex string (not plaintext).
+    cid: str = rec["clientId"]
+    assert len(cid) == 16
+    assert all(c in "0123456789abcdef" for c in cid)
+    assert cid != "dev123"  # not plaintext
+
+
+async def test_access_log_no_client_headers(tmp_path):
+    """No client-identity headers → all three fields null."""
+    logger = setup_access_log(enabled=True, dir=str(tmp_path))
+    config = _default_test_config()
+
+    def routes(app: FastAPI) -> None:
+        @app.get("/data")
+        async def data():
+            return PlainTextResponse(b"ok", media_type="text/plain")
+
+    app = _make_app_with_config_and_ledger(
+        config=config, configure_routes=routes,
+    )
+    async with await _client(app) as client:
+        resp = await client.get("/data")
+    assert resp.status_code == 200
+    for handler in logger.handlers:
+        handler.flush()
+    records = _read_access_log(tmp_path)
+    assert len(records) == 1
+    rec = records[0]
+    assert rec["client"] is None
+    assert rec["clientVer"] is None
+    assert rec["clientId"] is None
+
+
+async def test_access_log_client_headers_case_insensitive(tmp_path):
+    """Lowercase x-client-id / x-client-name should still be read."""
+    logger = setup_access_log(enabled=True, dir=str(tmp_path))
+    config = _default_test_config()
+
+    def routes(app: FastAPI) -> None:
+        @app.get("/data")
+        async def data():
+            return PlainTextResponse(b"ok", media_type="text/plain")
+
+    app = _make_app_with_config_and_ledger(
+        config=config, configure_routes=routes,
+    )
+    async with await _client(app) as client:
+        resp = await client.get(
+            "/data",
+            headers={
+                "x-client-name": "ocdroid",
+                "x-client-version": "2.1.0",
+                "x-client-id": "dev123",
+            },
+        )
+    assert resp.status_code == 200
+    for handler in logger.handlers:
+        handler.flush()
+    records = _read_access_log(tmp_path)
+    rec = records[0]
+    assert rec["client"] == "ocdroid"
+    assert rec["clientVer"] == "2.1.0"
+    assert rec["clientId"] is not None
+
+
+async def test_access_log_overlong_client_id_is_null(tmp_path):
+    """Client-Id > 128 UTF-8 bytes → clientId null (not truncated)."""
+    logger = setup_access_log(enabled=True, dir=str(tmp_path))
+    config = _default_test_config()
+    # 129 bytes of 'a' (ASCII, each 1 byte in UTF-8)
+    overlong = "a" * 129
+
+    def routes(app: FastAPI) -> None:
+        @app.get("/data")
+        async def data():
+            return PlainTextResponse(b"ok", media_type="text/plain")
+
+    app = _make_app_with_config_and_ledger(
+        config=config, configure_routes=routes,
+    )
+    async with await _client(app) as client:
+        resp = await client.get(
+            "/data",
+            headers={"X-Client-Id": overlong},
+        )
+    assert resp.status_code == 200
+    for handler in logger.handlers:
+        handler.flush()
+    records = _read_access_log(tmp_path)
+    rec = records[0]
+    assert rec["clientId"] is None, "overlong client-id must be null"
+
+
+async def test_access_log_control_char_client_id_is_null(tmp_path):
+    """X-Client-Id containing control chars → clientId null."""
+    logger = setup_access_log(enabled=True, dir=str(tmp_path))
+    config = _default_test_config()
+
+    def routes(app: FastAPI) -> None:
+        @app.get("/data")
+        async def data():
+            return PlainTextResponse(b"ok", media_type="text/plain")
+
+    app = _make_app_with_config_and_ledger(
+        config=config, configure_routes=routes,
+    )
+    # Inject a newline character — header injection attempt.
+    async with await _client(app) as client:
+        resp = await client.get(
+            "/data",
+            headers={"X-Client-Id": "valid\ninjected"},
+        )
+    assert resp.status_code == 200
+    for handler in logger.handlers:
+        handler.flush()
+    records = _read_access_log(tmp_path)
+    rec = records[0]
+    assert rec["clientId"] is None, "control-char client-id must be null"
+
+
+async def test_access_log_whitespace_client_header_is_null(tmp_path):
+    """Whitespace-only client headers → null."""
+    logger = setup_access_log(enabled=True, dir=str(tmp_path))
+    config = _default_test_config()
+
+    def routes(app: FastAPI) -> None:
+        @app.get("/data")
+        async def data():
+            return PlainTextResponse(b"ok", media_type="text/plain")
+
+    app = _make_app_with_config_and_ledger(
+        config=config, configure_routes=routes,
+    )
+    async with await _client(app) as client:
+        resp = await client.get(
+            "/data",
+            headers={"X-Client-Id": "   ", "X-Client-Name": "  "},
+        )
+    assert resp.status_code == 200
+    for handler in logger.handlers:
+        handler.flush()
+    records = _read_access_log(tmp_path)
+    rec = records[0]
+    assert rec["clientId"] is None, "whitespace client-id must be null"
+    assert rec["client"] is None, "whitespace client-name must be null"
+
+
+async def test_access_log_duplicate_client_header_first_wins(tmp_path):
+    """Duplicate X-Client-Id: first valid value is used (lenient)."""
+    logger = setup_access_log(enabled=True, dir=str(tmp_path))
+    config = _default_test_config()
+
+    def routes(app: FastAPI) -> None:
+        @app.get("/data")
+        async def data():
+            return PlainTextResponse(b"ok", media_type="text/plain")
+
+    app = _make_app_with_config_and_ledger(
+        config=config, configure_routes=routes,
+    )
+    # httpx's ASGITransport doesn't support duplicate headers easily,
+    # so we drive the middleware directly with a raw scope.
+    scope: dict = {
+        "type": "http",
+        "method": "GET",
+        "path": "/data",
+        "headers": [
+            (b"x-client-id", b"first"),
+            (b"x-client-id", b"second"),
+            (b"host", b"test"),
+        ],
+        "app": app,
+    }
+    recorded: dict = {}
+
+    async def inner_app(scope, receive, send):
+        nonlocal recorded
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"content-type", b"text/plain")],
+        })
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    outer = TrafficAccountingMiddleware(inner_app, logger=logger)
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        recorded.setdefault("messages", []).append(message)
+
+    await outer(scope, receive, send)
+    for handler in logger.handlers:
+        handler.flush()
+
+    records = _read_access_log(tmp_path)
+    rec = records[0]
+    # First header "first" should win.
+    assert rec["clientId"] is not None
+    # Verify the hash corresponds to "first", not "second".
+    from oc_slimapi.access_log import hash_client_id
+    assert rec["clientId"] == hash_client_id("first")
+
+
+async def test_access_log_client_id_hash_off_plaintext(tmp_path):
+    """client_id_hash=False → clientId logged as plaintext."""
+    logger = setup_access_log(enabled=True, dir=str(tmp_path))
+    config = _default_test_config(client_id_hash=False)
+
+    def routes(app: FastAPI) -> None:
+        @app.get("/data")
+        async def data():
+            return PlainTextResponse(b"ok", media_type="text/plain")
+
+    app = _make_app_with_config_and_ledger(
+        config=config, configure_routes=routes,
+    )
+    async with await _client(app) as client:
+        resp = await client.get(
+            "/data",
+            headers={"X-Client-Id": "my-plain-id"},
+        )
+    assert resp.status_code == 200
+    for handler in logger.handlers:
+        handler.flush()
+    records = _read_access_log(tmp_path)
+    rec = records[0]
+    assert rec["clientId"] == "my-plain-id", "hash off → plaintext"
+
+
+async def test_access_log_client_id_hash_with_salt(tmp_path):
+    """client_id_hash=True + salt set → HMAC result (different from no-salt)."""
+    logger = setup_access_log(enabled=True, dir=str(tmp_path))
+    config = _default_test_config(client_id_hash=True, client_id_salt="pepper")
+
+    def routes(app: FastAPI) -> None:
+        @app.get("/data")
+        async def data():
+            return PlainTextResponse(b"ok", media_type="text/plain")
+
+    app = _make_app_with_config_and_ledger(
+        config=config, configure_routes=routes,
+    )
+    async with await _client(app) as client:
+        resp = await client.get(
+            "/data",
+            headers={"X-Client-Id": "my-device"},
+        )
+    assert resp.status_code == 200
+    for handler in logger.handlers:
+        handler.flush()
+
+    records = _read_access_log(tmp_path)
+    rec = records[0]
+    cid: str = rec["clientId"]
+    assert len(cid) == 16
+    assert all(c in "0123456789abcdef" for c in cid)
+    # With salt, shorter HMAC round; just confirm it is a hash, not plaintext.
+    assert cid != "my-device"
+
+
+async def test_access_log_fail_closed_no_config(tmp_path):
+    """No app.state.config → hash applied (fail-closed)."""
+    logger = setup_access_log(enabled=True, dir=str(tmp_path))
+    # App WITHOUT config set — _config_from_scope returns None.
+    def routes(app: FastAPI) -> None:
+        @app.get("/data")
+        async def data():
+            return PlainTextResponse(b"ok", media_type="text/plain")
+
+    app = _make_app(ledger=None, configure_routes=routes)
+    # Ensure NO config on state.
+    assert not hasattr(app.state, "config")
+    async with await _client(app) as client:
+        resp = await client.get(
+            "/data",
+            headers={"X-Client-Id": "my-device"},
+        )
+    assert resp.status_code == 200
+    for handler in logger.handlers:
+        handler.flush()
+    records = _read_access_log(tmp_path)
+    rec = records[0]
+    # clientId must still be hashed (not plaintext).
+    cid: str = rec["clientId"]
+    assert len(cid) == 16
+    assert all(c in "0123456789abcdef" for c in cid)
+    assert cid != "my-device"
+
+
+# ---------------------------------------------------------------------------
+# 10. UTF-8 edge cases — invalid bytes rejected, valid multi-byte accepted
+# ---------------------------------------------------------------------------
+
+
+async def test_access_log_invalid_utf8_client_id_is_null(tmp_path):
+    """X-Client-Id with invalid UTF-8 bytes → clientId null (strict decode)."""
+    logger = setup_access_log(enabled=True, dir=str(tmp_path))
+    config = _default_test_config()
+
+    def routes(app: FastAPI) -> None:
+        @app.get("/data")
+        async def data():
+            return PlainTextResponse(b"ok", media_type="text/plain")
+
+    app = _make_app_with_config_and_ledger(
+        config=config, configure_routes=routes,
+    )
+    # Inject \xff\xfe which is invalid UTF-8 via raw scope.
+    scope: dict = {
+        "type": "http",
+        "method": "GET",
+        "path": "/data",
+        "headers": [
+            (b"x-client-id", b"\xff\xfe"),
+            (b"host", b"test"),
+        ],
+        "app": app,
+    }
+
+    async def inner_app(scope, receive, send):
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"content-type", b"text/plain")],
+        })
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    outer = TrafficAccountingMiddleware(inner_app, logger=logger)
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        pass
+
+    await outer(scope, receive, send)
+    for handler in logger.handlers:
+        handler.flush()
+
+    records = _read_access_log(tmp_path)
+    rec = records[0]
+    assert rec["clientId"] is None, "invalid UTF-8 client-id must be null"
+
+
+async def test_access_log_multi_byte_utf8_client_id_ok(tmp_path):
+    """X-Client-Id with valid multi-byte UTF-8 (e.g. Chinese) → read + hash."""
+    logger = setup_access_log(enabled=True, dir=str(tmp_path))
+    config = _default_test_config()
+
+    def routes(app: FastAPI) -> None:
+        @app.get("/data")
+        async def data():
+            return PlainTextResponse(b"ok", media_type="text/plain")
+
+    app = _make_app_with_config_and_ledger(
+        config=config, configure_routes=routes,
+    )
+    # Chinese device id as UTF-8 encoded bytes (httpx rejects non-ASCII headers,
+    # so drive the middleware directly via raw scope).
+    raw_id = "设备ID-中文"
+    scope: dict = {
+        "type": "http",
+        "method": "GET",
+        "path": "/data",
+        "headers": [
+            (b"x-client-id", raw_id.encode("utf-8")),
+            (b"host", b"test"),
+        ],
+        "app": app,
+    }
+
+    async def inner_app(scope, receive, send):
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"content-type", b"text/plain")],
+        })
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    outer = TrafficAccountingMiddleware(inner_app, logger=logger)
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        pass
+
+    await outer(scope, receive, send)
+    for handler in logger.handlers:
+        handler.flush()
+
+    records = _read_access_log(tmp_path)
+    rec = records[0]
+    cid: str = rec["clientId"]
+    assert len(cid) == 16
+    assert all(c in "0123456789abcdef" for c in cid)
+    # Hash of "设备ID-中文" — not plaintext.
+    from oc_slimapi.access_log import hash_client_id
+    assert cid == hash_client_id(raw_id)

@@ -53,7 +53,7 @@ systemctl --user status oc-slimapi      # 状态
 journalctl --user -u oc-slimapi -f      # 实时日志
 ```
 
-> 日志走 journald，**不**落项目内文件。理由与查询手册见 `operations.md` §5。
+> 应用日志走 journald；**access log（`logs/access-YYYY-MM-DD.jsonl`）与流量快照（`logs/traffic-snapshot-YYYY-MM-DD.jsonl`）落盘**到 `access_log_dir`（systemd 下为 `StateDirectory` `~/.local/state/oc-slimapi/logs`）。理由与查询手册见 `operations.md` §5。
 
 所有 `/slimapi/**` 请求（包括 `/slimapi/events` SSE）必须带：
 

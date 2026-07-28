@@ -10,6 +10,16 @@ Environment=OC_SLIMAPI_UPSTREAM=http://127.0.0.1:4096
 Environment=OC_SLIMAPI_MAX_MESSAGE_BYTES=33554432
 Environment=OC_SLIMAPI_SERVER_API_VERSION=2
 Environment=OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS=2,2
+
+# StateDirectory 为 access log 与 traffic snapshot 提供可写目录：
+# ProtectSystem=strict + ProtectHome=read-only 下，项目内相对路径（如 ./logs/）不可写；
+# StateDirectory=oc-slimapi 让 systemd 自动建 ~/.local/state/oc-slimapi（%S 占位符 = ~/.local/state）
+# 并在 sandbox 内显式允许写入该路径。
+# 代码默认仍为相对 logs/（本地开发 cwd 可写）；生产由下面两行 env 覆盖到 state dir。
+StateDirectory=oc-slimapi
+Environment=OC_SLIMAPI_ACCESS_LOG_DIR=%S/oc-slimapi/logs
+Environment=OC_SLIMAPI_TRAFFIC_SNAPSHOT_PATH=%S/oc-slimapi/logs/traffic-snapshot.jsonl
+
 ExecStart=%h/.local/share/oc-slimapi/venv/bin/oc-slimapi
 Restart=on-failure
 RestartSec=2

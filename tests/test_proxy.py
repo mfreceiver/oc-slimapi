@@ -322,3 +322,45 @@ async def test_s5_valid_directory_header_passed(upstream_factory):
     # Upstream should have received the directory header (case-insensitive)
     header_lower = {k.lower(): v for k, v in captured_headers.items()}
     assert header_lower.get(DIRECTORY_HEADER.lower()) == "/app"
+
+
+# ── Blocking 4: client-ident headers stripped from upstream ────────────────────
+
+
+async def test_proxy_strips_client_ident_headers(upstream_factory):
+    """X-Client-Name / X-Client-Version / X-Client-Id must be stripped before
+    forwarding upstream (device id shall not leak to opencode)."""
+    captured: dict[str, str] = {}
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        nonlocal captured
+        captured = dict(request.headers)
+        async def body():
+            yield b'{"ok":true}'
+        return httpx.Response(
+            200,
+            stream=httpx._content.AsyncIteratorByteStream(body()),
+            headers={"Content-Type": "application/json"},
+        )
+
+    upstream = upstream_factory(_handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/session",
+            headers={
+                "X-Client-Name": "ocdroid",
+                "X-Client-Version": "2.1.0",
+                "X-Client-Id": "device-abc-123",
+                "X-Custom-Forward": "should-pass",
+            },
+        )
+    assert response.status_code == 200
+    # Verify client-ident headers are NOT in the upstream request.
+    captured_lower = {k.lower(): v for k, v in captured.items()}
+    assert "x-client-name" not in captured_lower
+    assert "x-client-version" not in captured_lower
+    assert "x-client-id" not in captured_lower
+    # Verify other headers still pass through.
+    assert captured_lower.get("x-custom-forward") == "should-pass"

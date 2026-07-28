@@ -235,11 +235,54 @@ class Settings:
     access_log_enabled: bool = os.getenv(
         "OC_SLIMAPI_ACCESS_LOG_ENABLED", "true"
     ).lower() in ("1", "true", "yes", "on")
+    # DEPRECATED (unused since daily rotation): kept so existing deployments
+    # setting these env vars do not break on import (frozen dataclass fields
+    # remain valid). New code does NOT read them. app.py lifespan warns if
+    # OC_SLIMAPI_ACCESS_LOG_PATH is set to a non-default value and falls back
+    # to its parent dir (see traffic-log-persistence task-2 阻断6).
     access_log_path: str = os.getenv("OC_SLIMAPI_ACCESS_LOG_PATH", "logs/access.jsonl")
     access_log_max_bytes: int = int(
         os.getenv("OC_SLIMAPI_ACCESS_LOG_MAX_BYTES", str(10 * 1024 * 1024))
     )
     access_log_backups: int = int(os.getenv("OC_SLIMAPI_ACCESS_LOG_BACKUPS", "5"))
+
+    # Daily-rotated access log (replaces RotatingFileHandler). Files are named
+    # ``access-YYYY-MM-DD.jsonl`` under ``access_log_dir``; startup compresses
+    # non-today files to independent ``.gz`` archives and a background loop
+    # re-runs compress+prune so long-running processes do not depend on restart.
+    access_log_dir: str = os.getenv("OC_SLIMAPI_ACCESS_LOG_DIR", "logs")
+    access_log_compress_on_startup: bool = os.getenv(
+        "OC_SLIMAPI_ACCESS_LOG_COMPRESS_ON_STARTUP", "true"
+    ).lower() in ("1", "true", "yes", "on")
+    access_log_retain_days: int = int(os.getenv("OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS", "0"))
+    access_log_maintenance_interval_s: int = int(
+        os.getenv("OC_SLIMAPI_ACCESS_LOG_MAINTENANCE_INTERVAL_S", "3600")
+    )
+
+    # Periodic cumulative snapshot of the in-memory TrafficLedger (the only
+    # source for real SSE upstream cost, which is lost on restart). Writes a
+    # total (cumulative) snapshot per tick — deltas are derived at analysis
+    # time. Best-effort: failures warn + degrade, never crash the app.
+    traffic_snapshot_enabled: bool = os.getenv(
+        "OC_SLIMAPI_TRAFFIC_SNAPSHOT_ENABLED", "true"
+    ).lower() in ("1", "true", "yes", "on")
+    traffic_snapshot_interval_s: int = int(
+        os.getenv("OC_SLIMAPI_TRAFFIC_SNAPSHOT_INTERVAL_S", "300")
+    )
+    traffic_snapshot_path: str = os.getenv(
+        "OC_SLIMAPI_TRAFFIC_SNAPSHOT_PATH", "logs/traffic-snapshot.jsonl"
+    )
+
+    # Client identity in the access log (additive wire input, no version bump).
+    # ocdroid sends X-Client-Name / X-Client-Version / X-Client-Id. The device
+    # id is hashed before logging (fail-closed: hash on by default). With
+    # ``client_id_salt`` set, HMAC-SHA256 is used instead of plain SHA-256
+    # (stronger, cross-deployment unlinkability). Version fields are logged in
+    # plaintext (needed for filtering). See task-2 隐私修订.
+    client_id_hash: bool = os.getenv(
+        "OC_SLIMAPI_CLIENT_ID_HASH", "true"
+    ).lower() in ("1", "true", "yes", "on")
+    client_id_salt: str | None = os.getenv("OC_SLIMAPI_CLIENT_ID_SALT") or None
 
     # Skeleton projection inline caps (thresholded; config.env overridable).
     # Per-field cap: inline iff JSON-byte size <= this. Per-message cap: cumulative
@@ -396,5 +439,18 @@ class Settings:
             raise RuntimeError("OC_SLIMAPI_ACCESS_LOG_MAX_BYTES must be > 0")
         if self.access_log_backups < 0:
             raise RuntimeError("OC_SLIMAPI_ACCESS_LOG_BACKUPS must be >= 0")
+
+        # Daily-rotation + snapshot guards (traffic-log-persistence task-2).
+        # maintenance loop must be at least 60s to avoid hot-looping; snapshot
+        # interval >= 1s; retain_days >= 0 (0 = never prune).
+        if self.access_log_maintenance_interval_s < 60:
+            raise RuntimeError(
+                "OC_SLIMAPI_ACCESS_LOG_MAINTENANCE_INTERVAL_S must be >= 60"
+            )
+        if self.access_log_retain_days < 0:
+            raise RuntimeError("OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS must be >= 0")
+        if self.traffic_snapshot_interval_s < 1:
+            raise RuntimeError("OC_SLIMAPI_TRAFFIC_SNAPSHOT_INTERVAL_S must be >= 1")
+
 
 settings = Settings()
