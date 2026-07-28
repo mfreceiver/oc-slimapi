@@ -126,6 +126,12 @@
 - token resync **恒带 `sessionID`**；若极端情况收到无 `sessionID` 的 resync，从**连接**推断 sid（token 流每连接绑单 sid）。
 - **不发** `part_too_large`（超限走 `snapshot{truncated:true}`）。
 
+### `message.removed` 帧处理（必须）
+
+- `event: message.removed` payload `{sessionID,messageID}` 可在 token-stream 连接握手期（回放）或运行时（fan-out）收到。收到后应立即丢弃该 message 的所有 live 渲染态（streamOwned parts），该 message 已从上游 opencode 删除，后续 `/slimapi/messages/{sid}` 骨架列表中将不再出现该 message。**控制面 `session.digest` 的 `deleted=true` 是独立信号**，二者互不替代。
+- **握手期回放**：`server.connected` → 该 session 未过期 `message.removed` tombstones 按时间先于 snapshot 回放，客户端可在首次 snapshot 到达前清理已删除消息的状态。
+- 该帧**不存在**于控制面 `/slimapi/events` 连接中。
+
 ### 终态对齐（必须）
 
 - digest `message.updated`（step-finish）→ 客户端应重新拉取 `/slimapi/messages/{sid}` skeleton 列表以获取权威全文，**幂等覆盖**该 message 所有 part（含 token streamOwned 已完成的）。客户端可接受 digest 完成先于 / 晚于 token `snapshot{done:true}`；重拉 skeleton 替换幂等且凌驾所有 token 帧。

@@ -42,7 +42,7 @@
 | GET | `/slimapi/ready` | A | 🔒 | liveness；同上 schema 三键 |
 | GET | `/slimapi/metrics` | A | 🔒 T3 | 订阅者/queue/hub 指标；`batch` 字段恒为 `null`（BatchLedger 已移除，见 §6） |
 | GET | `/slimapi/sessions` | A | 🔒 | 骨架 session 列表（`?directory/roots/limit/start/search`；`roots` 默认 **False**——客户端**应显式传** `roots=true` 以排除 subagent/task；`start` = epoch-ms **时间戳水位** `time_updated >= start`，**非 offset**，上游 legacy 不暴露前向 cursor、不保证 id tie-break）；200 加 `X-Complete` 头（见下）；每条带 `directory` 字段 |
-| GET | `/slimapi/messages/{sid}` | A | 🔒 | **骨架分页**（`?limit/before/mode/directory`）；**恒返回 skeleton 投影**——`?mode=full` 被静默忽略（不报错，仅返回 skeleton）；列表按 `time.created` **升序**（与上游 `orderBy(desc(time_created), desc(id))` cursor 配合：客户端用 `?before` 翻页向旧方向 drain） |
+| GET | `/slimapi/messages/{sid}` | A | 🔒 | **骨架分页**（`?limit/before/mode/directory`）；**恒返回 skeleton 投影**——`?mode=full` 被静默忽略（不报错，仅返回 skeleton）；列表按 `time.created` **升序**；200 响应下发 **`X-Next-Cursor`** 头（opaque base64url 字符串，解析自 upstream `Link: <...?before=CURSOR>; rel="next"`），客户端用 `?before=<X-Next-Cursor>` 翻页向旧方向 drain |
 | GET | `/slimapi/messages/{sid}/full/{mid}` | A | 🔒 | 单条全文（展开某条）；**v2 简化**：**恒 200** full 投影 body，**无 304**、**无 ETag**、**无 `X-Message-Event-Seq` 响应头**、**无 `?known.*` 查询参数**（Stage B fingerprint 全部移除） |
 | GET | `/slimapi/events` | A | 🔒 | 实例级策展 SSE（见 §3） |
 | GET | `/slimapi/sessions/{sid}/stream` | A | 🔒 | opt-in 实时 token stream SSE（见 §3.x；**gzip 默认[lever2，首个 SSE gzip 例外]**、独立 T3 账本[§6.x]、终态 done:true marker 无 text[lever1]） |
@@ -113,7 +113,7 @@
 
 - `GET /slimapi/sessions/{sid}/stream?directory=<optional>`；`text/event-stream`；响应头 `Cache-Control:no-cache,no-transform`、`X-Accel-Buffering:no`、`X-Slimapi-Subscriber-ID:<ephemeral>`。
 - `/slimapi/**` 版本门禁复用 `SlimapiVersionMiddleware`（v2 `X-Slimapi-Version:2` 必带）；无 route-level `Depends`。
-- `directory` 可选 query；`normalize_directory()`；query 与 `X-Opencode-Directory` 头冲突（trailing-slash 归一后不等）→ 400 `directory_not_allowed`。directory 仅过滤进程级 GlobalBus 事件，**不开第二条上游连接**；sid 全局唯一、directory 无关（单用户 T3）。路由注册在 catch-all 反代之前；不遮蔽 `/{sid}/stream`。
+- `directory` 可选 query；仅校验 query 与 `X-Opencode-Directory` 头冲突（trailing-slash 归一后不等）→ 400 `directory_not_allowed`（NB-D7 结构性守卫，与 messages 路由镜像）；directory **本身对 token-stream fanout 是 no-op**——累加器以 sessionID 为键（单用户 T3 全局唯一），directory 不改变订阅者接收的帧集。**不开第二条上游连接**；sid 全局唯一、directory 无关（单用户 T3）。路由注册在 catch-all 反代之前；不遮蔽 `/{sid}/stream`。
 - **opt-in**：客户端前台/动画层才连；切背景/换 session 应断开（详见 §6.x token T3 信封「同时最多 1 条前台 stream」）。连接独立于控制面 `/slimapi/events`——两条连接，互不替代。
 - **P1 范围**：仅 text part（reasoning / tool-input 延后 P2+）；不做二进制流。
 
@@ -144,7 +144,7 @@ data: {"reason":"subscriber_backpressure|reconnect_no_replay|token_memory_limit|
 ```
 
 - **不发 SSE `id:` 字段**；`Last-Event-ID` 仅触发首帧 `resync{reconnect_no_replay,sessionID}`，**值忽略**。
-- **v2 删除的帧**：v1 Stage B v0.6 §P 的 `event: message.removed` tombstone 帧 + 全局重放队列（cap 1000 / TTL 24h）已移除——该机制属 Stage B part-tracking 一部分，v2 整体下线。客户端不再期望握手期收到 `message.removed` 帧；message 删除由控制面 digest `deleted=true` 表达。
+- **`event: message.removed`（token-stream 保留，非控制面）**：v2 删除了控制面 Stage B part-tracking（`_part_state`/`contentRevisions`/fingerprint），但 token-stream 的 `message.removed` 帧**保留**——属 token-stream 动画层协议，与控制面 part-tracking 是两回事。token hub 收到上游 `message.removed` 后（`TokenStreamHub.on_message_removed`，hub.py line 639）：(1) 清理该 message 的累加器/修订状态；(2) 向当前订阅者 fan-out `message.removed{sessionID,messageID}` 帧；(3) 记入有界回放队列（cap 1000 / TTL 24h）。客户端在**握手期**可能收到回放的 `message.removed` 帧（`server.connected` → tombstones 回放 → snapshot → fanout），在运行时也可能收到实时 fan-out 帧。收到后应丢弃该 message 的 live 渲染态（streamOwned）。控制面 `session.digest` 的 `deleted=true` 是独立信号，二者共存、不替代。队列不受 `resync_all` / `on_upstream_reconnect` 影响。
 - **终态顺序不变式（wire 强约束）**：对同一 `(sid,mid,pid)`，所有 `message.part.delta` 帧必先于对应 `snapshot{done:true}` 入队；`done:true` 后该 part 不许再发 delta。
 - **杠杆1（决定性）**：终态 `snapshot{done:true}` 是**仅完成 marker，不带 text**——取消上游 `part.text` 终态重发。**权威全文走 `/messages/{sid}` + `/full/{mid}`**（持久化真值）；token stream 是动画层，`/messages/{sid}` / `/full/{mid}` 幂等覆盖且凌驾所有 token 帧。客户端可接受 digest 完成先于/晚于 token 终态帧。
 - **resync reasons**（token 流均带 `sessionID`）：`reconnect_no_replay`（上游重连）/ `subscriber_backpressure`（订阅者 T3 溢出）/ `token_memory_limit`（全局累加器上限）/ `session_idle`（生成结束清理）/ `session_deleted`（会话被删除）。**单 part >1MiB 不走 resync**，而是 `message.part.snapshot{truncated:true}`（见上）——客户端清该 part streamOwned、走 `/messages/{sid}` 或 `/full/{mid}`。
@@ -185,7 +185,7 @@ data: {"reason":"subscriber_backpressure|reconnect_no_replay|token_memory_limit|
   1. 先 strict 比 `updatedAt`（严格 `>` 才推进时间维）；时间相等或回退→不推进时间维，但**不删除**已有消息（幂等）；
   2. 时间相等时 strict 比 `messageID`（`MessageID = msg_+ascending()` 单调递增、字典序可排序 → 新消息 id 字典序更大 → 严格 `>` 才推进 id 维）。
   - 此规则与上游 `(time_created DESC, id DESC)` + cursor `older()` 全序**完全对齐**，复用上游单调 `MessageID` 作天然 tie-break，零契约创新。
-- **分页**：`?limit` + `?before` 游标（向旧方向 drain）。
+- **分页**：`?limit` + `?before` 游标（向旧方向 drain）。200 响应带 `X-Next-Cursor` 头（opaque base64url 字符串，解析自 upstream `Link: <...?before=CURSOR>; rel="next"`）；客户端用 `?before=<X-Next-Cursor>` 翻向更旧页。无 `X-Next-Cursor` 头 = 当前页已是最后结果。
 - **v2 删除**：v1 的 `X-Since-Complete` 头（专配 `/since` 端点）已移除（`/since` 端点不存在）。
 - **初始拉取推荐 cursor drain（`?before` 游标分页）**（v1 rev C 裁定延续）：focus digest + resync 统一走 `/messages/{sid}` cursor drain 共享 reconciler。
 - 全文：单条 `GET /slimapi/messages/{sid}/full/{mid}`（**恒 200，无 304/ETag/`X-Message-Event-Seq`/`?known.*`**，见 §2）。

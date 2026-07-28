@@ -107,6 +107,8 @@
 **删**：`contentRevisions`、`childrenVersion`
 **不加**：不新增任何字段
 
+> **注（2026-07-28）：本节 bump_updated_at / part 事件触发 digest 的方案已被 v2-contract.md §3 取代。** 实际 v2 实现中 `message.part.updated` / `message.part.removed` **不触发 digest**（digest 仅由 `session.*` / `message.updated` / `message.appended` 驱动）。本节保留作历史记录。
+
 ### 4.2 bump updatedAt（~2 行新增）
 
 | 代码位置 | 改动 | 设计参考行号 |
@@ -118,6 +120,9 @@
 > **updatedAt 语义**：所有 bump 统一用 `_now_ms()`（sidecar wall-clock）。digest.updatedAt = 「sidecar 最后观察到该 session 有变化的 wall-clock 时间」。客户端 strict `>` 单调比较触发 reload。250ms debounce 限频。
 >
 > **时钟回退处理**：sidecar 重启后 `_now_ms()` 可能低于客户端保存的旧 bookmark。客户端检测到 `digest.updatedAt < bookmark` 时，视为 sidecar 重启 → 清除 bookmark + 强制 reload（digest reset 协议）。实现：SSE 连接建立时 sidecar 在首个 digest 帧附加 `reset: true` 标记（或客户端检测 updatedAt 跳变为 0 / 回退）。
+
+> **注（2026-07-28）：同上——§4.2 的 bump_updated_at 逻辑（part 事件触发 digest 且严格递增）已被 v2-contract.md §3 取代。** 实际 v2 实现中 part 事件不触发 digest；`updatedAt` 的单调性保证请以 v2-contract.md §3/§5 为准（跨窗口不保证严格单调，同一进程窗口内可保障）。
+> 本节的 `bump_updated_at` 函数设计保留作历史参考。
 
 ### 4.3 updatedAt 单调化
 
