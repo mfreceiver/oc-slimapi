@@ -96,7 +96,11 @@
       - 脱敏：`message` 取首行→剥绝对路径→剥 stack frame→剥 secret→截断 ≤512；缺失回落 `name` 或 `"(no detail)"`；`name` 截断 ≤128。
     - **v2 字段删除**：`childrenVersion?`、`contentRevisions?` 已移除（children 投影缓存与 Stage B fingerprint 全部下线）。客户端**不应**再消费这两个字段。
   - `session.error`（G1-B，**无** `sessionID` 时立即直推，不走 debounce）：`{directory?, name, message, at}`。abort（`MessageAbortedError`）静默丢弃。有 sid 的 `session.error` **不**走本帧，走 digest `lastError`（G1-A 立即 flush）。
-  - `question.asked`/`v2.asked`、`permission.asked`/`resolved`/`v2.asked`/`v2.resolved`：**立即直推** `{directory, type, properties}`。**注意**：v2 删除了 q/p 写端点与 routeToken，但 SSE 仍直推这些事件作观察信号；客户端应答 q/p 走 catch-all + `X-Opencode-Directory`（见 §2 写路径）。
+  - **q/p 阻塞信号（完整枚举 6 个帧名）**：`question.asked`、`question.v2.asked`、`permission.asked`、`permission.resolved`、`permission.v2.asked`、`permission.v2.resolved`——**立即直推** `{directory, type, properties}`。事件名作为 data payload 的 **`type` 字段值**下发（**无** SSE `event:` 字段；`type` 字段值取上游 opencode 事件名 **verbatim**，sidecar 不重命名/不映射，见 `hub_types.IMMEDIATE` + `global_hub.publish` 直通路径）。**客户端必须同时处理两种形式**（不可只订阅其中一种）：
+    - **legacy**：`type=="question.asked"` / `type=="permission.asked"` / `type=="permission.resolved"`；
+    - **v2 namespaced**：`type=="question.v2.asked"` / `type=="permission.v2.asked"` / `type=="permission.v2.resolved"`。
+    - 当前 upstream opencode (v1.18.x) 主要下发 **namespaced** 形式，但 legacy 形式仍在 sidecar 识别集合中（二者均触发立即直推）；客户端按 `type` 字段值分发，两种形式都必须接收。
+    - **注意**：v2 删除了 q/p 写端点与 routeToken，但 SSE 仍直推这些事件作观察信号；客户端应答 q/p 走 catch-all + `X-Opencode-Directory`（见 §2 写路径）。
   - `server.connected`（订阅即吐）、`server.heartbeat`（10s）、`resync`（重连 `{"reason":"reconnect_no_replay"}` / 背压 `{"reason":"subscriber_backpressure"}`，无 replay）。
 - **v2 删除的帧**：
   - `server.reconfigured`（v1 rev F）已移除——其触发条件 `load_products` 成功 + allowlist 集合变化在 v2 中不再发生（discovery 数据流下线）。
@@ -173,7 +177,13 @@ data: {"reason":"subscriber_backpressure|reconnect_no_replay|token_memory_limit|
   2. 当前打开 ses：`GET /slimapi/messages/{sid}`（拉骨架初始集；按 `time.created` 升序）。
 - 之后 SSE 接力增量（含 `resync` / `server.connected` → 复用冷启动）。
 - **resync / server.connected = 复用冷启动流程**（同一"加载初始状态"代码路径；幂等）。
-- **v2 删除**：v1 的 `GET /slimapi/projects`（步骤 1 可选显式刷新 allowlist）与 `GET /slimapi/questions` + `/permissions`（步骤 3）已从冷启动顺序中移除——这些端点在 v2 中不存在。客户端如需 q/p 快照，通过 SSE 订阅后实时推流获取（`question.asked` / `permission.asked` 等帧在连接建立后仍直推，见 §3）；订阅之前的 pending q/p 无 backlog replay——客户端可在冷启动后通过 catch-all 反代主动查询上游 opencode `GET /session/{sid}/question` / `GET /session/{sid}/permission` 补拉。
+- **v2 删除**：v1 的 `GET /slimapi/projects`（步骤 1 可选显式刷新 allowlist）与 `GET /slimapi/questions` + `/permissions`（步骤 3）已从冷启动顺序中移除——这些端点在 v2 中不存在。客户端如需 q/p 快照，通过 SSE 订阅后实时推流获取（§3 的 6 个 q/p 帧在连接建立后仍直推）；**SSE 无 backlog replay**——订阅之前已到达的 pending q/p 不会重放。
+- **pending q/p 主动补拉示例（catch-all 透传上游 legacy）**：SSE 无 backlog；冷启动或重连后若需补拉 pending q/p，经 catch-all 反代（§2 `/{path}`）请求上游 opencode legacy session 端点：
+  ```
+  GET /session/{sid}/question        # 请求头带 X-Opencode-Directory: <dir>
+  GET /session/{sid}/permission      # 请求头带 X-Opencode-Directory: <dir>
+  ```
+  这些是 **opencode legacy `/session/**` 端点**，经 sidecar catch-all **透传 verbatim**——slimapi 不解析、不聚合、不记忆 q/p 状态，响应体即上游 opencode 原样返回（ocdroid D-wire 已验证可用）。客户端按上游 legacy schema 解析；sid 经 §11.1 合法渠道（list / SSE）获知。
 
 ## §5 拉消息 🔒
 
@@ -271,7 +281,7 @@ skeleton 共享缓存（YAGNI，先指标）、多用户（独立 stack）、Par
 |---|---|---|
 | `GET /slimapi/sessions` | 200，不过滤（upstream 默认） | 透传 `?directory=` + `X-Opencode-Directory`（normalize 后） |
 | `GET /slimapi/messages/**`（含 `/full/{mid}`） | **不拦**（upstream 默认） | normalize 后作 `X-Opencode-Directory`；query 与 header 冲突 → 400 `directory_not_allowed` |
-| `GET /slimapi/sessions/{sid}/stream` | 不过滤（订阅所有 directory 事件） | normalize 后过滤进程级 GlobalBus 事件；query 与 header 冲突 → 400 `directory_not_allowed` |
+| `GET /slimapi/sessions/{sid}/stream` | 不过滤（订阅所有 directory 事件） | **no-op**——directory 不改变订阅者接收的帧集（累加器以 sessionID 为键，单用户 T3 全局唯一；与 §3.x.1 一致）；仅 query 与 `X-Opencode-Directory` 头冲突 → 400 `directory_not_allowed`（结构性守卫，NB-D7） |
 | catch-all `/{path}` | upstream 默认 | 客户端自带 `X-Opencode-Directory` 头透传；slimapi 不剥（非 hop-by-hop） |
 
 说明：

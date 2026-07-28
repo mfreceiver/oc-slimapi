@@ -49,6 +49,11 @@ ocdroid 对接时：
 - Deleted transform: project_and_pack, project_messages_and_pack, single=False branches
 - Stage B part-level tracking removed (_part_state, fingerprint, contentRevisions)
 
+### Documentation (contract clarification, no wire change — implementation already correct)
+- `docs/specs/v2-contract.md` §3: enumerated the complete set of 6 q/p blocking-signal frame names (`question.asked`/`question.v2.asked`/`permission.asked`/`permission.resolved`/`permission.v2.asked`/`permission.v2.resolved`) carried verbatim as the `type` field of the data payload; clients must handle both legacy and v2 namespaced forms (the slash shorthand was ambiguous).
+- `docs/specs/v2-contract.md` §11.1: `GET /slimapi/sessions/{sid}/stream` explicit-`directory` row corrected to **no-op** (consistent with §3.x.1 — accumulator keys on sessionID); the old "normalize 后过滤进程级 GlobalBus 事件" wording contradicted §3.x.1.
+- `docs/specs/v2-contract.md` §4: added concrete pending-q/p catch-all pull examples (`GET /session/{sid}/question` + `GET /session/{sid}/permission` via `X-Opencode-Directory`), noting catch-all passes upstream legacy endpoints through verbatim (slimapi does not parse/aggregate/remember q/p state).
+
 ---
 
 ## [0.12.0] - 2026-07-27
