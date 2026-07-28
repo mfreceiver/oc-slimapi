@@ -130,9 +130,13 @@ class GlobalHub:
     def _bump_updated_at(self, session_id: str, entry: "DigestFields") -> None:
         """Guarantee ``entry.updated_at`` is strictly monotonic per-session.
 
-        lite-v2 §4.3: client uses strict ``>`` on ``digest.updatedAt`` to trigger
-        skeleton reload, so two events in the same wall-clock ms MUST NOT produce
-        the same value. We take ``max(now, previous + 1)``.
+        lite-v2 §4.3 / contract §3: digest ``updatedAt`` is sidecar wall-clock
+        (``_now_ms()``). We take ``max(now, previous + 1)`` so two events in
+        the same wall-clock ms do not collide. Clients MUST use
+        ``(updatedAt, messageID)`` binary-tuple tie-break per contract §5 and
+        MUST NOT assume cross-window strict monotonicity — the per-session
+        high-water mark is an in-process optimisation, not a wire guarantee
+        (cleared on restart/resync/cap-eviction).
 
         lite-v2-dev (🟠-2): the monotonicity is now per-session and crosses
         debounce windows, not just within a single DigestFields entry. The
@@ -526,14 +530,14 @@ class GlobalHub:
         # high-frequency events from polluting the curated digest. When no
         # token hub is wired, behaviour is unchanged (events are dropped).
         #
-        # lite-v2: per-message part state is no longer tracked by the hub.
-        # The three part events now:
-        #   * ``message.part.updated`` / ``message.part.removed`` bump
-        #     ``digest.updatedAt`` (monotonic, §4.2/§4.3) so the client
-        #     reloads its skeleton, and route to the token hub for the
-        #     delta/snapshot stream. A retired-message gate
-        #     (``_retired_messages``) prevents late part events from
-        #     resurrecting state for a deleted message.
+        # lite-v2 (contract §3 alignment): per-message part state is no
+        # longer tracked by the hub. Per contract §3 (v2 删除的帧), only
+        # ``session.*`` / ``message.updated`` / ``message.appended`` drive
+        # the digest. ``message.part.updated`` / ``message.part.removed``
+        # no longer bump ``digest.updatedAt`` — they only route to the
+        # token hub for the delta/snapshot stream. A retired-message gate
+        # (``_retired_messages``) prevents late part events from
+        # resurrecting token hub state for a deleted message.
         #   * ``message.removed`` records the retired-message gate and
         #     fans out via the token hub; it does NOT bump updatedAt
         #     (skeleton reload is driven by the client's own message-list
@@ -562,19 +566,12 @@ class GlobalHub:
                         # rev-ogpt MAJOR 3: retired-message gate — if this
                         # message was removed upstream, late
                         # ``message.part.updated`` must NOT resurrect any
-                        # state. The token hub gates the same event on its
-                        # own ``_retired_messages``, but bumping updatedAt
-                        # here would still notify clients of a dead
-                        # message. This early return prevents that.
+                        # state (token hub routing). Per contract §3, part
+                        # events no longer bump digest updatedAt anyway.
                         if (psid, pmid) in self._retired_messages:
                             return
-                        # Per-session debounce entry keyed on part.sessionID.
-                        entry = self.pending.setdefault(psid, DigestFields())
-                        # lite-v2 §4.2/§4.3: bump updatedAt so the client's
-                        # strict-``>`` check reloads the skeleton on part
-                        # changes. Monotonic within the same wall-clock ms.
-                        # lite-v2-dev (🟠-2): now per-session cross-debounce.
-                        self._bump_updated_at(psid, entry)
+                        # Contract §3: part events NO LONGER trigger
+                        # digest — only route to token hub.
                         if self._token_hub is not None:
                             self._token_hub.on_part_updated(props)
                         return
@@ -589,13 +586,8 @@ class GlobalHub:
                     and isinstance(pmid, str) and pmid
                     and isinstance(ppid, str) and ppid
                 ):
-                    # lite-v2 §4.2/§4.3: bump updatedAt so the client's
-                    # strict-``>`` check reloads the skeleton on part
-                    # removal. Monotonic within the same wall-clock ms.
-                    # lite-v2-dev (🟠-2): now per-session cross-debounce.
-                    entry = self.pending.setdefault(psid, DigestFields())
-                    self._bump_updated_at(psid, entry)
-                    # rev-ogpt MAJOR 4: route to the token hub so it can
+                    # Contract §3: part events NO LONGER trigger digest —
+                    # only route to the token hub so it can
                     # retire the corresponding LivePart / pending
                     # accumulator / revision. Without this routing the
                     # token hub would keep emitting stale delta / snapshot

@@ -1,6 +1,6 @@
 # oc-slimapi lite-v2 执行计划
 
-> **状态**：待执行
+> **状态**：Track B（文档/契约对齐）已完成（commit 74b5261）；W1-W3 实现部分待核查
 > **基线**：oc-slimapi main 分支（v1 contract rev M）
 > **目标**：配合 ocdroid v2.7 方案，删除精确同步协议，简化为 skeleton 投影 + digest + token stream
 > **分支**：`lite-v2`（从 main 新建）

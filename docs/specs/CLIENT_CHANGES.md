@@ -73,7 +73,8 @@
 - **`server.heartbeat` ≠ 上游健康**：仅证 sidecar + 订阅存活；outage 探测用 `/slimapi/ready` 或自然 fetch/write 失败。sidecar 重启后重连收 `server.connected` → **应** cold-start。
 - digest `lastError`：sticky 跨窗口，`status=busy` 清除（显式 `null` 帧）；客户端据此显隐 session 错误 banner。`MessageAbortedError` 被 sidecar 过滤，不下发。
 - 客户端所有 `/slimapi/**` 请求（含 SSE）须带 `X-Slimapi-Version: 2`；连接时读 `/slimapi/health` 自检（见下 schema 三键）。
-- **已移除帧类型**：`question.*` / `permission.*` / `server.reconfigured`（对应端点已删除）。
+- **仍推送帧类型（仅作观察信号）**：`question.asked` / `v2.asked`、`permission.asked` / `resolved` / `v2.asked` / `v2.resolved`——这些帧仍通过 SSE 直推，但 v2 已删除 q/p 写端点与 routeToken；客户端应答 q/p 走 catch-all + `X-Opencode-Directory`（见 v2-contract §2 写路径）。帧的 wire 形态不变。
+- **已移除帧类型**：`server.reconfigured`（对应 discovery 数据流整体下线）。
 
 ## health schema 回显
 
@@ -83,12 +84,12 @@
 
 ## Token stream SSE（Stages A–E 落地，opt-in 实时流 — design-token-stream.md §9/§10）
 
-> **状态**：服务端 Stages A–E 已落地（A 地基 9.5 / B 生命周期 9.5 / C flush 9.5 / D 端点 9.6 / E 文档+预算 4+4）。未随当前发版出货前 `GET /slimapi/health` 根级 `features.tokenStream` 缺省，ocdroid 走既有「完成后整条出现」路径，**零回归**。本节是 ocdroid 侧改动清单（对应设计 §9 的 8 项 + §10 硬约束），供客户端预读。设计权威以 `docs/specs/design-token-stream.md` 为准；wire 以 `docs/specs/v1-contract.md` §3.x + §6.x 为准。
+> **状态**：服务端 Stages A–E 已落地（A 地基 9.5 / B 生命周期 9.5 / C flush 9.5 / D 端点 9.6 / E 文档+预算 4+4）。未随当前发版出货前 `GET /slimapi/health` 根级 `features.tokenStream` 缺省，ocdroid 走既有「完成后整条出现」路径，**零回归**。本节是 ocdroid 侧改动清单（对应设计 §9 的 8 项 + §10 硬约束），供客户端预读。设计权威以 `docs/specs/design-token-stream.md` 为准；wire 以 `docs/specs/v2-contract.md` §3.x + §6.x 为准。
 
 ### capability 探测（必须）
 
 - `/slimapi/health` 根级 **`features.tokenStream === true`** 才启用 stream 客户端；缺字段 / 404 / 405 → 降级为既有「完成后整条出现」（`/slimapi/messages/{sid}` 重拉权威全文），**不得**尝试连 stream 端点。
-- 路径与版本头以**本仓库** `docs/specs/v1-contract.md` + `CHANGELOG.md` 为准（端点 `GET /slimapi/sessions/{sid}/stream`，仍带 `X-Slimapi-Version: 2`，**不 bump**）。
+- 路径与版本头以**本仓库** `docs/specs/v2-contract.md` + `CHANGELOG.md` 为准（端点 `GET /slimapi/sessions/{sid}/stream`，仍带 `X-Slimapi-Version: 2`，**不 bump**）。
 
 ### stream 客户端生命周期（必须）
 

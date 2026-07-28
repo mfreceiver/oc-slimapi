@@ -36,7 +36,7 @@ def _settings(**overrides) -> Settings:
         transform_wait_seconds=0.5,
         max_response_bytes=64 * 1024,
         smoke_session_id=None,
-        server_api_version=1,
+        server_api_version=2,
         accepted_client_versions=(2, 2),
     )
     base.update(overrides)
@@ -332,12 +332,12 @@ async def test_health_schema_includes_version_and_client_range(upstream_factory)
     # New keys exist and are read from config (not hard-coded).
     assert body["schema"] == {
         "degraded": False,
-        "version": 1,
+        "version": 2,
         "clientMin": 2,
         "clientMax": 2,
     }
     # Old ``server.*`` keys still there for back-compat.
-    assert body["server"]["api_version"] == 1
+    assert body["server"]["api_version"] == 2
     assert body["server"]["accepted_client_versions"] == [2, 2]
     # lite-v2: static contract revision.
     assert body["slimapi_contract"] == 2
@@ -371,7 +371,7 @@ async def test_ready_schema_includes_version_and_client_range(upstream_factory):
     body = response.json()
     assert body["schema"] == {
         "degraded": False,
-        "version": 1,
+        "version": 2,
         "clientMin": 2,
         "clientMax": 2,
     }
@@ -389,11 +389,8 @@ async def test_ready_503_path_preserves_schema_fields(upstream_factory):
     response = await _get(app, "/slimapi/ready")
     assert response.status_code == 503
     body = response.json()
-    assert body["schema"]["version"] == 1
-    assert body["schema"]["clientMin"] == 2
-    assert body["schema"]["clientMax"] == 2
-    # Old fields still there.
-    assert body["server"]["api_version"] == 1
+    assert body["schema"]["version"] == 2
+    assert body["server"]["api_version"] == 2
     assert body["server"]["accepted_client_versions"] == [2, 2]
 
 
@@ -408,7 +405,7 @@ async def test_health_schema_reflects_schema_degraded_state(upstream_factory):
     body = response.json()
     assert body["schema"]["degraded"] is True
     # Other keys still present.
-    assert body["schema"]["version"] == 1
+    assert body["schema"]["version"] == 2
 
 
 # ---------------------------------------------------------------------------

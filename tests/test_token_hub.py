@@ -559,19 +559,10 @@ class TestPublishIntegration:
         assert ("s1", "m1", "p1") in th.live_parts
 
     async def test_token_routing_no_digest_pollution(self, bare_hub):
-        """Token ingest must NOT produce any TOKEN control-plane frame.
+        """Token ingest must NOT produce any control-plane digest.
 
-        lite-v2 removes per-message ``_part_state`` / ``contentRevisions``
-        from the digest. ``message.part.updated`` now writes ``updatedAt``
-        (sidecar wall-clock) instead of ``contentRevisions``. The
-        curated-stream subscriber sees a digest with ONLY ``sessionID`` +
-        ``updatedAt`` — no status / messageID / directory / contentRevisions
-        invented from token routing.
-
-        ``message.part.delta`` (token-stream-only) still produces NO
-        digest entry whatsoever — that half of the Stage-A invariant
-        remains intact.
-        """
+        Contract §3: message.part.updated no longer triggers digest — it
+        only routes to the token hub."""
         subscriber = Subscriber()
         bare_hub.subscribers.add(subscriber)
         th = TokenStreamHub()
@@ -590,16 +581,8 @@ class TestPublishIntegration:
         }))
         bare_hub.flush()
         frames = await drain_queue(subscriber, timeout=0.1)
-        # Exactly one digest frame, fired by the message.part.updated.
-        assert len(frames) == 1, f"expected one digest, got {frames!r}"
-        event_name, data = parse_event(frames[0])
-        assert event_name == "session.digest"
-        # Exact key set: ONLY sessionID + updatedAt — no token-routing leakage.
-        assert set(data) == {"sessionID", "updatedAt"}, (
-            f"expected exactly {{sessionID, updatedAt}}, got {set(data)}"
-        )
-        assert data["sessionID"] == "s1"
-        assert isinstance(data["updatedAt"], int)
+        # Contract §3: part events no longer produce digest frames.
+        assert frames == [], f"expected no digests, got {frames!r}"
 
     async def test_message_part_delta_alone_produces_no_digest(self, bare_hub):
         """``message.part.delta`` (token stream only) must NOT touch the
@@ -623,10 +606,9 @@ class TestPublishIntegration:
         """Without a token hub, ``message.part.*`` events do not crash and
         do not route to any token accumulator.
 
-        lite-v2: ``message.part.updated`` emits a digest carrying
-        ``updatedAt`` (sidecar wall-clock) instead of ``contentRevisions``.
+        Contract §3: ``message.part.updated`` no longer emits a digest.
         ``message.part.delta`` alone remains a full drop (no digest, no
-        state) — that half is unchanged.
+        state) — unchanged.
         """
         subscriber = Subscriber()
         bare_hub.subscribers.add(subscriber)
@@ -645,14 +627,8 @@ class TestPublishIntegration:
         }))
         bare_hub.flush()
         frames = await drain_queue(subscriber, timeout=0.1)
-        # The message.part.updated emits a digest carrying updatedAt.
-        # message.part.delta contributes nothing.
-        assert len(frames) == 1, f"expected one digest, got {frames!r}"
-        event_name, data = parse_event(frames[0])
-        assert event_name == "session.digest"
-        assert data["sessionID"] == "s1"
-        assert isinstance(data.get("updatedAt"), int)
-        assert "contentRevisions" not in data
+        # Contract §3: part events no longer produce digest frames.
+        assert frames == [], f"expected no digests from part events, got {frames!r}"
 
     async def test_control_plane_branches_untouched(self, bare_hub):
         """Sanity: the curated branches above the token-routing still

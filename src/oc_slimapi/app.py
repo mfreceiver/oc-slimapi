@@ -131,6 +131,13 @@ async def lifespan(app: FastAPI):
     # importing transform.py (would be a circular import via skeleton.py).
     app.state.hubs.set_transforms(app.state.transforms)
     await smoke(app)
+    # Best-effort upstream health check (contract §4). Non-blocking; failure
+    # is tolerated — the smoke() call already proved the client works, and a
+    # transient upstream blip at startup does not justify failing the process.
+    try:
+        await app.state.upstream.get("/global/health")
+    except Exception:
+        pass
     # ------------------------------------------------------------------
     # Startup banner: log concise operational summary (redacting secrets).
     # ------------------------------------------------------------------

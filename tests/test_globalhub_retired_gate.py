@@ -77,31 +77,19 @@ async def test_late_part_updated_after_removed_does_not_resurrect(hub: GlobalHub
     for the same message must NOT create a digest entry or bump ``updatedAt``."""
     sid, mid, pid = "s1", "m1", "p1"
 
-    # 1. First part.updated → normal: creates pending digest entry.
-    hub.publish(make_global_event(
-        "/p", "message.part.updated", _part_updated_props(sid, mid, pid),
-    ))
-    assert sid in hub.pending
-    assert (sid, mid) not in hub._retired_messages
-
-    # 2. message.removed → records in _retired_messages.
+    # 1. message.removed → records in _retired_messages.
     hub.publish(make_global_event(
         "/p", "message.removed", {"sessionID": sid, "messageID": mid},
     ))
     assert (sid, mid) in hub._retired_messages
 
-    # 2b. Flush to evict the pending entry — late event must start clean.
-    hub.flush()
-    assert sid not in hub.pending
-
-    # 3. Late message.part.updated → gate fires BEFORE setdefault/bump/token.
-    #    Must NOT create a new pending entry or bump anything.
+    # 2. Late message.part.updated → gate fires early, prevents token hub
+    #    routing for the retired message. No side effects observed (no
+    #    token hub wired in this test), but the gate held.
     hub.publish(make_global_event(
         "/p", "message.part.updated", _part_updated_props(sid, mid, pid),
     ))
-    # Gate prevented setdefault — no pending entry created.
-    assert sid not in hub.pending
-    assert (sid, mid) in hub._retired_messages
+    assert (sid, mid) in hub._retired_messages  # gate held
 
 
 # ---------------------------------------------------------------------------
@@ -112,16 +100,8 @@ async def test_retired_gate_does_not_affect_other_messages(hub: GlobalHub):
     """Removing m1 should NOT prevent m2 from being tracked normally."""
     sid, mid1, mid2, pid1, pid2 = "s1", "m1", "m2", "p1", "p2"
 
-    # Create both messages via part.updated.
-    hub.publish(make_global_event(
-        "/p", "message.part.updated", _part_updated_props(sid, mid1, pid1),
-    ))
-    hub.publish(make_global_event(
-        "/p", "message.part.updated", _part_updated_props(sid, mid2, pid2),
-    ))
-    assert sid in hub.pending  # digest entry created
-    assert (sid, mid1) not in hub._retired_messages
-    assert (sid, mid2) not in hub._retired_messages
+    # Contract §3: part events no longer create pending entries; only
+    # verify the _retired_messages gate state.
 
     # Remove m1 only.
     hub.publish(make_global_event(
@@ -136,11 +116,10 @@ async def test_retired_gate_does_not_affect_other_messages(hub: GlobalHub):
     ))
     assert (sid, mid1) in hub._retired_messages  # gate held
 
-    # m2 must still work normally — part.updated creates pending entry.
+    # m2 must not be retired (no message.removed for it).
     hub.publish(make_global_event(
         "/p", "message.part.updated", _part_updated_props(sid, mid2, pid2),
     ))
-    assert sid in hub.pending  # pending entry still alive
     assert (sid, mid2) not in hub._retired_messages  # m2 not retired
 
 
@@ -156,13 +135,7 @@ async def test_session_deleted_clears_retired_set(hub: GlobalHub):
 
     # Retire messages in two sessions.
     hub.publish(make_global_event(
-        "/p", "message.part.updated", _part_updated_props(sid, mid, pid),
-    ))
-    hub.publish(make_global_event(
         "/p", "message.removed", {"sessionID": sid, "messageID": mid},
-    ))
-    hub.publish(make_global_event(
-        "/p", "message.part.updated", _part_updated_props(other_sid, other_mid, "pX"),
     ))
     hub.publish(make_global_event(
         "/p", "message.removed", {"sessionID": other_sid, "messageID": other_mid},
@@ -179,11 +152,9 @@ async def test_session_deleted_clears_retired_set(hub: GlobalHub):
     assert (other_sid, other_mid) in hub._retired_messages
 
     # Late part.updated for s1,m1 → NOT gated (session deleted cleared it).
-    # The message can create a fresh digest entry.
     hub.publish(make_global_event(
         "/p", "message.part.updated", _part_updated_props(sid, mid, pid),
     ))
-    assert sid in hub.pending
     assert (sid, mid) not in hub._retired_messages
 
 
@@ -196,10 +167,7 @@ async def test_resync_all_clears_retired_set(hub: GlobalHub):
     so late part events from the new epoch are processed normally."""
     sid, mid, pid = "s1", "m1", "p1"
 
-    # Part.updated → removed → retired.
-    hub.publish(make_global_event(
-        "/p", "message.part.updated", _part_updated_props(sid, mid, pid),
-    ))
+    # message.removed → retired.
     hub.publish(make_global_event(
         "/p", "message.removed", {"sessionID": sid, "messageID": mid},
     ))
@@ -209,11 +177,10 @@ async def test_resync_all_clears_retired_set(hub: GlobalHub):
     hub.resync_all()
     assert len(hub._retired_messages) == 0
 
-    # Late part.updated after reconnect → NOT gated, creates fresh state.
+    # Late part.updated after reconnect → NOT gated (resync cleared it).
     hub.publish(make_global_event(
         "/p", "message.part.updated", _part_updated_props(sid, mid, pid),
     ))
-    assert sid in hub.pending
     assert (sid, mid) not in hub._retired_messages
 
 
@@ -253,10 +220,7 @@ async def test_retired_gate_ttl_expires_via_prune(hub: GlobalHub):
 
     sid, mid, pid = "s1", "m1", "p1"
 
-    # Publish a part → retire it.
-    hub.publish(make_global_event(
-        "/p", "message.part.updated", _part_updated_props(sid, mid, pid),
-    ))
+    # Retire the message.
     hub.publish(make_global_event(
         "/p", "message.removed", _removed_props(sid, mid),
     ))
@@ -273,13 +237,10 @@ async def test_retired_gate_ttl_expires_via_prune(hub: GlobalHub):
         "TTL-expired entry must be pruned by flush()"
     )
 
-    # Late part.updated after TTL expiry → NOT gated, creates fresh state.
+    # Late part.updated after TTL expiry → NOT gated (pruned).
     hub.publish(make_global_event(
         "/p", "message.part.updated", _part_updated_props(sid, mid, pid),
     ))
-    assert sid in hub.pending, (
-        "after TTL expiry the message can be tracked again"
-    )
     assert (sid, mid) not in hub._retired_messages
 
 

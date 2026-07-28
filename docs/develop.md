@@ -23,8 +23,8 @@ python -m venv .venv
 | `OC_SLIMAPI_ROUTE_SECRET` | 无 | 测试用持久 secret |
 | `OC_SLIMAPI_ROUTE_SECRET_FILE` | systemd credential | 生产 secret 文件 |
 | `OC_SLIMAPI_SMOKE_SESSION_ID` | 无 | 启动字段漂移 smoke 的已知 sid |
-| `OC_SLIMAPI_SERVER_API_VERSION` | `1` | 服务端当前整数 API 版本 |
-| `OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS` | `1,1` | 接受的客户端版本闭区间 |
+| `OC_SLIMAPI_SERVER_API_VERSION` | `2` | 服务端当前整数 API 版本 |
+| `OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS` | `2,2` | 接受的客户端版本闭区间 |
 
 ## 运行
 

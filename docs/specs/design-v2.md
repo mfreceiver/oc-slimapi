@@ -71,16 +71,17 @@
      - `deleted=true` ← `session.deleted`（一旦为 true 持续到窗口结束）
      - `archived` ← `session.updated` 的 `info.time.archived`（epoch_ms int，一旦有值粘滞保留到窗口结束）
      - `directory` ← GlobalEvent 的 directory
-     - **`lastError`（G1-A）**←有 sid 的 `session.error` 经脱敏后的 `{name,message,at}`（`at`=sidecar 收到 epoch-ms）。**三态 wire**（与 sticky 共存，互不矛盾；权威见 `docs/specs/v1-contract.md` §3）：
+      - **`lastError`（G1-A）**←有 sid 的 `session.error` 经脱敏后的 `{name,message,at}`（`at`=sidecar 收到 epoch-ms）。**三态 wire**（与 sticky 共存，互不矛盾；权威见 `docs/specs/v2-contract.md` §3）：
        - **对象** `{name,message,at}`：本窗口新 error，或 flush 时该 sid 仍有 sticky（其它字段触发的后续 digest 会继续带出对象，直至 clear/deleted）；error 到达时**立即 flush**（不等 250ms）
        - **显式 `null`**：clear 帧——该 session 出现新 `status=busy` 时 pop sticky 并立即 flush
        - **省略**：本 digest 没有本窗口新 error 对象、也没有显式 clear（`null`），**且** 该 sid 当前不存在 sticky error；`deleted=true` 的 digest **强制省略**（pop sticky，**不**发 null）
        - abort（`error.name=="MessageAbortedError"`）静默丢弃（不写 lastError、不发 G1-B 帧）
      - `session.updated` 创建 pending 项；若 `info.time.archived` 有值则设 `archived`（见上）；无其它字段变化时 emit `{sessionID,directory}` 让客户端 refetch `/sessions`
-     - 同 session 多次变化 → 合并取最新；窗口 flush 后清 pending（lastError sticky 经独立持久层跨窗口保留，见 `docs/specs/v1-impl-spec.md` §7）。
-  2. **`event: session.error`（G1-B）**——**无** `sessionID` 时**立即直推**（不进 debounce）：`data: {"directory"?,"name","message","at"}`。有 sid 的 `session.error` **不**走本帧，走 digest `lastError`（G1-A）。abort（`MessageAbortedError`）静默丢弃。实现细节见 `docs/specs/v1-impl-spec.md` §7；wire 权威见 `docs/specs/v1-contract.md` §3。
-  3. `event: server.connected`（订阅即吐首帧）+ `event: server.heartbeat`（10s）+ `event: resync` `{"reason":"reconnect_no_replay"}`（上游重连或客户端带 `Last-Event-ID` 时）。
-- **全部丢弃**：`message.part.delta`/`.updated`/`.removed`（逐 token）、`tool.*`、`message.removed`、`question.*`、`permission.*`、未知类型——省流核心。上游 `session.error` **不**在此列：经 G1 处理（有 sid→digest `lastError`；无 sid→`event: session.error`；abort 过滤），见上吐出帧 + `docs/specs/v1-contract.md` §3 / `docs/specs/v1-impl-spec.md` §7。
+      - 同 session 多次变化 → 合并取最新；窗口 flush 后清 pending（lastError sticky 经独立持久层跨窗口保留，见 `docs/specs/v2-contract.md` §3）。
+   2. **`event: session.error`（G1-B）**——**无** `sessionID` 时**立即直推**（不进 debounce）：`data: {"directory"?,"name","message","at"}`。有 sid 的 `session.error` **不**走本帧，走 digest `lastError`（G1-A）。abort（`MessageAbortedError`）静默丢弃。wire 权威见 `docs/specs/v2-contract.md` §3。
+   - **全部丢弃（不进 digest/不策展转发）**：`message.part.delta`/`.updated`/`.removed`（逐 token，仅路由到 token hub 供 token stream 消费）、`message.removed`（仅路由到 token hub 供 tombstone/token stream 维护）、`tool.*`、未知类型——省流核心。
+- **直推转发（观察信号）**：`question.asked`/`v2.asked`、`permission.asked`/`resolved`/`v2.asked`/`v2.resolved`——立即扇出订阅者，不进 debounce；客户端用于驱动 UI 提示，具体应答走 catch-all + `X-Opencode-Directory`（v2 无专用写端点）。
+- 上游 `session.error` **不**在此列：经 G1 处理（有 sid→digest `lastError`；无 sid→`event: session.error`；abort 过滤），见上吐出帧。
 - **背压**：每订阅 `asyncio.Queue`（item 上限 + 字节预算）；溢出时 **立即断开慢消费者**：标记 `closed` → **清空全部旧 queue 帧** → 入队 `event: resync` `{"reason":"subscriber_backpressure"}` → 入队 `STOP`（**不**交付此前积压帧，**不**「丢最旧续发」）。
 - **不承诺 replay**：无 event store；重连接收 `resync` 后走冷启动流程（sessions + messages）或前台 catch-up。
 - **生命周期**：首 subscriber 到达→启动 upstream 任务；末 subscriber 离开后 30s grace 再取消任务；`HubRegistry.close()` 取消所有任务。
@@ -155,7 +156,7 @@
 
 ## 5. gzip 实测（上线门禁）
 
-REST 字节是原始 JSON（opencode ≥1KB 自动 gzip，OkHttp 自动解压）；**SSE 不 gzip**（真实 wire）。**sidecar 必须自 gzip 响应 + `Vary: Accept-Encoding`**，否则手机拿原始 40KB。
+REST 字节是原始 JSON（opencode ≥1KB 自动 gzip，OkHttp 自动解压）；**控制面 SSE 不 gzip**（真实 wire）；**token stream SSE 默认 gzip**（杠杆2，首个 SSE gzip 例外，见 §3.x.3）。**sidecar 必须自 gzip 响应 + `Vary: Accept-Encoding`**，否则手机拿原始 40KB。
 
 测法：`curl --compressed -o /dev/null -w '%{size_download}'`（=下载字节）vs `Accept-Encoding: identity`（=原始）；确认 `Content-Encoding: gzip`；SSE 确认无 `Content-Encoding`。必测：messages(limit=1/10/40, skeleton)、sessions、single message。Android 端用 `TrafficCountingInterceptor` 校准（含 TLS/header）。
 **gzip 后 full vs skeleton wire 差从 11× 降到 ~5–8×，仍显著**；收益表须 raw/gzip 双口径。

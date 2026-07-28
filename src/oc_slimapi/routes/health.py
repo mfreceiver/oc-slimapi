@@ -29,9 +29,10 @@ async def health(request: Request):
         "schema": {
             "degraded": request.app.state.schema_degraded,
             # v6 §4: diagnostic re-exposure of the wire-version triplet. These
-            # are *config values*, NOT a feature-discovery surface — version=1
-            # is identical to v1 so it cannot enable capability negotiation
-            # on its own. Existing ``server.*`` keys are preserved for back-compat.
+            # are *config values*, NOT a feature-discovery surface — the value
+            # now matches the v2 wire (SERVER_API_VERSION=2) but remains a
+            # diagnostic re-exposure, not a capability-negotiation mechanism.
+            # Existing ``server.*`` keys are preserved for back-compat.
             "version": request.app.state.config.server_api_version,
             "clientMin": request.app.state.config.accepted_client_versions[0],
             "clientMax": request.app.state.config.accepted_client_versions[1],

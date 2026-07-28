@@ -19,7 +19,6 @@ from ..transform import (
     strip_diagnostics_and_pack,
 )
 from ..upstream import (
-    decoded_body_headers,
     forward_directory_headers,
 )
 from ..directory import validate_directory
@@ -244,23 +243,6 @@ async def _stream_upstream(
         raise CodedHTTPException(503, code="upstream_unavailable") from exc
 
 
-async def _drain_error(response, request: Request | None = None) -> Response:
-    """Buffer a small upstream error body and pass it through verbatim.
-
-    When ``request`` is given, the buffered body length is stashed for
-    traffic accounting so even upstream error responses contribute ``upIn``
-    to the request's bucket.
-    """
-    body = await response.aread()
-    if request is not None:
-        stash_up_in(request, len(body))
-    return Response(
-        body, response.status_code,
-        headers=decoded_body_headers(response.headers),
-        media_type=response.headers.get("content-type"),
-    )
-
-
 @router.get("")
 async def messages(
     request: Request,
@@ -297,7 +279,19 @@ async def messages(
             next_cursor: str | None = None
             try:
                 if response.status_code >= 400:
-                    return await _drain_error(response, request)
+                    # Drain upstream error body for connection reuse.
+                    body = await response.aread()
+                    stash_up_in(request, len(body))
+                    # Contract §7: map upstream errors to structured codes.
+                    if response.status_code == 404:
+                        raise CodedHTTPException(
+                            404, code="session_not_found", sessionID=sid,
+                        )
+                    if response.status_code < 500:
+                        raise CodedHTTPException(
+                            502, code=f"upstream_http_{response.status_code}",
+                        )
+                    raise CodedHTTPException(503, code="upstream_unavailable")
                 body, n_read = await read_with_cap(response, config.max_response_bytes)
                 if body is None:
                     return error_response(
@@ -316,10 +310,15 @@ async def messages(
                 next_cursor = _parse_link_next_cursor(response.headers.get("Link"))
                 # Full parse + sort (§8) + project + serialize/gzip chain in
                 # the worker pool.
-                encoded, extra = await pool.offload(
-                    _project_list_sorted_and_pack, body,
-                    accept_encoding=request.headers.get("accept-encoding"),
-                )
+                try:
+                    encoded, extra = await pool.offload(
+                        _project_list_sorted_and_pack, body,
+                        accept_encoding=request.headers.get("accept-encoding"),
+                    )
+                except orjson.JSONDecodeError as exc:
+                    raise CodedHTTPException(
+                        503, code="upstream_unavailable",
+                    ) from exc
             finally:
                 await response.aclose()
         base_headers: dict[str, str] = {"Cache-Control": "no-store"}
@@ -385,8 +384,21 @@ async def message(
                 # runs to release the connection.
                 try:
                     if response.status_code >= 400:
-                        return await _drain_error(response, request)
-                    status_code = response.status_code
+                        # Drain upstream error body for connection reuse.
+                        body = await response.aread()
+                        stash_up_in(request, len(body))
+                        # Contract §7: map upstream errors to structured codes.
+                        if response.status_code == 404:
+                            raise CodedHTTPException(
+                                404, code="session_not_found", sessionID=sid,
+                            )
+                        if response.status_code < 500:
+                            raise CodedHTTPException(
+                                502, code=f"upstream_http_{response.status_code}",
+                            )
+                        raise CodedHTTPException(503, code="upstream_unavailable")
+                    # Contract §2: /full/{mid} always returns 200 on success.
+                    status_code = 200
                     body, n_read = await read_with_cap(
                         response, config.max_message_bytes,
                     )

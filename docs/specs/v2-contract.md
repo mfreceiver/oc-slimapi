@@ -50,7 +50,7 @@
 
 ### v2 删除的端点（相对 v1，仅供迁移参考）
 
-以下端点在 v2 中**不存在**；客户端调用将命中 catch-all 反代或 404，不再是 slimapi 一等公民：
+以下端点在 v2 中**不存在**；客户端调用将因版本门闩返回 400（缺/坏版本头）或 404 `thin_route_not_found`（合法版本头但无对应路由 catch-all 拒绝），不再是 slimapi 一等公民：
 
 - `GET /slimapi/projects` —— discovery/allowlist 展示端点删除（allowlist 数据流整体下线）。
 - `GET /slimapi/questions`、`GET /slimapi/permissions` —— 跨目录聚合 pending 端点删除。SSE 仍直推 `question.asked` / `permission.asked` 等事件（见 §3），客户端通过 catch-all 反代应答上游。
@@ -173,7 +173,7 @@ data: {"reason":"subscriber_backpressure|reconnect_no_replay|token_memory_limit|
   2. 当前打开 ses：`GET /slimapi/messages/{sid}`（拉骨架初始集；按 `time.created` 升序）。
 - 之后 SSE 接力增量（含 `resync` / `server.connected` → 复用冷启动）。
 - **resync / server.connected = 复用冷启动流程**（同一"加载初始状态"代码路径；幂等）。
-- **v2 删除**：v1 的 `GET /slimapi/projects`（步骤 1 可选显式刷新 allowlist）与 `GET /slimapi/questions` + `/permissions`（步骤 3）已从冷启动顺序中移除——这些端点在 v2 中不存在。客户端如需 q/p 快照，从 SSE backlog 自然获取（订阅后首帧即吐）。
+- **v2 删除**：v1 的 `GET /slimapi/projects`（步骤 1 可选显式刷新 allowlist）与 `GET /slimapi/questions` + `/permissions`（步骤 3）已从冷启动顺序中移除——这些端点在 v2 中不存在。客户端如需 q/p 快照，通过 SSE 订阅后实时推流获取（`question.asked` / `permission.asked` 等帧在连接建立后仍直推，见 §3）；订阅之前的 pending q/p 无 backlog replay——客户端可在冷启动后通过 catch-all 反代主动查询上游 opencode `GET /session/{sid}/question` / `GET /session/{sid}/permission` 补拉。
 
 ## §5 拉消息 🔒
 
@@ -224,7 +224,7 @@ data: {"reason":"subscriber_backpressure|reconnect_no_replay|token_memory_limit|
 
 > v2 错误码集是 v1 的**子集**：所有 routeToken / G6 批量 / Opt-A 相关 code 已删除；其余 thin 路由 HTTP 状态 + body `{"code":…}` 模式不变。所有错误码加性于 v1 → v2 bump 不引入新 code。
 
-- 400 `version_required` / `version_incompatible` / `directory_not_allowed` / `invalid_directory_count`
+- 400 `version_required` / `version_incompatible` / `directory_not_allowed` / `invalid_directory_count`（**v2 无独立生产路径**——q/p 聚合路由删除后此码无触发路径；保留作结构性守卫文档参考，实现中无对应 wire 输出）
   - **`invalid_path`**（catch-all 反代）：归一化后路径含 `..` / `.` 段 → 400（与 `//` 折叠同在 `_normalize_path`；defense-in-depth，合法路径不含此类段）。
   - **`invalid_directory`**：thin 路由与 catch-all 的 `?directory=` query / `X-Opencode-Directory` 头含 `..` 段 / NUL / 控制字符 / 长度 > 4096 → 400（`validate_directory()`；安全守卫，不 gate 合法 directory）。
   - **`directory_not_allowed` 适用范围**：**仅** messages `/**`（list / full/{mid}）当 query `directory` 与 `X-Opencode-Directory` 头同时存在且冲突时返 400——这是结构性歧义（slimapi 不能猜该透传哪个），与上游能否服务无关。其它结构性守卫（`invalid_directory_count` 显式 list 0 / >32、版本门禁）不变。

@@ -599,6 +599,9 @@ async def test_full_message_under_cap_passthrough(upstream_factory):
 
 
 async def test_full_message_upstream_error_passthrough(upstream_factory):
+    """Contract §7: upstream 404 on /full/{mid} is mapped to structured
+    ``session_not_found`` (not raw passthrough). Other 4xx → 502
+    ``upstream_http_N``, 5xx → 503 ``upstream_unavailable``."""
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(404, content=b'{"error":"missing"}', headers={"Content-Type": "application/json"})
 
@@ -610,9 +613,10 @@ async def test_full_message_upstream_error_passthrough(upstream_factory):
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.get("/slimapi/messages/s1/full/m1", headers=VERSION_HEADERS)
         assert response.status_code == 404
-        # Body and content-type pass through verbatim (thin-route contract).
-        assert response.content == b'{"error":"missing"}'
-        assert response.headers["Content-Type"] == "application/json"
+        # Contract §7: upstream 404 → session_not_found (structured error, not raw passthrough).
+        body = response.json()
+        assert body["code"] == "session_not_found"
+        assert body["sessionID"] == "s1"
     finally:
         app.state.transforms.shutdown()
 
@@ -1030,7 +1034,6 @@ async def test_messages_list_query_header_conflict_400(upstream_factory):
     upstream = upstream_factory(handler)
     settings = _settings()
     app = _build_app(settings, upstream)
-    app.state.directory_allowlist = {"/app", "/other"}  # both allowed; conflict still 400
     transport = httpx.ASGITransport(app=app)
     try:
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -1103,7 +1106,6 @@ async def test_messages_list_allowed_directory_forwarded_normalized(upstream_fac
     upstream = upstream_factory(handler)
     settings = _settings()
     app = _build_app(settings, upstream)
-    app.state.directory_allowlist = {"/app"}
     transport = httpx.ASGITransport(app=app)
     try:
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -1128,7 +1130,6 @@ async def test_full_message_query_header_conflict_400(upstream_factory):
     upstream = upstream_factory(handler)
     settings = _settings()
     app = _build_app(settings, upstream)
-    app.state.directory_allowlist = {"/app", "/other"}
     transport = httpx.ASGITransport(app=app)
     try:
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:

@@ -1460,72 +1460,44 @@ async def test_digest_fields_converged(fresh_hub):
     assert "childrenVersion" not in payload
 
 
-async def test_part_updated_bumps_updatedAt_strictly(fresh_hub, monkeypatch):
-    """§9.3: two message.part.updated events in the SAME debounce window
-    must produce strictly increasing updatedAt within that window.
-
-    Uses a fixed clock to deterministically verify _bump_updated_at's
-    max(now, previous+1) guarantee.
-
-    lite-v2-dev (🟠-2): cross-window (post-flush) strict monotonicity IS
-    now guaranteed per-session via _last_updated_at_by_sid."""
+async def test_part_updated_does_not_touch_digest(fresh_hub, monkeypatch):
+    """Contract §3: message.part.updated no longer triggers digest.
+    Per contract, only session.* / message.updated / message.appended
+    drive the digest. Part events only route to the token hub."""
     hub, subscriber = fresh_hub
 
     FIXED = 1700000000000
     monkeypatch.setattr("oc_slimapi.sse.global_hub._now_ms", lambda: FIXED)
 
-    def part_updated(part_sid, part_mid, part_id):
-        return make_global_event("/proj", "message.part.updated", {
-            "part": {"sessionID": part_sid, "messageID": part_mid, "id": part_id},
-            "sessionID": part_sid, "messageID": part_mid,
-        })
-
-    # First part.updated: updated_at = max(FIXED, 0+1) = FIXED
-    hub.publish(part_updated("s1", "m1", "p1"))
-    assert hub.pending["s1"].updated_at == FIXED
-
-    # Second part.updated (same window): max(FIXED, FIXED+1) = FIXED+1
-    hub.publish(part_updated("s1", "m1", "p2"))
-    assert hub.pending["s1"].updated_at == FIXED + 1
+    hub.publish(make_global_event("/proj", "message.part.updated", {
+        "part": {"sessionID": "s1", "messageID": "m1", "id": "p1"},
+        "sessionID": "s1", "messageID": "m1",
+    }))
+    # Part events no longer create pending entries.
+    assert "s1" not in hub.pending
 
     hub.flush()
     frames = await drain_queue(subscriber)
-    digests = [
-        data for event, data in (parse_event(f) for f in frames)
-        if event == "session.digest" and data.get("sessionID") == "s1"
-    ]
-    assert len(digests) == 1
-    assert digests[0]["updatedAt"] == FIXED + 1
+    assert frames == []  # No digest produced from part event
 
 
-async def test_part_removed_bumps_updatedAt_strictly(fresh_hub, monkeypatch):
-    """§9.3: message.part.removed must also bump updatedAt (strictly
-    increasing within the same debounce window), analogous to part.updated."""
+async def test_part_removed_does_not_touch_digest(fresh_hub, monkeypatch):
+    """Contract §3: message.part.removed no longer triggers digest.
+    Part events only route to the token hub."""
     hub, subscriber = fresh_hub
 
     FIXED = 1700000000000
     monkeypatch.setattr("oc_slimapi.sse.global_hub._now_ms", lambda: FIXED)
 
-    # First part.removed: updated_at = max(FIXED, 0+1) = FIXED
     hub.publish(make_global_event("/proj", "message.part.removed", {
         "sessionID": "s1", "messageID": "m1", "partID": "p1",
     }))
-    assert hub.pending["s1"].updated_at == FIXED
-
-    # Second part.removed (same window): max(FIXED, FIXED+1) = FIXED+1
-    hub.publish(make_global_event("/proj", "message.part.removed", {
-        "sessionID": "s1", "messageID": "m1", "partID": "p2",
-    }))
-    assert hub.pending["s1"].updated_at == FIXED + 1
+    # Part events no longer create pending entries.
+    assert "s1" not in hub.pending
 
     hub.flush()
     frames = await drain_queue(subscriber)
-    digests = [
-        data for event, data in (parse_event(f) for f in frames)
-        if event == "session.digest" and data.get("sessionID") == "s1"
-    ]
-    assert len(digests) == 1
-    assert digests[0]["updatedAt"] == FIXED + 1
+    assert frames == []  # No digest produced from part event
 
 
 async def test_bump_updated_at_same_ms_collision(monkeypatch, fresh_hub):
