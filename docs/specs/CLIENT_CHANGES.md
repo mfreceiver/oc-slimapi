@@ -132,6 +132,24 @@
 - **握手期回放**：`server.connected` → 该 session 未过期 `message.removed` tombstones 按时间先于 snapshot 回放，客户端可在首次 snapshot 到达前清理已删除消息的状态。
 - 该帧**不存在**于控制面 `/slimapi/events` 连接中。
 
+### 客户端实现避坑（V2 token-stream，来自 ocdroid 升级实战）
+
+以下两项是 ocdroid V2 升级中踩过并修复的实现坑，**契约 §3.x 已规定正确行为**，此处补充客户端实现要点，帮助其他 V2 客户端避坑。
+
+#### 1. `snapshot{done:true}` 仅是完成 marker，**不得取 text**（契约 §3.x 杠杆1）
+- **契约**：终态 `message.part.snapshot{done:true}` 是**仅完成标记，不带 text**——上游 `part.text` 终态重发已被取消；**权威全文走 `/messages/{sid}` 或 `/full/{mid}`**（持久化真值）。
+- **坑**：ocdroid D-wire 初版 `TokenStreamReducer` 在 `done:true` 时取 `frame.text ?: existing?.text ?: ""` 作为终态值——与契约冲突。
+- **正确**：`done:true` 帧仅用于 ① 标记该 part 渲染完成、② 触发权威 fetch；**不得从该帧取 text**。REST skeleton/full 的全文**凌驾所有 token 帧**（幂等覆盖；客户端可接受 digest 完成先于/晚于 token 终态帧）。
+
+#### 2. `partEventRevision` 必须 **strict `>` 去重**（非 no-op）+ 原子更新 + 生命周期回收（契约 §3.x.2）
+- **契约**：token-stream 帧的 `partEventRevision` 由 token hub per-frame 维护（每帧唯一递增）；客户端按 **strict `>`** 去重。
+- **坑（ocdroid D-wire 初版两连）**：① 去重函数无条件 `return true`（**根本没去重**，no-op）；② 初版修复用非原子 get/check/put，存在 **TOCTOU 竞态**（并发 delta 帧竞争 last-revision）。
+- **正确实现要点**：
+  - **原子 compare-and-set** 做 strict `>` 更新（如 `ConcurrentHashMap.compute()` 或等价 CAS），杜绝 TOCTOU；
+  - **per-`(sid, mid, pid)` last-revision** 存储（不是全局单一计数器）；
+  - **生命周期回收**：part `done:true` / `truncated` / 连接 close / `resync` / session 切换时清对应条目，防泄漏；
+  - **有界存储**防内存增长（LRU；ocdroid 用 32 cap 防饥饿）。
+
 ### 终态对齐（必须）
 
 - digest `message.updated`（step-finish）→ 客户端应重新拉取 `/slimapi/messages/{sid}` skeleton 列表以获取权威全文，**幂等覆盖**该 message 所有 part（含 token streamOwned 已完成的）。客户端可接受 digest 完成先于 / 晚于 token `snapshot{done:true}`；重拉 skeleton 替换幂等且凌驾所有 token 帧。
