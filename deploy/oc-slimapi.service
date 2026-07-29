@@ -1,43 +1,44 @@
+# oc-slimapi — systemd **user** service unit template.
+#
+# 部署到 ~/.config/systemd/user/oc-slimapi.service（systemctl --user）。
+# 这是 user service：deliberately **不含** ProtectSystem/ProtectHome/
+# ProtectKernel*/NoNewPrivileges 等 sandbox —— 它们需要 root（capability drop），
+# user manager 无权设置，会以 status=218/CAPABILITIES 失败。
+# 进程隔离靠 stunnel mTLS（:14097/:14096）+ Tailscale ACL（见 AGENTS.md）。
+# 部署/更新步骤见 docs/operations.md §3。
+
 [Unit]
 Description=oc-slimapi (Python 省流 sidecar for ocdroid ↔ opencode)
+Documentation=file:///home/mar/personal_projects/oc-slimapi/AGENTS.md
 After=network.target
 
 [Service]
 Type=simple
-Environment=OC_SLIMAPI_HOST=127.0.0.1
+WorkingDirectory=/home/mar/personal_projects/oc-slimapi
+ExecStart=/home/mar/personal_projects/oc-slimapi/.venv/bin/python -m oc_slimapi.app
+Restart=on-failure
+RestartSec=5
+
+# OC_SLIMAPI_HOST=0.0.0.0 允许 Tailscale 直连；如仅 loopback（stunnel 本机转发）改 127.0.0.1。
+# :4097 为明文，远程暴露必须靠 stunnel mTLS / Tailscale ACL 隔离。
+Environment=OC_SLIMAPI_HOST=0.0.0.0
 Environment=OC_SLIMAPI_PORT=4097
 Environment=OC_SLIMAPI_UPSTREAM=http://127.0.0.1:4096
 Environment=OC_SLIMAPI_MAX_MESSAGE_BYTES=33554432
 Environment=OC_SLIMAPI_SERVER_API_VERSION=2
 Environment=OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS=2,2
+Environment=PYTHONUNBUFFERED=1
 
-# StateDirectory 为 access log 与 traffic snapshot 提供可写目录：
-# ProtectSystem=strict + ProtectHome=read-only 下，项目内相对路径（如 ./logs/）不可写；
-# StateDirectory=oc-slimapi 让 systemd 自动建 ~/.local/state/oc-slimapi（%S 占位符 = ~/.local/state）
-# 并在 sandbox 内显式允许写入该路径。
-# 代码默认仍为相对 logs/（本地开发 cwd 可写）；生产由下面两行 env 覆盖到 state dir。
+# v1.0.0: access log + traffic snapshot 落 StateDirectory（systemd 自动建
+# ~/.local/state/oc-slimapi 并允许写入）。代码默认相对 logs/（本地开发 cwd 可写），
+# 生产由下面两行 env 覆盖到 state dir。
 StateDirectory=oc-slimapi
 Environment=OC_SLIMAPI_ACCESS_LOG_DIR=%S/oc-slimapi/logs
 Environment=OC_SLIMAPI_TRAFFIC_SNAPSHOT_PATH=%S/oc-slimapi/logs/traffic-snapshot.jsonl
 
-ExecStart=%h/.local/share/oc-slimapi/venv/bin/oc-slimapi
-Restart=on-failure
-RestartSec=2
-StartLimitIntervalSec=60
-StartLimitBurst=10
-
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=read-only
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-RestrictSUIDSGID=true
-LockPersonality=true
-MemoryDenyWriteExecute=true
-MemoryMax=384M
-TasksMax=64
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=oc-slimapi
 
 [Install]
 WantedBy=default.target
