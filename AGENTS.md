@@ -61,7 +61,7 @@ ocdroid ──(stunnel mTLS 14096)──▶ opencode :4096   # 直连回退，�
 | 发版（tag + changelog） | `./scripts/release.sh <patch\|minor\|major>` | **[`docs/release.md`](docs/release.md)**（发版规范权威） |
 | 接口行为变更记录 | 编辑 [`CHANGELOG.md`](CHANGELOG.md) | 每次**破坏/加性 wire 行为**变更必须记；ocdroid 对接以本文件为准 |
 | 契约 / 设计 | `docs/specs/v2-contract.md`、`docs/specs/design-v2.md`、`docs/specs/INTERFACE_MAP.md` | 契约只在破坏性变更时 bump `X-Slimapi-Version` |
-| 省流 / 路由审计（advisory） | access log `logs/access.jsonl` + [`docs/specs/INTERFACE_MAP.md`](docs/specs/INTERFACE_MAP.md) | 查“哪些请求未省流”：按 `bucket=="passthrough"` 过滤 access log、聚合 `method+path`，再对照 INTERFACE_MAP 看有无 `/slimapi` 等价省流路由；新增 `/slimapi` 路由必须同步进 INTERFACE_MAP（否则 check.sh 失败） |
+| 省流 / 路由审计（advisory） | access log `access-YYYY-MM-DD.jsonl`（按天）+ snapshot `traffic-snapshot-YYYY-MM-DD.jsonl` + [`docs/specs/INTERFACE_MAP.md`](docs/specs/INTERFACE_MAP.md) | 查“哪些请求未省流”：按 `bucket=="passthrough"` 过滤 access log、聚合 `method+path`，再对照 INTERFACE_MAP 看有无 `/slimapi` 等价省流路由；文件位置/查询见 [`docs/manual/traffic-accounting.md`](docs/manual/traffic-accounting.md)（生产落 `~/.local/state/oc-slimapi/logs/`，`RETAIN_DAYS=3` 自动清理）；新增 `/slimapi` 路由必须同步进 INTERFACE_MAP（否则 check.sh 失败） |
 
 > 任何 release / tag / 版本号 / changelog 写入，都不得由 agent 自由发挥命令，必须走 `scripts/release.sh` 或 `docs/release.md` 写明的步骤。
 
@@ -97,7 +97,11 @@ OC_SLIMAPI_ROUTE_SECRET_FILE=/tmp/oc-slimapi-route-secret \
 
 # 生产：systemd user 服务（部署/日志/自启见 docs/operations.md）
 systemctl --user start oc-slimapi
-journalctl --user -u oc-slimapi -f
+journalctl --user -u oc-slimapi -f          # 应用日志（startup/warning/smoke）
+
+# 落盘日志（access log + snapshot，生产落 StateDirectory）
+ls ~/.local/state/oc-slimapi/logs/           # access-YYYY-MM-DD.jsonl(.gz) + traffic-snapshot-*.jsonl
+# 查询/分析手册：docs/manual/traffic-accounting.md（生产 RETAIN_DAYS=3 自动清理 access log）
 
 # 发版（见 docs/release.md）
 ./scripts/release.sh patch    # | minor | major
@@ -117,5 +121,5 @@ journalctl --user -u oc-slimapi -f
 | [`docs/release.md`](docs/release.md) | **发版流程规范**（本仓库权威） |
 | [`docs/operations.md`](docs/operations.md) | **部署 / 运维 / 日志**（systemd、journald、排障） |
 | [`docs/develop.md`](docs/develop.md) | 开发 / 运行 / 测试备忘 |
-| [`docs/manual/traffic-accounting.md`](docs/manual/traffic-accounting.md) | 流量/省流查询使用手册（`/slimapi/metrics.traffic` + access log，v0.7.0+） |
+| [`docs/manual/traffic-accounting.md`](docs/manual/traffic-accounting.md) | 流量/省流查询使用手册（`/slimapi/metrics.traffic` + 按天 access log + snapshot；落盘位置/RETAIN_DAYS 见此） |
 | ocdroid `docs/slim-mode-api-routing.md` | 客户端 slim 路由规约（对照用；冲突以本仓契约 + CHANGELOG 为准） |

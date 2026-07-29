@@ -35,6 +35,7 @@ Environment=PYTHONUNBUFFERED=1
 StateDirectory=oc-slimapi
 Environment=OC_SLIMAPI_ACCESS_LOG_DIR=%S/oc-slimapi/logs
 Environment=OC_SLIMAPI_TRAFFIC_SNAPSHOT_PATH=%S/oc-slimapi/logs/traffic-snapshot.jsonl
+Environment=OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS=3
 
 StandardOutput=journal
 StandardError=journal

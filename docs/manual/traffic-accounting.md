@@ -205,7 +205,7 @@ access log 的 `downOut` 是 **wire 级**字节（中间件视角，含 SSE 连�
 | `OC_SLIMAPI_ACCESS_LOG_ENABLED` | `1` | access log 落盘开关；`0` 时不建文件、纯 no-op |
 | `OC_SLIMAPI_ACCESS_LOG_DIR` | `logs` | access log 目录（按天文件 `access-YYYY-MM-DD.jsonl` 落在其下；父目录 best-effort 创建）。生产 systemd 覆盖为 `%S/oc-slimapi/logs` |
 | `OC_SLIMAPI_ACCESS_LOG_COMPRESS_ON_STARTUP` | `1` | 启动时压缩早于今天（`< today`）的 `.jsonl` → `.gz` |
-| `OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS` | `0` | prune 早于 N 天的 `access-YYYY-MM-DD.jsonl(.gz)`；`0`=不删。**不含** `access-legacy-*.jsonl.gz`（永久保留） |
+| `OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS` | `0` | prune 早于 N 天的 `access-YYYY-MM-DD.jsonl(.gz)`；**代码默认 `0`=不删**（本地开发/测试）；**生产 unit 配置 `3`**（见 `deploy/oc-slimapi.service` / `docs/operations.md` §3.2）。**不含** `access-legacy-*.jsonl.gz`（永久保留） |
 | `OC_SLIMAPI_ACCESS_LOG_MAINTENANCE_INTERVAL_S` | `3600` | 后台 compress+prune 周期（≥60） |
 | `OC_SLIMAPI_TRAFFIC_SNAPSHOT_ENABLED` | `1` | 内存账本周期快照开关（见 §9） |
 | `OC_SLIMAPI_TRAFFIC_SNAPSHOT_INTERVAL_S` | `300` | 快照周期（≥1） |

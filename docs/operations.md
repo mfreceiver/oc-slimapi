@@ -90,6 +90,14 @@ Environment=OC_SLIMAPI_PORT=4097
 Environment=OC_SLIMAPI_UPSTREAM=http://127.0.0.1:4096
 Environment=PYTHONUNBUFFERED=1
 
+# v1.0.0: access log + traffic snapshot 落 StateDirectory（systemd 自动建
+# ~/.local/state/oc-slimapi）。代码默认相对 logs/（本地开发 cwd 可写），
+# 生产由下面三行 env 覆盖到 state dir。RETAIN_DAYS=3 自动清理早于 3 天的 access log。
+StateDirectory=oc-slimapi
+Environment=OC_SLIMAPI_ACCESS_LOG_DIR=%S/oc-slimapi/logs
+Environment=OC_SLIMAPI_TRAFFIC_SNAPSHOT_PATH=%S/oc-slimapi/logs/traffic-snapshot.jsonl
+Environment=OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS=3
+
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=oc-slimapi
@@ -97,6 +105,8 @@ SyslogIdentifier=oc-slimapi
 [Install]
 WantedBy=default.target
 ```
+
+> 这是 **user service** 模板（`systemctl --user`）：**不含** `ProtectSystem`/`ProtectHome` 等 sandbox 指令——它们需要 root（capability drop），user manager 无权设置。进程隔离靠 stunnel mTLS（:14097/:14096）+ Tailscale ACL（见 §10）。仓库内 `deploy/oc-slimapi.service` 是同结构模板（含注释）。
 
 调参（订阅上限、buffer 字节预算、transform 并发等）只需在 `[Service]` 加 `Environment=OC_SLIMAPI_*` 行，参见 [`develop.md`](develop.md) §配置。
 
@@ -173,10 +183,10 @@ oc-slimapi 有两类日志输出，**分别处理**：
 
 | 场景 | 目录 | 来源 |
 |---|---|---|
-| **systemd 生产** | `~/.local/state/oc-slimapi/logs/` | unit `StateDirectory=oc-slimapi` + env `OC_SLIMAPI_ACCESS_LOG_DIR=%S/oc-slimapi/logs`、`OC_SLIMAPI_TRAFFIC_SNAPSHOT_PATH=%S/oc-slimapi/logs/traffic-snapshot.jsonl`（`%S` = `~/.local/state`）。`ProtectSystem=strict` + `ProtectHome=read-only` 下，`StateDirectory` 显式允许写入此路径 |
+| **systemd 生产** | `~/.local/state/oc-slimapi/logs/` | unit `StateDirectory=oc-slimapi`（systemd 自动建目录、管理生命周期）+ env `OC_SLIMAPI_ACCESS_LOG_DIR=%S/oc-slimapi/logs`、`OC_SLIMAPI_TRAFFIC_SNAPSHOT_PATH=%S/oc-slimapi/logs/traffic-snapshot.jsonl`（`%S` = `~/.local/state`） |
 | **本地开发**（手动跑） | `<cwd>/logs/` | 代码默认（相对路径；cwd 可写） |
 
-> **为何需要 StateDirectory**：unit 的 `ProtectSystem=strict` 禁止写 `/`、`ProtectHome=read-only` 禁止写 home。此前 access log 默认写相对 `logs/`（解析为 `/home/.../oc-slimapi/logs/`）在 sandbox 下不可写 → handler 初始化失败。`StateDirectory=oc-slimapi` 让 systemd 自动建 `~/.local/state/oc-slimapi` 并在 sandbox 内显式允许写入；env 覆盖把 access log / snapshot 指向该可写目录。
+> **为何用 StateDirectory**：把 access log / snapshot 收拢到 XDG 标准的 state 目录（`~/.local/state/oc-slimapi/`），而非污染项目工作树（`<cwd>/logs/` 会落在 git-tracked 目录下）。systemd 自动创建目录并设置属主；`StateDirectory=oc-slimapi` 是 user service 的标准做法。代码默认仍为相对 `logs/`（本地开发 cwd 可写），生产由 unit env 覆盖。
 
 ### 5.3 access log 维护（压缩 / retain / 后台 loop）
 
@@ -185,14 +195,14 @@ oc-slimapi 有两类日志输出，**分别处理**：
 - **legacy 迁移（仅当前目录）**：`migrate_legacy_access_log` 只处理**当前 `access_log_dir` 内**的无日期文件（旧 `access.jsonl`/`access.jsonl.N`），按 mtime 归档为 `access-legacy-{mtimeYYYYMMDD}-{N}.jsonl.gz`。**不跨目录迁移**：从旧相对目录（如 cwd 下 `logs/`）升级到 `StateDirectory`（`~/.local/state/oc-slimapi/logs`）时，旧位置的历史日志**不会自动迁移**——运维需手动移动。
 - **`access-legacy-*.jsonl.gz` 不受 retain 自动清理**：prune 的严格匹配只认 `access-YYYY-MM-DD.jsonl(.gz)`，迁移产物**永久保留**，清理由运维手动处理。
 - **后台 maintenance loop**（默认 1h 周期，`OC_SLIMAPI_ACCESS_LOG_MAINTENANCE_INTERVAL_S`）：周期执行 compress + prune，不依赖重启。
-- **prune**：`OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS`（默认 `0` = 不删）；设 `7` 则删除早于 7 天的 `access-YYYY-MM-DD.jsonl(.gz)`（**不含** `access-legacy-*.jsonl.gz`）。
+- **prune**：`OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS`（**代码默认 `0` = 不删**；**生产 unit 配置 `3`**——见 `deploy/oc-slimapi.service` / §3.2），删除早于 N 天的 `access-YYYY-MM-DD.jsonl(.gz)`（**不含** `access-legacy-*.jsonl.gz`）。
 - **snapshot 不在此维护范围**：`traffic-snapshot-YYYY-MM-DD.jsonl` 不经 access log 的 compress/prune（后者只认 `access-` 前缀），不自动压缩、不自动清理。
 
 ### 5.4 磁盘增长估算
 
 - **access log**：单日 raw 视请求量约 **50–100 MB**（每行 ~200–400 B × 请求数）；压缩后约 **1/8**（~6–12 MB/天）。
 - **traffic snapshot**：极小（每帧 ~1–2 KB × 每 300s = ~300 KB/天）；**不经自动压缩/prune**，长期累积需手动清理。
-- **建议**：长期运行的实例设 `OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS`（如 `30`）控制 access log 历史；snapshot 与 `access-legacy-*.jsonl.gz` 不受此控，需定期手动清理。journald 自身由 systemd 按 `/etc/systemd/journald.conf` 轮转，不在此列。
+- **建议**：生产 unit 已配 `OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS=3`（保留 3 天 access log，约 3×6–12 MB ≈ 20–36 MB 压缩后）；如需更久的历史可调大此值。snapshot 与 `access-legacy-*.jsonl.gz` **不受 retain**（永久保留），需定期手动清理。journald 自身由 systemd 按 `/etc/systemd/journald.conf` 轮转，不在此列。
 
 ### 5.5 journald 查询手册（应用日志）
 
