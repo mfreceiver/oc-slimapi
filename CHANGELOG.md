@@ -26,7 +26,13 @@ ocdroid 对接时：
 
 ---
 
-## [Unreleased] — turn token fence（服务端因果标识，加性 wire，未 bump `X-Slimapi-Version`，仍 `2`）
+## [Unreleased]
+
+_(未发布变更暂记于此。)_
+
+---
+
+## [1.0.1] - 2026-07-31 — turn token fence（服务端因果标识，加性 wire，未 bump `X-Slimapi-Version`，仍 `2`）
 
 > turn token 强 fence 契约：在转发的 `session.digest` SSE 事件里附加 `turnIncarnation`(int) + `turn`(int) 两个**可选** flat 顶层字段，供 ocdroid 做因果 fence（丢弃来自旧 incarnation / 旧 turn 的过期 digest）。ocdroid 侧解析已就绪并 merged。**全加性 / 向后兼容，未 bump** `X-Slimapi-Version`。
 
