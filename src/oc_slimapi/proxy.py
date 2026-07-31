@@ -45,6 +45,41 @@ def _is_shell_path(path: str) -> bool:
     return _SHELL_PATH_RE.match(path) is not None
 
 
+# Turn token fence (S2): scope/sid extraction from the catch-all path. The
+# sid segment is captured generically (no opencode ``01HQ...`` format
+# hardcoding) so any upstream id shape flows through.
+_SESSION_SID_RE = re.compile(r"^/session/([^/]+)")
+# The two forward paths that bump the turn counter (contract §4.1 two
+# classes of forward): prompt (new turn of work) and abort (cancels the
+# current turn). Trailing slash tolerant.
+_TURN_BUMPING_SUFFIX_RE = re.compile(r"^/session/[^/]+/(prompt|abort)/?$")
+
+
+def _extract_sid_from_path(norm_path: str) -> str | None:
+    """Extract the ``{sid}`` segment from a ``/session/{sid}/...`` path.
+
+    Returns ``None`` for non-session paths. Does NOT hardcode the opencode
+    ``01HQ...`` id format — any non-empty first segment under
+    ``/session/`` qualifies (the upstream will reject malformed ids).
+    """
+    m = _SESSION_SID_RE.match(norm_path)
+    if m is None:
+        return None
+    sid = m.group(1)
+    return sid or None
+
+
+def _is_turn_bumping_path(norm_path: str) -> bool:
+    """True iff ``norm_path`` is a turn-bumping forward (contract §4.1).
+
+    Matches ``/session/{sid}/prompt`` or ``/session/{sid}/abort`` (trailing
+    slash tolerant). These are the two forwards that start/stop a turn of
+    work and therefore must advance the turn counter at the S2 commit
+    point (send-before-bump).
+    """
+    return _TURN_BUMPING_SUFFIX_RE.match(norm_path) is not None
+
+
 # Client-identity headers that must be stripped before forwarding upstream
 # (device id could leak PII to opencode if forwarded).
 _CLIENT_IDENT_HEADERS = {"x-client-name", "x-client-version", "x-client-id"}
@@ -138,6 +173,28 @@ def install_proxy(app: FastAPI) -> None:
             "write": 300.0,
             "pool": 5.0,
         }
+        # S2: turn token fence — commit point is send-BEFORE-bump (contract
+        # §4.2 approved relaxation). Header-gated (O1): only when the
+        # request carries X-Ocdroid-Server-Group-Fp do we register the scope
+        # and (for prompt/abort) bump the turn. The catch-all reverse proxy
+        # transparently forwards X-Ocdroid-Server-Group-Fp upstream already
+        # (it is not in the hop-by-hop / client-ident strip sets), so no
+        # proxy-header change is needed for the upstream leg.
+        #
+        # If client.send() raises below (connection-level failure), the turn
+        # has already advanced → a HOLE is produced (no rollback / decrement).
+        # ocdroid's lex comparison tolerates holes; correctness is preserved.
+        server_group_fp = request.headers.get("x-ocdroid-server-group-fp")
+        turn_registry = getattr(request.app.state, "turn_registry", None)
+        if turn_registry is not None and server_group_fp:
+            sid = _extract_sid_from_path(norm_path)
+            if sid is not None:
+                # Register scope for EVERY scoped session request (not just
+                # prompt/abort) to maximize the chance a later digest stamp
+                # can resolve the scope from the sid alone.
+                turn_registry.register_scope(sid, server_group_fp)
+                if _is_turn_bumping_path(norm_path):
+                    turn_registry.bump_turn(server_group_fp, sid)
         response = await client.send(upstream_request, stream=True)
         # Wrap the upstream response iterator so we count the bytes returned
         # to the client (``upIn`` — the upstream leg of THIS request). The

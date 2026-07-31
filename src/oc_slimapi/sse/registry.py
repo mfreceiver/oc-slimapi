@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     import httpx
 
     from ..traffic import TrafficLedger
+    from ..turn_registry import TurnRegistry
     from .tokenstream import TokenStreamHub
 
 
@@ -72,6 +73,10 @@ class HubRegistry:
         # construction, the registry forwards the reference onto any
         # lazily-created GlobalHub.
         self._token_hub: TokenStreamHub | None = None
+        # Turn token fence (S9): app.py constructs the TurnRegistry in
+        # lifespan and pushes it here; the registry forwards the reference
+        # onto any lazily-created GlobalHub (mirrors _token_hub wiring).
+        self._turn_registry: TurnRegistry | None = None
         self._removal_task: asyncio.Task | None = None
 
     def set_transforms(self, pool: Any) -> None:
@@ -92,6 +97,17 @@ class HubRegistry:
         if self._global is not None:
             self._global._token_hub = token_hub
 
+    def set_turn_registry(self, registry: TurnRegistry | None) -> None:
+        """Wire the :class:`TurnRegistry` onto the registry and any live GlobalHub.
+
+        Mirrors :meth:`set_token_hub`: app.py constructs the registry in
+        lifespan and pushes it here; a later ``get()`` forwards it onto the
+        lazily-created GlobalHub. ``None`` is accepted for tests / detach.
+        """
+        self._turn_registry = registry
+        if self._global is not None:
+            self._global._turn_registry = registry
+
     def get(self, directory: str | None = None) -> GlobalHub:
         if self._global is None:
             self._global = GlobalHub(
@@ -100,6 +116,7 @@ class HubRegistry:
                 buffer_bytes=self.buffer_bytes,
                 max_frame_bytes=self.max_frame_bytes,
                 traffic_ledger=self._traffic_ledger,
+                turn_registry=self._turn_registry,
             )
             self._global._token_hub = self._token_hub
         return self._global

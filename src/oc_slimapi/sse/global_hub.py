@@ -44,6 +44,7 @@ from .hub_types import (
 
 if TYPE_CHECKING:
     from ..traffic import TrafficLedger
+    from ..turn_registry import TurnRegistry
     from .token_hub import TokenStreamHub
 
 logger = get_logger(__name__)
@@ -63,6 +64,7 @@ class GlobalHub:
         buffer_bytes: int = DEFAULT_SSE_BUFFER_BYTES,
         max_frame_bytes: int = DEFAULT_SSE_MAX_FRAME_BYTES,
         traffic_ledger: "TrafficLedger | None" = None,
+        turn_registry: "TurnRegistry | None" = None,
     ):
         self.client = client
         self.subscribers: set[Subscriber] = set()
@@ -70,6 +72,10 @@ class GlobalHub:
         self.buffer_bytes = buffer_bytes
         self.max_frame_bytes = max_frame_bytes
         self._traffic_ledger = traffic_ledger
+        # Turn token fence (S9 ingest-time snapshot stamp). Injected from
+        # app.py via set_turn_registry(); ``None`` → no stamping (fields
+        # omitted from every digest, ocdroid degrades).
+        self._turn_registry: TurnRegistry | None = turn_registry
         self.task: asyncio.Task | None = None
         self.flush_task: asyncio.Task | None = None
         self.heartbeat_task: asyncio.Task | None = None
@@ -308,6 +314,18 @@ class GlobalHub:
         """
         self._token_hub = token_hub
 
+    def set_turn_registry(self, registry: "TurnRegistry | None") -> None:
+        """Wire the :class:`TurnRegistry` so publish() can stamp
+        ``turnIncarnation`` / ``turn`` onto ``session.digest`` entries.
+
+        Mirrors :meth:`set_token_hub`: the registry owns the canonical
+        reference (app.py constructs it in lifespan) and pushes it onto the
+        live GlobalHub and any hub constructed later via
+        :meth:`HubRegistry.get`. ``None`` is accepted so the fence can be
+        detached (tests, shutdown).
+        """
+        self._turn_registry = registry
+
     def _prune_retired_messages(self, now_ms: int) -> None:
         """rev-ogpt MAJOR 4 (3rd-round terminal audit): enforce FIFO cap +
         TTL on the ``_retired_messages`` gate.
@@ -387,6 +405,20 @@ class GlobalHub:
                 status = props.get("status")
                 if isinstance(status, str):
                     entry.status = status
+                # S9: ingest-time snapshot stamp of turn/inc (header-gated).
+                # Stamped HERE (publish/ingest), NOT at flush time, so a turn
+                # bump occurring between ingest and flush cannot retroactively
+                # change an already-stamped digest (contract §7.4, V10). The
+                # snapshot freezes the ints onto the entry (Python int = value
+                # copy, not a reference). snapshot() returns None when no
+                # scope is known for this sid → both fields stay None → omitted
+                # by to_payload() (header-gated safe degrade).
+                if self._turn_registry is not None:
+                    snap = self._turn_registry.snapshot(
+                        server_group_fp=None, sid=session_id
+                    )
+                    if snap is not None:
+                        entry.turn_incarnation, entry.turn = snap
                 # G1: busy clears sticky lastError with explicit null digest.
                 # Per-sid flush only — other sessions stay in the debounce window.
                 if props.get("status") == "busy" and session_id in self.sticky_last_error:

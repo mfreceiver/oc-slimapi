@@ -148,6 +148,14 @@ class DigestFields:
     archived: int | None = None
     deleted: bool = False
     last_error: Any = _UNSET  # three-state: _UNSET=omit, None=explicit clear, dict=object
+    # Turn token fence (S1/S9): server-side causal identifiers stamped onto
+    # the digest so ocdroid can fence stale turns/incarnations. Paired:
+    # either both are emitted or neither is (header-gated; absent scope →
+    # both None → both omitted, ocdroid degrades). Frozen at ingest time
+    # (see GlobalHub.publish session.status branch) so a later bump cannot
+    # retroactively change an already-stamped digest (contract §7.4, V10).
+    turn_incarnation: int | None = None
+    turn: int | None = None
 
     def to_payload(self, session_id: str) -> dict[str, Any]:
         payload: dict[str, Any] = {"sessionID": session_id}
@@ -165,6 +173,15 @@ class DigestFields:
             payload["deleted"] = True
         if self.last_error is not _UNSET:
             payload["lastError"] = self.last_error
+        # Turn token fence: emit BOTH flat top-level fields only when the
+        # pair is present. They live at the SAME level as sessionID/status
+        # /archived/deleted/lastError — ocdroid parses the slimapi flat
+        # root as ``event.payload.properties`` (SSEClient.kt B1 path), so a
+        # nested ``properties`` sub-dict (the §3.3 diagram, which is an
+        # opencode upstream frame shape) would be UNREADABLE. Flat = legible.
+        if self.turn_incarnation is not None and self.turn is not None:
+            payload["turnIncarnation"] = self.turn_incarnation
+            payload["turn"] = self.turn
         return payload
 
 
