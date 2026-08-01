@@ -242,7 +242,7 @@ def write_access_log(
     ``OC_SLIMAPI_ACCESS_LOG_ENABLED=false`` path).
 
     ``client``, ``clientVer``, ``clientId`` are optional fields for client
-    identity tracking.  When ``None`` they are written as JSON ``null`` so
+    identity tracking.  When ``None`` these are written as JSON ``null`` so
     every row has a stable set of keys (``jq``-friendly).
     """
     if logger.disabled:

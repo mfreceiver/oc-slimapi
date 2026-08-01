@@ -405,20 +405,15 @@ class GlobalHub:
                 status = props.get("status")
                 if isinstance(status, str):
                     entry.status = status
-                # S9: ingest-time snapshot stamp of turn/inc (header-gated).
-                # Stamped HERE (publish/ingest), NOT at flush time, so a turn
-                # bump occurring between ingest and flush cannot retroactively
-                # change an already-stamped digest (contract §7.4, V10). The
-                # snapshot freezes the ints onto the entry (Python int = value
-                # copy, not a reference). snapshot() returns None when no
-                # scope is known for this sid → both fields stay None → omitted
-                # by to_payload() (header-gated safe degrade).
+                # S9: ingest-time snapshot stamp of turn/inc. Stamped HERE
+                # (publish/ingest), NOT at flush time, so a turn bump
+                # between ingest and flush cannot retroactively change an
+                # already-stamped digest (contract §7.4, V10). The snapshot
+                # freezes the ints onto the entry (Python int = value copy).
+                # Scope is sid alone; snapshot always returns a tuple
+                # (unobserved sid → (inc, 0)).
                 if self._turn_registry is not None:
-                    snap = self._turn_registry.snapshot(
-                        server_group_fp=None, sid=session_id
-                    )
-                    if snap is not None:
-                        entry.turn_incarnation, entry.turn = snap
+                    entry.turn_incarnation, entry.turn = self._turn_registry.snapshot(session_id)
                 # G1: busy clears sticky lastError with explicit null digest.
                 # Per-sid flush only — other sessions stay in the debounce window.
                 if props.get("status") == "busy" and session_id in self.sticky_last_error:

@@ -577,7 +577,7 @@ async def test_access_log_with_client_headers(tmp_path):
 
 
 async def test_access_log_no_client_headers(tmp_path):
-    """No client-identity headers → all three fields null."""
+    """No client-identity headers → identity fields null."""
     logger = setup_access_log(enabled=True, dir=str(tmp_path))
     config = _default_test_config()
 

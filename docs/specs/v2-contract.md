@@ -7,6 +7,7 @@
 >
 > | 修订日期 | wire 版本 | 文档 rev | 变更摘要 | 落地对照 |
 > |---|---|---|---|---|
+> | **2026-08-01** | **2（不变）** | **v2+additive** | **turn token fence scope 简化为「仅 sid」**：turn 计数器分桶 key 由 (serverGroupFp, sid) 改为 sid 单值（单 sidecar 单后端下 sid 已唯一）；移除 X-Ocdroid-Server-Group-Fp 输入头依赖（header 若来则忽略）；snapshot 恒返回（未观测 sid → (inc,0)），digest 的 turnIncarnation/turn 现在对所有 session.status 恒输出（只要 turn_registry 装配）；移除 access log 的 serverGroupFp 字段。免疫多设备共享 session 的 scope 翻转冻结。**未 bump** X-Slimapi-Version（digest 字段集不变，加性兼容）。详见 §3.y。 | §3 / §3.y |
 > | **2026-07-29** | **2（不变）** | **v2+additive** | **流量日志持久化 + 客户端标识（加性）**：access log 文件发现规则改为按天切分 `access-YYYY-MM-DD.jsonl`；内存账本快照按天切分 `traffic-snapshot-YYYY-MM-DD.jsonl`（均 ops 面）；新增可选输入头 `X-Client-Name`/`X-Client-Version`/`X-Client-Id`（不透传上游、缺省忽略）；access log 新增 `client`/`clientVer`/`clientId` 字段（缺省 `null`）。**`X-Slimapi-Version` 不 bump**（加性输入 + ops 面文件名，非 wire 协议破坏）。详见 §7、§12。 | §7 / §12 |
 > | **2026-07-28** | **2（breaking bump）** | **v2** | **Rev v2 (lite-v2)**: deleted 10+ endpoints, removed routeToken/discovery/children/Stage-B-part-tracking/Opt-A/BatchLedger; simplified `/full/{mid}` and `/messages`; digest `updatedAt` now sidecar wall-clock; version gate `(2,2)`. **Breaking wire bump** from `X-Slimapi-Version: 1` → `2`.详见下文各节。 | §0 / §1 / §2 / §3 / §5 / §6 / §7 / §11 |
 >
@@ -85,10 +86,11 @@
 
 - 上游：**一条** `/global/event`（进程级 GlobalBus，全实例跨目录，每事件自带 `directory`）。
 - 帧：
-  - `session.digest`（debounce 250ms/session，仅发有变化的字段）：`{sessionID, directory, status?, messageID?, updatedAt?, archived?, deleted?, lastError?}`。
+  - `session.digest`（debounce 250ms/session，仅发有变化的字段）：`{sessionID, directory, status?, messageID?, updatedAt?, archived?, deleted?, lastError?, turnIncarnation?, turn?}`。
     - **`updatedAt`（v2 语义变更）**：sidecar **wall-clock 时间戳**（epoch ms），由 digest 发射时刻确定，**不再是**上游 `info.time.updated`。理由：v1.18.x 的 message 级 `info.time.updated` 不可靠（多数情况回落到 `created`），改用 sidecar wall-clock 让 digest 时间戳真实反映「sidecar 看到变化的那一刻」。
     - **跨窗口严格单调性不保证**：同一 session 的两次 digest `updatedAt` 不保证 strict `>`（debounce 窗口合并、时钟分辨率、sidecar 进程重启、NTP 跳变等都可能让 `updatedAt` 相等或回退）。客户端 watermark 比较必须用 **`(updatedAt, messageID)` 二元组字典序**（见 §5），**且**对 `updatedAt` 回退/相等做幂等处理（同 messageID 不重复拉取；时间回退时不删除已有数据，仅作 reconcile）。
     - `status`←`session.status`(idle/busy)；`messageID`←`message.updated`/`message.appended` 的 `info.id`（取最新）；**`archived`**←`session.updated` 的 `info.time.archived`（有值→epoch-ms 时间戳）；`deleted`←`session.deleted`。
+    - **`turnIncarnation?` / `turn?`（turn-token fence，配对出现/缺失）**：sidecar 派生的**服务端因果标识**，供 ocdroid 做 lex 单调 fence（丢弃旧 incarnation / 旧 turn 的过期 digest）。两字段位于 digest data payload 的 **flat 顶层**（与 `sessionID`/`status`/`archived`/`deleted`/`lastError` 同层），**不**嵌套进 `properties` 子对象。配对规则：两者都非 None → 同时输出；任一为 None → **两者都不输出**（ocdroid 降级 Tier-2）。类型为 JSON integer ≥0。**只要 turn_registry 装配（lifespan 级部署配置）就对所有 `session.status` 事件恒输出**（未观测 sid → `(inc, 0)`）；turn_registry 未装配时两字段缺省。完整语义见 §3.y。
     - **`lastError`（G1-A，v2 保留）**←`session.error` 经脱敏后的 `{name,message,at}`（`at`=sidecar 收到时 epoch-ms）。**三态 wire**（与 sticky 共存，互不矛盾）：
       - **对象** `{name,message,at}`：本窗口新 error，或 flush 时该 sid 仍有 sticky。
       - **显式 `null`**：clear 帧——该 session 出现新 `status=busy` 时 pop sticky 并立即 flush。
@@ -168,6 +170,54 @@ data: {"reason":"subscriber_backpressure|reconnect_no_replay|token_memory_limit|
 - 控制面 `/slimapi/events`（§3）**一行不改**——token 流消费上游 `message.part.delta`/`updated`（控制面此前丢弃），与控制面队列隔离（独立 T3 账本，§6.x）。
 - part/message 完成仍走既有路径：`message.updated`(step-finish) → digest → 客户端 `/messages/{sid}` 或 `/full/{mid}` 拉权威全文。
 - token stream `snapshot{done:true}` 是「流视角完成」；digest + `/messages/{sid}` / `/full/{mid}` 是「持久化真值」。不一致以后者为准（幂等覆盖，凌驾所有 token 帧）。
+
+## §3.y Turn token fence（服务端因果标识，未 bump `X-Slimapi-Version`，仍 `2`）🔒
+
+> **跨项目 SSOT**：完整因果语义、术语、不变量、消费侧 lex 比较规则见 **`ocdroid/docs/2026-07-31-oc-slimapi-turn-token-contract.md`**（双方共同阅读的权威契约）。本节记录 **sidecar 侧的 wire 行为**（发什么字段、何时 stamp），与该 SSOT 一致。
+
+sidecar 作为 ocdroid 与 opencode 之间的 Python 中继层，可观察所有 `POST /session/{sid}/prompt` / `/abort` forward 流量，因此是「轮次起点」的权威观察者。它派生服务端因果标识 `(turnIncarnation, turn)`，stamp 进转发的 `session.digest`（§3），供 ocdroid 做 lexicographic 严格单调 fence（丢弃旧 incarnation / 旧 turn 的过期 digest）。**加性 / 向后兼容**：digest 字段集不变，从「有时输出」变「恒输出」，对 ocdroid 处理 present/absent 两种情况的客户端加性兼容；turn_registry 未装配（lifespan 级部署配置缺失）时两字段缺省 → ocdroid 降级 Tier-2 启发式确认门（系统正常工作）。
+
+### §3.y.1 wire 字段（digest data flat 顶层）
+
+| 字段 | 类型 | 语义 | 缺失语义 |
+|---|---|---|---|
+| `turnIncarnation` | integer ≥0 | sidecar **生命周期 epoch**（进程级，per-instance）。启动时 `persisted_last + 1`（持久化跨 restart 单调）；进程生命周期内恒定。 | 视为「无 incarnation 信息」→ ocdroid 该事件不参与 inc fence（降级 Tier-2） |
+| `turn` | integer ≥0 | per-`sid` 单调计数（0 起，bump-before-send，§3.y.3）。**事件 ingest 时快照**进 digest entry（ingest 后、flush 前的 bump 不回溯改已 stamp 的值）。 | 视为「无 turn 信息」→ 不参与 turn fence（降级 Tier-2） |
+
+- **配对规则**：两字段**必须同时出现或同时缺失**。ocdroid 仅当两者都非 null 时构造 `ServerRound(inc, turn)`；任一缺失 → `serverRound=null` → Tier-2。
+- **位于 digest data payload 的 flat 顶层**（与 `sessionID`/`status`/`archived`/`deleted`/`lastError` 同层），**不**嵌套进子对象。（ocdroid 把整个 digest data 当作 `properties` 消费，故 flat 顶层 = ocdroid 可读。）
+- `updatedAt` 排序 tie-break 不受影响（`(updatedAt, messageID)` 二元组仍是 digest 排序键）。
+
+### §3.y.2 scope = sid（无输入头依赖）
+
+- **scope key = `sid`（字符串）**。单 sidecar + 单 opencode 后端下 `sid` 全局唯一，turn 计数器按 `sid` 分桶即可，**不需要任何身份头**。
+- sidecar **不再读取** `X-Ocdroid-Server-Group-Fp` header。客户端若仍发来该 header，sidecar 直接忽略（不读、不记、不再落 access log 字段）。catch-all 反代会把它当作普通未知 header 透传上游（不在 hop-by-hop / client-ident 剥离集内），但 sidecar 自身的 turn 逻辑与它无关。
+
+### §3.y.3 turn 计数（bump-before-send commit point，S2）
+
+- **何时 bump**：catch-all 反代在构造 upstream request 之后、`await client.send()` **之前**，对两类 forward bump turn（`turn = prev + 1`，per-`sid` 单调不减）：
+  - `POST /session/{sid}/prompt`（含 `_async` 变体）—— 新执行轮次起点；
+  - `POST /session/{sid}/abort` —— abort 也是一次轮次（产生自己的 turn 号）。
+- **连接级失败 = hole**：若 `send()` 抛异常（连接级失败）或上游返回非 2xx，turn **已 bump 但无 upstream 工作**——产生 **hole**（不回退 / 不 decrement）。这是对「不 increment on failure」的**已批准放宽**：httpx stream 单 await 栈下，bump-before-send 是唯一保证 in-flight fence 正确的做法；ocdroid 的 lex 比较天然容忍 hole（hole 事件携带更高 turn，DROP 的是旧 turn，正确性不破）。
+- **其它带 sid 的 session 请求**（如 `GET /session/{sid}/message`）**不 bump**（也不注册任何 scope——scope 概念已随 serverGroupFp 一并移除）。
+
+### §3.y.4 incarnation（持久化 epoch，策略 A）
+
+- 启动时 `IncarnationStore` 从 state dir（复用 `OC_SLIMAPI_ACCESS_LOG_DIR`）下的 `incarnation` 文件 read persisted → `+1` → write 回 → 返回新值。单进程单事件循环，无文件锁。
+- 文件不存在（首次启动）= `persisted_last=0` → inc=1；损坏/不可写 → best-effort 兜底返回 1（warn 不 crash lifespan）。
+- 进程生命周期内恒定；restart → inc bump（新值严格大于旧进程的 inc，故旧进程 stamp 的 digest 在 ocdroid 侧 `inc < knownIncarnation` → DROP，不复活）。
+- **turn registry 不持久化**（restart 归零），由 incarnation bump 兜底正确性。
+
+### §3.y.5 stamp 时机（ingest-time snapshot，S9）
+
+- `GlobalHub.publish()` 在 `session.status` 事件 **ingest 时**（而非 flush 时）把当前 `(incarnation, turn)` 快照 stamp 到 `DigestFields` entry 上。entry 存 Python int（值拷贝），故 ingest 后、flush 前若有新 forward bump turn，已 stamp 的 entry **不受影响**（冻结于 ingest 时刻值）。
+- **gate = 「turn_registry 是否装配」**（lifespan 级，部署配置），不再是「header 是否存在」。`global_hub.publish` 里 `if self._turn_registry is not None` 这层保留；snapshot 恒返回 `(incarnation, turn)` 元组（未观测 sid → `(inc, 0)`），故只要 registry 装配，digest 对所有 `session.status` 事件恒输出两字段。
+- **已知上限竞态（前瞻性披露，接受）**：前一轮 forward 的**迟到** SSE 事件到达 GlobalHub 时，registry 已被后续 forward increment → 读到更高 turn → 被过 stamp 成新轮次。这在快速连续 forward（prompt→abort）+ SSE 延迟下可达，**仅靠 per-sid 单调计数器无法闭合**。本契约**接受**此限制：ocdroid lex fence 对「过 stamp 的高 turn」不 DROP（该事件因果上属前一轮，ocdroid 表现为「过早 busy」而非 stale 复活，liveness 不破）。详见跨项目 SSOT §4.4 / 开放问题 O6。
+
+### §3.y.6 单实例语义（O3）+ 无锁
+
+- 无 `instanceFp`；scope key = `sid`。单进程 / 单 asyncio 事件循环，`TurnRegistry` 所有方法为同步纯 dict 操作，无需锁（跨项目 SSOT §7.2 单调可见性不变量）。
+- **免疫多设备共享 session**：所有设备对同一 `sid` 的 prompt 共享同一单调计数器，读请求不翻转 scope（原 `(serverGroupFp, sid)` 分桶 + `register_scope` 的「最后写入者覆盖」会在多设备续看同一会话时翻转 scope、破坏 turn 单调性，导致 ocdroid 误判后续 digest 为 stale 而 DROP → session UI 冻结；sid-only 计数从根上消除该 bug）。
 
 ## §4 冷启动 & resync 🔒
 

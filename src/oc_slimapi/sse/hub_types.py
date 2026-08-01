@@ -150,10 +150,13 @@ class DigestFields:
     last_error: Any = _UNSET  # three-state: _UNSET=omit, None=explicit clear, dict=object
     # Turn token fence (S1/S9): server-side causal identifiers stamped onto
     # the digest so ocdroid can fence stale turns/incarnations. Paired:
-    # either both are emitted or neither is (header-gated; absent scope →
-    # both None → both omitted, ocdroid degrades). Frozen at ingest time
-    # (see GlobalHub.publish session.status branch) so a later bump cannot
-    # retroactively change an already-stamped digest (contract §7.4, V10).
+    # either both are emitted or neither is (when the registry is absent —
+    # a lifespan-level deployment property — both stay None → both omitted,
+    # ocdroid degrades). Once the registry is wired, snapshot always returns
+    # a tuple (unobserved sid → (inc, 0)), so every session.status digest
+    # carries both fields. Frozen at ingest time (see GlobalHub.publish
+    # session.status branch) so a later bump cannot retroactively change an
+    # already-stamped digest (contract §3.y.5, V10).
     turn_incarnation: int | None = None
     turn: int | None = None
 

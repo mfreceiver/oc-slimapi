@@ -49,10 +49,11 @@ def _is_shell_path(path: str) -> bool:
 # sid segment is captured generically (no opencode ``01HQ...`` format
 # hardcoding) so any upstream id shape flows through.
 _SESSION_SID_RE = re.compile(r"^/session/([^/]+)")
-# The two forward paths that bump the turn counter (contract §4.1 two
-# classes of forward): prompt (new turn of work) and abort (cancels the
-# current turn). Trailing slash tolerant.
-_TURN_BUMPING_SUFFIX_RE = re.compile(r"^/session/[^/]+/(prompt|abort)/?$")
+# The forward paths that bump the turn counter (contract §3.y.3): prompt /
+# prompt_async (new turn of work — ocdroid's production send path is
+# prompt_async) and abort (cancels the current turn). Trailing slash
+# tolerant. The bump itself is additionally gated on POST method below.
+_TURN_BUMPING_SUFFIX_RE = re.compile(r"^/session/[^/]+/(prompt(?:_async)?|abort)/?$")
 
 
 def _extract_sid_from_path(norm_path: str) -> str | None:
@@ -70,12 +71,13 @@ def _extract_sid_from_path(norm_path: str) -> str | None:
 
 
 def _is_turn_bumping_path(norm_path: str) -> bool:
-    """True iff ``norm_path`` is a turn-bumping forward (contract §4.1).
+    """True iff ``norm_path`` is a turn-bumping forward (contract §3.y.3).
 
-    Matches ``/session/{sid}/prompt`` or ``/session/{sid}/abort`` (trailing
-    slash tolerant). These are the two forwards that start/stop a turn of
-    work and therefore must advance the turn counter at the S2 commit
-    point (send-before-bump).
+    Matches ``/session/{sid}/prompt``, ``/session/{sid}/prompt_async``, or
+    ``/session/{sid}/abort`` (trailing slash tolerant). These are the forwards
+    that start/stop a turn of work and therefore must advance the turn
+    counter at the S2 commit point (bump-before-send). Path match alone is
+    NOT sufficient — the caller must additionally require ``POST`` method.
     """
     return _TURN_BUMPING_SUFFIX_RE.match(norm_path) is not None
 
@@ -173,28 +175,25 @@ def install_proxy(app: FastAPI) -> None:
             "write": 300.0,
             "pool": 5.0,
         }
-        # S2: turn token fence — commit point is send-BEFORE-bump (contract
-        # §4.2 approved relaxation). Header-gated (O1): only when the
-        # request carries X-Ocdroid-Server-Group-Fp do we register the scope
-        # and (for prompt/abort) bump the turn. The catch-all reverse proxy
-        # transparently forwards X-Ocdroid-Server-Group-Fp upstream already
-        # (it is not in the hop-by-hop / client-ident strip sets), so no
-        # proxy-header change is needed for the upstream leg.
+        # S2: turn token fence — commit point is bump-before-send. The turn
+        # counter is keyed by sid alone (single sidecar + single opencode
+        # backend → sid is globally unique). Bump only on POST prompt/
+        # prompt_async/abort forwards (method gate prevents GET/HEAD/etc.
+        # on matching paths from advancing the causal high-water).
         #
         # If client.send() raises below (connection-level failure), the turn
-        # has already advanced → a HOLE is produced (no rollback / decrement).
-        # ocdroid's lex comparison tolerates holes; correctness is preserved.
-        server_group_fp = request.headers.get("x-ocdroid-server-group-fp")
+        # has already advanced → a HOLE is produced (no rollback /
+        # decrement). ocdroid's lex comparison tolerates holes; correctness
+        # is preserved.
         turn_registry = getattr(request.app.state, "turn_registry", None)
-        if turn_registry is not None and server_group_fp:
+        if (
+            turn_registry is not None
+            and request.method == "POST"
+            and _is_turn_bumping_path(norm_path)
+        ):
             sid = _extract_sid_from_path(norm_path)
             if sid is not None:
-                # Register scope for EVERY scoped session request (not just
-                # prompt/abort) to maximize the chance a later digest stamp
-                # can resolve the scope from the sid alone.
-                turn_registry.register_scope(sid, server_group_fp)
-                if _is_turn_bumping_path(norm_path):
-                    turn_registry.bump_turn(server_group_fp, sid)
+                turn_registry.bump_turn(sid)
         response = await client.send(upstream_request, stream=True)
         # Wrap the upstream response iterator so we count the bytes returned
         # to the client (``upIn`` — the upstream leg of THIS request). The

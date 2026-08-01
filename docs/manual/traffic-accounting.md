@@ -1,7 +1,7 @@
 # 流量记录与分析（省流实证）使用手册
 
 > 如何查询与解读 oc-slimapi 的**双向字节账本** + **结构化 access log** + **内存账本周期快照**，实证 sidecar 的省流效果。
-> 特性版本：**v0.7.0+**（`/slimapi/metrics.traffic` + access log）；**2026-07-29**（按天切分 + client 标识字段 + traffic snapshot）。
+> 特性版本：**v0.7.0+**（`/slimapi/metrics.traffic` + access log）；**2026-07-29**（按天切分 + client 标识字段 + traffic snapshot）；**2026-08-01**（turn-token fence scope 简化为仅 sid；移除 serverGroupFp 字段）。
 > 性质：**加性 ops 可观测面**，不 bump `X-Slimapi-Version`；ocdroid 对接无变化（`/slimapi/metrics` 为 T3 ops 端点，非客户端契约）。
 > 实现：`src/oc_slimapi/traffic.py`、`src/oc_slimapi/traffic_snapshot.py`、`src/oc_slimapi/middleware/traffic_accounting.py`、`src/oc_slimapi/access_log.py`。
 
@@ -135,7 +135,7 @@ curl -s -H "$H" $BASE/slimapi/metrics | jq '
 {"ts":"2026-07-24T13:02:11+08:00","method":"GET","path":"/slimapi/messages/ses_x","bucket":"messages","status":200,"durationMs":12.3,"downIn":0,"downOut":4321,"upIn":20480,"upOut":0,"requestId":"a1b2c3...","client":"ocdroid","clientVer":"1.2.3","clientId":"5f4d3c2b1a098765"}
 ```
 
-字段说明（`client`/`clientVer`/`clientId` 为 2026-07-29 加性字段，缺省 `null`）：
+字段说明（`client`/`clientVer`/`clientId` 为 2026-07-29 加性字段；缺省 `null`）：
 
 | 字段 | 含义 |
 |---|---|

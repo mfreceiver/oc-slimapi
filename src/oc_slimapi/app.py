@@ -179,12 +179,13 @@ async def lifespan(app: FastAPI):
     # importing transform.py (would be a circular import via skeleton.py).
     app.state.hubs.set_transforms(app.state.transforms)
     # S5+S2: turn token fence — incarnation persistence (strategy A) +
-    # in-process turn registry. Header-gated (O1): only requests carrying
-    # X-Ocdroid-Server-Group-Fp maintain turn state. Reuses the access_log
-    # dir as the state dir for the single incarnation file (best-effort
-    # persistence; corrupt/unwritable → fallback incarnation, never crashes
-    # lifespan). Injected onto the global hub so publish() can stamp
-    # turnIncarnation/turn onto session.digest at ingest time (S9).
+    # in-process turn registry. Scope is the sid alone (single sidecar +
+    # single opencode backend → sid is globally unique); no header gate.
+    # Reuses the access_log dir as the state dir for the single incarnation
+    # file (best-effort persistence; corrupt/unwritable → fallback
+    # incarnation, never crashes lifespan). Injected onto the global hub so
+    # publish() can stamp turnIncarnation/turn onto session.digest at ingest
+    # time (S9).
     from .turn_registry import IncarnationStore, TurnRegistry
 
     inc_store = IncarnationStore(state_dir=access_log_dir)

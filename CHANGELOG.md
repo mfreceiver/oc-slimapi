@@ -28,7 +28,13 @@ ocdroid 对接时：
 
 ## [Unreleased]
 
-_(未发布变更暂记于此。)_
+### Changed
+
+- **turn token fence scope 简化为「仅 sid」**：turn 计数器分桶 key 由 `(serverGroupFp, sid)` 改为 `sid`（单 sidecar + 单 opencode 后端下 sid 已全局唯一）。移除 `X-Ocdroid-Server-Group-Fp` 输入头依赖（sidecar 不再读取该 header；客户端若仍发送会被忽略）；`register_scope`/`_sid_scope` 移除；`snapshot(sid)` 恒返回 `(incarnation, turn)`（未观测 sid → `(inc,0)`），故 digest 的 `turnIncarnation`/`turn` 现在对所有 `session.status` 事件恒输出（只要 turn_registry 装配），不再是 header-gated。**修正多设备共享 session 的 liveness bug**：原 `register_scope` 在每个带身份头的 session 请求上「最后写入者覆盖」，跨设备续看同一会话（哪怕只读 GET）会翻转 scope、破坏 turn 单调性，导致 ocdroid 误判后续 digest 为 stale 而 DROP（session UI 冻结）；sid-only 让所有设备对同一 sid 共享同一单调计数器，读请求不再翻转 scope。**未 bump** `X-Slimapi-Version`（digest 字段集不变，从「有时输出」变「恒输出」，加性兼容）。
+
+### Removed
+
+- **access log 撤回 `serverGroupFp` 字段**（未发布的加性改动，回滚）：该字段曾在 2026-07-31 作为未提交工作树改动短暂上线（经服务重启），但从未经 `release.sh` 正式发布。现 scope 改为仅 sid，该字段无数据来源；设备归属已有 `clientId` 字段。
 
 ---
 
@@ -39,7 +45,7 @@ _(未发布变更暂记于此。)_
 ### Added
 
 - **`session.digest` 新增可选 flat 顶层字段 `turnIncarnation` / `turn`（加性，配对出现/缺失）**：两个字段位于 digest payload 的 **flat 顶层**（与 `sessionID`/`status`/`archived`/`deleted`/`lastError` 同层），**不**嵌套进子 `properties` dict（契约 §3.3 的嵌套示意图是 opencode 上游帧形状的思维投射；slimapi 的 `session.digest` 是 event-typed 帧，ocdroid 把整个 data 对象当作 `properties`，故 flat 顶层 = ocdroid 可读）。配对规则：两者都非 None → 同时输出；任一为 None → **两者都不输出**（配对缺失，ocdroid 降级）。字段类型为 JSON integer ≥0（64-bit 范围）。`updatedAt` 排序 tie-break 不受影响（`(updatedAt, messageID)` 二元组仍是 digest 排序键）。
-- **header-gated scope 身份（O1）**：sidecar 仅当请求带 `X-Ocdroid-Server-Group-Fp` header 时才维护 turn 状态并 stamp digest。header 缺失 → 完全不 stamp（两字段缺省，安全降级）。该 header 经 catch-all 反代自动透传上游（不在 hop-by-hop / client-ident 剥离集内），无需改反代。ocdroid 通过该 header 透传 scope 身份。
+- **header-gated scope 身份（O1）**：sidecar 仅当请求带 `X-Ocdroid-Server-Group-Fp` header 时才维护 turn 状态并 stamp digest。header 缺失 → 完全不 stamp（两字段缺省，安全降级）。该 header 经 catch-all 反代自动透传上游（不在 hop-by-hop / client-ident 剥离集内），无需改反代。ocdroid 通过该 header 透传 scope 身份。（**2026-08-01 起 scope 简化为仅 sid，header-gate 移除，详见 [Unreleased]**）
 - **`turnIncarnation`（incarnation 策略 A，进程生命周期 epoch）**：启动时 `IncarnationStore` 从 StateDirectory（复用 `OC_SLIMAPI_ACCESS_LOG_DIR`）下的 `incarnation` 文件 read persisted → `+1` → write 回 → 返回新值（单进程单事件循环，无文件锁）。文件不存在（首次启动）= `persisted_last=0` → inc=1；损坏/不可写 → best-effort 兜底返回 1（warn 不 crash lifespan，参考 traffic_snapshot 容错风格）。此后进程生命周期内恒定。
 - **`turn`（per-`(serverGroupFp, sid)` 单调计数，S2 send-before-bump commit point）**：catch-all 反代在构造 upstream request 之后、`await client.send()` **之前**，对两类 forward（`POST /session/{sid}/prompt` 与 `POST /session/{sid}/abort`，契约 §4.1）bump turn（`turn = prev + 1`，单调不减）。连接级失败（`send()` 抛异常）→ 产生 **hole**（turn 已 bump 但无 upstream 工作，不回退/decrement）——这是对契约 §4.2「不 increment」的**已批准放宽**；ocdroid lex 比较天然处理 hole，正确性不破。对其它带 header + sid 的 session 请求（如 `GET /session/{sid}/message`）仅注册 scope（`register_scope`），不 bump，最大化 scope 已知概率让后续 digest stamp 命中。turn registry **不持久化**（restart 归零，incarnation bump 兜底）。
 - **ingest-time snapshot stamp（S9，契约 §7.4 / V10）**：`GlobalHub.publish()` 在 `session.status` 事件 ingest 时（而非 flush 时）把当前 `(incarnation, turn)` 快照 stamp 到 `DigestFields` entry 上。entry 存 Python int（值拷贝），故 ingest 后、flush 前若有新 forward bump turn，已 stamp 的 entry **不受影响**（冻结于 ingest 时刻值）。新一次 ingest stamp 当前新值。
@@ -49,7 +55,7 @@ _(未发布变更暂记于此。)_
 - **单实例语义（O3）**：无 instanceFp；scope key = `(serverGroupFp, sid)`。单进程 / 单 asyncio 事件循环，`TurnRegistry` 所有方法为同步纯 dict 操作，无需锁（契约 §7.2 单调可见性）。
 - **不 bump `X-Slimapi-Version`**（仍 `2` / `ACCEPTED_CLIENT_VERSIONS=(2,2)`）：纯加性可选字段 + 可选输入 header，非破坏性协议变更。
 - **未新增 `/slimapi` 路由**；`scripts/check_routes_doc.py` 仍一致（8 条）。无新增配置项（复用 `OC_SLIMAPI_ACCESS_LOG_DIR` 作为 incarnation 文件 state dir）。
-- 受影响实现文件：`src/oc_slimapi/turn_registry.py`（新增）、`src/oc_slimapi/sse/hub_types.py`（DigestFields）、`src/oc_slimapi/sse/global_hub.py`（publish stamp + setter）、`src/oc_slimapi/proxy.py`（commit point + scope 注册 + path 辅助）、`src/oc_slimapi/sse/registry.py`（HubRegistry 转发）、`src/oc_slimapi/app.py`（lifespan 装配）。ocdroid 解析见 `SessionSyncCoordinator.kt:1021-1022`（`props.turnIncarnation` / `props.turn`，props = slimapi flat root）。
+- 受影响实现文件：`src/oc_slimapi/turn_registry.py`（新增）、`src/oc_slimapi/sse/hub_types.py`（DigestFields）、`src/oc_slimapi/sse/global_hub.py`（publish stamp + setter）、`src/oc_slimapi/proxy.py`（commit point + scope 注册 + path 辅助）、`src/oc_slimapi/sse/registry.py`（HubRegistry 转发）、`src/oc_slimapi/app.py`（lifespan 装配）。ocdroid 解析见 `SessionSyncCoordinator.kt:1021-1022`（`props.turnIncarnation` / `props.turn`，props = slimapi flat root）。**wire 契约**：`docs/specs/v2-contract.md` §3.y（本仓库权威）；完整因果语义 / 术语 / 不变量见跨项目 SSOT `ocdroid/docs/2026-07-31-oc-slimapi-turn-token-contract.md`。
 
 ---
 

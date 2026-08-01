@@ -4,10 +4,10 @@ GlobalHub stamp + proxy commit point).
 Covers the 6 required scenarios from the implementation brief:
 
 1. IncarnationStore persistence + fault tolerance.
-2. TurnRegistry bump_turn monotonicity / scope independence / snapshot.
+2. TurnRegistry bump_turn monotonicity / per-sid independence / snapshot.
 3. DigestFields.to_payload flat top-level emission (paired present/absent).
-4. GlobalHub.publish ingest-time stamp (with/without scope).
-5. proxy forward bump (header-gated; prompt/abort only).
+4. GlobalHub.publish ingest-time stamp (registry wired / not wired).
+5. proxy forward bump (sid-keyed; prompt/abort only).
 6. V10: ingest snapshot freezes the value — a later bump does not change an
    already-stamped entry; a new ingest stamps the new value.
 """
@@ -129,40 +129,24 @@ def test_incarnation_store_unwritable_dir_does_not_crash(tmp_path):
 
 def test_bump_turn_is_monotonically_increasing():
     reg = TurnRegistry(incarnation=5)
-    assert reg.bump_turn("fp1", "s1") == 1
-    assert reg.bump_turn("fp1", "s1") == 2
-    assert reg.bump_turn("fp1", "s1") == 3
+    assert reg.bump_turn("s1") == 1
+    assert reg.bump_turn("s1") == 2
+    assert reg.bump_turn("s1") == 3
 
 
-def test_bump_turn_scopes_are_independent():
+def test_bump_turn_per_sid_are_independent():
     reg = TurnRegistry(incarnation=5)
-    reg.bump_turn("fp1", "s1")  # 1
-    reg.bump_turn("fp1", "s1")  # 2
-    reg.bump_turn("fp2", "s1")  # different fp → independent counter
-    assert reg.snapshot("fp1", "s1") == (5, 2)
-    assert reg.snapshot("fp2", "s1") == (5, 1)
-    # Different sid under same fp is also independent.
-    reg.bump_turn("fp1", "s2")
-    assert reg.snapshot("fp1", "s1") == (5, 2)
-    assert reg.snapshot("fp1", "s2") == (5, 1)
+    reg.bump_turn("s1")  # 1
+    reg.bump_turn("s1")  # 2
+    reg.bump_turn("s2")  # different sid → independent counter
+    assert reg.snapshot("s1") == (5, 2)
+    assert reg.snapshot("s2") == (5, 1)
 
 
-def test_register_scope_then_snapshot_resolves_from_sid():
-    """snapshot(fp=None, sid) reverse-resolves the fp via register_scope."""
-    reg = TurnRegistry(incarnation=9)
-    # No scope registered yet → snapshot returns None (header-gated degrade).
-    assert reg.snapshot(None, "s1") is None
-    reg.register_scope("s1", "fpX")
-    reg.bump_turn("fpX", "s1")
-    reg.bump_turn("fpX", "s1")
-    # Now the sid resolves to fpX and returns the stamped (inc, turn).
-    assert reg.snapshot(None, "s1") == (9, 2)
-
-
-def test_snapshot_unknown_scope_returns_none():
+def test_snapshot_unobserved_sid_returns_inc_and_zero():
+    """snapshot(sid) always returns a tuple; an unobserved sid → (inc, 0)."""
     reg = TurnRegistry(incarnation=1)
-    assert reg.snapshot("unknown-fp", "unknown-sid") == (1, 0)
-    assert reg.snapshot(None, "unknown-sid") is None
+    assert reg.snapshot("never-bumped") == (1, 0)
 
 
 # ── 3. DigestFields.to_payload ──────────────────────────────────────────────────
@@ -204,12 +188,11 @@ def test_digest_fields_omits_pair_when_either_is_none():
 
 
 async def test_publish_stamps_turn_when_scope_known():
-    """session.status ingest stamps turn/inc onto the entry when scope is known."""
+    """session.status ingest stamps turn/inc onto the entry (registry wired)."""
     hub = GlobalHub(client=None)
     try:
         reg = TurnRegistry(incarnation=42)
-        reg.register_scope("s1", "fp1")
-        reg.bump_turn("fp1", "s1")  # turn = 1
+        reg.bump_turn("s1")  # turn = 1
         hub.set_turn_registry(reg)
 
         subscriber = Subscriber()
@@ -233,13 +216,15 @@ async def test_publish_stamps_turn_when_scope_known():
         await _close_hub(hub)
 
 
-async def test_publish_omits_turn_when_scope_unknown():
-    """No scope registered → snapshot returns None → fields omitted (degrade)."""
+async def test_publish_stamps_inc_zero_for_unobserved_sid():
+    """An unobserved sid → snapshot always returns (inc, 0); the digest
+    now always carries turnIncarnation/turn once a registry is wired
+    (no header-gated degrade)."""
     hub = GlobalHub(client=None)
     try:
         reg = TurnRegistry(incarnation=42)
         hub.set_turn_registry(reg)
-        # No register_scope for s2 → snapshot(None, "s2") is None.
+        # No bump for s2 → snapshot returns (42, 0).
 
         subscriber = Subscriber()
         hub.subscribers.add(subscriber)
@@ -255,8 +240,8 @@ async def test_publish_omits_turn_when_scope_unknown():
         ]
         assert len(digests) == 1
         data = digests[0]
-        assert "turnIncarnation" not in data
-        assert "turn" not in data
+        assert data["turnIncarnation"] == 42
+        assert data["turn"] == 0
         assert data["status"] == "idle"
     finally:
         await _close_hub(hub)
@@ -284,7 +269,7 @@ async def test_publish_omits_turn_when_no_registry_wired():
         await _close_hub(hub)
 
 
-# ── 5. proxy forward bump (header-gated) ────────────────────────────────────────
+# ── 5. proxy forward bump (sid-keyed) ───────────────────────────────────────────
 
 
 def _settings(**overrides) -> Settings:
@@ -322,8 +307,8 @@ def _passthrough_handler():
     return handler
 
 
-async def test_proxy_bumps_turn_on_prompt_with_header(upstream_factory):
-    """POST /session/{sid}/prompt with X-Ocdroid-Server-Group-Fp bumps turn."""
+async def test_proxy_bumps_turn_on_prompt(upstream_factory):
+    """POST /session/{sid}/prompt bumps turn (no header required)."""
     upstream = upstream_factory(_passthrough_handler())
     app = _build_app(_settings(), upstream)
     reg = TurnRegistry(incarnation=3)
@@ -331,57 +316,18 @@ async def test_proxy_bumps_turn_on_prompt_with_header(upstream_factory):
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.post(
-            "/session/ses_abc/prompt",
-            headers={"X-Ocdroid-Server-Group-Fp": "fp1"},
-        )
-    assert response.status_code == 200
-    # Scope registered + turn bumped.
-    assert reg.snapshot("fp1", "ses_abc") == (3, 1)
-    # A second prompt bumps again (monotonic).
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        await client.post(
-            "/session/ses_abc/prompt",
-            headers={"X-Ocdroid-Server-Group-Fp": "fp1"},
-        )
-    assert reg.snapshot("fp1", "ses_abc") == (3, 2)
-
-
-async def test_proxy_bumps_turn_on_abort_with_header(upstream_factory):
-    """POST /session/{sid}/abort also bumps (contract §4.1 two forwards)."""
-    upstream = upstream_factory(_passthrough_handler())
-    app = _build_app(_settings(), upstream)
-    reg = TurnRegistry(incarnation=1)
-    app.state.turn_registry = reg
-
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.post(
-            "/session/ses_abc/abort",
-            headers={"X-Ocdroid-Server-Group-Fp": "fp1"},
-        )
-    assert response.status_code == 200
-    assert reg.snapshot("fp1", "ses_abc") == (1, 1)
-
-
-async def test_proxy_does_not_bump_without_header(upstream_factory):
-    """No X-Ocdroid-Server-Group-Fp header → no bump, no scope (header-gated)."""
-    upstream = upstream_factory(_passthrough_handler())
-    app = _build_app(_settings(), upstream)
-    reg = TurnRegistry(incarnation=1)
-    app.state.turn_registry = reg
-
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post("/session/ses_abc/prompt")
     assert response.status_code == 200
-    # No scope registered for ses_abc → snapshot from sid returns None.
-    assert reg.snapshot(None, "ses_abc") is None
-    assert reg._turns == {}
+    # Turn bumped (sid-keyed).
+    assert reg.snapshot("ses_abc") == (3, 1)
+    # A second prompt bumps again (monotonic).
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await client.post("/session/ses_abc/prompt")
+    assert reg.snapshot("ses_abc") == (3, 2)
 
 
-async def test_proxy_registers_scope_for_non_bumping_session_request(upstream_factory):
-    """A scoped GET /session/{sid}/message registers scope but does NOT bump."""
+async def test_proxy_bumps_turn_on_abort(upstream_factory):
+    """POST /session/{sid}/abort also bumps (contract §3.y.3 forwards)."""
     upstream = upstream_factory(_passthrough_handler())
     app = _build_app(_settings(), upstream)
     reg = TurnRegistry(incarnation=1)
@@ -389,13 +335,67 @@ async def test_proxy_registers_scope_for_non_bumping_session_request(upstream_fa
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get(
-            "/session/ses_abc/message",
-            headers={"X-Ocdroid-Server-Group-Fp": "fp1"},
-        )
+        response = await client.post("/session/ses_abc/abort")
     assert response.status_code == 200
-    # Scope registered (so a later digest stamp can resolve), turn NOT bumped.
-    assert reg.snapshot("fp1", "ses_abc") == (1, 0)
+    assert reg.snapshot("ses_abc") == (1, 1)
+
+
+async def test_proxy_bumps_turn_on_prompt_async(upstream_factory):
+    """POST /session/{sid}/prompt_async bumps turn — ocdroid's PRODUCTION
+    send path (rev-ogpt BLOCKER regression: regex previously matched only
+    `prompt`, not `prompt_async`, so the fence was dead in real traffic)."""
+    upstream = upstream_factory(_passthrough_handler())
+    app = _build_app(_settings(), upstream)
+    reg = TurnRegistry(incarnation=4)
+    app.state.turn_registry = reg
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/session/ses_abc/prompt_async")
+    assert response.status_code == 200
+    assert reg.snapshot("ses_abc") == (4, 1)
+    # Second prompt_async is monotonic.
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await client.post("/session/ses_abc/prompt_async")
+    assert reg.snapshot("ses_abc") == (4, 2)
+
+
+async def test_proxy_does_not_bump_on_non_post_method(upstream_factory):
+    """Method gate: GET/HEAD on /session/{sid}/prompt must NOT bump turn,
+    even though the path matches the bumping suffix (rev-ogpt MAJOR
+    regression). Only POST forwards advance the causal high-water."""
+    upstream = upstream_factory(_passthrough_handler())
+    app = _build_app(_settings(), upstream)
+    reg = TurnRegistry(incarnation=2)
+    app.state.turn_registry = reg
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        # GET /prompt — path matches but method is GET → no bump.
+        response = await client.get("/session/ses_abc/prompt")
+    assert response.status_code == 200
+    assert reg.snapshot("ses_abc") == (2, 0)
+    # A subsequent POST prompt then bumps to 1 (the GET did not consume a slot).
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await client.post("/session/ses_abc/prompt")
+    assert reg.snapshot("ses_abc") == (2, 1)
+
+
+async def test_proxy_does_not_bump_on_non_bumping_session_request(upstream_factory):
+    """A non-bumping GET /session/{sid}/message does NOT bump turn."""
+    upstream = upstream_factory(_passthrough_handler())
+    app = _build_app(_settings(), upstream)
+    reg = TurnRegistry(incarnation=1)
+    app.state.turn_registry = reg
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/session/ses_abc/message")
+    assert response.status_code == 200
+    # Snapshot still returns a tuple (unobserved sid → (inc, 0)); no bump
+    # recorded in the _turns dict.
+    assert reg.snapshot("ses_abc") == (1, 0)
+    assert reg._turns == {}
 
 
 async def test_proxy_no_turn_registry_in_state_still_works(upstream_factory):
@@ -406,10 +406,7 @@ async def test_proxy_no_turn_registry_in_state_still_works(upstream_factory):
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.post(
-            "/session/ses_abc/prompt",
-            headers={"X-Ocdroid-Server-Group-Fp": "fp1"},
-        )
+        response = await client.post("/session/ses_abc/prompt")
     assert response.status_code == 200
 
 
@@ -431,12 +428,14 @@ def test_extract_sid_from_path(path, expected_sid):
 
 @pytest.mark.parametrize("path,expected", [
     ("/session/ses_abc/prompt", True),
+    ("/session/ses_abc/prompt_async", True),   # ocdroid's production send path
     ("/session/ses_abc/abort", True),
     ("/session/ses_abc/prompt/", True),   # trailing slash tolerant
     ("/session/ses_abc/abort/", True),
     ("/session/ses_abc/message", False),
     ("/session/ses_abc", False),
     ("/session/ses_abc/prompt/sub", False),
+    ("/session/ses_abc/prompting", False),  # prefix guard
     ("/global/event", False),
 ])
 def test_is_turn_bumping_path(path, expected):
@@ -457,7 +456,6 @@ async def test_v10_ingest_snapshot_freezes_value_against_later_bump():
     hub = GlobalHub(client=None)
     try:
         reg = TurnRegistry(incarnation=5)
-        reg.register_scope("s1", "fp1")
         hub.set_turn_registry(reg)
 
         subscriber = Subscriber()
@@ -465,7 +463,7 @@ async def test_v10_ingest_snapshot_freezes_value_against_later_bump():
 
         # Bump to turn=3, then ingest a session.status → entry frozen at 3.
         for _ in range(3):
-            reg.bump_turn("fp1", "s1")
+            reg.bump_turn("s1")
         hub.publish(make_global_event("/proj", "session.status", {
             "sessionID": "s1", "status": "busy",
         }))
@@ -475,8 +473,8 @@ async def test_v10_ingest_snapshot_freezes_value_against_later_bump():
 
         # Now bump to turn=4 AFTER the stamp. The pending entry must NOT
         # change (no reference held — it's a copied int).
-        reg.bump_turn("fp1", "s1")
-        assert reg.snapshot("fp1", "s1") == (5, 4)  # registry moved on
+        reg.bump_turn("s1")
+        assert reg.snapshot("s1") == (5, 4)  # registry moved on
         assert entry.turn == 3  # still frozen at the ingest-time value
 
         # Flush the first window — the emitted digest carries the frozen 3.
@@ -510,8 +508,7 @@ async def test_v10_busy_flush_carries_frozen_stamp():
     hub = GlobalHub(client=None)
     try:
         reg = TurnRegistry(incarnation=8)
-        reg.register_scope("s1", "fp1")
-        reg.bump_turn("fp1", "s1")  # turn=1
+        reg.bump_turn("s1")  # turn=1
         hub.set_turn_registry(reg)
 
         subscriber = Subscriber()

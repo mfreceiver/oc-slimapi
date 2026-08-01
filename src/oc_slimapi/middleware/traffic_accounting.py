@@ -78,13 +78,16 @@ _CLIENT_IDENT_HEADERS: dict[bytes, int] = {
 }
 
 
-def _read_client_headers(scope: dict[str, Any]) -> tuple[str | None, str | None, str | None]:
-    """Read and validate X-Client-Name / X-Client-Version / X-Client-Id from scope.
+def _read_client_headers(
+    scope: dict[str, Any],
+) -> tuple[str | None, str | None, str | None]:
+    """Read and validate X-Client-Name / X-Client-Version / X-Client-Id
+    from scope.
 
     Returns ``(name, version, id_raw)`` — each is ``None`` when absent,
     empty/whitespace-only, >128 UTF-8 bytes, invalid UTF-8, or containing
-    control characters.  Duplicate headers are lenient: the first valid value
-    wins.
+    control characters.  Duplicate headers are lenient: the first valid
+    value wins.
     """
     headers: list[tuple[bytes, bytes]] = scope.get("headers") or []
     result: list[str | None] = [None, None, None]

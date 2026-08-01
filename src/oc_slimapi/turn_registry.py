@@ -5,24 +5,24 @@ stamps two flat top-level fields (``turnIncarnation`` + ``turn``) onto
 forwarded ``session.digest`` SSE events so ocdroid can do causal fencing
 (discard stale digests from a prior turn of a prior incarnation).
 
-Design (frozen decisions O1–O4 / S2 / S5 — see the implementation brief):
+Design (frozen decisions O2 / O3 / O4 / S2 / S5 — see the implementation brief):
 
-* **O1 header-gated**: the sidecar only maintains turn state when the
-  request carries ``X-Ocdroid-Server-Group-Fp``. Header missing → no scope
-  → ``snapshot()`` returns ``None`` → fields are omitted (safe degrade).
 * **O2 incarnation strategy A** (``persisted_last + 1``): single process,
   single event loop — no file lock needed.
-* **O3 single-instance semantics**: no instanceFp; the scope key is just
-  ``(serverGroupFp, sid)``.
+* **O3 single-instance semantics**: no instanceFp; the scope key is the
+  ``sid`` alone (single sidecar + single opencode backend → ``sid`` is
+  globally unique within the process, so no server-group fingerprint is
+  required to bucket the per-turn counter).
 * **O4 no turn persistence**: restart zeroes the turn registry; the
   incarnation bump covers correctness (a restarted process has a strictly
   greater incarnation, so stale turns from the old process compare low).
-* **S2 commit point = send-before-bump**: turn is bumped in the catch-all
+* **S2 commit point = bump-before-send**: turn is bumped in the catch-all
   proxy *before* ``await client.send()``. A connection-level failure (send
   raises) therefore produces a **hole** (turn number advances but no
   upstream work happened). This is the approved relaxation of contract
   §4.2 ("不 increment"); ocdroid's lex comparison tolerates holes and
-  correctness is preserved.
+  correctness is preserved. The turn counter is keyed by ``sid`` alone;
+  bump only on prompt/abort forward paths.
 
 Single process, asyncio, one event loop: every method below is a
 synchronous pure-dict operation, so no locking is required (contract §7.2
@@ -84,9 +84,9 @@ class IncarnationStore:
         if not self._write_persisted(inc):
             # Persistence failed — but the in-memory incarnation is still
             # valid for this process lifetime. A restart will re-read the
-            # stale file and pick a possibly-colliding value; the header
-            # gate + ocdroid's lex compare keep this correct in practice
-            # (the contract only requires monotonic-within-process).
+            # stale file and pick a possibly-colliding value; ocdroid's
+            # lex compare keeps this correct in practice (the contract
+            # only requires monotonic-within-process).
             logger.warning(
                 "turn-registry: failed to persist incarnation %d to %s; "
                 "using value in-memory only (restart may re-use a stale "
@@ -155,67 +155,50 @@ class IncarnationStore:
 
 
 class TurnRegistry:
-    """In-process turn counter + scope mapping (S2 turn counting).
+    """In-process turn counter keyed by ``sid`` (S2 turn counting).
 
     Holds:
 
     * ``incarnation`` — frozen at startup from :class:`IncarnationStore`;
       constant for the process lifetime (O2/O4).
-    * ``_turns`` — ``dict[(serverGroupFp, sid), int]``, monotonically
-      non-decreasing (S2). Keyed on the scope tuple (O3 single-instance:
-      no instanceFp in the key).
-    * ``_sid_scope`` — ``dict[sid, serverGroupFp]`` populated by the
-      catch-all proxy on every scoped request so the global hub can resolve
-      a scope from just a ``sid`` when stamping.
-
-    Header-gated (O1): if no scope is known for a ``sid`` (i.e. the proxy
-    never saw a ``X-Ocdroid-Server-Group-Fp`` header for that session),
-    :meth:`snapshot` returns ``None`` and the digest omits both fields.
+    * ``_turns`` — ``dict[sid, int]``, monotonically non-decreasing per
+      ``sid`` (S2). Scope is the ``sid`` alone (O3 single-instance: no
+      instanceFp, no server-group fingerprint in the key — single sidecar
+      + single opencode backend makes ``sid`` globally unique).
 
     All methods are synchronous pure-dict operations — no locking needed
-    under the single-event-loop model (contract §7.2).
+    under the single-event-loop model (contract §7.2). ``snapshot`` always
+    returns a ``(incarnation, turn)`` tuple: an unobserved ``sid`` returns
+    ``(incarnation, 0)``. The digest therefore always carries both fields
+    once a registry is wired (omitted only when the registry itself is
+    absent — a lifespan-level deployment property).
     """
 
     def __init__(self, incarnation: int) -> None:
         self.incarnation: int = incarnation
-        self._turns: dict[tuple[str, str], int] = {}
-        self._sid_scope: dict[str, str] = {}
+        self._turns: dict[str, int] = {}
 
-    def register_scope(self, sid: str, server_group_fp: str) -> None:
-        """Record the ``sid → serverGroupFp`` mapping (idempotent overwrite).
-
-        Called by the catch-all proxy on *every* scoped request (not just
-        prompt/abort) to maximize the probability that a later digest
-        stamp can resolve the scope from the ``sid`` alone.
-        """
-        self._sid_scope[sid] = server_group_fp
-
-    def bump_turn(self, server_group_fp: str, sid: str) -> int:
-        """Increment the turn for ``(server_group_fp, sid)`` and return it.
+    def bump_turn(self, sid: str) -> int:
+        """Increment the turn for ``sid`` and return it.
 
         S2 commit point: the proxy calls this *before* ``await client.send()``.
         A connection-level failure therefore leaves a hole (turn advanced,
         no upstream work) — the approved relaxation of contract §4.2.
-        Monotonically non-decreasing per scope tuple.
+        Monotonically non-decreasing per ``sid``.
         """
-        key = (server_group_fp, sid)
-        self._turns[key] = self._turns.get(key, 0) + 1
-        return self._turns[key]
+        self._turns[sid] = self._turns.get(sid, 0) + 1
+        return self._turns[sid]
 
-    def snapshot(self, server_group_fp: str | None, sid: str) -> tuple[int, int] | None:
-        """Return ``(incarnation, turn)`` for the scope, or ``None`` if unknown.
+    def snapshot(self, sid: str) -> tuple[int, int]:
+        """Return ``(incarnation, turn)`` for ``sid`` (always a tuple).
 
-        If ``server_group_fp`` is ``None``, the scope is reverse-resolved
-        from ``sid`` via the registered mapping. If still unknown →
-        ``None`` (header-gated safe degrade: both digest fields omitted).
+        An unobserved ``sid`` returns ``(incarnation, 0)`` — there is no
+        None / header-gated degrade path: once a registry is wired the
+        digest always carries both fields.
 
         The returned turn is the *current* value at call time; the caller
         (GlobalHub.publish) freezes it onto the :class:`DigestFields` entry
         so a later bump does not retroactively change an already-stamped
         digest (contract §7.4, V10 acceptance).
         """
-        if server_group_fp is None:
-            server_group_fp = self._sid_scope.get(sid)
-        if server_group_fp is None:
-            return None
-        return (self.incarnation, self._turns.get((server_group_fp, sid), 0))
+        return (self.incarnation, self._turns.get(sid, 0))
