@@ -7,6 +7,7 @@
 >
 > | 修订日期 | wire 版本 | 文档 rev | 变更摘要 | 落地对照 |
 > |---|---|---|---|---|
+> | **2026-08-03** | **2（不变）** | **v2+additive** | **加回 `GET /slimapi/sessions/status`（只读透传 + turn merge）**：透传上游 `GET /session/status`（返回 `Record<SessionID, {type:"busy"\|"idle"\|"retry"}>`）+ sidecar merge 每个条目的 `turnIncarnation`/`turn`（源自 `TurnRegistry.snapshot`，与 digest SSE 同源，§3.y）。端点只读、不写、不缓存；`directory` 必填；turn_registry 未装配时两字段缺省（配对缺失）。**加性回归**（lite-v2 删除面撤回此端点），**未 bump** `X-Slimapi-Version`（仍 2）。详见 §2。 | §0 / §2 / §8 / §10 / §11.1 |
 > | **2026-08-01** | **2（不变）** | **v2+additive** | **turn token fence scope 简化为「仅 sid」**：turn 计数器分桶 key 由 (serverGroupFp, sid) 改为 sid 单值（单 sidecar 单后端下 sid 已唯一）；移除 X-Ocdroid-Server-Group-Fp 输入头依赖（header 若来则忽略）；snapshot 恒返回（未观测 sid → (inc,0)），digest 的 turnIncarnation/turn 现在对所有 session.status 恒输出（只要 turn_registry 装配）；移除 access log 的 serverGroupFp 字段。免疫多设备共享 session 的 scope 翻转冻结。**未 bump** X-Slimapi-Version（digest 字段集不变，加性兼容）。详见 §3.y。 | §3 / §3.y |
 > | **2026-07-29** | **2（不变）** | **v2+additive** | **流量日志持久化 + 客户端标识（加性）**：access log 文件发现规则改为按天切分 `access-YYYY-MM-DD.jsonl`；内存账本快照按天切分 `traffic-snapshot-YYYY-MM-DD.jsonl`（均 ops 面）；新增可选输入头 `X-Client-Name`/`X-Client-Version`/`X-Client-Id`（不透传上游、缺省忽略）；access log 新增 `client`/`clientVer`/`clientId` 字段（缺省 `null`）。**`X-Slimapi-Version` 不 bump**（加性输入 + ops 面文件名，非 wire 协议破坏）。详见 §7、§12。 | §7 / §12 |
 > | **2026-07-28** | **2（breaking bump）** | **v2** | **Rev v2 (lite-v2)**: deleted 10+ endpoints, removed routeToken/discovery/children/Stage-B-part-tracking/Opt-A/BatchLedger; simplified `/full/{mid}` and `/messages`; digest `updatedAt` now sidecar wall-clock; version gate `(2,2)`. **Breaking wire bump** from `X-Slimapi-Version: 1` → `2`.详见下文各节。 | §0 / §1 / §2 / §3 / §5 / §6 / §7 / §11 |
@@ -26,7 +27,7 @@
 - **不读 opencode SQLite**；仅 legacy `/session` API；upstream 始终固定 loopback HTTP（SSRF guard 不随 host 放松）。
 - v2 目标：**2-5 台同用户设备**（T3 硬化进 v2）。
 - 客户端通过"切换服务器"进省流（R8：`mtls×slim` 两布尔→4 配置），非连接属性开关。
-- **v2 删减面（相对 v1）**：移除 `routeToken`、discovery allowlist 数据流、children 投影缓存、Stage B 单条 fingerprint（`_part_state`/`contentRevisions`/`X-Message-Event-Seq`/304/`?known.*`）、Opt-A partial-envelope、BatchLedger，以及 10+ 依赖性端点（`/projects`、`/questions`、`/permissions`、`/sessions/status`、`/sessions/{sid}/children`、`/messages/{sid}/since/{ts}`、q/p 写端点、`/full?ids=` 批量）。
+- **v2 删减面（相对 v1）**：移除 `routeToken`、discovery allowlist 数据流、children 投影缓存、Stage B 单条 fingerprint（`_part_state`/`contentRevisions`/`X-Message-Event-Seq`/304/`?known.*`）、Opt-A partial-envelope、BatchLedger，以及 10+ 依赖性端点（`/projects`、`/questions`、`/permissions`、`/sessions/{sid}/children`、`/messages/{sid}/since/{ts}`、q/p 写端点、`/full?ids=` 批量）。（`GET /slimapi/sessions/status` 曾在 lite-v2 删除，2026-08-03 加性回归，见 §2。）
 
 ## §1 版本契约 🔒
 
@@ -44,6 +45,7 @@
 | GET | `/slimapi/ready` | A | 🔒 | liveness；同上 schema 三键 |
 | GET | `/slimapi/metrics` | A | 🔒 T3 | 订阅者/queue/hub 指标；`batch` 字段恒为 `null`（BatchLedger 已移除，见 §6） |
 | GET | `/slimapi/sessions` | A | 🔒 | 骨架 session 列表（`?directory/roots/limit/start/search`；`roots` 默认 **False**——客户端**应显式传** `roots=true` 以排除 subagent/task；`start` = epoch-ms **时间戳水位** `time_updated >= start`，**非 offset**，上游 legacy 不暴露前向 cursor、不保证 id tie-break）；200 加 `X-Complete` 头（见下）；每条带 `directory` 字段 |
+| GET | `/slimapi/sessions/status` | A | 🔒 | **只读 status 投影**（`?directory=<必填>`）。透传上游 `GET /session/status`（`Record<SessionID, {type:"busy"\|"idle"\|"retry"}>`）+ sidecar merge 每条目的 flat 顶层 `turnIncarnation`/`turn`（源自 `TurnRegistry.snapshot`，与 digest SSE §3.y 同源；未观测 sid → `(inc,0)`；turn_registry 未装配时两字段配对缺省）。端点只读、不写、不缓存——同内存只读投影，不引入新状态机。上游非 dict body → 503 `upstream_unavailable`；上游 4xx → 502 `upstream_http_N`；5xx/网络 → 503 |
 | GET | `/slimapi/messages/{sid}` | A | 🔒 | **骨架分页**（`?limit/before/mode/directory`）；**恒返回 skeleton 投影**——`?mode=full` 被静默忽略（不报错，仅返回 skeleton）；列表按 `time.created` **升序**；200 响应下发 **`X-Next-Cursor`** 头（opaque base64url 字符串，解析自 upstream `Link: <...?before=CURSOR>; rel="next"`），客户端用 `?before=<X-Next-Cursor>` 翻页向旧方向 drain |
 | GET | `/slimapi/messages/{sid}/full/{mid}` | A | 🔒 | 单条全文（展开某条）；**v2 简化**：**恒 200** full 投影 body，**无 304**、**无 ETag**、**无 `X-Message-Event-Seq` 响应头**、**无 `?known.*` 查询参数**（Stage B fingerprint 全部移除） |
 | GET | `/slimapi/events` | A | 🔒 | 实例级策展 SSE（见 §3） |
@@ -56,7 +58,7 @@
 
 - `GET /slimapi/projects` —— discovery/allowlist 展示端点删除（allowlist 数据流整体下线）。
 - `GET /slimapi/questions`、`GET /slimapi/permissions` —— 跨目录聚合 pending 端点删除。SSE 仍直推 `question.asked` / `permission.asked` 等事件（见 §3），客户端通过 catch-all 反代应答上游。
-- `GET /slimapi/sessions/status`、`GET /slimapi/sessions/{sid}/status` —— status 端点删除。
+- ~~`GET /slimapi/sessions/status`、`GET /slimapi/sessions/{sid}/status`~~ —— 批量 status 端点 **2026-08-03 加性回归**（见 §2 端点表）。`GET /slimapi/sessions/{sid}/status`（per-session discover+status）仍删除。
 - `GET /slimapi/sessions/{sid}/children` —— children 投影端点删除（含 `X-Children-Version` 头、`childrenIDs[]` / `childrenComplete` list hint 全部移除）。
 - `GET /slimapi/messages/{sid}/since/{ts}` —— watermark 增量过滤端点删除；客户端改用 `GET /slimapi/messages/{sid}` + `?before` cursor drain（见 §5）。
 - `POST /slimapi/questions/{qid}/reply`、`POST /slimapi/questions/{qid}/reject`、`POST /slimapi/sessions/{sid}/permissions/{pid}` —— routeToken 写端点删除（routeToken 整体下线）；q/p 应答改走 catch-all + `X-Opencode-Directory` 透传上游 opencode。
@@ -312,7 +314,7 @@ sidecar 作为 ocdroid 与 opencode 之间的 Python 中继层，可观察所有
 
 连接(R8) + 版本头（**`X-Slimapi-Version: 2`**）+ health 自检(M2/fail-closed) + 冷启动（`/sessions` + 当前 ses `/messages/{sid}` 骨架，见 §4）+ SSE（digest + q/p asked + `lastError`/`session.error`）+ digest 触发拉消息（`/messages/{sid}` 骨架 + `/full/{mid}` 全文）+ 发消息/q/p 应答/abort（**经 catch-all + `X-Opencode-Directory` 透传**，无 routeToken）+ resync=冷启动。
 
-**v2 删除面**：routeToken 消费、`/projects` cold-start、`/questions` + `/permissions` 聚合、`/sessions/status`、`/sessions/{sid}/children` + `childrenVersion` 比对、`/messages/{sid}/since/{ts}` 增量、`/full?ids=` 批量、Opt-A 能力协商与 partial-envelope 处理、Stage B fingerprint（304短路 / `X-Message-Event-Seq` / `?known.*`）—— 客户端**不应**再实现这些代码路径。
+**v2 删除面**：routeToken 消费、`/projects` cold-start、`/questions` + `/permissions` 聚合、`/sessions/{sid}/children` + `childrenVersion` 比对、`/messages/{sid}/since/{ts}` 增量、`/full?ids=` 批量、Opt-A 能力协商与 partial-envelope 处理、Stage B fingerprint（304短路 / `X-Message-Event-Seq` / `?known.*`）—— 客户端**不应**再实现这些代码路径。（`GET /slimapi/sessions/status` 已于 2026-08-03 加性回归，客户端可恢复消费。）
 
 ## §9 gzip 🔒（小修）
 
@@ -322,7 +324,7 @@ sidecar 作为 ocdroid 与 opencode 之间的 Python 中继层，可观察所有
 
 ## §10 延后（非 v2）
 
-skeleton 共享缓存（YAGNI，先指标）、多用户（独立 stack）、Part 展开 UI、sessions status 迁移（端点已删）、circuit breaker、metrics 之外的可观测、Stage E token stream gzip 调参。
+skeleton 共享缓存（YAGNI，先指标）、多用户（独立 stack）、Part 展开 UI、circuit breaker、metrics 之外的可观测、Stage E token stream gzip 调参。
 
 ## §11 directory 语义与转发
 
@@ -333,6 +335,7 @@ skeleton 共享缓存（YAGNI，先指标）、多用户（独立 stack）、Par
 | 端点 | null / 未传 | 显式 directory |
 |---|---|---|
 | `GET /slimapi/sessions` | 200，不过滤（upstream 默认） | 透传 `?directory=` + `X-Opencode-Directory`（normalize 后） |
+| `GET /slimapi/sessions/status` | **400/422——`directory` 必填**（FastAPI 缺参→422） | normalize 后透传 `?directory=` + `X-Opencode-Directory`；上游 `GET /session/status` 返回全量 status map（directory 参数对上游是 no-op，但 slimapi 仍必填 + 透传以与 v1 契约一致） |
 | `GET /slimapi/messages/**`（含 `/full/{mid}`） | **不拦**（upstream 默认） | normalize 后作 `X-Opencode-Directory`；query 与 header 冲突 → 400 `directory_not_allowed` |
 | `GET /slimapi/sessions/{sid}/stream` | 不过滤（订阅所有 directory 事件） | **no-op**——directory 不改变订阅者接收的帧集（累加器以 sessionID 为键，单用户 T3 全局唯一；与 §3.x.1 一致）；仅 query 与 `X-Opencode-Directory` 头冲突 → 400 `directory_not_allowed`（结构性守卫，NB-D7） |
 | catch-all `/{path}` | upstream 默认 | 客户端自带 `X-Opencode-Directory` 头透传；slimapi 不剥（非 hop-by-hop） |
@@ -340,7 +343,7 @@ skeleton 共享缓存（YAGNI，先指标）、多用户（独立 stack）、Par
 说明：
 - **slimapi 不做目录警察**：directory 的合法性由上游 opencode 决定；opencode 自身的 4xx 会经 §7 透传（如 `upstream_http_N`）。
 - **sid 能力凭证**：客户端仅从 list / SSE 合法渠道获知 sid。
-- **v2 删除**：v1 §12 的 `/sessions/status`（必填 directory）、`/sessions/{sid}/status`、`/questions` + `/permissions`（repeated 1-32 + null 聚合）、POST q/p reply/reject/permission（directory 来自 routeToken）行已移除——这些端点在 v2 中不存在。
+- **v2 删除**：v1 §12 的 `/sessions/{sid}/status`、`/questions` + `/permissions`（repeated 1-32 + null 聚合）、POST q/p reply/reject/permission（directory 来自 routeToken）行已移除——这些端点在 v2 中不存在。（`GET /slimapi/sessions/status` 于 2026-08-03 加性回归，见 §2；v1 的 per-session `/sessions/{sid}/status` 仍删除。）
 - **v2 删除**：v1 §12「null 聚合（q/p）」「scope.directories 区分 scope 未就绪/权威空」语义已删除（q/p 聚合端点不存在）。
 
 ### §11.2 directory 发现与 allowlist 状态（v2 下线）

@@ -28,6 +28,7 @@ def _build_app(
     upstream: httpx.AsyncClient,
     *,
     hubs: object | None = None,
+    turn_registry: object | None = None,
 ) -> FastAPI:
     app = FastAPI(title="oc-slimapi-sessions-test")
     app.state.config = _settings()
@@ -43,6 +44,11 @@ def _build_app(
     # hits the spy / real hub instead of being a silent ``getattr(...,None)``.
     if hubs is not None:
         app.state.hubs = hubs
+    # Optional TurnRegistry for /slimapi/sessions/status turn merge tests.
+    # When omitted, getattr(request.app.state, "turn_registry", None) → None
+    # (the degrade path: turn fields omitted, contract §3.y.1 paired missing).
+    if turn_registry is not None:
+        app.state.turn_registry = turn_registry
     app.include_router(sessions.router)
     register_error_handlers(app)
     install_proxy(app)
@@ -351,6 +357,306 @@ async def test_sessions_non_list_payload_returns_503_no_completeness_headers(ups
         assert response.status_code == 503, f"body={bad_body!r}"
         assert response.json()["code"] == "upstream_unavailable"
         assert "X-Complete" not in response.headers
+
+
+# ---------------------------------------------------------------------------
+# GET /slimapi/sessions/status (additive re-add)
+#
+# Passthrough of upstream GET /session/status (Record<SessionID,{type}>)
+# + sidecar merge of TurnRegistry (turnIncarnation/turn) per sid.
+# Read-only, no caching; same in-memory turn source as digest SSE (§3.y).
+# directory is required (matches v1 contract §11.1). turn_registry is
+# lifespan-wired in production; when absent both fields are omitted.
+# ---------------------------------------------------------------------------
+
+
+def _status_handler_factory(captured: dict | None = None, body: bytes = b"{}"):
+    """Build an upstream mock handler returning ``body`` for /session/status.
+
+    Captures the directory query + header when a ``captured`` dict is given
+    so forwarding tests can assert both legs. Falls through to an empty 200
+    list for /session (so smoke/session-list calls don't noise the handler).
+    """
+    import orjson as _orjson
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session/status":
+            if captured is not None:
+                captured["query"] = request.url.params.get("directory")
+                captured["header"] = request.headers.get("x-opencode-directory")
+            return httpx.Response(200, content=body,
+                                  headers={"Content-Type": "application/json"})
+        return httpx.Response(200, content=_orjson.dumps([]),
+                              headers={"Content-Type": "application/json"})
+    return handler
+
+
+async def test_sessions_status_registered_returns_200_not_thin_route_not_found(upstream_factory):
+    """Regression: the endpoint EXISTS (200), not 404 ``thin_route_not_found``.
+
+    lite-v2 originally deleted /slimapi/sessions/status; this locks the
+    additive re-add so a future regression (route dropped or shadowed by
+    catch-all) surfaces immediately."""
+    upstream = upstream_factory(_status_handler_factory(body=b"{}"))
+    app = _build_app(upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/slimapi/sessions/status?directory=/app", headers=VERSION_HEADERS,
+        )
+    assert response.status_code == 200
+    assert response.json() == {}
+
+
+async def test_sessions_status_directory_required_returns_422(upstream_factory):
+    """``directory`` is a required query param (v1 contract §11.1). Missing
+    → FastAPI 422, never reaches upstream."""
+    upstream = upstream_factory(_status_handler_factory())
+    app = _build_app(upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/slimapi/sessions/status", headers=VERSION_HEADERS)
+    assert response.status_code == 422
+
+
+async def test_sessions_status_directory_validated_and_forwarded(upstream_factory):
+    """Directory is normalized + validated before forwarding: both
+    ``?directory=`` query and ``X-Opencode-Directory`` header reach upstream
+    (mirrors /slimapi/sessions). Trailing slash is stripped."""
+    from oc_slimapi.turn_registry import TurnRegistry
+    captured: dict[str, str | None] = {}
+    upstream = upstream_factory(_status_handler_factory(captured, b"{}"))
+    app = _build_app(upstream, turn_registry=TurnRegistry(incarnation=7))
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/slimapi/sessions/status?directory=/app/", headers=VERSION_HEADERS,
+        )
+    assert response.status_code == 200
+    assert captured["query"] == "/app"
+    assert captured["header"] == "/app"
+
+
+async def test_sessions_status_invalid_directory_returns_400(upstream_factory):
+    """Directory containing ``..`` segment → 400 ``invalid_directory``
+    (validate_directory security guard, never forwarded)."""
+    upstream = upstream_factory(_status_handler_factory())
+    app = _build_app(upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/slimapi/sessions/status?directory=/../etc", headers=VERSION_HEADERS,
+        )
+    assert response.status_code == 400
+    assert response.json()["code"] == "invalid_directory"
+
+
+async def test_sessions_status_merges_idle_busy_retry_turn_fields(upstream_factory):
+    """Sparse upstream status map (idle / busy / retry shapes) + sidecar
+    TurnRegistry → each entry gains paired ``turnIncarnation``/``turn`` at
+    the flat top level; the retry entry's extra fields are preserved; an
+    unobserved sid yields turn=0 (snapshot contract §3.y.1)."""
+    from oc_slimapi.turn_registry import TurnRegistry
+    body = orjson.dumps({
+        "s_idle": {"type": "idle"},
+        "s_busy": {"type": "busy"},
+        "s_retry": {
+            "type": "retry", "attempt": 2, "message": "rate limited",
+            "next": 3,
+        },
+    })
+    reg = TurnRegistry(incarnation=5)
+    reg.bump_turn("s_busy")  # one prompt forwarded through sidecar for s_busy
+    reg.bump_turn("s_busy")
+    upstream = upstream_factory(_status_handler_factory(body=body))
+    app = _build_app(upstream, turn_registry=reg)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/slimapi/sessions/status?directory=/app", headers=VERSION_HEADERS,
+        )
+    assert response.status_code == 200
+    data = response.json()
+    # idle: unobserved → (inc, 0)
+    assert data["s_idle"] == {"type": "idle", "turnIncarnation": 5, "turn": 0}
+    # busy: bumped twice → turn=2
+    assert data["s_busy"] == {"type": "busy", "turnIncarnation": 5, "turn": 2}
+    # retry: extra fields preserved + turn merge (unobserved → turn=0)
+    assert data["s_retry"]["type"] == "retry"
+    assert data["s_retry"]["attempt"] == 2
+    assert data["s_retry"]["message"] == "rate limited"
+    assert data["s_retry"]["next"] == 3
+    assert data["s_retry"]["turnIncarnation"] == 5
+    assert data["s_retry"]["turn"] == 0
+
+
+async def test_sessions_status_turn_reflects_concurrent_bump(upstream_factory):
+    """Live read: two status calls around a ``bump_turn`` observe turn 0 then
+    turn 1 — the merge reads the registry at call time (no caching). This is
+    the 'concurrent bump' / live-projection guarantee."""
+    from oc_slimapi.turn_registry import TurnRegistry
+    body = orjson.dumps({"s1": {"type": "busy"}})
+    reg = TurnRegistry(incarnation=3)
+    upstream = upstream_factory(_status_handler_factory(body=body))
+    app = _build_app(upstream, turn_registry=reg)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        r1 = await client.get(
+            "/slimapi/sessions/status?directory=/app", headers=VERSION_HEADERS,
+        )
+        assert r1.json()["s1"]["turn"] == 0
+        # A prompt forward bumps the turn (simulating catch-all commit point).
+        reg.bump_turn("s1")
+        r2 = await client.get(
+            "/slimapi/sessions/status?directory=/app", headers=VERSION_HEADERS,
+        )
+        assert r2.json()["s1"]["turn"] == 1
+        assert r2.json()["s1"]["turnIncarnation"] == 3
+
+
+async def test_sessions_status_no_registry_omits_turn_fields(upstream_factory):
+    """When ``turn_registry`` is not wired on app.state, turn fields are
+    omitted (paired missing → ocdroid Tier-2 degrade, contract §3.y.1).
+    The upstream status shape is otherwise untouched."""
+    body = orjson.dumps({"s1": {"type": "idle"}, "s2": {"type": "busy"}})
+    upstream = upstream_factory(_status_handler_factory(body=body))
+    app = _build_app(upstream)  # no turn_registry on state
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/slimapi/sessions/status?directory=/app", headers=VERSION_HEADERS,
+        )
+    assert response.status_code == 200
+    data = response.json()
+    assert data == {"s1": {"type": "idle"}, "s2": {"type": "busy"}}
+    assert "turnIncarnation" not in data["s1"]
+    assert "turn" not in data["s1"]
+
+
+async def test_sessions_status_bad_shape_non_dict_returns_503(upstream_factory):
+    """Upstream 200 but top-level JSON is not a Record (dict) → 503
+    upstream_unavailable (mirrors the sessions-list non-array guard)."""
+    for bad_body in (
+        b'["not", "a", "dict"]',   # list
+        b'"a string"',             # str
+        b"null",                   # None
+        b"42",                     # number
+    ):
+        def handler(request: httpx.Request, body: bytes = bad_body) -> httpx.Response:
+            if request.url.path == "/session/status":
+                return httpx.Response(200, content=body,
+                                      headers={"Content-Type": "application/json"})
+            return httpx.Response(200, content=b"[]",
+                                  headers={"Content-Type": "application/json"})
+
+        upstream = upstream_factory(handler)
+        app = _build_app(upstream)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
+                "/slimapi/sessions/status?directory=/app", headers=VERSION_HEADERS,
+            )
+        assert response.status_code == 503, f"body={bad_body!r}"
+        assert response.json()["code"] == "upstream_unavailable"
+
+
+async def test_sessions_status_upstream_4xx_returns_502(upstream_factory):
+    """Upstream 4xx on /session/status → 502 upstream_http_N (no sid, so
+    no session_not_found mapping — same as the list-level 4xx path)."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session/status":
+            return httpx.Response(400, content=b'{"error":"bad"}')
+        return httpx.Response(200, content=b"[]",
+                              headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/slimapi/sessions/status?directory=/app", headers=VERSION_HEADERS,
+        )
+    assert response.status_code == 502
+    assert response.json()["code"] == "upstream_http_400"
+
+
+async def test_sessions_status_upstream_5xx_and_network_error_return_503(upstream_factory):
+    """Upstream 5xx and connection-level error both → 503
+    upstream_unavailable (§7)."""
+    # 5xx
+    def handler_5xx(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session/status":
+            return httpx.Response(500, content=b"boom")
+        return httpx.Response(200, content=b"[]",
+                              headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler_5xx)
+    app = _build_app(upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/slimapi/sessions/status?directory=/app", headers=VERSION_HEADERS,
+        )
+    assert response.status_code == 503
+    assert response.json()["code"] == "upstream_unavailable"
+
+    # network error
+    def handler_net(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session/status":
+            raise httpx.ConnectError("simulated", request=request)
+        return httpx.Response(200, content=b"[]",
+                              headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler_net)
+    app = _build_app(upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/slimapi/sessions/status?directory=/app", headers=VERSION_HEADERS,
+        )
+    assert response.status_code == 503
+    assert response.json()["code"] == "upstream_unavailable"
+
+
+async def test_sessions_status_upstream_200_bad_json_returns_503(upstream_factory):
+    """Upstream 200 but body not JSON → 503 upstream_unavailable."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session/status":
+            return httpx.Response(200, content=b"not json",
+                                  headers={"Content-Type": "application/json"})
+        return httpx.Response(200, content=b"[]",
+                              headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/slimapi/sessions/status?directory=/app", headers=VERSION_HEADERS,
+        )
+    assert response.status_code == 503
+    assert response.json()["code"] == "upstream_unavailable"
+
+
+async def test_sessions_status_non_dict_entry_value_passed_through(upstream_factory):
+    """Defensive: if upstream returns a Record whose value is not a dict
+    (schema violation), the entry is passed through unchanged (no turn
+    merge on it) rather than crashing the whole response."""
+    from oc_slimapi.turn_registry import TurnRegistry
+    body = orjson.dumps({"s_ok": {"type": "idle"}, "s_bad": "busy"})
+    reg = TurnRegistry(incarnation=2)
+    upstream = upstream_factory(_status_handler_factory(body=body))
+    app = _build_app(upstream, turn_registry=reg)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/slimapi/sessions/status?directory=/app", headers=VERSION_HEADERS,
+        )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["s_ok"] == {"type": "idle", "turnIncarnation": 2, "turn": 0}
+    # Non-dict value passed through verbatim (no crash, no merge).
+    assert data["s_bad"] == "busy"
 
 
 
