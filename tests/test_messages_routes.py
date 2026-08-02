@@ -1326,7 +1326,9 @@ async def test_messages_list_skeleton_malformed_created_sorts_safely(upstream_fa
         # sessions.py deletions (§1)
         ("GET", "/slimapi/sessions/s1/children", "session children"),
         ("GET", "/slimapi/sessions/s1/status", "single session status"),
-        ("GET", "/slimapi/sessions/status", "batch session status"),
+        # NOTE: GET /slimapi/sessions/status (batch) was re-added on
+        # 2026-08-03 (additive, see CHANGELOG / v2-contract §2). It is no
+        # longer a deleted endpoint — covered by test_sessions_routes.py.
         ("GET", "/slimapi/projects", "projects discovery"),
         # questions.py deletions (§1, entire file retired)
         ("GET", "/slimapi/questions", "questions list"),
@@ -1337,7 +1339,7 @@ async def test_messages_list_skeleton_malformed_created_sorts_safely(upstream_fa
     ],
     ids=[
         "full-ids", "since-ts",
-        "session-children", "session-status", "sessions-status", "projects",
+        "session-children", "session-status", "projects",
         "questions", "permissions",
         "question-reply", "question-reject", "permission-reply",
     ],
@@ -1346,7 +1348,7 @@ async def test_deleted_endpoints_return_404(upstream_factory, method, path, desc
     """lite-v2 §1 + §9.3: ALL removed endpoints return 404 because the
     handlers are no longer registered (or the entire router file was deleted).
     Covers GET and POST methods across messages, sessions, and questions
-    families — 11 paths total, one per HTTP route template in §1."""
+    families — 10 paths total (batch /sessions/status was re-added 2026-08-03)."""
     # Handler should never be called: the route does not exist.
     def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
         return httpx.Response(200, content=b"[]")

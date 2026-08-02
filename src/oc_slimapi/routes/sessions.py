@@ -93,4 +93,56 @@ def _project_sessions(payload: list[dict]) -> list[dict]:
     return [skeleton_session(item) for item in payload]
 
 
+@router.get("/sessions/status")
+async def sessions_status(request: Request, directory: str):
+    """GET /slimapi/sessions/status?directory=<required>.
+
+    Additive re-add (lite-v2 originally deleted this; brought back as a
+    read-only projection). Passthrough of upstream opencode
+    ``GET /session/status`` (returns ``Record<SessionID, {type:"busy"|
+    "idle"|"retry"}>``) with a sidecar merge of the turn-token fence
+    fields (``turnIncarnation``/``turn``) per sid from
+    :class:`TurnRegistry`. No caching, no new state — same in-memory
+    sources the digest SSE already stamps from (contract §3.y).
+    """
+    directory = validate_directory(directory)
+    try:
+        response = await request.app.state.upstream.get(
+            "/session/status",
+            params={"directory": directory},
+            headers=forward_directory_headers(directory),
+        )
+    except httpx.RequestError as exc:
+        raise CodedHTTPException(503, code="upstream_unavailable") from exc
+    stash_up_in(request, len(response.content))
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise_upstream_status(exc)
+    try:
+        payload = response.json()
+    except Exception as exc:
+        raise CodedHTTPException(503, code="upstream_unavailable") from exc
+    if not isinstance(payload, dict):
+        # Upstream contract is Record<SessionID, Info> — a non-dict body is
+        # malformed. Mirrors the sessions-list non-array guard (503).
+        raise CodedHTTPException(503, code="upstream_unavailable")
+    # Read-only turn merge (contract §3.y.1: paired turnIncarnation/turn at
+    # the flat top level of each entry). Unobserved sid → (inc, 0). The
+    # registry is lifespan-wired in production; when absent both fields are
+    # omitted (paired missing → ocdroid Tier-2 degrade). Entries whose value
+    # is not a dict (upstream schema violation) are passed through unchanged.
+    turn_registry = getattr(request.app.state, "turn_registry", None)
+    if turn_registry is not None:
+        for sid, info in payload.items():
+            if isinstance(info, dict):
+                inc, turn = turn_registry.snapshot(sid)
+                info["turnIncarnation"] = inc
+                info["turn"] = turn
+    return json_response(
+        payload,
+        accept_encoding=request.headers.get("accept-encoding"),
+    )
+
+
 

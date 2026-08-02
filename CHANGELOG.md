@@ -28,6 +28,10 @@ ocdroid 对接时：
 
 ## [Unreleased]
 
+### Added
+
+- **`GET /slimapi/sessions/status`（加性回归，未 bump `X-Slimapi-Version`，仍 2）**：lite-v2 曾在批量清理中删除此端点，现加回性回归。语义：透传上游 opencode `GET /session/status`（返回 `Record<SessionID, {type:"busy"|"idle"|"retry"}>`）+ sidecar merge 每个条目的 flat 顶层 `turnIncarnation`/`turn`（源自 `TurnRegistry.snapshot`，与 digest SSE §3.y **同源内存**，未观测 sid → `(inc, 0)`）。`directory` 必填（v1 契约 §11.1 延续）；端点**只读、不写、不缓存**——纯同内存只读投影，不引入新状态机/新缓存/新持久化。turn_registry 未装配（lifespan 级）时两字段配对缺省（ocdroid 降级 Tier-2）。错误映射：上游 4xx → 502 `upstream_http_N`；5xx/网络/坏 JSON/非 dict body → 503 `upstream_unavailable`；缺 directory → FastAPI 422。**加性**：ocdroid 侧可恢复 v1 同名端点的既有消费逻辑（回归成本低）。实现：`src/oc_slimapi/routes/sessions.py`；测试：`tests/test_sessions_routes.py`（idle/busy/retry turn merge、并发 bump live read、坏 shape、endpoint-registered 非 404、directory 必填/校验、上游错误、无 registry 降级）。
+
 ### Changed
 
 - **turn token fence scope 简化为「仅 sid」**：turn 计数器分桶 key 由 `(serverGroupFp, sid)` 改为 `sid`（单 sidecar + 单 opencode 后端下 sid 已全局唯一）。移除 `X-Ocdroid-Server-Group-Fp` 输入头依赖（sidecar 不再读取该 header；客户端若仍发送会被忽略）；`register_scope`/`_sid_scope` 移除；`snapshot(sid)` 恒返回 `(incarnation, turn)`（未观测 sid → `(inc,0)`），故 digest 的 `turnIncarnation`/`turn` 现在对所有 `session.status` 事件恒输出（只要 turn_registry 装配），不再是 header-gated。**修正多设备共享 session 的 liveness bug**：原 `register_scope` 在每个带身份头的 session 请求上「最后写入者覆盖」，跨设备续看同一会话（哪怕只读 GET）会翻转 scope、破坏 turn 单调性，导致 ocdroid 误判后续 digest 为 stale 而 DROP（session UI 冻结）；sid-only 让所有设备对同一 sid 共享同一单调计数器，读请求不再翻转 scope。**未 bump** `X-Slimapi-Version`（digest 字段集不变，从「有时输出」变「恒输出」，加性兼容）。
