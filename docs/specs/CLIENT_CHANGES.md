@@ -39,6 +39,34 @@
 - 推荐：`limit=500` 兜底可保留，但用 `X-Complete` 判断是否可能截断，勿盲猜全集。
 - 已移除 `X-Discovery-Directories` 与 `X-Discovery-Ready` 响应头（discovery 系统已删除）。
 
+## Catalog skeleton（command / agent，加性 — 2026-08-05）
+
+> **加性 / 向后兼容**：wire 版本未 bump（仍 2）。旧 sidecar 无此路由 → 404 `thin_route_not_found`，客户端透明回退 catch-all 透传 `GET /command`、`GET /agent`（行为不变）。旧 ocdroid 继续走透传，零回归。完整集成告知：`docs/ocmar/reports/2026-08-05-ocdroid-catalog-skeleton-integration.md`。
+
+两个 catalog 读接口走 slim skeleton 投影（实测省流 command ~97.6% / agent ~95.8% raw）：
+
+- **`GET /slimapi/command`**：须带 `X-Slimapi-Version: 2`（建议 `Accept-Encoding: gzip`）；query `directory?`（可选，仅作 `X-Opencode-Directory` 头转发，catalog 全局）。200 返回裸数组，每项白名单 `{name, description, agent?, hints?}`（agent/hints 可选，缺则不出现）；**已丢弃** `template`(~97.7%)/`source`/`model`/`subtask`。
+- **`GET /slimapi/agent`**：同上头与 directory 语义。200 返回裸数组，每项白名单 `{name, description, mode, hidden?, native?}`（hidden/native 可选，可能为 null/false）；**已丢弃** `prompt`(~34.7%)/`permission`(~61.2%，`Permission.Ruleset` 规则集——**非** pending permission card)/`topP`/`temperature`/`color`/`variant`/`options`/`steps`/`model`。
+
+### 客户端必须
+
+- **能力探测**：加性路由 ≠ 旧 sidecar 支持。用 health feature flag 或一次性 404 探测（`thin_route_not_found` = 不支持）；探测结果缓存，勿每连接重复。
+- **fallback 规则（关键）**：**仅** `404 thin_route_not_found` → 回退 catch-all 透传 `GET /command`、`GET /agent`。**绝不**对 `503`(upstream_unavailable/transform_busy)/`413`/timeout/版本错误/鉴权错误回退（会流量翻倍 + 掩盖问题；503 走 circuit breaker + Retry-After 重试）。
+- **字段消费**：command 读 name/description/agent/hints；agent 读 name/description/mode/hidden/native（`native` 务必解析）。**不要**从 slim 端点期望被裁字段；若 UI 真需 template/prompt/permission → 走 passthrough（本批无 `/slimapi/command|agent/full`）。
+- **灰度**：feature flag 启用；关 flag = 立即回退 passthrough，无需改代码。
+
+### 错误码（thin 路由统一 `{"code":"..."}`）
+
+`400 version_required`/`version_incompatible`、`400 invalid_directory`、`404 thin_route_not_found`（旧 sidecar，回退信号）、`413 response_too_large`、`502 upstream_http_N`、`503 upstream_unavailable`、`503 transform_busy`(+`Retry-After:2`)、`422`。catalog 非 session 级，无 `session_not_found`。catalog 条目**无** `hasFull`/`omitted`（那是 message part 概念）。
+
+### 监控
+
+`GET /slimapi/metrics.traffic` 已有独立 `command` / `agent` 桶（upIn/downOut/省流比）；access log 每条带 `bucket` 字段。
+
+### 未做（待需求确认）
+
+`/slimapi/command|agent/full`（仅当确认 UI 真需 template/prompt/permission；优先「按名查单条详情」而非全量 full）；`hints` 单项/总量 cap（当前原样保留，live 值 14B，省流比为实测非保证）。
+
 ## 路由与失败策略
 
 - thin 使用 stunnel 14097，direct 14096。
