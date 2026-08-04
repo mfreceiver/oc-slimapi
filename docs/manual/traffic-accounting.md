@@ -102,6 +102,8 @@ curl -s -H "$H" $BASE/slimapi/metrics | jq '
 | `events_sse` | `/slimapi/events`（控制面 SSE） | **策展**：上游全量 token/tool 流 → `session.digest`+q/p 小帧（最大省流点） |
 | `token_stream_sse` | `/slimapi/sessions/{sid}/stream` | gzip + done-marker（见 §4 注意） |
 | `sessions` | `/slimapi/sessions/**`（列表/`/status`/`/children`） | session/child skeleton 投影 |
+| `command` | `/slimapi/command`、`/slimapi/command/**` | **骨架投影**：catalog whitelist（`name/description/agent/hints`），丢 `template`（~97.7%） |
+| `agent` | `/slimapi/agent`、`/slimapi/agent/**` | **骨架投影**：catalog whitelist（`name/description/mode/hidden/native`），丢 `prompt`+`permission`（>96%） |
 | `quiz` | `/slimapi/questions`、`/slimapi/permissions` | 聚合 + 投影 |
 | `passthrough` | catch-all `/**`（发消息等写） | **不省流**，透传（基线，比值≈1） |
 | `health` / `metrics` / `projects` / `other` | 各自端点 | 元数据/探活 |

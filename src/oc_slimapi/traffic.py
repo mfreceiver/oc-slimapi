@@ -70,6 +70,14 @@ def bucketize(method: str, path: str) -> str:
             return "events_sse"
         if path.startswith("/slimapi/messages"):
             return "messages"
+        # Catalog skeleton routes (additive). Distinct buckets so each
+        # endpoint's raw/gzip/downOut savings are visible in
+        # /slimapi/metrics.traffic (the handoff calls for per-endpoint
+        # saving validation).
+        if path == "/slimapi/command" or path.startswith("/slimapi/command/"):
+            return "command"
+        if path == "/slimapi/agent" or path.startswith("/slimapi/agent/"):
+            return "agent"
         # Generic /slimapi/sessions/**.
         if path.startswith("/slimapi/sessions"):
             return "sessions"

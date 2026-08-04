@@ -324,3 +324,121 @@ def test_inlined_output_still_reports_hasfull_when_other_fields_omitted():
     assert tool["hasFull"] is True
     assert "state.output" not in tool["omitted"]
     assert "state.structured" in tool["omitted"]
+
+
+# ---------------------------------------------------------------------------
+# Catalog skeleton projections (command / agent). These are pure whitelist
+# picks over a list of catalog entries — no part-typing, no hasFull/omitted
+# (catalog listings have no per-entry expand endpoint).
+# ---------------------------------------------------------------------------
+
+from oc_slimapi.skeleton import (
+    AGENT_SKELETON_KEYS,
+    COMMAND_SKELETON_KEYS,
+    skeleton_agent,
+    skeleton_agents,
+    skeleton_command,
+    skeleton_commands,
+)
+
+
+def test_skeleton_command_keeps_whitelist_drops_rest():
+    src = {
+        "name": "dev",
+        "description": "General coding agent",
+        "agent": None,  # optional, often null
+        "hints": [{"type": "mcp"}],
+        "template": "x" * 3000,   # never consumed → drop
+        "source": "builtin",
+        "model": "gpt-x",
+        "subtask": False,
+    }
+    out = skeleton_command(src)
+    assert set(out.keys()) == COMMAND_SKELETON_KEYS
+    assert out["name"] == "dev"
+    assert out["description"] == "General coding agent"
+    assert out["agent"] is None          # preserved verbatim (incl. null)
+    assert out["hints"] == [{"type": "mcp"}]
+    for dropped in ("template", "source", "model", "subtask"):
+        assert dropped not in out
+
+
+def test_skeleton_command_omits_absent_optional_keys():
+    # agent / hints absent (majority of commands have neither) → sparse skeleton
+    out = skeleton_command({"name": "n", "description": "d", "template": "t"})
+    assert out == {"name": "n", "description": "d"}
+
+
+def test_skeleton_commands_projects_list_in_order():
+    src = [
+        {"name": "a", "description": "da"},
+        {"name": "b", "description": "db", "agent": "plan"},
+    ]
+    out = skeleton_commands(src)
+    assert [item["name"] for item in out] == ["a", "b"]
+    assert out[1]["agent"] == "plan"
+
+
+def test_skeleton_agent_keeps_whitelist_drops_rest():
+    src = {
+        "name": "build",
+        "description": "Build specialist",
+        "mode": "primary",
+        "hidden": False,
+        "native": True,
+        "prompt": "y" * 18000,      # largest field → drop
+        "permission": [{"tool": "bash"}],  # Ruleset, no UI consumer → drop
+        "topP": 0.5,
+        "temperature": 0.7,
+        "color": "#fff",
+        "variant": None,
+        "options": {},
+        "steps": None,
+        "model": "claude",
+    }
+    out = skeleton_agent(src)
+    assert set(out.keys()) == AGENT_SKELETON_KEYS
+    assert out["name"] == "build"
+    assert out["mode"] == "primary"
+    assert out["hidden"] is False
+    assert out["native"] is True
+    for dropped in (
+        "prompt", "permission", "topP", "temperature", "color",
+        "variant", "options", "steps", "model",
+    ):
+        assert dropped not in out
+
+
+def test_skeleton_agent_omits_absent_optional_keys():
+    # native/hidden absent → sparse skeleton (only present keys kept)
+    out = skeleton_agent({"name": "n", "description": "d", "mode": "all"})
+    assert out == {"name": "n", "description": "d", "mode": "all"}
+
+
+def test_skeleton_agents_projects_list_in_order():
+    src = [
+        {"name": "a", "description": "da", "mode": "all", "hidden": False, "native": False},
+        {"name": "b", "description": "db", "mode": "primary", "hidden": True, "native": True},
+    ]
+    out = skeleton_agents(src)
+    assert [item["name"] for item in out] == ["a", "b"]
+    assert out[1]["native"] is True
+    assert out[1]["hidden"] is True
+
+
+def test_skeleton_catalogs_filter_non_dict_items():
+    """A malformed upstream catalog entry (null / string / number) is silently
+    dropped rather than reaching ``_pick`` (which would TypeError on
+    ``key in value``). Mirrors ``skeleton_messages``'s ``isinstance(part, dict)``
+    filter — one bad row degrades to a shorter skeleton, not a 500."""
+    command_src = [None, "bad", 42, {"name": "dev", "description": "d"}, {"template": "t"}]
+    out_c = skeleton_commands(command_src)
+    # Only the two dict entries survive; projected to their whitelists.
+    assert len(out_c) == 2
+    assert out_c[0] == {"name": "dev", "description": "d"}
+    assert out_c[1] == {}  # {"template":"t"} has no whitelist key -> empty pick
+
+    agent_src = [None, "x", {"name": "build", "mode": "primary"}]
+    out_a = skeleton_agents(agent_src)
+    assert len(out_a) == 1
+    assert out_a[0] == {"name": "build", "mode": "primary"}

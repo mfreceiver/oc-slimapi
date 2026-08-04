@@ -338,3 +338,68 @@ def skeleton_session(session: dict[str, Any]) -> dict[str, Any]:
         if isinstance(value, dict):
             result[key] = _pick(value, allowed)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Catalog skeleton projections (additive; wire version UNCHANGED — stays 2).
+#
+# opencode's ``/command`` and ``/agent`` catalogs are large (live-measured
+# ~292 KB / ~250 KB raw) but ocdroid reads only a handful of fields per entry
+# for its command palette / agent picker UIs. The dominant cost is never-
+# consumed content: command ``template`` (~97.7% of bytes) and agent
+# ``prompt``+``permission`` (>96%). These projections keep only the UI-consumed
+# whitelist and drop the rest — measured savings ~97.6% (command) / ~95.8%
+# (agent) raw.
+#
+# Whitelists are the client-DEFINED fields (rev: a skeleton must never drop a
+# key the client already reads). Optional keys are picked only when present
+# (``_pick``), so a sparse upstream row yields a sparse skeleton rather than a
+# key-shaped hole. ``hasFull``/``omitted`` are NOT emitted — these are catalog
+# listings, not message parts; there is no per-entry expand endpoint, and the
+# client always has the full upstream ``/command`` / ``/agent`` (catch-all
+# passthrough) as the authoritative source when it needs an omitted field.
+# ---------------------------------------------------------------------------
+COMMAND_SKELETON_KEYS = {"name", "description", "agent", "hints"}
+
+
+def skeleton_command(command: dict[str, Any]) -> dict[str, Any]:
+    """Whitelist projection of an opencode command catalog entry.
+
+    Keeps the ocdroid-consumed fields (``name`` / ``description`` / ``agent``
+    / ``hints``) and drops the never-read ``template`` / ``source`` /
+    ``model`` / ``subtask``. ``agent`` is optional in opencode's schema
+    (present on a minority of commands; often ``null``) — it is preserved
+    verbatim when present so the client's agent-scoping logic sees the same
+    key shape as the upstream catalog.
+    """
+    return _pick(command, COMMAND_SKELETON_KEYS)
+
+
+def skeleton_commands(commands: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # Non-dict items (e.g. a stray ``null`` / string / number in a malformed
+    # upstream catalog) are silently skipped, mirroring ``skeleton_messages``'s
+    # ``if isinstance(part, dict)`` filter. A non-dict element never reaches
+    # ``_pick`` (which would otherwise ``TypeError`` on ``key in value``), so a
+    # single bad row degrades to a shorter skeleton rather than a 500.
+    return [skeleton_command(item) for item in commands if isinstance(item, dict)]
+
+
+AGENT_SKELETON_KEYS = {"name", "description", "mode", "hidden", "native"}
+
+
+def skeleton_agent(agent: dict[str, Any]) -> dict[str, Any]:
+    """Whitelist projection of an opencode agent catalog entry.
+
+    Keeps the ocdroid-consumed fields (``name`` / ``description`` / ``mode``
+    / ``hidden`` / ``native``) and drops the never-read ``prompt`` (the
+    largest field — the full system prompt), ``permission`` (the
+    ``Permission.Ruleset`` list — no UI consumer; not the pending permission
+    card), ``topP`` / ``temperature`` / ``color`` / ``variant`` / ``options``
+    / ``steps`` / ``model``.
+    """
+    return _pick(agent, AGENT_SKELETON_KEYS)
+
+
+def skeleton_agents(agents: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # Non-dict items are silently skipped — see skeleton_commands for rationale.
+    return [skeleton_agent(item) for item in agents if isinstance(item, dict)]

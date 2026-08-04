@@ -87,6 +87,15 @@ class TestBucketize:
     def test_messages_subpath(self):
         assert bucketize("GET", "/slimapi/messages/ses_x") == "messages"
 
+    def test_catalog_buckets(self):
+        """The additive catalog skeleton routes get their own buckets so
+        per-endpoint savings are visible in metrics."""
+        assert bucketize("GET", "/slimapi/command") == "command"
+        assert bucketize("GET", "/slimapi/agent") == "agent"
+        # prefix-tolerant (no sub-routes today, but consistent with siblings)
+        assert bucketize("GET", "/slimapi/command/x") == "command"
+        assert bucketize("GET", "/slimapi/agent/x") == "agent"
+
     def test_session_root_is_sessions(self):
         assert bucketize("GET", "/slimapi/sessions") == "sessions"
 
