@@ -134,3 +134,33 @@ oc-slimapi 已上线两个加性 catalog skeleton 路由，请按本告知在 oc
 
 - `GET /slimapi/command/full`、`GET /slimapi/agent/full`（仅当确认 UI 真需要 template/prompt/permission 时再做；优先方案是「按名查单条详情」而非全量 full）
 - `hints` 单项 / 总量大小 cap（当前原样保留；live 值 14B，省流比为实测非保证；列为 follow-up）
+
+---
+
+## 审计结论（ocdroid 侧 2026-08-05 答复）—— 全量切流可行 ✅
+
+ocdroid 侧基于 **data-model 层证据**完成审计（比 UI grep 更强：`CommandInfo` / `AgentInfo` 的字段建模本身就是消费契约——未建模即不可能消费）。第五节 4 个待确认问题**全否**：
+
+| 问题 | 答复 | 证据 |
+|---|---|---|
+| Q1 UI 消费 `command.template`？ | **否** | `CommandInfo` 仅 4 字段（name/description/agent/hints），`template` 从未建模 |
+| Q2 UI 消费 `agent.prompt`/`permission`？ | **否** | `AgentInfo` 仅 5 字段（name/description/mode/hidden/native），`Permission.Ruleset` 零建模 |
+| Q3 hints/native 仍在消费？ | **否**（字段存在但零读取） | UI 实际只读 name+description（command）/ name+mode+hidden（agent） |
+| Q4 catalog 随目录变化？ | **否，全局全集** | API 无 `@Query(directory)` + `CACHEABLE_PATHS` 标注 global |
+
+### 对本仓的影响（结论）
+
+1. **全量切流，无需 passthrough**：白名单是消费字段的**严格超集**；被裁字段（template/prompt/permission/...）在客户端 data model 层根本不存在 → 切流零回归。ocdroid 改动仅 3 处（`SlimApi.kt` +2 方法 / `CatalogGateway.kt` +slim 分支 / `ServerCompatProfile.kt` +`useSlimCatalog` fail-open sticky），Repository/UI/Orchestrator **零改动**。
+
+2. **`/slimapi/command|agent/full` follow-up → 关闭**：Q1/Q2 全否 → 无 UI 需要 template/prompt/permission → full 变体不再需要。
+
+3. **`hints` cap follow-up → moot，不实现**：Q3 揭示 `hints`（command）与 `native`（agent）在客户端**零读取**（dead fields，仅 data model 建模）。即便未来 hints 携带大段内容也无消费方受影响 → 大小 cap 无实际意义。
+
+4. **可选未来优化（非现在，不建议当前做）**：既然 hints/native 零消费，未来若 ocdroid 同步精简 `CommandInfo`/`AgentInfo`（去掉这两个 dead 字段），sidecar 白名单可随之收窄到 `{name,description,agent?}`（command）/ `{name,description,mode,hidden?}`（agent）。**当前不建议**——会破坏 ocdroid「Repository/UI 零改动」的切流前提（白名单超集正是为保护其现有 data model 形状而保留），且 hints(14B)/native(bool) 的额外省流可忽略。保留超集白名单是安全且零协调成本的选择。
+
+### 状态收口
+
+- **sidecar**：已上线（commit `4374ec4`），live，**无需为本切流再改**。
+- **ocdroid**：3 文件改动即可全量切流（`ServerCompatProfile.useSlimCatalog` fail-open sticky，旧 sidecar 404 时透明回退透传）。
+- **双向兼容**：旧 sidecar 404 `thin_route_not_found` → ocdroid fail-open 回退透传；旧 ocdroid 继续透传 `GET /command`、`GET /agent`。
+- **验收**：切流后看 `/slimapi/metrics.traffic` 的 `command`/`agent` 桶 downOut / 省流比（预期 command ~97% / agent ~95%），以及 404 回退次数应趋近 0（新 sidecar）。
