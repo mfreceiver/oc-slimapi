@@ -365,8 +365,9 @@ async def test_sessions_non_list_payload_returns_503_no_completeness_headers(ups
 # Passthrough of upstream GET /session/status (Record<SessionID,{type}>)
 # + sidecar merge of TurnRegistry (turnIncarnation/turn) per sid.
 # Read-only, no caching; same in-memory turn source as digest SSE (§3.y).
-# directory is required (matches v1 contract §11.1). turn_registry is
-# lifespan-wired in production; when absent both fields are omitted.
+# directory is OPTIONAL (additive; upstream ignores it — returns the global
+# map — so callers may omit it). turn_registry is lifespan-wired in
+# production; when absent both fields are omitted.
 # ---------------------------------------------------------------------------
 
 
@@ -408,15 +409,22 @@ async def test_sessions_status_registered_returns_200_not_thin_route_not_found(u
     assert response.json() == {}
 
 
-async def test_sessions_status_directory_required_returns_422(upstream_factory):
-    """``directory`` is a required query param (v1 contract §11.1). Missing
-    → FastAPI 422, never reaches upstream."""
-    upstream = upstream_factory(_status_handler_factory())
+async def test_sessions_status_directory_optional_omitted_returns_200(upstream_factory):
+    """``directory`` is OPTIONAL (additive). Omitting it → 200 with the
+    global status map (upstream ignores directory anyway); the sidecar
+    forwards NEITHER ``?directory=`` query NOR ``X-Opencode-Directory``
+    header when it isn't supplied. See s4-batch-status-research.md."""
+    captured: dict[str, str | None] = {}
+    upstream = upstream_factory(_status_handler_factory(captured, b'{"s1":{"type":"busy"}}'))
     app = _build_app(upstream)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get("/slimapi/sessions/status", headers=VERSION_HEADERS)
-    assert response.status_code == 422
+    assert response.status_code == 200
+    assert response.json() == {"s1": {"type": "busy"}}
+    # No directory supplied → neither leg forwarded to upstream.
+    assert captured["query"] is None
+    assert captured["header"] is None
 
 
 async def test_sessions_status_directory_validated_and_forwarded(upstream_factory):

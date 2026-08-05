@@ -94,8 +94,8 @@ def _project_sessions(payload: list[dict]) -> list[dict]:
 
 
 @router.get("/sessions/status")
-async def sessions_status(request: Request, directory: str):
-    """GET /slimapi/sessions/status?directory=<required>.
+async def sessions_status(request: Request, directory: str | None = None):
+    """GET /slimapi/sessions/status?directory=<optional>.
 
     Additive re-add (lite-v2 originally deleted this; brought back as a
     read-only projection). Passthrough of upstream opencode
@@ -104,12 +104,28 @@ async def sessions_status(request: Request, directory: str):
     fields (``turnIncarnation``/``turn``) per sid from
     :class:`TurnRegistry`. No caching, no new state — same in-memory
     sources the digest SSE already stamps from (contract §3.y).
+
+    ``directory`` is OPTIONAL (additive). Upstream ``GET /session/status``
+    ignores ``directory`` entirely — its handler takes no args and
+    ``statusSvc.list()`` returns the full in-memory ``Map<SessionID, Info>``
+    regardless (the param exists only for ``WorkspaceRoutingMiddleware``
+    routing). So this endpoint always returns the GLOBAL status map no
+    matter what directory is (or isn't) supplied; callers SHOULD omit
+    ``directory`` and call once for the whole map (see
+    ``docs/ocmar/specs/2026-08-05-s4-batch-status-research.md``). When
+    supplied, it is validated + forwarded (as ``?directory=`` query and
+    ``X-Opencode-Directory`` header) for compatibility — upstream treats
+    it as a no-op either way.
     """
-    directory = validate_directory(directory)
+    if directory is not None:
+        directory = validate_directory(directory)
+    params: dict[str, str] = {}
+    if directory is not None:
+        params["directory"] = directory
     try:
         response = await request.app.state.upstream.get(
             "/session/status",
-            params={"directory": directory},
+            params=params,
             headers=forward_directory_headers(directory),
         )
     except httpx.RequestError as exc:
