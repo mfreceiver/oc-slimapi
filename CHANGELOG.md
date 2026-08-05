@@ -36,6 +36,10 @@ _(暂无)_
 
 _(暂无)_
 
+### Fixed
+
+- **`GET /slimapi/questions` 目录发现机制 bug 修复（未 bump `X-Slimapi-Version`，仍 2）**：发现调用从 `GET /session?limit=10000`（无 directory header）改为 `GET /project`。原实现误以为 `/session` 是"全局存储"（实测为 **per-Location**——按 `X-Opencode-Directory` 路由的 workdir instance，无 header 回落 `process.cwd()`，只返回 cwd workdir 的 session），导致 `workdir ≠ process.cwd()` 的所有 pending question **漏报**（实测：cwd workdir 37 条 session vs ocdroid workdir 193 条 + pending question 全不可见）。`GET /project` 返回 ProjectTable 全表（实测 27 个 workdir，跨所有 workdir，与 directory header 无关，handler 为 `db.select().from(ProjectTable).all()`），是真正的全局发现机制。字段映射：session 的 `directory` → project 的 `worktree`；跳过合成 "global" 项目（`worktree=="/"`，无真实 session/question）。**`discoveryComplete` 语义变化**：从「发现页未满（`len < limit`）时 true」改为「**恒 true**」（`/project` 无分页/截断概念，ProjectTable 一次全表返回）——故 `authoritativeDirectories` 现仅由 per-dir errors 决定（无 error → `null` 全局权威 replace-all；有 error → 成功 dir 数组 partial）。envelope 字段集 `{items, errors, authoritativeDirectories, discoveryComplete}` **不变**；所有错误码不变；total failure（发现失败 → 503 `upstream_unavailable`）不变。**已知 trade-off**：`/project` 只列出每个 project 的 worktree 根，**不**含 git worktree 子目录（如 `ocdroid/.slim/worktrees/wave0-*`）与临时目录（如 `/tmp/...`）——这些场景如有 pending question 仍会漏（次优方案 `/api/session` 旧版能覆盖但引入 `/api/` 命名空间，未采纳）。实现：`src/oc_slimapi/routes/questions.py`；测试：`tests/test_questions_routes.py`。
+
 ---
 
 ## [1.1.0] - 2026-08-05 — 批量加性端点（questions 跨目录聚合 / command / agent skeleton / sessions-status 回归），未 bump `X-Slimapi-Version`，仍 `2`

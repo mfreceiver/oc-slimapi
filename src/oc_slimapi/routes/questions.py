@@ -12,17 +12,6 @@ from ..upstream import forward_directory_headers
 
 router = APIRouter(prefix="/slimapi", tags=["questions"])
 
-# High limit for the directory-discovery /session call. The upstream legacy
-# /session listing is the only global source of "which directories have
-# sessions"; we pull a generous page so the distinct-directory set is as
-# complete as possible in one round-trip. Upstream legacy /session exposes NO
-# forward pagination cursor (`start` is a `time_updated >=` watermark filter,
-# not an offset/cursor), so raising the limit is the only lever — do NOT
-# attempt fake pagination loops. 10_000 is far above any realistic single-user
-# session count; if a response ever reaches this length it is treated as
-# possibly-truncated (see discoveryComplete below).
-_DISCOVERY_LIMIT = 10_000
-
 # Bounds concurrent per-dir /question fan-out within a single
 # /slimapi/questions request so a burst of many session-dirs cannot queue an
 # unbounded number of in-flight requests against the shared upstream client
@@ -41,10 +30,10 @@ async def questions(request: Request):
     instance): it only returns questions for the directory routed via
     ``X-Opencode-Directory`` and falls back to ``process.cwd()`` with no
     header, so questions pending in OTHER directories are invisible. This
-    endpoint fans out across every directory that has at least one session
-    and merges the results into a single envelope, fixing the slim-mode
-    cold-start regression where pending questions in a workdir ≠
-    ``process.cwd()`` could not be seen.
+    endpoint fans out across every discovered worktree (via the global
+    ``GET /project`` listing) and merges the results into a single envelope,
+    fixing the slim-mode cold-start regression where pending questions in a
+    workdir ≠ ``process.cwd()`` could not be seen.
 
     Additive (re-add); **no** ``X-Slimapi-Version`` bump (still 2). Each
     question entry is the upstream entry verbatim plus a ``directory`` field
@@ -73,25 +62,24 @@ async def questions(request: Request):
       non-listed/undiscovered dirs as "keep local" (partial-replace, no data
       loss). On discovery truncation this array protects the client from
       discarding pending questions in undiscovered directories.
-    - ``discoveryComplete`` (additive diagnostic): ``true`` iff the discovery
-      ``/session`` response held fewer than ``_DISCOVERY_LIMIT`` rows (i.e.
-      not truncated). Client may ignore if absent-aware.
+    - ``discoveryComplete`` (additive diagnostic): always ``true`` —
+      ``GET /project`` returns ProjectTable in full with no pagination, so
+      discovery is never truncated. Client may ignore if absent-aware.
 
-    Total failure (cannot list sessions to discover directories): HTTP 503
+    Total failure (cannot list projects to discover worktrees): HTTP 503
     ``{"code": "upstream_unavailable"}`` (no envelope).
     """
     upstream_client = request.app.state.upstream
 
     # ------------------------------------------------------------------
-    # Step 1: discover directories via the global /session list (no
-    # directory header — sessions are global storage). Any failure here is a
-    # TOTAL failure (503): without the directory set the sidecar cannot fan
-    # out, so the whole endpoint is unavailable to the client.
+    # Step 1: discover directories via GET /project (returns ProjectTable
+    # 全表 — 跨所有 workdir, 与 directory header 无关). This is the GLOBAL
+    # discovery source. The previous implementation used GET /session which
+    # is per-Location and could only see the cwd workdir's sessions, silently
+    # dropping pending questions from every other workdir.
     # ------------------------------------------------------------------
     try:
-        response = await upstream_client.get(
-            "/session", params={"limit": _DISCOVERY_LIMIT},
-        )
+        response = await upstream_client.get("/project")
     except httpx.RequestError as exc:
         raise CodedHTTPException(503, code="upstream_unavailable") from exc
     # Traffic accounting: discovery upstream body.
@@ -103,26 +91,31 @@ async def questions(request: Request):
         # the client about which directory failed.
         raise CodedHTTPException(503, code="upstream_unavailable")
     try:
-        sessions_payload = response.json()
+        projects_payload = response.json()
     except Exception as exc:
         raise CodedHTTPException(503, code="upstream_unavailable") from exc
-    if not isinstance(sessions_payload, list):
+    if not isinstance(projects_payload, list):
         raise CodedHTTPException(503, code="upstream_unavailable")
 
-    # Discovery completeness: upstream legacy /session has no forward cursor,
-    # so a full page (len == limit) means the directory set is *possibly*
-    # truncated. Downgraded to "partial" authority below to avoid the client
-    # discarding pending questions from undiscovered directories.
-    discovery_complete = len(sessions_payload) < _DISCOVERY_LIMIT
+    # /project has no pagination — ProjectTable is returned in full, so
+    # discovery is always complete (no truncation possible). The
+    # discoveryComplete field is retained in the envelope for backward
+    # compatibility and is always True.
+    discovery_complete = True
 
     # ------------------------------------------------------------------
-    # Step 2: derive the DISTINCT set of directory values (first-seen
-    # order). Sessions without a string `directory` field are ignored.
+    # Step 2: derive the DISTINCT set of worktree values (first-seen
+    # order). Skip the synthetic "global" project (worktree "/") which has
+    # no real sessions/questions, and skip non-string/empty worktrees
+    # defensively.
     # ------------------------------------------------------------------
     directories: list[str] = list(dict.fromkeys(
-        s["directory"]
-        for s in sessions_payload
-        if isinstance(s, dict) and isinstance(s.get("directory"), str)
+        p["worktree"]
+        for p in projects_payload
+        if isinstance(p, dict)
+           and isinstance(p.get("worktree"), str)
+           and p["worktree"]
+           and p["worktree"] != "/"
     ))
 
     # ------------------------------------------------------------------
