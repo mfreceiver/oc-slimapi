@@ -41,5 +41,11 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=oc-slimapi
 
+# Memory hard cap. The arithmetic of max_transforms=1 + max_response_bytes=64MiB
+# + 16MiB inline cap + Python/Baseline RSS fits under 384M (see design-v2 §0.10,
+# transform.py docstring). cgroup-enforced OOM kill protects the host if a
+# runaway upstream body ever bypasses the read_with_cap fences.
+MemoryMax=384M
+
 [Install]
 WantedBy=default.target

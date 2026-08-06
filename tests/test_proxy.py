@@ -364,3 +364,43 @@ async def test_proxy_strips_client_ident_headers(upstream_factory):
     assert "x-client-id" not in captured_lower
     # Verify other headers still pass through.
     assert captured_lower.get("x-custom-forward") == "should-pass"
+
+
+# ── T2: catch-all upstream network errors → 503 upstream_unavailable ─────────
+
+
+async def test_catch_all_upstream_connect_error_returns_503(upstream_factory):
+    """catch-all proxy: client.send raises httpx.ConnectError → 503 upstream_unavailable.
+    Regression: previously escaped as bare FastAPI 500 (INTERFACE_MAP §4 known gap)."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("simulated", request=request)
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/session/ses_x/message",
+            content=b'{"role":"user","content":"hi"}',
+            headers={"Content-Type": "application/json"},
+        )
+    assert response.status_code == 503
+    assert response.json()["code"] == "upstream_unavailable"
+
+
+async def test_catch_all_upstream_read_timeout_returns_503(upstream_factory):
+    """catch-all proxy: client.send raises httpx.ReadTimeout → 503 upstream_unavailable."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("simulated", request=request)
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/session/ses_x/message",
+            content=b'{"role":"user","content":"hi"}',
+            headers={"Content-Type": "application/json"},
+        )
+    assert response.status_code == 503
+    assert response.json()["code"] == "upstream_unavailable"

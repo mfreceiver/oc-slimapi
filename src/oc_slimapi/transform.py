@@ -99,6 +99,13 @@ def strip_diagnostics_and_pack(
     # zero-length input as an empty document). Do not swallow here — the
     # route layer turns it into a structured 503.
     parsed = orjson.loads(body)
+    if not isinstance(parsed, dict):
+        # /full/{mid} expects a single message dict. A non-dict body (list/
+        # null/scalar) would otherwise be passed through verbatim by
+        # strip_diagnostics_message's shape-robustness guard (skeleton.py),
+        # surfacing a malformed upstream 200 as a confusing 200 to the
+        # client. Treat as malformed upstream → route maps to 503.
+        raise ValueError("upstream single-message body is not a dict")
     projected = strip_diagnostics_message(parsed)
     return _pack_json(projected, accept_encoding)
 

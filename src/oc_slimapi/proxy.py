@@ -1,5 +1,6 @@
 import re
 
+import httpx
 from fastapi import FastAPI, Request, WebSocket
 from starlette.background import BackgroundTask
 from starlette.responses import JSONResponse, StreamingResponse
@@ -194,7 +195,18 @@ def install_proxy(app: FastAPI) -> None:
             sid = _extract_sid_from_path(norm_path)
             if sid is not None:
                 turn_registry.bump_turn(sid)
-        response = await client.send(upstream_request, stream=True)
+        try:
+            response = await client.send(upstream_request, stream=True)
+        except httpx.RequestError as exc:
+            # Align catch-all with thin routes (sessions/messages/agent/...):
+            # upstream connect/read/timeout/pool failures → structured 503
+            # upstream_unavailable, not a bare FastAPI 500. NOTE: turn-fence
+            # bump above (line ~196) already advanced; the resulting hole on
+            # send-failure is tolerated by ocdroid's lex comparison
+            # (see comment block above) — no rollback here. Scope: only the
+            # send() call itself; mid-stream breaks (send already returned)
+            # surface via _counted_upstream_response's finally.
+            raise CodedHTTPException(503, code="upstream_unavailable") from exc
         # Wrap the upstream response iterator so we count the bytes returned
         # to the client (``upIn`` — the upstream leg of THIS request). The
         # finally guarantees the count lands even on disconnect / error mid

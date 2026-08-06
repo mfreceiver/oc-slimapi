@@ -14,14 +14,16 @@ from oc_slimapi.transform import TransformConfig, TransformPool
 VERSION_HEADERS = {"X-Slimapi-Version": "1"}
 
 
-def _settings() -> Settings:
-    return Settings(
+def _settings(**overrides) -> Settings:
+    base = dict(
         host="127.0.0.1", port=4097, upstream="http://127.0.0.1:4096",
         max_message_bytes=32 * 1024 * 1024,
         max_transforms=1, transform_wait_seconds=0.5, max_response_bytes=64 * 1024,
         smoke_session_id=None,
         server_api_version=1, accepted_client_versions=(1, 1),
     )
+    base.update(overrides)
+    return Settings(**base)
 
 
 def _build_app(
@@ -29,9 +31,10 @@ def _build_app(
     *,
     hubs: object | None = None,
     turn_registry: object | None = None,
+    settings: Settings | None = None,
 ) -> FastAPI:
     app = FastAPI(title="oc-slimapi-sessions-test")
-    app.state.config = _settings()
+    app.state.config = settings or _settings()
     app.state.upstream = upstream
     app.state.schema_degraded = False
     # Transform pool (mirrors the real app's setup; required for offload).
@@ -137,6 +140,32 @@ async def test_sessions_list_network_error_returns_503(upstream_factory):
     assert response.json()["code"] == "upstream_unavailable"
 
 
+async def test_sessions_list_mid_stream_read_error_returns_503(upstream_factory):
+    """sessions list: upstream returns 200 then disconnects mid-body → 503
+    upstream_unavailable.
+
+    Regression: streaming read_with_cap() must map httpx.ReadError to
+    structured 503, not bare 500.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        async def failing_body():
+            yield b'{"info":'
+            raise httpx.ReadError("simulated mid-stream disconnect", request=request)
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            content=failing_body(),
+        )
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream, settings=_settings(max_response_bytes=64 * 1024))
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/slimapi/sessions", headers=VERSION_HEADERS)
+    assert response.status_code == 503
+    assert response.json()["code"] == "upstream_unavailable"
+
+
 async def test_sessions_list_upstream_200_bad_json_returns_503(upstream_factory):
     """GET /slimapi/sessions upstream 200 but body not JSON → 503 upstream_unavailable.
 
@@ -176,7 +205,26 @@ async def test_sessions_list_upstream_200_non_array_json_returns_503(upstream_fa
 
 
 
+async def test_sessions_list_oversize_body_returns_413(upstream_factory):
+    """sessions list upstream body > max_response_bytes → 413 response_too_large.
+    Aligns sessions list with messages/agent/command cap behaviour (closes
+    the known limitation noted at sessions.py:42-44)."""
+    cap = 4 * 1024
+    oversized = b"x" * (cap * 16)
 
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=oversized,
+                              headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream, settings=_settings(max_response_bytes=cap))
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/slimapi/sessions", headers=VERSION_HEADERS)
+    assert response.status_code == 413
+    body = response.json()
+    assert body["code"] == "response_too_large"
+    assert body["limit"] == cap
 
 
 
@@ -331,6 +379,25 @@ async def test_sessions_roots_default_unchanged_false(upstream_factory):
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         r = await client.get("/slimapi/sessions?roots=true", headers=VERSION_HEADERS)
     assert captured["roots"] == "true"
+
+
+async def test_sessions_list_scalar_element_list_returns_503(upstream_factory):
+    """sessions list: upstream returns [1, null] (list of non-dict) → 503
+    upstream_unavailable.
+
+    Regression: skeleton_session would call .get() on non-dict → bare 500.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b'[1, null]',
+                              headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/slimapi/sessions", headers=VERSION_HEADERS)
+    assert response.status_code == 503
+    assert response.json()["code"] == "upstream_unavailable"
 
 
 async def test_sessions_non_list_payload_returns_503_no_completeness_headers(upstream_factory):

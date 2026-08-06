@@ -70,8 +70,16 @@ def _project_list_sorted_and_pack(
     inline (kept private to that module) so this stays self-contained.
     """
     parsed = orjson.loads(body)
-    if isinstance(parsed, list):
-        parsed.sort(key=_created_sort_key)
+    if not isinstance(parsed, list) or not all(
+        isinstance(m, dict) for m in parsed
+    ):
+        # Mirrors sessions.py non-list guard: a non-list body (dict/null)
+        # OR a list with non-dict elements (scalar-list like [1,2,"x"])
+        # would make skeleton_messages / _created_sort_key call .get() on
+        # the wrong type → AttributeError. Treat as malformed upstream →
+        # route maps to 503.
+        raise ValueError("upstream message body is not a list of message dicts")
+    parsed.sort(key=_created_sort_key)
     projected = skeleton_messages(parsed)
     encoded = orjson.dumps(projected)
     headers: dict[str, str] = {"Vary": "Accept-Encoding"}
@@ -315,7 +323,7 @@ async def messages(
                         _project_list_sorted_and_pack, body,
                         accept_encoding=request.headers.get("accept-encoding"),
                     )
-                except orjson.JSONDecodeError as exc:
+                except (orjson.JSONDecodeError, ValueError) as exc:
                     raise CodedHTTPException(
                         503, code="upstream_unavailable",
                     ) from exc
@@ -420,7 +428,7 @@ async def message(
                         strip_diagnostics_and_pack, body,
                         accept_encoding=accept_encoding,
                     )
-                except orjson.JSONDecodeError as exc:
+                except (orjson.JSONDecodeError, ValueError) as exc:
                     raise CodedHTTPException(
                         503, code="upstream_unavailable",
                     ) from exc

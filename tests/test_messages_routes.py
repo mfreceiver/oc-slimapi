@@ -495,8 +495,14 @@ async def test_full_single_returns_transform_busy_with_no_upstream_get(upstream_
 
 
 async def test_full_single_wrong_shape_2xx_served(upstream_factory):
-    """A malformed-shape 200 body (non-dict) is served as-is — the strip is a
-    no-op on shapes it can't scrub, matching prior verbatim passthrough (no 500)."""
+    """A malformed-shape 200 body (non-dict) is rejected as 503 upstream_unavailable.
+
+    Task 1 / spec T1 (grilling extension): the full/{mid} worker now guards
+    that the upstream body is a single-message dict (mirroring the list
+    endpoint's non-list guard, opposite direction). Previously such a body
+    was passed through verbatim as 200 via strip_diagnostics_message's
+    shape-robustness no-op; that surfaced a malformed upstream 200 as a
+    confusing 200 to the client. An empty list ``[]`` is a non-dict → 503."""
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
 
@@ -508,8 +514,8 @@ async def test_full_single_wrong_shape_2xx_served(upstream_factory):
             response = await client.get(
                 "/slimapi/messages/s1/full/m1", headers=VERSION_HEADERS,
             )
-        assert response.status_code == 200
-        assert response.json() == []
+        assert response.status_code == 503
+        assert response.json()["code"] == "upstream_unavailable"
     finally:
         app.state.transforms.shutdown()
 
@@ -1367,5 +1373,114 @@ async def test_deleted_endpoints_return_404(upstream_factory, method, path, desc
             f"{description}: expected 404 for deleted endpoint, got "
             f"{response.status_code}"
         )
+    finally:
+        app.state.transforms.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Skeleton list endpoint — non-list body guard → 503 upstream_unavailable.
+# (Task 1 / spec T1: a malformed upstream 200 must not escape as a bare 500.
+# Mirrors the sessions non-array guard; the list worker expects a list and
+# a dict / null / scalar-list body would otherwise AttributeError.)
+# ---------------------------------------------------------------------------
+
+async def test_messages_list_non_list_dict_body_returns_503(upstream_factory):
+    """Upstream 200 but JSON is a dict (not list) → 503 upstream_unavailable.
+    Regression: skeleton_messages received a dict → AttributeError → bare 500."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b'{"unexpected":"shape"}',
+                              headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/slimapi/messages/s1", headers=VERSION_HEADERS)
+        assert response.status_code == 503
+        assert response.json()["code"] == "upstream_unavailable"
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_messages_list_non_list_null_body_returns_503(upstream_factory):
+    """Upstream 200 but JSON is null → 503 upstream_unavailable."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"null",
+                              headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/slimapi/messages/s1", headers=VERSION_HEADERS)
+        assert response.status_code == 503
+        assert response.json()["code"] == "upstream_unavailable"
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_messages_list_scalar_list_body_returns_503(upstream_factory):
+    """Upstream 200 but JSON is a list of scalars → 503 upstream_unavailable.
+    Regression: skeleton_message received a str element → AttributeError → bare 500."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b'[1, 2, "x"]',
+                              headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/slimapi/messages/s1", headers=VERSION_HEADERS)
+        assert response.status_code == 503
+        assert response.json()["code"] == "upstream_unavailable"
+    finally:
+        app.state.transforms.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# full/{mid} endpoint — non-dict body guard → 503 upstream_unavailable.
+# (Task 1 / spec T1, grilling extension: the full worker expects a single
+# message dict; a list / null body would make strip_diagnostics_message
+# AttributeError. Mirrors the list-endpoint guard, opposite direction.)
+# ---------------------------------------------------------------------------
+
+async def test_message_full_non_dict_list_body_returns_503(upstream_factory):
+    """GET /slimapi/messages/{sid}/full/{mid}: upstream returns a list (not a
+    single-message dict) → 503 upstream_unavailable.
+    Regression: strip_diagnostics_message received a list → AttributeError → bare 500.
+    Mirrors the list-endpoint non-list guard (grilling扩展覆盖 full)."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b'[{"info":{"id":"m1"},"parts":[]}]',
+                              headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/slimapi/messages/s1/full/m1", headers=VERSION_HEADERS)
+        assert response.status_code == 503
+        assert response.json()["code"] == "upstream_unavailable"
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_message_full_non_dict_null_body_returns_503(upstream_factory):
+    """GET /slimapi/messages/{sid}/full/{mid}: upstream returns null → 503 upstream_unavailable."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"null",
+                              headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/slimapi/messages/s1/full/m1", headers=VERSION_HEADERS)
+        assert response.status_code == 503
+        assert response.json()["code"] == "upstream_unavailable"
     finally:
         app.state.transforms.shutdown()

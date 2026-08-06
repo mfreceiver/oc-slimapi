@@ -92,7 +92,7 @@
 - `/health`：liveness，进程可服务→200。
 - `/ready`：探 `GET /global/health`，upstream 不通→503 `{"upstream":{"ok":false}}`。
 - 两者均暴露 `server.api_version`；health 另暴露 `server.accepted_client_versions`，客户端据此自检。
-- 启动字段漂移 smoke 已移除（不再校验已知 sid 的消息字段）。
+- 启动字段漂移 smoke 保留（app.py:35-56 运行消息字段校验，异常设 schema_degraded 供 health/ready 回显）。
 
 ### 1.6 透传反代（catch-all）
 - 非 `/slimapi/**` → `http://127.0.0.1:4096/{path}`；method/query/body 流式透传。

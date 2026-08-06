@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import httpx
+import orjson
 from fastapi import APIRouter, Query, Request
 
 from ..directory import validate_directory
@@ -8,7 +9,7 @@ from ..errors import CodedHTTPException
 from ..gzip_util import json_response
 from ..skeleton import skeleton_session
 from ..traffic import stash_up_in
-from ..transform import TransformBusy
+from ..transform import TransformBusy, read_with_cap
 from ..upstream import forward_directory_headers
 from ..upstream_errors import raise_upstream_status
 
@@ -39,41 +40,79 @@ async def sessions(
     # concurrent sessions-list requests (upstream body buffering + parse +
     # projection) by max_transforms so a burst cannot monopolise memory /
     # event-loop CPU. The slot is held across fetch→parse→project.
-    # Known limitation vs messages: the single-response body is not yet
-    # bounded by read_with_cap (no 413 on oversize) — pre-existing, out of
-    # this batch's scope; concurrency is bounded here.
+    config = request.app.state.config
     try:
         async with request.app.state.transforms as pool:
+            # Stream + cap-read so an oversized upstream /session body cannot
+            # spike sidecar RSS (mirrors messages.py:275-303). Cap metric =
+            # decompressed logical bytes.
             try:
-                response = await request.app.state.upstream.get(
-                    "/session", params=params, headers=forward_directory_headers(directory),
+                response = await request.app.state.upstream.send(
+                    request.app.state.upstream.build_request(
+                        "GET", "/session",
+                        params=params, headers=forward_directory_headers(directory),
+                    ),
+                    stream=True,
                 )
             except httpx.RequestError as exc:
                 raise CodedHTTPException(503, code="upstream_unavailable") from exc
-            # Traffic accounting: sessions-list upstream body.
-            stash_up_in(request, len(response.content))
             try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                raise_upstream_status(exc)
-            try:
-                payload = response.json()
-            except Exception as exc:
-                raise CodedHTTPException(503, code="upstream_unavailable") from exc
-            if not isinstance(payload, list):
-                # v6 §1.1: dict / string / null etc. would have been silently
-                # iterated by ``for item in payload`` and yielded a 200 with
-                # ``X-Complete: true`` (the empty skeleton list). Treat non-list
-                # bodies as a malformed upstream — same 503 as the sibling
-                # ``response.json()`` failure path. No completeness headers on
-                # this branch (the contract is: 200 only).
-                raise CodedHTTPException(503, code="upstream_unavailable")
-            # Offload skeleton projection to the worker so the event loop is
-            # not blocked by deep copy of potentially many sessions.
-            sessions = await pool.offload(
-                _project_sessions,  # helper below
-                payload,
-            )
+                # Wrap mid-stream upstream I/O failures (httpx.RequestError
+                # raised by aread() or read_with_cap aiter_bytes()) into a
+                # structured 503 instead of bubbling up as an unhandled
+                # FastAPI 500. The finally below still runs to release the
+                # connection (mirrors messages.py).
+                try:
+                    if response.status_code >= 400:
+                        # Drain upstream error body for connection reuse
+                        # (mirrors messages.py).
+                        err_body = await response.aread()
+                        stash_up_in(request, len(err_body))
+                        try:
+                            response.raise_for_status()
+                        except httpx.HTTPStatusError as exc:
+                            raise_upstream_status(exc)
+                    body, n_read = await read_with_cap(response, config.max_response_bytes)
+                    if body is None:
+                        raise CodedHTTPException(
+                            413, code="response_too_large",
+                            limit=config.max_response_bytes,
+                        )
+                    # Traffic accounting: skeleton-mode upstream bytes.
+                    stash_up_in(request, n_read)
+                    try:
+                        payload = orjson.loads(body)
+                    except (orjson.JSONDecodeError, ValueError) as exc:
+                        raise CodedHTTPException(
+                            503, code="upstream_unavailable",
+                        ) from exc
+                    if not isinstance(payload, list):
+                        # v6 §1.1: dict / string / null etc. would have been silently
+                        # iterated by ``for item in payload`` and yielded a 200 with
+                        # ``X-Complete: true`` (the empty skeleton list). Treat non-list
+                        # bodies as a malformed upstream — same 503 as the sibling
+                        # ``response.json()`` failure path. No completeness headers on
+                        # this branch (the contract is: 200 only).
+                        raise CodedHTTPException(503, code="upstream_unavailable")
+                    if payload and not all(isinstance(s, dict) for s in payload):
+                        # Scalar-element list (e.g. [1, null, "x"]) would make
+                        # skeleton_session() call .get() on non-dict → AttributeError.
+                        # Mirrors messages list element-level guard (Task 1).
+                        raise CodedHTTPException(503, code="upstream_unavailable")
+                    # Offload skeleton projection to the worker so the event loop is
+                    # not blocked by deep copy of potentially many sessions.
+                    sessions = await pool.offload(
+                        _project_sessions,  # helper below
+                        payload,
+                    )
+                except httpx.RequestError as exc:
+                    # Covers: aread() mid-stream read failure (error body drain)
+                    # and read_with_cap() mid-stream read failure (success body).
+                    # send() connection failure is covered by the sibling except
+                    # above. All → structured 503.
+                    raise CodedHTTPException(503, code="upstream_unavailable") from exc
+            finally:
+                await response.aclose()
     except TransformBusy as exc:
         raise CodedHTTPException(503, code="transform_busy") from exc
     # v6 §1.1: completeness signal header (200-only — 503 / 502 paths above

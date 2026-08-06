@@ -42,6 +42,16 @@ _(暂无)_
 
 ---
 
+## [1.1.2] - 2026-08-06 — 错误面硬化 + sessions 内存防线 + 文档语义同步（未 bump `X-Slimapi-Version`，仍 2）
+
+### Fixed
+
+- **catch-all 反代上游网络异常 → 503 `upstream_unavailable`（加性硬化，未 bump `X-Slimapi-Version`，仍 2，2026-08-06）**：catch-all 反代（`proxy.py` 的 `client.send`）在 `httpx.RequestError`（connect / read / write timeout、pool failure、`RemoteProtocolError` 等连接与请求建立阶段错误）时此前逃逸为 FastAPI 默认裸 `500 Internal Server Error`，现统一映射为结构化 `503 {"code":"upstream_unavailable"}`，与 thin 路由（sessions/messages/agent/command/questions）的错误面对齐（INTERFACE_MAP §4 known gap 收口）。**加性变更，不 bump** `X-Slimapi-Version`（无 client 依赖现有裸 500；新行为是 thin 路由既有行为的补齐）。**边界**：except 仅覆盖 `send()` 调用本身；mid-stream 断开（send 已返回 StreamingResponse 之后）走 `_counted_upstream_response` 的 finally，不经过此 except。**catch-all per-request timeout 不变**（SSE=None / command=300s / 其他=30s，`proxy.py:172-177`）。**turn-fence 语义不变**：send 失败产生的 turn hole（bump-before-send 已 advance）由 ocdroid lex 容忍，无 rollback。实现：`src/oc_slimapi/proxy.py`；测试：`tests/test_proxy.py`（ConnectError / ReadTimeout → 503）。
+- **`GET /slimapi/messages/{sid}/full/{mid}` 非 dict body → 503 `upstream_unavailable`（加性硬化，未 bump `X-Slimapi-Version`，仍 2，2026-08-06）**：`/full/{mid}` 端点期待单条 message dict；上游返回非 dict body（list / null / scalar）时，`strip_diagnostics_message`（skeleton.py）的 shape-robustness 守卫此前将其**原样透传**，把畸形上游 200 作为令人困惑的 200 返回客户端。现 worker 在数据接触点加 `isinstance(parsed, dict)` 守卫抛 `ValueError`，路由层 catch 扩展为 `(orjson.JSONDecodeError, ValueError)` 统一映射 `503 {"code":"upstream_unavailable"}`（畸形 body 不应透传客户端）。**加性变更，不 bump** `X-Slimapi-Version`（无 client 依赖现有 200 透传畸形 body；新行为是 thin 路由既有 JSONDecodeError 守卫的补齐）。与 messages list 非 list body 守卫同范式。实现：`src/oc_slimapi/transform.py` + `src/oc_slimapi/routes/messages.py`；测试：`tests/test_messages_routes.py`（list body / null body → 503）。
+- **`GET /slimapi/sessions` body 超 `max_response_bytes` → 413 `response_too_large`（加性硬化，未 bump `X-Slimapi-Version`，仍 2，2026-08-06）**：sessions list 端点原用非流式 `upstream.get` + `response.json()` 全 buffer，无 body cap（known limitation，`sessions.py:42-44`）。现改为流式 `build_request + send(stream=True)` + `read_with_cap(config.max_response_bytes)`，超限 → 413 `response_too_large`（+ `limit` 字段），与 messages/agent/command 的 64MiB 内存防线对齐。mid-stream `httpx.ReadError`/`ReadTimeout` → 503 `upstream_unavailable`（内层 `except httpx.RequestError` 覆盖 `aread()` + `read_with_cap()`）。**加性变更，不 bump** `X-Slimapi-Version`（无 client 依赖现有全 buffer 行为）。实现：`src/oc_slimapi/routes/sessions.py`；测试：`tests/test_sessions_routes.py`（oversize → 413 / mid-stream ReadError → 503）。
+
+---
+
 ## [1.1.1] - 2026-08-06 — questions 目录发现 bug 修复（`GET /session` → `GET /project`），未 bump `X-Slimapi-Version`，仍 `2`
 
 ### Fixed
