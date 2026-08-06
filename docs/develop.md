@@ -22,6 +22,14 @@ python -m venv .venv
 | `OC_SLIMAPI_SMOKE_SESSION_ID` | 无 | 启动字段漂移 smoke 的已知 sid |
 | `OC_SLIMAPI_SERVER_API_VERSION` | `2` | 服务端当前整数 API 版本 |
 | `OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS` | `2,2` | 接受的客户端版本闭区间 |
+| `OC_SLIMAPI_SKELETON_INLINE_OUTPUT_MAX_BYTES` | `4096` | 骨架投影单字段 inline 字节上限（超阈值则降级为引用占位） |
+| `OC_SLIMAPI_TRAFFIC_METRICS_ENABLED` | `1` | 双向字节账本总开关；`0` 时 `/slimapi/metrics.traffic` 与 ledger 全 no-op |
+| `OC_SLIMAPI_ACCESS_LOG_DIR` | `logs` | access log 目录（按天文件 `access-YYYY-MM-DD.jsonl`）；生产 systemd 覆盖为 `%S/oc-slimapi/logs` |
+| `OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS` | `0` | prune 早于 N 天的 `access-YYYY-MM-DD.jsonl(.gz)`（**代码默认 `0`=不删**；生产 unit 配 `3`） |
+| `OC_SLIMAPI_TRAFFIC_SNAPSHOT_ENABLED` | `1` | 内存账本周期快照开关（按天 `traffic-snapshot-YYYY-MM-DD.jsonl`） |
+| `OC_SLIMAPI_TRAFFIC_SNAPSHOT_PATH` | `logs/traffic-snapshot.jsonl` | 快照文件名 stem；生产 systemd 覆盖为 `%S/oc-slimapi/logs/traffic-snapshot.jsonl` |
+
+> 上表为**速查**（高频运维 knob）。**完整权威清单与默认值见 [`src/oc_slimapi/config.py`](../src/oc_slimapi/config.py) 的 `Settings` dataclass**（含 T3/SSE 上限、token-stream 预算、transform 池、deployment revision、client-id hash 等，共 35+ 项）。落盘日志/流量查询手册见 [`manual/traffic-accounting.md`](manual/traffic-accounting.md)。
 
 > v2 已移除 routeToken/route_secret，无需 route secret。
 

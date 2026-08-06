@@ -30,7 +30,7 @@ ocdroid (Android)
 
 | 依赖 | 说明 |
 |---|---|
-| Python ≥ 3.13（venv 推荐，Debian/Ubuntu PEP 668 不要系统强装） | 当前实测 3.14.4 |
+| Python ≥ 3.11（venv 推荐，Debian/Ubuntu PEP 668 不要系统强装） | 当前实测 3.14.4 |
 | opencode :4096 已启动 | 启动时 smoke 探针会打 `/session?limit=1` + `/session/{sid}/message?limit=1` |
 | systemd user instance + `Linger=yes` | 保证登出后服务存活；本机已开 |
 
@@ -88,6 +88,9 @@ RestartSec=5
 Environment=OC_SLIMAPI_HOST=0.0.0.0   # 或 127.0.0.1（仅 loopback，更保守）
 Environment=OC_SLIMAPI_PORT=4097
 Environment=OC_SLIMAPI_UPSTREAM=http://127.0.0.1:4096
+Environment=OC_SLIMAPI_MAX_MESSAGE_BYTES=33554432
+Environment=OC_SLIMAPI_SERVER_API_VERSION=2
+Environment=OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS=2,2
 Environment=PYTHONUNBUFFERED=1
 
 # v1.0.0: access log + traffic snapshot 落 StateDirectory（systemd 自动建
@@ -266,7 +269,7 @@ curl -s -H 'X-Slimapi-Version: 2' http://127.0.0.1:4097/slimapi/health | jq .
 ```json
 {
   "slimapi_contract": 2,
-  "sidecar": { "ok": true, "version": "0.12.0" },
+  "sidecar": { "ok": true, "version": "1.1.1" },
   "server":  { "api_version": 2, "accepted_client_versions": [2, 2] },
   "schema":  { "degraded": false, "version": 2, "clientMin": 2, "clientMax": 2 },
   "features": { "tokenStream": true, "thresholdedSkeleton": true, "skeletonInlineOutputMaxBytes": 4096 }

@@ -304,4 +304,4 @@ jq -c '{ts, ratio: .ratios.messages.downOutOverUpIn}' /tmp/snap-all.jsonl
 
 - 契约 / 设计：[`docs/specs/v2-contract.md`](../specs/v2-contract.md)（§2 `/slimapi/metrics`、§7 可观测性/access log/client header、§12 流量查询）
 - 运维手册：[`docs/operations.md`](../operations.md)（§5 日志策略、§5.2 落盘目录、§5.3 维护）
-- 变更记录：[`CHANGELOG.md`](../CHANGELOG.md) `[0.7.0]`（access log + traffic 首版）、`[Unreleased]`（按天切分 + client header + snapshot）
+- 变更记录：[`CHANGELOG.md`](../CHANGELOG.md) `[0.7.0]`（access log + traffic 首版）、`[1.0.0]`（按天切分 + client header + snapshot）

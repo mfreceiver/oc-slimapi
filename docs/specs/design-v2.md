@@ -62,15 +62,16 @@
 - **吐出帧（仅以下）**：
   1. **`event: session.digest`**——debounce 250ms/session，每 session 一帧；窗口内有变化的 session 才发，字段按变化出现：
      ```
-     event: session.digest
-      data: {"sessionID":"...","directory":"/path","status?":"busy","messageID?":"msg_..","updatedAt?":<epoch_ms>,"archived?":<epoch_ms>,"deleted?":true,"lastError?":{"name":"...","message":"...","at":<epoch_ms>}|null}
-     ```
-     - `status` ← `session.status`(idle/busy) 的 properties.status
-     - `messageID` ← `message.updated`/`message.appended` 的 `info.id`（取最新）
-     - `updatedAt` ← sidecar 收到事件时的 **wall-clock epoch-ms**（非上游时间戳）
-     - `deleted=true` ← `session.deleted`（一旦为 true 持续到窗口结束）
-     - `archived` ← `session.updated` 的 `info.time.archived`（epoch_ms int，一旦有值粘滞保留到窗口结束）
-     - `directory` ← GlobalEvent 的 directory
+      event: session.digest
+       data: {"sessionID":"...","directory":"/path","status?":"busy","messageID?":"msg_..","updatedAt?":<epoch_ms>,"archived?":<epoch_ms>,"deleted?":true,"lastError?":{"name":"...","message":"...","at":<epoch_ms>}|null,"turnIncarnation?":<int>,"turn?":<int>}
+      ```
+      - `status` ← `session.status`(idle/busy) 的 properties.status
+      - `messageID` ← `message.updated`/`message.appended` 的 `info.id`（取最新）
+      - `updatedAt` ← sidecar 收到事件时的 **wall-clock epoch-ms**（非上游时间戳）
+      - `deleted=true` ← `session.deleted`（一旦为 true 持续到窗口结束）
+      - `archived` ← `session.updated` 的 `info.time.archived`（epoch_ms int，一旦有值粘滞保留到窗口结束）
+      - `directory` ← GlobalEvent 的 directory
+      - `turnIncarnation?`/`turn?`（turn token fence，**配对出现/缺失**）：服务端因果标识，flat 顶层；turn_registry 装配（lifespan 级）时 stamp（未观测 sid → `(inc,0)`），未装配时两字段缺省。详见 `v2-contract.md` §3.y。
       - **`lastError`（G1-A）**←有 sid 的 `session.error` 经脱敏后的 `{name,message,at}`（`at`=sidecar 收到 epoch-ms）。**三态 wire**（与 sticky 共存，互不矛盾；权威见 `docs/specs/v2-contract.md` §3）：
        - **对象** `{name,message,at}`：本窗口新 error，或 flush 时该 sid 仍有 sticky（其它字段触发的后续 digest 会继续带出对象，直至 clear/deleted）；error 到达时**立即 flush**（不等 250ms）
        - **显式 `null`**：clear 帧——该 session 出现新 `status=busy` 时 pop sticky 并立即 flush
@@ -99,6 +100,27 @@
 - **超时**：command ≥300s（客户端 commandApi 读超时）；SSE 无限 read + 禁缓冲 + `aiter_raw()` 保 `Content-Encoding`。
 - **WebSocket**→501（不处理；PTY 需另上 nginx/Caddy）。
 - **SSRF 防护**：upstream 固定 loopback，禁参数控制；禁 body 日志。
+
+### 1.7 `GET /slimapi/questions`（跨目录 pending question 聚合，加性）
+
+- **参数**：无（sidecar 自发现目录）。
+- **upstream**：两阶段 fan-out——(1) `GET /project`（ProjectTable 全表，跨所有 workdir）发现 distinct worktree 集合（跳过合成 global `worktree=="/"`）；(2) 并发（`asyncio.gather`）对每个 dir `GET /question`（带 `X-Opencode-Directory`）合并。
+- **转化**：每条上游 entry 原样转发 + 追加 `directory` 字段（无 skeleton 投影、无转换池 admission）。
+- **响应**：**envelope 对象** `{items, errors, authoritativeDirectories, discoveryComplete}`（非裸数组，表达 partial 失败）。`discoveryComplete` 恒 `true`（`/project` 无分页/截断）。
+- **客户端契约**：`authoritativeDirectories==null` → 全局 replace-all；数组 → 仅 partial replace 所列 dir（不得丢弃未覆盖 dir 的既有 pending question，否则数据丢失）。
+- **保护**：发现调用失败 → 整体 503 `upstream_unavailable`（无 envelope）；per-dir 失败 isolated 进 `errors[]`（5xx→`upstream_unavailable`，4xx→`upstream_http_N`，不中断整体）。
+- **加性**：未 bump `X-Slimapi-Version`（仍 2）；旧 sidecar→catch-all 404 `thin_route_not_found`。详见 `v2-contract.md` §2「`/slimapi/questions` envelope」。
+
+### 1.8 `GET /slimapi/command` / `GET /slimapi/agent`（catalog skeleton，加性）
+
+- **参数**：`directory?`（可选，仅作 `X-Opencode-Directory` header 转发；catalog 全局，上游忽略）。
+- **upstream**：`GET /command` / `GET /agent`（透传）。
+- **转化**（白名单投影）：
+  - `/command`：留 `{name,description,agent?,hints?}`，丢 `template`/`source`/`model`/`subtask`（raw 省 ~97.6%）。
+  - `/agent`：留 `{name,description,mode,hidden?,native?}`，丢 `prompt`/`permission`/`topP`/`temperature`/`color`/`variant`/`options`/`steps`/`model`（raw 省 ~95.8%）。
+- **响应**：裸数组；catalog 无 `hasFull`/`omitted`（无 per-entry expand 端点）。
+- **保护**：转换池 admission 先于 upstream GET + 流式 `read_with_cap`（超 `max_response_bytes`→413）+ worker gzip；错误映射同 messages thin 路由（4xx→502 `upstream_http_N`；5xx/网络/坏 JSON/非 list→503 `upstream_unavailable`；转换池满→503 `transform_busy`+`Retry-After:2`；参数错误 422）。
+- **加性**：未 bump `X-Slimapi-Version`（仍 2）；旧 sidecar→catch-all 404，回退透传 `GET /command`/`GET /agent`。详见 `v2-contract.md` §2。
 
 ---
 

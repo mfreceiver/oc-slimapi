@@ -17,7 +17,7 @@ ocdroid ──(stunnel mTLS 14096)──▶ opencode :4096   # 直连回退，�
 ```
 
 - **只**通过 HTTP 调 opencode **legacy** `/session/**`（及 `/global/event` 等），**不读** opencode SQLite。
-- 为 ocdroid 提供：消息 skeleton 投影、策展 SSE（`session.digest` + q/p 直推）、routeToken 写端点、T3 资源限制、`/slimapi/**` 版本门禁 + catch-all 反代。
+- 为 ocdroid 提供：消息 skeleton 投影、策展 SSE（`session.digest` + q/p 直推）、T3 资源限制、`/slimapi/**` 版本门禁 + catch-all 反代。
 - **权威契约**：[`docs/specs/v2-contract.md`](docs/specs/v2-contract.md)（唯一 wire 基准；与 design / INTERFACE_MAP 冲突时以契约为准）。
 - **设计 / 接口追踪**：[`docs/specs/design-v2.md`](docs/specs/design-v2.md)、[`docs/specs/INTERFACE_MAP.md`](docs/specs/INTERFACE_MAP.md)。
 - **客户端配套说明**：[`docs/specs/CLIENT_CHANGES.md`](docs/specs/CLIENT_CHANGES.md)（给 ocdroid 开发者的改动清单）。
@@ -90,17 +90,15 @@ python -m venv .venv
 # 改动校验（必做）
 ./scripts/check.sh
 
-# 开发：本地手动跑（临时 secret）
-openssl rand -base64 48 > /tmp/oc-slimapi-route-secret && chmod 600 /tmp/oc-slimapi-route-secret
-OC_SLIMAPI_ROUTE_SECRET_FILE=/tmp/oc-slimapi-route-secret \
-  .venv/bin/python -m oc_slimapi.app
+# 开发：本地手动跑
+.venv/bin/python -m oc_slimapi.app
 
 # 生产：systemd user 服务（部署/日志/自启见 docs/operations.md）
 systemctl --user start oc-slimapi
 journalctl --user -u oc-slimapi -f          # 应用日志（startup/warning/smoke）
 
 # 落盘日志（access log + snapshot，生产落 StateDirectory）
-ls ~/.local/state/oc-slimapi/logs/           # access-YYYY-MM-DD.jsonl(.gz) + traffic-snapshot-*.jsonl
+ls ~/.local/state/oc-slimapi/logs/           # access-YYYY-MM-DD.jsonl(.gz) + traffic-snapshot-YYYY-MM-DD.jsonl
 # 查询/分析手册：docs/manual/traffic-accounting.md（生产 RETAIN_DAYS=3 自动清理 access log）
 
 # 发版（见 docs/release.md）

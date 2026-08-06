@@ -39,6 +39,28 @@
 - 推荐：`limit=500` 兜底可保留，但用 `X-Complete` 判断是否可能截断，勿盲猜全集。
 - 已移除 `X-Discovery-Directories` 与 `X-Discovery-Ready` 响应头（discovery 系统已删除）。
 
+## pending question 跨目录聚合（/slimapi/questions，加性 — 2026-08-05）
+
+> **加性 / 向后兼容**：wire 版本未 bump（仍 2）。旧 sidecar 无此路由 → 404 `thin_route_not_found`，客户端透明回退既有 SSE 直推 + catch-all 单目录 `GET /question`（行为不变）。权威 envelope 语义见 `docs/specs/v2-contract.md` §2「`/slimapi/questions` envelope」。
+
+`GET /slimapi/questions` 修复 slim-mode 冷启动看不到 `workdir ≠ process.cwd()` 目录 pending question 的 bug（上游 `GET /question` per-Location——按 `X-Opencode-Directory` 路由的 workdir instance，无 header 回落 `process.cwd()`）。**无参数**（sidecar 自发现目录）。
+
+### 客户端必须
+
+- **两阶段 fan-out（sidecar 侧，客户端透明）**：sidecar 先 `GET /project`（ProjectTable 全表，跨所有 workdir）发现 distinct worktree 集合（跳过合成 global `worktree=="/"`），再并发对每个 dir `GET /question`（带 `X-Opencode-Directory`）合并。
+- **envelope 形状**（非裸数组）`{items, errors, authoritativeDirectories, discoveryComplete}`：
+  - `items`：合并的 question entry，每条 = 上游 entry 原样 + 追加 `directory` 字段。
+  - `errors`：per-dir 失败（isolated，单 dir 失败不中断整体）。
+  - `authoritativeDirectories`：`null` = 全成功 → **全局 replace-all**；数组 = partial → 仅覆盖所列 dir。
+  - `discoveryComplete`：**恒 `true`**（`/project` 无分页/截断）；客户端可忽略。
+- **客户端契约（关键）**：`authoritativeDirectories==null` → 用本次 `items` 完整替换本地 pending question 集合（replace-all，不在 `items` 中的旧 question 视为已不再 pending）；为数组 → **仅**对数组所列 dir 做 replace，**不得**丢弃未覆盖 dir 的既有 pending question（否则丢失数据）。
+- **total failure**：发现调用失败 → 整体 503 `upstream_unavailable`（无 envelope）；客户端保留既有状态并重试，**不可**据此推断 pending question 集合为空。
+- **应答不经本端点**：pending question 的应答仍走 catch-all + `X-Opencode-Directory`（见 v2-contract §2 写路径）；本端点只读聚合。
+
+### 错误码（thin 路由统一 `{"code":"..."}`）
+
+`400 version_required`/`version_incompatible`、`404 thin_route_not_found`（旧 sidecar，回退信号）、`503 upstream_unavailable`（发现调用 total failure，无 envelope）。per-dir `/question` 失败 isolated 进 `errors[]`（非 HTTP 错误码，不中断整体）。
+
 ## Catalog skeleton（command / agent，加性 — 2026-08-05）
 
 > **加性 / 向后兼容**：wire 版本未 bump（仍 2）。旧 sidecar 无此路由 → 404 `thin_route_not_found`，客户端透明回退 catch-all 透传 `GET /command`、`GET /agent`（行为不变）。旧 ocdroid 继续走透传，零回归。完整集成告知：`docs/ocmar/reports/2026-08-05-ocdroid-catalog-skeleton-integration.md`。
