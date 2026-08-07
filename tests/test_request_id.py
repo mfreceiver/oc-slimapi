@@ -205,6 +205,117 @@ async def test_control_char_inbound_generates_new():
 
 
 # ---------------------------------------------------------------------------
+# P1-15: non-ASCII request-id → rejected → fresh uuid generated.
+# The proxy forwards request-id into an httpx header via build_request();
+# a non-ASCII value raises at BUILD time (before the send try/except) → bare
+# 500 instead of upstream_unavailable. Fail-closed: reject → fresh uuid.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_non_ascii_inbound_generates_new():
+    """Non-ASCII (multibyte UTF-8 like Chinese) → rejected → fresh uuid.
+
+    The proxy's client.build_request() would raise on a non-ASCII header
+    value; rejecting here prevents a bare 500."""
+    scope: dict[str, Any] = {
+        "type": "http",
+        "headers": [(b"x-request-id", "请求标识符123".encode("utf-8"))],
+    }
+
+    async def app(scope: dict, receive: Receive, send: Send) -> None:
+        rid = scope["state"][REQUEST_ID_KEY]
+        assert rid is not None
+        await send({"type": "http.response.start", "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    middleware = RequestIdMiddleware(app)
+    await middleware(scope, _noop_receive, _collect_send)
+
+    rid = scope["state"][REQUEST_ID_KEY]
+    # Must be pure ASCII (a freshly-generated uuid hex).
+    assert rid.isascii()
+    assert rid != "请求标识符123"
+
+
+@pytest.mark.asyncio
+async def test_high_ascii_byte_inbound_generates_new():
+    """A byte in the 0x80-0xFF range (invalid standalone ASCII / start of a
+    multibyte sequence) → rejected → fresh uuid."""
+    scope: dict[str, Any] = {
+        "type": "http",
+        "headers": [(b"x-request-id", b"abc\xff\xfe")],
+    }
+
+    async def app(scope: dict, receive: Receive, send: Send) -> None:
+        await send({"type": "http.response.start", "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    middleware = RequestIdMiddleware(app)
+    await middleware(scope, _noop_receive, _collect_send)
+
+    rid = scope["state"][REQUEST_ID_KEY]
+    assert rid.isascii()
+
+
+@pytest.mark.asyncio
+async def test_printable_ascii_inbound_used_verbatim():
+    """Valid printable ASCII request-id (including embedded spaces, dashes,
+    dots) is accepted and used verbatim."""
+    expected = "abc-DEF 123.xyz"
+    scope: dict[str, Any] = {
+        "type": "http",
+        "headers": [(b"x-request-id", expected.encode("ascii"))],
+    }
+
+    async def app(scope: dict, receive: Receive, send: Send) -> None:
+        rid = scope["state"][REQUEST_ID_KEY]
+        assert rid == expected
+        await send({"type": "http.response.start", "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    middleware = RequestIdMiddleware(app)
+    await middleware(scope, _noop_receive, _collect_send)
+
+
+@pytest.mark.asyncio
+async def test_del_byte_inbound_generates_new():
+    """Byte 0x7f (DEL) is not printable ASCII → rejected → fresh uuid."""
+    scope: dict[str, Any] = {
+        "type": "http",
+        "headers": [(b"x-request-id", b"abc\x7f")],
+    }
+
+    async def app(scope: dict, receive: Receive, send: Send) -> None:
+        await send({"type": "http.response.start", "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    middleware = RequestIdMiddleware(app)
+    await middleware(scope, _noop_receive, _collect_send)
+
+    rid = scope["state"][REQUEST_ID_KEY]
+    assert "\x7f" not in rid
+
+
+@pytest.mark.asyncio
+async def test_boundary_length_128_accepted():
+    """Exactly 128 printable ASCII chars is the boundary — must be accepted."""
+    value = "a" * 128
+    scope: dict[str, Any] = {
+        "type": "http",
+        "headers": [(b"x-request-id", value.encode("ascii"))],
+    }
+
+    async def app(scope: dict, receive: Receive, send: Send) -> None:
+        rid = scope["state"][REQUEST_ID_KEY]
+        assert rid == value
+        await send({"type": "http.response.start", "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    middleware = RequestIdMiddleware(app)
+    await middleware(scope, _noop_receive, _collect_send)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 

@@ -30,24 +30,33 @@ def _find_request_id(scope: dict[str, Any]) -> str | None:
     """Best-effort lookup of existing X-Request-ID from inbound headers.
 
     Validates the value: if empty / whitespace-only, longer than 128
-    characters, or contains control characters (incl. CR/LF — header-injection
-    guard, since the value is echoed in a response header and forwarded
-    upstream), returns ``None`` (so the caller generates a fresh id).
+    characters, or contains non-printable-ASCII bytes, returns ``None`` (so
+    the caller generates a fresh id).
+
+    P1-15: the value is restricted to **printable ASCII** (0x20–0x7e).
+    Non-ASCII multibyte sequences (e.g. UTF-8 Chinese) are rejected because
+    the catch-all proxy forwards the request-id into an httpx request header
+    via ``client.build_request()``; a non-ASCII header value raises an
+    encoding exception at BUILD time (before the ``send`` try/except that
+    maps to ``upstream_unavailable``), surfacing as a bare 500 rather than a
+    structured error. Fail-closed: reject → caller generates a fresh uuid.
     """
     headers: list[tuple[bytes, bytes]] = scope.get("headers") or []
     for name_bytes, value_bytes in headers:
         if name_bytes.lower() == b"x-request-id":
-            try:
-                value = value_bytes.decode("utf-8", "replace").strip()
-            except Exception:
+            # Strip leading/trailing ASCII whitespace (space, tab, CR, LF, etc.)
+            # then validate every remaining byte is printable ASCII.
+            stripped = value_bytes.strip()
+            if not stripped or len(stripped) > 128:
                 return None
-            if not value or len(value) > 128:
-                return None
-            # Reject control chars / CR / LF: the value is echoed in a response
-            # header and forwarded upstream — guard against header injection.
-            if any(ord(c) < 0x20 or ord(c) == 0x7f for c in value):
-                return None
-            return value
+            # P1-15: only accept printable ASCII (0x20-0x7e). This implicitly
+            # rejects all control chars (the prior CR/LF check is subsumed)
+            # AND non-ASCII multibyte UTF-8 (each byte of a multibyte sequence
+            # is >= 0x80, which is > 0x7e → rejected).
+            for byte in stripped:
+                if byte < 0x20 or byte > 0x7E:
+                    return None
+            return stripped.decode("ascii")
     return None
 
 
