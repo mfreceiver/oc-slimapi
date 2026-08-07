@@ -30,13 +30,23 @@ ocdroid 对接时：
 
 ### Added
 
-_(暂无)_
+- **`GET /slimapi/questions` 聚合超预算标记 `truncated`（P1-28，加性诊断字段，未 bump `X-Slimapi-Version`，仍 2）**：跨目录 fan-out 聚合结果累计 items 数超 `_MAX_AGGREGATE_ITEMS`（10000）时，envelope 新增 `truncated: true` 诊断字段，后续目录不再 extend。`authoritativeDirectories` 同步降级为 succeeded list（partial-replace，与 discovery 截断相同语义），客户端不会因聚合截断丢弃未跳过目录的 pending questions。客户端可忽略该字段（加性）。
 
 ### Changed
 
+- **version gate 生产固定 v2（P1-13，防 env 放宽，未 bump `X-Slimapi-Version`，仍 2）**：`Settings.validate()` 现拒绝 `OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS` 解析结果不为 `(2, 2)` 的配置——env 可被解析（格式错误仍 fail-fast），但值必须恰好是 `(2, 2)`。此前 `validate()` 只查 `minimum >= 1 and minimum <= maximum`，env `1,2` 或 `1,1` 即可让生产 sidecar 接受 v1，破坏 fail-closed 版本策略。`/slimapi/health` 回显的 `accepted_client_versions` 现始终为 `[2, 2]`（与权威 v2 契约一致）。**无 dev override**：env 本身是被加固的攻击面，提供 env-based escape hatch 会自相矛盾；需测试 v1 的开发者可临时编辑 `versioning.py` 常量。
+- **request-id 限可打印 ASCII（P1-15，未 bump `X-Slimapi-Version`，仍 2）**：`RequestIdMiddleware` 的 `_find_request_id` 现仅接受可打印 ASCII（0x20–0x7e）的入站 `X-Request-ID` 值。非 ASCII（含多字节 Unicode 如中文）→ 视为非法，生成新 uuid。此前用 `decode("utf-8","replace")` 接受非 ASCII Unicode，catch-all 反代将其写入 httpx header 时 `client.build_request()` 在 send try 之前抛编码异常 → 裸 500。**行为变更**：此前发送非 ASCII request-id 的客户端会收到该值回显（+ 上游 500）；现收到新生成的 uuid hex（+ 正常响应或结构化错误）。
 - **明确 `downIn` / `downOut` 为 ASGI 传输层字节口径（含 early-reject 说明）**：流量记账中间件（`middleware/traffic_accounting.py`）的模块 docstring 现显式声明 `downIn` / `downOut` 统计 ASGI 传输层实际收发字节（与上游 `upIn` / `upOut` 对称的「全链路双向计费」）。据此，version gate 等中间件 early-reject 的请求，因 app 未调用 `receive` 消费 body，该 body 不计入 `downIn` —— 这是 wire 口径的真实反映（app 未接收即未传输到 app），不为计一个被拒请求付出真实 I/O 代价（不 drain）。口径本身无行为变更（中间件始终只计 app 实际 `receive` 的字节）；此条为可观测面口径的显式文档化。
 
 ### Fixed
+
+- **边界 + 门禁硬化（批次 5，内部资源安全修复，未 bump `X-Slimapi-Version`，仍 2）**：修复 8 处资源边界 / 门禁 / 输入校验 / 错误映射问题（除上述 P1-13/P1-15/P1-28 已在 Changed/Added 记录的 wire 可见项外，其余为内部硬化）：
+  - **P1-14（version gate 路径归一化）**：version middleware 此前直接检查原始 `scope["path"].startswith("/slimapi/")`；ASGI server 若不折叠 `//`，`//slimapi/foo` 不过版本门禁但 catch-all 反代归一化后路由到 /slimapi/ 端点 → 门禁绕过。`/slimapi` 精确根路径也不满足 `/slimapi/` 前缀。现 `_is_slimapi_path()` 折叠重复斜杠后判断，同时识别根路径与子路径。`scope["path"]` 不变（不影响下游路由）。
+  - **P1-29（skeleton 嵌套类型防守）**：`skeleton_message` 此前 `message.get("info").get("id")` 在 info 为 None 时 AttributeError；`for part in message.get("parts")` 在 parts 为 int/bool 时 TypeError → 单坏消息致整页 500。现 info 非 dict → `{}`，parts 非 list → `[]`。`routes/messages.py` 两处 skeleton 调用增加 `(TypeError, AttributeError)` → 503 `upstream_unavailable` 映射（与既有 JSONDecodeError 映射对齐）。
+  - **P1-30（TransformPool RSS 上界）**：`config.validate()` 加 `max_transforms × max_response_bytes > 512 MiB` → raise（防误配置 OOM）。`transform.py` 模块 docstring 文档化 RSS 内存模型：最坏 ≈ `max_transforms × (max_response_bytes + projection overhead)`，建议生产 `max_transforms=1`。
+  - **P1-31（gzip 小响应阈值）**：transform worker pack 函数（`_pack_json` / `_project_list_sorted_and_pack` / questions envelope）现经 `compress_if_beneficial()`：body < `MIN_GZIP_BYTES`（64）或压缩后 ≥ raw → 返回 raw 不加 Content-Encoding（gzip header/footer 开销反使小响应变大，增加 downOut + access-log 计费）。`json_response` / `error_response` 不变（契约 §9 要求所有 JSON 路由含小错误体统一 gzip 协商）。
+  - **P1-41（TransformPool shutdown 超时）**：`shutdown(wait_seconds=10.0)` 加超时参数：cancel pending futures → daemon thread bounded wait → 超时返回（不 drain 在途 worker）。此前 `executor.shutdown(wait=True)` 无超时，hot reload 遇大响应/异常 worker 时阻塞事件循环超 uvicorn graceful 窗口。`app.py` `_shutdown_transforms` 传 `_TRANSFORM_DRAIN_TIMEOUT`（10s）。
+  - **P1-28（questions 聚合序列化 offload）**：`/slimapi/questions` 最终 envelope 的 `orjson.dumps` + gzip 现 offload 到 TransformPool executor（`pool.offload`），不再在 event loop 阻塞 SSE 心跳。聚合不获取 admission（已由 `_MAX_AGGREGATE_ITEMS` + per-dir cap 内存限制）。
 
 - **`session.deleted` 现服务端终止 token 订阅（INV-4 / P0-3，未 bump `X-Slimapi-Version`，仍 2）**：`GET /slimapi/sessions/{sid}/stream`（token SSE）此前在收到上游 `session.deleted` 时只入一个 deferred resync 帧（由 flush loop 下 tick drain），**不发 STOP**——token route generator 永远等下一帧，订阅者连接不释放（`total_subscribers` 不减、`_subs_by_sid` 不移、flush loop 不停）。资源释放完全依赖客户端主动关连接。现 `on_session_deleted` 对该 sid 的每个订阅者**同步逐个** `sub.terminate("session_deleted")`——发 `resync{session_deleted}` → `STOP` 严格此序，generator 收 STOP 退出 → finally 走正常 unsubscribe（detach + 减计数 + last-detach stop flush + grace arm）。客户端现在**一定**会收到 `resync{session_deleted}` + 连接断开（此前可能永远收不到断开信号）。**加性 wire 修正（多了一个确定的服务端断开信号），不 bump** `X-Slimapi-Version`（客户端原本就需处理 resync + 连接关闭）。
 - **SSE/Token 生命周期状态机闭合（批次 3，内部资源安全修复，未 bump `X-Slimapi-Version`，仍 2）**：修复 7 处 task 生命周期 / epoch 串行 / 资源安全问题（均非 wire 可见，仅影响内部资源安全）：
