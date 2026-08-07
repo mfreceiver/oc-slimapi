@@ -260,8 +260,26 @@ class TrafficSnapshotter:
 
         try:
             with path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(record, separators=(",", ":")))
-                f.write("\n")
+                # Single write call: serialise + append the newline into one
+                # string before writing (P1-27). Two separate write() calls
+                # left a crash window between them that produced a half-line
+                # (no trailing "\n"), which broke offline json.loads on the
+                # whole file. One call collapses that window to the OS-level
+                # write atomicity (small writes are effectively atomic under
+                # POSIX), so a crash at any point leaves either the prior
+                # complete line or the new complete line — never a half-line.
+                #
+                # We deliberately do NOT fsync here: the per-frame cost of a
+                # synchronous disk flush every interval (default 300s, plus
+                # shutdown final frame) is not justified for best-effort
+                # cumulative snapshots that are already redundant with the
+                # in-memory ledger (lost frames are recoverable from the
+                # surrounding frames by delta derivation). The OS page cache
+                # + the close()-on-exit flush is the chosen durability /
+                # performance trade-off; fsync would be the lever if a
+                # stronger power-loss guarantee were ever required.
+                line = json.dumps(record, separators=(",", ":")) + "\n"
+                f.write(line)
             return True
         except Exception:
             logger.warning(

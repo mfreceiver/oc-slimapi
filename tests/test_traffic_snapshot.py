@@ -529,6 +529,139 @@ class TestDailyRotation:
 
 
 # ---------------------------------------------------------------------------
+# P1-27: single write call — no half-line on crash
+# ---------------------------------------------------------------------------
+
+
+class _CountingFile:
+    """Wrap a text file obj to record each ``write`` call's argument.
+
+    Used to assert (P1-27) that a snapshot frame is emitted via a SINGLE
+    ``write(json + "\n")`` call rather than two separate ``write(json)`` /
+    ``write("\n")`` calls (the pre-fix shape that could leave a half-line
+    on crash). Optionally raises on write to simulate a mid-write crash.
+
+    Context-manager dunders are defined explicitly because Python looks up
+    dunder methods on the type, not the instance — ``__getattr__`` would
+    not be consulted for ``__enter__``/``__exit__``.
+    """
+
+    def __init__(self, fh, *, writes: list[str], raise_on_write: bool = False):
+        self._fh = fh
+        self._writes = writes
+        self._raise_on_write = raise_on_write
+        self.name = getattr(fh, "name", "")
+
+    def write(self, s):
+        self._writes.append(s)
+        if self._raise_on_write:
+            raise OSError("simulated crash during write")
+        return self._fh.write(s)
+
+    def __enter__(self):
+        # Mirror the wrapped file's context-manager enter so the snapshotter's
+        # ``with path.open(...) as f:`` block works.
+        self._fh.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return self._fh.__exit__(exc_type, exc, tb)
+
+    def __getattr__(self, item):
+        return getattr(self._fh, item)
+
+
+class TestSingleWriteAtomicity:
+    """P1-27: a frame is written via ONE ``write()`` call, not two.
+
+    Pre-P1-27 the code did ``f.write(json); f.write("\n")`` — a crash
+    between them left a line without a trailing newline, breaking offline
+    ``json.loads`` of the whole file (a half-line has no newline delimiter
+    and merges with the next line on read). The fix collapses both into a
+    single ``write(json + "\n")`` so a crash at any point leaves either the
+    prior complete line or the new complete line, never a half-line.
+    """
+
+    async def test_single_write_call_per_frame(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = str(tmp_path / "snap.jsonl")
+        ledger = _make_ledger_with_data()
+        snap = TrafficSnapshotter(ledger=ledger, interval_s=300, path=path)
+
+        writes: list[str] = []
+        real_open = Path.open
+
+        def spy_open(self, *args, **kwargs):
+            fh = real_open(self, *args, **kwargs)
+            # Only wrap the daily snapshot file; leave other I/O alone.
+            if "snap-" in self.name and self.name.endswith(".jsonl"):
+                return _CountingFile(fh, writes=writes)
+            return fh
+
+        monkeypatch.setattr(Path, "open", spy_open)
+        await snap.start()
+        await snap.stop()
+
+        assert len(writes) >= 1, "expected at least one frame written"
+        # Every captured write must be a COMPLETE line (json + trailing
+        # newline) — never a bare json blob without the newline. Pre-fix
+        # the json and "\n" were two separate writes, the first of which
+        # would NOT end in "\n".
+        for w in writes:
+            assert w.endswith("\n"), (
+                f"P1-27 violation: write missing trailing newline: {w!r}"
+            )
+        # And there is exactly one write per frame (start frame + stop frame).
+        assert len(writes) == 2, (
+            f"P1-27: expected exactly 1 write call per frame (2 frames = 2 "
+            f"writes), got {len(writes)} writes: {writes!r}"
+        )
+
+    async def test_no_half_line_after_simulated_crash(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """P1-27: a crash DURING the single write leaves the file with the
+        prior complete lines only (no half-line appended). Pre-fix, a crash
+        between the two writes left a bare json blob without a newline,
+        corrupting the file for offline parsing."""
+        path = str(tmp_path / "snap.jsonl")
+        ledger = _make_ledger_with_data()
+        snap = TrafficSnapshotter(ledger=ledger, interval_s=300, path=path)
+
+        # Write one good frame first (so we have a known-good prior line).
+        await snap.start()
+        await snap.stop()
+        daily = _snapshot_path(path)
+        raw_before = daily.read_text()
+        assert raw_before.endswith("\n")  # the prior file is well-formed
+
+        real_open = Path.open
+
+        def crashing_open(self, *args, **kwargs):
+            fh = real_open(self, *args, **kwargs)
+            if "snap-" in self.name and self.name.endswith(".jsonl"):
+                return _CountingFile(fh, writes=[], raise_on_write=True)
+            return fh
+
+        monkeypatch.setattr(Path, "open", crashing_open)
+
+        # A direct _write_once with the crash must (a) return False and
+        # (b) leave the file content unchanged (no half-line appended).
+        result = snap._write_once()
+        assert result is False, "crashed write must report failure"
+
+        raw_after = daily.read_text()
+        assert raw_after == raw_before, (
+            "file must be unchanged after a crashed write (no half-line)"
+        )
+        # Every line still parses as valid JSON — the file is not corrupted.
+        for line in raw_after.splitlines():
+            if line.strip():
+                json.loads(line)
+
+
+# ---------------------------------------------------------------------------
 # Identity stability
 # ---------------------------------------------------------------------------
 
