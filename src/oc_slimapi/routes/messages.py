@@ -20,6 +20,10 @@ from ..transform import (
 from ..upstream import (
     forward_directory_headers,
 )
+from ..upstream_errors import (
+    raise_upstream_status_code,
+    raise_upstream_unavailable,
+)
 from ..directory import validate_directory
 
 router = APIRouter(prefix="/slimapi/messages/{sid}", tags=["messages"])
@@ -243,7 +247,7 @@ async def _stream_upstream(
     try:
         return await request.app.state.upstream.send(upstream_request, stream=True)
     except httpx.RequestError as exc:
-        raise CodedHTTPException(503, code="upstream_unavailable") from exc
+        raise_upstream_unavailable(exc)
 
 
 @router.get("")
@@ -291,16 +295,12 @@ async def messages(
                         # Drain upstream error body for connection reuse.
                         body = await response.aread()
                         stash_up_in(request, len(body))
-                        # Contract §7: map upstream errors to structured codes.
-                        if response.status_code == 404:
-                            raise CodedHTTPException(
-                                404, code="session_not_found", sessionID=sid,
-                            )
-                        if response.status_code < 500:
-                            raise CodedHTTPException(
-                                502, code=f"upstream_http_{response.status_code}",
-                            )
-                        raise CodedHTTPException(503, code="upstream_unavailable")
+                        # Contract §7: map upstream errors to structured codes
+                        # (404+sid → session_not_found; other 4xx →
+                        # upstream_http_N; 5xx → upstream_unavailable).
+                        raise_upstream_status_code(
+                            response.status_code, sid=sid,
+                        )
                     # on_read stashes each chunk as it is pulled so a
                     # mid-stream httpx.RequestError cannot lose already-read
                     # bytes from upIn (P0-9); success/cap paths are additive
@@ -315,7 +315,7 @@ async def messages(
                     # of bubbling up as an unhandled FastAPI 500 (P1-24 —
                     # aligns the list branch with /full, sessions, catalog).
                     # Already-read bytes were stashed via on_read above.
-                    raise CodedHTTPException(503, code="upstream_unavailable") from exc
+                    raise_upstream_unavailable(exc)
                 if body is None:
                     return error_response(
                         "response_too_large", 413,
@@ -337,9 +337,7 @@ async def messages(
                         accept_encoding=request.headers.get("accept-encoding"),
                     )
                 except (orjson.JSONDecodeError, ValueError, TypeError, AttributeError) as exc:
-                    raise CodedHTTPException(
-                        503, code="upstream_unavailable",
-                    ) from exc
+                    raise_upstream_unavailable(exc)
             finally:
                 await response.aclose()
         base_headers: dict[str, str] = {"Cache-Control": "no-store"}
@@ -395,7 +393,7 @@ async def message(
             try:
                 response = await request.app.state.upstream.send(upstream_request, stream=True)
             except httpx.RequestError as exc:
-                raise CodedHTTPException(503, code="upstream_unavailable") from exc
+                raise_upstream_unavailable(exc)
             status_code = 200
             try:
                 # Wrap mid-stream upstream I/O failures (httpx.RequestError
@@ -408,16 +406,12 @@ async def message(
                         # Drain upstream error body for connection reuse.
                         body = await response.aread()
                         stash_up_in(request, len(body))
-                        # Contract §7: map upstream errors to structured codes.
-                        if response.status_code == 404:
-                            raise CodedHTTPException(
-                                404, code="session_not_found", sessionID=sid,
-                            )
-                        if response.status_code < 500:
-                            raise CodedHTTPException(
-                                502, code=f"upstream_http_{response.status_code}",
-                            )
-                        raise CodedHTTPException(503, code="upstream_unavailable")
+                        # Contract §7: map upstream errors to structured codes
+                        # (404+sid → session_not_found; other 4xx →
+                        # upstream_http_N; 5xx → upstream_unavailable).
+                        raise_upstream_status_code(
+                            response.status_code, sid=sid,
+                        )
                     # Contract §2: /full/{mid} always returns 200 on success.
                     status_code = 200
                     # on_read stashes each chunk so a mid-stream
@@ -429,7 +423,7 @@ async def message(
                         on_read=lambda n: stash_up_in(request, n),
                     )
                 except httpx.RequestError as exc:
-                    raise CodedHTTPException(503, code="upstream_unavailable") from exc
+                    raise_upstream_unavailable(exc)
                 if body is None:
                     return error_response(
                         "message_too_large", 413,
@@ -444,9 +438,7 @@ async def message(
                         accept_encoding=accept_encoding,
                     )
                 except (orjson.JSONDecodeError, ValueError, TypeError, AttributeError) as exc:
-                    raise CodedHTTPException(
-                        503, code="upstream_unavailable",
-                    ) from exc
+                    raise_upstream_unavailable(exc)
             finally:
                 await response.aclose()
         return Response(

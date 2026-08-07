@@ -7,11 +7,15 @@ import orjson
 from fastapi import APIRouter, Request
 from starlette.responses import Response
 
-from ..errors import CodedHTTPException
 from ..gzip_util import compress_if_beneficial
 from ..traffic import stash_up_in
 from ..transform import read_with_cap
 from ..upstream import forward_directory_headers
+from ..upstream_errors import (
+    UPSTREAM_UNAVAILABLE,
+    raise_upstream_unavailable,
+    upstream_error_code_for_status,
+)
 
 router = APIRouter(prefix="/slimapi", tags=["questions"])
 
@@ -138,7 +142,7 @@ async def questions(request: Request):
             stream=True,
         )
     except httpx.RequestError as exc:
-        raise CodedHTTPException(503, code="upstream_unavailable") from exc
+        raise_upstream_unavailable(exc)
     try:
         try:
             if response.status_code >= 400:
@@ -148,22 +152,22 @@ async def questions(request: Request):
                 # the client about which directory failed.
                 err_body = await response.aread()
                 stash_up_in(request, len(err_body))
-                raise CodedHTTPException(503, code="upstream_unavailable")
+                raise_upstream_unavailable()
             body, _ = await read_with_cap(
                 response, config.max_response_bytes,
                 on_read=lambda n: stash_up_in(request, n),
             )
             if body is None:
-                raise CodedHTTPException(503, code="upstream_unavailable")
+                raise_upstream_unavailable()
             try:
                 sessions_payload = orjson.loads(body)
             except (orjson.JSONDecodeError, ValueError) as exc:
-                raise CodedHTTPException(503, code="upstream_unavailable") from exc
+                raise_upstream_unavailable(exc)
             if not isinstance(sessions_payload, list):
-                raise CodedHTTPException(503, code="upstream_unavailable")
+                raise_upstream_unavailable()
         except httpx.RequestError as exc:
             # Mid-stream read failure (aread or read_with_cap).
-            raise CodedHTTPException(503, code="upstream_unavailable") from exc
+            raise_upstream_unavailable(exc)
     finally:
         await response.aclose()
 
@@ -215,7 +219,7 @@ async def questions(request: Request):
         if isinstance(result, asyncio.CancelledError):
             raise result
         if isinstance(result, Exception):
-            errors.append({"directory": directory, "code": "upstream_unavailable"})
+            errors.append({"directory": directory, "code": UPSTREAM_UNAVAILABLE})
             continue
         dir_items, error_code = result
         if error_code is not None:
@@ -314,32 +318,30 @@ async def _fetch_questions_for_dir(
                 stream=True,
             )
         except httpx.RequestError:
-            return [], "upstream_unavailable"
+            return [], UPSTREAM_UNAVAILABLE
         try:
             try:
                 status = response.status_code
-                if status >= 500:
-                    err_body = await response.aread()
-                    stash_up_in(request, len(err_body))
-                    return [], "upstream_unavailable"
                 if status >= 400:
-                    # 4xx (incl. unlikely 404) → upstream_http_N (per-dir, do NOT raise).
+                    # 4xx (incl. unlikely 404) → upstream_http_N; 5xx →
+                    # upstream_unavailable (per-dir, do NOT raise — isolated
+                    # into the envelope errors[]). Drain the body for reuse.
                     err_body = await response.aread()
                     stash_up_in(request, len(err_body))
-                    return [], f"upstream_http_{status}"
+                    return [], upstream_error_code_for_status(status)
                 body, _ = await read_with_cap(
                     response, config.max_response_bytes,
                     on_read=lambda n: stash_up_in(request, n),
                 )
                 if body is None:
-                    return [], "upstream_unavailable"
+                    return [], UPSTREAM_UNAVAILABLE
                 try:
                     payload = orjson.loads(body)
                 except (orjson.JSONDecodeError, ValueError):
-                    return [], "upstream_unavailable"
+                    return [], UPSTREAM_UNAVAILABLE
                 if not isinstance(payload, list):
                     # Non-list body for this single dir → treat the dir as failed.
-                    return [], "upstream_unavailable"
+                    return [], UPSTREAM_UNAVAILABLE
                 items: list[dict] = []
                 for entry in payload:
                     if isinstance(entry, dict):
@@ -349,6 +351,6 @@ async def _fetch_questions_for_dir(
                         items.append(entry)
                 return items, None
             except httpx.RequestError:
-                return [], "upstream_unavailable"
+                return [], UPSTREAM_UNAVAILABLE
         finally:
             await response.aclose()

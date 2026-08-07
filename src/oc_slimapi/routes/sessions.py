@@ -11,7 +11,7 @@ from ..skeleton import skeleton_session
 from ..traffic import stash_up_in
 from ..transform import TransformBusy, read_with_cap
 from ..upstream import forward_directory_headers
-from ..upstream_errors import raise_upstream_status
+from ..upstream_errors import raise_upstream_status, raise_upstream_unavailable
 
 router = APIRouter(prefix="/slimapi", tags=["sessions"])
 
@@ -55,7 +55,7 @@ async def sessions(
                     stream=True,
                 )
             except httpx.RequestError as exc:
-                raise CodedHTTPException(503, code="upstream_unavailable") from exc
+                raise_upstream_unavailable(exc)
             try:
                 # Wrap mid-stream upstream I/O failures (httpx.RequestError
                 # raised by aread() or read_with_cap aiter_bytes()) into a
@@ -88,9 +88,7 @@ async def sessions(
                     try:
                         payload = orjson.loads(body)
                     except (orjson.JSONDecodeError, ValueError) as exc:
-                        raise CodedHTTPException(
-                            503, code="upstream_unavailable",
-                        ) from exc
+                        raise_upstream_unavailable(exc)
                     if not isinstance(payload, list):
                         # v6 §1.1: dict / string / null etc. would have been silently
                         # iterated by ``for item in payload`` and yielded a 200 with
@@ -98,12 +96,12 @@ async def sessions(
                         # bodies as a malformed upstream — same 503 as the sibling
                         # ``response.json()`` failure path. No completeness headers on
                         # this branch (the contract is: 200 only).
-                        raise CodedHTTPException(503, code="upstream_unavailable")
+                        raise_upstream_unavailable()
                     if payload and not all(isinstance(s, dict) for s in payload):
                         # Scalar-element list (e.g. [1, null, "x"]) would make
                         # skeleton_session() call .get() on non-dict → AttributeError.
                         # Mirrors messages list element-level guard (Task 1).
-                        raise CodedHTTPException(503, code="upstream_unavailable")
+                        raise_upstream_unavailable()
                     # Offload skeleton projection to the worker so the event loop is
                     # not blocked by deep copy of potentially many sessions.
                     sessions = await pool.offload(
@@ -115,7 +113,7 @@ async def sessions(
                     # and read_with_cap() mid-stream read failure (success body).
                     # send() connection failure is covered by the sibling except
                     # above. All → structured 503.
-                    raise CodedHTTPException(503, code="upstream_unavailable") from exc
+                    raise_upstream_unavailable(exc)
             finally:
                 await response.aclose()
     except TransformBusy as exc:
@@ -173,7 +171,7 @@ async def sessions_status(request: Request, directory: str | None = None):
             headers=forward_directory_headers(directory),
         )
     except httpx.RequestError as exc:
-        raise CodedHTTPException(503, code="upstream_unavailable") from exc
+        raise_upstream_unavailable(exc)
     stash_up_in(request, len(response.content))
     try:
         response.raise_for_status()
@@ -182,11 +180,11 @@ async def sessions_status(request: Request, directory: str | None = None):
     try:
         payload = response.json()
     except Exception as exc:
-        raise CodedHTTPException(503, code="upstream_unavailable") from exc
+        raise_upstream_unavailable(exc)
     if not isinstance(payload, dict):
         # Upstream contract is Record<SessionID, Info> — a non-dict body is
         # malformed. Mirrors the sessions-list non-array guard (503).
-        raise CodedHTTPException(503, code="upstream_unavailable")
+        raise_upstream_unavailable()
     # Read-only turn merge (contract §3.y.1: paired turnIncarnation/turn at
     # the flat top level of each entry). Unobserved sid → (inc, 0). The
     # registry is lifespan-wired in production; when absent both fields are

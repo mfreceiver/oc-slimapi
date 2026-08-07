@@ -27,10 +27,13 @@ import httpx
 from fastapi import Request
 from starlette.responses import Response
 
-from ..errors import CodedHTTPException
 from ..gzip_util import accepts_gzip, error_response
 from ..traffic import stash_up_in
 from ..upstream import forward_upstream_headers, request_id_from_scope
+from ..upstream_errors import (
+    raise_upstream_status_code,
+    raise_upstream_unavailable,
+)
 
 # Shared with tests so the route and the wire contract agree on Retry-After.
 TRANSFORM_RETRY_AFTER_SECONDS = 2
@@ -79,7 +82,7 @@ async def stream_upstream(
     try:
         return await request.app.state.upstream.send(upstream_request, stream=True)
     except httpx.RequestError as exc:
-        raise CodedHTTPException(503, code="upstream_unavailable") from exc
+        raise_upstream_unavailable(exc)
 
 
 def make_project_and_pack(
@@ -143,11 +146,7 @@ async def handle_catalog_request(
                     stash_up_in(request, len(body))
                     # No session-scoped 404 mapping (catalog endpoint);
                     # 4xx -> 502 upstream_http_N, 5xx -> 503 upstream_unavailable.
-                    if response.status_code < 500:
-                        raise CodedHTTPException(
-                            502, code=f"upstream_http_{response.status_code}",
-                        )
-                    raise CodedHTTPException(503, code="upstream_unavailable")
+                    raise_upstream_status_code(response.status_code)
                 # on_read stashes each chunk so a mid-stream
                 # httpx.RequestError cannot lose already-read bytes from
                 # upIn (P0-9); success/cap paths are additive
@@ -162,7 +161,7 @@ async def handle_catalog_request(
                 # aiter_bytes()) into a structured 503 instead of bubbling
                 # up as an unhandled FastAPI 500. The finally below still
                 # runs to release the connection.
-                raise CodedHTTPException(503, code="upstream_unavailable") from exc
+                raise_upstream_unavailable(exc)
             if body is None:
                 return error_response(
                     "response_too_large", 413,
@@ -176,9 +175,7 @@ async def handle_catalog_request(
                     accept_encoding=request.headers.get("accept-encoding"),
                 )
             except (orjson.JSONDecodeError, ValueError) as exc:
-                raise CodedHTTPException(
-                    503, code="upstream_unavailable",
-                ) from exc
+                raise_upstream_unavailable(exc)
         finally:
             await response.aclose()
     return Response(
