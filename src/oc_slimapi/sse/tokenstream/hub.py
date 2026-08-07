@@ -245,6 +245,16 @@ class TokenStreamHub:
         # Cleared wholesale by ``on_upstream_reconnect`` (new epoch) and
         # ``on_session_deleted(sid)``.
         self._retired_messages: set[tuple[str, str]] = set()
+        # P1-22: bounded deleted-sid gate. Records sids whose
+        # ``session.deleted`` has been processed so late part events
+        # (``message.part.updated`` / ``.delta`` / ``.removed``) for a
+        # deleted session are dropped before they can resurrect a LivePart.
+        # Cap + TTL aligned with ``TOKEN_REMOVED_MESSAGES_MAX`` /
+        # ``TOKEN_REMOVED_MESSAGES_TTL_MS`` (same constants as the replay
+        # queue — a session whose deletion tombstone has aged out of the
+        # replay queue is acceptably treated as "new" again). Cleared on
+        # ``on_upstream_reconnect`` (new epoch).
+        self._deleted_sids: OrderedDict[str, int] = OrderedDict()
 
     # ------------------------------------------------------------------
     # Properties
@@ -527,6 +537,9 @@ class TokenStreamHub:
         if not all(isinstance(x, str) and x for x in (sid, mid, pid)):
             return
         key: PartKey = (sid, mid, pid)
+        # P1-22: deleted-sid gate — late part event for a deleted session → drop.
+        if self._is_deleted_sid(sid):
+            return
         # CRITICAL 2 gate: late update for a removed message → drop.
         if (sid, mid) in self._retired_messages:
             return
@@ -618,6 +631,9 @@ class TokenStreamHub:
         mid = props.get("messageID")
         pid = props.get("partID")
         if not all(isinstance(x, str) and x for x in (sid, mid, pid)):
+            return
+        # P1-22: deleted-sid gate — late delta for a deleted session → drop.
+        if self._is_deleted_sid(sid):
             return
         # CRITICAL 2 gate: late delta for a removed message → drop.
         if (sid, mid) in self._retired_messages:
@@ -743,6 +759,9 @@ class TokenStreamHub:
         message-level retire already dropped every part for this
         message).
         """
+        # P1-22: deleted-sid gate — late part removal for a deleted session → drop.
+        if self._is_deleted_sid(sid):
+            return
         # CRITICAL 2 gate: message-level retire already dropped this part.
         if (sid, mid) in self._retired_messages:
             return
@@ -934,6 +953,9 @@ class TokenStreamHub:
         # CRITICAL 2 gate cleanup for this session.
         for key in [k for k in self._retired_messages if k[0] == sid]:
             self._retired_messages.discard(key)
+        # P1-22: record sid in the deleted-sid gate so late part events
+        # for this session are dropped (no LivePart resurrection).
+        self._remember_deleted_sid(sid)
         # INV-4 (P0-3): server-side termination — directly terminate each
         # subscriber (resync{session_deleted} → STOP). Do NOT detach or
         # decrement; the generator's finally → unsubscribe handles that.
@@ -1624,6 +1646,39 @@ class TokenStreamHub:
         while len(store) > TOKEN_DISABLED_MAX:
             store.popitem(last=False)
 
+    def _remember_deleted_sid(self, sid: str) -> None:
+        """P1-22: record a sid in the bounded deleted-sid gate.
+
+        Late part events for a deleted session are dropped at the entry of
+        ``on_part_updated`` / ``on_part_delta`` / ``on_part_removed`` so they
+        cannot resurrect a LivePart. Cap + TTL aligned with the replay queue
+        (``TOKEN_REMOVED_MESSAGES_MAX`` / ``TOKEN_REMOVED_MESSAGES_TTL_MS``).
+        ``move_to_end`` on re-delete keeps the freshest entry at the tail.
+        """
+        now_ms = _now_ms()
+        self._deleted_sids[sid] = now_ms
+        self._deleted_sids.move_to_end(sid)
+        self._prune_deleted_sids(now_ms)
+
+    def _is_deleted_sid(self, sid: str) -> bool:
+        """P1-22: check the deleted-sid gate (with lazy TTL expiry)."""
+        ts = self._deleted_sids.get(sid)
+        if ts is None:
+            return False
+        if ts < _now_ms() - TOKEN_REMOVED_MESSAGES_TTL_MS:
+            self._deleted_sids.pop(sid, None)
+            return False
+        return True
+
+    def _prune_deleted_sids(self, now_ms: int) -> None:
+        """P1-22: enforce FIFO cap + TTL on the deleted-sid gate."""
+        cutoff = now_ms - TOKEN_REMOVED_MESSAGES_TTL_MS
+        expired = [k for k, ts in self._deleted_sids.items() if ts < cutoff]
+        for k in expired:
+            self._deleted_sids.pop(k, None)
+        while len(self._deleted_sids) > TOKEN_REMOVED_MESSAGES_MAX:
+            self._deleted_sids.popitem(last=False)
+
     def _prune_removed_messages(self, now_ms: int) -> None:
         """Enforce FIFO cap + TTL on the ``_removed_messages`` replay queue.
 
@@ -1744,6 +1799,9 @@ class TokenStreamHub:
         # CRITICAL 2 gate: new epoch, no late events from the previous
         # epoch can arrive.
         self._retired_messages.clear()
+        # P1-22: deleted-sid gate cleared (new epoch — deleted sessions
+        # from the old epoch cannot send late part events).
+        self._deleted_sids.clear()
         # NOTE: _removed_messages (replay queue) AND _part_revisions are
         # intentionally NOT cleared — see docstring.
         # Fan reconnect_no_replay to every sid with an attached subscriber.

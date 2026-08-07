@@ -853,3 +853,91 @@ class TestInv4SessionDeletedTermination:
         finally:
             th.stop()
             await _close_registry(hubs)
+
+
+# ===========================================================================
+# Step 5 — P1-22: deleted-sid gate
+# ===========================================================================
+
+def _updated_props(sid, mid, pid, *, text="", ptype="text"):
+    """Build message.part.updated props for tests."""
+    return {
+        "part": {
+            "sessionID": sid, "messageID": mid, "id": pid,
+            "type": ptype, "text": text,
+            "time": {},
+        },
+    }
+
+
+def _delta_props(sid, mid, pid, *, delta="x"):
+    """Build message.part.delta props for tests."""
+    return {
+        "field": "text", "sessionID": sid, "messageID": mid,
+        "partID": pid, "delta": delta,
+    }
+
+
+class TestP1_22DeletedSidGate:
+    """Late part events for a deleted session are dropped (no LivePart
+    resurrection)."""
+
+    def test_deleted_sid_blocks_part_updated(self):
+        """After on_session_deleted, a late message.part.updated for the same
+        sid does NOT create a LivePart."""
+        th = TokenStreamHub()
+        th.on_session_deleted("s1")
+        th.on_part_updated(_updated_props("s1", "m1", "p1", text="hello"))
+        assert ("s1", "m1", "p1") not in th.live_parts
+
+    def test_deleted_sid_blocks_part_delta(self):
+        """After on_session_deleted, a late message.part.delta is dropped."""
+        th = TokenStreamHub()
+        # Create a LivePart first, then delete the session.
+        th.on_part_updated(_updated_props("s1", "m1", "p1", text=""))
+        assert ("s1", "m1", "p1") in th.live_parts
+        th.on_session_deleted("s1")
+        # LivePart cleared by retire_session.
+        assert ("s1", "m1", "p1") not in th.live_parts
+        # Late delta does NOT recreate the LivePart.
+        th.on_part_delta(_delta_props("s1", "m1", "p1", delta="late"))
+        assert ("s1", "m1", "p1") not in th.live_parts
+
+    def test_deleted_sid_blocks_part_removed(self):
+        """After on_session_deleted, a late message.part.removed is a no-op."""
+        th = TokenStreamHub()
+        th.on_session_deleted("s1")
+        # Should not crash or create state.
+        th.on_part_removed("s1", "m1", "p1")
+        assert ("s1", "m1", "p1") not in th.live_parts
+
+    def test_other_sid_not_blocked(self):
+        """Part events for a DIFFERENT sid are not blocked by a deleted sid."""
+        th = TokenStreamHub()
+        th.on_session_deleted("s1")
+        th.on_part_updated(_updated_props("s2", "m2", "p2", text="hello"))
+        assert ("s2", "m2", "p2") in th.live_parts
+
+    def test_gate_cleared_on_reconnect(self):
+        """on_upstream_reconnect clears the deleted-sid gate (new epoch)."""
+        th = TokenStreamHub()
+        th.on_session_deleted("s1")
+        assert "s1" in th._deleted_sids
+        th.on_upstream_reconnect()
+        assert len(th._deleted_sids) == 0
+        # After reconnect, part events for s1 are accepted again.
+        th.on_part_updated(_updated_props("s1", "m1", "p1", text="hello"))
+        assert ("s1", "m1", "p1") in th.live_parts
+
+    def test_gate_is_bounded(self):
+        """The deleted-sid gate has a FIFO cap (TOKEN_REMOVED_MESSAGES_MAX)."""
+        from oc_slimapi.config import TOKEN_REMOVED_MESSAGES_MAX
+        th = TokenStreamHub()
+        for i in range(TOKEN_REMOVED_MESSAGES_MAX + 50):
+            th.on_session_deleted(f"sid_{i}")
+        # Cap enforced.
+        assert len(th._deleted_sids) <= TOKEN_REMOVED_MESSAGES_MAX
+        # Oldest evicted.
+        assert "sid_0" not in th._deleted_sids
+        # Newest kept.
+        assert f"sid_{TOKEN_REMOVED_MESSAGES_MAX + 49}" in th._deleted_sids
