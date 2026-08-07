@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 
 import httpx
+import orjson
 from fastapi import APIRouter, Request
 
 from ..errors import CodedHTTPException
 from ..gzip_util import json_response
 from ..traffic import stash_up_in
+from ..transform import read_with_cap
 from ..upstream import forward_directory_headers
 
 router = APIRouter(prefix="/slimapi", tags=["questions"])
@@ -113,31 +115,47 @@ async def questions(request: Request):
     # dropped — /question is an in-memory store independent of archive
     # state, so at worst we fan out to a dead instance (isolated errors[]).
     # ------------------------------------------------------------------
+    config = request.app.state.config
     try:
-        response = await upstream_client.get(
-            "/experimental/session",
-            params={
-                "roots": "true",
-                "archived": "true",
-                "limit": _DISCOVERY_LIMIT,
-            },
+        response = await upstream_client.send(
+            upstream_client.build_request(
+                "GET", "/experimental/session",
+                params={
+                    "roots": "true",
+                    "archived": "true",
+                    "limit": _DISCOVERY_LIMIT,
+                },
+            ),
+            stream=True,
         )
     except httpx.RequestError as exc:
         raise CodedHTTPException(503, code="upstream_unavailable") from exc
-    # Traffic accounting: discovery upstream body.
-    stash_up_in(request, len(response.content))
-    if response.status_code >= 400:
-        # network/5xx/4xx on discovery = total failure (contract §7: 503
-        # upstream_unavailable, NOT upstream_http_N). Discovery is an
-        # internal derived call; leaking the upstream status would mislead
-        # the client about which directory failed.
-        raise CodedHTTPException(503, code="upstream_unavailable")
     try:
-        sessions_payload = response.json()
-    except Exception as exc:
-        raise CodedHTTPException(503, code="upstream_unavailable") from exc
-    if not isinstance(sessions_payload, list):
-        raise CodedHTTPException(503, code="upstream_unavailable")
+        try:
+            if response.status_code >= 400:
+                # network/5xx/4xx on discovery = total failure (contract §7: 503
+                # upstream_unavailable, NOT upstream_http_N). Discovery is an
+                # internal derived call; leaking the upstream status would mislead
+                # the client about which directory failed.
+                err_body = await response.aread()
+                stash_up_in(request, len(err_body))
+                raise CodedHTTPException(503, code="upstream_unavailable")
+            body, n_read = await read_with_cap(response, config.max_response_bytes)
+            # Traffic accounting: discovery upstream body (bytes read, even on cap).
+            stash_up_in(request, n_read)
+            if body is None:
+                raise CodedHTTPException(503, code="upstream_unavailable")
+            try:
+                sessions_payload = orjson.loads(body)
+            except (orjson.JSONDecodeError, ValueError) as exc:
+                raise CodedHTTPException(503, code="upstream_unavailable") from exc
+            if not isinstance(sessions_payload, list):
+                raise CodedHTTPException(503, code="upstream_unavailable")
+        except httpx.RequestError as exc:
+            # Mid-stream read failure (aread or read_with_cap).
+            raise CodedHTTPException(503, code="upstream_unavailable") from exc
+    finally:
+        await response.aclose()
 
     # /experimental/session honors `limit`; detect truncation so the client
     # can degrade authoritativeDirectories (avoid replace-all dropping
@@ -240,32 +258,50 @@ async def _fetch_questions_for_dir(
     below never swallow it).
     """
     async with _fanout_sem:
+        config = request.app.state.config
         try:
-            response = await upstream_client.get(
-                "/question", headers=forward_directory_headers(directory),
+            response = await upstream_client.send(
+                upstream_client.build_request(
+                    "GET", "/question",
+                    headers=forward_directory_headers(directory),
+                ),
+                stream=True,
             )
         except httpx.RequestError:
             return [], "upstream_unavailable"
-        # Traffic accounting: per-dir upstream body.
-        stash_up_in(request, len(response.content))
-        status = response.status_code
-        if status >= 500:
-            return [], "upstream_unavailable"
-        if status >= 400:
-            # 4xx (incl. unlikely 404) → upstream_http_N (per-dir, do NOT raise).
-            return [], f"upstream_http_{status}"
         try:
-            payload = response.json()
-        except Exception:
-            return [], "upstream_unavailable"
-        if not isinstance(payload, list):
-            # Non-list body for this single dir → treat the dir as failed.
-            return [], "upstream_unavailable"
-        items: list[dict] = []
-        for entry in payload:
-            if isinstance(entry, dict):
-                # Stamp directory last (after id, sessionID, questions, tool)
-                # so the upstream field order is preserved verbatim.
-                entry["directory"] = directory
-                items.append(entry)
-        return items, None
+            try:
+                status = response.status_code
+                if status >= 500:
+                    err_body = await response.aread()
+                    stash_up_in(request, len(err_body))
+                    return [], "upstream_unavailable"
+                if status >= 400:
+                    # 4xx (incl. unlikely 404) → upstream_http_N (per-dir, do NOT raise).
+                    err_body = await response.aread()
+                    stash_up_in(request, len(err_body))
+                    return [], f"upstream_http_{status}"
+                body, n_read = await read_with_cap(response, config.max_response_bytes)
+                # Traffic accounting: per-dir upstream body.
+                stash_up_in(request, n_read)
+                if body is None:
+                    return [], "upstream_unavailable"
+                try:
+                    payload = orjson.loads(body)
+                except (orjson.JSONDecodeError, ValueError):
+                    return [], "upstream_unavailable"
+                if not isinstance(payload, list):
+                    # Non-list body for this single dir → treat the dir as failed.
+                    return [], "upstream_unavailable"
+                items: list[dict] = []
+                for entry in payload:
+                    if isinstance(entry, dict):
+                        # Stamp directory last (after id, sessionID, questions, tool)
+                        # so the upstream field order is preserved verbatim.
+                        entry["directory"] = directory
+                        items.append(entry)
+                return items, None
+            except httpx.RequestError:
+                return [], "upstream_unavailable"
+        finally:
+            await response.aclose()

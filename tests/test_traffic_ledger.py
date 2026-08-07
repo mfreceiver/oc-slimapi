@@ -96,6 +96,13 @@ class TestBucketize:
         assert bucketize("GET", "/slimapi/command/x") == "command"
         assert bucketize("GET", "/slimapi/agent/x") == "agent"
 
+    def test_questions_bucket(self):
+        """The cross-directory questions aggregation endpoint gets its own
+        bucket (matches the command/agent catalog precedent)."""
+        assert bucketize("GET", "/slimapi/questions") == "questions"
+        # prefix-tolerant (consistent with siblings)
+        assert bucketize("GET", "/slimapi/questions/x") == "questions"
+
     def test_session_root_is_sessions(self):
         assert bucketize("GET", "/slimapi/sessions") == "sessions"
 

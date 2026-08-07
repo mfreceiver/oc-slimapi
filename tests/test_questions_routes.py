@@ -1070,3 +1070,81 @@ async def test_sessions_missing_directory_field_skipped(upstream_factory):
     dirs_of_items = {item["directory"] for item in body["items"]}
     assert dirs_of_items == {"/good", "/also-good"}
     assert body["errors"] == []
+
+
+# ---------------------------------------------------------------------------
+# read_with_cap: discovery cap exceeded → 503 total failure (no envelope)
+# ---------------------------------------------------------------------------
+
+
+async def test_discovery_cap_exceeded_returns_503(upstream_factory):
+    """Discovery returns a 200 body exceeding max_response_bytes (64 KiB) →
+    503 upstream_unavailable (total failure, no envelope)."""
+    # Build a sessions body large enough to exceed the 64 KiB cap.
+    many_dirs = [f"/dir{i:04d}" for i in range(3000)]
+    big_body = _sessions_body(*many_dirs)
+    assert len(big_body) > 64 * 1024, "test payload must exceed max_response_bytes"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/experimental/session":
+            return httpx.Response(
+                200, content=big_body,
+                headers={"Content-Type": "application/json"},
+            )
+        return httpx.Response(404)
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/slimapi/questions", headers=VERSION_HEADERS)
+    assert response.status_code == 503
+    assert response.json() == {"code": "upstream_unavailable"}
+
+
+# ---------------------------------------------------------------------------
+# read_with_cap: per-dir cap exceeded → that dir in errors[], others succeed
+# ---------------------------------------------------------------------------
+
+
+async def test_per_dir_cap_exceeded_errors_that_dir(upstream_factory):
+    """/a returns small /question response, /b returns huge /question response
+    exceeding max_response_bytes. /b lands in errors[] with
+    upstream_unavailable, /a's question preserved."""
+    big_questions = [_question(f"que_{i:04d}") for i in range(5000)]
+    big_body = orjson.dumps(big_questions)
+    assert len(big_body) > 64 * 1024, "test payload must exceed max_response_bytes"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/experimental/session":
+            return httpx.Response(
+                200, content=_sessions_body("/a", "/b"),
+                headers={"Content-Type": "application/json"},
+            )
+        if request.url.path == "/question":
+            d = request.headers.get("x-opencode-directory")
+            if d == "/a":
+                return httpx.Response(
+                    200, content=orjson.dumps([_question("que_a")]),
+                    headers={"Content-Type": "application/json"},
+                )
+            if d == "/b":
+                return httpx.Response(
+                    200, content=big_body,
+                    headers={"Content-Type": "application/json"},
+                )
+        return httpx.Response(404)
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/slimapi/questions", headers=VERSION_HEADERS)
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["items"]) == 1
+    assert body["items"][0]["directory"] == "/a"
+    assert body["items"][0]["id"] == "que_a"
+    assert len(body["errors"]) == 1
+    assert body["errors"][0] == {"directory": "/b", "code": "upstream_unavailable"}
+    assert body["authoritativeDirectories"] == ["/a"]

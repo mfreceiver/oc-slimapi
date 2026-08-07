@@ -50,6 +50,14 @@ _(暂无)_
 
 ---
 
+## [1.1.4] - 2026-08-07 — questions 内存防线 + traffic 桶修正 + 文档纠错（未 bump `X-Slimapi-Version`，仍 2）
+
+### Fixed
+
+- **`GET /slimapi/questions` 加 `read_with_cap` 内存防线（加性硬化，未 bump `X-Slimapi-Version`，仍 2，2026-08-07）**：questions 路由的两处上游调用——发现调用 `GET /experimental/session?roots=true&archived=true`（`limit=10000`，全量 SessionInfo）与 per-dir fan-out `GET /question`——此前用非流式 `client.get()` + 全 buffer `response.json()`，无 body cap（v1.1.2 刚为 `/slimapi/sessions` 补上流式 `read_with_cap`，但 v1.1.0 引入的 questions 路由未享受同一硬化）。现两处均改为流式 `client.send(stream=True)` + `read_with_cap(config.max_response_bytes)` + `try/finally: response.aclose()`，与 sessions/messages/agent/command 的内存防线对齐（mirrors `routes/sessions.py`）。**行为映射**：发现调用超限→**503 `upstream_unavailable`**（total failure，无 envelope，contract §7 discovery exception——发现是内部派生调用，泄漏上游状态会误导客户端）；per-dir `/question` 超限→该 dir 计入 envelope `errors[]`（`code:"upstream_unavailable"`，isolated，不中断整体）。mid-stream `httpx.RequestError`（aread/read_with_cap 阶段）→ 同路径 503 / errors[]。上游错误状态码仍抽干 body 记 traffic + 复用连接。**加性变更，不 bump** `X-Slimapi-Version`（无 client 依赖现有全 buffer 行为；新行为是 thin 路由既有 `read_with_cap` 防线的补齐）。实现：`src/oc_slimapi/routes/questions.py`；测试：`tests/test_questions_routes.py`（发现 cap→503、per-dir cap→errors[] 两条新用例）。
+- **traffic 桶表修正：`bucketize()` 加 `questions` 桶 + 手册同步（2026-08-07）**：`src/oc_slimapi/traffic.py` 的 `bucketize()` 此前无 `questions` 桶，`/slimapi/questions` 实际落入 `"other"`；而 `docs/manual/traffic-accounting.md` §3.2 文档了不存在的 `quiz` 桶（含 v2 已删的 `/permissions`）——文档↔实现漂移。现 `bucketize` 加 `questions` 桶（`/slimapi/questions` + `/slimapi/questions/**`，与 command/agent 平权），手册 §3.2 修正为 `questions` 行、删去 v2 不存在的 `projects`/`permissions`。省流口径变更（ops 可观测面，非客户端 wire 契约）；既有桶名不变。实现：`src/oc_slimapi/traffic.py` + `docs/manual/traffic-accounting.md`；测试：`tests/test_traffic_ledger.py`（`test_questions_bucket`）。
+- **文档纠错：README「范围」节 + INTERFACE_MAP 错误映射（doc-fix，2026-08-07）**：(1) README「范围」节三处与实现矛盾的描述纠正——删去 v2 已删的 `since` 端点误述、token stream SSE 从"永不 gzip"改为"默认 gzip（lever2，首个 SSE gzip 例外）"、补齐 `questions`（跨目录聚合）与 `sessions/status` 加性回归端点。(2) `docs/specs/INTERFACE_MAP.md` 两处 messages 路由（`/slimapi/messages/{sid}` 与 `/full/{mid}`）的上游错误映射从 v1 残留"原状态透传 / 原状态 body 透传"改为契约 §7 的正确映射：404→404 `session_not_found`（带 `sessionID`）；其他 4xx→502 `upstream_http_N`；5xx/网络→503 `upstream_unavailable`（与 sessions 行写法一致）。纯文档纠错，无行为变更。---
+
 ## [1.1.2] - 2026-08-06 — 错误面硬化 + sessions 内存防线 + 文档语义同步（未 bump `X-Slimapi-Version`，仍 2）
 
 ### Fixed
