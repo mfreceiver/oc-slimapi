@@ -241,10 +241,6 @@ class Settings:
     # OC_SLIMAPI_ACCESS_LOG_PATH is set to a non-default value and falls back
     # to its parent dir (see traffic-log-persistence task-2 阻断6).
     access_log_path: str = os.getenv("OC_SLIMAPI_ACCESS_LOG_PATH", "logs/access.jsonl")
-    access_log_max_bytes: int = int(
-        os.getenv("OC_SLIMAPI_ACCESS_LOG_MAX_BYTES", str(10 * 1024 * 1024))
-    )
-    access_log_backups: int = int(os.getenv("OC_SLIMAPI_ACCESS_LOG_BACKUPS", "5"))
 
     # Daily-rotated access log (replaces RotatingFileHandler). Files are named
     # ``access-YYYY-MM-DD.jsonl`` under ``access_log_dir``; startup compresses
@@ -430,15 +426,6 @@ class Settings:
                 "the revision cap can evict a still-living PartKey, "
                 "causing revision regression (MINOR 6)"
             )
-
-        # Traffic-accounting guards. The in-memory ledger flag has no scalar
-        # bound (it is a bool), but the access-log rotation knobs must be
-        # strictly positive so the RotatingFileHandler does not divide-by-zero
-        # or refuse to roll over.
-        if self.access_log_max_bytes <= 0:
-            raise RuntimeError("OC_SLIMAPI_ACCESS_LOG_MAX_BYTES must be > 0")
-        if self.access_log_backups < 0:
-            raise RuntimeError("OC_SLIMAPI_ACCESS_LOG_BACKUPS must be >= 0")
 
         # Daily-rotation + snapshot guards (traffic-log-persistence task-2).
         # maintenance loop must be at least 60s to avoid hot-looping; snapshot

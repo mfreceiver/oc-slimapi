@@ -394,8 +394,6 @@ def test_traffic_settings_defaults_are_on():
         "OC_SLIMAPI_TRAFFIC_METRICS_ENABLED",
         "OC_SLIMAPI_ACCESS_LOG_ENABLED",
         "OC_SLIMAPI_ACCESS_LOG_PATH",
-        "OC_SLIMAPI_ACCESS_LOG_MAX_BYTES",
-        "OC_SLIMAPI_ACCESS_LOG_BACKUPS",
     ]
     saved = {k: os.environ.pop(k, None) for k in keys}
     try:
@@ -407,8 +405,6 @@ def test_traffic_settings_defaults_are_on():
         assert s.traffic_metrics_enabled is True
         assert s.access_log_enabled is True
         assert s.access_log_path == "logs/access.jsonl"
-        assert s.access_log_max_bytes == 10 * 1024 * 1024
-        assert s.access_log_backups == 5
     finally:
         for k, v in saved.items():
             if v is not None:

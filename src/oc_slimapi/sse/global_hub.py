@@ -194,6 +194,13 @@ class GlobalHub:
         return subscriber
 
     def unsubscribe(self, subscriber: Subscriber) -> None:
+        """Remove a subscriber and arm grace-stop when the last one leaves.
+
+        Test/maintenance surface: production detach goes through
+        ``HubRegistry.unsubscribe`` (which also tears down idle hubs). This
+        method is exercised directly only by unit tests constructing a
+        bare GlobalHub.
+        """
         self.subscribers.discard(subscriber)
         logger.info("sse subscriber detach", extra={"subscriber_id": subscriber.id})
         if not self.has_consumers() and not self.stop_task:
@@ -240,6 +247,7 @@ class GlobalHub:
             self._token_hub.on_upstream_reconnect()
 
     async def stop_after_grace(self) -> None:
+        """Grace timer used by ``unsubscribe`` / ``ensure_upstream``; exercised in tests."""
         await asyncio.sleep(GRACE_SECONDS)
         if not self.has_consumers():
             for task in (self.task, self.flush_task, self.heartbeat_task):

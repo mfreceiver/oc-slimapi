@@ -26,14 +26,6 @@ ocdroid 对接时：
 
 ---
 
-## [1.1.3] - 2026-08-07 — questions 发现机制根治（/project → /experimental/session?roots=true&archived=true），未 bump `X-Slimapi-Version`，仍 2
-
-### Fixed
-
-- **`GET /slimapi/questions` 发现机制彻底修复（未 bump `X-Slimapi-Version`，仍 2）**：发现源从 `GET /project` 改为 `GET /experimental/session?roots=true`。**根因（v1.1.1/v1.1.2 仍未根治）**：opencode `project.resolve()`（`packages/core/src/project.ts:110-122`）把**非 git repo** 的 workdir 归到合成 global project（`worktree="/"`），sidecar 此前显式跳过 `worktree=="/"`（CHANGELOG v1.1.1：「跳过合成 global 项目，无真实 session/question」——**该假设错误**），导致所有非-git workdir（自定义工作目录如 `opencode_wd`、`/tmp` 临时目录）以及 git worktree 子目录（`ocdroid/.slim/worktrees/wave0-*`）的 pending question **全部漏报**。实测：pending 在 `/home/mar/opencode_wd`（非-git），`/project` 列表不含该目录 → 聚合恒 `items:[]`；带 `X-Opencode-Directory: /home/mar/opencode_wd` 直查上游却能取到。**`GET /experimental/session?roots=true`** 是 opencode 的**全局顶层 session 列表**（`roots=true` ⇒ `parentID==null` only，源码 `packages/app/src/utils/server-compat.ts:147` 确证），每个 session 携带**真实 `directory` 字段**（创建该 session 的 workdir 原始路径），覆盖 git repo + 非-git目录 + git worktree 子目录（app/tui/acp/cli/SDK 全在用的 v2 正式端点，非 deprecated `/api/`）。借鉴 qq-ocbot `fetch_questions`（`src/core/opencode.py:170`）的成熟方案。**删去 `worktree=="/"` 跳过逻辑**（session.directory 恒为真实路径，无合成 global 问题）。**发现调用带 `archived=true`**——使发现集合成为**超集**（含已归档 session），消除"某 workdir 顶层 session 全部归档但实例仍存活、pending question 仍在内存"的盲区（`/question` 是内存态，与归档状态无关；最多 fan-out 到已死实例产生 isolated `errors[]`，无副作用）。`discoveryComplete` 语义从「恒 true（`/project` 无分页）」改为「页未满 `_DISCOVERY_LIMIT`(=10000) 时 true，页满降级 false」——`/experimental/session` 接受 `limit`，`roots=true` 只返顶层 session（数量 ≈ workdir 数），实际不会截断；截断时 `authoritativeDirectories` 降级为 succeeded 数组（复用 v1.1.0 既有逻辑，防 replace-all 丢弃未发现目录 pending）。`authoritativeDirectories` 其余语义不变；envelope 字段集 `{items,errors,authoritativeDirectories,discoveryComplete}` **不变**；所有错误码不变；total failure（发现失败 → 503 `upstream_unavailable`）不变。**加性硬化，不 bump** `X-Slimapi-Version`。**上游依赖**：需 opencode ≥ v1.18.x（`/experimental/session` v2 端点；server 端 query schema `public.ts:59-64` + `isNull(parent_id)` 实现 `session.ts:560,987` 已核实；app/tui/acp/cli/SDK 共用）。**已知 trade-off**：发现调用 payload 体积较 `/project` 上升（每条 session 携带完整 SessionInfo，sidecar 只用 `id`+`directory`；本地回环单次调用 + 顶层 session 数量小，可接受）。实现：`src/oc_slimapi/routes/questions.py`；测试：`tests/test_questions_routes.py`（重写发现 mock 为 `/experimental/session` + 新增非-git 盲区 / git worktree 子目录 / archived-only 盲区 / 截断降级 / `roots=true`+`archived=true` 契约 / 缺失 directory 字段跳过 / discovery 4xx→503 等用例，共 27 用例）。评审：rev-ds 9/10 APPROVE + rev-glm 8/10 APPROVE（均独立经 opencode server 源码确证方案根基）。
-
----
-
 ## [Unreleased]
 
 ### Added
@@ -50,6 +42,29 @@ _(暂无)_
 
 ---
 
+## [1.1.5] - 2026-08-07 — P2/P3 改进 + 死代码清理（未 bump `X-Slimapi-Version`，仍 2）
+
+> rev-kimi 代码质量评审（`docs/ocmar/reviews/2026-08-07-rev-kimi-code-quality-review.md`）Handoff 清单 P2/P3/清理项落地。多为内部重构/清理/测试加固；两项行为口径修正（B1/C1）记录如下。**未 bump** `X-Slimapi-Version`（无破坏性协议变更，仍 2）。
+
+### Fixed
+
+- **cap-bail `upIn` 记账口径统一（B1，省流审计面，未 bump `X-Slimapi-Version`，仍 2）**：`GET /slimapi/sessions` 与 `GET /slimapi/messages/{sid}`（list）在 upstream body 超 `max_response_bytes` 触发 413 `response_too_large` 时，此前 `stash_up_in(n_read)` 在 cap-bail 返回**之后**执行 → 超限读字节不计入 bucket `upIn`（与 `/full/{mid}`、`/agent`、`/command` 的「先 stash 后判 None」不一致）。现四处统一为「先 stash 后判 None」，超限读仍归因到对应 bucket `upIn`，省流审计口径一致。错误码/状态码/body 不变。补 cap-bail upIn 断言测试（`tests/test_traffic_upin_gaps.py`）。
+- **gzip 协商修正 `gzip;q=0`（C1，协议正确性，未 bump `X-Slimapi-Version`，仍 2）**：gzip 协商此前为子串匹配（`"gzip" in accept_encoding.lower()`），客户端显式 `Accept-Encoding: gzip;q=0`（RFC 7231「拒绝 gzip」）时仍被压缩。现新增 `gzip_util.accepts_gzip()` 按 q-value 解析（`gzip;q=0`→不压缩；`*` 通配；显式 `gzip;q=0` 覆盖通配；`x-gzip` 同义；大小写不敏感），统一用于所有 JSON gzip 决策点（`json_response` / transform `_pack_json` / messages list / agent+command catalog / token stream / 版本门禁 400）。补边界测试（`tests/test_gzip_negotiation.py`）。实际客户端几乎不发 `gzip;q=0`，属协议正确性瑕疵修正。
+
+### Changed
+
+- **版本门禁 400 协商 gzip（C3）**：`SlimapiVersionMiddleware` 的 400（`version_required`/`version_incompatible`）此前直接 `JSONResponse` 不经 gzip 协商；现走 `gzip_util.json_response`，与「所有 JSON 路由 honor `Accept-Encoding`」一致（契约 §9 字面覆盖）。body 极小，纯一致性变更。
+
+### Internal（无 wire 变更，简记）
+
+- **agent/command 去重（B2）**：`routes/agent.py` + `routes/command.py`（~95% 逐行重复）抽取公共骨架 `routes/_catalog_common.py`（参数化 path/projection/timeout）；各自保留 docstring 省流实测数据。行为不变；`read_with_cap` 经参数注入保留 `test_command_routes` 的 monkeypatch 面。
+- **`TurnRegistry._turns` 加 LRU 上限（B3）**：唯一无界状态点加 `_TURNS_MAX=10_000` LRU cap（对齐 `sse/global_hub.py` `_LAST_UPDATED_AT_BY_SID_MAX` 模式）；evicted sid 下次 bump 从 1 起（hole，ocdroid lex 容忍，同 restart 语义）。
+- **`smoke()` 单测（B4）**：补 `app.smoke()` schema 校验四分支 + happy path 单测（`tests/test_smoke.py`）。
+- **`check_routes_doc.py` 语义校验（B5）**：路由↔文档一致性门禁增加错误码关键词语义校验（白名单：sessions / messages list / messages full / command / agent 的 `session_not_found` / `upstream_http_` / `upstream_unavailable` / `transform_busy`），防 P1-2 那类「路由存在但错误映射描述漂移」；存在性校验保留。
+- **死代码清理（D1-D5）**：删 `upstream.decoded_body_headers()`（零调用）；`logging_config.redact()` 注明 test-only；删 config 残留字段 `access_log_max_bytes` / `access_log_backups`（RotatingFileHandler 时代遗留，无消费方）+ 其 env 读取 + validate + `test_traffic_integration` 引用 + INTERFACE_MAP deprecated 描述同步；`GlobalHub.unsubscribe` / `stop_after_grace` 注明 test-only；`traffic.py` docstring 修悬空的 `BatchLedger` 引用。
+- **测试夹具对齐 v2（D6）**：`tests/test_traffic_upin_gaps.py` 夹具从 `X-Slimapi-Version: 1` / `accepted_client_versions=(1,1)` 对齐到生产 v2（`2` / `(2,2)`），docstring 去除过时的 G6/questions 描述。
+- **`?before=` 前置条件注释锚定（C4）**：messages list 路由加注释锚定「opencode cursor 为 base64url」假设（不含 `+` / 空格，故 unquote_plus 往返安全）。
+
 ## [1.1.4] - 2026-08-07 — questions 内存防线 + traffic 桶修正 + 文档纠错（未 bump `X-Slimapi-Version`，仍 2）
 
 ### Fixed
@@ -57,6 +72,14 @@ _(暂无)_
 - **`GET /slimapi/questions` 加 `read_with_cap` 内存防线（加性硬化，未 bump `X-Slimapi-Version`，仍 2，2026-08-07）**：questions 路由的两处上游调用——发现调用 `GET /experimental/session?roots=true&archived=true`（`limit=10000`，全量 SessionInfo）与 per-dir fan-out `GET /question`——此前用非流式 `client.get()` + 全 buffer `response.json()`，无 body cap（v1.1.2 刚为 `/slimapi/sessions` 补上流式 `read_with_cap`，但 v1.1.0 引入的 questions 路由未享受同一硬化）。现两处均改为流式 `client.send(stream=True)` + `read_with_cap(config.max_response_bytes)` + `try/finally: response.aclose()`，与 sessions/messages/agent/command 的内存防线对齐（mirrors `routes/sessions.py`）。**行为映射**：发现调用超限→**503 `upstream_unavailable`**（total failure，无 envelope，contract §7 discovery exception——发现是内部派生调用，泄漏上游状态会误导客户端）；per-dir `/question` 超限→该 dir 计入 envelope `errors[]`（`code:"upstream_unavailable"`，isolated，不中断整体）。mid-stream `httpx.RequestError`（aread/read_with_cap 阶段）→ 同路径 503 / errors[]。上游错误状态码仍抽干 body 记 traffic + 复用连接。**加性变更，不 bump** `X-Slimapi-Version`（无 client 依赖现有全 buffer 行为；新行为是 thin 路由既有 `read_with_cap` 防线的补齐）。实现：`src/oc_slimapi/routes/questions.py`；测试：`tests/test_questions_routes.py`（发现 cap→503、per-dir cap→errors[] 两条新用例）。
 - **traffic 桶表修正：`bucketize()` 加 `questions` 桶 + 手册同步（2026-08-07）**：`src/oc_slimapi/traffic.py` 的 `bucketize()` 此前无 `questions` 桶，`/slimapi/questions` 实际落入 `"other"`；而 `docs/manual/traffic-accounting.md` §3.2 文档了不存在的 `quiz` 桶（含 v2 已删的 `/permissions`）——文档↔实现漂移。现 `bucketize` 加 `questions` 桶（`/slimapi/questions` + `/slimapi/questions/**`，与 command/agent 平权），手册 §3.2 修正为 `questions` 行、删去 v2 不存在的 `projects`/`permissions`。省流口径变更（ops 可观测面，非客户端 wire 契约）；既有桶名不变。实现：`src/oc_slimapi/traffic.py` + `docs/manual/traffic-accounting.md`；测试：`tests/test_traffic_ledger.py`（`test_questions_bucket`）。
 - **文档纠错：README「范围」节 + INTERFACE_MAP 错误映射（doc-fix，2026-08-07）**：(1) README「范围」节三处与实现矛盾的描述纠正——删去 v2 已删的 `since` 端点误述、token stream SSE 从"永不 gzip"改为"默认 gzip（lever2，首个 SSE gzip 例外）"、补齐 `questions`（跨目录聚合）与 `sessions/status` 加性回归端点。(2) `docs/specs/INTERFACE_MAP.md` 两处 messages 路由（`/slimapi/messages/{sid}` 与 `/full/{mid}`）的上游错误映射从 v1 残留"原状态透传 / 原状态 body 透传"改为契约 §7 的正确映射：404→404 `session_not_found`（带 `sessionID`）；其他 4xx→502 `upstream_http_N`；5xx/网络→503 `upstream_unavailable`（与 sessions 行写法一致）。纯文档纠错，无行为变更。
+
+---
+
+## [1.1.3] - 2026-08-07 — questions 发现机制根治（/project → /experimental/session?roots=true&archived=true），未 bump `X-Slimapi-Version`，仍 2
+
+### Fixed
+
+- **`GET /slimapi/questions` 发现机制彻底修复（未 bump `X-Slimapi-Version`，仍 2）**：发现源从 `GET /project` 改为 `GET /experimental/session?roots=true`。**根因（v1.1.1/v1.1.2 仍未根治）**：opencode `project.resolve()`（`packages/core/src/project.ts:110-122`）把**非 git repo** 的 workdir 归到合成 global project（`worktree="/"`），sidecar 此前显式跳过 `worktree=="/"`（CHANGELOG v1.1.1：「跳过合成 global 项目，无真实 session/question」——**该假设错误**），导致所有非-git workdir（自定义工作目录如 `opencode_wd`、`/tmp` 临时目录）以及 git worktree 子目录（`ocdroid/.slim/worktrees/wave0-*`）的 pending question **全部漏报**。实测：pending 在 `/home/mar/opencode_wd`（非-git），`/project` 列表不含该目录 → 聚合恒 `items:[]`；带 `X-Opencode-Directory: /home/mar/opencode_wd` 直查上游却能取到。**`GET /experimental/session?roots=true`** 是 opencode 的**全局顶层 session 列表**（`roots=true` ⇒ `parentID==null` only，源码 `packages/app/src/utils/server-compat.ts:147` 确证），每个 session 携带**真实 `directory` 字段**（创建该 session 的 workdir 原始路径），覆盖 git repo + 非-git目录 + git worktree 子目录（app/tui/acp/cli/SDK 全在用的 v2 正式端点，非 deprecated `/api/`）。借鉴 qq-ocbot `fetch_questions`（`src/core/opencode.py:170`）的成熟方案。**删去 `worktree=="/"` 跳过逻辑**（session.directory 恒为真实路径，无合成 global 问题）。**发现调用带 `archived=true`**——使发现集合成为**超集**（含已归档 session），消除"某 workdir 顶层 session 全部归档但实例仍存活、pending question 仍在内存"的盲区（`/question` 是内存态，与归档状态无关；最多 fan-out 到已死实例产生 isolated `errors[]`，无副作用）。`discoveryComplete` 语义从「恒 true（`/project` 无分页）」改为「页未满 `_DISCOVERY_LIMIT`(=10000) 时 true，页满降级 false」——`/experimental/session` 接受 `limit`，`roots=true` 只返顶层 session（数量 ≈ workdir 数），实际不会截断；截断时 `authoritativeDirectories` 降级为 succeeded 数组（复用 v1.1.0 既有逻辑，防 replace-all 丢弃未发现目录 pending）。`authoritativeDirectories` 其余语义不变；envelope 字段集 `{items,errors,authoritativeDirectories,discoveryComplete}` **不变**；所有错误码不变；total failure（发现失败 → 503 `upstream_unavailable`）不变。**加性硬化，不 bump** `X-Slimapi-Version`。**上游依赖**：需 opencode ≥ v1.18.x（`/experimental/session` v2 端点；server 端 query schema `public.ts:59-64` + `isNull(parent_id)` 实现 `session.ts:560,987` 已核实；app/tui/acp/cli/SDK 共用）。**已知 trade-off**：发现调用 payload 体积较 `/project` 上升（每条 session 携带完整 SessionInfo，sidecar 只用 `id`+`directory`；本地回环单次调用 + 顶层 session 数量小，可接受）。实现：`src/oc_slimapi/routes/questions.py`；测试：`tests/test_questions_routes.py`（重写发现 mock 为 `/experimental/session` + 新增非-git 盲区 / git worktree 子目录 / archived-only 盲区 / 截断降级 / `roots=true`+`archived=true` 契约 / 缺失 directory 字段跳过 / discovery 4xx→503 等用例，共 27 用例）。评审：rev-ds 9/10 APPROVE + rev-glm 8/10 APPROVE（均独立经 opencode server 源码确证方案根基）。
 
 ---
 

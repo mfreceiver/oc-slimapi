@@ -31,6 +31,7 @@ single-loop monotonic visibility).
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from pathlib import Path
 
 from .logging_config import get_logger
@@ -42,6 +43,11 @@ logger = get_logger(__name__)
 # unwritable: we never crash the process over a causal-identifier best
 # effort (mirrors traffic_snapshot.py's fault tolerance style).
 _FALLBACK_INCARNATION = 1
+
+# LRU cap on the per-sid turn map (mirrors _LAST_UPDATED_AT_BY_SID_MAX in
+# sse/global_hub.py). An evicted sid's next bump starts fresh at 1 — a "hole"
+# ocdroid's lex compare tolerates exactly like a restart hole.
+_TURNS_MAX = 10_000
 
 # Single flat file holding the last-written incarnation integer, one line.
 _INCARNATION_FILENAME = "incarnation"
@@ -161,10 +167,13 @@ class TurnRegistry:
 
     * ``incarnation`` — frozen at startup from :class:`IncarnationStore`;
       constant for the process lifetime (O2/O4).
-    * ``_turns`` — ``dict[sid, int]``, monotonically non-decreasing per
-      ``sid`` (S2). Scope is the ``sid`` alone (O3 single-instance: no
-      instanceFp, no server-group fingerprint in the key — single sidecar
-      + single opencode backend makes ``sid`` globally unique).
+    * ``_turns`` — ``OrderedDict[str, int]``, monotonically non-decreasing per
+      ``sid`` (S2). FIFO/LRU-bounded by :data:`_TURNS_MAX` (10_000) — an
+      evicted sid's next bump starts fresh at 1 (a "hole" the client's lex
+      compare tolerates like a restart hole). Scope is the ``sid`` alone (O3
+      single-instance: no instanceFp, no server-group fingerprint in the key
+      — single sidecar + single opencode backend makes ``sid`` globally
+      unique).
 
     All methods are synchronous pure-dict operations — no locking needed
     under the single-event-loop model (contract §7.2). ``snapshot`` always
@@ -176,7 +185,7 @@ class TurnRegistry:
 
     def __init__(self, incarnation: int) -> None:
         self.incarnation: int = incarnation
-        self._turns: dict[str, int] = {}
+        self._turns: OrderedDict[str, int] = OrderedDict()
 
     def bump_turn(self, sid: str) -> int:
         """Increment the turn for ``sid`` and return it.
@@ -187,6 +196,11 @@ class TurnRegistry:
         Monotonically non-decreasing per ``sid``.
         """
         self._turns[sid] = self._turns.get(sid, 0) + 1
+        # LRU cap: refresh insertion order so actively-bumping sids survive,
+        # then evict least-recently-bumped over _TURNS_MAX.
+        self._turns.move_to_end(sid)
+        while len(self._turns) > _TURNS_MAX:
+            self._turns.popitem(last=False)
         return self._turns[sid]
 
     def snapshot(self, sid: str) -> tuple[int, int]:

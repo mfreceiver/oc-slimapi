@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
+
+from .gzip_util import json_response
 
 SERVER_API_VERSION = 2
 ACCEPTED_CLIENT_VERSIONS: tuple[int, int] = (2, 2)
@@ -36,21 +37,27 @@ class SlimapiVersionMiddleware:
         except ValueError:
             client_version = None
 
+        # Negotiate gzip on the 400 body (contract §9 "all JSON routes") via
+        # gzip_util.json_response so a client sending Accept-Encoding: gzip
+        # gets a gzipped error body, consistent with every other JSON route.
+        accept_encoding = headers.get("accept-encoding")
         minimum, maximum = self.accepted
         if client_version is None:
-            await JSONResponse(
+            await json_response(
                 {"code": "version_required", "accepted": [minimum, maximum]},
                 status_code=400,
+                accept_encoding=accept_encoding,
             )(scope, receive, send)
             return
         if not minimum <= client_version <= maximum:
-            await JSONResponse(
+            await json_response(
                 {
                     "code": "version_incompatible",
                     "client": client_version,
                     "accepted": [minimum, maximum],
                 },
                 status_code=400,
+                accept_encoding=accept_encoding,
             )(scope, receive, send)
             return
 
