@@ -3,7 +3,6 @@ import time
 from fastapi import APIRouter, Request
 
 from .. import __version__
-from ..config import settings
 from ..gzip_util import json_response
 from ..traffic import stash_up_in
 
@@ -53,7 +52,7 @@ async def health(request: Request):
         "features": {
             "tokenStream": True,
             "thresholdedSkeleton": True,
-            "skeletonInlineOutputMaxBytes": settings.skeleton_inline_output_max_bytes,
+            "skeletonInlineOutputMaxBytes": request.app.state.config.skeleton_inline_output_max_bytes,
         },
     }
     # S-E: optional deployment revision, omitted when None
