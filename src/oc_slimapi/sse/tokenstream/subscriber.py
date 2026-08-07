@@ -520,25 +520,32 @@ class TokenStreamRegistry:
 
         1. cap check — else raise :class:`TokenSubscriberCapacityError`
            (caller maps to 503 ``sse_token_subscriber_limit``).
-        2. ensure the single upstream ``/global/event`` is connected
+        2. construct the :class:`TokenSubscriber` (no side effects — just a
+           dataclass + queue; safe to construct before the side-effectful
+           section).
+        3. ensure the single upstream ``/global/event`` is connected
            (design §5.2: ``registry.get_global().ensure_upstream()``) and
-           cancel any armed registry grace-removal (NB-B1, Stage-B TODO).
-        3. start the token flush loop (first-attach lifecycle, NB-C4 — the
-           current production path is ingest-only until the first subscriber
-           arrives; this makes the flush loop actually run).
-        4. construct the :class:`TokenSubscriber`.
+           cancel any armed registry grace-removal (NB-B1).
+        4. start the token flush loop (first-attach lifecycle, NB-C4).
         5. :meth:`TokenStreamHub.attach_subscriber` runs the §5.5 handshake
            (server.connected → flush_sid → snapshot → enter fanout).
         6. MAJOR 4 + MAJOR 5: if the sub came back from ``attach_subscriber``
            with ``closed=True`` (handshake buffer overflow CRITICAL 2,
            oversized-frame guard armed mid-handshake, or a future Lane-A
            change), DO NOT increment the ledger AND perform a COMPLETE
-           ROLLBACK of the side effects from steps 2–3 (flush loop stop +
+           ROLLBACK of the side effects from steps 3–4 (flush loop stop +
            GlobalHub grace re-arm). Without the rollback the flush loop
            keeps running for nobody, ``GlobalHub.run()`` parks forever on
            ``aiter_lines``, and the upstream ``/global/event`` connection +
            hub tasks leak (B-D1 ghost-subscriber resource leak).
         7. increment the ledger.
+
+        INV-3 (P1-20): steps 3–5 are wrapped in ``try / except`` so ANY
+        exception (QueueFull, serialization error, future handshake logic
+        error, etc. — not just the ``closed`` path) triggers the SAME
+        symmetric rollback via :meth:`_rollback_failed_attach`.
+        :class:`asyncio.CancelledError` is re-raised without being caught
+        by ``except Exception``.
         """
         if self.total_subscribers >= self.max_subscribers:
             self.rejected_total += 1
@@ -547,13 +554,10 @@ class TokenStreamRegistry:
                 limit=self.max_subscribers,
                 current=self.total_subscribers,
             )
-        # Upstream lifecycle: ensure connected + cancel grace removal (NB-B1).
-        if self.hub_registry is not None:
-            hub = self.hub_registry.get_global()
-            self.hub_registry.cancel_pending_removal()
-            hub.ensure_upstream()
-        # Token flush loop (idempotent start; first-attach lifecycle).
-        self.token_hub.start()
+        # Construct the sub early — it has no side effects (just a dataclass
+        # + bounded queue init), so it is safe to create before the
+        # side-effectful section. This lets INV-3 wrap ensure_upstream /
+        # start / attach in a single try with a uniform rollback.
         sub = TokenSubscriber(
             session_id=sid,
             metrics=self.token_hub._metrics,
@@ -561,14 +565,32 @@ class TokenStreamRegistry:
             buffer_bytes=self.buffer_bytes,
             max_frame_bytes=self.max_frame_bytes,
         )
-        # §5.5 handshake (server.connected first, then flush_sid → snapshot
-        # → enter fanout). Implemented in Stage C attach_subscriber.
-        self.token_hub.attach_subscriber(sid, sub)
+        # INV-3 (P1-20): wrap the ENTIRE side-effectful section so any
+        # exception (not just sub.closed) triggers symmetric rollback.
+        # CancelledError is re-raised untouched (not swallowed by the
+        # broad except).
+        try:
+            # Upstream lifecycle: ensure connected + cancel grace removal (NB-B1).
+            if self.hub_registry is not None:
+                hub = self.hub_registry.get_global()
+                self.hub_registry.cancel_pending_removal()
+                hub.ensure_upstream()
+            # Token flush loop (idempotent start; first-attach lifecycle).
+            self.token_hub.start()
+            # §5.5 handshake (server.connected first, then flush_sid →
+            # snapshot → enter fanout).
+            self.token_hub.attach_subscriber(sid, sub)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._rollback_failed_attach(sid, sub)
+            self.rejected_total += 1
+            raise
         # MAJOR 4 + MAJOR 5: attach_subscriber's membership guard checks
         # ``sub.closed`` and bails without entering fanout if True. The
         # pre-MAJOR-4 bug: subscribe() ALWAYS incremented total_subscribers
         # afterwards, leaking a slot on every closed-attach. The pre-MAJOR-5
-        # bug: the side effects from steps 2–3 above (flush loop running,
+        # bug: the side effects from steps 3–4 above (flush loop running,
         # GlobalHub grace cancelled, upstream ensured) were NOT rolled back,
         # leaking a ghost subscriber + flush loop + upstream connection.
         #

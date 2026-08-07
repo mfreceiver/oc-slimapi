@@ -20,6 +20,10 @@ from oc_slimapi.sse.hub_types import Subscriber
 from oc_slimapi.sse.registry import HubRegistry
 from oc_slimapi.sse.tokenstream.hub import TokenStreamHub
 from oc_slimapi.sse.tokenstream.models import LivePart
+from oc_slimapi.sse.tokenstream.subscriber import (
+    TokenStreamRegistry,
+    TokenSubscriber,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +43,25 @@ async def _close_hub(hub: GlobalHub) -> None:
     hub.flush_task = None
     hub.heartbeat_task = None
     hub.stop_task = None
+
+
+async def _close_registry(hubs: HubRegistry) -> None:
+    """Cancel + await the registry's removal task and its hub tasks."""
+    removal = hubs._removal_task
+    hubs._removal_task = None
+    tasks: list = []
+    if removal is not None:
+        tasks.append(removal)
+    if hubs._global is not None:
+        for t in (hubs._global.task, hubs._global.flush_task,
+                   hubs._global.heartbeat_task, hubs._global.stop_task):
+            if t is not None:
+                tasks.append(t)
+    for t in tasks:
+        t.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    hubs._global = None
 
 
 async def _pump_callbacks(n: int = 3) -> None:
@@ -540,3 +563,138 @@ class TestInv2GraceSerialEpochCleanup:
         # _global NOT nulled (removal was cancelled mid-gather).
         assert registry._global is hub
         await _close_hub(hub)
+
+
+# ===========================================================================
+# Step 3 — INV-3: subscribe full-exception rollback
+# ===========================================================================
+
+class TestInv3SubscribeRollback:
+    """TokenStreamRegistry.subscribe: ANY exception in ensure_upstream /
+    start / attach triggers symmetric rollback."""
+
+    def _build_registry(self) -> tuple:
+        th = TokenStreamHub()
+        hubs = HubRegistry(client=None)
+        hubs.set_token_hub(th)
+        reg = TokenStreamRegistry(
+            th, hubs,
+            max_subscribers=2,
+            queue_items=64,
+            buffer_bytes=512 * 1024,
+            max_frame_bytes=1024 * 1024,
+        )
+        return reg, th, hubs
+
+    async def test_attach_exception_rolls_back_flush_loop(self, monkeypatch):
+        """attach_subscriber raises a non-closed exception (e.g. QueueFull) →
+        flush loop stopped, grace re-armed, total_subscribers not incremented,
+        exception propagated."""
+        monkeypatch.setattr("oc_slimapi.sse.global_hub.GRACE_SECONDS", 0.0)
+        monkeypatch.setattr("oc_slimapi.sse.registry.GRACE_SECONDS", 0.0)
+        reg, th, hubs = self._build_registry()
+        try:
+            def raising_attach(sid, sub):
+                raise RuntimeError("attach boom")
+
+            th.attach_subscriber = raising_attach  # type: ignore[assignment]
+
+            with pytest.raises(RuntimeError, match="attach boom"):
+                reg.subscribe("s1")
+
+            # total_subscribers NOT incremented.
+            assert reg.total_subscribers == 0
+            # Flush loop STOPPED (rollback stopped it — no ghost task).
+            assert th._flush_task is None or th._flush_task.done()
+            # No ghost subscriber in _subs_by_sid.
+            assert len(th._subs_by_sid) == 0
+            # Grace re-armed (rollback called maybe_arm_grace_if_idle).
+            # With GRACE_SECONDS=0.0, the removal task fires immediately.
+            assert hubs._removal_task is not None or hubs._global is None
+        finally:
+            th.stop()
+            if hubs._global is not None:
+                await _close_registry(hubs)
+
+    async def test_attach_exception_does_not_increment_rejected_for_capacity(self):
+        """The rejected_total is bumped on rollback (the sub was rejected),
+        but the code is NOT a capacity error — the exception propagates as-is."""
+        reg, th, hubs = self._build_registry()
+        try:
+            def raising_attach(sid, sub):
+                raise RuntimeError("attach boom")
+
+            th.attach_subscriber = raising_attach  # type: ignore[assignment]
+
+            with pytest.raises(RuntimeError):
+                reg.subscribe("s1")
+
+            assert reg.rejected_total == 1
+            assert reg.total_subscribers == 0
+        finally:
+            th.stop()
+            if hubs._global is not None:
+                await _close_registry(hubs)
+
+    async def test_cancelled_error_reraised_not_swallowed(self):
+        """CancelledError is re-raised without being caught by the broad
+        except Exception."""
+        reg, th, hubs = self._build_registry()
+        try:
+            def cancelling_attach(sid, sub):
+                raise asyncio.CancelledError()
+
+            th.attach_subscriber = cancelling_attach  # type: ignore[assignment]
+
+            with pytest.raises(asyncio.CancelledError):
+                reg.subscribe("s1")
+
+            assert reg.total_subscribers == 0
+        finally:
+            th.stop()
+            if hubs._global is not None:
+                await _close_registry(hubs)
+
+    async def test_successful_subscribe_still_works(self):
+        """Sanity: the refactor doesn't break the happy path."""
+        reg, th, hubs = self._build_registry()
+        try:
+            sub = reg.subscribe("s1")
+            assert reg.total_subscribers == 1
+            assert th._flush_task is not None and not th._flush_task.done()
+            assert th.has_subscriber("s1", sub)
+            reg.unsubscribe(sub)
+            assert reg.total_subscribers == 0
+        finally:
+            th.stop()
+            if hubs._global is not None:
+                await _close_registry(hubs)
+
+    async def test_attach_exception_then_successful_subscribe(self):
+        """After a rolled-back attach failure, a subsequent subscribe
+        succeeds (no stale state from the failure)."""
+        reg, th, hubs = self._build_registry()
+        try:
+            calls = {"n": 0}
+            real_attach = th.attach_subscriber
+
+            def fail_once(sid, sub):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise RuntimeError("first attach boom")
+                real_attach(sid, sub)
+
+            th.attach_subscriber = fail_once  # type: ignore[assignment]
+
+            with pytest.raises(RuntimeError):
+                reg.subscribe("s1")
+
+            # Second subscribe succeeds.
+            sub = reg.subscribe("s1")
+            assert reg.total_subscribers == 1
+            assert th.has_subscriber("s1", sub)
+            reg.unsubscribe(sub)
+        finally:
+            th.stop()
+            if hubs._global is not None:
+                await _close_registry(hubs)
