@@ -372,3 +372,32 @@ def test_shutdown_is_idempotent():
     pool = _pool()
     pool.shutdown()
     pool.shutdown()  # second shutdown must not raise
+
+
+def test_shutdown_with_slow_worker_returns_within_timeout():
+    """P1-41: shutdown(wait_seconds=N) must return within ~N even if a
+    worker is still running. Previously shutdown() blocked on
+    executor.shutdown(wait=True) with no timeout — a stuck worker would
+    stall the event loop past the uvicorn graceful-shutdown window."""
+    pool = _pool(max_transforms=1)
+    # Submit a slow task directly to the executor (bypass admission) so it's
+    # in-flight when shutdown is called.
+    pool._executor.submit(time.sleep, 3.0)
+    # Let the worker actually start.
+    time.sleep(0.05)
+    start = time.monotonic()
+    pool.shutdown(wait_seconds=0.2)
+    elapsed = time.monotonic() - start
+    # Must return well within the slow worker's 3s duration.
+    assert elapsed < 1.0, (
+        f"shutdown took {elapsed:.2f}s (expected < 1s with 0.2s timeout)"
+    )
+
+
+def test_shutdown_default_wait_seconds_is_10():
+    """The default wait_seconds is 10 (production graceful window)."""
+    pool = _pool(max_transforms=1)
+    import inspect
+    sig = inspect.signature(pool.shutdown)
+    assert sig.parameters["wait_seconds"].default == 10.0
+    pool.shutdown(wait_seconds=0.01)  # fast cleanup

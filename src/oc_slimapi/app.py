@@ -59,6 +59,15 @@ _SMOKE_TIMEOUT = 5.0
 # (bounded gzip work + per-operation _MAINT_LOCK in access_log.py).
 _MAINT_DRAIN_TIMEOUT = 30.0
 
+# Graceful drain timeout for the transform pool on shutdown (P1-41). The
+# pool's shutdown() cancels pending futures and waits for in-flight workers
+# bounded by this timeout. A running transform (large gzip / pathological
+# input) that doesn't finish within this window is abandoned (the daemon
+# drain thread continues in the background). 10s aligns with the typical
+# uvicorn graceful-shutdown window so a hot reload / systemd stop is not
+# stalled by a single slow worker.
+_TRANSFORM_DRAIN_TIMEOUT = 10.0
+
 
 def _log_maint_task_exception(task: asyncio.Task) -> None:
     """Log an unobserved exception from a finished maintenance task (P1-38).
@@ -274,10 +283,14 @@ async def lifespan(app: FastAPI):
         ))
 
         def _shutdown_transforms():
-            # Drain in-flight transforms so a hot reload does not yank a
-            # worker out from under an active gzip.
+            # P1-41: drain in-flight transforms bounded by a timeout so a
+            # hot reload does not yank a worker out from under an active
+            # gzip, but also does not stall the event loop past the uvicorn
+            # graceful-shutdown window if a worker is stuck.
             try:
-                app.state.transforms.shutdown()
+                app.state.transforms.shutdown(
+                    wait_seconds=_TRANSFORM_DRAIN_TIMEOUT,
+                )
             except Exception as exc:
                 get_logger("app").warning("transforms.shutdown failed", exc_info=exc)
         stack.callback(_shutdown_transforms)

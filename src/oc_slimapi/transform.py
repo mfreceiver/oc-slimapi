@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import threading
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -246,6 +247,39 @@ class TransformPool:
             "waiting": waiting,
         }
 
-    def shutdown(self) -> None:
-        """Drain in-flight workers (``wait=True``) without cancelling queued futures."""
-        self._executor.shutdown(wait=True, cancel_futures=False)
+    def shutdown(self, wait_seconds: float = 10.0) -> None:
+        """Drain in-flight workers bounded by ``wait_seconds`` (P1-41).
+
+        ``ThreadPoolExecutor.shutdown(wait=True)`` blocks without a native
+        timeout; a stuck or slow worker (large gzip, pathological input)
+        would stall the event loop past the uvicorn graceful-shutdown window
+        during hot reload / systemd stop. This bounds the drain:
+
+        1. Cancel pending (not-yet-started) futures immediately.
+        2. Wait for in-flight workers in a daemon thread, bounded by
+           ``wait_seconds``.
+        3. If the drain hasn't finished when the timeout fires, return
+           anyway — the daemon thread keeps waiting in the background but
+           does not block process exit, and the calling event loop is freed.
+
+        Idempotent: subsequent calls are no-ops (the executor is already
+        shut down; ``shutdown`` on a terminated executor returns immediately).
+        """
+        # Cancel pending futures; let running workers finish naturally.
+        self._executor.shutdown(wait=False, cancel_futures=True)
+        # Bounded wait for in-flight workers via a daemon thread so the
+        # calling (event-loop) thread is never blocked past ``wait_seconds``.
+        done = threading.Event()
+
+        def _drain() -> None:
+            try:
+                self._executor.shutdown(wait=True)
+            finally:
+                done.set()
+
+        watcher = threading.Thread(
+            target=_drain, daemon=True,
+            name="oc-slimapi-transform-drain",
+        )
+        watcher.start()
+        done.wait(timeout=wait_seconds)
