@@ -210,7 +210,14 @@ def install_proxy(app: FastAPI) -> None:
         # Wrap the upstream response iterator so we count the bytes returned
         # to the client (``upIn`` — the upstream leg of THIS request). The
         # finally guarantees the count lands even on disconnect / error mid
-        # stream. BackgroundTask still owns response.aclose().
+        # stream. The ``response.aclose()`` in finally is the LAST line of
+        # defense against connection-pool leaks: StreamingResponse's
+        # BackgroundTask(response.aclose) only runs after the generator
+        # completes normally, so a mid-stream exception (generator torn down
+        # by a client disconnect or upstream error) would skip it. Closing
+        # here is idempotent with the BackgroundTask (httpx aclose is
+        # reentrant) — the normal path closes twice harmlessly, the exception
+        # path closes exactly once via this finally (P1-10).
         async def _counted_upstream_response():
             n = 0
             try:
@@ -220,6 +227,7 @@ def install_proxy(app: FastAPI) -> None:
             finally:
                 if n > 0:
                     stash_up_in(request, n)
+                await response.aclose()
 
         return StreamingResponse(
             _counted_upstream_response(),

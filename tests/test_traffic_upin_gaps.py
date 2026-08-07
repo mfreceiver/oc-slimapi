@@ -344,3 +344,69 @@ async def test_messages_cap_bail_stashes_upin(upstream_factory):
         )
     finally:
         await _shutdown(app)
+
+
+# ===========================================================================
+# Scenario 4 — proxy mid-stream upstream response aclose via finally (P1-10)
+# ===========================================================================
+
+async def test_proxy_mid_stream_response_aclose_via_finally_stashes_upin(
+    upstream_factory,
+):
+    """P1-10: ``_counted_upstream_response``'s ``finally`` block calls
+    ``response.aclose()`` even when the upstream stream fails mid-way.
+
+    The ``response.aclose()`` in the ``finally`` is the last line of defence
+    against connection-pool leaks: ``StreamingResponse``'s
+    ``BackgroundTask(response.aclose)`` only runs after the generator
+    completes normally, so a mid-stream exception would skip it.
+
+    Observable proxy: ``stash_up_in(request, n)`` is the line JUST BEFORE
+    ``response.aclose()`` in the SAME ``finally`` block. If the stash fires
+    (attributing the partial bytes to ``upIn``), the ``finally`` executed —
+    and ``response.aclose()``, being the next unconditional line, also ran.
+    This mirrors how ``test_proxy_counted_req_stream_happy_path_stashes_upout``
+    verifies the request-stream ``finally`` via the ``upOut`` stash.
+    """
+    PARTIAL = b'{"partial":true}'
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        async def body():
+            yield PARTIAL
+            raise httpx.ReadError("mid-stream disconnect", request=request)
+
+        return httpx.Response(
+            200,
+            stream=httpx._content.AsyncIteratorByteStream(body()),
+            headers={"Content-Type": "application/json"},
+        )
+
+    upstream = upstream_factory(handler)
+    app, ledger = _build_app(
+        _settings(), upstream, include_proxy=True,
+    )
+    assert ledger is not None
+    transport = httpx.ASGITransport(app)
+    try:
+        async with httpx.AsyncClient(transport=transport,
+                                     base_url="http://test") as client:
+            # The mid-stream failure propagates through StreamingResponse.
+            # The client may see a partial body or a transport error; we do
+            # not assert on the response shape — the key assertion is the
+            # traffic stash below proving the ``finally`` ran.
+            try:
+                await client.get("/session")
+            except httpx.HTTPError:
+                pass  # partial / incomplete response is expected
+
+        snap = ledger.snapshot()
+        assert "passthrough" in snap["buckets"]
+        bucket = snap["buckets"]["passthrough"]
+        assert bucket["upIn"] == len(PARTIAL), (
+            f"upIn ({bucket['upIn']}) should equal the partial bytes read "
+            f"before failure ({len(PARTIAL)}) — proves "
+            f"_counted_upstream_response's finally ran, and thus "
+            f"response.aclose() (the next unconditional line) also ran"
+        )
+    finally:
+        await _shutdown(app)
