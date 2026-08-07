@@ -179,10 +179,28 @@ def install_proxy(app: FastAPI) -> None:
         rid = request.scope.get("state", {}).get("request_id")
         if rid is not None:
             proxy_headers["X-Request-ID"] = rid
+        # P0-7: forward the ORIGINAL raw query string (contract §4 transparent
+        # reverse proxy). Using Starlette's parsed ``query_params.multi_items()``
+        # would have httpx re-encode the query, which loses fidelity for:
+        #   * percent-encoded octets (e.g. %20 vs +) — Starlette decodes, httpx
+        #     may pick a different canonical encoding on re-encode.
+        #   * ``+`` in the raw query — Starlette's QueryParams decodes ``+`` to
+        #     space (HTML-form convention) then httpx re-encodes space as ``+``
+        #     or %20 depending on its encoder.
+        #   * flag-style empty params (``?flag`` with no ``=``) and the order
+        #     of repeated keys — both preserved verbatim by the raw bytes.
+        # The scope's ``query_string`` is the undecoded bytes the client sent.
+        # Security note: the ``?directory=`` validation above still uses the
+        # parsed query_params (multi_items); this only changes how the bytes
+        # are forwarded upstream.
+        raw_qs = request.scope.get("query_string", b"") or b""
+        upstream_url = norm_path
+        if raw_qs:
+            upstream_url = f"{norm_path}?{raw_qs.decode('latin-1')}"
         upstream_request = client.build_request(
             request.method,
-            norm_path,  # norm_path already starts with /
-            params=request.query_params.multi_items(),
+            upstream_url,
+            params=None,  # do NOT re-encode — query is already in upstream_url
             headers=proxy_headers,
             content=_counted_req_stream(),
         )

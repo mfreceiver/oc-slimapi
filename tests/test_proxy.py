@@ -523,3 +523,120 @@ async def test_catch_all_error_response_without_gzip_still_has_vary(
     # Body is plain JSON, no gzip magic.
     assert raw_bytes[:2] != b"\x1f\x8b"
     assert orjson.loads(raw_bytes)["code"] == expected_code
+
+
+# ── P0-7: catch-all preserves the original raw query string (contract §4) ────
+
+
+@pytest.mark.parametrize("raw_query", [
+    # percent-encoded octets — Starlette would decode %20 to space, httpx
+    # might re-encode space as + or %20; the raw byte must round-trip.
+    "name=hello%20world",
+    # '+' in the raw query — Starlette decodes '+' to space (HTML form
+    # convention); the raw '+' must reach upstream verbatim.
+    "expr=a+b",
+    # flag-style empty param (no '='): the literal 'flag' must arrive as-is.
+    "flag",
+    # repeated keys with order-dependence — order must be preserved.
+    "k=1&k=2&k=3",
+    # mix of percent-encoding, '+', and a sub-path-style value.
+    "q=%2Fpath%2Fto%2Fx&sig=a+b+c",
+    # special reserved characters that have different canonical forms
+    # ('%2F' vs '/' inside a value).
+    "callback=foo%2Fbar",
+])
+async def test_catch_all_forwards_raw_query_verbatim(upstream_factory, raw_query):
+    """P0-7: the catch-all must forward the client's raw query bytes to
+    upstream unchanged (contract §4 transparent reverse proxy).
+
+    Previously the proxy used Starlette's parsed ``query_params.multi_items()``
+    and let httpx re-encode the query — which broke percent-encoding, ``+``,
+    flag-style empty params, and key ordering. The fix reads
+    ``scope['query_string']`` (raw bytes) and appends it to the upstream URL
+    verbatim, with ``params=None`` so httpx doesn't re-encode.
+
+    We verify by capturing the exact upstream URL the mock transport received
+    and comparing its query portion to the raw input.
+    """
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # ``request.url`` is the URL after httpx parsed it; its ``query`` is
+        # the percent-decoded view. We need the RAW query bytes — read from
+        # request.url.raw_path / raw_query equivalent. httpx.URL keeps the
+        # raw query at ``request.url.copy_with(params=...).query`` … but the
+        # simplest portable capture is ``request.url`` whose str form preserves
+        # the original encoding httpx was given.
+        captured["url"] = str(request.url)
+        captured["raw_query"] = request.url.query.decode() if isinstance(request.url.query, bytes) else request.url.query
+
+        async def body():
+            yield b'{"ok":true}'
+
+        return httpx.Response(
+            200,
+            stream=httpx._content.AsyncIteratorByteStream(body()),
+            headers={"Content-Type": "application/json"},
+        )
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        # Build the request manually so httpx doesn't normalize the query
+        # before sending (so we test what the sidecar actually receives, not
+        # what httpx the client would have sent over the wire to a real
+        # server — which is also out of our control).
+        response = await client.get(f"/session?{raw_query}")
+
+    assert response.status_code == 200
+    # The raw query string forwarded upstream must equal the client's raw
+    # bytes — no re-encoding, no '+' → space, no key reordering.
+    assert captured["raw_query"] == raw_query, (
+        f"raw_query drifted: sent {raw_query!r}, upstream got {captured['raw_query']!r}"
+    )
+
+
+async def test_catch_all_no_query_no_question_mark(upstream_factory):
+    """P0-7 boundary: when the client sends no query, the upstream URL must
+    not have a trailing ``?`` (which would be a behavior change from the
+    previous params=None path)."""
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        async def body():
+            yield b'{"ok":true}'
+        return httpx.Response(
+            200,
+            stream=httpx._content.AsyncIteratorByteStream(body()),
+            headers={"Content-Type": "application/json"},
+        )
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/session")
+
+    assert response.status_code == 200
+    # No '?' appended to the upstream URL.
+    assert "?" not in captured["url"]
+
+
+async def test_catch_all_directory_query_validation_still_runs(upstream_factory):
+    """P0-7 regression guard: the security validation on ``?directory=`` still
+    fires (it uses the parsed query_params, which is unaffected by the raw-
+    bytes forwarding change). A ``?directory=../etc`` must still 400 before
+    any upstream call."""
+    handler, seen = _upstream_passthrough()
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/session?directory=../etc")
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "invalid_directory"
+    # Upstream must NOT have been reached.
+    assert seen["path"] is None
