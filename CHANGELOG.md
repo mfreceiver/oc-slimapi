@@ -28,6 +28,14 @@ ocdroid 对接时：
 
 ## [Unreleased]
 
+_（暂无）_
+
+---
+
+## [1.1.6] - 2026-08-08 — 多维度代码质量评审完善（7 批次，未 bump `X-Slimapi-Version`，仍 2）
+
+> 基于 5 维度独立代码质量评审（4× rev-gpt A/B/C/D + explorer E）汇总 → oracle 审定 → 7 批次实施。消除 9 P0 + ~30 P1 + 2 P2，+193 回归测试（1055→1248），0 回归。批次 3（SSE/token 生命周期，最高风险）经 oracle 状态机稿审定 + rev-grok(9/10)/rev-glm(8.5/10) 双终审 gate 放行。多数为内部资源安全 / 契约收敛修复；wire 可见项见下方 Added/Changed/Fixed。设计 / 决策记录见 `.ocmar/workflows/2026-08-08-code-quality-overhaul/`（plan.md + batch3-lifecycle-statemachine.md）。
+
 ### Added
 
 - **`GET /slimapi/questions` 聚合超预算标记 `truncated`（P1-28，加性诊断字段，未 bump `X-Slimapi-Version`，仍 2）**：跨目录 fan-out 聚合结果累计 items 数超 `_MAX_AGGREGATE_ITEMS`（10000）时，envelope 新增 `truncated: true` 诊断字段，后续目录不再 extend。`authoritativeDirectories` 同步降级为 succeeded list（partial-replace，与 discovery 截断相同语义），客户端不会因聚合截断丢弃未跳过目录的 pending questions。客户端可忽略该字段（加性）。
