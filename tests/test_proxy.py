@@ -640,3 +640,73 @@ async def test_catch_all_directory_query_validation_still_runs(upstream_factory)
     assert response.json()["code"] == "invalid_directory"
     # Upstream must NOT have been reached.
     assert seen["path"] is None
+
+
+# ── P1-11: catch-all preserves Content-Length + duplicate response headers ────
+
+
+async def test_catch_all_preserves_upstream_content_length(upstream_factory):
+    """P1-11: upstream ``Content-Length`` must survive strip_hop_by_hop and
+    reach the client. ``content-length`` is NOT a hop-by-hop header (RFC 7230
+    §6.1) — previously the sidecar stripped it, breaking transparent reverse
+    proxy semantics (contract §4): the client couldn't see the byte count
+    the upstream reported."""
+    body_bytes = b'{"ok":true}'
+    def handler(request: httpx.Request) -> httpx.Response:
+        async def body():
+            yield body_bytes
+        # Use stream= (not content=) so the sidecar's aiter_raw() can iterate
+        # the body — content= marks is_stream_consumed=True at construction.
+        return httpx.Response(
+            200,
+            stream=httpx._content.AsyncIteratorByteStream(body()),
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(len(body_bytes)),
+            },
+        )
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/session")
+
+    assert response.status_code == 200
+    # content-length was forwarded verbatim (not stripped by hop-by-hop).
+    assert response.headers.get("content-length") == str(len(body_bytes))
+
+
+async def test_catch_all_preserves_duplicate_set_cookie(upstream_factory):
+    """P1-11: multiple Set-Cookie headers from upstream must NOT be silently
+    dropped. Via multi_items() they are read faithfully and comma-merged
+    (RFC 7230 §3.2.2) into the single slot Starlette Response headers
+    support. The merge is imperfect for Set-Cookie (cookie values can
+    contain commas), but losing a whole cookie is strictly worse."""
+    body_bytes = b'{"ok":true}'
+    def handler(request: httpx.Request) -> httpx.Response:
+        async def body():
+            yield body_bytes
+        return httpx.Response(
+            200,
+            stream=httpx._content.AsyncIteratorByteStream(body()),
+            headers=httpx.Headers([
+                ("Content-Type", "application/json"),
+                ("Set-Cookie", "session=abc; Path=/"),
+                ("Set-Cookie", "token=xyz; Path=/"),
+            ]),
+        )
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/session")
+
+    assert response.status_code == 200
+    # Both Set-Cookie values survived the forward. They arrive comma-merged
+    # in the single slot (Starlette limitation); the test asserts that BOTH
+    # cookie values are present, not just the first.
+    raw_set_cookie = response.headers.get("set-cookie", "")
+    assert "session=abc" in raw_set_cookie
+    assert "token=xyz" in raw_set_cookie
