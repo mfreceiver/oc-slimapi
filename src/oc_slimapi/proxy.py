@@ -3,10 +3,11 @@ import re
 import httpx
 from fastapi import FastAPI, Request, WebSocket
 from starlette.background import BackgroundTask
-from starlette.responses import JSONResponse, StreamingResponse
+from starlette.responses import StreamingResponse
 
 from .directory import validate_directory
 from .errors import CodedHTTPException
+from .gzip_util import error_response
 from .traffic import stash_up_in, stash_up_out
 from .upstream import strip_hop_by_hop, DIRECTORY_HEADER
 
@@ -117,10 +118,18 @@ def install_proxy(app: FastAPI) -> None:
         try:
             norm_path = _normalize_path(raw_path)
         except CodedHTTPException:
-            return JSONResponse({"code": "invalid_path"}, status_code=400)
+            # P0-5: catch-all error responses must honour the gzip/Vary
+            # contract (§9) — same path as thin routes' coded_exception_handler.
+            return error_response(
+                "invalid_path", 400,
+                accept_encoding=request.headers.get("accept-encoding"),
+            )
 
         if norm_path.startswith("/slimapi/"):
-            return JSONResponse({"code": "thin_route_not_found"}, status_code=404)
+            return error_response(
+                "thin_route_not_found", 404,
+                accept_encoding=request.headers.get("accept-encoding"),
+            )
 
         # Validate X-Opencode-Directory header if present
         dir_header = request.headers.get(DIRECTORY_HEADER)
@@ -128,17 +137,26 @@ def install_proxy(app: FastAPI) -> None:
             try:
                 validate_directory(dir_header)
             except CodedHTTPException:
-                return JSONResponse({"code": "invalid_directory"}, status_code=400)
+                return error_response(
+                    "invalid_directory", 400,
+                    accept_encoding=request.headers.get("accept-encoding"),
+                )
 
         # Validate ?directory= query params (catch-all forwards them upstream)
         for dir_val in request.query_params.getlist("directory"):
             try:
                 validate_directory(dir_val)
             except CodedHTTPException:
-                return JSONResponse({"code": "invalid_directory"}, status_code=400)
+                return error_response(
+                    "invalid_directory", 400,
+                    accept_encoding=request.headers.get("accept-encoding"),
+                )
 
         if request.app.state.config.shell_deny_list_enabled and _is_shell_path(norm_path):
-            return JSONResponse({"code": "shell_not_allowed"}, status_code=403)
+            return error_response(
+                "shell_not_allowed", 403,
+                accept_encoding=request.headers.get("accept-encoding"),
+            )
         client = request.app.state.upstream
         # Wrap the downstream request body stream so we count the bytes
         # actually forwarded upstream (``upOut``). Only ``len()`` per chunk —

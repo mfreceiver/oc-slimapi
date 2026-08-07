@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import gzip
+
 import httpx
+import orjson
 import pytest
 from fastapi import FastAPI
 
@@ -404,3 +407,119 @@ async def test_catch_all_upstream_read_timeout_returns_503(upstream_factory):
         )
     assert response.status_code == 503
     assert response.json()["code"] == "upstream_unavailable"
+
+
+# ── P0-5: catch-all error responses honour gzip/Vary contract (§9) ────────────
+
+
+async def _drive_asgi_raw(app, method: str, path: str, headers_list):
+    """Drive the ASGI app by hand and collect (status, headers, raw_body).
+
+    Bypasses httpx so we can prove the body itself is gzip-encoded (httpx
+    auto-decompresses ``response.content``) AND so we can pass raw paths
+    like ``/a/../b`` (httpx normalizes URL paths per spec before sending,
+    which would defeat the invalid_path trigger).
+    """
+    scope = {
+        "type": "http",
+        "method": method,
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "headers": [(k.lower().encode(), v.encode()) for k, v in headers_list],
+        "scheme": "http",
+        "server": ("test", 80),
+        "client": ("test", 0),
+        "root_path": "",
+        "extensions": {},
+    }
+    status_code = 0
+    headers: list = []
+    body = b""
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        nonlocal status_code, headers, body
+        if message["type"] == "http.response.start":
+            status_code = message["status"]
+            headers = message["headers"]
+        elif message["type"] == "http.response.body":
+            body += message.get("body", b"")
+
+    await app(scope, receive, send)
+    return status_code, headers, body
+
+
+@pytest.mark.parametrize("trigger_path,method,expected_status,expected_code", [
+    # invalid_path: _normalize_path rejects `..` / `.` segments
+    ("/a/../b", "GET", 400, "invalid_path"),
+    # thin_route_not_found: any /slimapi/* that isn't a real thin route
+    ("/slimapi/nope", "GET", 404, "thin_route_not_found"),
+    # invalid_directory (header): X-Opencode-Directory with `..`
+    ("/some-path", "GET", 400, "invalid_directory"),
+    # shell_not_allowed: POST /session/{sid}/shell (deny list default-on)
+    ("/session/ses_x/shell", "POST", 403, "shell_not_allowed"),
+], ids=["invalid_path", "thin_route_not_found", "invalid_directory", "shell_not_allowed"])
+async def test_catch_all_error_response_honours_gzip(
+    upstream_factory, trigger_path, method, expected_status, expected_code,
+):
+    """P0-5: every catch-all error response (invalid_path / thin_route_not_found
+    / invalid_directory / shell_not_allowed) must honour Accept-Encoding: gzip
+    per contract §9 — previously these used bare ``JSONResponse`` and skipped
+    the gzip/Vary negotiation that thin-route errors already did.
+
+    We drive the ASGI app directly so we can verify the *raw wire bytes* are
+    gzip (magic ``\\x1f\\x8b``), not just the Content-Encoding header.
+    """
+    from oc_slimapi.upstream import DIRECTORY_HEADER
+
+    handler, _ = _upstream_passthrough()
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+
+    extra_headers = [("Accept-Encoding", "gzip")]
+    if expected_code == "invalid_directory":
+        extra_headers.append((DIRECTORY_HEADER, "/../etc"))
+
+    status, headers, raw_bytes = await _drive_asgi_raw(
+        app, method, trigger_path, extra_headers,
+    )
+
+    assert status == expected_status
+    header_map = {k.decode().lower(): v.decode() for k, v in headers}
+    assert header_map["content-encoding"] == "gzip"
+    assert header_map["vary"] == "Accept-Encoding"
+    # Body is genuinely gzip (magic bytes), then decodes to the coded body.
+    assert raw_bytes[:2] == b"\x1f\x8b"
+    decoded = gzip.decompress(raw_bytes)
+    assert orjson.loads(decoded)["code"] == expected_code
+
+
+@pytest.mark.parametrize("trigger_path,method,extra_headers,expected_code", [
+    ("/a/../b", "GET", [], "invalid_path"),
+    ("/slimapi/nope", "GET", [], "thin_route_not_found"),
+    ("/some-path", "GET", [("X-Opencode-Directory", "/../etc")], "invalid_directory"),
+    ("/session/ses_x/shell", "POST", [], "shell_not_allowed"),
+], ids=["invalid_path", "thin_route_not_found", "invalid_directory", "shell_not_allowed"])
+async def test_catch_all_error_response_without_gzip_still_has_vary(
+    upstream_factory, trigger_path, method, extra_headers, expected_code,
+):
+    """P0-5 negative path: with Accept-Encoding: identity the body stays plain
+    JSON (no gzip magic) but the Vary: Accept-Encoding header is still emitted
+    (so a cache that keyed on gzip-vs-identity would not collide)."""
+    handler, _ = _upstream_passthrough()
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+
+    status, headers, raw_bytes = await _drive_asgi_raw(
+        app, method, trigger_path,
+        [("Accept-Encoding", "identity"), *extra_headers],
+    )
+    header_map = {k.decode().lower(): v.decode() for k, v in headers}
+    assert "content-encoding" not in header_map
+    assert header_map["vary"] == "Accept-Encoding"
+    # Body is plain JSON, no gzip magic.
+    assert raw_bytes[:2] != b"\x1f\x8b"
+    assert orjson.loads(raw_bytes)["code"] == expected_code
