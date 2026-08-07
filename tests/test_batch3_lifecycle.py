@@ -988,3 +988,119 @@ class TestInv5ConfigFrameCeiling:
         from oc_slimapi.config import DEFAULT_TOKEN_MAX_FRAME_BYTES
         th = TokenStreamHub()
         assert th._max_frame_bytes == DEFAULT_TOKEN_MAX_FRAME_BYTES
+
+
+# ===========================================================================
+# Step 7 — INV-6: EOF=loss + double notify fix
+# ===========================================================================
+
+class TestInv6EofLossAndDoubleNotify:
+    """run(): EOF treated as upstream loss (notify + sleep + backoff);
+    double-notify guard on the reconnect branch."""
+
+    async def test_eof_triggers_notify_and_backoff(self):
+        """When aiter_lines ends normally (EOF), _notify_upstream_loss is
+        called once and the loop sleeps before reconnecting (no hot-loop)."""
+        import httpx
+
+        notify_calls = {"n": 0}
+        sleep_calls = {"n": 0, "delays": []}
+
+        # Mock client whose stream returns a response that EOFs immediately.
+        class _MockResponse:
+            def raise_for_status(self):
+                pass
+            async def aiter_lines(self):
+                # Yield nothing, then end (EOF).
+                if False:
+                    yield ""  # make it an async generator
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                pass
+
+        class _MockClient:
+            def stream(self, *args, **kwargs):
+                return _MockResponse()
+
+        hub = GlobalHub(client=_MockClient())
+        sub = Subscriber()
+        hub.subscribers.add(sub)
+
+        original_notify = hub._notify_upstream_loss
+        def counting_notify():
+            notify_calls["n"] += 1
+            original_notify()
+        hub._notify_upstream_loss = counting_notify  # type: ignore
+
+        original_sleep = asyncio.sleep
+        async def counting_sleep(delay, *_a, **_kw):
+            if delay and delay >= 0.5:  # only count backoff sleeps, not 0-yields
+                sleep_calls["n"] += 1
+                sleep_calls["delays"].append(delay)
+                # Stop the loop after first backoff by removing the consumer.
+                hub.subscribers.discard(sub)
+            await original_sleep(0)
+        # Patch asyncio.sleep used inside run() (module-level reference).
+        import oc_slimapi.sse.global_hub as gh_mod
+        original_mod_sleep = gh_mod.asyncio.sleep
+        gh_mod.asyncio.sleep = counting_sleep  # type: ignore
+        try:
+            hub.ensure_upstream()
+            await asyncio.sleep(0.1)
+            await _pump_callbacks(5)
+        finally:
+            gh_mod.asyncio.sleep = original_mod_sleep  # type: ignore
+            await _close_hub(hub)
+
+        # EOF → notify called exactly once.
+        assert notify_calls["n"] == 1, (
+            f"INV-6: EOF should notify exactly once, got {notify_calls['n']}"
+        )
+        # EOF → backoff sleep happened (no hot-loop).
+        assert sleep_calls["n"] >= 1, "INV-6: EOF should trigger backoff sleep"
+
+    async def test_exception_path_notifies_once(self):
+        """The exception path (connect error) notifies exactly once per epoch."""
+        import httpx
+
+        notify_calls = {"n": 0}
+
+        class _MockClient:
+            def stream(self, *args, **kwargs):
+                raise ConnectionError("connect failed")
+
+        hub = GlobalHub(client=_MockClient())
+        sub = Subscriber()
+        hub.subscribers.add(sub)
+
+        original_notify = hub._notify_upstream_loss
+        def counting_notify():
+            notify_calls["n"] += 1
+            original_notify()
+        hub._notify_upstream_loss = counting_notify  # type: ignore
+
+        # Make ever_connected True so the exception path can notify.
+        hub.ever_connected = True
+
+        import oc_slimapi.sse.global_hub as gh_mod
+        original_sleep = gh_mod.asyncio.sleep
+        call_count = {"n": 0}
+        async def fast_sleep(delay, *_a, **_kw):
+            call_count["n"] += 1
+            if call_count["n"] >= 2:
+                hub.subscribers.discard(sub)  # stop the loop
+            await original_sleep(0)
+        gh_mod.asyncio.sleep = fast_sleep  # type: ignore
+        try:
+            hub.ensure_upstream()
+            await asyncio.sleep(0.1)
+            await _pump_callbacks(5)
+        finally:
+            gh_mod.asyncio.sleep = original_sleep  # type: ignore
+            await _close_hub(hub)
+
+        # Exception path → notify exactly once (guard prevents re-notify).
+        assert notify_calls["n"] == 1, (
+            f"INV-6: exception should notify exactly once, got {notify_calls['n']}"
+        )

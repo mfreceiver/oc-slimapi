@@ -823,15 +823,19 @@ class GlobalHub:
                     if self.ever_connected:
                         self.reconnects_total += 1
                         # §16-B: notify token hub of upstream loss on the
-                        # successful-reconnect path. Once-per-epoch semantics
-                        # are preserved because the reconnect itself
-                        # establishes a new epoch (the previous loss, if any,
-                        # was already notified on the exception path; the
-                        # reconnect flag resets below).
-                        self._notify_upstream_loss()
+                        # successful-reconnect path. INV-6 (P1-18 fix):
+                        # the ``not self._upstream_loss_notified`` guard
+                        # ensures "each loss notifies exactly once" across
+                        # all three loss paths (EOF / exception / reconnect).
+                        # Without it, a loss notified on the exception path
+                        # would be re-notified here on the next reconnect —
+                        # a double-notify. reconnects_total is unaffected
+                        # (it counts every reconnect, not every notify).
+                        if not self._upstream_loss_notified:
+                            self._notify_upstream_loss()
                     self.ever_connected = True
                     # New epoch begins — reset the per-epoch loss guard so
-                    # the NEXT disconnect's first exception can fire.
+                    # the NEXT disconnect's first exception/EOF can fire.
                     self._upstream_loss_notified = False
                     delay = 1.0
                     data_lines: list[str] = []
@@ -863,6 +867,23 @@ class GlobalHub:
                             except orjson.JSONDecodeError:
                                 logger.debug("upstream sse malformed frame dropped", exc_info=True)
                             data_lines.clear()
+                # INV-6 (P1-18): aiter_lines ended normally (EOF) = upstream
+                # loss. An SSE stream is long-lived; a normal end means the
+                # server closed it. Treat it identically to the exception
+                # path: notify (if not already) + sleep + backoff. Without
+                # this, the loop would immediately reconnect with no sleep
+                # (hot-loop / connect storm on a persistently-closing
+                # upstream) and the token hub would not be notified of the
+                # loss (stale LiveParts survive the silent reconnect).
+                if self.ever_connected and not self._upstream_loss_notified:
+                    self._notify_upstream_loss()
+                    self._upstream_loss_notified = True
+                logger.warning(
+                    "upstream sse EOF (stream closed), reconnecting in %.1fs",
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 30.0)
             except asyncio.CancelledError:
                 raise
             except Exception:
