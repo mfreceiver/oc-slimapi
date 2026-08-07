@@ -50,6 +50,32 @@ SMOKE_VALID = "valid"
 # but non-blocking ≠ long-timeout.
 _SMOKE_TIMEOUT = 5.0
 
+# Graceful drain timeout for the access-log maintenance task on shutdown
+# (P1-38). The maintenance loop dispatches gzip/prune work via
+# asyncio.to_thread; setting stop_event lets the loop finish its current
+# to_thread then exit cleanly. This timeout bounds how long we wait for
+# that graceful drain before forcing a cancel. A running to_thread thread
+# cannot be safely cancelled — it finishes on its own in the thread pool
+# (bounded gzip work + per-operation _MAINT_LOCK in access_log.py).
+_MAINT_DRAIN_TIMEOUT = 30.0
+
+
+def _log_maint_task_exception(task: asyncio.Task) -> None:
+    """Log an unobserved exception from a finished maintenance task (P1-38).
+
+    Without this, a task that died with an unhandled exception (a bug in the
+    loop's own code — the loop itself catches compress/prune exceptions) would
+    leave the exception unobserved until GC. Calling ``task.exception()`` marks
+    it as consumed.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        get_logger("app").warning(
+            "access log maintenance task exited with error", exc_info=exc
+        )
+
 
 async def smoke(app: FastAPI) -> None:
     """Validate the upstream message-list schema and record a diagnostic status.
@@ -374,15 +400,38 @@ async def lifespan(app: FastAPI):
             app.state._access_log_maintenance_task = maint_task
 
             async def _stop_maintenance():
-                # Stop the maintenance loop first (signal + cancel) so it
-                # cannot race the ledger/hub teardown below.
+                # Stop the maintenance loop first so it cannot race the
+                # ledger/hub teardown below.
                 stop_event.set()
-                if not maint_task.done():
-                    maint_task.cancel()
-                    try:
-                        await maint_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
+                if maint_task.done():
+                    _log_maint_task_exception(maint_task)
+                    return
+                # Graceful drain: let the loop's current to_thread (gzip/prune)
+                # finish, then the loop checks stop_event and exits cleanly.
+                done, _ = await asyncio.wait(
+                    {maint_task}, timeout=_MAINT_DRAIN_TIMEOUT
+                )
+                if maint_task in done:
+                    _log_maint_task_exception(maint_task)
+                    return
+                # Drain timeout — force cancel. A running to_thread thread is
+                # NOT joined here (cannot safely cancel a thread); it finishes
+                # on its own in the thread pool.
+                get_logger("app").warning(
+                    "access log maintenance did not drain within %ss; "
+                    "cancelling (in-flight to_thread continues in background)",
+                    _MAINT_DRAIN_TIMEOUT,
+                )
+                maint_task.cancel()
+                try:
+                    await maint_task
+                except asyncio.CancelledError:
+                    pass  # expected — we just cancelled
+                except Exception as exc:
+                    get_logger("app").warning(
+                        "access log maintenance task error during cancel",
+                        exc_info=exc,
+                    )
             stack.push_async_callback(_stop_maintenance)
         if settings.traffic_snapshot_enabled and settings.traffic_metrics_enabled:
             try:
