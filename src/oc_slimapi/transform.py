@@ -117,6 +117,7 @@ async def read_with_cap(
     max_bytes: int,
     *,
     chunk_size: int = 64 * 1024,
+    on_read: Callable[[int], None] | None = None,
 ) -> tuple[bytes | None, int]:
     """Stream-read an httpx streaming response, aborting as soon as ``max_bytes`` is crossed.
 
@@ -128,6 +129,25 @@ async def read_with_cap(
     A non-positive ``max_bytes`` short-circuits to ``(None, 0)`` without
     touching the stream, so cumulative-budget callers (``messages_since``)
     can safely pass ``remaining = cap - total_so_far``.
+
+    ``on_read`` (optional) is invoked with ``len(chunk)`` for every chunk
+    pulled from the stream, immediately after accumulating into ``total`` and
+    BEFORE the cap check. This unifies byte attribution across all three exit
+    paths so callers need not stash separately:
+
+    * **success** — one callback per chunk, summing to ``total``;
+    * **cap-bail** — the chunk that crosses the cap is attributed, THEN
+      ``(None, total)`` is returned (so the oversize read is accounted);
+    * **mid-stream exception** (``aiter_bytes`` raises ``httpx.RequestError``)
+      — every chunk read before the failure is attributed; the exception then
+      propagates untouched. Without the callback the caller would see the
+      exception and have no way to recover ``total``, silently undercounting
+      ``upIn`` (P0-9).
+
+    Typical route usage passes ``on_read=lambda n: stash_up_in(request, n)``
+    and drops the post-call ``stash_up_in(request, n_read)`` (the callback is
+    additive and equivalent on the success/cap paths, and is the ONLY way to
+    attribute bytes on the exception path).
     """
     if max_bytes <= 0:
         return None, 0
@@ -136,6 +156,8 @@ async def read_with_cap(
     iterator: AsyncIterator[bytes] = response.aiter_bytes(chunk_size)
     async for chunk in iterator:
         total += len(chunk)
+        if on_read is not None:
+            on_read(len(chunk))
         if total > max_bytes:
             return None, total
         chunks.append(chunk)

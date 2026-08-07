@@ -13,6 +13,7 @@ import asyncio
 import gzip
 import time
 
+import httpx
 import orjson
 import pytest
 
@@ -182,6 +183,89 @@ async def test_read_with_cap_handles_zero_or_negative_budget_without_iteration()
     assert body is None
     assert total == 0
     assert fake.produced == 0  # never touched the stream
+
+
+# ---------------------------------------------------------------------------
+# on_read callback (P0-9): unify byte attribution across all three exit paths
+# (success / cap-bail / mid-stream exception) so already-read bytes are never
+# lost from upIn.
+# ---------------------------------------------------------------------------
+
+
+class _FailingStreamingResponse:
+    """Stand-in for an httpx streaming response that yields a few chunks then
+    raises ``httpx.RequestError`` mid-stream (simulates a connection reset)."""
+
+    def __init__(self, chunks: list[bytes], fail_after: int) -> None:
+        self._chunks = chunks
+        self._fail_after = fail_after
+
+    async def aiter_bytes(self, chunk_size: int):
+        for i, chunk in enumerate(self._chunks):
+            if i >= self._fail_after:
+                raise httpx.ReadError("simulated mid-stream disconnect")
+            yield chunk
+
+
+async def test_read_with_cap_on_read_success_path_sums_to_total():
+    """on_read fires once per chunk on the success path; the sum of callback
+    values equals ``total`` (additive equivalence to the old post-call stash)."""
+    fake = _FakeStreamingResponse(total_bytes=4096, chunk_size=512)
+    seen: list[int] = []
+    body, total = await read_with_cap(
+        fake, max_bytes=8192, chunk_size=512,
+        on_read=lambda n: seen.append(n),
+    )
+    assert body == b"x" * 4096
+    assert total == 4096
+    assert sum(seen) == total
+    assert len(seen) == 4096 // 512  # one callback per chunk
+
+
+async def test_read_with_cap_on_read_cap_bail_attributes_oversize_read():
+    """on_read fires for every chunk up to and INCLUDING the one that crosses
+    the cap; the sum equals ``total`` (which is > cap). This preserves the B1
+    unified cap-bail upIn convention."""
+    cap = 4 * 1024
+    fake = _FakeStreamingResponse(total_bytes=256 * 1024, chunk_size=1024)
+    seen: list[int] = []
+    body, total = await read_with_cap(
+        fake, max_bytes=cap, chunk_size=1024,
+        on_read=lambda n: seen.append(n),
+    )
+    assert body is None
+    assert cap < total <= cap + 1024
+    assert sum(seen) == total, (
+        "on_read sum must equal total so cap-bail bytes are fully attributed"
+    )
+
+
+async def test_read_with_cap_on_read_mid_stream_exception_attributes_read_bytes():
+    """P0-9 regression: when ``aiter_bytes`` raises ``httpx.RequestError``
+    mid-stream, ``on_read`` has already fired for every chunk read before the
+    failure. Without the callback the caller would see the exception and have
+    no way to recover ``total``, silently undercounting upIn."""
+    chunks = [b"aaaa", b"bbbb", b"cccc"]  # 12 bytes before failure
+    fake = _FailingStreamingResponse(chunks=chunks, fail_after=2)
+    seen: list[int] = []
+    with pytest.raises(httpx.ReadError):
+        await read_with_cap(
+            fake, max_bytes=4096, chunk_size=64,
+            on_read=lambda n: seen.append(n),
+        )
+    # The two chunks before the failure were attributed via the callback.
+    assert seen == [4, 4]
+    assert sum(seen) == 8
+
+
+async def test_read_with_cap_on_read_none_is_backward_compatible():
+    """on_read=None (default) preserves the original behaviour: no callback,
+    same (body, total) return — all existing call sites that don't pass
+    on_read keep working unchanged."""
+    fake = _FakeStreamingResponse(total_bytes=2048, chunk_size=512)
+    body, total = await read_with_cap(fake, max_bytes=4096, chunk_size=512)
+    assert body == b"x" * 2048
+    assert total == 2048
 
 
 # ---------------------------------------------------------------------------
