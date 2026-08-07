@@ -102,6 +102,11 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+# P1-21: FIFO cap on session-routing metadata to prevent unbounded growth.
+# Aligned with GlobalHub._LAST_UPDATED_AT_BY_SID_MAX (same 10k pattern).
+_SESSION_STATUS_MAX = 10_000
+
+
 # Number of flush ticks between TTL sweeps (NB-B5: 60s cadence). Floored at 1
 # so a misconfigured TOKEN_FLUSH_SECONDS still sweeps.
 _TTL_TICK_INTERVAL = max(1, int(round(60.0 / TOKEN_FLUSH_SECONDS)))
@@ -191,8 +196,10 @@ class TokenStreamHub:
         self._total_pending_bytes: int = 0
         self._metrics: _TokenMetrics = _TokenMetrics()
         # Stage B session-routing state (§16-B).
-        self._session_status: dict[str, str] = {}
-        self._busy_sids: set[str] = set()
+        # P1-21: bounded OrderedDicts with FIFO cap to prevent unbounded
+        # growth across high-churn sessions.
+        self._session_status: OrderedDict[str, str] = OrderedDict()
+        self._busy_sids: OrderedDict[str, None] = OrderedDict()
         # Pending resyncs for the flush loop to fan out (bounded, NB-B2).
         self._pending_session_resinks: list[tuple[str, str]] = []
         # Stage C subscriber fanout (§5.5 handshake). Stage D's TokenSubscriber
@@ -900,11 +907,15 @@ class TokenStreamHub:
         if status not in ("busy", "idle"):
             return
         self._session_status[sid] = status
+        self._session_status.move_to_end(sid)
+        self._prune_session_status()
         if status == "busy":
-            self._busy_sids.add(sid)
+            self._busy_sids[sid] = None
+            self._busy_sids.move_to_end(sid)
+            self._prune_busy_sids()
             return
         # idle
-        self._busy_sids.discard(sid)
+        self._busy_sids.pop(sid, None)
         self._retire_session(sid)
         self._enqueue_session_resync(sid, "session_idle")
 
@@ -949,7 +960,7 @@ class TokenStreamHub:
         """
         self._retire_session(sid)
         self._session_status.pop(sid, None)
-        self._busy_sids.discard(sid)
+        self._busy_sids.pop(sid, None)
         # CRITICAL 2 gate cleanup for this session.
         for key in [k for k in self._retired_messages if k[0] == sid]:
             self._retired_messages.discard(key)
@@ -1678,6 +1689,16 @@ class TokenStreamHub:
             self._deleted_sids.pop(k, None)
         while len(self._deleted_sids) > TOKEN_REMOVED_MESSAGES_MAX:
             self._deleted_sids.popitem(last=False)
+
+    def _prune_session_status(self) -> None:
+        """P1-21: FIFO cap on ``_session_status`` to prevent unbounded growth."""
+        while len(self._session_status) > _SESSION_STATUS_MAX:
+            self._session_status.popitem(last=False)
+
+    def _prune_busy_sids(self) -> None:
+        """P1-21: FIFO cap on ``_busy_sids`` to prevent unbounded growth."""
+        while len(self._busy_sids) > _SESSION_STATUS_MAX:
+            self._busy_sids.popitem(last=False)
 
     def _prune_removed_messages(self, now_ms: int) -> None:
         """Enforce FIFO cap + TTL on the ``_removed_messages`` replay queue.

@@ -100,7 +100,9 @@ class GlobalHub:
         # hub on each retry. We want once-per-epoch-transition.
         self._upstream_loss_notified: bool = False
         # G1 sticky lastError: sid -> lastError dict (cleared = popped).
-        self.sticky_last_error: dict[str, dict] = {}
+        # P1-21: bounded OrderedDict with FIFO cap to prevent unbounded
+        # growth across high-churn sessions.
+        self.sticky_last_error: OrderedDict[str, dict] = OrderedDict()
         # C⑩ tombstone: sids whose session.deleted digest has been emitted.
         # Survives pending eviction so a LATE session.error (arriving after
         # flush() cleared the deleted entry from self.pending) cannot revive
@@ -110,7 +112,8 @@ class GlobalHub:
         # cold-starts anyway; sids are unique in opencode so a tombstone
         # persisting until resync is correct and the set cannot grow
         # unbounded across reconnects).
-        self.deleted_tombstones: set[str] = set()
+        # P1-21: bounded OrderedDict (ordered-set pattern) with FIFO cap.
+        self.deleted_tombstones: OrderedDict[str, None] = OrderedDict()
         # T3 observability counters (contract §6 / §2 metrics endpoint).
         self.upstream_events_total = 0
         self.emitted_frames_total = 0
@@ -404,6 +407,8 @@ class GlobalHub:
         # Opportunistic TTL/cap prune (no-op when nothing expired).
         self._prune_retired_messages(_now_ms())
         self._prune_last_updated_at()
+        self._prune_sticky_last_error()
+        self._prune_deleted_tombstones()
         if not self.pending:
             return
         snapshot, self.pending = self.pending, {}
@@ -491,6 +496,20 @@ class GlobalHub:
         while len(self._last_updated_at_by_sid) > _LAST_UPDATED_AT_BY_SID_MAX:
             self._last_updated_at_by_sid.popitem(last=False)
 
+    def _prune_sticky_last_error(self) -> None:
+        """P1-21: FIFO cap on ``sticky_last_error`` to prevent unbounded
+        growth across high-churn sessions. Mirrors ``_prune_last_updated_at``.
+        """
+        while len(self.sticky_last_error) > _LAST_UPDATED_AT_BY_SID_MAX:
+            self.sticky_last_error.popitem(last=False)
+
+    def _prune_deleted_tombstones(self) -> None:
+        """P1-21: FIFO cap on ``deleted_tombstones`` to prevent unbounded
+        growth. Mirrors ``_prune_last_updated_at``.
+        """
+        while len(self.deleted_tombstones) > _LAST_UPDATED_AT_BY_SID_MAX:
+            self.deleted_tombstones.popitem(last=False)
+
     def publish(self, global_event: dict[str, Any]) -> None:
         # Count every JSON-decoded upstream event we were asked to consider;
         # early-returns below still represent real traffic the GlobalBus saw.
@@ -546,7 +565,10 @@ class GlobalHub:
                 entry.deleted = True
                 # C⑩: record a tombstone that survives pending eviction so a
                 # LATE session.error (post-flush) cannot revive lastError.
-                self.deleted_tombstones.add(session_id)
+                # P1-21: bounded OrderedDict — move_to_end + prune.
+                self.deleted_tombstones[session_id] = None
+                self.deleted_tombstones.move_to_end(session_id)
+                self._prune_deleted_tombstones()
                 # G1: deleted pops sticky; digest omits lastError.
                 self.sticky_last_error.pop(session_id, None)
                 entry.last_error = _UNSET
@@ -652,6 +674,8 @@ class GlobalHub:
                 }
                 entry.last_error = last_error_obj
                 self.sticky_last_error[sid] = last_error_obj
+                self.sticky_last_error.move_to_end(sid)
+                self._prune_sticky_last_error()
                 if isinstance(directory, str):
                     entry.directory = directory
                 self.flush_sid(sid)  # G1-A immediate, this sid only

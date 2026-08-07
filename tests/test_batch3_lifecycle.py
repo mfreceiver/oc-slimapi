@@ -406,7 +406,7 @@ class TestInv2GraceSerialEpochCleanup:
         th = TokenStreamHub()
         # Populate old-epoch state.
         th._session_status["s1"] = "busy"
-        th._busy_sids.add("s1")
+        th._busy_sids["s1"] = None
         th.live_parts[("s1", "m1", "p1")] = LivePart()
         th._retired_messages.add(("s1", "m1"))
 
@@ -1104,3 +1104,54 @@ class TestInv6EofLossAndDoubleNotify:
         assert notify_calls["n"] == 1, (
             f"INV-6: exception should notify exactly once, got {notify_calls['n']}"
         )
+
+
+# ===========================================================================
+# Step 8 — P1-21: session metadata cap
+# ===========================================================================
+
+class TestP1_21SessionMetadataCap:
+    """_session_status / _busy_sids / sticky_last_error /
+    deleted_tombstones have FIFO caps to prevent unbounded growth."""
+
+    def test_session_status_capped(self):
+        """Injecting > _SESSION_STATUS_MAX sids evicts the oldest."""
+        from oc_slimapi.sse.tokenstream.hub import _SESSION_STATUS_MAX
+        th = TokenStreamHub()
+        for i in range(_SESSION_STATUS_MAX + 50):
+            th.on_session_status(f"sid_{i}", "busy")
+        assert len(th._session_status) <= _SESSION_STATUS_MAX
+        assert "sid_0" not in th._session_status
+        assert f"sid_{_SESSION_STATUS_MAX + 49}" in th._session_status
+
+    def test_busy_sids_capped(self):
+        """_busy_sids is bounded (FIFO cap)."""
+        from oc_slimapi.sse.tokenstream.hub import _SESSION_STATUS_MAX
+        th = TokenStreamHub()
+        for i in range(_SESSION_STATUS_MAX + 50):
+            th.on_session_status(f"sid_{i}", "busy")
+        assert len(th._busy_sids) <= _SESSION_STATUS_MAX
+        assert "sid_0" not in th._busy_sids
+
+    def test_sticky_last_error_capped(self):
+        """sticky_last_error is bounded (FIFO cap)."""
+        from oc_slimapi.sse.global_hub import _LAST_UPDATED_AT_BY_SID_MAX
+        hub = GlobalHub(client=None)
+        for i in range(_LAST_UPDATED_AT_BY_SID_MAX + 50):
+            hub.sticky_last_error[f"sid_{i}"] = {"name": "err", "message": "x", "at": 0}
+            hub.sticky_last_error.move_to_end(f"sid_{i}")
+            hub._prune_sticky_last_error()
+        assert len(hub.sticky_last_error) <= _LAST_UPDATED_AT_BY_SID_MAX
+        assert "sid_0" not in hub.sticky_last_error
+        assert f"sid_{_LAST_UPDATED_AT_BY_SID_MAX + 49}" in hub.sticky_last_error
+
+    def test_deleted_tombstones_capped(self):
+        """deleted_tombstones is bounded (FIFO cap)."""
+        from oc_slimapi.sse.global_hub import _LAST_UPDATED_AT_BY_SID_MAX
+        hub = GlobalHub(client=None)
+        for i in range(_LAST_UPDATED_AT_BY_SID_MAX + 50):
+            hub.deleted_tombstones[f"sid_{i}"] = None
+            hub.deleted_tombstones.move_to_end(f"sid_{i}")
+            hub._prune_deleted_tombstones()
+        assert len(hub.deleted_tombstones) <= _LAST_UPDATED_AT_BY_SID_MAX
+        assert "sid_0" not in hub.deleted_tombstones

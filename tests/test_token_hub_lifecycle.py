@@ -708,7 +708,7 @@ class TestTtlSweep:
         th.on_part_updated(_updated_props("s1", "m1", "p1", text=""))
         key = ("s1", "m1", "p1")
         th._session_status["s1"] = "busy"
-        th._busy_sids.add("s1")
+        th._busy_sids["s1"] = None
         now = _now_ms()
         th.live_parts[key].last_delta_ms = now - TOKEN_ACC_IDLE_MS - 1
         retired = th.ttl_sweep(now)
@@ -752,7 +752,7 @@ class TestTtlSweep:
         # Expired busy.
         th.on_part_updated(_updated_props("s3", "m3", "p3", text=""))
         th._session_status["s3"] = "busy"
-        th._busy_sids.add("s3")
+        th._busy_sids["s3"] = None
 
         now = _now_ms()
         th.live_parts[("s1", "m1", "p1")].last_delta_ms = now - TOKEN_ACC_IDLE_MS - 1
