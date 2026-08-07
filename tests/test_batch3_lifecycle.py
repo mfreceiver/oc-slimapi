@@ -17,7 +17,9 @@ import pytest
 from oc_slimapi.config import TOKEN_FLUSH_SECONDS
 from oc_slimapi.sse.global_hub import GlobalHub
 from oc_slimapi.sse.hub_types import Subscriber
+from oc_slimapi.sse.registry import HubRegistry
 from oc_slimapi.sse.tokenstream.hub import TokenStreamHub
+from oc_slimapi.sse.tokenstream.models import LivePart
 
 
 # ---------------------------------------------------------------------------
@@ -360,3 +362,181 @@ class TestInv1TokenFlushWatchdog:
             assert not th._flush_task.done()
         finally:
             th.stop()
+
+
+# ===========================================================================
+# Step 2 — INV-2: grace serial + epoch cleanup
+# ===========================================================================
+
+class TestInv2GraceSerialEpochCleanup:
+    """registry._remove_hub_after_grace: await gather + re-check +
+    token_hub.on_upstream_reconnect (preserving _part_revisions /
+    _removed_messages)."""
+
+    async def test_grace_removal_clears_token_hub_old_epoch_state(self, monkeypatch):
+        """grace removal fires → token_hub.on_upstream_reconnect() called →
+        live_parts / _session_status / _busy_sids / _retired_messages
+        cleared; _global nulled."""
+        monkeypatch.setattr("oc_slimapi.sse.global_hub.GRACE_SECONDS", 0.0)
+        monkeypatch.setattr("oc_slimapi.sse.registry.GRACE_SECONDS", 0.0)
+
+        th = TokenStreamHub()
+        # Populate old-epoch state.
+        th._session_status["s1"] = "busy"
+        th._busy_sids.add("s1")
+        th.live_parts[("s1", "m1", "p1")] = LivePart()
+        th._retired_messages.add(("s1", "m1"))
+
+        registry = HubRegistry(client=None)
+        registry.set_token_hub(th)
+
+        sub = registry.subscribe()
+        hub = registry.get_global()
+        registry.unsubscribe(sub)
+        removal = registry._removal_task
+        assert removal is not None
+        await removal  # grace fires → teardown
+        await _pump_callbacks(3)
+
+        # _global nulled.
+        assert registry._global is None
+        # Token hub old-epoch state cleared by on_upstream_reconnect.
+        assert len(th._session_status) == 0
+        assert len(th._busy_sids) == 0
+        assert len(th.live_parts) == 0
+        assert len(th._retired_messages) == 0
+
+    async def test_part_revisions_preserved_across_epoch_cleanup(self, monkeypatch):
+        """CRITICAL 1: _part_revisions survives on_upstream_reconnect
+        (ocdroid strict-`>` watermark invariant). Also _removed_messages
+        (replay queue) survives."""
+        monkeypatch.setattr("oc_slimapi.sse.global_hub.GRACE_SECONDS", 0.0)
+        monkeypatch.setattr("oc_slimapi.sse.registry.GRACE_SECONDS", 0.0)
+
+        th = TokenStreamHub()
+        th._part_revisions[("s1", "m1", "p1")] = 42
+        th._removed_messages[("s1", "m1")] = 99999
+
+        registry = HubRegistry(client=None)
+        registry.set_token_hub(th)
+
+        sub = registry.subscribe()
+        registry.unsubscribe(sub)
+        removal = registry._removal_task
+        assert removal is not None
+        await removal
+        await _pump_callbacks(3)
+
+        # CRITICAL 1: _part_revisions preserved.
+        assert ("s1", "m1", "p1") in th._part_revisions
+        assert th._part_revisions[("s1", "m1", "p1")] == 42
+        # Replay queue preserved.
+        assert ("s1", "m1") in th._removed_messages
+
+    async def test_grace_removal_awaits_hub_tasks(self, monkeypatch):
+        """INV-2: after cancelling hub tasks, the removal awaits their full
+        exit (gather). Verified by asserting the old run task is .done()
+        after removal completes (not still winding down)."""
+        monkeypatch.setattr("oc_slimapi.sse.global_hub.GRACE_SECONDS", 0.0)
+        monkeypatch.setattr("oc_slimapi.sse.registry.GRACE_SECONDS", 0.0)
+
+        registry = HubRegistry(client=None)
+        sub = registry.subscribe()
+        hub = registry.get_global()
+        run_ref = hub.task
+        flush_ref = hub.flush_task
+        hb_ref = hub.heartbeat_task
+        registry.unsubscribe(sub)
+        removal = registry._removal_task
+        assert removal is not None
+        await removal
+
+        # All old hub tasks fully done (not just cancelled — gathered).
+        assert run_ref is not None and run_ref.done()
+        assert flush_ref is not None and flush_ref.done()
+        assert hb_ref is not None and hb_ref.done()
+
+    async def test_recheck_aborts_removal_if_consumer_arrives(self, monkeypatch):
+        """INV-2 re-check: if a subscriber arrives during the gather (reviving
+        the hub), removal is abandoned (_global stays, _removal_task cleared).
+
+        We simulate this by making the hub's run task slow to cancel (it
+        parks on a long sleep), so the gather window is wide enough for a
+        new subscribe to land."""
+        monkeypatch.setattr("oc_slimapi.sse.global_hub.GRACE_SECONDS", 0.0)
+        monkeypatch.setattr("oc_slimapi.sse.registry.GRACE_SECONDS", 0.0)
+
+        registry = HubRegistry(client=None)
+        sub = registry.subscribe()
+        hub = registry.get_global()
+        # Replace run with a slow-to-cancel task so the gather has a wide
+        # window. The supervisor done_callback is bypassed (cancelled path).
+        if hub.task is not None:
+            hub.task.cancel()
+
+            async def slow_run():
+                try:
+                    await asyncio.sleep(10.0)
+                except asyncio.CancelledError:
+                    # Simulate slow unwind (httpx connection teardown).
+                    await asyncio.sleep(0.05)
+                    raise
+
+            hub.task = asyncio.create_task(slow_run())
+        registry.unsubscribe(sub)
+        removal = registry._removal_task
+        assert removal is not None
+
+        # Schedule a new subscribe to land during the gather. The removal
+        # task cancels hub.task, then enters gather. We yield once so the
+        # removal starts its gather, then subscribe (which revives the hub
+        # via ensure_upstream → _spawn_group).
+        await asyncio.sleep(0.02)  # let removal enter gather
+        # A new subscriber arrives → revive hub.
+        new_sub = registry.subscribe()
+        try:
+            await removal  # removal completes (re-check aborts)
+            await _pump_callbacks(3)
+            # Hub was revived: _global still points to the hub.
+            assert registry._global is hub
+            assert hub.has_consumers()
+        finally:
+            registry.unsubscribe(new_sub)
+            await _close_hub(hub)
+
+    async def test_cancel_during_gather_returns_cleanly(self, monkeypatch):
+        """If cancel_pending_removal fires during the gather (e.g. token
+        subscribe), the removal task returns cleanly without nulling."""
+        monkeypatch.setattr("oc_slimapi.sse.global_hub.GRACE_SECONDS", 0.0)
+        monkeypatch.setattr("oc_slimapi.sse.registry.GRACE_SECONDS", 0.0)
+
+        registry = HubRegistry(client=None)
+        sub = registry.subscribe()
+        hub = registry.get_global()
+        # Slow-to-cancel run task.
+        if hub.task is not None:
+            hub.task.cancel()
+
+            async def slow_run():
+                try:
+                    await asyncio.sleep(10.0)
+                except asyncio.CancelledError:
+                    await asyncio.sleep(0.05)
+                    raise
+
+            hub.task = asyncio.create_task(slow_run())
+        registry.unsubscribe(sub)
+        removal = registry._removal_task
+        assert removal is not None
+
+        await asyncio.sleep(0.02)  # let removal enter gather
+        registry.cancel_pending_removal()  # cancels removal during gather
+
+        with __import__("contextlib").suppress(asyncio.CancelledError):
+            await removal
+        await _pump_callbacks(3)
+        # _removal_task cleared by cancel_pending_removal.
+        assert registry._removal_task is None
+        # _global NOT nulled (removal was cancelled mid-gather).
+        assert registry._global is hub
+        await _close_hub(hub)

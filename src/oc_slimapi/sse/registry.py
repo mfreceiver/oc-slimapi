@@ -232,9 +232,25 @@ class HubRegistry:
 
         Mirrors :meth:`GlobalHub.stop_after_grace` but additionally nulls the
         registry's strong reference so the hub (and its task handles) can be
-        GC'd — avoiding unbounded growth if the process lives long enough
-        to cycle through many idle periods. A new ``subscribe()`` arriving
+        GC'd — avoiding unbounded growth if the process lives long enough to
+        cycle through many idle periods. A new ``subscribe()`` arriving
         during the grace window cancels this task.
+
+        INV-2 (P0-2): epoch strictly serial. After cancelling the hub's 4
+        tasks we ``await asyncio.gather(*tasks, return_exceptions=True)``
+        (aligned with :meth:`close`) so the old ``run()`` fully exits and
+        releases its ``/global/event`` connection BEFORE we null the
+        reference. After the gather we re-check ``hub is self._global and
+        not hub.has_consumers()`` — a subscriber arriving during the await
+        may have revived the hub, in which case removal is abandoned. The
+        cleanup→null segment after re-check is a no-await sync block:
+
+        * ``token_hub.on_upstream_reconnect()`` clears old-epoch state
+          (live_parts / _session_status / _busy_sids / _retired_messages).
+          ``has_consumers()`` is False here → the resync fanout is a natural
+          no-op (zero wire impact). ``_part_revisions`` (CRITICAL 1) and
+          ``_removed_messages`` (replay queue) are PRESERVED.
+        * ``self._global = None`` drops the strong reference.
         """
         try:
             await asyncio.sleep(GRACE_SECONDS)
@@ -247,9 +263,36 @@ class HubRegistry:
             # subscriber (Stage D) keeps the hub alive too (§16-B).
             self._removal_task = None
             return
-        for task in (hub.task, hub.flush_task, hub.heartbeat_task, hub.stop_task):
-            if task is not None and not task.done():
-                task.cancel()
+        # Cancel the hub's 4 tasks.
+        tasks = [
+            task for task in (hub.task, hub.flush_task, hub.heartbeat_task, hub.stop_task)
+            if task is not None and not task.done()
+        ]
+        for task in tasks:
+            task.cancel()
+        # INV-2: await full exit so the old run() releases /global/event
+        # BEFORE we null the reference (aligns with close()'s gather).
+        if tasks:
+            try:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            except asyncio.CancelledError:
+                # A new subscriber (or close()) cancelled this removal
+                # task during the gather. Return without nulling — the
+                # hub was revived (subscribe→ensure_upstream) or will be
+                # cleaned up by close().
+                return
+        # INV-2: re-check after gather — a new subscriber may have arrived
+        # during the await, reviving the hub. If so, abandon removal.
+        if hub is not self._global or hub.has_consumers():
+            self._removal_task = None
+            return
+        # INV-2: no-await sync segment. on_upstream_reconnect() clears the
+        # token hub's old-epoch state so the next hub starts clean.
+        # has_consumers()==False → resync fanout is a no-op. CRITICAL 1:
+        # _part_revisions and _removed_messages are PRESERVED by
+        # on_upstream_reconnect (see its docstring).
+        if self._token_hub is not None:
+            self._token_hub.on_upstream_reconnect()
         self._global = None
         self._removal_task = None
 
