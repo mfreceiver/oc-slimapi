@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 
 import httpx
 import pytest
@@ -122,6 +123,105 @@ def test_incarnation_store_unwritable_dir_does_not_crash(tmp_path):
     inc = store.load_or_bump()
     assert isinstance(inc, int)
     assert inc >= 1
+
+
+# ── 1b. IncarnationStore atomic-write regression (P0-4) ────────────────────────
+
+
+def test_incarnation_write_is_atomic_via_temp_then_replace(tmp_path, monkeypatch):
+    """P0-4: load_or_bump writes to a ``.tmp`` sibling then ``os.replace``.
+
+    Regression guard for the half-write hazard: if the process is killed
+    mid-write, the persisted file must be either the old value or the new
+    value, never truncated. We assert the write goes through a temp file +
+    ``os.replace`` (the atomic-commit primitive), not a direct truncate
+    overwrite of the final path.
+    """
+    replace_calls: list[tuple[str, str]] = []
+    real_replace = os.replace
+
+    def spy_replace(src, dst):
+        replace_calls.append((str(src), str(dst)))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(
+        "oc_slimapi.turn_registry.os.replace", spy_replace
+    )
+
+    store = IncarnationStore(state_dir=str(tmp_path))
+    assert store.load_or_bump() == 1
+
+    # Exactly one atomic replace landed on the final path, sourced from a
+    # .tmp sibling in the same directory.
+    assert len(replace_calls) == 1
+    src, dst = replace_calls[0]
+    assert src.endswith("incarnation.tmp")
+    assert str(tmp_path) in src
+    assert dst == str(tmp_path / "incarnation")
+
+    # The temp file must NOT linger after a successful commit.
+    assert not (tmp_path / "incarnation.tmp").exists()
+    # The final file holds the fully-written value.
+    assert (tmp_path / "incarnation").read_text().strip() == "1"
+
+
+def test_incarnation_write_tmp_cleaned_up_on_replace_failure(tmp_path, monkeypatch):
+    """P0-4: when os.replace fails, the orphan ``.tmp`` is cleaned up."""
+    store = IncarnationStore(state_dir=str(tmp_path))
+    # Seed a valid prior value so we can assert it survives a failed write.
+    (tmp_path / "incarnation").write_text("7\n", encoding="utf-8")
+
+    def boom(src, dst):
+        raise OSError("rename denied (read-only filesystem)")
+
+    monkeypatch.setattr("oc_slimapi.turn_registry.os.replace", boom)
+
+    # load_or_bump returns the computed value (8) in-memory even though the
+    # persist failed — best-effort, never crashes the lifespan.
+    assert store.load_or_bump() == 8
+    # The prior value is untouched on disk (the atomic replace never landed).
+    assert (tmp_path / "incarnation").read_text().strip() == "7"
+    # The orphan temp was cleaned up by the failure path.
+    assert not (tmp_path / "incarnation.tmp").exists()
+
+
+def test_incarnation_write_crash_mid_write_leaves_prior_value(tmp_path, monkeypatch):
+    """P0-4: a crash (simulated as a failed open of the temp) cannot truncate
+    the already-persisted file. Pre-P0-4 a direct ``write_text`` would
+    truncate the final path before writing; a crash there left an empty file
+    → next restart reads 0 → incarnation 1 reused (fence reuse). Now the
+    final file is only touched via the atomic rename."""
+    store = IncarnationStore(state_dir=str(tmp_path))
+    (tmp_path / "incarnation").write_text("42\n", encoding="utf-8")
+
+    # Simulate a crash by making the temp-file open raise.
+    real_open = open
+
+    def crash_on_temp_write(path, *args, **kwargs):
+        if str(path).endswith("incarnation.tmp"):
+            raise OSError("simulated crash before write")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", crash_on_temp_write)
+
+    assert store.load_or_bump() == 43  # computed in-memory
+    # The final file is fully intact — prior value survives the crash.
+    assert (tmp_path / "incarnation").read_text().strip() == "42"
+    # And no temp lingers.
+    assert not (tmp_path / "incarnation.tmp").exists()
+
+
+def test_incarnation_reload_after_successful_atomic_write(tmp_path):
+    """P0-4 end-to-end: a successful atomic write is observable by a fresh
+    reader on the next process start — the value survives a real restart."""
+    s1 = IncarnationStore(state_dir=str(tmp_path))
+    first = s1.load_or_bump()
+    assert first == 1
+    # Simulate a restart by constructing a fresh store against the same dir.
+    s2 = IncarnationStore(state_dir=str(tmp_path))
+    assert s2.load_or_bump() == 2
+    s3 = IncarnationStore(state_dir=str(tmp_path))
+    assert s3.load_or_bump() == 3
 
 
 # ── 2. TurnRegistry ─────────────────────────────────────────────────────────────

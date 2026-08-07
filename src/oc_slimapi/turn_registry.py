@@ -31,6 +31,7 @@ single-loop monotonic visibility).
 
 from __future__ import annotations
 
+import os
 from collections import OrderedDict
 from pathlib import Path
 
@@ -147,16 +148,41 @@ class IncarnationStore:
         return value
 
     def _write_persisted(self, inc: int) -> bool:
-        """Best-effort write of ``inc`` to the persistence file.
+        """Best-effort **atomic** write of ``inc`` to the persistence file.
 
-        Creates the parent directory if needed. Returns ``True`` on success,
-        ``False`` on any I/O failure (logged as a warning). Never raises.
+        Creates the parent directory if needed. Writes the value to a sibling
+        ``.tmp`` file, ``fsync``s it (durability against power loss), then
+        ``os.replace``s it onto the final path — atomic on POSIX (and on the
+        same filesystem rename is atomic on Linux). A crash at any point
+        leaves the previous file intact (either the old value or the new
+        value, never a truncated/half-written file). This guards against the
+        restart-incarnation-reuse hazard: a half-written file would be parsed
+        as corrupt → fallback to 0 → the next process reuses incarnation 1
+        (reusing the old fence).
+
+        Single process / single event loop → no concurrent writer; the
+        atomicity is purely for **crash** protection (process killed, OOM,
+        power loss). Returns ``True`` on success, ``False`` on any I/O
+        failure (logged as a warning). Never raises.
+
+        The ``.tmp`` sibling is cleaned up on any failure path so a stale
+        temp never lingers to confuse readers (the reader only ever reads
+        the final path, but cleanliness is its own reward).
         """
+        data = f"{inc}\n".encode("utf-8")
+        tmp_path = self._path.with_name(self._path.name + ".tmp")
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            # Write atomically-ish: write then flush. Single process, no
-            # concurrent writer, so a plain overwrite is sufficient.
-            self._path.write_text(f"{inc}\n", encoding="utf-8")
+            # Write + fsync the temp file first. fsync is what makes the
+            # subsequent atomic replace actually durable on power loss —
+            # without it the rename could land before the data.
+            with open(str(tmp_path), "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            # Atomic commit — the final path now points at the fully-written,
+            # fsynced content. A reader never observes a partial write.
+            os.replace(str(tmp_path), str(self._path))
             return True
         except OSError:
             logger.warning(
@@ -164,6 +190,12 @@ class IncarnationStore:
                 self._path,
                 exc_info=True,
             )
+            # Best-effort cleanup of the temp on failure so it doesn't
+            # linger (it is harmless to the reader, but tidy).
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
             return False
 
 
