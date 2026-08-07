@@ -941,3 +941,50 @@ class TestP1_22DeletedSidGate:
         assert "sid_0" not in th._deleted_sids
         # Newest kept.
         assert f"sid_{TOKEN_REMOVED_MESSAGES_MAX + 49}" in th._deleted_sids
+
+
+# ===========================================================================
+# Step 6 — INV-5: config frame ceiling
+# ===========================================================================
+
+class TestInv5ConfigFrameCeiling:
+    """TokenStreamHub.max_frame_bytes sourced from Settings (not hardcoded)."""
+
+    def test_hub_uses_configured_max_frame_bytes(self):
+        """A hub constructed with max_frame_bytes=512KiB truncates a 700KiB
+        snapshot instead of silently accepting it (the default 1MiB would
+        accept it)."""
+        config_bytes = 512 * 1024
+        th = TokenStreamHub(max_frame_bytes=config_bytes)
+        assert th._max_frame_bytes == config_bytes
+
+        # Create a LivePart with large seed BEFORE attaching (so the
+        # handshake snapshot picks it up).
+        big_text = "x" * (700 * 1024)
+        th.on_part_updated({
+            "part": {
+                "sessionID": "s1", "messageID": "m1", "id": "p1",
+                "type": "text", "text": big_text,
+                "time": {},
+            },
+        })
+        assert ("s1", "m1", "p1") in th.live_parts
+
+        # Attach subscriber — handshake snapshot exceeds 512KiB frame cap.
+        sub = _FakeSub(session_id="s1")
+        th.attach_subscriber("s1", sub)
+
+        truncated_frames = [
+            f for f in sub.frames
+            if isinstance(f, bytes) and b"truncated" in f
+        ]
+        assert len(truncated_frames) > 0, (
+            "INV-5: a snapshot exceeding the configured max_frame_bytes "
+            "must be truncated, not silently accepted"
+        )
+
+    def test_default_hub_uses_1mib(self):
+        """Without explicit config, the hub uses the 1MiB default."""
+        from oc_slimapi.config import DEFAULT_TOKEN_MAX_FRAME_BYTES
+        th = TokenStreamHub()
+        assert th._max_frame_bytes == DEFAULT_TOKEN_MAX_FRAME_BYTES

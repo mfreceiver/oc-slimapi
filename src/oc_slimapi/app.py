@@ -157,7 +157,12 @@ async def lifespan(app: FastAPI):
     # into it the moment the first upstream event arrives; subscriber /
     # flush / fan-out wiring lands in Stage B/C/D. Independent ledger —
     # does NOT consume MAX_TOTAL_SUBSCRIBERS.
-    app.state.token_hub = TokenStreamHub()
+    # INV-5 (P1-17): pass max_frame_bytes from Settings so the hub's
+    # snapshot/truncation ceiling matches the subscriber's oversized
+    # ceiling (same source: settings.token_stream_max_frame_bytes).
+    app.state.token_hub = TokenStreamHub(
+        max_frame_bytes=settings.token_stream_max_frame_bytes,
+    )
     app.state.hubs.set_token_hub(app.state.token_hub)
     # Stage D (design-token-stream.md §5.1 / §6): independent admission
     # ledger for token-stream subscribers. Own cap
