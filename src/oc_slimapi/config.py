@@ -102,6 +102,11 @@ TOKEN_HANDSHAKE_BUFFER_BYTES = 8 * 1024 * 1024    # 8 MiB
 # while still allowing generous headroom (defaults are 32 MiB / 64 MiB).
 _MAX_MESSAGE_BYTES_CAP = 256 * 1024 * 1024    # 256 MiB
 _MAX_RESPONSE_BYTES_CAP = 256 * 1024 * 1024   # 256 MiB
+# P1-30: RSS upper bound for the transform pool = max_transforms ×
+# max_response_bytes. Prevents a misconfiguration (e.g. max_transforms=8 ×
+# max_response_bytes=128 MiB = 1 GiB) from risking OOM under systemd
+# MemoryMax. 512 MiB leaves headroom for the rest of the process.
+_MAX_TRANSFORM_TOTAL_BYTES = 512 * 1024 * 1024  # 512 MiB
 
 # Default values for the access-log dir / path fields (P1-34). These mirror
 # the hardcoded defaults in the dataclass field definitions below and are
@@ -442,6 +447,24 @@ class Settings:
             raise RuntimeError(
                 f"OC_SLIMAPI_MAX_RESPONSE_BYTES must be <= "
                 f"{_MAX_RESPONSE_BYTES_CAP // (1024 * 1024)} MiB"
+            )
+        # P1-30: RSS upper-bound sanity. The worst-case RSS for the transform
+        # pool is approximately ``max_transforms × max_response_bytes`` (each
+        # admitted transform buffers the upstream body + the projection tree
+        # + the serialised output simultaneously). A product exceeding this
+        # cap risks OOM under the systemd MemoryMax before the admission
+        # semaphore can protect the process. Default max_transforms=1 ×
+        # max_response_bytes=64 MiB = 64 MiB (well within budget). Operators
+        # who genuinely need more should raise both deliberately.
+        _transform_total_bytes = self.max_transforms * self.max_response_bytes
+        if _transform_total_bytes > _MAX_TRANSFORM_TOTAL_BYTES:
+            raise RuntimeError(
+                f"OC_SLIMAPI_MAX_TRANSFORMS ({self.max_transforms}) × "
+                f"OC_SLIMAPI_MAX_RESPONSE_BYTES ({self.max_response_bytes}) "
+                f"= {_transform_total_bytes} bytes exceeds "
+                f"{_MAX_TRANSFORM_TOTAL_BYTES // (1024 * 1024)} MiB — risk of "
+                f"OOM under MemoryMax (reduce one or both). See transform.py "
+                f"shutdown/RSS comment for the memory model."
             )
         # Skeleton projection inline caps: per-field and per-message.
         if self.skeleton_inline_output_max_bytes <= 0:

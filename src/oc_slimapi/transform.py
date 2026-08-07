@@ -27,6 +27,21 @@ and the admission slot is released on exit even if the upstream errors out.
 
 SSE routes (``sse/hub.py``, ``routes/events.py``) never touch this module, so
 the event loop stays free for heartbeats regardless of transform load.
+
+RSS / memory model (P1-30):
+    The worst-case RSS attributable to the transform pool is approximately::
+
+        max_transforms × (max_response_bytes + projection_overhead)
+
+    where ``projection_overhead`` is the skeleton tree + serialised output
+    (typically < 2× the upstream body for skeleton projections, which are
+    smaller than the source). Admission is acquired BEFORE the upstream GET,
+    so at most ``max_transforms`` bodies are buffered at any time. The
+    default ``max_transforms=1`` is the strongest protection: at most one
+    body is buffered regardless of ``max_response_bytes``. Operators who raise
+    ``max_transforms`` should verify ``max_transforms × max_response_bytes``
+    stays well under the systemd ``MemoryMax`` — config.validate() rejects a
+    product exceeding 512 MiB (see ``_MAX_TRANSFORM_TOTAL_BYTES`` in config.py).
 """
 
 from __future__ import annotations

@@ -300,6 +300,33 @@ def test_validate_accepts_boundary_byte_caps():
     _base(max_message_bytes=256 * 1024 * 1024).validate()
 
 
+# ---------------------------------------------------------------------------
+# P1-30: transform pool RSS upper bound (max_transforms × max_response_bytes).
+# ---------------------------------------------------------------------------
+
+def test_validate_rejects_transform_product_exceeding_rss_cap():
+    """max_transforms=8 × max_response_bytes=128MiB = 1GiB > 512MiB → reject."""
+    settings = _base(max_transforms=8, max_response_bytes=128 * 1024 * 1024)
+    with pytest.raises(RuntimeError, match=r"OOM under MemoryMax"):
+        settings.validate()
+
+
+def test_validate_accepts_transform_product_within_rss_cap():
+    """max_transforms=2 × max_response_bytes=128MiB = 256MiB < 512MiB → OK."""
+    _base(max_transforms=2, max_response_bytes=128 * 1024 * 1024).validate()
+
+
+def test_validate_accepts_default_transform_product():
+    """Default max_transforms=1 × max_response_bytes=64MiB = 64MiB → OK."""
+    _base(max_transforms=1, max_response_bytes=64 * 1024 * 1024).validate()
+
+
+def test_validate_accepts_boundary_transform_product():
+    """max_transforms=2 × max_response_bytes=256MiB = 512MiB = exactly the
+    cap (<= comparison) → OK."""
+    _base(max_transforms=2, max_response_bytes=256 * 1024 * 1024).validate()
+
+
 def test_validate_rejects_server_version_outside_accepted_range():
     """server_api_version must be within accepted_client_versions range.
 
