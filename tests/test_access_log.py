@@ -816,3 +816,115 @@ def test_compress_skips_future_date(tmp_path):
     assert count == 0
     assert future.exists()
     assert not (tmp_path / "access-2026-07-30.jsonl.gz").exists()
+
+
+# ---------------------------------------------------------------------------
+# 21. P0-8: maintenance serialisation lock + unique temp names
+# ---------------------------------------------------------------------------
+
+
+def test_compress_uses_unique_pid_scoped_tmp_name(tmp_path):
+    """P0-8: the compress temp file is PID+token scoped, not a fixed
+    ``.gz.tmp``. Two concurrent invocations must not share the same temp
+    name (the original bug: a fixed ``.gz.tmp`` let a second invocation
+    unlink/overwrite the first's in-flight gzip)."""
+    old_path = tmp_path / "access-2026-07-28.jsonl"
+    old_path.write_text('{"old": true}\n')
+
+    seen_tmp_names: list[str] = []
+    real_gzip_open = gzip.open
+
+    def spy_gzip_open(path, mode):
+        # Capture the temp path used for the gzip output.
+        name = Path(path).name
+        if ".tmp." in name:
+            seen_tmp_names.append(name)
+        return real_gzip_open(path, mode)
+
+    with patch("oc_slimapi.access_log.gzip.open", spy_gzip_open):
+        count = compress_old_access_logs(str(tmp_path), date(2026, 7, 29))
+
+    assert count == 1
+    assert len(seen_tmp_names) == 1
+    tmp_name = seen_tmp_names[0]
+    # PID-scoped: contains the current PID and a random token.
+    assert str(os.getpid()) in tmp_name
+    assert tmp_name.startswith("access-2026-07-28.jsonl.gz.tmp.")
+    # Token suffix is present (something after the pid).
+    after_pid = tmp_name.split(f".{os.getpid()}.", 1)[1]
+    assert len(after_pid) >= 1
+    # No fixed-name tmp lingers (the old bug left a shared .gz.tmp).
+    assert not (tmp_path / "access-2026-07-28.jsonl.gz.tmp").exists()
+
+
+def test_compress_concurrent_invocations_are_serialised(tmp_path):
+    """P0-8: two threads calling compress simultaneously do not corrupt the
+    archive — the module-level ``_MAINT_LOCK`` serialises them. We assert
+    (a) both succeed, (b) no torn .gz is produced, (c) the resulting archive
+    is valid gzip whose content matches the source.
+
+    Before the lock + unique tmp, a fixed ``.gz.tmp`` let the second thread
+    race the first's write (truncated .gz, or one thread unlinking the
+    other's temp before os.replace landed)."""
+    import threading
+
+    # Two distinct old days to compress — each thread owns its own file but
+    # they share the same directory (the race window the lock closes).
+    for d in (27, 28):
+        (tmp_path / f"access-2026-07-{d:02d}.jsonl").write_text(
+            f'{{"day": {d}}}\n'
+        )
+
+    errors: list[Exception] = []
+
+    def run():
+        try:
+            compress_old_access_logs(str(tmp_path), date(2026, 7, 29))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == [], f"concurrent compress raised: {errors}"
+    # Both archives exist and are valid gzip with the right content.
+    for d in (27, 28):
+        gz = tmp_path / f"access-2026-07-{d:02d}.jsonl.gz"
+        assert gz.exists(), f"{gz} missing after concurrent compress"
+        with gzip.open(gz, "rt", encoding="utf-8") as f:
+            assert f.read().strip() == f'{{"day": {d}}}'
+    # No leftover temp files of either flavour.
+    leftovers = list(tmp_path.glob("*.tmp")) + list(tmp_path.glob("*.tmp.*"))
+    assert leftovers == [], f"leftover temp files: {leftovers}"
+
+
+def test_compress_concurrent_same_file_only_one_wins(tmp_path):
+    """P0-8: even when two threads target the SAME source file, the lock +
+    existence-check (``gz_path.exists()`` skip) means exactly one compress
+    lands and the .gz is authoritative (no torn double-write)."""
+    import threading
+
+    src = tmp_path / "access-2026-07-28.jsonl"
+    src.write_text('{"x": 1}\n')
+
+    counts: list[int] = []
+
+    def run():
+        counts.append(compress_old_access_logs(str(tmp_path), date(2026, 7, 29)))
+
+    threads = [threading.Thread(target=run) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Exactly one thread did the actual compress (the rest saw gz exists).
+    assert sum(counts) == 1, f"expected exactly 1 compress, got {counts}"
+    gz = tmp_path / "access-2026-07-28.jsonl.gz"
+    assert gz.exists()
+    with gzip.open(gz, "rt", encoding="utf-8") as f:
+        assert f.read().strip() == '{"x": 1}'
+

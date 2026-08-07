@@ -33,6 +33,7 @@ import logging
 import os
 import re
 import threading
+import uuid
 from datetime import date, datetime
 from pathlib import Path
 
@@ -40,6 +41,18 @@ from .logging_config import get_logger
 
 _LOGGER_NAME = "oc_slimapi.access"
 _setup_lock = threading.Lock()
+
+# Cross-thread serialisation for the maintenance file operations (compress /
+# prune / migrate). Startup runs on the main thread; the maintenance loop
+# runs compress/prune via ``asyncio.to_thread`` in the default thread pool —
+# so two maintenance operations CAN overlap (startup migrate + first loop
+# tick, or a hot-reload re-init racing the loop). Without this lock the two
+# would share fixed ``.gz.tmp`` names and clobber each other's archives.
+# Granularity: whole-function hold — maintenance is inherently serial work
+# (gzip is CPU-bound, the file set is small); holding the lock for the whole
+# call is simpler than per-file critical sections and avoids TOCTOU windows
+# between the existence checks and the writes.
+_MAINT_LOCK = threading.Lock()
 
 # Maintenance logger — separate from the access logger so diagnostic warnings
 # never leak into ``access-*.jsonl`` files (which are parsed by jq).
@@ -272,13 +285,35 @@ def write_access_log(
 # ---------------------------------------------------------------------------
 
 
+def _unique_tmp_path(base: Path, suffix: str = ".tmp") -> Path:
+    """Return a unique temp-file path in *base*'s directory.
+
+    Includes the PID + a short random token so two concurrent maintenance
+    invocations (startup main thread + a ``to_thread`` maintenance tick, or
+    a hot-reload re-init) never share the same ``.tmp`` name and clobber
+    each other's in-flight gzip writes. Only the caller (the process that
+    created the name) is responsible for cleaning it up.
+    """
+    token = uuid.uuid4().hex[:8]
+    return base.with_name(
+        f"{base.name}.{suffix.lstrip('.')}.{os.getpid()}.{token}"
+    )
+
+
 def _cleanup_leftover_tmp(dir: str) -> None:
     """Remove orphaned ``.gz.tmp`` files from previous failed operations.
 
-    Covers both daily access log temp files (``access-*.jsonl.gz.tmp``) and
-    legacy migration temp files (``access-legacy-*.jsonl.gz.tmp``).
+    Covers daily access log temp files (``access-*.jsonl.gz.tmp`` and the
+    PID-scoped ``access-*.jsonl.gz.tmp.<pid>.<token>`` variant introduced
+    by :func:`_unique_tmp_path`), as well as legacy migration temp files.
     """
-    for pattern in ("access-*.jsonl.gz.tmp", "access-legacy-*.jsonl.gz.tmp"):
+    patterns = (
+        "access-*.jsonl.gz.tmp",
+        "access-*.jsonl.gz.tmp.*",   # PID-scoped unique tmp (P0-8)
+        "access-legacy-*.jsonl.gz.tmp",
+        "access-legacy-*.jsonl.gz.tmp.*",  # PID-scoped unique tmp (P0-8)
+    )
+    for pattern in patterns:
         for p in Path(dir).glob(pattern):
             try:
                 p.unlink()
@@ -295,59 +330,64 @@ def compress_old_access_logs(dir: str, today: date) -> int:
       future-dated from clock skew — never compress those).
     * Skips files whose ``.gz`` sibling already exists (conservative — a
       damaged ``.gz`` from a previous run is not re-compressed).
-    * Writes to ``.gz.tmp`` → ``os.replace`` (atomic commit) → deletes the
-      source ``.jsonl``.  If source deletion fails a warning is logged but
-      the ``.gz`` is kept (already authoritative).
+    * Writes to a unique ``.gz.tmp.<pid>.<token>`` → ``os.replace`` (atomic
+      commit) → deletes the source ``.jsonl``.  If source deletion fails a
+      warning is logged but the ``.gz`` is kept (already authoritative).
     * Orphaned ``.gz.tmp`` files are cleaned up at the start of every call.
 
-    Returns the number of successfully compressed files.
+    The whole call is serialised by :data:`_MAINT_LOCK` — maintenance is
+    inherently serial work (gzip is CPU-bound, the file set is small), and
+    the lock prevents startup-migrate / loop-tick / hot-reload re-init from
+    racing on the same directory. Returns the number of successfully
+    compressed files.
     """
-    _cleanup_leftover_tmp(dir)
     log = _get_maint_log()
-    count = 0
-    for p in sorted(Path(dir).glob("access-*.jsonl")):
-        m = _ACCESS_LOG_RE.match(p.name)
-        if not m:
-            continue
-        try:
-            file_date = date.fromisoformat(m.group(1))
-        except ValueError:
-            continue
-        if file_date >= today:
-            continue
-
-        gz_path = p.with_name(p.name + ".gz")
-        if gz_path.exists():
-            continue
-
-        tmp_path = p.with_name(p.name + ".gz.tmp")
-        try:
-            # Compress to temporary file.
-            with open(p, "rb") as f_in, gzip.open(tmp_path, "wb") as f_out:
-                f_out.writelines(f_in)
-            # Atomic replace — the .gz is now authoritative.
-            os.replace(str(tmp_path), str(gz_path))
-            # Best-effort removal of the source .jsonl.
+    with _MAINT_LOCK:
+        _cleanup_leftover_tmp(dir)
+        count = 0
+        for p in sorted(Path(dir).glob("access-*.jsonl")):
+            m = _ACCESS_LOG_RE.match(p.name)
+            if not m:
+                continue
             try:
-                p.unlink()
-            except OSError:
-                log.warning(
-                    "Compressed %s but failed to delete source; .gz is authoritative",
-                    p,
-                    exc_info=True,
-                )
-            count += 1
-        except Exception:
-            log.warning(
-                "Failed to compress %s", p, exc_info=True,
-            )
-            # Clean up leftover tmp on failure.
-            if tmp_path.exists():
+                file_date = date.fromisoformat(m.group(1))
+            except ValueError:
+                continue
+            if file_date >= today:
+                continue
+
+            gz_path = p.with_name(p.name + ".gz")
+            if gz_path.exists():
+                continue
+
+            tmp_path = _unique_tmp_path(gz_path, ".tmp")
+            try:
+                # Compress to the unique temporary file.
+                with open(p, "rb") as f_in, gzip.open(tmp_path, "wb") as f_out:
+                    f_out.writelines(f_in)
+                # Atomic replace — the .gz is now authoritative.
+                os.replace(str(tmp_path), str(gz_path))
+                # Best-effort removal of the source .jsonl.
                 try:
-                    tmp_path.unlink()
-                except Exception:
-                    pass
-    return count
+                    p.unlink()
+                except OSError:
+                    log.warning(
+                        "Compressed %s but failed to delete source; .gz is authoritative",
+                        p,
+                        exc_info=True,
+                    )
+                count += 1
+            except Exception:
+                log.warning(
+                    "Failed to compress %s", p, exc_info=True,
+                )
+                # Clean up this caller's unique tmp on failure.
+                if tmp_path.exists():
+                    try:
+                        tmp_path.unlink()
+                    except Exception:
+                        pass
+        return count
 
 
 def prune_old_access_logs(dir: str, retain_days: int, today: date) -> int:
@@ -359,30 +399,33 @@ def prune_old_access_logs(dir: str, retain_days: int, today: date) -> int:
     * Only files matching the strict naming pattern (:data:`_ACCESS_LOG_RE`)
       are considered.
 
-    Returns the number of successfully deleted files.
+    Serialised by :data:`_MAINT_LOCK` so it cannot race with a concurrent
+    :func:`compress_old_access_logs` / :func:`migrate_legacy_access_log` on
+    the same directory. Returns the number of successfully deleted files.
     """
     if retain_days <= 0:
         return 0
     deadline = date.fromordinal(today.toordinal() - retain_days)
     log = _get_maint_log()
     count = 0
-    for pattern in ("access-*.jsonl", "access-*.jsonl.gz"):
-        for p in Path(dir).glob(pattern):
-            m = _ACCESS_LOG_RE.match(p.name)
-            if not m:
-                continue
-            try:
-                file_date = date.fromisoformat(m.group(1))
-            except ValueError:
-                continue
-            if file_date < deadline:
+    with _MAINT_LOCK:
+        for pattern in ("access-*.jsonl", "access-*.jsonl.gz"):
+            for p in Path(dir).glob(pattern):
+                m = _ACCESS_LOG_RE.match(p.name)
+                if not m:
+                    continue
                 try:
-                    p.unlink()
-                    count += 1
-                except Exception:
-                    log.warning(
-                        "Failed to prune %s", p, exc_info=True,
-                    )
+                    file_date = date.fromisoformat(m.group(1))
+                except ValueError:
+                    continue
+                if file_date < deadline:
+                    try:
+                        p.unlink()
+                        count += 1
+                    except Exception:
+                        log.warning(
+                            "Failed to prune %s", p, exc_info=True,
+                        )
     return count
 
 
@@ -397,31 +440,33 @@ def migrate_legacy_access_log(dir: str) -> int:
     Best-effort — each file is tried independently; failures are logged and
     do not stop processing the remaining files.
 
+    Serialised by :data:`_MAINT_LOCK` (mirrors compress/prune) so a startup
+    migration cannot race a concurrent maintenance tick on the same dir.
     Returns the number of successfully migrated files.
     """
     log = _get_maint_log()
     count = 0
+    with _MAINT_LOCK:
+        # Main file: access.jsonl
+        main_path = Path(dir) / "access.jsonl"
+        if main_path.exists():
+            try:
+                if _migrate_one(main_path, "current", log):
+                    count += 1
+            except Exception:
+                log.warning("Failed to migrate %s", main_path, exc_info=True)
 
-    # Main file: access.jsonl
-    main_path = Path(dir) / "access.jsonl"
-    if main_path.exists():
-        try:
-            if _migrate_one(main_path, "current", log):
-                count += 1
-        except Exception:
-            log.warning("Failed to migrate %s", main_path, exc_info=True)
-
-    # Numbered backups: access.jsonl.N  (N = integer ≥ 1)
-    for p in sorted(Path(dir).glob("access.jsonl.*")):
-        # Skip false positives like "access.jsonl.gz" or "access.jsonl.abc".
-        suffix = p.name[len("access.jsonl."):]
-        if not suffix.isdigit() or int(suffix) < 1:
-            continue
-        try:
-            if _migrate_one(p, suffix, log):
-                count += 1
-        except Exception:
-            log.warning("Failed to migrate %s", p, exc_info=True)
+        # Numbered backups: access.jsonl.N  (N = integer ≥ 1)
+        for p in sorted(Path(dir).glob("access.jsonl.*")):
+            # Skip false positives like "access.jsonl.gz" or "access.jsonl.abc".
+            suffix = p.name[len("access.jsonl."):]
+            if not suffix.isdigit() or int(suffix) < 1:
+                continue
+            try:
+                if _migrate_one(p, suffix, log):
+                    count += 1
+            except Exception:
+                log.warning("Failed to migrate %s", p, exc_info=True)
 
     return count
 
@@ -429,9 +474,10 @@ def migrate_legacy_access_log(dir: str) -> int:
 def _migrate_one(path: Path, label: str, log: logging.Logger) -> bool:
     """Helper: gzip *path* into a legacy-named archive, then delete *path*.
 
-    Uses atomic ``.gz.tmp`` + ``os.replace`` (same as
-    :func:`compress_old_access_logs`) so an interrupted migration never leaves
-    a truncated ``.gz`` as the target.
+    Uses a unique ``.tmp.<pid>.<token>`` (:func:`_unique_tmp_path`) +
+    ``os.replace`` (same atomic-commit guarantee as
+    :func:`compress_old_access_logs`, now with a non-shared temp name so two
+    concurrent invocations cannot clobber each other's archive).
 
     Returns ``True`` if the file was actually migrated, ``False`` if skipped
     (destination already exists).
@@ -443,13 +489,13 @@ def _migrate_one(path: Path, label: str, log: logging.Logger) -> bool:
     if dst_path.exists():
         log.info("Legacy archive %s already exists, skipping", dst_name)
         return False
-    tmp_path = path.with_name(dst_name + ".tmp")
+    tmp_path = _unique_tmp_path(dst_path, ".tmp")
     try:
         with open(path, "rb") as f_in, gzip.open(tmp_path, "wb") as f_out:
             f_out.writelines(f_in)
         os.replace(str(tmp_path), str(dst_path))
     except BaseException:
-        # Clean up tmp on failure.
+        # Clean up this caller's unique tmp on failure.
         if tmp_path.exists():
             try:
                 tmp_path.unlink()
@@ -480,6 +526,17 @@ async def run_access_log_maintenance_loop(
 
     Does **not** call :func:`migrate_legacy_access_log` (migration is done once
     at startup by the caller).
+
+    **Shutdown / cancellation contract (caller responsibility)**: each tick
+    dispatches ``compress`` / ``prune`` via :func:`asyncio.to_thread`, which
+    hands the blocking gzip work to the default thread pool.  When *stop_event*
+    is set (or the task is cancelled), this coroutine unwinds promptly, but an
+    already-running gzip thread is **not** joined here — it finishes on its own
+    in the thread pool.  The caller (app.py lifespan) is responsible for
+    awaiting any in-flight ``to_thread`` completion before process exit if it
+    needs a clean drain.  This function does NOT own cancel-time thread drain.
+    The per-operation :data:`_MAINT_LOCK` ensures that even if a drain is not
+    performed, concurrent maintenance operations are still mutually exclusive.
     """
     log = _get_maint_log()
     while not stop_event.is_set():
