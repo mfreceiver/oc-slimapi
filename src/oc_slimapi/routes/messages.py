@@ -291,25 +291,36 @@ async def messages(
             )
             next_cursor: str | None = None
             try:
-                if response.status_code >= 400:
-                    # Drain upstream error body for connection reuse.
-                    body = await response.aread()
-                    stash_up_in(request, len(body))
-                    # Contract §7: map upstream errors to structured codes.
-                    if response.status_code == 404:
-                        raise CodedHTTPException(
-                            404, code="session_not_found", sessionID=sid,
-                        )
-                    if response.status_code < 500:
-                        raise CodedHTTPException(
-                            502, code=f"upstream_http_{response.status_code}",
-                        )
-                    raise CodedHTTPException(503, code="upstream_unavailable")
-                body, n_read = await read_with_cap(response, config.max_response_bytes)
-                # Traffic accounting: cap-read upstream bytes, recorded BEFORE
-                # the cap-bail return so oversize reads are still attributed
-                # (unified cap-bail upIn convention with /full, agent, command).
-                stash_up_in(request, n_read)
+                try:
+                    if response.status_code >= 400:
+                        # Drain upstream error body for connection reuse.
+                        body = await response.aread()
+                        stash_up_in(request, len(body))
+                        # Contract §7: map upstream errors to structured codes.
+                        if response.status_code == 404:
+                            raise CodedHTTPException(
+                                404, code="session_not_found", sessionID=sid,
+                            )
+                        if response.status_code < 500:
+                            raise CodedHTTPException(
+                                502, code=f"upstream_http_{response.status_code}",
+                            )
+                        raise CodedHTTPException(503, code="upstream_unavailable")
+                    # on_read stashes each chunk as it is pulled so a
+                    # mid-stream httpx.RequestError cannot lose already-read
+                    # bytes from upIn (P0-9); success/cap paths are additive
+                    # equivalents of the old post-call stash (B1).
+                    body, _ = await read_with_cap(
+                        response, config.max_response_bytes,
+                        on_read=lambda n: stash_up_in(request, n),
+                    )
+                except httpx.RequestError as exc:
+                    # Wrap mid-stream upstream I/O failures (aread drain or
+                    # read_with_cap aiter_bytes) into a structured 503 instead
+                    # of bubbling up as an unhandled FastAPI 500 (P1-24 —
+                    # aligns the list branch with /full, sessions, catalog).
+                    # Already-read bytes were stashed via on_read above.
+                    raise CodedHTTPException(503, code="upstream_unavailable") from exc
                 if body is None:
                     return error_response(
                         "response_too_large", 413,
@@ -414,15 +425,16 @@ async def message(
                         raise CodedHTTPException(503, code="upstream_unavailable")
                     # Contract §2: /full/{mid} always returns 200 on success.
                     status_code = 200
-                    body, n_read = await read_with_cap(
+                    # on_read stashes each chunk so a mid-stream
+                    # httpx.RequestError cannot lose already-read bytes from
+                    # upIn (P0-9); success/cap paths are additive
+                    # equivalents of the old post-call stash (B1).
+                    body, _ = await read_with_cap(
                         response, config.max_message_bytes,
+                        on_read=lambda n: stash_up_in(request, n),
                     )
                 except httpx.RequestError as exc:
                     raise CodedHTTPException(503, code="upstream_unavailable") from exc
-                # Traffic accounting: cap-read upstream bytes, recorded BEFORE
-                # the cap-bail return so oversize reads are still attributed
-                # (unified cap-bail upIn convention across list/full/catalog).
-                stash_up_in(request, n_read)
                 if body is None:
                     return error_response(
                         "message_too_large", 413,

@@ -140,9 +140,10 @@ async def questions(request: Request):
                 err_body = await response.aread()
                 stash_up_in(request, len(err_body))
                 raise CodedHTTPException(503, code="upstream_unavailable")
-            body, n_read = await read_with_cap(response, config.max_response_bytes)
-            # Traffic accounting: discovery upstream body (bytes read, even on cap).
-            stash_up_in(request, n_read)
+            body, _ = await read_with_cap(
+                response, config.max_response_bytes,
+                on_read=lambda n: stash_up_in(request, n),
+            )
             if body is None:
                 raise CodedHTTPException(503, code="upstream_unavailable")
             try:
@@ -281,9 +282,10 @@ async def _fetch_questions_for_dir(
                     err_body = await response.aread()
                     stash_up_in(request, len(err_body))
                     return [], f"upstream_http_{status}"
-                body, n_read = await read_with_cap(response, config.max_response_bytes)
-                # Traffic accounting: per-dir upstream body.
-                stash_up_in(request, n_read)
+                body, _ = await read_with_cap(
+                    response, config.max_response_bytes,
+                    on_read=lambda n: stash_up_in(request, n),
+                )
                 if body is None:
                     return [], "upstream_unavailable"
                 try:

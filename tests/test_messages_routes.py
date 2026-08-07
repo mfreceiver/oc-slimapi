@@ -1441,6 +1441,46 @@ async def test_messages_list_scalar_list_body_returns_503(upstream_factory):
 
 
 # ---------------------------------------------------------------------------
+# P1-24: messages list mid-stream upstream failure → 503 upstream_unavailable.
+# (Mirrors sessions / command / agent mid-stream tests. The list branch
+# previously had only ``finally: await response.aclose()`` and no
+# ``except httpx.RequestError``, so a mid-stream disconnect escaped as a bare
+# FastAPI 500. Now it maps to a structured 503, aligned with /full/{mid}.)
+# ---------------------------------------------------------------------------
+
+
+async def test_messages_list_mid_stream_read_error_returns_503(upstream_factory):
+    """messages list: upstream returns 200 then disconnects mid-body → 503
+    upstream_unavailable (not a bare 500).
+
+    Regression (P1-24): the list branch lacked the ``except
+    httpx.RequestError`` wrapper that /full/{mid}, sessions, and catalog
+    routes already had. A mid-stream ReadError during ``read_with_cap``
+    escaped as an unhandled FastAPI 500 instead of a structured 503.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        async def failing_body():
+            yield b'[{"info":'
+            raise httpx.ReadError("simulated mid-stream disconnect", request=request)
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            content=failing_body(),
+        )
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/slimapi/messages/s1", headers=VERSION_HEADERS)
+        assert response.status_code == 503
+        assert response.json()["code"] == "upstream_unavailable"
+    finally:
+        app.state.transforms.shutdown()
+
+
+# ---------------------------------------------------------------------------
 # full/{mid} endpoint — non-dict body guard → 503 upstream_unavailable.
 # (Task 1 / spec T1, grilling extension: the full worker expects a single
 # message dict; a list / null body would make strip_diagnostics_message

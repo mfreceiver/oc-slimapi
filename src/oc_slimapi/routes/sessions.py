@@ -72,11 +72,14 @@ async def sessions(
                             response.raise_for_status()
                         except httpx.HTTPStatusError as exc:
                             raise_upstream_status(exc)
-                    body, n_read = await read_with_cap(response, config.max_response_bytes)
-                    # Traffic accounting: cap-read upstream bytes, recorded
-                    # BEFORE the cap-bail raise so oversize reads are still
-                    # attributed (unified with messages/agent/command).
-                    stash_up_in(request, n_read)
+                    # on_read stashes each chunk so a mid-stream
+                    # httpx.RequestError cannot lose already-read bytes from
+                    # upIn (P0-9); success/cap paths are additive
+                    # equivalents of the old post-call stash (B1).
+                    body, _ = await read_with_cap(
+                        response, config.max_response_bytes,
+                        on_read=lambda n: stash_up_in(request, n),
+                    )
                     if body is None:
                         raise CodedHTTPException(
                             413, code="response_too_large",

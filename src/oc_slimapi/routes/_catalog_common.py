@@ -141,7 +141,14 @@ async def handle_catalog_request(
                             502, code=f"upstream_http_{response.status_code}",
                         )
                     raise CodedHTTPException(503, code="upstream_unavailable")
-                body, n_read = await read_with_cap(response, config.max_response_bytes)
+                # on_read stashes each chunk so a mid-stream
+                # httpx.RequestError cannot lose already-read bytes from
+                # upIn (P0-9); success/cap paths are additive
+                # equivalents of the old post-call stash (B1).
+                body, _ = await read_with_cap(
+                    response, config.max_response_bytes,
+                    on_read=lambda n: stash_up_in(request, n),
+                )
             except httpx.RequestError as exc:
                 # Wrap mid-stream upstream I/O failures (httpx.RequestError
                 # raised by the error-body drain aread() or read_with_cap
@@ -149,11 +156,6 @@ async def handle_catalog_request(
                 # up as an unhandled FastAPI 500. The finally below still
                 # runs to release the connection.
                 raise CodedHTTPException(503, code="upstream_unavailable") from exc
-            # Traffic accounting: cap-read upstream bytes (counted even
-            # on cap-bail, matching the messages /full convention — must
-            # run BEFORE the body-None check so oversize reads are still
-            # attributed).
-            stash_up_in(request, n_read)
             if body is None:
                 return error_response(
                     "response_too_large", 413,
