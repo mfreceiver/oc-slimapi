@@ -149,6 +149,31 @@ def test_snapshot_unobserved_sid_returns_inc_and_zero():
     assert reg.snapshot("never-bumped") == (1, 0)
 
 
+def test_turns_map_is_lru_bounded():
+    """B3: ``_turns`` is LRU-bounded by ``_TURNS_MAX``.
+
+    Bumping more distinct sids than the cap evicts the least-recently-bumped;
+    an evicted sid falls back to ``snapshot == (inc, 0)`` and, if re-bumped
+    within the SAME incarnation, restarts at turn 1 — the disclosed
+    within-incarnation regression (see ``_TURNS_MAX`` docstring)."""
+    from oc_slimapi.turn_registry import _TURNS_MAX
+
+    reg = TurnRegistry(incarnation=7)
+    # Fill to the cap, then one more distinct sid forces a single eviction.
+    for i in range(_TURNS_MAX + 1):
+        reg.bump_turn(f"sid_{i}")
+    # The map is capped (never unbounded).
+    assert len(reg._turns) == _TURNS_MAX
+    # sid_0 (first-bumped, least-recently-active) is evicted → snapshot falls
+    # back to (inc, 0).
+    assert reg.snapshot("sid_0") == (7, 0)
+    # The most-recently-bumped sid is still resident with turn 1.
+    assert reg.snapshot(f"sid_{_TURNS_MAX}") == (7, 1)
+    # An evicted sid re-bumped within the same incarnation restarts at 1
+    # (the disclosed regression — NOT a restart, which bumps incarnation).
+    assert reg.bump_turn("sid_0") == 1
+
+
 # ── 3. DigestFields.to_payload ──────────────────────────────────────────────────
 
 

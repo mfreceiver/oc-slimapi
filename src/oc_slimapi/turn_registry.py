@@ -45,8 +45,15 @@ logger = get_logger(__name__)
 _FALLBACK_INCARNATION = 1
 
 # LRU cap on the per-sid turn map (mirrors _LAST_UPDATED_AT_BY_SID_MAX in
-# sse/global_hub.py). An evicted sid's next bump starts fresh at 1 — a "hole"
-# ocdroid's lex compare tolerates exactly like a restart hole.
+# sse/global_hub.py). KNOWN UPPER-BOUND TRADE-OFF (prospective disclosure,
+# accepted): if a sid is evicted and later bumps again within the SAME
+# incarnation, its turn restarts at 1 — a within-incarnation regression
+# (lex-LOWER), which ocdroid's fence would treat as stale until the turn
+# re-climbs past the pre-eviction value. This is NOT a restart hole (a restart
+# bumps the incarnation, which this does not). Practically unreachable: needs
+# >10_000 distinct bumped sids in a single process — far beyond the single-
+# user sidecar's working set (same disclosure pattern as v2-contract.md's
+# "known upper-bound race").
 _TURNS_MAX = 10_000
 
 # Single flat file holding the last-written incarnation integer, one line.
@@ -168,9 +175,14 @@ class TurnRegistry:
     * ``incarnation`` — frozen at startup from :class:`IncarnationStore`;
       constant for the process lifetime (O2/O4).
     * ``_turns`` — ``OrderedDict[str, int]``, monotonically non-decreasing per
-      ``sid`` (S2). FIFO/LRU-bounded by :data:`_TURNS_MAX` (10_000) — an
-      evicted sid's next bump starts fresh at 1 (a "hole" the client's lex
-      compare tolerates like a restart hole). Scope is the ``sid`` alone (O3
+      ``sid`` while that sid remains resident (S2). LRU-bounded by
+      :data:`_TURNS_MAX` (10_000): if a sid is evicted and later bumps again
+      within the same incarnation, its turn restarts at 1 — a within-incarnation
+      regression (lex-LOWER) the client's fence would treat as stale until the
+      turn re-climbs; this is NOT a restart hole (a restart bumps incarnation)
+      and is accepted prospectively (practically unreachable at >10_000 bumped
+      sids; same disclosure pattern as v2-contract.md's "known upper-bound
+      race"). Scope is the ``sid`` alone (O3
       single-instance: no instanceFp, no server-group fingerprint in the key
       — single sidecar + single opencode backend makes ``sid`` globally
       unique).
@@ -193,7 +205,8 @@ class TurnRegistry:
         S2 commit point: the proxy calls this *before* ``await client.send()``.
         A connection-level failure therefore leaves a hole (turn advanced,
         no upstream work) — the approved relaxation of contract §4.2.
-        Monotonically non-decreasing per ``sid``.
+        Monotonically non-decreasing per ``sid`` while it remains resident
+        (eviction under :data:`_TURNS_MAX` is the lone exception; see there).
         """
         self._turns[sid] = self._turns.get(sid, 0) + 1
         # LRU cap: refresh insertion order so actively-bumping sids survive,

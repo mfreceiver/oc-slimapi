@@ -58,11 +58,12 @@ _(暂无)_
 ### Internal（无 wire 变更，简记）
 
 - **agent/command 去重（B2）**：`routes/agent.py` + `routes/command.py`（~95% 逐行重复）抽取公共骨架 `routes/_catalog_common.py`（参数化 path/projection/timeout）；各自保留 docstring 省流实测数据。行为不变；`read_with_cap` 经参数注入保留 `test_command_routes` 的 monkeypatch 面。
-- **`TurnRegistry._turns` 加 LRU 上限（B3）**：唯一无界状态点加 `_TURNS_MAX=10_000` LRU cap（对齐 `sse/global_hub.py` `_LAST_UPDATED_AT_BY_SID_MAX` 模式）；evicted sid 下次 bump 从 1 起（hole，ocdroid lex 容忍，同 restart 语义）。
+- **`TurnRegistry._turns` 加 LRU 上限（B3）**：唯一无界状态点加 `_TURNS_MAX=10_000` LRU cap（对齐 `sse/global_hub.py` `_LAST_UPDATED_AT_BY_SID_MAX` 模式）。**已知上限 trade-off（前瞻性披露，接受）**：若某 sid 被逐出后**在同一 incarnation 内**再次 bump，其 turn 从 1 重起——这是**同 incarnation 内的 turn 回退**（字典序更低），ocdroid fence 会将后续 digest 视为 stale 直到 turn 重新爬过旧值。**这不等于 restart hole**（restart 会 bump incarnation，本机制不 bump）。实际不可达：单进程内需 >10,000 个不同 sid 有 bump 活动后旧 sid 回归，远超单用户 sidecar 工作集（参考契约 v2-contract.md「已知上限竞态」披露范式）。
 - **`smoke()` 单测（B4）**：补 `app.smoke()` schema 校验四分支 + happy path 单测（`tests/test_smoke.py`）。
 - **`check_routes_doc.py` 语义校验（B5）**：路由↔文档一致性门禁增加错误码关键词语义校验（白名单：sessions / messages list / messages full / command / agent 的 `session_not_found` / `upstream_http_` / `upstream_unavailable` / `transform_busy`），防 P1-2 那类「路由存在但错误映射描述漂移」；存在性校验保留。
 - **死代码清理（D1-D5）**：删 `upstream.decoded_body_headers()`（零调用）；`logging_config.redact()` 注明 test-only；删 config 残留字段 `access_log_max_bytes` / `access_log_backups`（RotatingFileHandler 时代遗留，无消费方）+ 其 env 读取 + validate + `test_traffic_integration` 引用 + INTERFACE_MAP deprecated 描述同步；`GlobalHub.unsubscribe` / `stop_after_grace` 注明 test-only；`traffic.py` docstring 修悬空的 `BatchLedger` 引用。
 - **测试夹具对齐 v2（D6）**：`tests/test_traffic_upin_gaps.py` 夹具从 `X-Slimapi-Version: 1` / `accepted_client_versions=(1,1)` 对齐到生产 v2（`2` / `(2,2)`），docstring 去除过时的 G6/questions 描述。
+- **`health.py` 走 `app.state.config`（C2）**：`/slimapi/health` 的 `features.skeletonInlineOutputMaxBytes` 从模块级 `settings` 单例改为 `request.app.state.config`（与同文件其余字段一致）；生产无 wire 变化（`app.state.config is settings`），消除测试期自定义 config 覆盖不一致。
 - **`?before=` 前置条件注释锚定（C4）**：messages list 路由加注释锚定「opencode cursor 为 base64url」假设（不含 `+` / 空格，故 unquote_plus 往返安全）。
 
 ## [1.1.4] - 2026-08-07 — questions 内存防线 + traffic 桶修正 + 文档纠错（未 bump `X-Slimapi-Version`，仍 2）
