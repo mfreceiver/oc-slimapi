@@ -34,11 +34,13 @@ _(暂无)_
 
 ### Changed
 
-_(暂无)_
+- **明确 `downIn` / `downOut` 为 ASGI 传输层字节口径（含 early-reject 说明）**：流量记账中间件（`middleware/traffic_accounting.py`）的模块 docstring 现显式声明 `downIn` / `downOut` 统计 ASGI 传输层实际收发字节（与上游 `upIn` / `upOut` 对称的「全链路双向计费」）。据此，version gate 等中间件 early-reject 的请求，因 app 未调用 `receive` 消费 body，该 body 不计入 `downIn` —— 这是 wire 口径的真实反映（app 未接收即未传输到 app），不为计一个被拒请求付出真实 I/O 代价（不 drain）。口径本身无行为变更（中间件始终只计 app 实际 `receive` 的字节）；此条为可观测面口径的显式文档化。
 
 ### Fixed
 
-_(暂无)_
+- **`read_with_cap` 中途断连已读字节正确计入 `upIn`（P0-9）**：`GET /slimapi/sessions`、`GET /slimapi/messages/{sid}`（list）、`GET /slimapi/messages/{sid}/full/{mid}`、`GET /slimapi/agent`、`GET /slimapi/command`、`GET /slimapi/questions`（发现调用 + per-dir fan-out）等 thin 路由在流式读取上游 body 时，若上游中途断连（`httpx.RequestError`），此前已读字节的 `stash_up_in` 在异常退出路径中不执行 → 该请求的 `upIn` 漏计（记 0）。现 `read_with_cap` 通过 `on_read` 回调在逐 chunk 读取时即时记账（覆盖成功 / cap 超出 / 异常三条路径），中途断连已读字节不再丢失。错误码 / 状态码不变；cap-bail upIn 口径（B1）不变。
+- **`GET /slimapi/messages/{sid}`（list）上游中途异常现映射 503 `upstream_unavailable`（P1-24）**：messages list 分支此前只有 `finally: await response.aclose()`，无 `except httpx.RequestError`，上游 body 读取阶段的中途断连（`ReadError` / `ReadTimeout`）逃逸为裸 FastAPI 500。现与同文件 `/full/{mid}` 分支、sessions、catalog 路由对齐，映射为结构化 `503 {"code":"upstream_unavailable"}`。加性硬化，不 bump `X-Slimapi-Version`（无 client 依赖现有裸 500）。
+- **catch-all 反代 upstream response 中途流异常时保证关闭（P1-10）**：catch-all 反代（`proxy.py`）的 upstream response 关闭此前依赖 `StreamingResponse` 的 `BackgroundTask(response.aclose)`，但 BackgroundTask 在 generator 异常退出（客户端中途断连 / 上游中途错误）时不保证执行 → 连接池连接泄漏。现 `_counted_upstream_response` 的 `finally` 追加 `await response.aclose()`（与 BackgroundTask 幂等共存，httpx aclose 可重入），异常路径由 finally 兜底，正常路径仍由 BackgroundTask 关闭（幂等无副作用）。
 
 ---
 

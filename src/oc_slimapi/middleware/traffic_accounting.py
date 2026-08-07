@@ -14,8 +14,26 @@ the ``receive`` and ``send`` callables, accumulates ``len(chunk)``, and
 forwards every chunk unmodified to the inner app — so SSE token streams and
 the catch-all reverse proxy keep streaming exactly as before.
 
+**Byte-counting calibre (``downIn`` / ``downOut``) — wire bytes, not logical
+bytes.** Both counters measure ASGI transport-layer bytes: ``downIn`` is the
+sum of ``len(body)`` over every ``http.request`` ASGI message the inner app
+actually pulls via the wrapped ``receive``; ``downOut`` is the same over
+``http.response.body`` messages sent. This is symmetric with the upstream
+``upIn`` / ``upOut`` counters (the "full-chain bidirectional accounting"
+contract), and has one deliberate consequence:
+
+* **Early-reject bodies are NOT counted in ``downIn``.** When the version
+  gate or another middleware rejects a request before the app calls
+  ``receive`` to consume the request body, those bytes never enter the ASGI
+  ``receive`` path and are therefore not attributed to ``downIn``. This is
+  the true wire calibre — the app did not receive (transport to app did not
+  happen), so the bytes are not counted. We deliberately do **not** drain
+  rejected bodies solely to inflate ``downIn``: paying real I/O to account
+  for a request we are already rejecting is a net loss. The access log still
+  records the request (status, bucket, timing) for observability.
+
 SSE buckets (``events_sse`` / ``token_stream_sse``): the middleware still
-bumps ``requests`` + ``downIn`` and writes the access log line (so an operator
+bump ``requests`` + ``downIn`` and write the access log line (so an operator
 sees per-connection lifetime / wire bytes), but passes ``resp_bytes=0`` to
 :meth:`TrafficLedger.record_downstream` so the SSE per-frame counters
 (:meth:`record_sse_downstream`, called by the SSE generators) own the
