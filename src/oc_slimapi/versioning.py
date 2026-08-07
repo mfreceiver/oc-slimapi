@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .gzip_util import json_response
@@ -9,6 +11,29 @@ from .gzip_util import json_response
 SERVER_API_VERSION = 2
 ACCEPTED_CLIENT_VERSIONS: tuple[int, int] = (2, 2)
 VERSION_HEADER = "X-Slimapi-Version"
+
+# P1-14: collapse duplicate slashes for the version-gate path decision only.
+# ASGI servers may not fold ``//`` → ``/`` (unlike FastAPI's URL parsing), so
+# ``//slimapi/foo`` could bypass the version gate (raw path does not start
+# with ``/slimapi/``) while the catch-all proxy normalises it later and routes
+# it to a /slimapi/ endpoint. This regex is used to normalise the path for the
+# GATE DECISION ONLY — ``scope["path"]`` is left unchanged so downstream
+# routing (FastAPI / Starlette) sees the original path exactly as the ASGI
+# server delivered it.
+_SLASH_RE = re.compile(r"/+")
+
+
+def _is_slimapi_path(path: str) -> bool:
+    """Return True if ``path`` targets the ``/slimapi`` namespace.
+
+    Collapses duplicate slashes first (``//slimapi/foo`` → ``/slimapi/foo``)
+    so a double-slash prefix cannot bypass the gate. Recognises BOTH the
+    exact root ``/slimapi`` and any sub-path ``/slimapi/...`` — the root
+    must NOT bypass the gate (it either matches a router or 404s through the
+    proxy, but in both cases the version header is checked first).
+    """
+    normalised = _SLASH_RE.sub("/", path)
+    return normalised == "/slimapi" or normalised.startswith("/slimapi/")
 
 
 class SlimapiVersionMiddleware:
@@ -23,7 +48,7 @@ class SlimapiVersionMiddleware:
         self.accepted = accepted_client_versions
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or not scope.get("path", "").startswith("/slimapi/"):
+        if scope["type"] != "http" or not _is_slimapi_path(scope.get("path", "")):
             await self.app(scope, receive, send)
             return
 
