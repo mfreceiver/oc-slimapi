@@ -38,7 +38,18 @@ _(暂无)_
 
 ### Fixed
 
+- **`session.deleted` 现服务端终止 token 订阅（INV-4 / P0-3，未 bump `X-Slimapi-Version`，仍 2）**：`GET /slimapi/sessions/{sid}/stream`（token SSE）此前在收到上游 `session.deleted` 时只入一个 deferred resync 帧（由 flush loop 下 tick drain），**不发 STOP**——token route generator 永远等下一帧，订阅者连接不释放（`total_subscribers` 不减、`_subs_by_sid` 不移、flush loop 不停）。资源释放完全依赖客户端主动关连接。现 `on_session_deleted` 对该 sid 的每个订阅者**同步逐个** `sub.terminate("session_deleted")`——发 `resync{session_deleted}` → `STOP` 严格此序，generator 收 STOP 退出 → finally 走正常 unsubscribe（detach + 减计数 + last-detach stop flush + grace arm）。客户端现在**一定**会收到 `resync{session_deleted}` + 连接断开（此前可能永远收不到断开信号）。**加性 wire 修正（多了一个确定的服务端断开信号），不 bump** `X-Slimapi-Version`（客户端原本就需处理 resync + 连接关闭）。
+- **SSE/Token 生命周期状态机闭合（批次 3，内部资源安全修复，未 bump `X-Slimapi-Version`，仍 2）**：修复 7 处 task 生命周期 / epoch 串行 / 资源安全问题（均非 wire 可见，仅影响内部资源安全）：
+  - **INV-1（P1-19）**：GlobalHub run/flush/heartbeat 三 task 现为原子组（supervisor done_callback）；任一非 cancel 死亡 → cancel 兄弟 + `has_consumers()` 时重建；TokenStreamHub `_flush_task` 同款看门狗。修掉 run 异常后孤儿/重复 flush/heartbeat。
+  - **INV-2（P0-2）**：grace removal 现 cancel+`gather` hub 全部 task（等旧 run 完全退出释放 `/global/event` 连接）+ re-check（gather 期间新订阅可放弃 removal）+ 同步段 `token_hub.on_upstream_reconnect()` 清旧 epoch 状态（`_part_revisions` / `_removed_messages` 保留）。修掉跨 epoch 脏数据。
+  - **INV-3（P1-20）**：`TokenStreamRegistry.subscribe` 现包 ensure_upstream / start / attach 整段 try/except——任一异常（QueueFull / 序列化等，非仅 closed）触发对称 rollback（flush 停 + grace 重 arm + 计数不增）。
+  - **INV-5（P1-17）**：`app.py` 构造 `TokenStreamHub` 现传 `max_frame_bytes=settings.token_stream_max_frame_bytes`（hub 与 subscriber frame ceiling 同源）。
+  - **INV-6（P1-18）**：上游正常 EOF（aiter_lines 正常结束）现视为 upstream loss（notify + sleep + 退避），修掉 EOF 热循环；重连分支 `_notify_upstream_loss()` 加 `not _upstream_loss_notified` 守卫，修掉 EOF/异常/重连三路径双重 notify。
+  - **P1-22**：新增 deleted-sid gate（bounded + TTL），`on_session_deleted` 后晚到的同 sid part 事件直接 drop（不重建 LivePart）。
+  - **P1-21**：`_session_status` / `_busy_sids`（token hub）、`sticky_last_error` / `deleted_tombstones`（global hub）加 FIFO cap（对齐 `_LAST_UPDATED_AT_BY_SID_MAX` = 10k），防高 churn 无限增长。
+
 - **`read_with_cap` 中途断连已读字节正确计入 `upIn`（P0-9）**：`GET /slimapi/sessions`、`GET /slimapi/messages/{sid}`（list）、`GET /slimapi/messages/{sid}/full/{mid}`、`GET /slimapi/agent`、`GET /slimapi/command`、`GET /slimapi/questions`（发现调用 + per-dir fan-out）等 thin 路由在流式读取上游 body 时，若上游中途断连（`httpx.RequestError`），此前已读字节的 `stash_up_in` 在异常退出路径中不执行 → 该请求的 `upIn` 漏计（记 0）。现 `read_with_cap` 通过 `on_read` 回调在逐 chunk 读取时即时记账（覆盖成功 / cap 超出 / 异常三条路径），中途断连已读字节不再丢失。错误码 / 状态码不变；cap-bail upIn 口径（B1）不变。
+
 - **`GET /slimapi/messages/{sid}`（list）上游中途异常现映射 503 `upstream_unavailable`（P1-24）**：messages list 分支此前只有 `finally: await response.aclose()`，无 `except httpx.RequestError`，上游 body 读取阶段的中途断连（`ReadError` / `ReadTimeout`）逃逸为裸 FastAPI 500。现与同文件 `/full/{mid}` 分支、sessions、catalog 路由对齐，映射为结构化 `503 {"code":"upstream_unavailable"}`。加性硬化，不 bump `X-Slimapi-Version`（无 client 依赖现有裸 500）。
 - **catch-all 反代 upstream response 中途流异常时保证关闭（P1-10）**：catch-all 反代（`proxy.py`）的 upstream response 关闭此前依赖 `StreamingResponse` 的 `BackgroundTask(response.aclose)`，但 BackgroundTask 在 generator 异常退出（客户端中途断连 / 上游中途错误）时不保证执行 → 连接池连接泄漏。现 `_counted_upstream_response` 的 `finally` 追加 `await response.aclose()`（与 BackgroundTask 幂等共存，httpx aclose 可重入），异常路径由 finally 兜底，正常路径仍由 BackgroundTask 关闭（幂等无副作用）。
 - **incarnation 持久化改原子写（P0-4，落盘原子性 / 运维面）**：`IncarnationStore._write_persisted` 此前用 `path.write_text` 直接 truncate 覆盖最终路径，无 fsync、无原子替换——进程崩溃 / 掉电可能留空文件或半写文件 → 下次 `_read_persisted()` 按 0（损坏兜底）处理 → 重启复用 incarnation 1（复用旧 turn fence，破坏因果边界）。现改为写 sibling `.tmp` → `flush` + `os.fsync` → `os.replace` 原子提交，崩溃后磁盘要么是旧值要么是新值，永不半写；失败路径清理 `.tmp`，best-effort 不 crash lifespan 的容错保留（写失败 warn + 返回 False，in-memory 继续）。
