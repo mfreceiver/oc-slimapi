@@ -359,3 +359,78 @@ def test_deployment_revision_credentials_directory_fallback(tmp_path, monkeypatc
     monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(creds))
     s = _base(deployment_revision=None, deployment_revision_file=None)
     assert s.read_deployment_revision() == "fallback-rev"
+
+
+# ---------------------------------------------------------------------------
+# P1-34: deprecated access-log path priority (distinguish unset vs explicit
+# default). An explicitly-set OC_SLIMAPI_ACCESS_LOG_DIR always wins over the
+# deprecated OC_SLIMAPI_ACCESS_LOG_PATH, even when the explicit value equals
+# the default.
+# ---------------------------------------------------------------------------
+
+def test_access_log_dir_default_no_deprecated(monkeypatch):
+    """Default dir, default path → dir wins, no deprecated fallback."""
+    monkeypatch.delenv("OC_SLIMAPI_ACCESS_LOG_DIR", raising=False)
+    monkeypatch.delenv("OC_SLIMAPI_ACCESS_LOG_PATH", raising=False)
+    s = Settings(
+        host="127.0.0.1", port=4097, upstream="http://127.0.0.1:4096",
+        access_log_dir="logs", access_log_path="logs/access.jsonl",
+    )
+    d, used = s.effective_access_log_dir()
+    assert d == "logs"
+    assert used is False
+
+
+def test_access_log_explicit_dir_wins_over_deprecated(monkeypatch):
+    """Explicitly set new dir = 'logs' + non-default deprecated path → new dir wins.
+
+    This is the bug P1-34 fixes: the old value-comparison (dir == 'logs')
+    could not tell 'unset default' from 'explicitly set to the default'. With
+    the env-source check, an explicit OC_SLIMAPI_ACCESS_LOG_DIR=logs always
+    wins.
+    """
+    monkeypatch.setenv("OC_SLIMAPI_ACCESS_LOG_DIR", "logs")
+    s = Settings(
+        host="127.0.0.1", port=4097, upstream="http://127.0.0.1:4096",
+        access_log_dir="logs", access_log_path="/var/log/slim/access.jsonl",
+    )
+    d, used = s.effective_access_log_dir()
+    assert d == "logs"
+    assert used is False
+
+
+def test_access_log_deprecated_fallback_when_dir_unset(monkeypatch):
+    """Dir unset + non-default deprecated path → deprecated parent used."""
+    monkeypatch.delenv("OC_SLIMAPI_ACCESS_LOG_DIR", raising=False)
+    s = Settings(
+        host="127.0.0.1", port=4097, upstream="http://127.0.0.1:4096",
+        access_log_dir="logs", access_log_path="/var/log/slim/access.jsonl",
+    )
+    d, used = s.effective_access_log_dir()
+    assert d == "/var/log/slim"
+    assert used is True
+
+
+def test_access_log_deprecated_default_path_no_fallback(monkeypatch):
+    """Dir unset + default deprecated path → dir default, no fallback."""
+    monkeypatch.delenv("OC_SLIMAPI_ACCESS_LOG_DIR", raising=False)
+    monkeypatch.delenv("OC_SLIMAPI_ACCESS_LOG_PATH", raising=False)
+    s = Settings(
+        host="127.0.0.1", port=4097, upstream="http://127.0.0.1:4096",
+        access_log_dir="logs", access_log_path="logs/access.jsonl",
+    )
+    d, used = s.effective_access_log_dir()
+    assert d == "logs"
+    assert used is False
+
+
+def test_access_log_custom_dir_wins(monkeypatch):
+    """Custom explicit dir + custom deprecated path → custom dir wins."""
+    monkeypatch.setenv("OC_SLIMAPI_ACCESS_LOG_DIR", "/custom/dir")
+    s = Settings(
+        host="127.0.0.1", port=4097, upstream="http://127.0.0.1:4096",
+        access_log_dir="/custom/dir", access_log_path="/var/log/slim/access.jsonl",
+    )
+    d, used = s.effective_access_log_dir()
+    assert d == "/custom/dir"
+    assert used is False

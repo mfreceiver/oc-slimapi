@@ -70,23 +70,18 @@ async def lifespan(app: FastAPI):
     # rotated by calendar day; startup compresses history and a background loop
     # re-runs compress+prune. Best-effort — a failure degrades to a disabled
     # logger and NEVER crashes lifespan (traffic-log-persistence task-2 阻断2).
-    # Backward-compat (阻断6): if the deprecated OC_SLIMAPI_ACCESS_LOG_PATH is
-    # set to a non-default value, honor its parent dir with a warning.
-    access_log_dir = settings.access_log_dir
-    # Backward-compat (阻断6) + priority clarity (终审重要项): the deprecated
+    # Backward-compat + priority clarity (P1-34): the deprecated
     # OC_SLIMAPI_ACCESS_LOG_PATH gets a say ONLY when the new
-    # OC_SLIMAPI_ACCESS_LOG_DIR is left at its default. An explicitly-set new
-    # dir always wins over the deprecated path (its parent is used as a
-    # fallback + warning). Without this guard a stale legacy env would
-    # silently override an explicit new dir.
-    if access_log_dir == "logs" and settings.access_log_path != "logs/access.jsonl":
-        legacy_dir = str(Path(settings.access_log_path).parent) or "."
+    # OC_SLIMAPI_ACCESS_LOG_DIR is left unset (at default). An explicitly-set
+    # new dir always wins. The env-source check lives in Settings so the
+    # lifespan body stays declarative.
+    access_log_dir, used_deprecated = settings.effective_access_log_dir()
+    if used_deprecated:
         get_logger("app").warning(
             "OC_SLIMAPI_ACCESS_LOG_PATH is deprecated (ignored); using its "
             "parent dir %r — set OC_SLIMAPI_ACCESS_LOG_DIR explicitly",
-            legacy_dir,
+            access_log_dir,
         )
-        access_log_dir = legacy_dir
     setup_access_log(enabled=settings.access_log_enabled, dir=access_log_dir)
     # Daily-rotation maintenance at startup (best-effort): migrate any legacy
     # RotatingFileHandler files, compress non-today history, prune by retain.

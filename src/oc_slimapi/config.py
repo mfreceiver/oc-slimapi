@@ -103,6 +103,13 @@ TOKEN_HANDSHAKE_BUFFER_BYTES = 8 * 1024 * 1024    # 8 MiB
 _MAX_MESSAGE_BYTES_CAP = 256 * 1024 * 1024    # 256 MiB
 _MAX_RESPONSE_BYTES_CAP = 256 * 1024 * 1024   # 256 MiB
 
+# Default values for the access-log dir / path fields (P1-34). These mirror
+# the hardcoded defaults in the dataclass field definitions below and are
+# used by :meth:`Settings.effective_access_log_dir` to distinguish "unset"
+# (default) from "explicitly set to the same value as the default".
+_ACCESS_LOG_DIR_DEFAULT = "logs"
+_ACCESS_LOG_PATH_DEFAULT = "logs/access.jsonl"
+
 # Guard: the revision cap (_part_revisions, bounded by TOKEN_DISABLED_MAX)
 # must never be smaller than the LivePart count cap, otherwise a still-alive
 # LivePart's revision can be evicted under FIFO pressure, causing the next
@@ -333,6 +340,31 @@ class Settings:
             return None
         stripped = content.strip()
         return stripped if stripped else None
+
+    def effective_access_log_dir(self) -> tuple[str, bool]:
+        """Resolve the effective access-log directory, honouring deprecation
+        priority (P1-34).
+
+        The deprecated ``OC_SLIMAPI_ACCESS_LOG_PATH`` gets a say **only** when
+        the new ``OC_SLIMAPI_ACCESS_LOG_DIR`` is left at its default (unset in
+        the environment). An explicitly-set new dir **always wins** over the
+        deprecated path — even when the explicit value happens to equal the
+        default (``"logs"``). This fixes the value-comparison bug where a stale
+        legacy env would silently override an explicit new dir.
+
+        Returns ``(dir, deprecated_used)``:
+        * ``deprecated_used=True`` — the deprecated path's parent was used as a
+          fallback (caller should emit a deprecation warning).
+        * ``deprecated_used=False`` — ``self.access_log_dir`` wins.
+        """
+        new_dir_explicit = "OC_SLIMAPI_ACCESS_LOG_DIR" in os.environ
+        if (
+            not new_dir_explicit
+            and self.access_log_path != _ACCESS_LOG_PATH_DEFAULT
+        ):
+            legacy_dir = str(Path(self.access_log_path).parent) or "."
+            return legacy_dir, True
+        return self.access_log_dir, False
 
     def validate(self) -> None:
         # Bind host: loopback is the safe default; ``0.0.0.0`` is allowed as a
