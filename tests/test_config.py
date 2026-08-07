@@ -219,3 +219,69 @@ def test_validate_accepts_positive_debug_part_max(val):
 @pytest.mark.parametrize("val", [1, 4, 16])
 def test_validate_accepts_positive_debug_live_parts_max(val):
     _base(token_stream_debug_live_parts_max=val).validate()  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# P1-35: port range, byte caps, and server/accepted version consistency.
+# ---------------------------------------------------------------------------
+
+def test_validate_rejects_port_zero():
+    """Port 0 (OS-picks-random) is not useful for a fixed-port client config."""
+    settings = _base(port=0)
+    with pytest.raises(RuntimeError, match=r"OC_SLIMAPI_PORT must be in \[1, 65535\]"):
+        settings.validate()
+
+
+def test_validate_rejects_negative_port():
+    settings = _base(port=-1)
+    with pytest.raises(RuntimeError, match=r"OC_SLIMAPI_PORT must be in \[1, 65535\]"):
+        settings.validate()
+
+
+def test_validate_rejects_port_above_65535():
+    settings = _base(port=70000)
+    with pytest.raises(RuntimeError, match=r"OC_SLIMAPI_PORT must be in \[1, 65535\]"):
+        settings.validate()
+
+
+def test_validate_accepts_boundary_ports():
+    """Port 1 and 65535 are valid boundary values."""
+    _base(port=1).validate()       # must not raise
+    _base(port=65535).validate()   # must not raise
+
+
+def test_validate_rejects_oversize_max_response_bytes():
+    settings = _base(max_response_bytes=257 * 1024 * 1024)
+    with pytest.raises(RuntimeError, match=r"OC_SLIMAPI_MAX_RESPONSE_BYTES must be <= 256 MiB"):
+        settings.validate()
+
+
+def test_validate_rejects_oversize_max_message_bytes():
+    settings = _base(max_message_bytes=257 * 1024 * 1024)
+    with pytest.raises(RuntimeError, match=r"OC_SLIMAPI_MAX_MESSAGE_BYTES must be <= 256 MiB"):
+        settings.validate()
+
+
+def test_validate_accepts_boundary_byte_caps():
+    """Exactly 256 MiB is the boundary — must pass (<= comparison)."""
+    _base(max_response_bytes=256 * 1024 * 1024).validate()
+    _base(max_message_bytes=256 * 1024 * 1024).validate()
+
+
+def test_validate_rejects_server_version_outside_accepted_range():
+    """server_api_version must be within accepted_client_versions range."""
+    settings = _base(server_api_version=5, accepted_client_versions=(1, 3))
+    with pytest.raises(RuntimeError, match=r"SERVER_API_VERSION .* must be within .* range"):
+        settings.validate()
+
+
+def test_validate_rejects_server_version_below_accepted_range():
+    settings = _base(server_api_version=1, accepted_client_versions=(2, 3))
+    with pytest.raises(RuntimeError, match=r"SERVER_API_VERSION .* must be within .* range"):
+        settings.validate()
+
+
+def test_validate_accepts_server_version_at_range_boundaries():
+    """server_api_version == minimum and == maximum are both valid."""
+    _base(server_api_version=2, accepted_client_versions=(2, 4)).validate()
+    _base(server_api_version=4, accepted_client_versions=(2, 4)).validate()

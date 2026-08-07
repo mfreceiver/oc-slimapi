@@ -335,7 +335,15 @@ install_proxy(app)
 
 
 def main() -> None:
-    settings.validate()
+    # P1-35: surface configuration errors with a clear, field-named message
+    # rather than a raw traceback. setup_logging() runs first so the error
+    # is visible on stderr; then we exit with a non-zero status.
+    setup_logging()
+    try:
+        settings.validate()
+    except RuntimeError as exc:
+        get_logger("app").error("configuration error: %s", exc)
+        raise SystemExit(1)
     uvicorn.run("oc_slimapi.app:app", host=settings.host, port=settings.port, workers=1)
 
 

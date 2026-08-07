@@ -97,6 +97,12 @@ DEFAULT_TOKEN_MAX_FRAME_BYTES = 1024 * 1024    # 1 MiB
 TOKEN_HANDSHAKE_ITEMS = 2048
 TOKEN_HANDSHAKE_BUFFER_BYTES = 8 * 1024 * 1024    # 8 MiB
 
+# Upper-bound sanity caps for message/response byte limits (P1-35). Prevents
+# an operator from accidentally configuring an OOM-inducing buffer ceiling
+# while still allowing generous headroom (defaults are 32 MiB / 64 MiB).
+_MAX_MESSAGE_BYTES_CAP = 256 * 1024 * 1024    # 256 MiB
+_MAX_RESPONSE_BYTES_CAP = 256 * 1024 * 1024   # 256 MiB
+
 # Guard: the revision cap (_part_revisions, bounded by TOKEN_DISABLED_MAX)
 # must never be smaller than the LivePart count cap, otherwise a still-alive
 # LivePart's revision can be evicted under FIFO pressure, causing the next
@@ -325,9 +331,27 @@ class Settings:
             raise RuntimeError("OC_SLIMAPI_UPSTREAM must be fixed loopback HTTP")
         if parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise RuntimeError("OC_SLIMAPI_UPSTREAM must not contain credentials/query/fragment")
+        # Port range (P1-35): 0 is not useful for a server with a fixed client
+        # config (it lets the OS pick a random port at bind time); out-of-range
+        # values are obvious typos.
+        if not 1 <= self.port <= 65535:
+            raise RuntimeError(
+                "OC_SLIMAPI_PORT must be in [1, 65535] "
+                "(0 is not supported — the client expects a fixed port)"
+            )
         minimum, maximum = self.accepted_client_versions
         if self.server_api_version < 1 or minimum < 1 or minimum > maximum:
             raise RuntimeError("slimapi version configuration is invalid")
+        # Version consistency (P1-35): the advertised server version must fall
+        # within the accepted client range — otherwise the server would be
+        # advertising a version it itself rejects from clients, which is a
+        # configuration error (almost certainly a typo / mismatched envs).
+        if not minimum <= self.server_api_version <= maximum:
+            raise RuntimeError(
+                f"OC_SLIMAPI_SERVER_API_VERSION ({self.server_api_version}) must be "
+                f"within OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS range "
+                f"[{minimum}, {maximum}]"
+            )
         # Transform-pool guards: all three must be strictly positive or the
         # sidecar would either reject every request (max_transforms=0) or
         # never admit a slow one (wait<=0), and a zero/negative byte cap
@@ -338,6 +362,18 @@ class Settings:
             raise RuntimeError("OC_SLIMAPI_TRANSFORM_WAIT_SECONDS must be > 0")
         if self.max_response_bytes <= 0:
             raise RuntimeError("OC_SLIMAPI_MAX_RESPONSE_BYTES must be > 0")
+        # Upper-bound sanity caps (P1-35): prevent accidentally configuring an
+        # OOM-inducing buffer ceiling while still allowing generous headroom.
+        if self.max_message_bytes > _MAX_MESSAGE_BYTES_CAP:
+            raise RuntimeError(
+                f"OC_SLIMAPI_MAX_MESSAGE_BYTES must be <= "
+                f"{_MAX_MESSAGE_BYTES_CAP // (1024 * 1024)} MiB"
+            )
+        if self.max_response_bytes > _MAX_RESPONSE_BYTES_CAP:
+            raise RuntimeError(
+                f"OC_SLIMAPI_MAX_RESPONSE_BYTES must be <= "
+                f"{_MAX_RESPONSE_BYTES_CAP // (1024 * 1024)} MiB"
+            )
         # Skeleton projection inline caps: per-field and per-message.
         if self.skeleton_inline_output_max_bytes <= 0:
             raise RuntimeError(
