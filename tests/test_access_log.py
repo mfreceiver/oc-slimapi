@@ -928,3 +928,152 @@ def test_compress_concurrent_same_file_only_one_wins(tmp_path):
     with gzip.open(gz, "rt", encoding="utf-8") as f:
         assert f.read().strip() == '{"x": 1}'
 
+
+# ---------------------------------------------------------------------------
+# 22. P1-25: compress skips the live handler's open source file
+# ---------------------------------------------------------------------------
+
+
+def test_compress_skips_active_handler_open_source(tmp_path):
+    """P1-25: when the live DailyAccessHandler still holds yesterday's .jsonl
+    fd open (cross-midnight idle gap — no emit yet today), compress must NOT
+    unlink that source. unlinking it would leave the fd pointing at a deleted
+    inode (disk space not released until next emit / process exit). Instead
+    compress defers it to a later tick.
+
+    We simulate this by installing a handler that has emitted on yesterday's
+    date (so its ``current_path`` is yesterday's file) and asserting that a
+    compress run targeting that same file skips it."""
+    import oc_slimapi.access_log as mod
+
+    yesterday = date(2026, 7, 28)
+    src = tmp_path / "access-2026-07-28.jsonl"
+    src.write_text('{"yesterday": true}\n')
+
+    handler = DailyAccessHandler(directory=str(tmp_path))
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    # Force the handler to open yesterday's file by emitting a record whose
+    # .created maps to yesterday midnight — without this current_path is None.
+    handler.emit(_make_record('{"warmup": 1}', target_date=yesterday))
+
+    saved_ref = mod._active_handler_ref
+    mod._active_handler_ref = handler
+    try:
+        assert handler.current_path == src, (
+            f"handler should hold {src}, holds {handler.current_path}"
+        )
+        count = compress_old_access_logs(str(tmp_path), date(2026, 7, 29))
+    finally:
+        mod._active_handler_ref = saved_ref
+        handler.close()
+
+    # The live source was deferred — not compressed this tick.
+    assert count == 0
+    assert src.exists(), "live handler's source must not be unlinked"
+    assert not (tmp_path / "access-2026-07-28.jsonl.gz").exists()
+
+
+def test_compress_compresses_inactive_file_alongside_active(tmp_path):
+    """P1-25 boundary: when the active handler holds day N, a DIFFERENT old
+    day (day N-1) with no open fd is still compressed normally — only the
+    active handler's exact held path is deferred."""
+    import oc_slimapi.access_log as mod
+
+    held_day = date(2026, 7, 28)
+    other_day = date(2026, 7, 27)
+    held_src = tmp_path / "access-2026-07-28.jsonl"
+    other_src = tmp_path / "access-2026-07-27.jsonl"
+    held_src.write_text('{"held": true}\n')
+    other_src.write_text('{"other": true}\n')
+
+    handler = DailyAccessHandler(directory=str(tmp_path))
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    handler.emit(_make_record('{"warmup": 1}', target_date=held_day))
+
+    saved_ref = mod._active_handler_ref
+    mod._active_handler_ref = handler
+    try:
+        count = compress_old_access_logs(str(tmp_path), date(2026, 7, 29))
+    finally:
+        mod._active_handler_ref = saved_ref
+        handler.close()
+
+    # Only the non-held file was compressed (1); the held one was deferred.
+    assert count == 1
+    assert held_src.exists(), "held source deferred"
+    assert not other_src.exists(), "other source compressed + unlinked"
+    assert (tmp_path / "access-2026-07-27.jsonl.gz").exists()
+    assert not (tmp_path / "access-2026-07-28.jsonl.gz").exists()
+
+
+def test_compress_no_active_handler_compresses_all(tmp_path):
+    """P1-25 boundary: with no live handler installed (``_active_handler_ref``
+    is None — disabled, or pre-setup), every old file is compressed as
+    before. The skip only applies to the handler's held path."""
+    import oc_slimapi.access_log as mod
+
+    for d in (27, 28):
+        (tmp_path / f"access-2026-07-{d:02d}.jsonl").write_text(f'{{"d": {d}}}\n')
+
+    saved_ref = mod._active_handler_ref
+    mod._active_handler_ref = None
+    try:
+        count = compress_old_access_logs(str(tmp_path), date(2026, 7, 29))
+    finally:
+        mod._active_handler_ref = saved_ref
+
+    assert count == 2
+    for d in (27, 28):
+        assert not (tmp_path / f"access-2026-07-{d:02d}.jsonl").exists()
+        assert (tmp_path / f"access-2026-07-{d:02d}.jsonl.gz").exists()
+
+
+def test_daily_handler_current_path_is_none_before_first_emit(tmp_path):
+    """P1-25: a freshly-constructed handler (no emit yet) reports
+    ``current_path`` as None — no file held open."""
+    handler = DailyAccessHandler(directory=str(tmp_path))
+    try:
+        assert handler.current_path is None
+    finally:
+        handler.close()
+
+
+def test_daily_handler_current_path_tracks_open_file(tmp_path):
+    """P1-25: after an emit, ``current_path`` returns the open file's path."""
+    handler = DailyAccessHandler(directory=str(tmp_path))
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    try:
+        handler.emit(_make_record('{"x": 1}', target_date=date(2026, 7, 28)))
+        assert handler.current_path == tmp_path / "access-2026-07-28.jsonl"
+        # After closing, no path is held.
+        handler.close()
+        assert handler.current_path is None
+    finally:
+        try:
+            handler.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# 23. P0-8/P1-25: setup_access_log registers / clears the active handler ref
+# ---------------------------------------------------------------------------
+
+
+def test_setup_registers_active_handler_ref(tmp_path):
+    """P0-8/P1-25: ``setup_access_log(enabled=True)`` installs the handler as
+    the module-level ``_active_handler_ref`` so maintenance can consult it."""
+    import oc_slimapi.access_log as mod
+
+    setup_access_log(enabled=True, dir=str(tmp_path))
+    assert mod._active_handler_ref is not None
+    assert isinstance(mod._active_handler_ref, DailyAccessHandler)
+    # Re-init clears the old ref and installs a fresh one.
+    first = mod._active_handler_ref
+    setup_access_log(enabled=True, dir=str(tmp_path))
+    assert mod._active_handler_ref is not first
+    # Disabling clears the ref entirely.
+    setup_access_log(enabled=False, dir=str(tmp_path))
+    assert mod._active_handler_ref is None
+
+

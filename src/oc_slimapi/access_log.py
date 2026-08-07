@@ -54,6 +54,13 @@ _setup_lock = threading.Lock()
 # between the existence checks and the writes.
 _MAINT_LOCK = threading.Lock()
 
+# Reference to the currently-installed DailyAccessHandler (set by
+# setup_access_log), so maintenance functions can avoid unlinking the .jsonl
+# that the live handler still holds open (see P1-25). ``None`` when no handler
+# is installed (disabled, or before setup). Read-only by maintenance; only
+# setup_access_log writes it (under _setup_lock).
+_active_handler_ref: "DailyAccessHandler | None" = None
+
 # Maintenance logger — separate from the access logger so diagnostic warnings
 # never leak into ``access-*.jsonl`` files (which are parsed by jq).
 _MAINT_LOG = None  # lazy-init via get_logger
@@ -142,6 +149,24 @@ class DailyAccessHandler(logging.Handler):
             except Exception:
                 pass
 
+    # -- public read-only state (P1-25) -------------------------------------
+
+    @property
+    def current_path(self) -> "Path | None":
+        """Return the full path of the file this handler currently holds open,
+        or ``None`` if no file is open yet (no record emitted) or after
+        :meth:`close`.
+
+        Maintenance (:func:`compress_old_access_logs`) consults this via the
+        module-level ``_active_handler_ref`` to avoid unlinking a .jsonl
+        whose file descriptor the live handler still holds open across a
+        cross-midnight idle gap — unlinking it would leak the inode (disk
+        space not released until the next emit or process exit).
+        """
+        if self._current_fh is None or self._current_date is None:
+            return None
+        return Path(self._directory) / f"access-{self._current_date.isoformat()}.jsonl"
+
     # -- logging.Handler API ------------------------------------------------
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -197,6 +222,7 @@ def setup_access_log(*, enabled: bool, dir: str) -> logging.Logger:
     lifespan).
     """
     logger = get_access_logger()
+    global _active_handler_ref
     with _setup_lock:
         logger.setLevel(logging.INFO)
         logger.propagate = False
@@ -207,6 +233,9 @@ def setup_access_log(*, enabled: bool, dir: str) -> logging.Logger:
                 handler.close()
             except Exception:
                 pass
+        # Drop the stale active-handler reference whenever we tear down the
+        # installed handlers (re-init / disable). Re-installed below if enabled.
+        _active_handler_ref = None
         if not enabled:
             logger.disabled = True
             return logger
@@ -217,6 +246,9 @@ def setup_access_log(*, enabled: bool, dir: str) -> logging.Logger:
             handler = DailyAccessHandler(directory=dir)
             handler.setFormatter(logging.Formatter("%(message)s"))
             logger.addHandler(handler)
+            # Record the live handler so maintenance can avoid unlinking its
+            # currently-open .jsonl across cross-midnight idle gaps (P1-25).
+            _active_handler_ref = handler
         except Exception:
             logger.warning(
                 "Failed to set up DailyAccessHandler in %r; disabling access log",
@@ -344,6 +376,21 @@ def compress_old_access_logs(dir: str, today: date) -> int:
     log = _get_maint_log()
     with _MAINT_LOCK:
         _cleanup_leftover_tmp(dir)
+        # Snapshot the live handler's currently-held path once (under the
+        # lock so setup_access_log cannot flip it mid-run). Comparing paths
+        # by resolved string avoids unlinking a .jsonl whose fd the handler
+        # still holds open across a cross-midnight idle gap (P1-25): the
+        # inode would be freed only on next emit / process exit.
+        active_path: "Path | None" = None
+        handler = _active_handler_ref
+        if handler is not None:
+            try:
+                active_path = handler.current_path
+            except Exception:
+                active_path = None
+        active_path_str = (
+            str(active_path.resolve()) if active_path is not None else None
+        )
         count = 0
         for p in sorted(Path(dir).glob("access-*.jsonl")):
             m = _ACCESS_LOG_RE.match(p.name)
@@ -358,6 +405,20 @@ def compress_old_access_logs(dir: str, today: date) -> int:
 
             gz_path = p.with_name(p.name + ".gz")
             if gz_path.exists():
+                continue
+
+            # P1-25: never unlink the live handler's open source file —
+            # defer to a later tick instead.
+            try:
+                p_resolved = str(p.resolve())
+            except OSError:
+                p_resolved = str(p)
+            if active_path_str is not None and p_resolved == active_path_str:
+                log.info(
+                    "Skipping compress of %s — live handler still holds its fd; "
+                    "deferring to next maintenance tick",
+                    p,
+                )
                 continue
 
             tmp_path = _unique_tmp_path(gz_path, ".tmp")
