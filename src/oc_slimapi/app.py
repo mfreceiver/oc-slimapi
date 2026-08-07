@@ -32,27 +32,83 @@ from .upstream import create_client
 from .versioning import SlimapiVersionMiddleware
 
 
+# ---------------------------------------------------------------------------
+# Smoke-probe status (P1-36): distinguishes *why* smoke could not validate the
+# upstream message schema, so health/ready diagnostics can tell apart "upstream
+# is down" (upstream_unavailable) from "upstream is up but the shape changed"
+# (invalid_schema). ``schema_degraded`` is True ONLY for ``invalid_schema`` —
+# an unreachable upstream is not a schema regression.
+# ---------------------------------------------------------------------------
+SMOKE_NOT_RUN = "not_run"
+SMOKE_UPSTREAM_UNAVAILABLE = "upstream_unavailable"
+SMOKE_INVALID_SCHEMA = "invalid_schema"
+SMOKE_VALID = "valid"
+
+# Short read timeout for startup smoke + health probes (P1-37). The default
+# httpx client timeout is 30 s — an unreachable upstream would stall systemd
+# readiness / hot reload for multiple 30 s windows. 5 s aligns with the
+# routes' /ready health-check timeout. Failure is tolerated (non-blocking),
+# but non-blocking ≠ long-timeout.
+_SMOKE_TIMEOUT = 5.0
+
+
 async def smoke(app: FastAPI) -> None:
+    """Validate the upstream message-list schema and record a diagnostic status.
+
+    Sets ``app.state.smoke_status`` to one of the ``SMOKE_*`` constants and
+    ``app.state.schema_degraded`` to ``True`` **only** when the upstream
+    responded with a parseable body whose field shape does not match the
+    expected message schema (``invalid_schema``). Connection errors / timeouts
+    / non-2xx status → ``upstream_unavailable`` (schema_degraded stays False).
+    """
     sid = app.state.config.smoke_session_id
     if not sid:
         try:
-            sessions = (await app.state.upstream.get("/session", params={"limit": 1})).json()
+            sessions = (
+                await app.state.upstream.get(
+                    "/session", params={"limit": 1}, timeout=_SMOKE_TIMEOUT
+                )
+            ).json()
             sid = sessions[0].get("id") if sessions else None
         except Exception as exc:
             get_logger("app").warning("smoke: failed to fetch sessions list", exc_info=exc)
-            sid = None
-    if not sid:
-        return
+            app.state.smoke_status = SMOKE_UPSTREAM_UNAVAILABLE
+            app.state.schema_degraded = False
+            return
+        if not sid:
+            app.state.smoke_status = SMOKE_NOT_RUN
+            app.state.schema_degraded = False
+            return
     try:
-        response = await app.state.upstream.get(f"/session/{sid}/message", params={"limit": 1})
+        response = await app.state.upstream.get(
+            f"/session/{sid}/message", params={"limit": 1}, timeout=_SMOKE_TIMEOUT
+        )
         payload = response.json()
-        valid = response.status_code < 300 and isinstance(payload, list)
-        if payload:
-            valid = valid and isinstance(payload[0].get("info", {}).get("id"), str)
-            valid = valid and all(isinstance(part.get("type"), str) for part in payload[0].get("parts", []))
-        app.state.schema_degraded = not valid
     except Exception as exc:
-        get_logger("app").warning("smoke: schema validation failed", exc_info=exc)
+        get_logger("app").warning("smoke: upstream unavailable", exc_info=exc)
+        app.state.smoke_status = SMOKE_UPSTREAM_UNAVAILABLE
+        app.state.schema_degraded = False
+        return
+    # Upstream responded + body parsed. A non-2xx status means the endpoint
+    # is not usable (404 = session gone, 5xx = upstream broken) — this is an
+    # upstream-availability issue, not a schema regression.
+    if response.status_code >= 300:
+        get_logger("app").warning(
+            "smoke: upstream returned status %s for session %s",
+            response.status_code, sid,
+        )
+        app.state.smoke_status = SMOKE_UPSTREAM_UNAVAILABLE
+        app.state.schema_degraded = False
+        return
+    valid = isinstance(payload, list)
+    if payload:
+        valid = valid and isinstance(payload[0].get("info", {}).get("id"), str)
+        valid = valid and all(isinstance(part.get("type"), str) for part in payload[0].get("parts", []))
+    if valid:
+        app.state.smoke_status = SMOKE_VALID
+        app.state.schema_degraded = False
+    else:
+        app.state.smoke_status = SMOKE_INVALID_SCHEMA
         app.state.schema_degraded = True
 
 
@@ -126,6 +182,8 @@ async def lifespan(app: FastAPI):
         max_response_bytes=settings.max_response_bytes,
     ))
     app.state.schema_degraded = False
+    # P1-36: smoke status defaults to not_run; smoke() updates it.
+    app.state.smoke_status = SMOKE_NOT_RUN
     # S-E: best-effort deployment revision (env or file, swallow errors)
     try:
         app.state.deployment_revision = settings.read_deployment_revision()
