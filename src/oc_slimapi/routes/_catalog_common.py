@@ -30,7 +30,7 @@ from starlette.responses import Response
 from ..errors import CodedHTTPException
 from ..gzip_util import accepts_gzip, error_response
 from ..traffic import stash_up_in
-from ..upstream import forward_directory_headers
+from ..upstream import forward_upstream_headers, request_id_from_scope
 
 # Shared with tests so the route and the wire contract agree on Retry-After.
 TRANSFORM_RETRY_AFTER_SECONDS = 2
@@ -57,10 +57,17 @@ async def stream_upstream(
     instead of buffering the whole catalog into memory at once.
 
     Caller MUST ``await response.aclose()`` (typically in a ``finally`` block).
+
+    P0-6: forwards ``X-Request-ID`` alongside the directory header so the
+    sidecar access log line can be correlated with opencode's logs
+    (contract §7). The two headers have distinct names → no collision.
     """
+    headers = forward_upstream_headers(
+        directory, request_id_from_scope(request.scope),
+    )
     upstream_request = request.app.state.upstream.build_request(
         "GET", upstream_path,
-        headers=forward_directory_headers(directory),
+        headers=headers,
     )
     if read_timeout is not None:
         upstream_request.extensions["timeout"] = {

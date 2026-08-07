@@ -669,3 +669,42 @@ async def test_agent_empty_or_non_json_body_returns_503(upstream_factory, body: 
         assert response.json() == {"code": "upstream_unavailable"}
     finally:
         app.state.transforms.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# P0-6: agent catalog forwards X-Request-ID upstream (contract §7).
+# agent.py shares _catalog_common.handle_catalog_request with command.py, so
+# this is the symmetric lock-down of the same helper on the agent side.
+# ---------------------------------------------------------------------------
+
+
+async def test_agent_forwards_request_id_to_upstream(upstream_factory):
+    """P0-6: ``GET /slimapi/agent`` must forward ``X-Request-ID`` upstream so
+    the sidecar access log line correlates with opencode's logs (contract §7).
+    The agent route shares ``_catalog_common.handle_catalog_request`` with
+    command, so this also covers the helper's wiring on this side."""
+    from oc_slimapi.middleware.request_id import RequestIdMiddleware
+
+    captured: dict[str, str | None] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["rid"] = request.headers.get("x-request-id")
+        return httpx.Response(
+            200, content=orjson.dumps(_sample_agents()),
+            headers={"Content-Type": "application/json"},
+        )
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    app.add_middleware(RequestIdMiddleware)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
+                "/slimapi/agent",
+                headers={**VERSION_HEADERS, "X-Request-ID": "agent-rid-9"},
+            )
+        assert response.status_code == 200
+        assert captured["rid"] == "agent-rid-9"
+    finally:
+        app.state.transforms.shutdown()

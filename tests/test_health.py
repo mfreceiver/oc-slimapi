@@ -428,3 +428,76 @@ async def test_health_advertises_thresholded_skeleton_feature(upstream_factory):
     # New diagnostic keys.
     assert features["thresholdedSkeleton"] is True
     assert features["skeletonInlineOutputMaxBytes"] == 4096
+
+
+# ---------------------------------------------------------------------------
+# P0-6: /ready forwards X-Request-ID to upstream (contract §7 correlation)
+# ---------------------------------------------------------------------------
+
+
+async def test_ready_forwards_request_id_to_upstream(upstream_factory):
+    """P0-6: ``GET /slimapi/ready`` must forward ``X-Request-ID`` to upstream's
+    ``/global/health`` so the sidecar access log can be correlated with
+    opencode's own logs (contract §7). Previously /ready called
+    ``upstream.get`` with no headers at all."""
+    from oc_slimapi.middleware.request_id import RequestIdMiddleware
+
+    captured: dict[str, str | None] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["rid"] = request.headers.get("x-request-id")
+        captured["path"] = request.url.path
+        return httpx.Response(200, content=b'{"healthy": true}',
+                              headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    # The middleware is what production wires up; without it scope.state has
+    # no request_id and the header would be omitted.
+    app.add_middleware(RequestIdMiddleware)
+
+    transport = httpx.ASGITransport(app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/slimapi/ready",
+            headers={**VERSION_HEADERS, "X-Request-ID": "rid-ready-42", "Accept-Encoding": "identity"},
+        )
+
+    assert response.status_code == 200
+    # Upstream actually received the ping.
+    assert captured["path"] == "/global/health"
+    # And the inbound X-Request-ID flowed through.
+    assert captured["rid"] == "rid-ready-42"
+
+
+async def test_ready_generates_request_id_when_inbound_absent(upstream_factory):
+    """P0-6: when the client doesn't send ``X-Request-ID``, the middleware
+    generates a fresh one — and /ready must still forward that generated id
+    upstream (so the opencode log line is correlatable with the sidecar's)."""
+    from oc_slimapi.middleware.request_id import RequestIdMiddleware
+
+    captured: dict[str, str | None] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["rid"] = request.headers.get("x-request-id")
+        return httpx.Response(200, content=b'{"healthy": true}',
+                              headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    app.add_middleware(RequestIdMiddleware)
+
+    transport = httpx.ASGITransport(app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/slimapi/ready",
+            headers={**VERSION_HEADERS, "Accept-Encoding": "identity"},
+            # No X-Request-ID on the inbound side.
+        )
+
+    assert response.status_code == 200
+    # Middleware generated one and /ready forwarded it.
+    assert captured["rid"] is not None
+    assert len(captured["rid"]) > 0
+    # And the response echoes the same id (middleware injects on response too).
+    assert response.headers["x-request-id"] == captured["rid"]

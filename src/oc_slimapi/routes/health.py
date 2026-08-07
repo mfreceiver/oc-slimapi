@@ -5,6 +5,7 @@ from fastapi import APIRouter, Request
 from .. import __version__
 from ..gzip_util import json_response
 from ..traffic import stash_up_in
+from ..upstream import forward_upstream_headers, request_id_from_scope
 
 router = APIRouter(prefix="/slimapi", tags=["health"])
 
@@ -66,7 +67,17 @@ async def health(request: Request):
 async def ready(request: Request):
     started = time.monotonic()
     try:
-        response = await request.app.state.upstream.get("/global/health", timeout=5.0)
+        # P0-6: forward X-Request-ID so the sidecar access log line can be
+        # correlated with opencode's /global/health log entry (contract §7).
+        # ``client.get`` builds the request internally; pass headers through.
+        response = await request.app.state.upstream.get(
+            "/global/health",
+            timeout=5.0,
+            headers=forward_upstream_headers(
+                directory=None,
+                request_id=request_id_from_scope(request.scope),
+            ),
+        )
         # Traffic accounting: stash the health-check response body so the
         # health bucket's upIn reflects the upstream ping bytes.
         stash_up_in(request, len(response.content))

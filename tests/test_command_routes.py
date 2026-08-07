@@ -269,6 +269,77 @@ async def test_directory_validation(upstream_factory):
 
 
 # ---------------------------------------------------------------------------
+# P0-6: X-Request-ID forwarded upstream on catalog requests (contract §7)
+# ---------------------------------------------------------------------------
+
+
+async def test_command_forwards_request_id_to_upstream(upstream_factory):
+    """P0-6: GET /slimapi/command forwards X-Request-ID to upstream opencode so
+    the sidecar access log line can be correlated with opencode's own logs
+    (contract §7). Inbound ``X-Request-ID`` is preserved by
+    ``RequestIdMiddleware`` (stored in scope.state) and re-emitted upstream
+    alongside the directory header."""
+    from oc_slimapi.middleware.request_id import RequestIdMiddleware
+
+    captured: dict[str, str | None] = {}
+    catalog = orjson.dumps(_sample_catalog())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["rid"] = request.headers.get("x-request-id")
+        return httpx.Response(200, content=catalog, headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    # Without the middleware, scope.state has no request_id → header would be
+    # omitted. The middleware is what production wires up.
+    app.add_middleware(RequestIdMiddleware)
+    transport = httpx.ASGITransport(app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
+                "/slimapi/command", headers={**VERSION_HEADERS, "X-Request-ID": "req-xyz-789"},
+            )
+        assert response.status_code == 200
+        # The inbound X-Request-ID flows through the middleware into scope.state
+        # and back out as the upstream request header.
+        assert captured["rid"] == "req-xyz-789"
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_command_forwards_directory_and_request_id_together(upstream_factory):
+    """P0-6 regression: directory header and X-Request-ID must NOT collide —
+    they have distinct header names and must both arrive at upstream. Earlier
+    catalog code forwarded only the directory header; the request_id helper
+    adds the second header without clobbering the first."""
+    from oc_slimapi.middleware.request_id import RequestIdMiddleware
+
+    captured: dict[str, str | None] = {}
+    catalog = orjson.dumps(_sample_catalog())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["dir"] = request.headers.get("x-opencode-directory")
+        captured["rid"] = request.headers.get("x-request-id")
+        return httpx.Response(200, content=catalog, headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    app.add_middleware(RequestIdMiddleware)
+    transport = httpx.ASGITransport(app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
+                "/slimapi/command?directory=/foo",
+                headers={**VERSION_HEADERS, "X-Request-ID": "abc-123"},
+            )
+        assert response.status_code == 200
+        assert captured["dir"] == "/foo"
+        assert captured["rid"] == "abc-123"
+    finally:
+        app.state.transforms.shutdown()
+
+
+# ---------------------------------------------------------------------------
 # Upstream error mapping
 # ---------------------------------------------------------------------------
 
