@@ -26,6 +26,14 @@ ocdroid 对接时：
 
 ---
 
+## [1.1.3] - 2026-08-07 — questions 发现机制根治（/project → /experimental/session?roots=true&archived=true），未 bump `X-Slimapi-Version`，仍 2
+
+### Fixed
+
+- **`GET /slimapi/questions` 发现机制彻底修复（未 bump `X-Slimapi-Version`，仍 2）**：发现源从 `GET /project` 改为 `GET /experimental/session?roots=true`。**根因（v1.1.1/v1.1.2 仍未根治）**：opencode `project.resolve()`（`packages/core/src/project.ts:110-122`）把**非 git repo** 的 workdir 归到合成 global project（`worktree="/"`），sidecar 此前显式跳过 `worktree=="/"`（CHANGELOG v1.1.1：「跳过合成 global 项目，无真实 session/question」——**该假设错误**），导致所有非-git workdir（自定义工作目录如 `opencode_wd`、`/tmp` 临时目录）以及 git worktree 子目录（`ocdroid/.slim/worktrees/wave0-*`）的 pending question **全部漏报**。实测：pending 在 `/home/mar/opencode_wd`（非-git），`/project` 列表不含该目录 → 聚合恒 `items:[]`；带 `X-Opencode-Directory: /home/mar/opencode_wd` 直查上游却能取到。**`GET /experimental/session?roots=true`** 是 opencode 的**全局顶层 session 列表**（`roots=true` ⇒ `parentID==null` only，源码 `packages/app/src/utils/server-compat.ts:147` 确证），每个 session 携带**真实 `directory` 字段**（创建该 session 的 workdir 原始路径），覆盖 git repo + 非-git目录 + git worktree 子目录（app/tui/acp/cli/SDK 全在用的 v2 正式端点，非 deprecated `/api/`）。借鉴 qq-ocbot `fetch_questions`（`src/core/opencode.py:170`）的成熟方案。**删去 `worktree=="/"` 跳过逻辑**（session.directory 恒为真实路径，无合成 global 问题）。**发现调用带 `archived=true`**——使发现集合成为**超集**（含已归档 session），消除"某 workdir 顶层 session 全部归档但实例仍存活、pending question 仍在内存"的盲区（`/question` 是内存态，与归档状态无关；最多 fan-out 到已死实例产生 isolated `errors[]`，无副作用）。`discoveryComplete` 语义从「恒 true（`/project` 无分页）」改为「页未满 `_DISCOVERY_LIMIT`(=10000) 时 true，页满降级 false」——`/experimental/session` 接受 `limit`，`roots=true` 只返顶层 session（数量 ≈ workdir 数），实际不会截断；截断时 `authoritativeDirectories` 降级为 succeeded 数组（复用 v1.1.0 既有逻辑，防 replace-all 丢弃未发现目录 pending）。`authoritativeDirectories` 其余语义不变；envelope 字段集 `{items,errors,authoritativeDirectories,discoveryComplete}` **不变**；所有错误码不变；total failure（发现失败 → 503 `upstream_unavailable`）不变。**加性硬化，不 bump** `X-Slimapi-Version`。**上游依赖**：需 opencode ≥ v1.18.x（`/experimental/session` v2 端点；server 端 query schema `public.ts:59-64` + `isNull(parent_id)` 实现 `session.ts:560,987` 已核实；app/tui/acp/cli/SDK 共用）。**已知 trade-off**：发现调用 payload 体积较 `/project` 上升（每条 session 携带完整 SessionInfo，sidecar 只用 `id`+`directory`；本地回环单次调用 + 顶层 session 数量小，可接受）。实现：`src/oc_slimapi/routes/questions.py`；测试：`tests/test_questions_routes.py`（重写发现 mock 为 `/experimental/session` + 新增非-git 盲区 / git worktree 子目录 / archived-only 盲区 / 截断降级 / `roots=true`+`archived=true` 契约 / 缺失 directory 字段跳过 / discovery 4xx→503 等用例，共 27 用例）。评审：rev-ds 9/10 APPROVE + rev-glm 8/10 APPROVE（均独立经 opencode server 源码确证方案根基）。
+
+---
+
 ## [Unreleased]
 
 ### Added

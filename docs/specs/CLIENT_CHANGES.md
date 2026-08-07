@@ -47,12 +47,12 @@
 
 ### 客户端必须
 
-- **两阶段 fan-out（sidecar 侧，客户端透明）**：sidecar 先 `GET /project`（ProjectTable 全表，跨所有 workdir）发现 distinct worktree 集合（跳过合成 global `worktree=="/"`），再并发对每个 dir `GET /question`（带 `X-Opencode-Directory`）合并。
+- **两阶段 fan-out（sidecar 侧，客户端透明）**：sidecar 先 `GET /experimental/session?roots=true&archived=true`（opencode 全局顶层 session 列表 + 含已归档 session，每个 session 携带真实 `directory` 字段——覆盖 git repo + 非-git目录 + git worktree 子目录 + archived-only workdir）发现 distinct directory 集合，再并发对每个 dir `GET /question`（带 `X-Opencode-Directory`）合并。（**2026-08-07**：发现源从 `GET /project` 改为 `GET /experimental/session?roots=true&archived=true`——根因 `/project` 把非-git workdir 归到合成 global（`worktree="/"`）被跳过，导致非-git/临时目录 + git worktree 子目录的 pending question 漏报；`archived=true` 使发现集合成超集防 archived-only workdir 漏报。）
 - **envelope 形状**（非裸数组）`{items, errors, authoritativeDirectories, discoveryComplete}`：
   - `items`：合并的 question entry，每条 = 上游 entry 原样 + 追加 `directory` 字段。
   - `errors`：per-dir 失败（isolated，单 dir 失败不中断整体）。
-  - `authoritativeDirectories`：`null` = 全成功 → **全局 replace-all**；数组 = partial → 仅覆盖所列 dir。
-  - `discoveryComplete`：**恒 `true`**（`/project` 无分页/截断）；客户端可忽略。
+  - `authoritativeDirectories`：`null` = 全成功且发现完整 → **全局 replace-all**；数组 = partial（per-dir 失败或发现截断）→ 仅覆盖所列 dir。
+  - `discoveryComplete`：`true` 除非发现页填满 `_DISCOVERY_LIMIT`(=10000)（可能截断）；`roots=true` 只返顶层 session，实际恒 `true`；客户端可忽略。
 - **客户端契约（关键）**：`authoritativeDirectories==null` → 用本次 `items` 完整替换本地 pending question 集合（replace-all，不在 `items` 中的旧 question 视为已不再 pending）；为数组 → **仅**对数组所列 dir 做 replace，**不得**丢弃未覆盖 dir 的既有 pending question（否则丢失数据）。
 - **total failure**：发现调用失败 → 整体 503 `upstream_unavailable`（无 envelope）；客户端保留既有状态并重试，**不可**据此推断 pending question 集合为空。
 - **应答不经本端点**：pending question 的应答仍走 catch-all + `X-Opencode-Directory`（见 v2-contract §2 写路径）；本端点只读聚合。

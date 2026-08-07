@@ -104,9 +104,9 @@
 ### 1.7 `GET /slimapi/questions`（跨目录 pending question 聚合，加性）
 
 - **参数**：无（sidecar 自发现目录）。
-- **upstream**：两阶段 fan-out——(1) `GET /project`（ProjectTable 全表，跨所有 workdir）发现 distinct worktree 集合（跳过合成 global `worktree=="/"`）；(2) 并发（`asyncio.gather`）对每个 dir `GET /question`（带 `X-Opencode-Directory`）合并。
+- **upstream**：两阶段 fan-out——(1) `GET /experimental/session?roots=true&archived=true`（opencode 全局顶层 session 列表 + 含已归档 session，每个 session 携带真实 `directory` 字段——覆盖 git repo + 非-git目录 + git worktree 子目录 + archived-only workdir）发现 distinct directory 集合；(2) 并发（`asyncio.gather`）对每个 dir `GET /question`（带 `X-Opencode-Directory`）合并。（**2026-08-07**：发现源从 `GET /project` 改为 `/experimental/session?roots=true&archived=true`——根因 `/project` 把非-git workdir 归到合成 global（`worktree="/"`）被跳过，漏报非-git/临时目录 + git worktree 子目录的 pending question；`archived=true` 使发现集合成超集防 archived-only workdir 漏报。）
 - **转化**：每条上游 entry 原样转发 + 追加 `directory` 字段（无 skeleton 投影、无转换池 admission）。
-- **响应**：**envelope 对象** `{items, errors, authoritativeDirectories, discoveryComplete}`（非裸数组，表达 partial 失败）。`discoveryComplete` 恒 `true`（`/project` 无分页/截断）。
+- **响应**：**envelope 对象** `{items, errors, authoritativeDirectories, discoveryComplete}`（非裸数组，表达 partial 失败）。`discoveryComplete` 为 `true` 除非发现页填满 `_DISCOVERY_LIMIT`(=10000)（`roots=true` 只返顶层 session，实际恒 `true`）。
 - **客户端契约**：`authoritativeDirectories==null` → 全局 replace-all；数组 → 仅 partial replace 所列 dir（不得丢弃未覆盖 dir 的既有 pending question，否则数据丢失）。
 - **保护**：发现调用失败 → 整体 503 `upstream_unavailable`（无 envelope）；per-dir 失败 isolated 进 `errors[]`（5xx→`upstream_unavailable`，4xx→`upstream_http_N`，不中断整体）。
 - **加性**：未 bump `X-Slimapi-Version`（仍 2）；旧 sidecar→catch-all 404 `thin_route_not_found`。详见 `v2-contract.md` §2「`/slimapi/questions` envelope」。

@@ -2,10 +2,11 @@
 
 Exercises ``GET /slimapi/questions`` (cross-directory aggregation of pending
 questions) end-to-end through a mocked upstream. Discovery is driven by
-``GET /project`` (returns ProjectTable in full — the ``worktree`` field of
-each entry is the workdir). The app is constructed fresh per test (bypassing
-the module-level lifespan) so the version gate and catch-all proxy are wired
-exactly as in production.
+``GET /experimental/session?roots=true`` (opencode's GLOBAL top-level session
+list — each session carries its REAL ``directory`` field, covering git repos,
+non-git workdirs, and git-worktree subdirs alike). The app is constructed
+fresh per test (bypassing the module-level lifespan) so the version gate and
+catch-all proxy are wired exactly as in production.
 """
 from __future__ import annotations
 
@@ -72,11 +73,18 @@ def _question(qid: str, sid: str = "01HSESSION") -> dict:
     }
 
 
-def _projects_body(*worktrees: str) -> bytes:
-    """Build an upstream /project list payload with one project per worktree."""
-    return orjson.dumps(
-        [{"id": f"proj_{i:03d}", "worktree": w} for i, w in enumerate(worktrees)]
-    )
+def _sessions_body(*directories: str) -> bytes:
+    """Build an upstream /experimental/session payload: one top-level session
+    per directory. Each session carries its REAL ``directory`` field (the
+    workdir it was created in) — the field the sidecar discovers on."""
+    return orjson.dumps([
+        {
+            "id": f"ses_{i:04d}",
+            "directory": d,
+            "time": {"updated": 0, "created": 0},
+        }
+        for i, d in enumerate(directories)
+    ])
 
 
 # ---------------------------------------------------------------------------
@@ -85,15 +93,15 @@ def _projects_body(*worktrees: str) -> bytes:
 
 
 async def test_aggregates_across_directories(upstream_factory):
-    """/project returns worktrees /a and /b; /question for each returns one
+    """Discovery returns sessions in /a and /b; /question for each returns one
     question. items has both, each stamped with its directory; the
     X-Opencode-Directory header was forwarded per dir."""
     seen_dirs: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/project":
+        if request.url.path == "/experimental/session":
             return httpx.Response(
-                200, content=_projects_body("/a", "/b"),
+                200, content=_sessions_body("/a", "/b"),
                 headers={"Content-Type": "application/json"},
             )
         if request.url.path == "/question":
@@ -134,12 +142,12 @@ async def test_aggregates_across_directories(upstream_factory):
 
 
 async def test_authoritative_empty_when_all_dirs_return_empty(upstream_factory):
-    """/project returns worktrees /a,/b; all /question calls return [].
+    """Discovery returns sessions in /a,/b; all /question calls return [].
     items==[], errors==[], authoritativeDirectories==null."""
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/project":
+        if request.url.path == "/experimental/session":
             return httpx.Response(
-                200, content=_projects_body("/a", "/b"),
+                200, content=_sessions_body("/a", "/b"),
                 headers={"Content-Type": "application/json"},
             )
         if request.url.path == "/question":
@@ -170,9 +178,9 @@ async def test_partial_failure_one_dir_5xx(upstream_factory):
     errors has one entry for /b with code upstream_unavailable,
     authoritativeDirectories==['/a']."""
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/project":
+        if request.url.path == "/experimental/session":
             return httpx.Response(
-                200, content=_projects_body("/a", "/b"),
+                200, content=_sessions_body("/a", "/b"),
                 headers={"Content-Type": "application/json"},
             )
         if request.url.path == "/question":
@@ -210,9 +218,9 @@ async def test_per_dir_network_error_tolerated(upstream_factory):
     """/b raises httpx.ConnectError. /a's question is preserved; errors has
     an entry for /b with code upstream_unavailable."""
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/project":
+        if request.url.path == "/experimental/session":
             return httpx.Response(
-                200, content=_projects_body("/a", "/b"),
+                200, content=_sessions_body("/a", "/b"),
                 headers={"Content-Type": "application/json"},
             )
         if request.url.path == "/question":
@@ -241,14 +249,15 @@ async def test_per_dir_network_error_tolerated(upstream_factory):
 
 
 # ---------------------------------------------------------------------------
-# 5. Total failure (project list fails)
+# 5. Total failure (discovery list fails)
 # ---------------------------------------------------------------------------
 
 
-async def test_total_failure_project_list_5xx(upstream_factory):
-    """/project returns 500. Expect HTTP 503 with body {"code":"upstream_unavailable"}."""
+async def test_total_failure_discovery_5xx(upstream_factory):
+    """Discovery (/experimental/session) returns 500. Expect HTTP 503 with
+    body {"code":"upstream_unavailable"}."""
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/project":
+        if request.url.path == "/experimental/session":
             return httpx.Response(500, content=b"boom")
         return httpx.Response(404)
 
@@ -261,10 +270,10 @@ async def test_total_failure_project_list_5xx(upstream_factory):
     assert response.json() == {"code": "upstream_unavailable"}
 
 
-async def test_total_failure_project_list_non_list(upstream_factory):
-    """/project returns 200 but a non-list body → 503 upstream_unavailable."""
+async def test_total_failure_discovery_non_list(upstream_factory):
+    """Discovery returns 200 but a non-list body → 503 upstream_unavailable."""
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/project":
+        if request.url.path == "/experimental/session":
             return httpx.Response(
                 200, content=b'{"unexpected":"shape"}',
                 headers={"Content-Type": "application/json"},
@@ -280,11 +289,28 @@ async def test_total_failure_project_list_non_list(upstream_factory):
     assert response.json()["code"] == "upstream_unavailable"
 
 
-async def test_total_failure_project_list_network_error(upstream_factory):
-    """/project raises httpx.ConnectError → 503 upstream_unavailable."""
+async def test_total_failure_discovery_network_error(upstream_factory):
+    """Discovery raises httpx.ConnectError → 503 upstream_unavailable."""
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/project":
+        if request.url.path == "/experimental/session":
             raise httpx.ConnectError("simulated", request=request)
+        return httpx.Response(404)
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/slimapi/questions", headers=VERSION_HEADERS)
+    assert response.status_code == 503
+    assert response.json()["code"] == "upstream_unavailable"
+
+
+async def test_total_failure_discovery_4xx(upstream_factory):
+    """Discovery returns 4xx → 503 upstream_unavailable (NOT upstream_http_N —
+    discovery is an internal derived call; contract §7 exception)."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/experimental/session":
+            return httpx.Response(404, content=b"not found")
         return httpx.Response(404)
 
     upstream = upstream_factory(handler)
@@ -304,9 +330,9 @@ async def test_total_failure_project_list_network_error(upstream_factory):
 async def test_stamps_directory_on_each_entry(upstream_factory):
     """Every item has a `directory` field equal to the dir it came from."""
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/project":
+        if request.url.path == "/experimental/session":
             return httpx.Response(
-                200, content=_projects_body("/a", "/b"),
+                200, content=_sessions_body("/a", "/b"),
                 headers={"Content-Type": "application/json"},
             )
         if request.url.path == "/question":
@@ -339,24 +365,16 @@ async def test_stamps_directory_on_each_entry(upstream_factory):
 
 
 async def test_distinct_directories_dedup_question_called_once(upstream_factory):
-    """/project returns 3 entries with the same worktree /a (artificial
-    duplicates — the DB never returns dup worktrees, but this verifies the
-    sidecar's defensive dedup); /question for /a must be called exactly
-    ONCE. Expect 1 item."""
+    """Discovery returns 3 sessions all in the same directory /a; /question
+    for /a must be called exactly ONCE (defensive dedup). Expect 1 item."""
     call_count = {"question_a": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/project":
-            # /project never returns duplicate worktrees in practice (DB
-            # unique), but construct duplicates here to verify the defensive
-            # dedup logic in the sidecar.
+        if request.url.path == "/experimental/session":
+            # Multiple sessions sharing one directory (common: many sessions
+            # per workdir). The sidecar must dedup to a single /question call.
             return httpx.Response(
-                200,
-                content=orjson.dumps([
-                    {"id": "proj_a1", "worktree": "/a"},
-                    {"id": "proj_a2", "worktree": "/a"},
-                    {"id": "proj_a3", "worktree": "/a"},
-                ]),
+                200, content=_sessions_body("/a", "/a", "/a"),
                 headers={"Content-Type": "application/json"},
             )
         if request.url.path == "/question":
@@ -392,9 +410,9 @@ async def test_inbound_directory_header_ignored(upstream_factory):
     seen_dirs: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/project":
+        if request.url.path == "/experimental/session":
             return httpx.Response(
-                200, content=_projects_body("/a", "/b"),
+                200, content=_sessions_body("/a", "/b"),
                 headers={"Content-Type": "application/json"},
             )
         if request.url.path == "/question":
@@ -452,9 +470,9 @@ async def test_per_dir_4xx_mapped_to_upstream_http_n(upstream_factory):
     """/a returns 1 question, /b returns HTTP 403. errors entry for /b has
     code upstream_http_403 (not upstream_unavailable); /a preserved."""
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/project":
+        if request.url.path == "/experimental/session":
             return httpx.Response(
-                200, content=_projects_body("/a", "/b"),
+                200, content=_sessions_body("/a", "/b"),
                 headers={"Content-Type": "application/json"},
             )
         if request.url.path == "/question":
@@ -483,16 +501,16 @@ async def test_per_dir_4xx_mapped_to_upstream_http_n(upstream_factory):
 
 
 # ---------------------------------------------------------------------------
-# Additional: zero projects → authoritative empty envelope
+# Additional: zero sessions → authoritative empty envelope
 # ---------------------------------------------------------------------------
 
 
-async def test_zero_projects_returns_authoritative_empty(upstream_factory):
-    """/project returns [] (no projects at all). Expect envelope
+async def test_zero_sessions_returns_authoritative_empty(upstream_factory):
+    """Discovery returns [] (no sessions at all). Expect envelope
     {items:[], errors:[], authoritativeDirectories:null, discoveryComplete:true}
-    (discovery is always complete — /project returns ProjectTable in full)."""
+    (page not full → complete; authoritative empty)."""
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/project":
+        if request.url.path == "/experimental/session":
             return httpx.Response(
                 200, content=b"[]", headers={"Content-Type": "application/json"},
             )
@@ -522,9 +540,9 @@ async def test_per_dir_non_list_question_body_fails_that_dir(upstream_factory):
     """/a returns a list, /b returns a dict body (non-list). /b is treated as
     failed (upstream_unavailable); /a's questions preserved."""
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/project":
+        if request.url.path == "/experimental/session":
             return httpx.Response(
-                200, content=_projects_body("/a", "/b"),
+                200, content=_sessions_body("/a", "/b"),
                 headers={"Content-Type": "application/json"},
             )
         if request.url.path == "/question":
@@ -563,9 +581,9 @@ async def test_per_dir_non_list_question_body_fails_that_dir(upstream_factory):
 async def test_gzip_negotiation_honored(upstream_factory):
     """Client sends Accept-Encoding: gzip → response is gzip-encoded."""
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/project":
+        if request.url.path == "/experimental/session":
             return httpx.Response(
-                200, content=_projects_body("/a"),
+                200, content=_sessions_body("/a"),
                 headers={"Content-Type": "application/json"},
             )
         if request.url.path == "/question":
@@ -590,28 +608,222 @@ async def test_gzip_negotiation_honored(upstream_factory):
 
 
 # ---------------------------------------------------------------------------
-# /project discovery completeness (P1): ProjectTable is returned in full
-# (no pagination), so discovery is NEVER truncated — even for large project
-# counts, no error → authoritativeDirectories stays null (global authority).
+# Discovery call shape: uses /experimental/session with roots=true&limit
 # ---------------------------------------------------------------------------
 
 
-async def test_project_discovery_always_complete_no_truncation(upstream_factory):
-    """/project returns ProjectTable in full (no limit/pagination). Even with
-    a large number of projects, discovery is always complete: there is no
-    truncation-downgrade path. With no per-dir errors, the envelope must
-    claim global authority: discoveryComplete == true AND
-    authoritativeDirectories == null."""
-    # 50 distinct worktrees (/d0../d49) — well above any legacy limit, but
-    # /project has no pagination so this is still complete.
-    projects = [
-        {"id": f"proj_{i:03d}", "worktree": f"/d{i}"} for i in range(50)
-    ]
+async def test_discovery_uses_experimental_session_with_roots(upstream_factory):
+    """The discovery call MUST hit /experimental/session with roots=true
+    (top-level sessions only) and archived=true (superset — include archived
+    sessions so a workdir whose top-level sessions are all archived but whose
+    instance still holds pending questions is not dropped) — not /project and
+    not bare /session. This is the contract that guarantees coverage of
+    non-git workdirs AND archived-only workdirs."""
+    captured: dict = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/project":
+        if request.url.path == "/experimental/session":
+            captured["hit"] = True
+            captured["roots"] = request.url.params.get("roots")
+            captured["archived"] = request.url.params.get("archived")
+            captured["limit"] = request.url.params.get("limit")
             return httpx.Response(
-                200, content=orjson.dumps(projects),
+                200, content=_sessions_body("/a"),
+                headers={"Content-Type": "application/json"},
+            )
+        if request.url.path == "/project":
+            captured["project_hit"] = True  # legacy discovery, must NOT be called
+        if request.url.path == "/question":
+            return httpx.Response(
+                200, content=b"[]", headers={"Content-Type": "application/json"},
+            )
+        return httpx.Response(404)
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/slimapi/questions", headers=VERSION_HEADERS)
+    assert response.status_code == 200
+    assert captured.get("hit") is True
+    assert captured.get("roots") == "true"
+    assert captured.get("archived") == "true", (
+        "archived=true MUST be sent so archived-only workdirs are not dropped"
+    )
+    assert captured.get("limit") is not None
+    assert captured.get("project_hit") is not True, (
+        "/project must NOT be used for discovery (it normalizes non-git workdirs to '/')"
+    )
+
+
+# ---------------------------------------------------------------------------
+# CORE REGRESSION: non-git workdir discovered (the bug this fix targets)
+# ---------------------------------------------------------------------------
+
+
+async def test_non_git_workdir_discovered(upstream_factory):
+    """REGRESSION GUARD: a session whose workdir is NOT a git repo (e.g. a
+    custom working dir like /home/user/opencode_wd, or a /tmp scratch dir)
+    MUST be discovered and its pending questions aggregated.
+
+    Root cause this guards: opencode's project.resolve() maps non-git
+    workdirs to the synthetic global project (worktree="/"), so the former
+    /project-based discovery skipped them (worktree=="/" filter) and their
+    pending questions were silently dropped. /experimental/session carries
+    the REAL session.directory, so non-git workdirs are now covered.
+
+    Upstream /project is also mocked here (returning only git workdirs) to
+    prove the sidecar no longer depends on it — and would still find the
+    non-git workdir's question even if /project omitted it."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/experimental/session":
+            # A non-git workdir (opencode_wd) + a normal git repo dir.
+            return httpx.Response(
+                200,
+                content=_sessions_body("/home/user/opencode_wd", "/home/user/gitproj"),
+                headers={"Content-Type": "application/json"},
+            )
+        if request.url.path == "/project":
+            # /project would ONLY list the git repo — opencode_wd is invisible
+            # here (synthetic global). Proves discovery no longer relies on it.
+            return httpx.Response(
+                200,
+                content=orjson.dumps([{"id": "p1", "worktree": "/home/user/gitproj"}]),
+                headers={"Content-Type": "application/json"},
+            )
+        if request.url.path == "/question":
+            d = request.headers.get("x-opencode-directory")
+            if d == "/home/user/opencode_wd":
+                return httpx.Response(
+                    200, content=orjson.dumps([_question("que_nongit", "ses_nongit")]),
+                    headers={"Content-Type": "application/json"},
+                )
+            if d == "/home/user/gitproj":
+                return httpx.Response(
+                    200, content=orjson.dumps([_question("que_git", "ses_git")]),
+                    headers={"Content-Type": "application/json"},
+                )
+        return httpx.Response(404)
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/slimapi/questions", headers=VERSION_HEADERS)
+    assert response.status_code == 200
+    body = response.json()
+    # BOTH workdirs discovered — the non-git one is no longer dropped.
+    dirs_of_items = {item["directory"] for item in body["items"]}
+    assert "/home/user/opencode_wd" in dirs_of_items, (
+        "non-git workdir MUST be discovered (regression: was dropped by /project)"
+    )
+    assert "/home/user/gitproj" in dirs_of_items
+    assert body["errors"] == []
+    assert body["authoritativeDirectories"] is None
+
+
+async def test_git_worktree_subdir_discovered(upstream_factory):
+    """REGRESSION GUARD: a session in a git-worktree SUBDIR (e.g.
+    /repo/.slim/worktrees/wave0-foo) MUST be discovered. /project lists only
+    the worktree ROOT (/repo), not its git-worktree children — those were
+    dropped by /project-based discovery too. /experimental/session carries
+    the real subdir path."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/experimental/session":
+            return httpx.Response(
+                200,
+                content=_sessions_body(
+                    "/repo",
+                    "/repo/.slim/worktrees/wave0-deadcode",
+                    "/repo/.slim/worktrees/wave0-ci",
+                ),
+                headers={"Content-Type": "application/json"},
+            )
+        if request.url.path == "/question":
+            d = request.headers.get("x-opencode-directory")
+            return httpx.Response(
+                200, content=orjson.dumps([_question(f"que_{d.split('/')[-1]}")]),
+                headers={"Content-Type": "application/json"},
+            )
+        return httpx.Response(404)
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/slimapi/questions", headers=VERSION_HEADERS)
+    assert response.status_code == 200
+    body = response.json()
+    dirs_of_items = {item["directory"] for item in body["items"]}
+    assert dirs_of_items == {
+        "/repo",
+        "/repo/.slim/worktrees/wave0-deadcode",
+        "/repo/.slim/worktrees/wave0-ci",
+    }
+
+
+# ---------------------------------------------------------------------------
+# REGRESSION: archived-only workdir still discovered (archived=true superset)
+# ---------------------------------------------------------------------------
+
+
+async def test_archived_only_workdir_still_discovered(upstream_factory):
+    """REGRESSION GUARD (rev-ds MINOR-1 / rev-glm M1): a workdir whose
+    top-level sessions are ALL archived but whose instance still holds pending
+    questions MUST still be discovered. Discovery sends archived=true so the
+    session list is a superset; /question is an in-memory store independent
+    of archive state, so the pending question is still retrievable.
+
+    Without archived=true, /experimental/session excludes archived sessions
+    (opencode listGlobal default `!archived`) and this workdir would vanish
+    from the discovery set → pending question dropped."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/experimental/session":
+            # Upstream honors archived=true → returns the archived session too.
+            # (If the sidecar forgot archived=true, upstream would omit it and
+            # the workdir would not be discovered.)
+            assert request.url.params.get("archived") == "true"
+            return httpx.Response(
+                200,
+                content=_sessions_body("/home/user/archived-only-wd"),
+                headers={"Content-Type": "application/json"},
+            )
+        if request.url.path == "/question":
+            d = request.headers.get("x-opencode-directory")
+            if d == "/home/user/archived-only-wd":
+                # Instance still alive, pending question still in memory.
+                return httpx.Response(
+                    200, content=orjson.dumps([_question("que_archived", "ses_arch")]),
+                    headers={"Content-Type": "application/json"},
+                )
+        return httpx.Response(404)
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/slimapi/questions", headers=VERSION_HEADERS)
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["items"]) == 1
+    assert body["items"][0]["directory"] == "/home/user/archived-only-wd"
+    assert body["items"][0]["id"] == "que_archived"
+    assert body["errors"] == []
+
+
+# ---------------------------------------------------------------------------
+# Discovery truncation: discoveryComplete flips when the page fills exactly
+# ---------------------------------------------------------------------------
+
+
+async def test_discovery_complete_when_page_not_full(upstream_factory):
+    """Normal case: fewer sessions than _DISCOVERY_LIMIT → discoveryComplete
+    is true, and with no per-dir errors → authoritativeDirectories null
+    (global authority, replace-all safe)."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/experimental/session":
+            return httpx.Response(
+                200, content=_sessions_body("/a", "/b"),
                 headers={"Content-Type": "application/json"},
             )
         if request.url.path == "/question":
@@ -627,23 +839,56 @@ async def test_project_discovery_always_complete_no_truncation(upstream_factory)
         response = await client.get("/slimapi/questions", headers=VERSION_HEADERS)
     assert response.status_code == 200
     body = response.json()
-    # No pagination → always complete; no errors → global authority.
     assert body["discoveryComplete"] is True
     assert body["errors"] == []
     assert body["authoritativeDirectories"] is None
-    assert body["items"] == []
+
+
+async def test_discovery_incomplete_when_page_full_degrades_authority(upstream_factory, monkeypatch):
+    """When the discovery page fills EXACTLY at _DISCOVERY_LIMIT (possible
+    truncation), discoveryComplete flips to false. Even with NO per-dir
+    errors, authoritativeDirectories must degrade to the succeeded list (NOT
+    null) — so the client does NOT replace-all and drop pending questions in
+    undiscovered dirs. Uses a tiny monkeypatched limit to avoid building 10k
+    sessions."""
+    monkeypatch.setattr(questions, "_DISCOVERY_LIMIT", 3)
+    # Exactly 3 sessions (= limit) → truncation suspected.
+    dirs = ["/d0", "/d1", "/d2"]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/experimental/session":
+            return httpx.Response(
+                200, content=_sessions_body(*dirs),
+                headers={"Content-Type": "application/json"},
+            )
+        if request.url.path == "/question":
+            return httpx.Response(
+                200, content=b"[]", headers={"Content-Type": "application/json"},
+            )
+        return httpx.Response(404)
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/slimapi/questions", headers=VERSION_HEADERS)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["discoveryComplete"] is False
+    # No errors BUT discovery incomplete → succeeded list, not null.
+    assert body["errors"] == []
+    assert body["authoritativeDirectories"] == dirs
 
 
 async def test_complete_discovery_full_success_is_globally_authoritative(upstream_factory):
-    """/project returns 5 projects (2 distinct worktrees) and every dir's
+    """Discovery returns sessions in 2 distinct dirs and every dir's
     /question succeeds. discoveryComplete == true AND
     authoritativeDirectories == null (global authority → client replace-all
     is safe)."""
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/project":
-            # 5 projects, 2 distinct worktrees (dups verify dedup).
+        if request.url.path == "/experimental/session":
             return httpx.Response(
-                200, content=_projects_body("/a", "/b", "/a", "/b", "/a"),
+                200, content=_sessions_body("/a", "/b"),
                 headers={"Content-Type": "application/json"},
             )
         if request.url.path == "/question":
@@ -672,9 +917,9 @@ async def test_partial_failure_with_complete_discovery_lists_succeeded(upstream_
     the succeeded list (NOT null), discoveryComplete == true. Confirms the
     partial-authority rule also fires on per-dir errors, not just truncation."""
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/project":
+        if request.url.path == "/experimental/session":
             return httpx.Response(
-                200, content=_projects_body("/a", "/b"),
+                200, content=_sessions_body("/a", "/b"),
                 headers={"Content-Type": "application/json"},
             )
         if request.url.path == "/question":
@@ -701,7 +946,7 @@ async def test_partial_failure_with_complete_discovery_lists_succeeded(upstream_
 
 
 # ---------------------------------------------------------------------------
-# Fan-out concurrency bound (P1): more dirs than _FANOUT_CONCURRENCY still
+# Fan-out concurrency bound: more dirs than _FANOUT_CONCURRENCY still
 # completes correctly (no deadlock, per-dir isolation intact).
 # ---------------------------------------------------------------------------
 
@@ -716,9 +961,9 @@ async def test_fanout_concurrency_bound_completes_with_many_dirs(upstream_factor
     dirs = [f"/dir{i}" for i in range(n_dirs)]
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/project":
+        if request.url.path == "/experimental/session":
             return httpx.Response(
-                200, content=_projects_body(*dirs),
+                200, content=_sessions_body(*dirs),
                 headers={"Content-Type": "application/json"},
             )
         if request.url.path == "/question":
@@ -755,9 +1000,9 @@ async def test_fanout_concurrency_bound_isolates_errors_with_many_dirs(upstream_
     failing_dir = dirs[len(dirs) // 2]
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/project":
+        if request.url.path == "/experimental/session":
             return httpx.Response(
-                200, content=_projects_body(*dirs),
+                200, content=_sessions_body(*dirs),
                 headers={"Content-Type": "application/json"},
             )
         if request.url.path == "/question":
@@ -783,3 +1028,45 @@ async def test_fanout_concurrency_bound_isolates_errors_with_many_dirs(upstream_
     # Partial authority (one error) → succeeded list, not null.
     assert body["authoritativeDirectories"] is not None
     assert failing_dir not in body["authoritativeDirectories"]
+
+
+# ---------------------------------------------------------------------------
+# Sessions missing/blank directory field are skipped defensively
+# ---------------------------------------------------------------------------
+
+
+async def test_sessions_missing_directory_field_skipped(upstream_factory):
+    """A session whose `directory` is missing/empty/non-string is skipped
+    (defensive — malformed upstream); well-formed sessions are still
+    discovered."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/experimental/session":
+            return httpx.Response(
+                200,
+                content=orjson.dumps([
+                    {"id": "s1", "directory": "/good"},
+                    {"id": "s2", "directory": ""},            # empty → skip
+                    {"id": "s3"},                              # missing → skip
+                    {"id": "s4", "directory": None},           # non-string → skip
+                    {"id": "s5", "directory": "/also-good"},
+                ]),
+                headers={"Content-Type": "application/json"},
+            )
+        if request.url.path == "/question":
+            d = request.headers.get("x-opencode-directory")
+            return httpx.Response(
+                200, content=orjson.dumps([_question(f"que_{d[1:]}")]),
+                headers={"Content-Type": "application/json"},
+            )
+        return httpx.Response(404)
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/slimapi/questions", headers=VERSION_HEADERS)
+    assert response.status_code == 200
+    body = response.json()
+    dirs_of_items = {item["directory"] for item in body["items"]}
+    assert dirs_of_items == {"/good", "/also-good"}
+    assert body["errors"] == []

@@ -21,6 +21,15 @@ router = APIRouter(prefix="/slimapi", tags=["questions"])
 _FANOUT_CONCURRENCY = 16
 _fanout_sem = asyncio.Semaphore(_FANOUT_CONCURRENCY)
 
+# Page size for the GET /experimental/session?roots=true discovery call.
+# `roots=true` returns only top-level sessions (parentID==null), so the count
+# ≈ number of distinct workdirs — orders of magnitude smaller than the full
+# session table. 10000 is therefore effectively never hit in practice; it is
+# a safety cap so a pathological upstream cannot exhaust memory. If the page
+# fills exactly, discovery is marked incomplete (see discovery_complete) so
+# the client degrades authoritativeDirectories instead of replace-all.
+_DISCOVERY_LIMIT = 10_000
+
 
 @router.get("/questions")
 async def questions(request: Request):
@@ -30,15 +39,26 @@ async def questions(request: Request):
     instance): it only returns questions for the directory routed via
     ``X-Opencode-Directory`` and falls back to ``process.cwd()`` with no
     header, so questions pending in OTHER directories are invisible. This
-    endpoint fans out across every discovered worktree (via the global
-    ``GET /project`` listing) and merges the results into a single envelope,
-    fixing the slim-mode cold-start regression where pending questions in a
-    workdir ≠ ``process.cwd()`` could not be seen.
+    endpoint fans out across every discovered workdir and merges the results
+    into a single envelope, fixing the slim-mode cold-start regression where
+    pending questions in a workdir ≠ ``process.cwd()`` could not be seen.
 
     Additive (re-add); **no** ``X-Slimapi-Version`` bump (still 2). Each
     question entry is the upstream entry verbatim plus a ``directory`` field
     stamped with the directory it was fetched from (field order: id,
     sessionID, questions, tool, then directory).
+
+    Discovery source: ``GET /experimental/session?roots=true`` — opencode's
+    GLOBAL top-level session list (cross all workdir instances; ``roots=true``
+    ⇒ ``parentID==null`` only). Each session carries its REAL ``directory``
+    field (the workdir it was created in). This is preferred over
+    ``GET /project`` because ``/project``'s ``worktree`` normalizes non-git
+    workdirs to ``"/"`` (synthetic global project, ``project.ts`` resolve()
+    non-git branch) — silently dropping pending questions from non-git
+    workdirs (custom working dirs, ``/tmp`` scratch dirs) AND git-worktree
+    subdirs. The session ``directory`` covers git repos, non-git dirs, and
+    git-worktree subdirs alike. (Mirrors qq-ocbot's proven
+    ``fetch_questions`` discovery approach.)
 
     Envelope (always 200 on the happy/partial path):
 
@@ -62,24 +82,46 @@ async def questions(request: Request):
       non-listed/undiscovered dirs as "keep local" (partial-replace, no data
       loss). On discovery truncation this array protects the client from
       discarding pending questions in undiscovered directories.
-    - ``discoveryComplete`` (additive diagnostic): always ``true`` —
-      ``GET /project`` returns ProjectTable in full with no pagination, so
-      discovery is never truncated. Client may ignore if absent-aware.
+    - ``discoveryComplete`` (additive diagnostic): ``true`` unless the
+      ``GET /experimental/session?roots=true&archived=true`` discovery page
+      filled exactly at ``_DISCOVERY_LIMIT`` (possible truncation). ``roots=true``
+      returns only top-level sessions (count ≈ distinct workdirs), so in
+      practice it is effectively always ``true``. Client may ignore if
+      absent-aware. Discovery includes archived sessions (``archived=true``)
+      so a workdir whose top-level sessions are all archived but whose
+      instance still holds pending questions is NOT dropped (``/question`` is
+      an in-memory store independent of archive state).
 
-    Total failure (cannot list projects to discover worktrees): HTTP 503
-    ``{"code": "upstream_unavailable"}`` (no envelope).
+    Total failure (cannot list top-level sessions to discover workdirs):
+    HTTP 503 ``{"code": "upstream_unavailable"}`` (no envelope).
     """
     upstream_client = request.app.state.upstream
 
     # ------------------------------------------------------------------
-    # Step 1: discover directories via GET /project (returns ProjectTable
-    # 全表 — 跨所有 workdir, 与 directory header 无关). This is the GLOBAL
-    # discovery source. The previous implementation used GET /session which
-    # is per-Location and could only see the cwd workdir's sessions, silently
-    # dropping pending questions from every other workdir.
+    # Step 1: discover directories via GET /experimental/session?roots=true
+    # &archived=true — the GLOBAL top-level session list (cross all workdir
+    # instances, roots=true ⇒ parentID==null only). Each session carries its
+    # REAL `directory` field (the workdir it was created in). This replaces
+    # the former GET /project discovery: /project's `worktree` normalizes
+    # non-git workdirs to "/" (synthetic global project), silently dropping
+    # their pending questions — non-git working dirs (e.g. custom dirs,
+    # /tmp scratch) and git-worktree subdirs were invisible. The session
+    # `directory` covers all of them. (Same approach as qq-ocbot's
+    # fetch_questions.) archived=true makes discovery a SUPERSET (includes
+    # archived sessions) so a workdir whose top-level sessions are all
+    # archived but whose instance still holds pending questions is not
+    # dropped — /question is an in-memory store independent of archive
+    # state, so at worst we fan out to a dead instance (isolated errors[]).
     # ------------------------------------------------------------------
     try:
-        response = await upstream_client.get("/project")
+        response = await upstream_client.get(
+            "/experimental/session",
+            params={
+                "roots": "true",
+                "archived": "true",
+                "limit": _DISCOVERY_LIMIT,
+            },
+        )
     except httpx.RequestError as exc:
         raise CodedHTTPException(503, code="upstream_unavailable") from exc
     # Traffic accounting: discovery upstream body.
@@ -91,31 +133,32 @@ async def questions(request: Request):
         # the client about which directory failed.
         raise CodedHTTPException(503, code="upstream_unavailable")
     try:
-        projects_payload = response.json()
+        sessions_payload = response.json()
     except Exception as exc:
         raise CodedHTTPException(503, code="upstream_unavailable") from exc
-    if not isinstance(projects_payload, list):
+    if not isinstance(sessions_payload, list):
         raise CodedHTTPException(503, code="upstream_unavailable")
 
-    # /project has no pagination — ProjectTable is returned in full, so
-    # discovery is always complete (no truncation possible). The
-    # discoveryComplete field is retained in the envelope for backward
-    # compatibility and is always True.
-    discovery_complete = True
+    # /experimental/session honors `limit`; detect truncation so the client
+    # can degrade authoritativeDirectories (avoid replace-all dropping
+    # pending questions in undiscovered dirs). roots=true returns only
+    # top-level sessions (count ≈ distinct workdirs), so _DISCOVERY_LIMIT is
+    # effectively never hit in practice — but guard it for correctness.
+    discovery_complete = len(sessions_payload) < _DISCOVERY_LIMIT
 
     # ------------------------------------------------------------------
-    # Step 2: derive the DISTINCT set of worktree values (first-seen
-    # order). Skip the synthetic "global" project (worktree "/") which has
-    # no real sessions/questions, and skip non-string/empty worktrees
-    # defensively.
+    # Step 2: derive the DISTINCT set of workdir directories (first-seen
+    # order) from each session's REAL `directory` field. Unlike /project's
+    # `worktree` (which normalizes non-git workdirs to "/" and must be
+    # skipped), the session `directory` is always a real path — no
+    # synthetic-global skip is needed. Skip non-string/empty defensively.
     # ------------------------------------------------------------------
     directories: list[str] = list(dict.fromkeys(
-        p["worktree"]
-        for p in projects_payload
-        if isinstance(p, dict)
-           and isinstance(p.get("worktree"), str)
-           and p["worktree"]
-           and p["worktree"] != "/"
+        s["directory"]
+        for s in sessions_payload
+        if isinstance(s, dict)
+           and isinstance(s.get("directory"), str)
+           and s["directory"]
     ))
 
     # ------------------------------------------------------------------
