@@ -5,9 +5,10 @@ import asyncio
 import httpx
 import orjson
 from fastapi import APIRouter, Request
+from starlette.responses import Response
 
 from ..errors import CodedHTTPException
-from ..gzip_util import json_response
+from ..gzip_util import compress_if_beneficial
 from ..traffic import stash_up_in
 from ..transform import read_with_cap
 from ..upstream import forward_directory_headers
@@ -22,6 +23,14 @@ router = APIRouter(prefix="/slimapi", tags=["questions"])
 # production; modern asyncio.Semaphore does not bind a loop at construction).
 _FANOUT_CONCURRENCY = 16
 _fanout_sem = asyncio.Semaphore(_FANOUT_CONCURRENCY)
+
+# P1-28: aggregate item budget. Each per-dir /question response is capped by
+# max_response_bytes, but items.extend() across all dirs can accumulate far
+# beyond a single dir's cap (10k dirs × cap). Once the merged item count
+# exceeds this safety limit, further dirs are skipped and the envelope is
+# marked ``truncated: true`` (additive diagnostic — client degrades to
+# partial-replace, same as discovery truncation).
+_MAX_AGGREGATE_ITEMS = 10_000
 
 # Page size for the GET /experimental/session?roots=true discovery call.
 # `roots=true` returns only top-level sessions (parentID==null), so the count
@@ -197,6 +206,7 @@ async def questions(request: Request):
     items: list[dict] = []
     errors: list[dict] = []
     succeeded: list[str] = []
+    truncated = False
     for directory, result in zip(directories, results):
         # _fetch_questions_for_dir catches httpx.RequestError internally, but
         # guard against any unexpected exception so one bad dir cannot abort
@@ -211,6 +221,12 @@ async def questions(request: Request):
         if error_code is not None:
             errors.append({"directory": directory, "code": error_code})
             continue
+        # P1-28: aggregate item budget — stop extending once the merged list
+        # exceeds the safety cap. Remaining dirs are not collected into
+        # succeeded[] so authoritativeDirectories degrades to partial-replace.
+        if len(items) + len(dir_items) > _MAX_AGGREGATE_ITEMS:
+            truncated = True
+            break
         items.extend(dir_items)
         succeeded.append(directory)
 
@@ -219,19 +235,48 @@ async def questions(request: Request):
     # complete discovery (replace-all for the client). On truncation or any
     # per-dir error, emit the succeeded-directory list (partial-replace) so
     # the client never discards pending questions from undiscovered/failed
-    # directories.
+    # directories. Aggregate truncation (P1-28) also forces partial-replace.
     # ------------------------------------------------------------------
-    authoritative = None if (not errors and discovery_complete) else succeeded
+    authoritative = (
+        None
+        if (not errors and discovery_complete and not truncated)
+        else succeeded
+    )
     envelope = {
         "items": items,
         "errors": errors,
         "authoritativeDirectories": authoritative,
         "discoveryComplete": discovery_complete,
     }
-    return json_response(
-        envelope,
+    if truncated:
+        envelope["truncated"] = True
+    # P1-28: offload orjson.dumps + gzip to the transform pool's executor so
+    # serialising a large aggregation does not block the event loop (SSE
+    # heartbeats, other light async work). No admission acquisition — the
+    # aggregation is already memory-bounded by _MAX_AGGREGATE_ITEMS and the
+    # per-dir cap; the offload is purely about CPU-bound serialisation.
+    pool = request.app.state.transforms
+    encoded, extra = await pool.offload(
+        _pack_questions_envelope, envelope,
         accept_encoding=request.headers.get("accept-encoding"),
     )
+    return Response(
+        encoded, status_code=200, media_type="application/json", headers=extra,
+    )
+
+
+def _pack_questions_envelope(
+    envelope: dict, *, accept_encoding: str | None,
+) -> tuple[bytes, dict[str, str]]:
+    """Worker entrypoint (P1-28): serialise the questions envelope + optional gzip.
+
+    Offloaded to the transform executor so a large aggregation's
+    ``orjson.dumps`` + ``gzip`` does not block the event loop while SSE
+    heartbeats are pending. Uses :func:`compress_if_beneficial` (P1-31) so
+    small/incompressible envelopes skip gzip.
+    """
+    encoded = orjson.dumps(envelope)
+    return compress_if_beneficial(encoded, accept_encoding)
 
 
 async def _fetch_questions_for_dir(

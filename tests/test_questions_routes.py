@@ -1148,3 +1148,99 @@ async def test_per_dir_cap_exceeded_errors_that_dir(upstream_factory):
     assert len(body["errors"]) == 1
     assert body["errors"][0] == {"directory": "/b", "code": "upstream_unavailable"}
     assert body["authoritativeDirectories"] == ["/a"]
+
+
+# ---------------------------------------------------------------------------
+# P1-28: aggregate item budget + serialise offload
+# ---------------------------------------------------------------------------
+
+
+async def test_aggregate_truncation_marks_envelope(upstream_factory, monkeypatch):
+    """When the merged item count exceeds _MAX_AGGREGATE_ITEMS, the envelope
+    is marked ``truncated: true`` and authoritativeDirectories degrades to
+    the succeeded list (NOT null — partial-replace so the client does not
+    discard pending questions from skipped dirs)."""
+    # Set a tiny cap so we can trigger truncation with a small test.
+    monkeypatch.setattr(questions, "_MAX_AGGREGATE_ITEMS", 2)
+    dirs = ["/a", "/b", "/c"]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/experimental/session":
+            return httpx.Response(
+                200, content=_sessions_body(*dirs),
+                headers={"Content-Type": "application/json"},
+            )
+        if request.url.path == "/question":
+            d = request.headers.get("x-opencode-directory")
+            return httpx.Response(
+                200, content=orjson.dumps([_question(f"que_{d[1:]}")]),
+                headers={"Content-Type": "application/json"},
+            )
+        return httpx.Response(404)
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream)
+    transport = httpx.ASGITransport(app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/slimapi/questions", headers=VERSION_HEADERS)
+    assert response.status_code == 200
+    body = response.json()
+    # Items from /a and /b fill the cap (2); /c is skipped.
+    assert len(body["items"]) <= 2
+    assert body.get("truncated") is True
+    # Partial-replace: authoritative is the succeeded list, not null.
+    assert body["authoritativeDirectories"] is not None
+    assert body["errors"] == []
+
+
+async def test_no_truncation_when_under_budget(upstream_factory):
+    """Normal case: items under _MAX_AGGREGATE_ITEMS → no truncated field."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/experimental/session":
+            return httpx.Response(
+                200, content=_sessions_body("/a", "/b"),
+                headers={"Content-Type": "application/json"},
+            )
+        if request.url.path == "/question":
+            return httpx.Response(
+                200, content=orjson.dumps([_question("que")]),
+                headers={"Content-Type": "application/json"},
+            )
+        return httpx.Response(404)
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream)
+    transport = httpx.ASGITransport(app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/slimapi/questions", headers=VERSION_HEADERS)
+    assert response.status_code == 200
+    body = response.json()
+    assert "truncated" not in body
+
+
+async def test_serialise_offload_returns_valid_response(upstream_factory):
+    """P1-28: the final envelope serialisation is offloaded to the transform
+    executor. The response must still be valid JSON with the expected shape."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/experimental/session":
+            return httpx.Response(
+                200, content=_sessions_body("/a"),
+                headers={"Content-Type": "application/json"},
+            )
+        if request.url.path == "/question":
+            return httpx.Response(
+                200, content=orjson.dumps([_question("que_a")]),
+                headers={"Content-Type": "application/json"},
+            )
+        return httpx.Response(404)
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream)
+    transport = httpx.ASGITransport(app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/slimapi/questions", headers=VERSION_HEADERS)
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["items"]) == 1
+    assert body["items"][0]["directory"] == "/a"
+    assert body["authoritativeDirectories"] is None
