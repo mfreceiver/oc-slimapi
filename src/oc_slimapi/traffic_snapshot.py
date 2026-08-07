@@ -59,7 +59,7 @@ import logging
 import os
 import time
 import uuid
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -207,10 +207,6 @@ class TrafficSnapshotter:
                     exc_info=True,
                 )
 
-    def _daily_path(self) -> Path:
-        """Return the daily-rotated output path for today."""
-        return self._dir / f"{self._stem}-{date.today().isoformat()}.jsonl"
-
     def _path_repr(self) -> str:
         """Human-friendly representation of the path template."""
         return str(self._dir / f"{self._stem}.jsonl")
@@ -222,7 +218,19 @@ class TrafficSnapshotter:
         error).  Failures are logged as warnings but never propagated.
         Silent no-op when the ledger snapshot reports ``enabled=False``
         (safety net — returns ``True`` because nothing went wrong).
+
+        **Single time sample point (P1-26)**: the wall-clock ``now`` is
+        captured once at the top of the call and used to derive BOTH the
+        record's ``ts`` field AND the daily output path's date. Previously
+        these were two separate samples (``datetime.now()`` for ``ts`` and
+        ``date.today()`` for the path), which could straddle midnight and
+        assign a near-midnight frame to the wrong daily file (the ``ts``
+        field said day N+1 but the file name said day N). One sample
+        eliminates the cross-midnight mis-bucketing window.
         """
+        # Single sampling point for the whole frame.
+        now = datetime.now().astimezone()
+
         try:
             snap = self._ledger.snapshot()  # type: ignore[union-attr]
         except Exception:
@@ -236,7 +244,7 @@ class TrafficSnapshotter:
             return True
 
         record: dict[str, Any] = {
-            "ts": datetime.now().astimezone().isoformat(),
+            "ts": now.isoformat(),
             "bootTs": self._boot_ts,
             "runId": self._run_id,
             "uptimeS": time.monotonic() - self._start_monotonic,
@@ -247,7 +255,9 @@ class TrafficSnapshotter:
             "ratios": snap.get("ratios", {}),
         }
 
-        path = self._daily_path()
+        # Derive the daily path from the SAME `now` so the ts field and the
+        # file name always agree on a date (single sample point).
+        path = self._dir / f"{self._stem}-{now.date().isoformat()}.jsonl"
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
         except Exception:

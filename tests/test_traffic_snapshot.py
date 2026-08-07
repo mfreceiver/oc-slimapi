@@ -493,16 +493,31 @@ class TestDailyRotation:
     async def test_cross_day_rotation(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Frames across a date boundary land in different daily files."""
-        # Replace date.today with a controllable fake.
-        class _FakeDate(datetime.date):
-            _current = datetime.date(2026, 7, 29)
+        """Frames across a date boundary land in different daily files.
+
+        P1-26: the daily path is derived from the SAME single ``now`` sample
+        as the ``ts`` field, so we control that one sample point (a fake
+        ``datetime`` whose ``now()`` returns a controllable instant). This
+        more honestly exercises the single-sample-point invariant — both
+        the file name and the ``ts`` field move together when the clock
+        advances past midnight."""
+        # A controllable fake datetime: now() returns an aware datetime at
+        # midday on the controlled date so .date() is unambiguous. The fake
+        # subclasses datetime.datetime so isinstance checks and .astimezone()
+        # / .date() / .isoformat() all behave normally.
+        class _FakeDateTime(datetime.datetime):
+            _now = datetime.datetime(2026, 7, 29, 12, 0, 0).astimezone()
 
             @classmethod
-            def today(cls):
-                return cls._current
+            def now(cls, tz=None):
+                # Return an aware datetime regardless of the tz arg; the
+                # snapshotter calls datetime.now().astimezone() and the
+                # .astimezone() on an already-aware datetime is idempotent.
+                return cls._now
 
-        monkeypatch.setattr("oc_slimapi.traffic_snapshot.date", _FakeDate)
+        monkeypatch.setattr(
+            "oc_slimapi.traffic_snapshot.datetime", _FakeDateTime
+        )
 
         path = str(tmp_path / "snap.jsonl")
         ledger = _make_ledger_with_data()
@@ -512,7 +527,7 @@ class TestDailyRotation:
         await asyncio.sleep(0.06)
 
         # Advance to next day.
-        _FakeDate._current = datetime.date(2026, 7, 30)
+        _FakeDateTime._now = datetime.datetime(2026, 7, 30, 12, 0, 0).astimezone()
         await asyncio.sleep(0.06)
 
         await snap.stop()  # writes to snap-2026-07-30.jsonl
@@ -526,6 +541,11 @@ class TestDailyRotation:
         lines2 = [json.loads(l) for l in day2.read_text().splitlines() if l.strip()]
         assert len(lines1) >= 1
         assert len(lines2) >= 1
+        # P1-26: each frame's ts date agrees with the file it landed in.
+        for frame in lines1:
+            assert frame["ts"].startswith("2026-07-29")
+        for frame in lines2:
+            assert frame["ts"].startswith("2026-07-30")
 
 
 # ---------------------------------------------------------------------------
@@ -659,6 +679,75 @@ class TestSingleWriteAtomicity:
         for line in raw_after.splitlines():
             if line.strip():
                 json.loads(line)
+
+
+# ---------------------------------------------------------------------------
+# P1-26: single time sample point — ts and path date agree across midnight
+# ---------------------------------------------------------------------------
+
+
+class TestSingleTimeSamplePoint:
+    """P1-26: ``ts`` field and the daily path's date are derived from ONE
+    ``now`` sample, so a frame can never have its ts disagree with its file.
+    """
+
+    async def test_ts_date_matches_filename(self, tmp_path: Path) -> None:
+        """Every frame's ts date equals the date embedded in its filename."""
+        path = str(tmp_path / "snap.jsonl")
+        ledger = _make_ledger_with_data()
+        snap = TrafficSnapshotter(ledger=ledger, interval_s=0.05, path=path)
+
+        await snap.start()
+        await asyncio.sleep(0.08)
+        await snap.stop()
+
+        daily = _snapshot_path(path)
+        assert daily.exists()
+        for line in daily.read_text().splitlines():
+            if not line.strip():
+                continue
+            frame = json.loads(line)
+            ts_date = frame["ts"][:10]  # YYYY-MM-DD prefix of the ISO ts
+            # Filename embeds the date as <stem>-YYYY-MM-DD.jsonl
+            embedded = daily.name.split("-", 1)[1].rsplit(".jsonl", 1)[0]
+            assert ts_date == embedded, (
+                f"P1-26 violation: ts date {ts_date} != file date {embedded}"
+            )
+
+    async def test_single_sample_not_two(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """P1-26: ``datetime.now()`` is called exactly ONCE per frame (not
+        once for ts and again for the path). ``datetime.datetime`` is an
+        immutable type, so we replace the module-level ``datetime`` binding
+        with a fake whose ``now()`` counts calls.
+
+        The snapshotter is constructed BEFORE the patch so its ``__init__``
+        bootTs sample (which legitimately uses now() once, for a different
+        purpose) does not pollute the per-frame count."""
+        import oc_slimapi.traffic_snapshot as mod
+
+        path = str(tmp_path / "snap.jsonl")
+        ledger = _make_ledger_with_data()
+        snap = TrafficSnapshotter(ledger=ledger, interval_s=300, path=path)
+
+        real_datetime = mod.datetime
+        now_calls: list[int] = [0]
+
+        class _CountingDateTime(real_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                now_calls[0] += 1
+                return real_datetime.now(tz) if tz is not None else real_datetime.now()
+
+        monkeypatch.setattr(mod, "datetime", _CountingDateTime)
+
+        result = snap._write_once()
+        assert result is True
+        # Exactly one now() sample for the whole frame (ts + path together).
+        assert now_calls[0] == 1, (
+            f"P1-26 violation: expected 1 now() call, got {now_calls[0]}"
+        )
 
 
 # ---------------------------------------------------------------------------
