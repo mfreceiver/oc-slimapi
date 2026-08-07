@@ -285,3 +285,77 @@ def test_validate_accepts_server_version_at_range_boundaries():
     """server_api_version == minimum and == maximum are both valid."""
     _base(server_api_version=2, accepted_client_versions=(2, 4)).validate()
     _base(server_api_version=4, accepted_client_versions=(2, 4)).validate()
+
+
+# ---------------------------------------------------------------------------
+# P1-40: deployment revision error observability — distinguish unset / not-
+# found (silent None) from permission / encoding errors (warning + None).
+# Whitespace-only values (env or file) → None.
+# ---------------------------------------------------------------------------
+
+def test_deployment_revision_from_env():
+    s = _base(deployment_revision="abc123", deployment_revision_file=None)
+    assert s.read_deployment_revision() == "abc123"
+
+
+def test_deployment_revision_env_stripped():
+    s = _base(deployment_revision="  abc123  ", deployment_revision_file=None)
+    assert s.read_deployment_revision() == "abc123"
+
+
+def test_deployment_revision_env_whitespace_only_falls_through(tmp_path):
+    """Whitespace-only env value should be treated as unset → fall through to file."""
+    rev_file = tmp_path / "rev"
+    rev_file.write_text("from-file\n")
+    s = _base(deployment_revision="   ", deployment_revision_file=str(rev_file))
+    assert s.read_deployment_revision() == "from-file"
+
+
+def test_deployment_revision_unset_and_no_file():
+    s = _base(deployment_revision=None, deployment_revision_file=None)
+    assert s.read_deployment_revision() is None
+
+
+def test_deployment_revision_from_file(tmp_path):
+    rev_file = tmp_path / "rev"
+    rev_file.write_text("  deadbeef  \n")
+    s = _base(deployment_revision=None, deployment_revision_file=str(rev_file))
+    assert s.read_deployment_revision() == "deadbeef"
+
+
+def test_deployment_revision_file_not_found_silent(tmp_path):
+    """FileNotFoundError → silent None (no warning)."""
+    s = _base(deployment_revision=None, deployment_revision_file=str(tmp_path / "nope"))
+    assert s.read_deployment_revision() is None
+
+
+def test_deployment_revision_file_empty_returns_none(tmp_path):
+    rev_file = tmp_path / "rev"
+    rev_file.write_text("   \n  ")
+    s = _base(deployment_revision=None, deployment_revision_file=str(rev_file))
+    assert s.read_deployment_revision() is None
+
+
+def test_deployment_revision_permission_error_warns(tmp_path, caplog):
+    """PermissionError → best-effort None but a warning is logged (observability)."""
+    rev_file = tmp_path / "rev"
+    rev_file.write_text("secret")
+    rev_file.chmod(0o000)
+    try:
+        s = _base(deployment_revision=None, deployment_revision_file=str(rev_file))
+        with caplog.at_level("WARNING"):
+            result = s.read_deployment_revision()
+        assert result is None
+        assert any("deployment revision" in r.message for r in caplog.records)
+    finally:
+        rev_file.chmod(0o644)  # restore so tmp_path cleanup works
+
+
+def test_deployment_revision_credentials_directory_fallback(tmp_path, monkeypatch):
+    creds = tmp_path / "creds"
+    creds.mkdir()
+    rev_file = creds / "deployment-revision"
+    rev_file.write_text("fallback-rev")
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(creds))
+    s = _base(deployment_revision=None, deployment_revision_file=None)
+    assert s.read_deployment_revision() == "fallback-rev"

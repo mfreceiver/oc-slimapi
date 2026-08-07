@@ -298,21 +298,41 @@ class Settings:
 
     def read_deployment_revision(self) -> str | None:
         """Best-effort deployment revision (env or file). Returns None if unset.
-        Swallows read errors (non-fatal — health simply omits the field)."""
+
+        Distinguishes *unset / file-not-found* (silent ``None`` — the field
+        is simply omitted from health) from *permission / encoding / path*
+        errors (a one-shot warning preserves observability for the operator).
+        Whitespace-only values (env or file) are treated as empty → ``None``
+        rather than returning an empty string.
+        """
         # env wins; else file (support CREDENTIALS_DIRECTORY fallback);
-        # strip whitespace; no length requirement (it's a deploy label, not a secret).
+        # strip whitespace before emptiness check (P1-40: whitespace-only env
+        # value was previously returned as "").
         value: str | None = self.deployment_revision
-        if value:
-            return value.strip()
+        if value is not None:
+            stripped = value.strip()
+            if stripped:
+                return stripped
         path = self.deployment_revision_file
         if path is None and os.getenv("CREDENTIALS_DIRECTORY"):
             path = str(Path(os.environ["CREDENTIALS_DIRECTORY"]) / "deployment-revision")
         if not path:
             return None
         try:
-            return Path(path).read_text().strip()
-        except Exception:
+            content = Path(path).read_text()
+        except FileNotFoundError:
+            # Unset / not-yet-created — silent.
             return None
+        except (PermissionError, UnicodeDecodeError, OSError) as exc:
+            # Non-trivial error — best-effort None but preserve observability
+            # so an operator can diagnose a misconfigured path / permission.
+            from .logging_config import get_logger
+            get_logger("config").warning(
+                "failed to read deployment revision from %r: %s", path, exc,
+            )
+            return None
+        stripped = content.strip()
+        return stripped if stripped else None
 
     def validate(self) -> None:
         # Bind host: loopback is the safe default; ``0.0.0.0`` is allowed as a
