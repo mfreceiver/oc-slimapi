@@ -226,8 +226,18 @@ def skeleton_part(part: dict[str, Any], *, budget: dict[str, int] | None = None)
 
 
 def skeleton_message(message: dict[str, Any]) -> dict[str, Any]:
-    result = {"info": deepcopy(message.get("info", {}))}
-    source_parts = message.get("parts")
+    # P1-29: normalise nested fields defensively. A malformed upstream message
+    # where ``info`` is null or ``parts`` is a non-list (int/bool/string) would
+    # crash the projection: ``None.get("id")`` → AttributeError,
+    # ``for part in 1`` → TypeError. Normalise to safe defaults so a single bad
+    # message degrades to a placeholder rather than a 500.
+    info = message.get("info") if isinstance(message, dict) else None
+    if not isinstance(info, dict):
+        info = {}
+    result = {"info": deepcopy(info)}
+    parts = message.get("parts") if isinstance(message, dict) else None
+    if not isinstance(parts, list):
+        parts = []
     # Per-message cumulative inline-byte budget shared across all parts in part
     # order. Bounds total inlined output/error so a single message cannot
     # balloon even when many small fields each individually pass the per-field
@@ -235,7 +245,7 @@ def skeleton_message(message: dict[str, Any]) -> dict[str, Any]:
     budget = {"used": 0}
     thin_parts = [
         skeleton_part(part, budget=budget)
-        for part in source_parts or [] if isinstance(part, dict)
+        for part in parts if isinstance(part, dict)
     ]
     if not any(_is_renderable(part) for part in thin_parts):
         message_id = result["info"].get("id", "unknown")

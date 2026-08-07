@@ -116,6 +116,66 @@ def test_empty_parts_receive_renderable_placeholder():
     }]
 
 
+# ---------------------------------------------------------------------------
+# P1-29: nested type defense — malformed upstream messages (info=None,
+# parts=int/bool/string) must not crash skeleton_message. A single bad
+# message degrades to a placeholder rather than a 500.
+# ---------------------------------------------------------------------------
+
+def test_skeleton_message_with_null_info_normalises_to_empty():
+    """info=None → normalised to {} → placeholder uses 'unknown' id."""
+    result = skeleton_messages([{"info": None, "parts": []}])
+    assert result[0]["info"] == {}
+    assert result[0]["parts"][0]["id"] == "thin_placeholder_unknown"
+
+
+def test_skeleton_message_with_missing_info_normalises():
+    """No info key at all → normalised to {}."""
+    result = skeleton_messages([{"parts": []}])
+    assert result[0]["info"] == {}
+    assert result[0]["parts"][0]["messageID"] == "unknown"
+
+
+def test_skeleton_message_with_non_dict_info_normalises():
+    """info is a string/list/int → normalised to {}."""
+    for bad_info in ("not-a-dict", [1, 2], 42, True):
+        result = skeleton_messages([{"info": bad_info, "parts": []}])
+        assert result[0]["info"] == {}
+
+
+def test_skeleton_message_with_non_list_parts_normalises():
+    """parts is an int/bool/string (not None, not list) → normalised to []."""
+    for bad_parts in (1, True, "not-a-list", 3.14):
+        result = skeleton_messages([{"info": {"id": "m1"}, "parts": bad_parts}])
+        # Normalised to [] → no renderable parts → placeholder appended.
+        assert len(result[0]["parts"]) == 1
+        assert result[0]["parts"][0]["type"] == "text"
+        assert result[0]["parts"][0]["messageID"] == "m1"
+
+
+def test_skeleton_message_with_null_parts_normalises():
+    """parts=None → normalised to [] → placeholder."""
+    result = skeleton_messages([{"info": {"id": "m1"}, "parts": None}])
+    assert len(result[0]["parts"]) == 1
+    assert result[0]["parts"][0]["id"] == "thin_placeholder_m1"
+
+
+def test_skeleton_messages_mixed_good_and_bad():
+    """A bad message among good ones doesn't crash the batch — it degrades
+    to a placeholder while good messages project normally."""
+    source = [
+        {"info": {"id": "good"}, "parts": [{"type": "text", "text": "hi", "id": "p1", "messageID": "good"}]},
+        {"info": None, "parts": 1},  # bad: both info and parts malformed
+        {"info": {"id": "good2"}, "parts": [{"type": "text", "text": "hi2", "id": "p2", "messageID": "good2"}]},
+    ]
+    result = skeleton_messages(source)
+    assert len(result) == 3
+    assert result[0]["parts"][0]["text"] == "hi"
+    assert result[1]["info"] == {}
+    assert result[1]["parts"][0]["id"] == "thin_placeholder_unknown"
+    assert result[2]["parts"][0]["text"] == "hi2"
+
+
 def test_golden_skeleton_is_bounded_by_the_content_preservation_floor():
     raw, source = load_fixture()
     encoded = orjson.dumps(skeleton_messages(source))

@@ -336,7 +336,7 @@ async def messages(
                         _project_list_sorted_and_pack, body,
                         accept_encoding=request.headers.get("accept-encoding"),
                     )
-                except (orjson.JSONDecodeError, ValueError) as exc:
+                except (orjson.JSONDecodeError, ValueError, TypeError, AttributeError) as exc:
                     raise CodedHTTPException(
                         503, code="upstream_unavailable",
                     ) from exc
@@ -443,7 +443,7 @@ async def message(
                         strip_diagnostics_and_pack, body,
                         accept_encoding=accept_encoding,
                     )
-                except (orjson.JSONDecodeError, ValueError) as exc:
+                except (orjson.JSONDecodeError, ValueError, TypeError, AttributeError) as exc:
                     raise CodedHTTPException(
                         503, code="upstream_unavailable",
                     ) from exc
