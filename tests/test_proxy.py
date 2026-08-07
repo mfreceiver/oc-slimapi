@@ -710,3 +710,67 @@ async def test_catch_all_preserves_duplicate_set_cookie(upstream_factory):
     raw_set_cookie = response.headers.get("set-cookie", "")
     assert "session=abc" in raw_set_cookie
     assert "token=xyz" in raw_set_cookie
+
+
+# ── P1-12: timeout classification is trailing-sash tolerant ──────────────────
+
+
+@pytest.mark.parametrize("path,expected_read_timeout", [
+    # baseline: non-SSE, non-command → 30s default
+    ("/session", 30.0),
+    # SSE: no trailing slash → read=None
+    ("/event", None),
+    ("/global/event", None),
+    # SSE: WITH trailing slash → previously 30s (bug), now None
+    ("/event/", None),
+    ("/global/event/", None),
+    # SSE: multiple trailing slashes → also tolerated
+    ("/event//", None),
+    # command: no trailing slash → 300s
+    ("/session/ses_x/command", 300.0),
+    # command: WITH trailing slash → previously 30s (bug), now 300s
+    ("/session/ses_x/command/", 300.0),
+])
+async def test_timeout_classification_trailing_slash_tolerant(
+    upstream_factory, path, expected_read_timeout,
+):
+    """P1-12: ``_normalize_path`` collapses ``//`` but does NOT strip a
+    trailing slash, so ``/event/`` / ``/command/`` previously fell through
+    to the 30s default — risking long-connection kills (SSE read None,
+    command 300s). The classification now rstrip('/')s for the timeout
+    decision only; the forwarded path is unchanged.
+
+    We observe the ``read`` timeout that reaches the mock transport via
+    ``request.extensions['timeout']``.
+    """
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["timeout"] = request.extensions.get("timeout", {}).get("read")
+        captured["url_path"] = request.url.path
+        async def body():
+            yield b'{"ok":true}'
+        return httpx.Response(
+            200,
+            stream=httpx._content.AsyncIteratorByteStream(body()),
+            headers={"Content-Type": "application/json"},
+        )
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(path)
+
+    assert response.status_code == 200
+    # The timeout classification matches the expected value (None for SSE,
+    # 300s for command, 30s default).
+    assert captured["timeout"] == expected_read_timeout, (
+        f"path {path!r}: expected read={expected_read_timeout!r}, "
+        f"got {captured['timeout']!r}"
+    )
+    # Sanity: the FORWARD path is whatever the client sent (modulo the
+    # ``//`` collapse in _normalize_path). P1-12 only changes classification.
+    # ``request.url.path`` here is what the mock upstream received.
+    # We don't over-assert path equality — the trailing-slash collapse is
+    # explicitly NOT applied to the forward path.

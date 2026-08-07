@@ -204,8 +204,16 @@ def install_proxy(app: FastAPI) -> None:
             headers=proxy_headers,
             content=_counted_req_stream(),
         )
-        is_sse = norm_path in {"/event", "/global/event"}
-        is_command = norm_path.endswith("/command")
+        # P1-12: timeout classification must be trailing-slash tolerant.
+        # ``_normalize_path`` collapses ``//`` but does NOT strip a trailing
+        # slash, so ``/event/`` / ``/session/.../command/`` previously fell
+        # through to the 30s default — risking long-connection kills (SSE
+        # read None, command 300s). Compute a slash-collapsed view used ONLY
+        # for classification; the upstream forward path stays ``norm_path``
+        # so the actual URL the upstream sees is unchanged.
+        classified = norm_path.rstrip("/") or "/"
+        is_sse = classified in {"/event", "/global/event"}
+        is_command = classified.endswith("/command")
         upstream_request.extensions["timeout"] = {
             "connect": 5.0,
             "read": None if is_sse else (300.0 if is_command else 30.0),
