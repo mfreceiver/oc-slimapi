@@ -11,7 +11,6 @@ from starlette.responses import Response
 from ..errors import CodedHTTPException
 from ..gzip_util import compress_if_beneficial, error_response
 from ..skeleton import skeleton_messages
-from ..traffic import stash_up_in
 from ..transform import (
     TransformBusy,
     read_with_cap,
@@ -21,9 +20,9 @@ from ..upstream import (
     forward_directory_headers,
 )
 from ..upstream_errors import (
-    raise_upstream_status_code,
     raise_upstream_unavailable,
 )
+from ._catalog_common import read_upstream_response
 from ..directory import validate_directory
 
 router = APIRouter(prefix="/slimapi/messages/{sid}", tags=["messages"])
@@ -290,32 +289,14 @@ async def messages(
             )
             next_cursor: str | None = None
             try:
-                try:
-                    if response.status_code >= 400:
-                        # Drain upstream error body for connection reuse.
-                        body = await response.aread()
-                        stash_up_in(request, len(body))
-                        # Contract §7: map upstream errors to structured codes
-                        # (404+sid → session_not_found; other 4xx →
-                        # upstream_http_N; 5xx → upstream_unavailable).
-                        raise_upstream_status_code(
-                            response.status_code, sid=sid,
-                        )
-                    # on_read stashes each chunk as it is pulled so a
-                    # mid-stream httpx.RequestError cannot lose already-read
-                    # bytes from upIn (P0-9); success/cap paths are additive
-                    # equivalents of the old post-call stash (B1).
-                    body, _ = await read_with_cap(
-                        response, config.max_response_bytes,
-                        on_read=lambda n: stash_up_in(request, n),
-                    )
-                except httpx.RequestError as exc:
-                    # Wrap mid-stream upstream I/O failures (aread drain or
-                    # read_with_cap aiter_bytes) into a structured 503 instead
-                    # of bubbling up as an unhandled FastAPI 500 (P1-24 —
-                    # aligns the list branch with /full, sessions, catalog).
-                    # Already-read bytes were stashed via on_read above.
-                    raise_upstream_unavailable(exc)
+                # Shared drain-or-cap-read skeleton (status mapping with sid +
+                # read_with_cap + mid-stream RequestError → 503).
+                body = await read_upstream_response(
+                    request, response,
+                    cap=config.max_response_bytes,
+                    read_with_cap=read_with_cap,
+                    sid=sid,
+                )
                 if body is None:
                     return error_response(
                         "response_too_large", 413,
@@ -396,34 +377,16 @@ async def message(
                 raise_upstream_unavailable(exc)
             status_code = 200
             try:
-                # Wrap mid-stream upstream I/O failures (httpx.RequestError
-                # raised by _drain_error.aread() or read_with_cap
-                # .aiter_bytes()) into a structured 503 instead of bubbling
-                # up as an unhandled FastAPI 500. The finally below still
-                # runs to release the connection.
-                try:
-                    if response.status_code >= 400:
-                        # Drain upstream error body for connection reuse.
-                        body = await response.aread()
-                        stash_up_in(request, len(body))
-                        # Contract §7: map upstream errors to structured codes
-                        # (404+sid → session_not_found; other 4xx →
-                        # upstream_http_N; 5xx → upstream_unavailable).
-                        raise_upstream_status_code(
-                            response.status_code, sid=sid,
-                        )
-                    # Contract §2: /full/{mid} always returns 200 on success.
-                    status_code = 200
-                    # on_read stashes each chunk so a mid-stream
-                    # httpx.RequestError cannot lose already-read bytes from
-                    # upIn (P0-9); success/cap paths are additive
-                    # equivalents of the old post-call stash (B1).
-                    body, _ = await read_with_cap(
-                        response, config.max_message_bytes,
-                        on_read=lambda n: stash_up_in(request, n),
-                    )
-                except httpx.RequestError as exc:
-                    raise_upstream_unavailable(exc)
+                # Shared drain-or-cap-read skeleton (status mapping with sid +
+                # read_with_cap + mid-stream RequestError → 503). cap is the
+                # per-message limit (max_message_bytes), distinct from the
+                # list/catalog max_response_bytes.
+                body = await read_upstream_response(
+                    request, response,
+                    cap=config.max_message_bytes,
+                    read_with_cap=read_with_cap,
+                    sid=sid,
+                )
                 if body is None:
                     return error_response(
                         "message_too_large", 413,

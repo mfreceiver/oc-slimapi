@@ -85,6 +85,55 @@ async def stream_upstream(
         raise_upstream_unavailable(exc)
 
 
+async def read_upstream_response(
+    request: Request,
+    response: httpx.Response,
+    *,
+    cap: int,
+    read_with_cap,
+    sid: str | None = None,
+) -> bytes | None:
+    """Drain an error response OR cap-read the success body of a streaming
+    upstream ``response`` — the shared skeleton duplicated verbatim across
+    sessions / messages / catalog routes.
+
+    Does **not** close ``response`` — the caller owns ``await response.aclose()``
+    (typically in a ``finally`` block) so it can keep the response open across
+    any post-read offload, matching the existing control flow of every caller.
+
+    Behaviour (identical to the inlined chains it replaces):
+
+    * ``response.status_code >= 400`` → drain the error body (for connection
+      reuse), stash its length, then map via
+      :func:`raise_upstream_status_code` (``sid`` toggles the session-scoped
+      404 → ``session_not_found`` mapping).
+    * success → :func:`read_with_cap` with ``on_read=stash_up_in`` so a
+      mid-stream ``httpx.RequestError`` cannot lose already-read bytes from
+      ``upIn`` (P0-9).
+    * any ``httpx.RequestError`` from the drain ``aread()`` or from
+      ``read_with_cap``'s ``aiter_bytes()`` → 503 ``upstream_unavailable``
+      (structured, never a bare 500).
+
+    Returns the buffered body on success, or ``None`` when the cap was
+    exceeded (caller decides its own 413 shape — ``response_too_large`` vs
+    ``message_too_large``). ``read_with_cap`` is a parameter so test
+    monkey-patches on the route module (e.g. ``command.read_with_cap``) flow
+    through unchanged.
+    """
+    try:
+        if response.status_code >= 400:
+            err_body = await response.aread()
+            stash_up_in(request, len(err_body))
+            raise_upstream_status_code(response.status_code, sid=sid)
+        body, _ = await read_with_cap(
+            response, cap,
+            on_read=lambda n: stash_up_in(request, n),
+        )
+    except httpx.RequestError as exc:
+        raise_upstream_unavailable(exc)
+    return body
+
+
 def make_project_and_pack(
     project_fn,
     body: bytes,
@@ -139,29 +188,11 @@ async def handle_catalog_request(
     async with pool:
         response = await stream_upstream(request, upstream_path, directory, read_timeout)
         try:
-            try:
-                if response.status_code >= 400:
-                    # Drain upstream error body for connection reuse.
-                    body = await response.aread()
-                    stash_up_in(request, len(body))
-                    # No session-scoped 404 mapping (catalog endpoint);
-                    # 4xx -> 502 upstream_http_N, 5xx -> 503 upstream_unavailable.
-                    raise_upstream_status_code(response.status_code)
-                # on_read stashes each chunk so a mid-stream
-                # httpx.RequestError cannot lose already-read bytes from
-                # upIn (P0-9); success/cap paths are additive
-                # equivalents of the old post-call stash (B1).
-                body, _ = await read_with_cap(
-                    response, config.max_response_bytes,
-                    on_read=lambda n: stash_up_in(request, n),
-                )
-            except httpx.RequestError as exc:
-                # Wrap mid-stream upstream I/O failures (httpx.RequestError
-                # raised by the error-body drain aread() or read_with_cap
-                # aiter_bytes()) into a structured 503 instead of bubbling
-                # up as an unhandled FastAPI 500. The finally below still
-                # runs to release the connection.
-                raise_upstream_unavailable(exc)
+            body = await read_upstream_response(
+                request, response,
+                cap=config.max_response_bytes,
+                read_with_cap=read_with_cap,
+            )
             if body is None:
                 return error_response(
                     "response_too_large", 413,

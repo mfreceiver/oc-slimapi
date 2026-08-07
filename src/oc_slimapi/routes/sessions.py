@@ -12,6 +12,7 @@ from ..traffic import stash_up_in
 from ..transform import TransformBusy, read_with_cap
 from ..upstream import forward_directory_headers
 from ..upstream_errors import raise_upstream_status, raise_upstream_unavailable
+from ._catalog_common import read_upstream_response
 
 router = APIRouter(prefix="/slimapi", tags=["sessions"])
 
@@ -57,63 +58,43 @@ async def sessions(
             except httpx.RequestError as exc:
                 raise_upstream_unavailable(exc)
             try:
-                # Wrap mid-stream upstream I/O failures (httpx.RequestError
-                # raised by aread() or read_with_cap aiter_bytes()) into a
-                # structured 503 instead of bubbling up as an unhandled
-                # FastAPI 500. The finally below still runs to release the
-                # connection (mirrors messages.py).
+                # Shared drain-or-cap-read skeleton (status mapping +
+                # read_with_cap + mid-stream RequestError → 503); no sid
+                # here (list endpoint), so a 404 reports as
+                # upstream_http_404 like any other 4xx.
+                body = await read_upstream_response(
+                    request, response,
+                    cap=config.max_response_bytes,
+                    read_with_cap=read_with_cap,
+                )
+                if body is None:
+                    raise CodedHTTPException(
+                        413, code="response_too_large",
+                        limit=config.max_response_bytes,
+                    )
                 try:
-                    if response.status_code >= 400:
-                        # Drain upstream error body for connection reuse
-                        # (mirrors messages.py).
-                        err_body = await response.aread()
-                        stash_up_in(request, len(err_body))
-                        try:
-                            response.raise_for_status()
-                        except httpx.HTTPStatusError as exc:
-                            raise_upstream_status(exc)
-                    # on_read stashes each chunk so a mid-stream
-                    # httpx.RequestError cannot lose already-read bytes from
-                    # upIn (P0-9); success/cap paths are additive
-                    # equivalents of the old post-call stash (B1).
-                    body, _ = await read_with_cap(
-                        response, config.max_response_bytes,
-                        on_read=lambda n: stash_up_in(request, n),
-                    )
-                    if body is None:
-                        raise CodedHTTPException(
-                            413, code="response_too_large",
-                            limit=config.max_response_bytes,
-                        )
-                    try:
-                        payload = orjson.loads(body)
-                    except (orjson.JSONDecodeError, ValueError) as exc:
-                        raise_upstream_unavailable(exc)
-                    if not isinstance(payload, list):
-                        # v6 §1.1: dict / string / null etc. would have been silently
-                        # iterated by ``for item in payload`` and yielded a 200 with
-                        # ``X-Complete: true`` (the empty skeleton list). Treat non-list
-                        # bodies as a malformed upstream — same 503 as the sibling
-                        # ``response.json()`` failure path. No completeness headers on
-                        # this branch (the contract is: 200 only).
-                        raise_upstream_unavailable()
-                    if payload and not all(isinstance(s, dict) for s in payload):
-                        # Scalar-element list (e.g. [1, null, "x"]) would make
-                        # skeleton_session() call .get() on non-dict → AttributeError.
-                        # Mirrors messages list element-level guard (Task 1).
-                        raise_upstream_unavailable()
-                    # Offload skeleton projection to the worker so the event loop is
-                    # not blocked by deep copy of potentially many sessions.
-                    sessions = await pool.offload(
-                        _project_sessions,  # helper below
-                        payload,
-                    )
-                except httpx.RequestError as exc:
-                    # Covers: aread() mid-stream read failure (error body drain)
-                    # and read_with_cap() mid-stream read failure (success body).
-                    # send() connection failure is covered by the sibling except
-                    # above. All → structured 503.
+                    payload = orjson.loads(body)
+                except (orjson.JSONDecodeError, ValueError) as exc:
                     raise_upstream_unavailable(exc)
+                if not isinstance(payload, list):
+                    # v6 §1.1: dict / string / null etc. would have been silently
+                    # iterated by ``for item in payload`` and yielded a 200 with
+                    # ``X-Complete: true`` (the empty skeleton list). Treat non-list
+                    # bodies as a malformed upstream — same 503 as the sibling
+                    # ``response.json()`` failure path. No completeness headers on
+                    # this branch (the contract is: 200 only).
+                    raise_upstream_unavailable()
+                if payload and not all(isinstance(s, dict) for s in payload):
+                    # Scalar-element list (e.g. [1, null, "x"]) would make
+                    # skeleton_session() call .get() on non-dict → AttributeError.
+                    # Mirrors messages list element-level guard (Task 1).
+                    raise_upstream_unavailable()
+                # Offload skeleton projection to the worker so the event loop is
+                # not blocked by deep copy of potentially many sessions.
+                sessions = await pool.offload(
+                    _project_sessions,  # helper below
+                    payload,
+                )
             finally:
                 await response.aclose()
     except TransformBusy as exc:
