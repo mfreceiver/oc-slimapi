@@ -236,3 +236,69 @@ async def test_maintenance_cancelled_cleanly(monkeypatch, tmp_path):
     # would have hung (the test would time out).
     task = app.state._access_log_maintenance_task
     assert task.done()
+
+
+# ---------------------------------------------------------------------------
+# P1-39: access-log handler failure gate — maintenance suppressed when the
+# DailyAccessHandler install fails (directory not writable), even though
+# access_log_enabled is True in config.
+# ---------------------------------------------------------------------------
+
+async def test_access_log_setup_failure_suppresses_maintenance(monkeypatch, tmp_path):
+    """P1-39: when setup_access_log fails (logger.disabled), the maintenance
+    task must NOT be created and startup maintenance must NOT run."""
+    # A path that cannot be created (parent is a file, not a dir) forces
+    # setup_access_log to fail → logger.disabled = True.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a dir")
+    unwritable_dir = str(blocker / "subdir")
+
+    test_settings = _test_settings(tmp_path, access_log_dir=unwritable_dir)
+    monkeypatch.setattr("oc_slimapi.app.settings", test_settings)
+
+    async def _noop_smoke(app):
+        app.state.smoke_status = "not_run"
+        app.state.schema_degraded = False
+    monkeypatch.setattr("oc_slimapi.app.smoke", _noop_smoke)
+
+    def _mock_client(settings):
+        return httpx.AsyncClient(
+            base_url=settings.upstream,
+            transport=httpx.MockTransport(
+                lambda req: (_ for _ in ()).throw(httpx.ConnectError("no upstream"))
+            ),
+        )
+    monkeypatch.setattr("oc_slimapi.app.create_client", _mock_client)
+
+    app = FastAPI()
+    async with lifespan(app):
+        await asyncio.sleep(0.01)
+
+    # No maintenance task created.
+    assert not hasattr(app.state, "_access_log_maintenance_task")
+
+
+async def test_access_log_disabled_no_maintenance(monkeypatch, tmp_path):
+    """P1-39: access_log_enabled=False → no maintenance task (sanity check)."""
+    test_settings = _test_settings(tmp_path, access_log_enabled=False)
+    monkeypatch.setattr("oc_slimapi.app.settings", test_settings)
+
+    async def _noop_smoke(app):
+        app.state.smoke_status = "not_run"
+        app.state.schema_degraded = False
+    monkeypatch.setattr("oc_slimapi.app.smoke", _noop_smoke)
+
+    def _mock_client(settings):
+        return httpx.AsyncClient(
+            base_url=settings.upstream,
+            transport=httpx.MockTransport(
+                lambda req: (_ for _ in ()).throw(httpx.ConnectError("no upstream"))
+            ),
+        )
+    monkeypatch.setattr("oc_slimapi.app.create_client", _mock_client)
+
+    app = FastAPI()
+    async with lifespan(app):
+        await asyncio.sleep(0.01)
+
+    assert not hasattr(app.state, "_access_log_maintenance_task")

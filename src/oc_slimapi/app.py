@@ -183,7 +183,21 @@ async def lifespan(app: FastAPI):
     # token_hub AFTER hubs.
     # ------------------------------------------------------------------
     async with AsyncExitStack() as stack:
-        setup_access_log(enabled=settings.access_log_enabled, dir=access_log_dir)
+        access_logger = setup_access_log(
+            enabled=settings.access_log_enabled, dir=access_log_dir
+        )
+        # P1-39: gate maintenance on the ACTUAL install result, not the config
+        # flag. setup_access_log is best-effort — if the directory is not
+        # writable, it disables the logger (logger.disabled = True). Gating
+        # on settings.access_log_enabled alone would start a maintenance loop
+        # that repeatedly hits a failed directory (wasted IO + noise). Only
+        # run maintenance when the handler is actually live.
+        access_log_active = settings.access_log_enabled and not access_logger.disabled
+        if settings.access_log_enabled and not access_log_active:
+            get_logger("app").warning(
+                "access log enabled in config but handler install failed; "
+                "maintenance loop suppressed"
+            )
         # Close the access-log DailyAccessHandler so file handles flush +
         # release on graceful shutdown (re-init removes handlers, but a clean
         # lifespan shutdown should not rely on interpreter GC — 终审重要项).
@@ -200,9 +214,9 @@ async def lifespan(app: FastAPI):
                 pass
         stack.callback(_close_access_log_handlers)
         # Daily-rotation maintenance at startup (best-effort): migrate any
-        # legacy RotatingFileHandler files, compress non-today history, prune
+        # legacy RotatingFileHandler files, compress non-toay history, prune
         # by retain.
-        if settings.access_log_enabled:
+        if access_log_active:
             try:
                 migrate_legacy_access_log(access_log_dir)
                 if settings.access_log_compress_on_startup:
@@ -380,13 +394,15 @@ async def lifespan(app: FastAPI):
             settings.shell_deny_list_enabled,
             settings.token_stream_max_subscribers,
             settings.traffic_metrics_enabled,
-            access_log_dir if settings.access_log_enabled else "disabled",
+            access_log_dir if access_log_active else "disabled",
         )
         # Start background tasks after all state is wired. The access-log
         # maintenance loop (compress+prune) runs independent of restart so a
         # long-running process still compresses history; the snapshotter writes
         # its first frame immediately then ticks on interval.
-        if settings.access_log_enabled:
+        # P1-39: gate on access_log_active (actual install result) so a failed
+        # directory does not spawn a maintenance loop hitting a dead path.
+        if access_log_active:
             stop_event = asyncio.Event()
             app.state._access_log_stop_event = stop_event
             maint_task = asyncio.create_task(
