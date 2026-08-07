@@ -434,6 +434,31 @@ class TokenSubscriber:
         self.queue.put_runtime_terminal(STOP)
         return False
 
+    def terminate(self, reason: str) -> None:
+        """INV-4 (P0-3): server-side termination (session.deleted).
+
+        Mirrors the overflow termination idiom (closed=True →
+        clear_runtime → put_runtime_terminal(resync) →
+        put_runtime_terminal(STOP)) but WITHOUT bumping
+        forced_disconnects / dropped_frames_total — this is a clean
+        server-side close, not a backpressure disconnect. The generator
+        receives the resync frame (so the client learns WHY the stream
+        ended) then STOP (so the generator breaks → finally →
+        unsubscribe releases the slot / stops flush / arms grace).
+
+        Does NOT detach from the hub's fanout — :meth:`on_session_deleted`
+        relies on the sub still being in ``_subs_by_sid`` so the
+        generator's finally → :meth:`TokenStreamRegistry.unsubscribe`
+        sees ``has_subscriber() == True`` and runs the normal cleanup
+        path (detach + decrement + last-detach stop + grace arm).
+        """
+        self.closed = True
+        self.queue.clear_runtime()
+        self.queue.put_runtime_terminal(
+            _resync_frame(self.session_id, reason)
+        )
+        self.queue.put_runtime_terminal(STOP)
+
     def ack(self, frame: Any) -> None:
         """Decrement the byte ledger for a frame consumed via ``queue.get()``.
 

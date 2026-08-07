@@ -591,10 +591,38 @@ class TestOnSessionDeleted:
         assert "s1" not in th._session_status
         assert "s1" not in th._busy_sids
 
-    def test_records_pending_session_deleted_resync(self):
+    def test_terminates_subscribers_on_session_deleted(self):
+        """INV-4 (P0-3): on_session_deleted directly terminates subscribers
+        (resync{session_deleted} → STOP), not via the deferred flush-loop
+        resync queue. Test updated from test_records_pending_session_deleted_resync
+        because the behavior changed: _enqueue_session_resync is replaced by
+        direct sub.terminate."""
+        from oc_slimapi.sse.tokenstream.frames import STOP, _resync_frame
         th = TokenStreamHub()
+        # Attach a fake subscriber.
+        class _FakeSub:
+            def __init__(self):
+                self.session_id = "s1"
+                self.closed = False
+                self.frames = []
+                self._in_handshake = False
+            def begin_handshake(self): self._in_handshake = True
+            def end_handshake(self): self._in_handshake = False
+            def put(self, frame): self.frames.append(frame); return True
+            def terminate(self, reason):
+                self.closed = True
+                self.frames.append(_resync_frame(self.session_id, reason))
+                self.frames.append(STOP)
+        sub = _FakeSub()
+        th.attach_subscriber("s1", sub)
+        sub.frames.clear()
         th.on_session_deleted("s1")
-        assert th._pending_session_resinks == [("s1", "session_deleted")]
+        # No pending resync in the flush queue (old behavior removed).
+        assert th._pending_session_resinks == []
+        # Subscriber terminated directly.
+        assert sub.closed is True
+        resyncs = [f for f in sub.frames if isinstance(f, bytes) and b"resync" in f]
+        assert len(resyncs) == 1
 
     def test_does_not_touch_other_sessions(self):
         th = TokenStreamHub()
@@ -758,10 +786,16 @@ class TestTtlSweep:
 class TestOnUpstreamReconnectStageB:
     def test_clears_session_routing_state(self):
         """on_upstream_reconnect clears _session_status / _busy_sids /
-        _pending_session_resinks (Stage B extension to Stage A's clear)."""
+        _pending_session_resinks (Stage B extension to Stage A's clear).
+
+        Test updated: previously used on_session_deleted to populate
+        _pending_session_resinks, but INV-4 (P0-3) changed
+        on_session_deleted to directly terminate subscribers instead of
+        enqueueing a resync. Now uses on_session_status("idle") to
+        populate the resync queue."""
         th = TokenStreamHub()
         th.on_session_status("s1", "busy")
-        th.on_session_deleted("s2")
+        th.on_session_status("s2", "idle")  # enqueues ("s2", "session_idle")
         th.on_part_updated(_updated_props("s3", "m3", "p3", text=""))
         assert th._session_status
         assert th._busy_sids
@@ -822,7 +856,10 @@ class TestPublishSessionRouting:
             "sessionID": "s1",
         }))
         assert ("s1", "m1", "p1") not in th.live_parts
-        assert th._pending_session_resinks[-1] == ("s1", "session_deleted")
+        # INV-4: session.deleted no longer enqueues a flush-loop resync;
+        # it directly terminates subscribers. With no subscribers attached
+        # here, _pending_session_resinks stays empty.
+        assert th._pending_session_resinks == []
 
     async def test_no_token_hub_no_crash_on_session_status(self, bare_hub):
         """Without a token hub, session.status/deleted routing is a no-op."""

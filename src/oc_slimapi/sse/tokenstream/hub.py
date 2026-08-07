@@ -890,16 +890,24 @@ class TokenStreamHub:
         self._enqueue_session_resync(sid, "session_idle")
 
     def on_session_deleted(self, sid: str) -> None:
-        """Clear all state for a deleted session (§16-B).
+        """Clear all state for a deleted session (§16-B) + terminate token
+        subscribers (INV-4 / P0-3).
 
         WHY no separate ``reconnect_no_replay`` reason here: deleted
         sessions are signalled to clients via the existing control-plane
-        digest (``session.deleted`` in ``session.digest``). Token-stream
-        subscribers will be torn down by the Stage-D HTTP layer when they
-        try to read a deleted session; recording a ``session_deleted``
-        resync note lets the flush loop opportunistically nudge any
-        attached token subscriber, but the authoritative eviction path is
-        the control plane.
+        digest (``session.deleted`` in ``session.digest``).
+
+        INV-4 (P0-3): session.deleted is a **server-side termination signal**
+        for token subscribers. Each subscriber for this sid receives
+        ``resync{session_deleted} → STOP`` via :meth:`TokenSubscriber.terminate`.
+        The generator receives STOP → breaks → finally →
+        :meth:`TokenStreamRegistry.unsubscribe` (normal path: detach +
+        decrement + last-detach stop flush + grace arm). Previously only a
+        resync was enqueued via the flush loop (no STOP) — the subscriber
+        connection stayed open forever (resource leak). The direct
+        ``terminate`` replaces ``_enqueue_session_resync`` so the frames
+        are delivered immediately in the correct order (resync THEN STOP),
+        not deferred to the next flush tick where STOP could precede resync.
 
         WHY also clear ``_session_status`` / ``_busy_sids`` here (but NOT
         in ``_retire_session``): per spec ``_retire_session`` only owns
@@ -913,6 +921,12 @@ class TokenStreamHub:
         for this sid are left intact (their own TTL/cap will clean them
         up; tearing them down eagerly would surprise a reconnecting
         client that subscribed mid-deletion).
+
+        The hub does NOT detach subscribers or decrement the registry's
+        ``total_subscribers`` — the membership guard in
+        :meth:`TokenStreamRegistry.unsubscribe` relies on the sub still
+        being in the fanout so the generator's finally runs the normal
+        cleanup path.
         """
         self._retire_session(sid)
         self._session_status.pop(sid, None)
@@ -920,7 +934,11 @@ class TokenStreamHub:
         # CRITICAL 2 gate cleanup for this session.
         for key in [k for k in self._retired_messages if k[0] == sid]:
             self._retired_messages.discard(key)
-        self._enqueue_session_resync(sid, "session_deleted")
+        # INV-4 (P0-3): server-side termination — directly terminate each
+        # subscriber (resync{session_deleted} → STOP). Do NOT detach or
+        # decrement; the generator's finally → unsubscribe handles that.
+        for sub in tuple(self._subs_by_sid.get(sid, ())):
+            sub.terminate("session_deleted")
 
     def _retire_session(self, sid: str) -> None:
         """Clear the 4 part-state structures for a session (§16-B).

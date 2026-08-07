@@ -110,15 +110,17 @@ class _FakeSub:
 
     Mirrors the subset of ``hub.Subscriber`` / ``TokenSubscriber`` that
     TokenStreamHub calls: ``begin_handshake`` / ``end_handshake`` /
-    ``put`` / ``closed``. These four comprise the complete hub→sub
-    contract; the CRITICAL 3 handshake/runtime queue PHYSICAL separation
-    lives entirely INSIDE ``TokenSubscriber`` (its ``_SubscriberQueue``)
-    and is exercised by ``test_token_subscriber_overflow.py``, so this
-    stub does NOT need to mirror it — it just records the wire sequence
-    so hub-logic tests can assert on ordering / fanout shape.
+    ``put`` / ``closed`` / ``terminate``. These comprise the complete
+    hub→sub contract; the CRITICAL 3 handshake/runtime queue PHYSICAL
+    separation lives entirely INSIDE ``TokenSubscriber`` (its
+    ``_SubscriberQueue``) and is exercised by
+    ``test_token_subscriber_overflow.py``, so this stub does NOT need to
+    mirror it — it just records the wire sequence so hub-logic tests can
+    assert on ordering / fanout shape.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, session_id: str = "s1") -> None:
+        self.session_id = session_id
         self.frames: list[bytes] = []
         self._in_handshake: bool = False
         self.closed: bool = False
@@ -133,10 +135,17 @@ class _FakeSub:
         self.frames.append(frame)
         return True
 
+    def terminate(self, reason: str) -> None:
+        """INV-4: mirror TokenSubscriber.terminate — record resync + STOP."""
+        from oc_slimapi.sse.tokenstream.frames import STOP, _resync_frame
+        self.closed = True
+        self.frames.append(_resync_frame(self.session_id, reason))
+        self.frames.append(STOP)
+
 
 def _attach(th: TokenStreamHub, sid: str = "s1") -> _FakeSub:
     """Attach a fresh subscriber; return it for frame inspection."""
-    sub = _FakeSub()
+    sub = _FakeSub(session_id=sid)
     th.attach_subscriber(sid, sub)
     return sub
 
@@ -1214,16 +1223,36 @@ class TestPendingSessionResyncs:
         _, data = parse_event(resyncs[0])
         assert data == {"reason": "session_idle", "sessionID": "s1"}
 
-    def test_deleted_resync_drained_on_flush(self):
+    def test_deleted_terminates_subscriber_directly(self):
+        """INV-4 (P0-3): on_session_deleted directly terminates subscribers
+        (resync{session_deleted} → STOP), not via the flush loop. The frames
+        are in sub.frames immediately after on_session_deleted — no flush()
+        needed (the previous _enqueue_session_resync + flush path is gone).
+
+        Test updated from test_deleted_resync_drained_on_flush because the
+        behavior changed: session.deleted now delivers resync+STOP directly
+        via TokenSubscriber.terminate (server-side termination), not via the
+        deferred flush-loop resync queue.
+        """
+        from oc_slimapi.sse.tokenstream.frames import STOP
         th = TokenStreamHub()
         sub = _attach(th, "s1")
         sub.frames.clear()
         th.on_session_deleted("s1")
-        th.flush()
-        resyncs = [f for f in sub.frames if parse_event(f)[0] == "resync"]
+        # resync{session_deleted} delivered directly (no flush needed).
+        resyncs = [
+            f for f in sub.frames
+            if isinstance(f, bytes) and parse_event(f)[0] == "resync"
+        ]
         assert len(resyncs) == 1
         _, data = parse_event(resyncs[0])
         assert data["reason"] == "session_deleted"
+        # STOP delivered after resync (strict order).
+        resync_idx = sub.frames.index(resyncs[0])
+        stop_idx = sub.frames.index(STOP)
+        assert stop_idx > resync_idx
+        # Sub marked closed.
+        assert sub.closed is True
 
     def test_resync_only_fans_to_matching_sid(self):
         th = TokenStreamHub()

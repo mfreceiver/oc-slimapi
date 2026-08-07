@@ -698,3 +698,158 @@ class TestInv3SubscribeRollback:
             th.stop()
             if hubs._global is not None:
                 await _close_registry(hubs)
+
+
+# ===========================================================================
+# Step 4 — INV-4: session.deleted server-side termination
+# ===========================================================================
+
+class _FakeSub:
+    """Minimal subscriber stub for hub-level INV-4 tests."""
+
+    def __init__(self, session_id: str = "s1") -> None:
+        self.session_id = session_id
+        self.frames: list = []
+        self._in_handshake = False
+        self.closed = False
+
+    def begin_handshake(self) -> None:
+        self._in_handshake = True
+
+    def end_handshake(self) -> None:
+        self._in_handshake = False
+
+    def put(self, frame) -> bool:
+        self.frames.append(frame)
+        return True
+
+    def terminate(self, reason: str) -> None:
+        from oc_slimapi.sse.tokenstream.frames import STOP, _resync_frame
+        self.closed = True
+        self.frames.append(_resync_frame(self.session_id, reason))
+        self.frames.append(STOP)
+
+
+class TestInv4SessionDeletedTermination:
+    """on_session_deleted: directly terminate subscribers via
+    TokenSubscriber.terminate (resync{session_deleted} → STOP)."""
+
+    def test_subscriber_receives_resync_then_stop_in_order(self):
+        """A subscriber for the deleted sid receives resync{session_deleted}
+        followed by STOP — strict order, delivered synchronously (not via
+        flush loop)."""
+        from oc_slimapi.sse.tokenstream.frames import STOP
+        th = TokenStreamHub()
+        sub = _FakeSub(session_id="s1")
+        th.attach_subscriber("s1", sub)
+        sub.frames.clear()
+        th.on_session_deleted("s1")
+        # resync frame delivered.
+        resync_frames = [
+            f for f in sub.frames
+            if isinstance(f, bytes) and b"resync" in f
+        ]
+        assert len(resync_frames) == 1
+        # STOP delivered.
+        assert STOP in sub.frames
+        # Strict order: resync BEFORE STOP.
+        resync_idx = sub.frames.index(resync_frames[0])
+        stop_idx = sub.frames.index(STOP)
+        assert resync_idx < stop_idx
+        # Sub closed.
+        assert sub.closed is True
+
+    def test_no_enqueue_session_resync(self):
+        """INV-4: on_session_deleted does NOT call _enqueue_session_resync
+        (the old deferred flush-loop path is removed)."""
+        th = TokenStreamHub()
+        th.on_session_deleted("s1")
+        assert th._pending_session_resinks == []
+
+    def test_hub_does_not_detach_subscriber(self):
+        """INV-4: on_session_deleted terminates the subscriber but does NOT
+        detach it from _subs_by_sid — the generator's finally → unsubscribe
+        relies on has_subscriber() == True to run the normal cleanup."""
+        th = TokenStreamHub()
+        sub = _FakeSub(session_id="s1")
+        th.attach_subscriber("s1", sub)
+        th.on_session_deleted("s1")
+        # Sub still in fanout (not detached by on_session_deleted).
+        assert th.has_subscriber("s1", sub)
+
+    def test_other_sid_subscribers_not_terminated(self):
+        """Only subscribers for the deleted sid are terminated; subscribers
+        for other sids are untouched."""
+        from oc_slimapi.sse.tokenstream.frames import STOP
+        th = TokenStreamHub()
+        sub1 = _FakeSub(session_id="s1")
+        sub2 = _FakeSub(session_id="s2")
+        th.attach_subscriber("s1", sub1)
+        th.attach_subscriber("s2", sub2)
+        sub1.frames.clear()
+        sub2.frames.clear()
+        th.on_session_deleted("s1")
+        # s1 terminated.
+        assert sub1.closed is True
+        assert STOP in sub1.frames
+        # s2 NOT terminated.
+        assert sub2.closed is False
+        assert STOP not in sub2.frames
+
+    def test_live_parts_cleared_for_deleted_sid(self):
+        """Existing cleanup is preserved: _retire_session clears live_parts."""
+        th = TokenStreamHub()
+        th._subs_by_sid.setdefault("s1", set()).add(_FakeSub(session_id="s1"))
+        th.live_parts[("s1", "m1", "p1")] = LivePart()
+        th.on_session_deleted("s1")
+        assert ("s1", "m1", "p1") not in th.live_parts
+
+    def test_multiple_subscribers_all_terminated(self):
+        """Multiple subscribers for the same deleted sid are all terminated."""
+        from oc_slimapi.sse.tokenstream.frames import STOP
+        th = TokenStreamHub()
+        sub_a = _FakeSub(session_id="s1")
+        sub_b = _FakeSub(session_id="s1")
+        th.attach_subscriber("s1", sub_a)
+        th.attach_subscriber("s1", sub_b)
+        sub_a.frames.clear()
+        sub_b.frames.clear()
+        th.on_session_deleted("s1")
+        assert sub_a.closed is True
+        assert STOP in sub_a.frames
+        assert sub_b.closed is True
+        assert STOP in sub_b.frames
+
+    async def test_generator_finally_unsubscribes_after_stop(self, monkeypatch):
+        """Integration: after on_session_deleted, the route generator
+        receives STOP → breaks → finally → unsubscribe (normal path with
+        has_subscriber True → detach + decrement + stop flush + grace arm)."""
+        monkeypatch.setattr("oc_slimapi.sse.global_hub.GRACE_SECONDS", 0.0)
+        monkeypatch.setattr("oc_slimapi.sse.registry.GRACE_SECONDS", 0.0)
+
+        th = TokenStreamHub()
+        hubs = HubRegistry(client=None)
+        hubs.set_token_hub(th)
+        reg = TokenStreamRegistry(
+            th, hubs,
+            max_subscribers=2,
+            queue_items=64,
+            buffer_bytes=512 * 1024,
+            max_frame_bytes=1024 * 1024,
+        )
+        try:
+            sub = reg.subscribe("s1")
+            assert reg.total_subscribers == 1
+            assert th.has_subscriber("s1", sub)
+
+            # Simulate session.deleted arriving from upstream.
+            th.on_session_deleted("s1")
+
+            # Generator finally: unsubscribe (normal path — sub still in fanout).
+            reg.unsubscribe(sub)
+            assert reg.total_subscribers == 0
+            # Sub detached (membership guard passed because sub was still in fanout).
+            assert not th.has_subscriber("s1", sub)
+        finally:
+            th.stop()
+            await _close_registry(hubs)
