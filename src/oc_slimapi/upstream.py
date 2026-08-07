@@ -58,14 +58,5 @@ def strip_hop_by_hop(headers: Mapping[str, str]) -> dict[str, str]:
         result[key] = value
     return result
 
-
-def decoded_body_headers(headers: Mapping[str, str]) -> dict[str, str]:
-    """Headers for httpx-buffered bodies, which have already been decoded."""
-    return {
-        key: value for key, value in strip_hop_by_hop(headers).items()
-        if key.lower() not in {"content-encoding", "content-length"}
-    }
-
-
 def forward_directory_headers(directory: str | None) -> dict[str, str]:
     return {DIRECTORY_HEADER: directory} if directory else {}

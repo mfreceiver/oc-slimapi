@@ -41,6 +41,7 @@ from typing import Any, Callable
 
 import orjson
 
+from .gzip_util import accepts_gzip
 from .skeleton import (
     strip_diagnostics_message,
 )
@@ -64,12 +65,13 @@ def _pack_json(value: Any, accept_encoding: str | None) -> tuple[bytes, dict[str
 
     Returns ``(payload, extra_headers)``; ``extra_headers`` always carries
     ``Vary: Accept-Encoding`` and adds ``Content-Encoding: gzip`` when the
-    caller's ``Accept-Encoding`` header allows it. Pure-CPU; safe to call
-    from a worker thread.
+    caller's ``Accept-Encoding`` header allows it (parsed via
+    :func:`oc_slimapi.gzip_util.accepts_gzip` so ``gzip;q=0`` is honoured).
+    Pure-CPU; safe to call from a worker thread.
     """
     encoded = orjson.dumps(value)
     headers: dict[str, str] = {"Vary": "Accept-Encoding"}
-    if "gzip" in (accept_encoding or "").lower():
+    if accepts_gzip(accept_encoding):
         encoded = gzip.compress(encoded, compresslevel=6)
         headers["Content-Encoding"] = "gzip"
     return encoded, headers

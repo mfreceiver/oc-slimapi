@@ -10,7 +10,7 @@ from fastapi import APIRouter, Query, Request
 from starlette.responses import Response
 
 from ..errors import CodedHTTPException
-from ..gzip_util import error_response
+from ..gzip_util import accepts_gzip, error_response
 from ..skeleton import skeleton_messages
 from ..traffic import stash_up_in
 from ..transform import (
@@ -83,7 +83,7 @@ def _project_list_sorted_and_pack(
     projected = skeleton_messages(parsed)
     encoded = orjson.dumps(projected)
     headers: dict[str, str] = {"Vary": "Accept-Encoding"}
-    if "gzip" in (accept_encoding or "").lower():
+    if accepts_gzip(accept_encoding):
         encoded = gzip.compress(encoded, compresslevel=6)
         headers["Content-Encoding"] = "gzip"
     return encoded, headers
@@ -272,6 +272,11 @@ async def messages(
     directory = await _resolve_messages_directory(request, directory)
     params = {"limit": limit}
     if before:
+        # `before` is opencode's opaque base64url pagination cursor (a
+        # base64url JSON envelope — see _extract_before_verbatim /
+        # _parse_link_next_cursor). base64url uses only [-_A-Za-z0-9] (no
+        # "+" / "/" / space), so FastAPI's percent-decoding of this query
+        # param round-trips safely; forward it verbatim to upstream.
         params["before"] = before
     config = request.app.state.config
     pool = request.app.state.transforms
@@ -301,14 +306,16 @@ async def messages(
                         )
                     raise CodedHTTPException(503, code="upstream_unavailable")
                 body, n_read = await read_with_cap(response, config.max_response_bytes)
+                # Traffic accounting: cap-read upstream bytes, recorded BEFORE
+                # the cap-bail return so oversize reads are still attributed
+                # (unified cap-bail upIn convention with /full, agent, command).
+                stash_up_in(request, n_read)
                 if body is None:
                     return error_response(
                         "response_too_large", 413,
                         limit=config.max_response_bytes,
                         accept_encoding=request.headers.get("accept-encoding"),
                     )
-                # Traffic accounting: skeleton-mode upstream bytes.
-                stash_up_in(request, n_read)
                 # Translate opencode's Link header into our X-Next-Cursor
                 # (opaque passthrough). Capture BEFORE aclose() for clarity,
                 # though httpx headers remain readable afterward. Never
@@ -412,8 +419,9 @@ async def message(
                     )
                 except httpx.RequestError as exc:
                     raise CodedHTTPException(503, code="upstream_unavailable") from exc
-                # Traffic accounting: cap-read upstream bytes (counted even
-                # on cap-bail, matching the list convention).
+                # Traffic accounting: cap-read upstream bytes, recorded BEFORE
+                # the cap-bail return so oversize reads are still attributed
+                # (unified cap-bail upIn convention across list/full/catalog).
                 stash_up_in(request, n_read)
                 if body is None:
                     return error_response(

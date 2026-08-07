@@ -1,14 +1,15 @@
-"""Tests for fixing upstream byte (upIn) undercounting gaps.
+"""Tests for fixing upstream byte (upIn / upOut) undercounting gaps.
 
-Scenarios (per reviewer findings):
+Scenarios:
 
 1. **ready stash** (MUST-PASS): ``/slimapi/ready`` pings upstream
    ``/global/health`` → the ``health`` bucket's ``upIn`` includes the
    health-check response body (was fully missing before the fix).
 
-2. **batch 4xx drain** (BEST-EFFORT): a G6 batch ``fetch_one`` where a
-   per-mid upstream returns 404 → the 404 response body is drained and
-   counted in ``messages`` bucket ``upIn``.
+2. **cap-bail upIn** (B1): ``/slimapi/sessions`` and
+   ``/slimapi/messages/{sid}`` oversize upstream bodies → 413 cap-bail
+   STILL attributes the bytes read to the respective bucket's ``upIn``
+   (stash runs before the None check — unified convention).
 
 3. **disconnect finally** (BEST-EFFORT): a streaming proxy request where
    the client disconnects mid-stream → already-forwarded bytes are still
@@ -17,9 +18,6 @@ Scenarios (per reviewer findings):
 Hard constraint: this file is self-contained (no conftest changes) and
 follows the ``_build_app`` + ``upstream_factory`` pattern established in
 ``test_traffic_integration.py``.
-
-NOTE: lite-v2 removed the ``/slimapi/questions`` family of endpoints;
-the former "questions 4xx stash" scenario has been removed accordingly.
 """
 
 from __future__ import annotations
@@ -39,7 +37,7 @@ from oc_slimapi.traffic import TrafficLedger
 from oc_slimapi.transform import TransformConfig, TransformPool
 from oc_slimapi.versioning import SlimapiVersionMiddleware
 
-VERSION_HEADERS = {"X-Slimapi-Version": "1"}
+VERSION_HEADERS = {"X-Slimapi-Version": "2"}
 
 
 # ---------------------------------------------------------------------------
@@ -56,8 +54,8 @@ def _settings(**overrides) -> Settings:
         transform_wait_seconds=0.5,
         max_response_bytes=64 * 1024,
         smoke_session_id=None,
-        server_api_version=1,
-        accepted_client_versions=(1, 1),
+        server_api_version=2,
+        accepted_client_versions=(2, 2),
 
     )
     base.update(overrides)
@@ -282,3 +280,67 @@ async def test_proxy_counted_req_stream_happy_path_stashes_upout(
     )
     # The proxy body is passed through 1:1.
     assert bucket["upIn"] == len(body)
+
+
+# ===========================================================================
+# Scenario 2 — cap-bail upIn (B1)
+# ===========================================================================
+
+async def test_sessions_cap_bail_stashes_upin(upstream_factory):
+    """B1: when /slimapi/sessions upstream body exceeds max_response_bytes,
+    the 413 cap-bail STILL attributes the bytes read to the ``sessions``
+    bucket ``upIn`` (stash runs before the None check — unified convention)."""
+    # Body larger than max_response_bytes (64 KiB). Content need not be valid
+    # JSON: read_with_cap bails before the route ever parses it.
+    oversize = b"x" * (200 * 1024)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/session"
+        return httpx.Response(200, content=oversize,
+                              headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    app, ledger = _build_app(_settings(), upstream, include_messages=True)
+    transport = httpx.ASGITransport(app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/slimapi/sessions", headers=VERSION_HEADERS)
+        assert response.status_code == 413
+        assert response.json()["code"] == "response_too_large"
+        snap = ledger.snapshot()
+        bucket = snap["buckets"]["sessions"]
+        assert bucket["upIn"] >= 64 * 1024, (
+            f"cap-bail upIn ({bucket['upIn']}) must still attribute the oversize "
+            f"read — B1 unified stash-before-None convention"
+        )
+    finally:
+        await _shutdown(app)
+
+
+async def test_messages_cap_bail_stashes_upin(upstream_factory):
+    """B1: when /slimapi/messages/{sid} upstream body exceeds
+    max_response_bytes, the 413 cap-bail STILL attributes the bytes read to
+    the ``messages`` bucket ``upIn``."""
+    oversize = b"x" * (200 * 1024)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/session/s1/message"
+        return httpx.Response(200, content=oversize,
+                              headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    app, ledger = _build_app(_settings(), upstream, include_messages=True)
+    transport = httpx.ASGITransport(app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/slimapi/messages/s1", headers=VERSION_HEADERS)
+        assert response.status_code == 413
+        assert response.json()["code"] == "response_too_large"
+        snap = ledger.snapshot()
+        bucket = snap["buckets"]["messages"]
+        assert bucket["upIn"] >= 64 * 1024, (
+            f"cap-bail upIn ({bucket['upIn']}) must still attribute the oversize "
+            f"read — B1 unified stash-before-None convention"
+        )
+    finally:
+        await _shutdown(app)

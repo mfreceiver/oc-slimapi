@@ -3,8 +3,9 @@
 Records downstream (client ↔ sidecar) and upstream (sidecar ↔ opencode) byte
 flows per logical bucket, plus SSE-specific counters for the curated events
 stream and the per-session token stream. Single uvicorn worker, single event
-loop — a :class:`threading.Lock` guards mutations for honesty (mirrors
-:class:`oc_slimapi.observability.BatchLedger`).
+loop — a :class:`threading.Lock` guards mutations for honesty (the lock is
+belt-and-suspenders under the single-loop model; the prior reference to a
+``BatchLedger`` class is stale — that class was removed in lite-v2).
 
 Counting strategy (no double-count):
 

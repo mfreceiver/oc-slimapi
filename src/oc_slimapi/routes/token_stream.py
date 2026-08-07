@@ -38,14 +38,14 @@ from starlette.responses import StreamingResponse
 
 from ..directory import validate_directory
 from ..errors import CodedHTTPException
-from ..gzip_util import json_response
+from ..gzip_util import accepts_gzip, json_response
 from ..sse.token_hub import STOP, TokenSubscriberCapacityError, _resync_frame
 
 router = APIRouter(prefix="/slimapi", tags=["token-stream"])
 
 
 def _accepts_gzip(request: Request) -> bool:
-    return "gzip" in (request.headers.get("accept-encoding") or "").lower()
+    return accepts_gzip(request.headers.get("accept-encoding"))
 
 
 def _resolve_directory_conflict(request: Request, directory: str | None) -> None:

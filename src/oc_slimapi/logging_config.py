@@ -101,5 +101,9 @@ def get_logger(name: str) -> logging.Logger:
 
 
 def redact(secret: str) -> str:
-    """Replace a secret string with the literal ``<redacted>``."""
+    """Replace a secret string with the literal ``<redacted>``.
+
+    Test-only utility: no production call site (the startup banner logs no
+    secrets). Retained so ``tests/test_logging_config`` can pin the contract.
+    """
     return "<redacted>"

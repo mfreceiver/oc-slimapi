@@ -73,13 +73,15 @@ async def sessions(
                         except httpx.HTTPStatusError as exc:
                             raise_upstream_status(exc)
                     body, n_read = await read_with_cap(response, config.max_response_bytes)
+                    # Traffic accounting: cap-read upstream bytes, recorded
+                    # BEFORE the cap-bail raise so oversize reads are still
+                    # attributed (unified with messages/agent/command).
+                    stash_up_in(request, n_read)
                     if body is None:
                         raise CodedHTTPException(
                             413, code="response_too_large",
                             limit=config.max_response_bytes,
                         )
-                    # Traffic accounting: skeleton-mode upstream bytes.
-                    stash_up_in(request, n_read)
                     try:
                         payload = orjson.loads(body)
                     except (orjson.JSONDecodeError, ValueError) as exc:
