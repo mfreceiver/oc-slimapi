@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import OrderedDict
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 import httpx
 import orjson
@@ -171,14 +171,128 @@ class GlobalHub:
         when the tasks are already running, and cancels any armed
         ``stop_after_grace`` so a fresh consumer does not get torn down by a
         grace timer fired a moment earlier.
+
+        INV-1 (P1-19): the run / flush / heartbeat tasks form ONE atomic
+        group. Group creation is delegated to :meth:`_spawn_group` so the
+        supervisor ``done_callback`` can force a rebuild without waiting
+        for the just-cancelled run task to wind down (the ``task.done()``
+        check below would otherwise block the rebuild).
         """
         if self.stop_task:
             self.stop_task.cancel()
             self.stop_task = None
         if not self.task or self.task.done():
-            self.task = asyncio.create_task(self.run())
-            self.flush_task = asyncio.create_task(self.flush_loop())
-            self.heartbeat_task = asyncio.create_task(self.heartbeat_loop())
+            self._spawn_group()
+
+    def _spawn_group(self) -> None:
+        """INV-1 (P1-19): create a fresh run / flush / heartbeat group.
+
+        Consistency check: cancel any surviving siblings from a previous
+        partial group (run done but flush / heartbeat still alive). Do NOT
+        await (sync method); the cancelled survivors wind down on their own
+        (flush / heartbeat hold no upstream connection — only run does) and
+        their own done_callbacks are no-ops once the new group is assigned.
+
+        The group is created as LOCAL variables before being assigned to
+        ``self``, so a ``done_callback`` / finally that reads ``self.*``
+        cannot act on the new group via a stale reference. Capturing the
+        group in the callback closure makes the staleness guard
+        ``self.task is run_task`` reliable.
+        """
+        # Consistency check: cancel survivors from a partial previous group.
+        for stale in (self.flush_task, self.heartbeat_task):
+            if stale is not None and not stale.done():
+                stale.cancel()
+        run_task = asyncio.create_task(self.run())
+        flush_task = asyncio.create_task(self.flush_loop())
+        heartbeat_task = asyncio.create_task(self.heartbeat_loop())
+        run_task.add_done_callback(
+            self._make_group_done_callback(
+                run_task, flush_task, heartbeat_task, is_run=True,
+            )
+        )
+        flush_task.add_done_callback(
+            self._make_group_done_callback(
+                run_task, flush_task, heartbeat_task, is_run=False,
+            )
+        )
+        heartbeat_task.add_done_callback(
+            self._make_group_done_callback(
+                run_task, flush_task, heartbeat_task, is_run=False,
+            )
+        )
+        self.task = run_task
+        self.flush_task = flush_task
+        self.heartbeat_task = heartbeat_task
+
+    def _make_group_done_callback(
+        self,
+        run_task: asyncio.Task,
+        flush_task: asyncio.Task,
+        heartbeat_task: asyncio.Task,
+        *,
+        is_run: bool,
+    ) -> Callable[[asyncio.Task], None]:
+        """INV-1 (P1-19): supervisor ``done_callback`` for a group member.
+
+        Closed over the group's OWN task references (``run_task`` /
+        ``flush_task`` / ``heartbeat_task``) — NEVER reads ``self.task`` /
+        ``self.flush_task`` / etc. to decide whether this group is stale
+        (those slots may have been replaced by a rebuild). The guard
+        ``self.task is run_task`` is the single staleness check: if the run
+        slot has been replaced, the whole group is stale and the callback
+        is a no-op.
+
+        Behaviour:
+        * cancelled task → return (teardown path).
+        * normal exit (run only — ``has_consumers()`` went False) → cancel
+          flush + heartbeat to stop the small pre-grace spin.
+        * exception death → cancel the two siblings + rebuild via
+          :meth:`_spawn_group` iff ``has_consumers()``. The cancelled
+          siblings' own callbacks then see ``self.task is run_task`` go
+          False after the rebuild and return early (no cascading rebuild).
+        """
+        def _on_done(task: asyncio.Task) -> None:
+            if task.cancelled():
+                return
+            try:
+                exc = task.exception()
+            except asyncio.CancelledError:
+                return  # defensive — cancelled() already caught this
+            except asyncio.InvalidStateError:
+                return  # not done — defensive
+            # Stale-group guard: a rebuild replaced self.task → no-op.
+            if self.task is not run_task:
+                return
+            if exc is None:
+                # Normal exit. Only run() exits normally (its
+                # ``while self.has_consumers()`` loop returned False).
+                # Cancel flush + heartbeat so they do not keep spinning
+                # until the grace timer fires (small pre-grace leak fix).
+                if is_run:
+                    for sib in (flush_task, heartbeat_task):
+                        if sib is not None and not sib.done():
+                            sib.cancel()
+                return
+            # Exception death → cancel siblings + rebuild if still needed.
+            which = (
+                "run" if task is run_task
+                else "flush" if task is flush_task
+                else "heartbeat"
+            )
+            logger.warning(
+                "sse hub task %s died unexpectedly; rebuilding group",
+                which, exc_info=exc,
+            )
+            for sib in (run_task, flush_task, heartbeat_task):
+                if sib is not task and sib is not None and not sib.done():
+                    sib.cancel()
+            if self.has_consumers():
+                # Force a rebuild via _spawn_group (NOT ensure_upstream):
+                # the just-cancelled run task may not be .done() yet, so
+                # ensure_upstream's ``task.done()`` guard would no-op.
+                self._spawn_group()
+        return _on_done
 
     def subscribe(self) -> Subscriber:
         subscriber = Subscriber(

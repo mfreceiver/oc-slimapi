@@ -80,6 +80,7 @@ from ...config import (
     TOKEN_REMOVED_MESSAGES_TTL_MS,
     TOKEN_RESYNC_QUEUE_CAP,
 )
+from ...logging_config import get_logger
 from .frames import (
     STOP,
     _connected_frame,
@@ -96,6 +97,9 @@ from .models import DeltaAccumulator, LivePart, _TokenMetrics
 
 if TYPE_CHECKING:
     from ..hub import HubRegistry
+
+
+logger = get_logger(__name__)
 
 
 # Number of flush ticks between TTL sweeps (NB-B5: 60s cadence). Floored at 1
@@ -294,9 +298,52 @@ class TokenStreamHub:
         wires this into the HTTP endpoint lifecycle (start on first
         subscriber, stop on last unsubscribe); for Stage C, tests call it
         directly to exercise the 100ms cadence + 60s TTL tick.
+
+        INV-1 (P1-19): a supervisor ``done_callback`` is attached so a
+        non-cancelled death (``flush()`` raising) while subscribers remain
+        is logged at CRITICAL and the loop is rebuilt — otherwise deltas
+        would silently stop forever and ``_pending`` would grow unbounded
+        (the TTL sweep lives inside the same loop, so it dies too). The
+        callback guards on ``self._flush_task is task`` so a stale task
+        (replaced by a later ``start()``) is a no-op.
         """
         if self._flush_task is None or self._flush_task.done():
-            self._flush_task = asyncio.create_task(self.flush_loop())
+            flush_task = asyncio.create_task(self.flush_loop())
+            flush_task.add_done_callback(self._on_flush_done)
+            self._flush_task = flush_task
+
+    def _on_flush_done(self, task: asyncio.Task) -> None:
+        """INV-1 (P1-19): watchdog for the token flush loop.
+
+        * cancelled task → return (teardown via :meth:`stop` / registry
+          close — expected).
+        * normal exit → return (``flush_loop`` is ``while True`` so this is
+          unreachable; defensive).
+        * exception death → if subscribers remain, log CRITICAL and rebuild
+          via :meth:`start` so deltas do not silently stop; else leave it
+          dead (no consumers → no point rebuilding; the next first-attach
+          :meth:`start` will create a fresh task).
+        """
+        if task.cancelled():
+            return
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        except asyncio.InvalidStateError:
+            return
+        # Stale-task guard: a newer start() replaced the slot → no-op.
+        if self._flush_task is not task:
+            return
+        if exc is None:
+            return  # defensive — flush_loop is while True
+        logger.critical(
+            "token flush_loop died unexpectedly; %d subscriber(s) remain",
+            self.subscriber_count, exc_info=exc,
+        )
+        if self.subscriber_count > 0:
+            self._flush_task = None
+            self.start()
 
     def stop(self) -> None:
         """Cancel the background flush loop. Idempotent."""
