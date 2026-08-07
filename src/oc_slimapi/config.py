@@ -394,6 +394,23 @@ class Settings:
         minimum, maximum = self.accepted_client_versions
         if self.server_api_version < 1 or minimum < 1 or minimum > maximum:
             raise RuntimeError("slimapi version configuration is invalid")
+        # P1-13: production version gate is fail-closed to v2. The env knob
+        # OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS is parsed syntactically (so a
+        # malformed value still fails fast at import), but the resolved range
+        # MUST be exactly (2, 2) — an operator cannot widen the accepted range
+        # via env to admit v1 clients. This runs BEFORE the server-version
+        # consistency check so the error message is unambiguous: the real
+        # problem is the pin, not a mismatched server version. No dev override
+        # is provided: the env IS the attack surface we are hardening against,
+        # so an env-based escape hatch would defeat the purpose. A developer
+        # who genuinely needs to test v1 behaviour can temporarily edit the
+        # constant in versioning.py.
+        if self.accepted_client_versions != ACCEPTED_CLIENT_VERSIONS:
+            raise RuntimeError(
+                f"OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS must be (2, 2) — the "
+                f"production version gate is fail-closed to v2 and cannot be "
+                f"widened via env (got {self.accepted_client_versions})"
+            )
         # Version consistency (P1-35): the advertised server version must fall
         # within the accepted client range — otherwise the server would be
         # advertising a version it itself rejects from clients, which is a
