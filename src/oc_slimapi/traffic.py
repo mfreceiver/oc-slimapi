@@ -78,6 +78,9 @@ def bucketize(method: str, path: str) -> str:
             return "command"
         if path == "/slimapi/agent" or path.startswith("/slimapi/agent/"):
             return "agent"
+        # Cross-directory questions aggregation endpoint (additive catalog style).
+        if path == "/slimapi/questions" or path.startswith("/slimapi/questions/"):
+            return "questions"
         # Generic /slimapi/sessions/**.
         if path.startswith("/slimapi/sessions"):
             return "sessions"

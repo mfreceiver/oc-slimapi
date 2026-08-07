@@ -104,9 +104,9 @@ curl -s -H "$H" $BASE/slimapi/metrics | jq '
 | `sessions` | `/slimapi/sessions/**`（列表/`/status`/`/children`） | session/child skeleton 投影 |
 | `command` | `/slimapi/command`、`/slimapi/command/**` | **骨架投影**：catalog whitelist（`name/description/agent/hints`），丢 `template`（~97.7%） |
 | `agent` | `/slimapi/agent`、`/slimapi/agent/**` | **骨架投影**：catalog whitelist（`name/description/mode/hidden/native`），丢 `prompt`+`permission`（>96%） |
-| `quiz` | `/slimapi/questions`、`/slimapi/permissions` | 聚合 + 投影 |
+| `questions` | `/slimapi/questions`（跨目录聚合，加性回归） | 聚合 envelope（envelope 透传，per-dir fan-out） |
 | `passthrough` | catch-all `/**`（发消息等写） | **不省流**，透传（基线，比值≈1） |
-| `health` / `metrics` / `projects` / `other` | 各自端点 | 元数据/探活 |
+| `health` / `metrics` / `other` | 各自端点 | 元数据/探活 |
 
 ---
 

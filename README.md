@@ -36,13 +36,13 @@ curl --fail -H 'X-Slimapi-Version: 2' http://127.0.0.1:4097/slimapi/health
 
 ## 范围（v2 / wire `X-Slimapi-Version: 2`）
 
-- `/slimapi/**`：sessions / messages（list·since·full skeleton 投影）/ events（策展 SSE）/ token-stream / metrics / health。每个请求（含 SSE）必须带整数头 `X-Slimapi-Version: 2`；缺失、非整数或不在服务端接受区间返回 400。版本只在破坏性变更时递增，加性变更保持兼容。
+- `/slimapi/**`：sessions / sessions/status / messages（list·full skeleton 投影）/ questions（跨目录聚合）/ command / agent（catalog skeleton）/ events（策展 SSE）/ token-stream / metrics / health。每个请求（含 SSE）必须带整数头 `X-Slimapi-Version: 2`；缺失、非整数或不在服务端接受区间返回 400。版本只在破坏性变更时递增，加性变更保持兼容。
 - 其他 HTTP path：流式反代至 `127.0.0.1:4096`（catch-all）。
 - WebSocket：501 语义，不支持 PTY；需要时在前方部署专用 HTTP/WS proxy。
 - REST 精简 JSON：按 `Accept-Encoding` 自 gzip 并返回 `Vary: Accept-Encoding`。
-- SSE：永不 gzip。
+- SSE：控制面 `/slimapi/events` 永不 gzip；token stream `/slimapi/sessions/{sid}/stream` **默认 gzip**（lever2，首个 SSE gzip 例外，按 `Accept-Encoding` 协商）。
 
-> v2 已移除 routeToken/route_secret，以及 projects / questions / permissions / since / session children·status 等端点（详见 [`CHANGELOG.md`](CHANGELOG.md) `[1.0.0]`）。
+> v2 已移除 routeToken/route_secret，以及 projects / permissions / since / session children 等端点；`questions`（跨目录聚合）与 `sessions/status` 已于 1.1.x 加性回归（详见 [`CHANGELOG.md`](CHANGELOG.md)）。
 
 ## 流量记账与日志
 
