@@ -274,6 +274,36 @@ def test_turns_map_is_lru_bounded():
     assert reg.bump_turn("sid_0") == 1
 
 
+def test_lru_eviction_emits_warning(caplog, monkeypatch):
+    """B7 (P1-23): LRU eviction emits an observability warning.
+
+    Behaviour is unchanged (oracle ruled the eviction→new-incarnation cure
+    expands the blast radius since incarnation is process-level frozen). The
+    warning makes the practically-unreachable edge visible to ops. Uses a
+    small cap via monkeypatch so the test is fast (the real _TURNS_MAX is
+    exercised by ``test_turns_map_is_lru_bounded`` above)."""
+    import logging
+
+    monkeypatch.setattr("oc_slimapi.turn_registry._TURNS_MAX", 3)
+    reg = TurnRegistry(incarnation=7)
+    with caplog.at_level(logging.WARNING, logger="oc_slimapi.turn_registry"):
+        # 4 distinct sids under cap=3 → exactly one eviction (sid_0).
+        for i in range(4):
+            reg.bump_turn(f"sid_{i}")
+    evict_msgs = [r for r in caplog.records if "LRU evicted sid" in r.getMessage()]
+    assert len(evict_msgs) == 1
+    msg = evict_msgs[0].getMessage()
+    assert "sid_0" in msg
+    assert "incarnation 7" in msg
+    # No eviction when under cap → no warning. caplog.records is cumulative
+    # across with-blocks, so clear before the negative check.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="oc_slimapi.turn_registry"):
+        reg2 = TurnRegistry(incarnation=1)
+        reg2.bump_turn("only_sid")
+    assert not [r for r in caplog.records if "LRU evicted sid" in r.getMessage()]
+
+
 # ── 3. DigestFields.to_payload ──────────────────────────────────────────────────
 
 

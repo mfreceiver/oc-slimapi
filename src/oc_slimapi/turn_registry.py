@@ -244,8 +244,21 @@ class TurnRegistry:
         # LRU cap: refresh insertion order so actively-bumping sids survive,
         # then evict least-recently-bumped over _TURNS_MAX.
         self._turns.move_to_end(sid)
+        # B7 (P1-23): behaviour unchanged (LRU eviction maintained — oracle
+        # ruled the eviction→new-incarnation cure expands the blast radius
+        # since incarnation is process-level frozen). Added an observability
+        # warning so the practically-unreachable edge (>10_000 bumped sids in
+        # one process) is visible to ops rather than silent. Fires only when
+        # an eviction actually occurs, not on every bump.
         while len(self._turns) > _TURNS_MAX:
-            self._turns.popitem(last=False)
+            evicted_sid, _ = self._turns.popitem(last=False)
+            logger.warning(
+                "turn-registry: LRU evicted sid %r at incarnation %d; its "
+                "turn will restart at 1 if bumped again this incarnation "
+                "(within-incarnation regression — practically unreachable at "
+                "_TURNS_MAX=%d)",
+                evicted_sid, self.incarnation, _TURNS_MAX,
+            )
         return self._turns[sid]
 
     def snapshot(self, sid: str) -> tuple[int, int]:

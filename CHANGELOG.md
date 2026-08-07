@@ -40,6 +40,7 @@ ocdroid 对接时：
 
 ### Fixed
 
+- **turn-registry LRU eviction 现记录 warning（B7 / P1-23，纯可观测，非 wire 行为变更，未 bump `X-Slimapi-Version`，仍 2）**：`TurnRegistry.bump_turn` 在 `_TURNS_MAX`（10000）LRU eviction 实际发生时记录 warning（含被 evict 的 sid + 当前 incarnation），便于运维观测这个 practically-unreachable 边缘（需 >10000 个 distinct bumped sid 在单进程内）。**行为不变**：eviction 维持——oracle 裁定"eviction→新 incarnation"的 cure 会扩大爆炸半径（incarnation 是进程级冻结），故采纳"维持 LRU + 加可观测 warning"。
 - **边界 + 门禁硬化（批次 5，内部资源安全修复，未 bump `X-Slimapi-Version`，仍 2）**：修复 8 处资源边界 / 门禁 / 输入校验 / 错误映射问题（除上述 P1-13/P1-15/P1-28 已在 Changed/Added 记录的 wire 可见项外，其余为内部硬化）：
   - **P1-14（version gate 路径归一化）**：version middleware 此前直接检查原始 `scope["path"].startswith("/slimapi/")`；ASGI server 若不折叠 `//`，`//slimapi/foo` 不过版本门禁但 catch-all 反代归一化后路由到 /slimapi/ 端点 → 门禁绕过。`/slimapi` 精确根路径也不满足 `/slimapi/` 前缀。现 `_is_slimapi_path()` 折叠重复斜杠后判断，同时识别根路径与子路径。`scope["path"]` 不变（不影响下游路由）。
   - **P1-29（skeleton 嵌套类型防守）**：`skeleton_message` 此前 `message.get("info").get("id")` 在 info 为 None 时 AttributeError；`for part in message.get("parts")` 在 parts 为 int/bool 时 TypeError → 单坏消息致整页 500。现 info 非 dict → `{}`，parts 非 list → `[]`。`routes/messages.py` 两处 skeleton 调用增加 `(TypeError, AttributeError)` → 503 `upstream_unavailable` 映射（与既有 JSONDecodeError 映射对齐）。
