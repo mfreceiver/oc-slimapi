@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import gzip
 import re
 from urllib.parse import urlparse
 
@@ -10,7 +9,7 @@ from fastapi import APIRouter, Query, Request
 from starlette.responses import Response
 
 from ..errors import CodedHTTPException
-from ..gzip_util import accepts_gzip, error_response
+from ..gzip_util import compress_if_beneficial, error_response
 from ..skeleton import skeleton_messages
 from ..traffic import stash_up_in
 from ..transform import (
@@ -82,11 +81,7 @@ def _project_list_sorted_and_pack(
     parsed.sort(key=_created_sort_key)
     projected = skeleton_messages(parsed)
     encoded = orjson.dumps(projected)
-    headers: dict[str, str] = {"Vary": "Accept-Encoding"}
-    if accepts_gzip(accept_encoding):
-        encoded = gzip.compress(encoded, compresslevel=6)
-        headers["Content-Encoding"] = "gzip"
-    return encoded, headers
+    return compress_if_beneficial(encoded, accept_encoding)
 
 
 _REL_PARAM_RE = re.compile(

@@ -16,6 +16,14 @@ from typing import Any
 import orjson
 from starlette.responses import Response
 
+# P1-31: minimum body size for gzip to be worth attempting. Bodies below this
+# threshold are returned raw because gzip's fixed header/footer overhead
+# (~18 bytes + deflate framing) almost always makes them LARGER. The version
+# gate 400 body (~44 bytes) and short error codes (~31 bytes) are canonical
+# examples. This is a CPU optimisation — the ``compress_if_beneficial`` size
+# comparison below catches any larger-but-incompressible body regardless.
+MIN_GZIP_BYTES = 64
+
 
 def accepts_gzip(accept_encoding: str | None) -> bool:
     """Return True iff the client's ``Accept-Encoding`` permits gzip.
@@ -62,6 +70,41 @@ def accepts_gzip(accept_encoding: str | None) -> bool:
     if star_q is not None:
         return star_q > 0
     return False
+
+
+def compress_if_beneficial(
+    body: bytes, accept_encoding: str | None,
+) -> tuple[bytes, dict[str, str]]:
+    """Gzip ``body`` only when the client accepts it AND it is beneficial.
+
+    Returns ``(payload, headers)`` where ``headers`` always includes
+    ``Vary: Accept-Encoding`` and includes ``Content-Encoding: gzip`` only
+    when compression was actually applied.
+
+    Three gates (P1-31):
+
+    1. **Negotiation**: the client must accept gzip (:func:`accepts_gzip`).
+    2. **Minimum size**: the raw body must exceed :data:`MIN_GZIP_BYTES`.
+       Below this, the gzip header/footer overhead makes the body larger.
+    3. **Actual benefit**: the compressed result must be strictly smaller
+       than the raw body. Incompressible data (even above the threshold) can
+       expand under gzip; this check catches it and returns the raw body.
+
+    NOTE: this function is always called on a freshly ``orjson.dumps``'d body
+    — there is never a pre-existing ``Content-Encoding`` to double-compress.
+    If a caller ever passes an already-compressed body, gate 3 prevents
+    re-compression (compressed input is incompressible → result >= input).
+    """
+    headers: dict[str, str] = {"Vary": "Accept-Encoding"}
+    if not accepts_gzip(accept_encoding):
+        return body, headers
+    if len(body) < MIN_GZIP_BYTES:
+        return body, headers
+    compressed = gzip.compress(body, compresslevel=6)
+    if len(compressed) >= len(body):
+        return body, headers
+    headers["Content-Encoding"] = "gzip"
+    return compressed, headers
 
 
 def json_response(

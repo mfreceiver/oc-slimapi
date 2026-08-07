@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import asyncio
 import functools
-import gzip
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -41,7 +40,7 @@ from typing import Any, Callable
 
 import orjson
 
-from .gzip_util import accepts_gzip
+from .gzip_util import compress_if_beneficial
 from .skeleton import (
     strip_diagnostics_message,
 )
@@ -64,17 +63,13 @@ def _pack_json(value: Any, accept_encoding: str | None) -> tuple[bytes, dict[str
     """Serialize ``value`` to JSON bytes and optionally gzip them.
 
     Returns ``(payload, extra_headers)``; ``extra_headers`` always carries
-    ``Vary: Accept-Encoding`` and adds ``Content-Encoding: gzip`` when the
-    caller's ``Accept-Encoding`` header allows it (parsed via
-    :func:`oc_slimapi.gzip_util.accepts_gzip` so ``gzip;q=0`` is honoured).
-    Pure-CPU; safe to call from a worker thread.
+    ``Vary: Accept-Encoding`` and adds ``Content-Encoding: gzip`` when
+    compression is both negotiated and beneficial (see
+    :func:`oc_slimapi.gzip_util.compress_if_beneficial`). Pure-CPU; safe to
+    call from a worker thread.
     """
     encoded = orjson.dumps(value)
-    headers: dict[str, str] = {"Vary": "Accept-Encoding"}
-    if accepts_gzip(accept_encoding):
-        encoded = gzip.compress(encoded, compresslevel=6)
-        headers["Content-Encoding"] = "gzip"
-    return encoded, headers
+    return compress_if_beneficial(encoded, accept_encoding)
 
 
 def strip_diagnostics_and_pack(

@@ -85,6 +85,21 @@ def test_strip_diagnostics_and_pack_applies_gzip_when_client_accepts_it():
     assert "diagnostics" not in decoded["parts"][1]["state"]["metadata"]
 
 
+def test_strip_diagnostics_and_pack_skips_gzip_for_tiny_body():
+    """P1-31: a body below MIN_GZIP_BYTES is returned raw (gzip would make
+    it larger due to header/footer overhead). The transform worker pack
+    function uses compress_if_beneficial, not raw gzip."""
+    from oc_slimapi.gzip_util import MIN_GZIP_BYTES
+    tiny_msg = {"info": {"id": "m"}, "parts": []}
+    body = orjson.dumps(tiny_msg)
+    assert len(body) < MIN_GZIP_BYTES, "test body must be below threshold"
+
+    payload, headers = strip_diagnostics_and_pack(body, accept_encoding="gzip")
+
+    assert "Content-Encoding" not in headers
+    assert payload == body  # raw, unchanged
+
+
 def test_strip_diagnostics_message_is_in_place_and_keeps_empty_metadata():
     """Production path: orjson.loads trees have no shared aliases, so strip
     mutates in place (no deepcopy). Emptied ``metadata`` stays as ``{}``."""
