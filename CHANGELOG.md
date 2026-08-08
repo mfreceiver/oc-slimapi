@@ -28,7 +28,17 @@ ocdroid 对接时：
 
 ## [Unreleased]
 
-_（暂无）_
+### Added
+
+（暂无）
+
+---
+
+## [1.2.0] - 2026-08-08 — 加性新端点 `GET /slimapi/directories`（全局 directory catalog，项目切换器）；未 bump `X-Slimapi-Version`，仍 2
+
+### Added
+
+- **`GET /slimapi/directories`（全局 directory catalog，加性新增，未 bump `X-Slimapi-Version`，仍 2）**：全新端点，列出 opencode 已知的工作目录（directory），供客户端渲染"项目切换器"。发现源 `GET /experimental/session?roots=true&archived=true&limit=10000`（复用 questions 的全局顶层 session 发现——每个 session 携带真实 `directory` 字段，覆盖 git repo + 非-git目录 + git worktree 子目录 + archived-only workdir）。**无 query 参数**（全局发现语义，干脆不接受 directory，避免误导——与 catalog 端点的 no-op `directory` 不同）。按 `normalize_directory` 归一聚合：每 dir 一行 `{directory,title,lastUpdated,rootSessionCount,activeRootSessionCount,archivedRootSessionCount,archivedOnly}`（`title`+`lastUpdated` 来自同源 winner——按 `(time.updated,time.created,id)` 取 max；数字字段缺失/非数字→0 排最后）；返回 **envelope 对象** `{items, discoveryComplete}`（非裸数组；`discoveryComplete=len(sessions)<10000`，items 排序 `lastUpdated` DESC + tie-break `directory` ASC）。**严格 schema 守卫**：任一 session 非 dict、或 `directory` 非非空 string → 整体 **503** `upstream_unavailable`（不静默跳过——跳过会让"看似完整"列表缺目录）。错误映射同 questions 发现调用（网络/5xx/**4xx**/坏 JSON/非 list/超 cap→503 `upstream_unavailable`，不泄漏 upstream status；experimental 端点 4xx 意 opencode 不支持）；转换池 admission 先于 upstream GET + 流式 `read_with_cap` + worker gzip；转换池满→503 `transform_busy`+`Retry-After:2`。**被动发现局限（诚实）**：仅能看到至少有一条顶层 session 的 workdir；**从未建过 session 的 workdir 不可见**；**不扫文件系统**；**返回目录不代表目录仍存在**（可能已删）。**加性**：旧 sidecar 无此路由→catch-all 404 `thin_route_not_found`，客户端 fallback（仅对 404 `thin_route_not_found` 降级，**不**对 503/413 fallback）。详见 `docs/specs/v2-contract.md` §2 + §2「`/slimapi/directories` envelope」；新增独立 traffic bucket `directories`（`/slimapi/metrics.traffic` + access log `bucket` 字段）。
 
 ---
 

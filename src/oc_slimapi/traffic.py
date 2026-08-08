@@ -82,6 +82,9 @@ def bucketize(method: str, path: str) -> str:
         # Cross-directory questions aggregation endpoint (additive catalog style).
         if path == "/slimapi/questions" or path.startswith("/slimapi/questions/"):
             return "questions"
+        # Global directory catalog endpoint (additive catalog style).
+        if path == "/slimapi/directories" or path.startswith("/slimapi/directories/"):
+            return "directories"
         # Generic /slimapi/sessions/**.
         if path.startswith("/slimapi/sessions"):
             return "sessions"

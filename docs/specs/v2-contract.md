@@ -6,6 +6,7 @@
 >
 > | 修订日期 | wire 版本 | 文档 rev | 变更摘要 | 落地对照 |
 > |---|---|---|---|---|
+> | **2026-08-08** | **2（不变）** | **v2+additive** | **加性新增 `GET /slimapi/directories`（全局 directory catalog，全新端点）**：列出 opencode 已知的工作目录供客户端渲染"项目切换器"。发现源 `GET /experimental/session?roots=true&archived=true&limit=10000`（复用 questions 的全局顶层 session 发现——每个 session 携带真实 `directory` 字段，覆盖 git repo + 非-git目录 + git worktree 子目录 + archived-only workdir）。**无 query 参数**（全局发现语义，干脆不接受 directory，避免误导）。按 `normalize_directory` 归一聚合：每 dir 一行 `{directory,title,lastUpdated,rootSessionCount,activeRootSessionCount,archivedRootSessionCount,archivedOnly}`（title+lastUpdated 来自同源 winner——按 `(time.updated,time.created,id)` 取 max）；返回 **envelope 对象** `{items, discoveryComplete}`（非裸数组，`discoveryComplete=len(sessions)<10000`）。**严格 schema 守卫**：任一 session 非 dict、或 `directory` 非非空 string → 整体 **503** `upstream_unavailable`（不静默跳过——跳过会让"看似完整"列表缺目录）。错误映射同 questions 发现调用（网络/5xx/**4xx**/坏 JSON/非 list/超 cap → 503 `upstream_unavailable`，**不**泄漏 upstream status）；转换池满→503 `transform_busy`+`Retry-After:2`。**被动发现局限**（诚实）：仅能看到至少有一条顶层 session 的 workdir；从未建过 session 的 workdir 不可见；不扫文件系统；返回目录不代表目录仍存在。**未 bump** `X-Slimapi-Version`（仍 2）。详见 §2 + §2「`/slimapi/directories` envelope」。 | §2 / §7 / §8 |
 > | **2026-08-07** | **2（不变）** | **v2+fix** | **`GET /slimapi/questions` 发现机制根治**：发现调用从 `GET /project` 改为 `GET /experimental/session?roots=true&archived=true`（opencode 全局顶层 session 列表 + 含已归档 session，每个 session 携带真实 `directory` 字段）。根因：`/project` 的 `worktree` 把非-git workdir 归到合成 global（`worktree="/"`），sidecar 跳过 `"/"` → 非-git目录（自定义工作目录、`/tmp`）+ git worktree 子目录（`.slim/worktrees/*`）的 pending question 全漏报。`/experimental/session` 用 session 真实 `directory`，覆盖全部；`archived=true` 使发现集合成超集（防 archived-only workdir 漏报）。删去 `worktree=="/"` 跳过。`discoveryComplete` 从「恒 true」改为「页未满 `_DISCOVERY_LIMIT`(10000) 时 true」（`/experimental/session` 接受 `limit`，截断时 `authoritativeDirectories` 降级）。envelope 字段集/错误码/total failure 不变。需 opencode ≥ v1.18.x。未 bump `X-Slimapi-Version`。详见 §2。 | §2 |
 > | **2026-08-05** | **2（不变）** | **v2+fix** | **`GET /slimapi/questions` 发现机制 bug 修复**：发现调用从 `GET /session?limit=10000`（误以为全局，实测 per-Location）改为 `GET /project`（ProjectTable 全表，真全局）。原实现漏报所有 `workdir ≠ process.cwd()` 的 pending question。字段 `directory`→`worktree`，跳过合成 global（`worktree=="/"`）。`discoveryComplete` 由"页未满时 true"改为**恒 true**（`/project` 无分页）。envelope 字段集不变，未 bump `X-Slimapi-Version`。（**2026-08-07 v2+fix**：本行的 `/project` 发现机制因非-git workdir 漏报，已替换为 `/experimental/session?roots=true`，见上一行。）详见 §2。 | §2 |
 > | **2026-08-05** | **2（不变）** | **v2+additive** | **加性回归 `GET /slimapi/questions`（跨目录 pending question 聚合）**：lite-v2 曾在批量清理中删除此端点，现加回为跨目录聚合端点。上游 opencode `GET /question` 是 **per-Location**（按 `X-Opencode-Directory` 路由的 workdir instance；无 header 回落 `process.cwd()`），故 `workdir ≠ process.cwd()` 的 pending question 对冷启动客户端不可见。本端点先 `GET /session?limit=1000`（无 directory header，全局存储）发现所有 directory，再对每个 distinct directory 并发 `GET /question`（带 `X-Opencode-Directory`）并合并。返回 **envelope 对象** `{items, errors, authoritativeDirectories}`（非裸数组，以表达 partial 失败）：每条 item 为上游 entry 原样 + 追加 `directory` 字段；`errors` 为 per-dir 失败（isolated，单 dir 失败不中断整体）；`authoritativeDirectories` null=全成功（client replace-all），数组=partial（仅覆盖所列 dir）。发现调用失败（网络/5xx/4xx/坏 JSON/非 list）→ 整体 **503** `upstream_unavailable`（无 envelope）。**未 bump** `X-Slimapi-Version`（仍 2）。修复 slim-mode 冷启动 pending question 不可见回归。详见 §2 + §2「`/slimapi/questions` envelope」。（**2026-08-05 v2+fix**：本行的 `GET /session?limit=…` 发现机制已替换为 `GET /project`，见上一行。） | §2 / §4 |
@@ -51,6 +52,7 @@
 | GET | `/slimapi/sessions` | A | 🔒 | 骨架 session 列表（`?directory/roots/limit/start/search`；`roots` 默认 **False**——客户端**应显式传** `roots=true` 以排除 subagent/task；`start` = epoch-ms **时间戳水位** `time_updated >= start`，**非 offset**，上游 legacy 不暴露前向 cursor、不保证 id tie-break）；200 加 `X-Complete` 头（见下）；每条带 `directory` 字段 |
 | GET | `/slimapi/sessions/status` | A | 🔒 | **只读 status 投影**（`?directory=<可选>`）。透传上游 `GET /session/status`（`Record<SessionID, {type:"busy"\|"idle"\|"retry"}>`）+ sidecar merge 每条目的 flat 顶层 `turnIncarnation`/`turn`（源自 `TurnRegistry.snapshot`，与 digest SSE §3.y 同源；未观测 sid → `(inc,0)`；turn_registry 未装配时两字段配对缺省）。端点只读、不写、不缓存——同内存只读投影，不引入新状态机。`directory` 可选（不传→200 全局 map + 不转发 directory；传→normalize+透传，上游 handler 零参数对 directory 是 no-op，恒返全量 map）。上游非 dict body → 503 `upstream_unavailable`；上游 4xx → 502 `upstream_http_N`；5xx/网络 → 503 |
 | GET | `/slimapi/questions` | A | 🔒 | **跨目录 pending question 聚合（加性回归，未 bump `X-Slimapi-Version`，仍 2）**。无参数（sidecar 自发现目录）。修复 slim-mode 冷启动看不到非-`process.cwd()` 目录 pending question 的 bug（上游 `GET /question` per-Location）。先 `GET /experimental/session?roots=true&archived=true`（opencode 全局顶层 session 列表 + 含已归档 session，每个 session 携带真实 `directory` 字段，覆盖 git repo + 非-git目录 + git worktree 子目录 + archived-only workdir）发现 distinct directory 集合，再并发对每个 dir `GET /question`（带 `X-Opencode-Directory`）合并。返回 envelope `{items, errors, authoritativeDirectories, discoveryComplete}`（见 §2「`/slimapi/questions` envelope」）；每条 item = 上游 entry 原样 + `directory` 字段。发现失败 → 整体 503 `upstream_unavailable`（无 envelope）；per-dir 失败 isolated 进 `errors[]`（不中断整体）。pending question 应答仍走 catch-all + `X-Opencode-Directory` |
+| GET | `/slimapi/directories` | A | 🔒 | **全局 directory catalog（加性新增，未 bump `X-Slimapi-Version`，仍 2）**。无 query 参数（全局发现语义，干脆不接受 directory，避免误导）。列出 opencode 已知工作目录供客户端渲染"项目切换器"。发现源 `GET /experimental/session?roots=true&archived=true&limit=10000`（复用 questions 的全局顶层 session 发现——每个 session 携带真实 `directory` 字段）。按 `normalize_directory` 归一聚合：每 dir 一行 `{directory,title,lastUpdated,rootSessionCount,activeRootSessionCount,archivedRootSessionCount,archivedOnly}`（title+lastUpdated 来自同源 winner——按 `(time.updated,time.created,id)` 取 max）；返回 envelope `{items, discoveryComplete}`（见 §2「`/slimapi/directories` envelope」）。**严格 schema 守卫**：任一 session 非 dict、或 `directory` 非非空 string → 整体 503 `upstream_unavailable`（不静默跳过）。错误映射同 questions 发现调用（网络/5xx/4xx/坏 JSON/非 list/超 cap→503 `upstream_unavailable`，不泄漏 upstream status）；转换池满→503 `transform_busy`+`Retry-After:2`。**被动发现局限**：仅覆盖至少有一条顶层 session 的 workdir；不扫文件系统；返回目录不代表目录仍存在 |
 | GET | `/slimapi/command` | A | 🔒 | **catalog skeleton（加性新增，未 bump `X-Slimapi-Version`，仍 2）**。透传上游 `GET /command`，白名单投影每项 `{name,description,agent?,hints?}`（丢 `template`(~97.7% 字节)/`source`/`model`/`subtask`；raw 省 ~97.6%）。`directory` 可选（仅 `X-Opencode-Directory` header 转发；command catalog 全局，上游忽略）。转换池 admission 先于 upstream GET + 流式 `read_with_cap`（超 `max_response_bytes`→413）+ worker gzip。上游 4xx→502 `upstream_http_N`；5xx/网络/坏 JSON/非 list→503 `upstream_unavailable`；转换池满→503 `transform_busy`+`Retry-After:2`；参数错误 422。catalog 无 `hasFull`/`omitted`。**加性**：旧 sidecar 无此路由→catch-all 404 `thin_route_not_found`，客户端回退透传 `GET /command` |
 | GET | `/slimapi/agent` | A | 🔒 | **catalog skeleton（加性新增，未 bump `X-Slimapi-Version`，仍 2）**。透传上游 `GET /agent`，白名单投影每项 `{name,description,mode,hidden?,native?}`（丢 `prompt`(~34.7%)/`permission`(~61.2%，`Permission.Ruleset` 规则集——**非** pending permission card)/`topP`/`temperature`/`color`/`variant`/`options`/`steps`/`model`；raw 省 ~95.8%）。`directory` 可选（catalog 全局）。转换池 admission + 流式 `read_with_cap` + worker gzip（同 command）。错误映射同 command。catalog 无 `hasFull`/`omitted`。**加性**：旧 sidecar→catch-all 404，回退透传 `GET /agent` |
 | GET | `/slimapi/messages/{sid}` | A | 🔒 | **骨架分页**（`?limit/before/mode/directory`）；**恒返回 skeleton 投影**——`?mode=full` 被静默忽略（不报错，仅返回 skeleton）；列表按 `time.created` **升序**；200 响应下发 **`X-Next-Cursor`** 头（opaque base64url 字符串，解析自 upstream `Link: <...?before=CURSOR>; rel="next"`），客户端用 `?before=<X-Next-Cursor>` 翻页向旧方向 drain |
@@ -119,6 +121,44 @@
 - **total failure**（发现调用 `GET /experimental/session` 失败：网络/5xx/4xx/坏 JSON/非 list）→ HTTP **503** `{"code":"upstream_unavailable"}`（**无 envelope**；客户端不可据此推断 pending question 集合，应保留既有状态并重试）。
 - pending question 的**应答动作**不经本端点（仍走 catch-all + `X-Opencode-Directory`，见 §2 写路径）；本端点只做读聚合。
 - **不读** opencode SQLite；上游 `/question` 是 legacy `:4096` server 挂载路径（per-Location）；发现调用 `/experimental/session` 是 opencode v2 全局端点（app/tui/acp/cli/SDK 共用）。
+
+### `/slimapi/directories` envelope（加性，2026-08-08；未 bump `X-Slimapi-Version`，仍 2）
+
+`GET /slimapi/directories` 返回一个 **envelope 对象**（非裸数组），供客户端渲染"项目切换器"。形状：
+
+```json
+{
+  "items": [
+    {
+      "directory": "/home/mar/.../ocdroid",
+      "title": "winner session 的 title 或 null",
+      "lastUpdated": 1723000000000,
+      "rootSessionCount": 12,
+      "activeRootSessionCount": 2,
+      "archivedRootSessionCount": 10,
+      "archivedOnly": false
+    }
+  ],
+  "discoveryComplete": true
+}
+```
+
+> **`discoveryComplete`**：`true` 除非发现页正好填满 `_DISCOVERY_LIMIT`(=10000)（可能截断）。`roots=true` 只返顶层 session，实际恒 `true`。
+
+字段语义：
+- **`items`**：每个 distinct directory 一行（`directory` 经 `normalize_directory` 归一——去尾斜杠、根 `/` 保留——后作 group key 去重，故 `/a` 与 `/a/` 合并）。排序：`lastUpdated` DESC，tie-break `directory` ASC。
+- **`directory`**：归一后的 workdir 绝对路径。
+- **`title`**：该 dir 下 winner session 的 `title`（非非空 string → `null`）。
+- **`lastUpdated`**：winner session 的 `time.updated`（数字；缺失/非数字→0）。
+- **`rootSessionCount`** / **`activeRootSessionCount`** / **`archivedRootSessionCount`**：该 dir 顶层 session 总数 / 未归档数（`time.archived` 非数字）/ 已归档数（`time.archived` 数字，排除 bool）。
+- **`archivedOnly`**：`activeRootSessionCount == 0`（该 dir 顶层 session 全已归档）。
+- **winner（title + lastUpdated 必须来自同一 session）**：按 `(time.updated, time.created, id)` 字典序取 `max` 的那个 session；数字字段缺失/非数字→0（排最后）；`id` 字典序最大者。
+
+**边界**：
+- 无任何 session（`/experimental/session` 返 `[]`）→ envelope `{items:[], discoveryComplete:true}`（**权威空**：无 workdir，replace-all 安全）。
+- **total failure**（发现调用失败：网络/5xx/4xx/坏 JSON/非 list/超 cap）→ HTTP **503** `{"code":"upstream_unavailable"}`（**无 envelope**）。
+- **严格 schema 守卫**：parse 得 list 后遍历每个 session，**任一**非 dict、或 `directory` 非 string、或为空字符串 → **503** `upstream_unavailable`（**不**静默跳过——本端点用 `discoveryComplete` 表达完整性，跳过坏 session 会让"看似完整"列表缺目录；镜像 sessions.py `not all(isinstance(s,dict))`→503 守卫）。
+- **被动发现局限（诚实）**：仅能看到至少有一条顶层 session 的 workdir；**从未建过 session 的 workdir 不可见**；**不扫文件系统**；**返回目录不代表目录仍存在**于文件系统（可能已删）。转换池满 → 503 `transform_busy` + `Retry-After:2`。
 
 ## §3 SSE 契约 🔒
 
@@ -339,7 +379,7 @@ sidecar 作为 ocdroid 与 opencode 之间的 Python 中继层，可观察所有
 - 502 `upstream_http_N`（top-level：thin 路由对 upstream **非 404 的 4xx** → 502）
   - **v2 删除**：v1 的 G6 envelope 语境（mid ≥400 → `errors[]`）已删除；v1 的 G6 discover 语境已删除。
 - 503 `transform_busy`（`Retry-After`；含 `GET /slimapi/sessions` 列表 projection 池饱和）/ `upstream_unavailable`（含 allowlist 刷新失败——v2 中 allowlist 已无独立刷新路径，此 code 主要覆盖 upstream 网络/5xx/坏 JSON）/ `sse_subscriber_limit_*`
-  - **`GET /slimapi/questions` 发现调用例外（2026-08-05 加性）**：该端点的目录发现调用（`GET /experimental/session?roots=true&archived=true`）是**内部派生调用**，其**任一**失败（网络/5xx/**4xx**/坏 JSON/非 list）统一映射为 **503 `upstream_unavailable`**（整体 total failure，无 envelope），**不走**通用的 4xx→502 `upstream_http_N` 规则——发现是 sidecar 自身 fan-out 的前提，泄漏上游状态码会误导客户端认为某个 directory 失败。per-dir `/question` 失败仍遵循通用 §7 映射（5xx→`upstream_unavailable`，4xx→`upstream_http_N`，isolated 进 `errors[]`）。（**2026-08-07 v2+fix**：发现调用从 `GET /project` 改为 `GET /experimental/session?roots=true&archived=true`——根因 `/project` 把非-git workdir 归到合成 global（`worktree="/"`）被跳过导致漏报；`/experimental/session` 用 session 真实 `directory` 字段根治，`archived=true` 使发现集合成超集防 archived-only workdir 漏报。映射规则不变。）
+  - **`GET /slimapi/questions` 与 `GET /slimapi/directories` 发现调用例外（2026-08-05 / 2026-08-08 加性）**：这两个端点的目录发现调用（`GET /experimental/session?roots=true&archived=true`）是**内部派生调用**，其**任一**失败（网络/5xx/**4xx**/坏 JSON/非 list/超 cap）统一映射为 **503 `upstream_unavailable`**（整体 total failure，无 envelope），**不走**通用的 4xx→502 `upstream_http_N` 规则——发现是 sidecar 自身聚合的前提，泄漏上游状态码会误导客户端。`/questions` 的 per-dir `/question` 失败仍遵循通用 §7 映射（5xx→`upstream_unavailable`，4xx→`upstream_http_N`，isolated 进 `errors[]`）；`/directories` 无 per-dir fan-out，发现即全部。（**2026-08-07 v2+fix**：发现调用从 `GET /project` 改为 `GET /experimental/session?roots=true&archived=true`——根因 `/project` 把非-git workdir 归到合成 global（`worktree="/"`）被跳过导致漏报；`/experimental/session` 用 session 真实 `directory` 字段根治，`archived=true` 使发现集合成超集防 archived-only workdir 漏报。映射规则不变。）
 - 503 `sse_token_subscriber_limit`（token stream admission 溢出；带 `{"limit":8,"current":N}` + `Retry-After:5`；**独立账本**，不占控制面 `MAX_TOTAL_SUBSCRIBERS`，见 §6.x）
 - 503 `sse_token_handshake_overflow`（token stream handshake buffer overflow；带 `{"limit":8,"current":N,"bufferBytes":8388608}` + `Retry-After:5`；触发于单次 handshake items 超 `TOKEN_HANDSHAKE_ITEMS=2048` 或 bytes 超 `TOKEN_HANDSHAKE_BUFFER_BYTES=8MiB`，见 §6.x）
 - **v2 删除**：v1 的 `upstream_unavailable`（envelope per-mid，Opt-A opt-in）已删除（Opt-A 整体下线）；v1 的 `upstream_error`（G6 envelope mid 2xx body 不可解析 + q/p fan-out 单 dir 失败项）已删除（G6 / q/p 端点不存在）；v1 的 q/p mutation `upstream_timeout` 504 已删除（q/p 写端点不存在，所有写经 catch-all 反代时由上游 opencode 自身语义决定）。

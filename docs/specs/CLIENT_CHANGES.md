@@ -89,6 +89,35 @@
 
 `/slimapi/command|agent/full`（仅当确认 UI 真需 template/prompt/permission；优先「按名查单条详情」而非全量 full）；`hints` 单项/总量 cap（当前原样保留，live 值 14B，省流比为实测非保证）。
 
+## 全局 directory catalog（/slimapi/directories，加性 — 2026-08-08）
+
+> **加性 / 向后兼容**：wire 版本未 bump（仍 2）。旧 sidecar 无此路由 → 404 `thin_route_not_found`，客户端透明回退（不渲染项目切换器，或用 `/slimapi/sessions` 兜底）。权威 envelope 语义见 `docs/specs/v2-contract.md` §2「`/slimapi/directories` envelope」。
+
+`GET /slimapi/directories` 列出 opencode 已知的工作目录（directory），供客户端渲染"项目切换器"。**无 query 参数**（全局发现语义，sidecar 自发现，客户端不传 directory）。发现源与 `/slimapi/questions` 共用 `GET /experimental/session?roots=true&archived=true`（每个 session 携带真实 `directory` 字段）。
+
+### 客户端必须
+
+- **envelope 形状**（非裸数组）`{items, discoveryComplete}`：
+  - `items`：每个 distinct directory 一行（`/a` 与 `/a/` 经归一合并成同一行），排序 `lastUpdated` DESC + tie-break `directory` ASC。每行字段：
+    - `directory`：归一后的 workdir 绝对路径。
+    - `title`：该 dir 下 winner session 的 `title`（非非空 string → `null`）。
+    - `lastUpdated`：winner session 的 `time.updated`（数字；缺失/非数字→0）。
+    - `rootSessionCount` / `activeRootSessionCount` / `archivedRootSessionCount`：该 dir 顶层 session 总数 / 未归档 / 已归档。
+    - `archivedOnly`：`activeRootSessionCount == 0`（该 dir 顶层 session 全已归档）。
+  - `discoveryComplete`：`true` 除非发现页填满 `_DISCOVERY_LIMIT`(=10000)（可能截断；`roots=true` 只返顶层 session，实际恒 `true`，客户端可忽略）。
+- **fallback 规则（关键）**：**仅** `404 thin_route_not_found` → 回退（旧 sidecar 无此路由，或用 `/slimapi/sessions` 兜底）。**绝不**对 `503`(upstream_unavailable/transform_busy)/`413`/timeout/版本错误/鉴权错误回退（会流量翻倍 + 掩盖问题；503 走 circuit breaker + Retry-After 重试）。
+- **total failure**：发现调用失败 → 整体 503 `upstream_unavailable`（无 envelope）；客户端保留既有项目列表并重试，**不可**据此推断"无任何 workdir"。
+- **被动发现局限（诚实，客户端需知晓）**：本端点**仅覆盖至少有一条顶层 session 的 workdir**。**从未建过 session 的 workdir 不可见**（用户须先在该 workdir 发起一次会话才会出现）；**不扫文件系统**；**返回目录不代表目录仍存在**于文件系统（workdir 可能已被删除，旧 session 仍记录其 path）。客户端"新建项目/打开文件夹"仍需走既有路径（本地文件选择 + 发首条消息建 session）。
+- **`archivedOnly` 含义**：`true` = 该 workdir 所有顶层 session 都已归档（用户在该 workdir 无活跃会话）。UI 可据此弱化/折叠该条目，但不应隐藏（用户可能仍想切换回去继续）。
+
+### 错误码（thin 路由统一 `{"code":"..."}`）
+
+`400 version_required`/`version_incompatible`、`404 thin_route_not_found`（旧 sidecar，回退信号）、`503 upstream_unavailable`（发现调用 total failure / 严格 schema 守卫失败 / 超响应 cap / 网络 5xx，无 envelope）、`503 transform_busy`(+`Retry-After:2`)、`422`。directories 非 session 级，无 `session_not_found`。**注意**：discovery 4xx 也映射为 `upstream_unavailable`（不泄漏 upstream status——experimental 端点 4xx 意 opencode 不支持）。
+
+### 监控
+
+`GET /slimapi/metrics.traffic` 已有独立 `directories` 桶（upIn/downOut/省流比）；access log 每条带 `bucket` 字段。
+
 ## 路由与失败策略
 
 - thin 使用 stunnel 14097，direct 14096。

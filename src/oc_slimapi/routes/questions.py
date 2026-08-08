@@ -7,13 +7,13 @@ import orjson
 from fastapi import APIRouter, Request
 from starlette.responses import Response
 
+from ..discovery import _DISCOVERY_LIMIT, fetch_global_root_sessions
 from ..gzip_util import compress_if_beneficial
 from ..traffic import stash_up_in
 from ..transform import read_with_cap
 from ..upstream import forward_directory_headers
 from ..upstream_errors import (
     UPSTREAM_UNAVAILABLE,
-    raise_upstream_unavailable,
     upstream_error_code_for_status,
 )
 
@@ -36,14 +36,10 @@ _fanout_sem = asyncio.Semaphore(_FANOUT_CONCURRENCY)
 # partial-replace, same as discovery truncation).
 _MAX_AGGREGATE_ITEMS = 10_000
 
-# Page size for the GET /experimental/session?roots=true discovery call.
-# `roots=true` returns only top-level sessions (parentID==null), so the count
-# ≈ number of distinct workdirs — orders of magnitude smaller than the full
-# session table. 10000 is therefore effectively never hit in practice; it is
-# a safety cap so a pathological upstream cannot exhaust memory. If the page
-# fills exactly, discovery is marked incomplete (see discovery_complete) so
-# the client degrades authoritativeDirectories instead of replace-all.
-_DISCOVERY_LIMIT = 10_000
+# Discovery page size for GET /experimental/session?roots=true — imported
+# from ..discovery (single source of truth; see fetch_global_root_sessions).
+# Referenced by name (not inlined) so tests can monkeypatch this binding to
+# exercise the discovery-truncation path without building 10k sessions.
 
 
 @router.get("/questions")
@@ -127,56 +123,15 @@ async def questions(request: Request):
     # archived but whose instance still holds pending questions is not
     # dropped — /question is an in-memory store independent of archive
     # state, so at worst we fan out to a dead instance (isolated errors[]).
+    #
+    # status>=400 / RequestError / bad JSON / non-list / cap-exceeded →
+    # 503 upstream_unavailable (total failure, contract §7 discovery
+    # exception — do NOT leak upstream status). ``limit`` is read by name
+    # from this module so tests can monkeypatch the binding.
     # ------------------------------------------------------------------
-    config = request.app.state.config
-    try:
-        response = await upstream_client.send(
-            upstream_client.build_request(
-                "GET", "/experimental/session",
-                params={
-                    "roots": "true",
-                    "archived": "true",
-                    "limit": _DISCOVERY_LIMIT,
-                },
-            ),
-            stream=True,
-        )
-    except httpx.RequestError as exc:
-        raise_upstream_unavailable(exc)
-    try:
-        try:
-            if response.status_code >= 400:
-                # network/5xx/4xx on discovery = total failure (contract §7: 503
-                # upstream_unavailable, NOT upstream_http_N). Discovery is an
-                # internal derived call; leaking the upstream status would mislead
-                # the client about which directory failed.
-                err_body = await response.aread()
-                stash_up_in(request, len(err_body))
-                raise_upstream_unavailable()
-            body, _ = await read_with_cap(
-                response, config.max_response_bytes,
-                on_read=lambda n: stash_up_in(request, n),
-            )
-            if body is None:
-                raise_upstream_unavailable()
-            try:
-                sessions_payload = orjson.loads(body)
-            except (orjson.JSONDecodeError, ValueError) as exc:
-                raise_upstream_unavailable(exc)
-            if not isinstance(sessions_payload, list):
-                raise_upstream_unavailable()
-        except httpx.RequestError as exc:
-            # Mid-stream read failure (aread or read_with_cap).
-            raise_upstream_unavailable(exc)
-    finally:
-        await response.aclose()
-
-    # /experimental/session honors `limit`; detect truncation so the client
-    # can degrade authoritativeDirectories (avoid replace-all dropping
-    # pending questions in undiscovered dirs). roots=true returns only
-    # top-level sessions (count ≈ distinct workdirs), so _DISCOVERY_LIMIT is
-    # effectively never hit in practice — but guard it for correctness.
-    discovery_complete = len(sessions_payload) < _DISCOVERY_LIMIT
+    sessions_payload, discovery_complete = await fetch_global_root_sessions(
+        upstream_client, request, limit=_DISCOVERY_LIMIT,
+    )
 
     # ------------------------------------------------------------------
     # Step 2: derive the DISTINCT set of workdir directories (first-seen

@@ -111,6 +111,16 @@
 - **保护**：发现调用失败 → 整体 503 `upstream_unavailable`（无 envelope）；per-dir 失败 isolated 进 `errors[]`（5xx→`upstream_unavailable`，4xx→`upstream_http_N`，不中断整体）。
 - **加性**：未 bump `X-Slimapi-Version`（仍 2）；旧 sidecar→catch-all 404 `thin_route_not_found`。详见 `v2-contract.md` §2「`/slimapi/questions` envelope」。
 
+### 1.7b `GET /slimapi/directories`（全局 directory catalog，加性）
+
+- **参数**：无（全局发现语义，干脆不接受 directory，避免误导）。
+- **upstream**：`GET /experimental/session?roots=true&archived=true&limit=10000`（复用 questions 的全局顶层 session 发现——每个 session 携带真实 `directory` 字段，覆盖 git repo + 非-git目录 + git worktree 子目录 + archived-only workdir）。无 per-dir fan-out。
+- **转化**：转换池 admission **先于** upstream GET；流式读 + `read_with_cap`；**严格 schema 守卫**（任一 session 非 dict / `directory` 非非空 string → 整体 503 `upstream_unavailable`，不静默跳过——本端点用 `discoveryComplete` 表达完整性）；worker 内按 `normalize_directory` 归一聚合每 dir 一行 + winner（`(time.updated,time.created,id)` 取 max，title+lastUpdated 同源）+ serialize + gzip。
+- **响应**：**envelope 对象** `{items:[{directory,title,lastUpdated,rootSessionCount,activeRootSessionCount,archivedRootSessionCount,archivedOnly}],discoveryComplete}`（非裸数组）。items 排序 `lastUpdated` DESC + tie-break `directory` ASC。`discoveryComplete` 为 `true` 除非发现页填满 `_DISCOVERY_LIMIT`(=10000)。
+- **保护**：发现调用任一失败（网络/5xx/**4xx**/坏 JSON/非 list/超 cap）→ 整体 503 `upstream_unavailable`（无 envelope，不泄漏 upstream status）；转换池满→503 `transform_busy`+`Retry-After:2`。
+- **被动发现局限（诚实）**：仅覆盖至少有一条顶层 session 的 workdir；从未建过 session 的 workdir 不可见；不扫文件系统；返回目录不代表目录仍存在。
+- **加性**：未 bump `X-Slimapi-Version`（仍 2）；旧 sidecar→catch-all 404 `thin_route_not_found`，客户端 fallback。详见 `v2-contract.md` §2「`/slimapi/directories` envelope」。
+
 ### 1.8 `GET /slimapi/command` / `GET /slimapi/agent`（catalog skeleton，加性）
 
 - **参数**：`directory?`（可选，仅作 `X-Opencode-Directory` header 转发；catalog 全局，上游忽略）。
