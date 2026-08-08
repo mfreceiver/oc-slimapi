@@ -126,7 +126,15 @@
 
 **场景 2 — 非 slim 模式（ocdroid 直连 opencode，不经 sidecar）**：无 `/slimapi/**` 路由面。
 
-**降级实现（按推荐度，可叠加）**：
+> **ocdroid 实际采用（2026-08-08 双向确认）**：
+> - **降级地板 = 方案 2（MRU 本地列表）**，复用既有 `recentWorkdirs`（EncryptedSharedPreferences per-fingerprint、cap 30），仅用户选中时并入（不批量灌入，防驱逐本机最近条目）；禁 DataStore（项目规范硬约束）。
+> - **不上方案 1**（`/experimental/session` 自聚合代价过高，且 legacy 模式直接隐藏功能无需它）。方案 1/3 保留为参考实现（其他客户端或未来选项）。
+> - legacy（slim=false）隐藏整个项目切换器功能；slim + 旧 sidecar 时入口图标仍在、sheet 降级 MRU 标「本机最近项目」。
+> - capability 探测：一次性 404 probe + sticky flag（复用 `ServerCompatProfile.supportsSlimDirectories`），不引入 feature flag 系统。
+> - **normalize 一致性（关键）**：客户端「已连接禁选集」去重的 `normalize()` 必须与 sidecar `normalize_directory` 语义一致——`s.rstrip("/") or "/"`（去所有尾部斜杠，根 `/` 保留；`/a/b/`→`/a/b`、`/`→`/`），否则 sidecar 下发的已归一 `directory` 与客户端 normalize 结果不匹配 → 禁选集漏判 / 重复添加。
+> - `transform_busy` + `Retry-After`：ocdroid 已有 `retryAfterHeaderToMs` + 重试范式，本端点复用（sidecar 仍发 `Retry-After:2`，无改动）。
+
+**降级实现（参考，按覆盖面排序）**：
 
 1. **直连上游自聚合（推荐，覆盖面与 slim 版相同）**：ocdroid 直接请求 opencode `GET /experimental/session?roots=true&archived=true&limit=10000`（走 ocdroid direct 配置端口，经 :14096 mTLS），客户端自行 group-by-directory 聚合——算法与 sidecar `_aggregate_and_pack` 一致：
    - group key = `directory`（去尾斜杠，根 `/` 保留）；
