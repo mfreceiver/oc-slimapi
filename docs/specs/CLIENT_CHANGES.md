@@ -118,6 +118,30 @@
 
 `GET /slimapi/metrics.traffic` 已有独立 `directories` 桶（upIn/downOut/省流比）；access log 每条带 `bucket` 字段。
 
+### 非 slim 模式 / 旧 sidecar 降级方案
+
+`/slimapi/directories` 仅在 sidecar ≥ v1.2.0 的 slim 模式下可用。两种降级场景与推荐实现：
+
+**场景 1 — 旧 sidecar（< v1.2.0，slim 模式）**：调 `/slimapi/directories` 返回 404 `thin_route_not_found` → 触发降级（探测结果缓存，勿每连接重复）。
+
+**场景 2 — 非 slim 模式（ocdroid 直连 opencode，不经 sidecar）**：无 `/slimapi/**` 路由面。
+
+**降级实现（按推荐度，可叠加）**：
+
+1. **直连上游自聚合（推荐，覆盖面与 slim 版相同）**：ocdroid 直接请求 opencode `GET /experimental/session?roots=true&archived=true&limit=10000`（走 ocdroid direct 配置端口，经 :14096 mTLS），客户端自行 group-by-directory 聚合——算法与 sidecar `_aggregate_and_pack` 一致：
+   - group key = `directory`（去尾斜杠，根 `/` 保留）；
+   - 每 dir：`rootSessionCount` / `activeRootSessionCount`（`time.archived` 非数字）/ `archivedRootSessionCount`（`time.archived` 数字，排除 bool）/ `archivedOnly`（active==0）；
+   - winner = `(time.updated, time.created, id)` 字典序 max；`title` + `lastUpdated` 取自同一 winner（缺失数字→0 排最后）；
+   - items 排序 `lastUpdated` DESC + tie-break `directory` ASC。
+   - **代价**：客户端拉完整 `Session.Info` 对象（不省流；`roots=true` 只返顶层 session，量级 ≈ workdir 数，单次通常可接受）+ 自实现聚合。
+   - **依赖**：opencode ≥ v1.18.x 提供 `/experimental/session`（experimental 端点，跨版本兼容性需注意；若 opencode 不支持或返 4xx → 降级到方案 2）。
+
+2. **本地维护 directory 列表（兜底，零网络依赖）**：客户端持久化"用户访问过的 workdir 路径"（历史记录 + 手动添加）。完全不依赖服务端发现，最可靠；但不自动发现新 workdir（用户须先在该 workdir 发起会话，客户端记录其 `directory`）。建议与方案 1 叠加：方案 1 拉到的 directory 并入本地列表，方案 1 不可用时退回本地列表。
+
+3. **legacy `/session` per-Location（不足以做跨目录项目切换器）**：`GET /session` 受 `X-Opencode-Directory` 路由，只能看当前 workdir，无法跨目录发现——仅适合"确认当前 workdir 可达"，不适合渲染跨目录切换器。
+
+**不降级触发条件**：与 fallback 规则一致——**仅** 404 `thin_route_not_found`（场景 1）或确认处于非 slim 模式（场景 2）才走降级。**绝不**对 503（`upstream_unavailable` / `transform_busy`）/413/timeout/版本错误降级（走重试 + circuit breaker + `Retry-After`）。
+
 ## 路由与失败策略
 
 - thin 使用 stunnel 14097，direct 14096。
