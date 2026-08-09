@@ -12,7 +12,7 @@
 
 ### F1【BUG · 阻塞客户端】`_patch()` 把 diffStats 写到了客户端不读的顶层位置
 
-**位置**: `src/oc_slimapi/skeleton.py:256-260`，函数 `_patch()`。
+**位置**: `src/oc_slimapi/skeleton.py:251-259`（约 251-259），函数 `_patch()`。
 
 ```python
 # 当前（错误）
@@ -46,13 +46,15 @@ state.metadata?.get("diffStats")   // ocdroid 读法（JsonObject → additions/
 
 **确认依据**: `v2-contract.md:247-250` —— digest 字段集 = `{sessionID, directory, status?, messageID?, updatedAt?, archived?, deleted?, lastError?, turnIncarnation?, turn?}`，**不含** part state、不含 diffStats。
 
-这是 v2 的有意设计（lite-v2 删除了 Stage B part-tracking，见 `v2-contract.md:268`）。diffStats 只能通过骨架投影（`/slimapi/messages/{sid}` 或 `/slimapi/messages/{sid}/full/{mid}`）获得。
+这是 v2 的有意设计（lite-v2 删除了 Stage B part-tracking，见 `v2-contract.md:268`）。diffStats 仅由 skeleton 投影注入，**只在 `/slimapi/messages/{sid}` 列表端点可获得**。`/slimapi/messages/{sid}/full/{mid}` 端点走 `strip_diagnostics_and_pack`（仅删 diagnostics，不跑 skeleton 投影），返回全量上游内容（含 raw `state.metadata.filediff`），**不注入计算型 diffStats**。客户端的 diffStats 徽章状态来自 skeleton 列表，/full 展开是为取完整 output 文本，不重读徽章。
 
 ### F4【可见性路径确认】客户端看到 running→completed + diffStats 的可靠路径
 
 **契约依据**: `v2-contract.md:330`——
 
 > part/message 完成仍走既有路径：`message.updated`(step-finish) → digest → 客户端 `/messages/{sid}` 或 `/full/{mid}` 拉权威全文。
+>
+> 注：此处"权威全文"指 output/text 完整内容（token stream reconcile 用），**不含** diffStats——diffStats 仅 skeleton 投影注入。
 
 **完整链路**（slimapi 侧可保证部分 + 上游依赖部分）:
 
@@ -261,7 +263,7 @@ import orjson
 from oc_slimapi.sse.global_hub import GlobalHub
 from oc_slimapi.sse.hub_types import STOP, Subscriber, sse_frame
 
-async def _drain(subscriber, timeout=0.5):
+def _drain(subscriber):
     """抽出 subscriber queue 当前已入队的所有帧（不阻塞）。"""
     frames = []
     try:
@@ -408,7 +410,10 @@ def test_skeleton_after_patch_complete_has_diffstats_in_state_metadata():
 
 1. **环境**: 启 oc-slimapi（`.venv/bin/python -m oc_slimapi.app`）+ opencode（`:4096`）。
 2. **抓上游 SSE**: 在 slimapi 与 opencode 之间插观察点——临时改 `global_hub.py:run()` 在 `self.publish(orjson.loads(...))` 前打印 `event_type`，或用 `mitmproxy` / `socat` 旁路抓包。
-3. **触发**: 用 ocdroid 或 curl 对 opencode 发一个 edit 工具调用（`POST /session/{sid}/prompt`，prompt 让模型改一个文件）。
+3. **触发两组实测**:
+   (a) **edit 工具**（走 `_tool()` + filediff）：用 ocdroid 或 curl 对 opencode 发一个 edit 工具调用（`POST /session/{sid}/prompt`，prompt 让模型改一个文件）。
+   (b) **apply_patch / 多文件 write**（走 `_patch()` + files[]）：用 ocdroid 触发 apply_patch 或 write 工具（创建/修改多个文件）。
+   两组分别记录事件序列 + 判定 digest→骨架拉取链路。edit 与 patch 的上游事件序列可能不同（如 patch 可能发额外 `message.part.updated`），需分别验证。
 4. **记录上游事件序列**，预期看到（按时间）:
    - `session.status(busy)`
    - `message.updated` 或 `message.appended`（消息创建）
@@ -416,10 +421,12 @@ def test_skeleton_after_patch_complete_has_diffstats_in_state_metadata():
    - `message.part.updated`（part state running → completed）
    - **`message.updated`（关键：工具完成 nudge）← 必须确认存在 + 时机**
    - `session.status(idle)`
-5. **判定标准**:
-   - ✅ 工具完成时上游发 `message.updated`，且 filediff 已落库（抓 `/session/{sid}/message/{mid}` 看是否有 `state.metadata.filediff`）→ 客户端链路可靠。
-   - ⚠️ 上游发 `message.updated` 但 filediff 尚未落库（竞态）→ 客户端拉骨架会拿到无 diffStats 的中间态，需客户端在下次 digest 再拉一次（幂等 reconcile）。
-   - ❌ 上游**不**发 `message.updated`（只发 `message.part.updated`）→ slim 不 nudge，客户端看不到完成——**需 omni 决策**：要么推 opencode 上游改，要么 slimapi 在 `message.part.updated` 检测到 `state.status` running→completed 跃迁时主动 bump digest（违背 v2 「part 事件不进 digest」设计，需契约 bump）。
+5. **判定标准**（以 digest 发出后客户端拉取到 completed + diffStats 为最终基准）:
+   - ✅ **可靠**: digest 发出时 filediff 已落库 → 客户端拉 `/messages/{sid}` 拿到 completed + `state.metadata.diffStats`。
+   - ⚠️ **竞态**: digest 发出时 filediff 未落库 → 客户端拉到 completed 但无 diffStats（中间态）。**仅当实测确认存在后续 digest nudge（下次 `message.updated`）或客户端有明确 retry 时才算可恢复**；否则判为不可靠。
+   - ❌ **不可靠**: 上游**不**发 `message.updated`（只发 `message.part.updated`）→ slim 不 nudge → 客户端看不到完成。**需 omni 决策**：要么推 opencode 上游改，要么 slimapi 在 `message.part.updated` 检测到 `state.status` running→completed 跃迁时主动 bump digest（违背 v2 「part 事件不进 digest」设计，需契约 bump）。
+
+> **Q1 限定条件**：Q1（slimapi 可保证）仅在"事件含可解析 sessionID 且 subscriber 存在"时成立（`_extract_session_id` 会拒绝 malformed event，见 `hub_types.py:305-328`）。
 
 **实测产出**: 一份事件序列 trace（类似 `design-token-stream.md` §11 的实测表），归档进 `docs/specs/chat-toolcard-investigation.md` §B.8。
 
@@ -435,6 +442,8 @@ def test_skeleton_after_patch_complete_has_diffstats_in_state_metadata():
 | R4 | **patch 有 files[] 无 state 的边界** | **无行为变化**——`_is_renderable` 操作输入 `part`（files[] 存在即返回 True），修复仅改变输出 `result` 形状，不影响 `_is_renderable` 判定 | §2 已论证无回归；`test_patch_with_files_but_no_state_creates_state_metadata` 仍保留，但定位为"验证 state 容器创建边界"而非"验证 renderable 行为变化" |
 | R5 | **契约文档未记录 diffStats**（F2） | 后续 agent 不知 wire 位置 | 项2 建议补录 v2-contract.md + INTERFACE_MAP.md（需 omni 批准，本任务不做） |
 | R6 | **diffStats 注入位置改到 state.metadata，与 `/full/{mid}` 的 diagnostics strip 共存** | strip_diagnostics_message 只 pop diagnostics，不动 diffStats → 无冲突 | 已核 `skeleton.py:382-415`，strip 只动 `metadata.diagnostics`，diffStats 保留。无风险 |
+| R7 | **`/full/{mid}` 不含 diffStats** | `/full` 走 `strip_diagnostics_and_pack`（不跑 skeleton），返回全量上游（含 raw filediff，无计算型 diffStats）。客户端若以 `/full` 响应整体覆盖 part 模型，diffStats 徽章会丢失；若按字段合并则从 skeleton 保留。ocdroid 合并逻辑未知（跨仓不确定项）。 | 本方案 F1 修复范围 = skeleton 投影（`/messages/{sid}`）；`/full` 的 diffStats 对等（若客户端需要）是 **单独 follow-up**，需 omni 决策是否扩展 `strip_diagnostics_and_pack` 注入 diffStats。 |
+| R8 | **wire 位置移动的兼容性** | 顶层 `result.diffStats` 从未被任何已知客户端消费（ocdroid 只读 `state.metadata?.get("diffStats")`，`PartStateSerializer` 不搬运顶层字段）。本次"移动"实质是修复一个从未生效的 bug，对已知客户端无破坏性。 | 旧顶层位置**不是受支持契约**（无文档记录、无消费者）；移动后顶层 diffStats 消失是预期行为。若未来发现外部消费者读顶层，需另行评估。 |
 
 ---
 
