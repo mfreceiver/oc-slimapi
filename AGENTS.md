@@ -35,7 +35,7 @@ ocdroid ──(stunnel mTLS 14096)──▶ opencode :4096   # 直连回退，�
 | **opencode 源码（在 ocdroid 内）** | `/home/mar/personal_projects/ocdroid/opencode-src/current` | 上游 server 源码快照，供对照 legacy 行为 |
 
 **opencode 源码目录（相对 ocdroid 根）**：`opencode-src/current/`（稳定符号链接 → 当前对齐版本的子目录）。  
-**当前对齐版本**：`opencode-src/current` → **v1.18.4**（完整 monorepo 树；非部分抽取）。后续定期更新时，仅 repoint `current` 符号链接即可，本仓文档路径不需改。`opencode-src/` 在 ocdroid `.gitignore` 中，符号链接不污染 ocdroid git。
+**当前对齐版本**：`opencode-src/current` → **v1.18.13**（完整 monorepo 树；非部分抽取）。后续定期更新时，仅 repoint `current` 符号链接即可，本仓文档路径不需改。`opencode-src/` 在 ocdroid `.gitignore` 中，符号链接不污染 ocdroid git。
 
 ### 上游对照常用路径（相对 `opencode-src/current/`）
 
