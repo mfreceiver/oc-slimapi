@@ -403,3 +403,60 @@ curl -s --cert client-cert.pem --key client-key.pem \
 - **Client cert**：ocdroid 客户端持有 `client-cert.pem` + `client-key.pem`（CA 签发）。**本轮 patch 无需轮换**。
 
 > **注意**：`docs/mtls-setup-guide.md` 不在此仓库；ops-maintained。证书更新流程由 ops 自行维护。
+
+---
+
+## 11. actions 管理功能
+
+> 本节记录 `/slimapi/actions` 的运维注意事项。功能详见 `docs/specs/v2-contract.md` §2「`/slimapi/actions` API」。
+
+### 11.1 安全风险声明
+
+> **这是风险接受声明，非安全保证。**
+
+`/slimapi/actions` 提供在服务器端执行任意命令的能力（由 manifest 声明）。暴露面有两层：
+
+1. **manifest 声明的动作**：由 `OC_SLIMAPI_ACTIONS_FILE` TOML 文件定义，仅 owner 可写。
+2. **既有 catch-all → opencode control 端点**（`/global/upgrade`、`/global/config PATCH`、`/global/dispose`、`/instance/dispose` 等）——这些先于 actions 功能存在，经明文 `:4097` 均可达。
+
+运维须明确接受本功能与既有 catch-all 相同的风险类：
+
+- **明文 `:4097` 可达**：能访问 `:4097` 的任何设备均可触发 manifest 中声明的任意动作。version 门闩（`X-Slimapi-Version`）≠ 鉴权，`confirm` ≠ 授权，`X-Client-Id` 不可信。
+- **不做 token、不加 loopback 闸门**：本功能延续既有安全模型，不引入额外鉴权层。
+- **缓解措施**（已纳入，非授权替代）：
+  - 默认空 manifest（功能 opt-in，默认禁用）
+  - spawn 并发上限（`OC_SLIMAPI_ACTIONS_MAX_CONCURRENT`，默认 4）
+  - single-flight + min_interval 限频
+  - manifest owner-only-write 保护（启动校验：文件须 owner 写权限，禁止 group/other write 位）
+  - 动作名称仅作白名单字典键查找（无可变参数、无 shell=True）
+  - 结构化审计日志（所有调用 WARNING 级写入 journald，不受 `OC_SLIMAPI_LOG_LEVEL` 影响）
+
+### 11.2 manifest 配置
+
+```toml
+# TOML 文件路径由 OC_SLIMAPI_ACTIONS_FILE 指定
+[actions.restart_opencode]
+kind = "exec"
+argv = ["/usr/bin/systemctl", "--user", "restart", "opencode-web"]
+description = "重启 opencode 服务"
+timeout_s = 30
+min_interval_s = 60
+require_confirm = true
+
+[actions.plan_limit]
+kind = "query"
+argv = ["/home/mar/.config/opencode/scripts/plan_limit.py"]
+description = "查询上游厂商订阅配额"
+timeout_s = 90
+max_output_bytes = 65536
+```
+
+### 11.3 运维注意事项
+
+- **manifest 文件安全**：启动校验强制 manifest 必须是 regular file（拒绝 symlink）、owner-only-write（拒绝 group/other write 位）、owner 为 sidecar 运行用户。修改 manifest 后须重启 sidecar。
+- **action 脚本勿 daemonize**：脚本若 fork 子进程后父进程退出，sidecar 的 `killpg` 无法收回孤儿进程（进程组 ID 会变）。action 脚本应同步执行，不要后台化/daemonize。
+- **exec 200 ok:true ≠ opencode ready**：exec 动作返回 `ok:true` 仅表示子进程 exit 0。如果动作涉及重启 opencode（如 `restart_opencode`），客户端须轮询 `/slimapi/ready` 确认 opencode 重新就绪。
+- **query stdout 可能含任意内容**：`markdown` 字段是脚本 stdout 投影。运维定义 action 时应注意脚本输出内容；客户端渲染应使用 sandboxed markdown renderer。
+- **子进程环境**：子进程继承 sidecar 环境变量（含 `DBUS_SESSION_BUS_ADDRESS`、`HOME`、`PATH` 等），以 sidecar 运行用户（`mar`）身份执行，可读 `~/.config/opencode/` 凭证。这是有意设计（systemctl/plan_limit 需此环境）。
+- **审计**：所有 action 调用（含 timeout/spawn-fail/disconnect/throttle）以 WARNING 级别写入 journald，不受 `OC_SLIMAPI_LOG_LEVEL` 影响。查询审计：`journalctl --user -u oc-slimapi -p warning | rg action`。
+- **进程重启 = 限频归零**：min_interval 限频是内存态（`time.monotonic()`），sidecar 进程重启后清零。这是有意设计（启动后各 action 均可立即调用一次）。

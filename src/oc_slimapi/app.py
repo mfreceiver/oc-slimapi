@@ -14,13 +14,14 @@ from .access_log import (
     run_access_log_maintenance_loop,
     setup_access_log,
 )
+from .actions import load_registry as actions_load_registry
 from .config import settings
 from .errors import register_error_handlers
 from .logging_config import get_logger, setup_logging
 from .middleware.request_id import RequestIdMiddleware
 from .middleware.traffic_accounting import TrafficAccountingMiddleware
 from .proxy import install_proxy
-from .routes import agent, command, directories, events, health, messages, metrics, questions, sessions, token_stream
+from .routes import actions, agent, command, directories, events, health, messages, metrics, questions, sessions, token_stream
 from .sse.hub import HubRegistry
 from .sse.token_hub import TokenStreamHub, TokenStreamRegistry
 from .sse.tokenstream.hub import apply_debug_budget_overrides
@@ -303,6 +304,13 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             get_logger("app").warning("failed to read deployment revision", exc_info=exc)
             app.state.deployment_revision = None
+        # /slimapi/actions: configuration-driven admin actions (spec §5).
+        # Best-effort manifest load — mirrors the access-log pattern: an unset
+        # / missing / unreadable / invalid manifest disables the feature with a
+        # WARNING/ERROR log and NEVER crashes lifespan. ``load_registry`` does
+        # not raise; the async Semaphore it constructs binds lazily to the
+        # running loop, which is always live here (lifespan).
+        app.state.actions_registry = actions_load_registry(settings)
         # T3-hardened hub registry (contract §6): per-subscriber byte budget,
         # per-frame ceiling, and per-directory / total admission caps all flow
         # in from Settings so an operator can tune them via env without code.
@@ -494,7 +502,7 @@ app.add_middleware(RequestIdMiddleware)
 # install_proxy's catch-all (design §5.1: route must precede the reverse
 # proxy). Its path ``/slimapi/sessions/{sid}/stream`` does not shadow
 # ``/{sid}/status`` or ``/{sid}/children`` (different literal suffixes).
-for router in (health.router, agent.router, command.router, sessions.router, messages.router, events.router, metrics.router, questions.router, directories.router, token_stream.router):
+for router in (health.router, actions.router, agent.router, command.router, sessions.router, messages.router, events.router, metrics.router, questions.router, directories.router, token_stream.router):
     app.include_router(router)
 install_proxy(app)
 

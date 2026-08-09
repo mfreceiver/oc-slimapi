@@ -150,6 +150,29 @@
 
 **不降级触发条件**：与 fallback 规则一致——**仅** 404 `thin_route_not_found`（场景 1）或确认处于非 slim 模式（场景 2）才走降级。**绝不**对 503（`upstream_unavailable` / `transform_busy`）/413/timeout/版本错误降级（走重试 + circuit breaker + `Retry-After`）。
 
+## 通用管理动作（/slimapi/actions，加性 — 2026-08-09）
+
+> **加性 / 向后兼容**：wire 版本未 bump（仍 2）。旧 sidecar 无此路由 → 404 `thin_route_not_found`，客户端透明回退（不展示管理动作 UI）。
+
+`/slimapi/actions` 提供服务器端管理能力。配置驱动（TOML manifest），两类动作：
+
+- **exec**：触发服务器端命令，回显 `{kind:"exec", ok, exit_code, duration_ms, message}`（**`message` 字段始终出现**，成功时为 `null`；非零退出为固定短串 `"non-zero exit"`）。
+- **query**：触发命令，回显待渲染 markdown `{kind:"query", ok, markdown, exit_code, duration_ms, truncated, message}`（**`message` 字段始终出现**，成功时为 `null`）。
+
+### 客户端必须
+
+- **发现可调用动作**：`GET /slimapi/actions` → 返回 `{"enabled":bool,"actions":[{"name","kind","description","requireConfirm"}]}`。未配置 manifest 时 `enabled:false`，actions 为空数组。
+- **调用动作**：`POST /slimapi/actions/{name}`，body `{}` 或空 body（`require_confirm=true` 的 exec 动作须 `{"confirm":true}`，否则 409）。
+- **query 响应 `markdown` 字段安全渲染**（关键）：query 类响应的 `markdown` 字段是脚本 stdout 投影，可能含**任意内容**（由管理员定义的 action 脚本输出生成）。ocdroid 渲染 `markdown` **必须用 sandboxed markdown renderer**，禁用 raw HTML、脚本执行、远程图片加载，防止 XSS 或意外内容执行。
+- **exec 响应 **：`ok:true` 仅表示子进程 exit 0，**不**代表 opencode 就绪。客户端须轮询 `/slimapi/ready` 确认 opencode 可达（如果 exec 动作涉及重启 opencode 等操作）。
+- **无可变参数**：所有动作参数（argv）由 manifest 固定，客户端不可传可变参数。name 仅作白名单键查找。
+- **请求体 ≤ 1 KiB**：body 恒为空或 `{"confirm":true}`；**不得**发送更大的 body——超限将被拒 **413** `request_too_large`（admission 前）。
+- **错误码**：413 `request_too_large`（body 超 1 KiB）；404 `action_not_found` → 动作名不存在；409 `action_confirm_required` → 缺 confirm 字段；429 `action_throttled`（+ `Retry-After`）→ 动作级限频，等待后重试；503 `actions_disabled`/`action_unavailable`/`action_busy`（+ `Retry-After:2`）→ 功能禁用/spawn 失败/服务级并发满；504 `action_timeout`（+ `timeout_s`）→ 超时。
+
+### 错误码（thin 路由统一 `{"code":"..."}`）
+
+`400 version_required`/`version_incompatible`、`404 thin_route_not_found`（旧 sidecar，回退信号）、`404 action_not_found`、`409 action_confirm_required`、`413 request_too_large`、`429 action_throttled`+`Retry-After`、`503 actions_disabled`/`action_unavailable`/`action_busy`+`Retry-After:2`、`504 action_timeout`+`timeout_s`、`422`。
+
 ## 路由与失败策略
 
 - thin 使用 stunnel 14097，direct 14096。

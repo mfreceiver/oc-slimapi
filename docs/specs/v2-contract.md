@@ -59,6 +59,8 @@
 | GET | `/slimapi/messages/{sid}/full/{mid}` | A | 🔒 | 单条全文（展开某条）；**v2 简化**：**恒 200** full 投影 body，**无 304**、**无 ETag**、**无 `X-Message-Event-Seq` 响应头**、**无 `?known.*` 查询参数**（Stage B fingerprint 全部移除） |
 | GET | `/slimapi/events` | A | 🔒 | 实例级策展 SSE（见 §3） |
 | GET | `/slimapi/sessions/{sid}/stream` | A | 🔒 | opt-in 实时 token stream SSE（见 §3.x；**gzip 默认[lever2，首个 SSE gzip 例外]**、独立 T3 账本[§6.x]、终态 done:true marker 无 text[lever1]） |
+| GET | `/slimapi/actions` | A | 🔒 | **动作发现（加性新增，未 bump `X-Slimapi-Version`，仍 2）**：返回服务器端 TOML manifest 声明的可调用动作清单。响应 `{"enabled":bool,"actions":[{"name","kind","description","requireConfirm"}]}`；未配置 manifest → `{"enabled":false,"actions":[]}`。`Cache-Control: no-store`。见 §2「`/slimapi/actions` API」 |
+| POST | `/slimapi/actions/{name}` | A | 🔒 | **动作调用（加性新增，未 bump `X-Slimapi-Version`，仍 2）**：按 name 调用 manifest 声明的动作。两类响应信封——exec `{"kind":"exec","ok":bool,"exit_code":int|null,"duration_ms":int,"message":str|null}` / query `{"kind":"query","ok":bool,"markdown":str|null,"exit_code":int|null,"duration_ms":int,"truncated":bool,"message":str|null}`。空 body 或 `{}` → 视为 `{}`；`require_confirm=true` 缺 `{"confirm":true}` → 409 `action_confirm_required`。7 新错误码。`Cache-Control: no-store` + `Vary: Accept-Encoding`。name 仅作 registry 字典键查找（白名单，不参与路径拼接/eval）。**与 catch-all 关系**：本端点是 sidecar 本地端点，不走 catch-all 反代。见 §2「`/slimapi/actions` API」 |
 | * | `/{path}` (catch-all) | B | 🔒 | 透传 opencode（含发消息等写）；客户端发 `X-Opencode-Directory` 头过透传 |
 
 ### v2 删除的端点（相对 v1，仅供迁移参考）
@@ -76,6 +78,7 @@
 ### 写路径（B2）🔒
 
 - **所有写操作**（发消息、abort、q/p reply/reject、permission resolve 等）走 catch-all 反代，客户端自带 `X-Opencode-Directory` 头（现有 `DirectoryHeaderInterceptor`），slimapi 不剥（非 hop-by-hop）。
+  - **例外**：`/slimapi/actions/**`（详见 §2「`/slimapi/actions` API」）是 sidecar **本地**端点，由 actions 路由直接处理，**不走 catch-all 反代**。
 - **routeToken 在 v2 中不存在**：v1 的 `/slimapi/questions` / `/permissions` 聚合响应不再下发 `routeToken`；v1 的 `invalid_route_token` 错误码已删除（见 §7）。客户端 q/p 应答直接 POST 上游 opencode legacy URL（经 catch-all）。
 - q/p SSE 事件仍推送（见 §3），但**仅作观察信号**——具体应答动作不经 slimapi 专门端点。
 
@@ -159,6 +162,84 @@
 - **total failure**（发现调用失败：网络/5xx/4xx/坏 JSON/非 list/超 cap）→ HTTP **503** `{"code":"upstream_unavailable"}`（**无 envelope**）。
 - **严格 schema 守卫**：parse 得 list 后遍历每个 session，**任一**非 dict、或 `directory` 非 string、或为空字符串 → **503** `upstream_unavailable`（**不**静默跳过——本端点用 `discoveryComplete` 表达完整性，跳过坏 session 会让"看似完整"列表缺目录；镜像 sessions.py `not all(isinstance(s,dict))`→503 守卫）。
 - **被动发现局限（诚实）**：仅能看到至少有一条顶层 session 的 workdir；**从未建过 session 的 workdir 不可见**；**不扫文件系统**；**返回目录不代表目录仍存在**于文件系统（可能已删）。转换池满 → 503 `transform_busy` + `Retry-After:2`。
+
+### `/slimapi/actions` API（加性新增，未 bump `X-Slimapi-Version`，仍 2）
+
+> **加性 / 向后兼容**：wire 版本未 bump（仍 2）。旧 sidecar 无此路由 → catch-all 404 `thin_route_not_found`。
+
+`/slimapi/actions` 通用管理能力框架。配置驱动，服务器端 TOML manifest（`OC_SLIMAPI_ACTIONS_FILE`）声明可调用动作清单；客户端按名调用。**无可变参数**（argv 全由 manifest 固定，action name 仅作 registry 字典键白名单查找，不参与路径拼接/eval/shell）。两类动作：
+
+- **exec**：触发服务器端命令，回显规范状态码 `{kind:"exec", ok, exit_code, duration_ms, message}`（**`message` 字段始终出现**——成功时为 `null`；非零退出为固定短串 `"non-zero exit"`）
+- **query**：触发命令，回显待渲染 markdown `{kind:"query", ok, markdown, exit_code, duration_ms, truncated, message}`（**`message` 字段始终出现**，成功时为 `null`）
+
+manifest 未配置/缺失 → 功能禁用（`enabled: false`，opt-in 默认空）。
+
+#### GET `/slimapi/actions` — 动作发现
+
+无参数。返回服务器端 registry 中所有已加载的 action manifest。响应：
+
+```json
+{
+  "enabled": true,
+  "actions": [
+    {"name": "restart_opencode", "kind": "exec", "description": "重启 opencode 服务", "requireConfirm": true}
+  ]
+}
+```
+
+- 未配置 manifest → `{"enabled":false,"actions":[]}`
+- 响应头 `Cache-Control: no-store`；gzip 协商
+
+#### POST `/slimapi/actions/{name}` — 动作调用
+
+读 raw body（空 body 或 `{}` → 视为 `{}`；不可直接 `request.json()` 因空 body 抛异常）。body 格式：
+
+- **body 上限 1 KiB**（body 恒为空或 `{"confirm":true}`，~17 字节）：`Content-Length` > 1024 → **413** `request_too_large`（不读 body）；chunked（无可用 Content-Length）实读超 1 KiB → **413**（stream 读 cap+1 字节即拒）。**在 admission 前拒绝**，防明文端点内存 DoS。
+- `require_confirm=true` 的 exec 动作须发 `{"confirm":true}` → 否则 **409** `action_confirm_required`
+- `require_confirm=false` 收到 confirm → 忽略，正常执行
+- malformed body → **422**
+
+`name` 仅作 `registry.actions` 字典键查找（白名单），不参与路径拼接/eval/shell。
+
+**exec 响应信封**（200，ok 判成败）：
+
+```json
+{"kind":"exec","ok":true,"exit_code":0,"duration_ms":1234,"message":null}
+```
+
+- 成功（exit 0）→ `ok=true, exit_code=0, message=null`
+- 非零 → `ok=false, exit_code=N, message="non-zero exit"`（固定短串，非 stdout——stdout 已 discard）
+- `exit_code < 0`（信号杀）原样返回负值
+- timeout/spawn-fail → 走 coded error（不进本 body）
+
+**query 响应信封**（200，ok 判成败）：
+
+```json
+{"kind":"query","ok":true,"markdown":"<stdout>","exit_code":0,"duration_ms":1234,"truncated":false,"message":null}
+```
+
+- exit 0 → `ok=true, markdown=<stdout>, truncated=<bool>`
+- 非零 → `ok=false, markdown="", exit_code=N`（仍 200）
+- stderr 不回传（写 journald）
+- `truncated`：stdout 超 `max_output_bytes` 时 `true`（累计到 cap 后继续 drain-and-discard 到 EOF，pipe buffer 不阻塞）
+
+**响应头**：`Cache-Control: no-store` + `Vary: Accept-Encoding` + gzip 协商。
+
+**错误码**（7 新码，见 §7 清单）：
+
+| HTTP | code | 触发 | headers/fields |
+|---|---|---|---|
+| 404 | `action_not_found` | name 不在 registry | |
+| 409 | `action_confirm_required` | exec `require_confirm` 未带 confirm | |
+| 429 | `action_throttled` | single-flight 冲突 / min_interval 限频（**动作级限流**） | `Retry-After` |
+| 503 | `actions_disabled` | manifest 未配置，功能禁用 | |
+| 503 | `action_unavailable` | spawn 失败（OSError 全族） | |
+| 503 | `action_busy` | Semaphore 满（**服务级限流**） | `Retry-After:2` |
+| 504 | `action_timeout` | 超 timeout_s | `timeout_s` 字段 |
+
+**429 vs 503 限流分工**：`action_throttled`(429) 是**动作级**限流——single-flight 防止同名动作并发执行，min_interval 防同动作频繁调用；`action_busy`(503) 是**服务级**限流——全局 Semaphore 满（所有动作共享并发上限）。
+
+**与 catch-all 关系**：本端点（`/slimapi/actions/**`）是 sidecar 本地端点，**不走 catch-all 反代**（独立于 §2「写路径」的 catch-all 转发）。
 
 ## §3 SSE 契约 🔒
 
@@ -363,7 +444,7 @@ sidecar 作为 ocdroid 与 opencode 之间的 Python 中继层，可观察所有
 
 ## §7 错误码 🔒
 
-> v2 错误码集是 v1 的**子集**：所有 routeToken / G6 批量 / Opt-A 相关 code 已删除；其余 thin 路由 HTTP 状态 + body `{"code":…}` 模式不变。所有错误码加性于 v1 → v2 bump 不引入新 code。
+> v2 错误码集在 v1 之上**删除 + 加性演进**（并非 v1 的严格子集）：所有 routeToken / G6 批量 / Opt-A 相关 code 已删除；其余 thin 路由 HTTP 状态 + body `{"code":…}` 模式不变。v2 bump 本身不引入新 code，但 v2 生命周期内**加性新增**（均未 bump `X-Slimapi-Version`）已引入新码：`/slimapi/actions` 的 **7 码**（2026-08-09，见下）+ 请求体上限 **`request_too_large`**（2026-08-09，见下）。
 
 - 400 `version_required` / `version_incompatible` / `directory_not_allowed` / `invalid_directory_count`（**v2 无独立生产路径**——q/p 聚合路由删除后此码无触发路径；保留作结构性守卫文档参考，实现中无对应 wire 输出）
   - **`invalid_path`**（catch-all 反代）：归一化后路径含 `..` / `.` 段 → 400（与 `//` 折叠同在 `_normalize_path`；defense-in-depth，合法路径不含此类段）。
@@ -375,6 +456,7 @@ sidecar 作为 ocdroid 与 opencode 之间的 Python 中继层，可观察所有
   - **v2 删除**：v1 的 `message_not_found`（G6 envelope mid 级 code）已删除（G6 端点不存在）；客户端单条 `/full/{mid}` upstream 404 仍走 `session_not_found` 或上游原始 404 透传。
 - 413 `response_too_large`（top-level：超 `MAX_RESPONSE_BYTES`）
   - **`message_too_large`**：**top-level** 于 `GET .../full/{mid}`（单条流式 cap→413）。
+  - **`request_too_large`（加性新增，2026-08-09，未 bump `X-Slimapi-Version`）**：`POST /slimapi/actions/{name}` 请求体超 **1 KiB** cap——`Content-Length` 声明 >1024 或 chunked 实读超限 → **413**（在 admission 前拒绝，防明文端点内存 DoS；body 恒为空或 `{"confirm":true}`，~17 字节）。
   - **v2 删除**：v1 的 envelope 语境（G6 mid body 超 `max_message_bytes`）已删除（G6 端点不存在）。
 - 502 `upstream_http_N`（top-level：thin 路由对 upstream **非 404 的 4xx** → 502）
   - **v2 删除**：v1 的 G6 envelope 语境（mid ≥400 → `errors[]`）已删除；v1 的 G6 discover 语境已删除。
@@ -382,6 +464,15 @@ sidecar 作为 ocdroid 与 opencode 之间的 Python 中继层，可观察所有
   - **`GET /slimapi/questions` 与 `GET /slimapi/directories` 发现调用例外（2026-08-05 / 2026-08-08 加性）**：这两个端点的目录发现调用（`GET /experimental/session?roots=true&archived=true`）是**内部派生调用**，其**任一**失败（网络/5xx/**4xx**/坏 JSON/非 list/超 cap）统一映射为 **503 `upstream_unavailable`**（整体 total failure，无 envelope），**不走**通用的 4xx→502 `upstream_http_N` 规则——发现是 sidecar 自身聚合的前提，泄漏上游状态码会误导客户端。`/questions` 的 per-dir `/question` 失败仍遵循通用 §7 映射（5xx→`upstream_unavailable`，4xx→`upstream_http_N`，isolated 进 `errors[]`）；`/directories` 无 per-dir fan-out，发现即全部。（**2026-08-07 v2+fix**：发现调用从 `GET /project` 改为 `GET /experimental/session?roots=true&archived=true`——根因 `/project` 把非-git workdir 归到合成 global（`worktree="/"`）被跳过导致漏报；`/experimental/session` 用 session 真实 `directory` 字段根治，`archived=true` 使发现集合成超集防 archived-only workdir 漏报。映射规则不变。）
 - 503 `sse_token_subscriber_limit`（token stream admission 溢出；带 `{"limit":8,"current":N}` + `Retry-After:5`；**独立账本**，不占控制面 `MAX_TOTAL_SUBSCRIBERS`，见 §6.x）
 - 503 `sse_token_handshake_overflow`（token stream handshake buffer overflow；带 `{"limit":8,"current":N,"bufferBytes":8388608}` + `Retry-After:5`；触发于单次 handshake items 超 `TOKEN_HANDSHAKE_ITEMS=2048` 或 bytes 超 `TOKEN_HANDSHAKE_BUFFER_BYTES=8MiB`，见 §6.x）
+- **actions 错误码（加性新增，未 bump `X-Slimapi-Version`，仍 2）**：
+  - **404 `action_not_found`**：`POST /slimapi/actions/{name}` 的 name 不在 registry 中。
+  - **409 `action_confirm_required`**：exec 动作 `require_confirm=true` 但请求 body 未带 `{"confirm":true}`。
+  - **429 `action_throttled`**：**动作级**限流——single-flight 冲突（同名动作已在执行）或 min_interval 未到。响应头 `Retry-After: <ceil(剩余秒)>`（single-flight 冲突时固定 `2`）。
+  - **503 `actions_disabled`**：manifest 未配置，功能整体禁用。
+  - **503 `action_unavailable`**：spawn 失败（OSError 全族，含 FileNotFoundError/PermissionError/EMFILE/ENOMEM）。
+  - **503 `action_busy`**：**服务级**限流——全局 Semaphore 满（所有动作共享并发上限，`max_concurrent`）。响应头 `Retry-After: 2`。
+  - **504 `action_timeout`**：动作执行超 timeout_s。body 携带 `timeout_s` 字段（`{"code":"action_timeout","timeout_s":30}`）。
+  - **429 vs 503 限流分工明确**：`action_throttled`(429) 是**动作级**限流（per-action single-flight + min_interval），`action_busy`(503) 是**服务级**限流（Semaphore 满，跨动作共享）。客户端对 429 应等待 `Retry-After` 后重试同一动作；对 503 `action_busy` 应等待 `Retry-After`(2s) 后重试（任何动作均可能因全局并发满被拒）。
 - **v2 删除**：v1 的 `upstream_unavailable`（envelope per-mid，Opt-A opt-in）已删除（Opt-A 整体下线）；v1 的 `upstream_error`（G6 envelope mid 2xx body 不可解析 + q/p fan-out 单 dir 失败项）已删除（G6 / q/p 端点不存在）；v1 的 q/p mutation `upstream_timeout` 504 已删除（q/p 写端点不存在，所有写经 catch-all 反代时由上游 opencode 自身语义决定）。
 - thin 路由错误体统一：`{"code":string, "message"?:string, ...}`（非 `{"detail":...}`）
 - FastAPI 参数缺失/类型错误仍为 422。

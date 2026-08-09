@@ -28,9 +28,21 @@ ocdroid 对接时：
 
 ## [Unreleased]
 
+---
+
+## [1.3.0] - 2026-08-09 — `/slimapi/actions` 通用能力框架（exec/query 两类，配置驱动 manifest，加性）；未 bump `X-Slimapi-Version`，仍 2
+
 ### Added
 
-（暂无）
+- **`/slimapi/actions` 通用能力框架（加性新增，未 bump `X-Slimapi-Version`，仍 2）**：配置驱动的服务器端管理端点。两类动作——**exec**（触发服务器端命令，回显规范状态码 `{kind:"exec", ok, exit_code, duration_ms, message}`（**`message` 字段始终出现**，成功时为 `null`））与 **query**（触发命令，回显待渲染 markdown `{kind:"query", ok, markdown, exit_code, duration_ms, truncated, message}`（**`message` 字段始终出现**，成功时为 `null`））。服务器端 TOML manifest（`OC_SLIMAPI_ACTIONS_FILE`）声明动作清单；客户端按名调用，**禁止传可变参数**（argv 全由 manifest 固定，action name 仅作 registry 字典键白名单查找，不参与路径拼接/eval/shell）。`GET /slimapi/actions` 返回可调用动作发现清单；`POST /slimapi/actions/{name}` 触发动作执行。7 新错误码（`action_not_found`/`action_confirm_required`/`action_throttled`/`actions_disabled`/`action_unavailable`/`action_busy`/`action_timeout`）。**加性**，不 bump `X-Slimapi-Version`。详见 `docs/specs/v2-contract.md` §2「`/slimapi/actions` API」。**注意**：`/slimapi/actions/**` 是 sidecar 本地端点，不走 catch-all 反代（§2 写路径例外声明）。
+
+### Security
+
+- **`/slimapi/actions` POST 请求体上限 1 KiB（rev-13，新错误码 `request_too_large`，未 bump `X-Slimapi-Version`，仍 2）**：`POST /slimapi/actions/{name}` 的请求体在 **admission 前**被大小门禁——`Content-Length` 声明 >1024 字节或 chunked 实读超 1 KiB → **413 `{"code":"request_too_large"}`**（此前 body 被全量缓冲后才解析，明文端点存在内存 DoS）。合法 body 恒为空或 `{"confirm":true}`（~17 字节），1 KiB 门禁不影响任何有效调用。新错误码已登记 v2-contract §7 + INTERFACE_MAP。**加性**，不 bump `X-Slimapi-Version`。
+
+### Fixed
+
+- **`/slimapi/actions` 进程生命周期统一清理（rev-13，未 bump `X-Slimapi-Version`，仍 2）**：(1) **stderr 日志 cap 改按字节计**——此前按 chunk 数（`<65536` chunks）判，每 chunk ≤4 KiB → 实际可累积 ~256 MiB 才触发声称的 64 KiB journald cap；现按累计字节（≤64 KiB）截断保留缓冲，仍**始终 drain 到 EOF**（防 pipe 阻塞致假超时）。(2) **drain-hang 根治**——asyncio 的 `Process.wait()` 仅在 stdout/stderr pipe 也断开时才返回（`base_subprocess.py` `_try_finish`），孙进程持 pipe 写端时即使子进程已退出 `wait()` 也会挂死、drain 无 deadline；现子进程退出检测改用 `returncode` 轮询（与 pipe 无关），退出后**立即 killpg**（杀掉持 pipe 的孙进程释放管道），并给 drain 加 **5s 硬 deadline**（超时 force-cancel drain、warning、以已收部分作答、query 标 `truncated`）。(3) **统一 try/finally 清理**——`finally` 无条件 killpg(SIGKILL) + reap + 失败路径审计，覆盖正常退出/timeout/**drain 期取消**等所有路径；semaphore 等待期取消也补审计（原 Bug E：无审计记录）。(4) spawn 的 `ValueError`（argv 含 NUL / 坏 cwd）也映射 `action_unavailable`。均为内部生命周期修复；wire 可见变化仅 query `truncated` 可能因 drain-deadline 置真（edge case）与新增 `request_too_large`（见上）。
 
 ---
 

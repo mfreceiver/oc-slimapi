@@ -24,6 +24,7 @@ import threading
 # which is configured by :mod:`oc_slimapi.access_log` with ``propagate=False``.
 # ---------------------------------------------------------------------------
 _ROOT_LOGGER_NAME = "oc_slimapi"
+_AUDIT_LOGGER_NAME = "oc_slimapi.actions_audit"
 _setup_lock = threading.Lock()
 
 
@@ -49,6 +50,39 @@ def _resolve_log_level() -> int:
             raw,
         )
         return logging.INFO
+
+
+def setup_actions_audit_logging() -> None:
+    """Configure the ``oc_slimapi.actions_audit`` logger with a fixed
+    WARNING-level stderr handler, independent of ``OC_SLIMAPI_LOG_LEVEL``.
+
+    Idempotent — subsequent calls are no-ops (no duplicate handlers).
+
+    ``propagate=False`` ensures audit records are **not** filtered by the root
+    logger's level (which is driven by ``OC_SLIMAPI_LOG_LEVEL``).  The audit
+    handler always writes at ``WARNING`` regardless of the root logger's
+    configuration.  Called as part of :func:`setup_logging`.
+    """
+    logger = logging.getLogger(_AUDIT_LOGGER_NAME)
+    logger.setLevel(logging.WARNING)     # fixed level, not from env
+    logger.propagate = False             # independent of root logger's level
+
+    with _setup_lock:
+        if any(
+            isinstance(h, logging.StreamHandler) and h.stream is sys.stderr
+            for h in logger.handlers
+        ):
+            return  # already set up
+
+        handler = logging.StreamHandler(stream=sys.stderr)
+        handler.setLevel(logging.WARNING)  # fixed; let the logger's level gate
+        handler.setFormatter(
+            logging.Formatter(
+                fmt="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+        )
+        logger.addHandler(handler)
 
 
 def setup_logging() -> None:
@@ -84,6 +118,9 @@ def setup_logging() -> None:
             )
         )
         logger.addHandler(handler)
+
+    # Also bootstrap the actions-audit logger (idempotent inside).
+    setup_actions_audit_logging()
 
 
 def get_logger(name: str) -> logging.Logger:

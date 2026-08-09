@@ -24,18 +24,32 @@ class CodedHTTPException(HTTPException):
     fallback HTTPException handler still show a meaningful identifier.
     """
 
-    def __init__(self, status_code: int, *, code: str, **fields: Any) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        *,
+        code: str,
+        headers: dict[str, str] | None = None,
+        **fields: Any,
+    ) -> None:
         self.code = code
         self.fields = fields
         super().__init__(status_code=status_code, detail=code)
+        # Set AFTER super(): starlette's ``HTTPException.__init__`` assigns
+        # ``self.headers`` from its own (default-None) ``headers`` arg, which
+        # would otherwise clobber the value passed here.
+        self.headers = headers
 
 
 async def coded_exception_handler(request: Request, exc: CodedHTTPException) -> Response:
-    return json_response(
+    response = json_response(
         {"code": exc.code, **exc.fields},
         status_code=exc.status_code,
         accept_encoding=request.headers.get("accept-encoding"),
     )
+    if exc.headers:
+        response.headers.update(exc.headers)
+    return response
 
 
 def register_error_handlers(app: FastAPI) -> None:

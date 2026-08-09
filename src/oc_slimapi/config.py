@@ -1,4 +1,4 @@
-"""Environment-only configuration; no database or mutable config files."""
+"""Environment-only configuration. The single exception is the read-only actions manifest (OC_SLIMAPI_ACTIONS_FILE), a local non-wire file declaring admin actions."""
 
 from __future__ import annotations
 
@@ -241,6 +241,12 @@ class Settings:
     deployment_revision: str | None = os.getenv("OC_SLIMAPI_DEPLOYMENT_REVISION")
     deployment_revision_file: str | None = os.getenv("OC_SLIMAPI_DEPLOYMENT_REVISION_FILE")
 
+    # Actions framework (see /slimapi/actions spec). Manifest file — TOML
+    # declaring admin actions (exec / query). When None / unset, the actions
+    # feature is disabled (opt-in, default off).
+    actions_file: str | None = os.getenv("OC_SLIMAPI_ACTIONS_FILE") or None
+    # Global spawn concurrency ceiling for the action executor. Must be >= 1.
+    actions_max_concurrent: int = int(os.getenv("OC_SLIMAPI_ACTIONS_MAX_CONCURRENT", "4"))
 
     # Full bidirectional byte ledger + structured access log (traffic
     # accounting). Additive observability — does NOT touch the wire contract.
@@ -554,6 +560,10 @@ class Settings:
                 "the revision cap can evict a still-living PartKey, "
                 "causing revision regression (MINOR 6)"
             )
+
+        # Actions framework guards.
+        if self.actions_max_concurrent < 1:
+            raise RuntimeError("OC_SLIMAPI_ACTIONS_MAX_CONCURRENT must be >= 1")
 
         # Daily-rotation + snapshot guards (traffic-log-persistence task-2).
         # maintenance loop must be at least 60s to avoid hot-looping; snapshot
