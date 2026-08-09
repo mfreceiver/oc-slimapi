@@ -1,0 +1,55 @@
+# oc-slimapi actions manifest — reference example (deploy/actions.manifest.example.toml)
+#
+# Canonical 4-action manifest matching the live deployment on this host.
+# Wire contract: docs/specs/v2-contract.md §2.  Ops notes: docs/operations.md §11.
+#
+# DEPLOY: copy to a machine-local path (e.g. ~/.config/oc-slimapi/actions.toml),
+#   chmod 0600, and point OC_SLIMAPI_ACTIONS_FILE at it in the systemd unit
+#   (see deploy/oc-slimapi.service). Adjust argv[0] paths to your host.
+#
+# Validation (enforced at sidecar startup, see src/oc_slimapi/actions.py
+#   _load_manifest): regular file (no symlink), owner-only-write (no group/other
+#   write bits), owned by the sidecar runtime user. A bad file disables the
+#   feature (fail-closed); a bad action drops only that action (WARNING).
+#
+# Security posture: plaintext :4097 reachable; this is a risk-accepted surface
+#   co-equal to the pre-existing catch-all → opencode control endpoints.
+#   Mitigations (not authorization): spawn concurrency cap, single-flight +
+#   min_interval throttle, shell=False, structured audit at WARNING to journald.
+
+# --- queries (echo stdout as markdown) --------------------------------------
+# Each argv[0] must be executable (chmod +x) and have a working shebang.
+
+[actions.plan_limit]
+kind = "query"
+argv = ["/home/mar/.config/opencode/scripts/plan_limit.py"]
+description = "查询上游厂商订阅配额（GLM/Kimi/GPT/LongCat 余额与用量）"
+timeout_s = 90
+max_output_bytes = 65536
+
+[actions.list_model]
+kind = "query"
+argv = ["/home/mar/.config/opencode/scripts/list_model.py"]
+description = "列出 opencode 已配置 provider 及其可用模型"
+timeout_s = 15
+max_output_bytes = 16384
+
+[actions.list_agent]
+kind = "query"
+argv = ["/home/mar/.config/opencode/scripts/list_agent.py"]
+description = "列出 opencode 已配置 agent（slim preset / 内建 / 自定义）及模型"
+timeout_s = 15
+max_output_bytes = 32768
+
+# --- exec (echo status envelope; ok = exit 0) -------------------------------
+# require_confirm=true → POST without {"confirm":true} returns 409
+#   action_confirm_required (the action does NOT run). min_interval_s throttles
+#   back-to-back calls (in-memory; resets on sidecar restart).
+
+[actions.restart]
+kind = "exec"
+argv = ["/usr/bin/systemctl", "--user", "restart", "opencode-web"]
+description = "重启 opencode-web 服务（require_confirm）"
+timeout_s = 30
+min_interval_s = 60
+require_confirm = true

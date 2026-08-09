@@ -37,6 +37,12 @@ Environment=OC_SLIMAPI_ACCESS_LOG_DIR=%S/oc-slimapi/logs
 Environment=OC_SLIMAPI_TRAFFIC_SNAPSHOT_PATH=%S/oc-slimapi/logs/traffic-snapshot.jsonl
 Environment=OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS=3
 
+# /slimapi/actions manifest (opt-in; unset = feature disabled).
+# Manifest must be a regular file, owner-only-write (chmod 0600), owned by the
+# runtime user. Reference: deploy/actions.manifest.example.toml. Spec/ops:
+# docs/specs/v2-contract.md §2 + docs/operations.md §11.
+#Environment=OC_SLIMAPI_ACTIONS_FILE=%h/.config/oc-slimapi/actions.toml
+
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=oc-slimapi

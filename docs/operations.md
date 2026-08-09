@@ -433,23 +433,54 @@ curl -s --cert client-cert.pem --key client-key.pem \
 
 ### 11.2 manifest 配置
 
+manifest 是一个 TOML 文件，路径由 `OC_SLIMAPI_ACTIONS_FILE` 指定。仓库内 [`deploy/actions.manifest.example.toml`](../deploy/actions.manifest.example.toml) 是与本机部署一致的 4-action 参考模板（复制到机器本地路径后改 argv[0]）。
+
+**当前部署实例**：`~/.config/oc-slimapi/actions.toml`（owner-only-write，`chmod 0600`），声明 4 个 actions：
+
 ```toml
 # TOML 文件路径由 OC_SLIMAPI_ACTIONS_FILE 指定
-[actions.restart_opencode]
-kind = "exec"
-argv = ["/usr/bin/systemctl", "--user", "restart", "opencode-web"]
-description = "重启 opencode 服务"
-timeout_s = 30
-min_interval_s = 60
-require_confirm = true
+# 校验规则见 src/oc_slimapi/actions.py _load_manifest：regular file（拒绝 symlink）、
+# owner-only-write（拒绝 group/other write 位）、owner 为 sidecar 运行用户。
 
 [actions.plan_limit]
 kind = "query"
 argv = ["/home/mar/.config/opencode/scripts/plan_limit.py"]
-description = "查询上游厂商订阅配额"
+description = "查询上游厂商订阅配额（GLM/Kimi/GPT/LongCat 余额与用量）"
 timeout_s = 90
 max_output_bytes = 65536
+
+[actions.list_model]
+kind = "query"
+argv = ["/home/mar/.config/opencode/scripts/list_model.py"]
+description = "列出 opencode 已配置 provider 及其可用模型"
+timeout_s = 15
+max_output_bytes = 16384
+
+[actions.list_agent]
+kind = "query"
+argv = ["/home/mar/.config/opencode/scripts/list_agent.py"]
+description = "列出 opencode 已配置 agent（slim preset / 内建 / 自定义）及模型"
+timeout_s = 15
+max_output_bytes = 32768
+
+[actions.restart]
+kind = "exec"
+argv = ["/usr/bin/systemctl", "--user", "restart", "opencode-web"]
+description = "重启 opencode-web 服务（require_confirm）"
+timeout_s = 30
+min_interval_s = 60
+require_confirm = true
 ```
+
+部署步骤：
+
+1. 写 manifest 到 `~/.config/oc-slimapi/actions.toml`，`chmod 0600`（owner-only-write）。
+2. 确保 argv[0] 脚本可执行（`chmod +x`，带 shebang）；exec 类用绝对路径二进制（如 `/usr/bin/systemctl`）。
+3. 在 service unit `[Service]` 加 `Environment=OC_SLIMAPI_ACTIONS_FILE=/home/mar/.config/oc-slimapi/actions.toml`（模板见 `deploy/oc-slimapi.service`，默认注释）。
+4. `systemctl --user daemon-reload && systemctl --user restart oc-slimapi`。
+5. 验证：`GET /slimapi/actions` 返回 `enabled:true` 且 actions 列表非空；启动日志无 `manifest rejected` / `actions disabled`。
+
+> **action 脚本来源**：`plan_limit.py` / `list_model.py` / `list_agent.py` 由 opencode 侧维护，位于 `~/.config/opencode/scripts/`。`list_model` 读 `http://127.0.0.1:4096/config/providers`，`list_agent` 读 opencode 配置 + `/agent` API，`plan_limit` 查询上游厂商订阅配额（均只读）。
 
 ### 11.3 运维注意事项
 

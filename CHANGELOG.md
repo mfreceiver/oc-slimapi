@@ -28,6 +28,12 @@ ocdroid 对接时：
 
 ## [Unreleased]
 
+本节记录**部署侧配置**变更（无代码改动、未 bump `X-Slimapi-Version`，仍 2）。actions 框架本身已在 v1.3.0 实现，此处仅配置 manifest 使其可用。
+
+### Ops
+
+- **`/slimapi/actions` 已在本机部署启用（manifest 配置，未 bump `X-Slimapi-Version`，仍 2）**：通过 `OC_SLIMAPI_ACTIONS_FILE`（`~/.config/oc-slimapi/actions.toml`，`chmod 0600`）声明 4 个 actions —— 3 个 query（`plan_limit` / `list_model` / `list_agent`，只读，echo stdout 为 markdown）+ 1 个 exec（`restart`，`require_confirm=true`，重启 `opencode-web`）。`GET /slimapi/actions` 从 `enabled:false`（空）变为 `enabled:true` + 4 actions。**加性**：actions 框架 wire 契约（v1.3.0）未变，客户端仅多观察到非空 catalog。manifest 为机器本地配置（非代码），参考模板见 `deploy/actions.manifest.example.toml`；运维细节见 `docs/operations.md` §11.2。
+
 ---
 
 ## [1.3.1] - 2026-08-09 — patch/apply_patch 工具卡 diffStats 徽章修复（wire 行为修复，未 bump `X-Slimapi-Version`，仍 2）
