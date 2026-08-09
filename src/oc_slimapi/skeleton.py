@@ -16,7 +16,7 @@ TOOL_INPUT_KEYS = {
     "path", "filePath", "file_path", "command", "agent", "description",
     "subagent_type", "todos",
 }
-TOOL_METADATA_KEYS = {"sessionId", "sessionID", "description", "agent"}
+TOOL_METADATA_KEYS = {"sessionId", "sessionID", "description", "agent", "diffStats"}
 FILE_URL_LIMIT = 8 * 1024
 COMPACTION_PART_LIMIT = 64 * 1024
 
@@ -73,6 +73,77 @@ def _field_byte_size(value: Any) -> int:
         return len(orjson.dumps(value))
     except TypeError:
         return len(str(value).encode("utf-8"))
+
+
+def _compute_diffstats(
+    filediff: dict[str, Any] | list[dict[str, Any]] | Any,
+) -> dict[str, int] | None:
+    """Compute compact ``diffStats = {additions, deletions, files}`` from an
+    upstream ``state.metadata.filediff`` value (a single ``Snapshot.FileDiff``
+    object or possibly a list thereof for multi-file tools).
+
+    Returns ``None`` when the input is not a recognised shape (no data to
+    derive statistics from), so callers can safely skip injection.
+
+    Edge cases:
+      * Single filediff dict with missing/non-numeric ``additions`` /
+        ``deletions`` → treated as zero.
+      * List of filediff dicts → sums per-file additions/deletions across the
+        list; ``files`` = list length.
+      * ``None`` / non-dict / non-list → ``None`` (no stats).
+      * Non-finite numbers (inf, nan) are not expected on the wire (Schema
+        ``Schema.Finite`` rejects them upstream), but ``int(val) or 0``
+        guards against degenerate values defensively.
+    """
+    # ── digest 对账标注 ────────────────────────────────────────────────
+    # digest 对账（tool 完成→message.updated 映射）：后续 SSE 实测验证项，
+    # 本轮不实现。参见 docs/specs/chat-toolcard-investigation.md §B.8
+    # ────────────────────────────────────────────────────────────────────
+    if isinstance(filediff, list):
+        if not filediff:
+            return None
+        total_additions = 0
+        total_deletions = 0
+        for item in filediff:
+            if isinstance(item, dict):
+                total_additions += int(item.get("additions", 0) or 0)
+                total_deletions += int(item.get("deletions", 0) or 0)
+        return {
+            "additions": total_additions,
+            "deletions": total_deletions,
+            "files": len(filediff),
+        }
+    if isinstance(filediff, dict):
+        additions = int(filediff.get("additions", 0) or 0)
+        deletions = int(filediff.get("deletions", 0) or 0)
+        return {
+            "additions": additions,
+            "deletions": deletions,
+            "files": 1,
+        }
+    return None
+
+
+def _compute_diffstats_from_files(files: list[dict[str, Any]] | Any) -> dict[str, int] | None:
+    """Compute ``diffStats = {additions, deletions, files}`` from a ``files[]``
+    array (as used by patch parts and multi-file apply_patch). Each file item
+    must be a dict with ``additions`` / ``deletions`` (schema ``NonNegativeInt``).
+
+    Returns ``None`` when input is not a non-empty list of dicts.
+    """
+    if not isinstance(files, list) or not files:
+        return None
+    total_additions = 0
+    total_deletions = 0
+    for item in files:
+        if isinstance(item, dict):
+            total_additions += int(item.get("additions", 0) or 0)
+            total_deletions += int(item.get("deletions", 0) or 0)
+    return {
+        "additions": total_additions,
+        "deletions": total_deletions,
+        "files": len(files),
+    }
 
 
 def _maybe_inline_state_field(
@@ -141,6 +212,23 @@ def _tool(part: dict[str, Any], *, budget: dict[str, int] | None = None) -> dict
         for key in SKELETON_ALWAYS_OMIT_FIELDS:
             if key in state:
                 omitted.append(f"state.{key}")
+        # Inject compact diffStats from upstream filediff (computed, injected
+        # AFTER thresholding so it is never elligible for omission — the ~50 B
+        # object is well below the per-field cap, and sits in TOOL_METADATA_KEYS
+        # so it survives the whitelist). digest 对账（tool 完成→message.updated
+        # 映射）为后续 SSE 实测验证项，本轮不实现.
+        #
+        # NOTE: ``thin_metadata`` from ``_pick`` above is a local var (empty
+        # disconnected dict when no whitelist keys matched). We must write
+        # to ``thin_state["metadata"]`` explicitly to ensure the key exists.
+        if isinstance(source_metadata, dict):
+            source_filediff = source_metadata.get("filediff")
+            if source_filediff is not None:
+                diffStats = _compute_diffstats(source_filediff)
+                if diffStats is not None:
+                    if "metadata" not in thin_state:
+                        thin_state["metadata"] = {}
+                    thin_state["metadata"]["diffStats"] = diffStats
         result["state"] = thin_state
     for key in part:
         if key not in TOOL_KEYS and key != "state":
@@ -160,6 +248,15 @@ def _patch(part: dict[str, Any], *, budget: dict[str, int] | None = None) -> dic
     metadata = part.get("metadata")
     if isinstance(metadata, dict) and "path" in metadata:
         result["metadata"] = {"path": deepcopy(metadata["path"])}
+    # Inject compact diffStats from files[] (computed, injected AFTER
+    # thresholding — no thresholding is applied to diffStats). Patch parts
+    # project files[] with additions/deletions; diffStats is a compact
+    # aggregate consistent with the per-file data. digest 对账为后续 SSE
+    # 实测验证项，本轮不实现。
+    if isinstance(files, list):
+        diffStats = _compute_diffstats_from_files(files)
+        if diffStats is not None:
+            result["diffStats"] = diffStats
     state = part.get("state")
     if isinstance(state, dict):
         thin_state = _pick(state, {"status", "title", "time"})

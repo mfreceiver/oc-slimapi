@@ -6,6 +6,8 @@ import orjson
 from oc_slimapi.config import settings as _skel_config
 from oc_slimapi.skeleton import (
     PLACEHOLDER_TEXT,
+    _compute_diffstats,
+    _compute_diffstats_from_files,
     _field_byte_size,
     skeleton_messages,
 )
@@ -60,7 +62,7 @@ def test_tool_state_is_reduced_to_contract_whitelists():
         "path", "filePath", "file_path", "command", "agent", "description",
         "subagent_type", "todos",
     }
-    allowed_metadata = {"sessionId", "sessionID", "description", "agent"}
+    allowed_metadata = {"sessionId", "sessionID", "description", "agent", "diffStats"}
 
     for tool in parts(result, "tool"):
         state = tool.get("state", {})
@@ -384,6 +386,249 @@ def test_inlined_output_still_reports_hasfull_when_other_fields_omitted():
     assert tool["hasFull"] is True
     assert "state.output" not in tool["omitted"]
     assert "state.structured" in tool["omitted"]
+
+
+# ---------------------------------------------------------------------------
+# compact diffStats projection (批次4). Tool parts derive from upstream
+# ``state.metadata.filediff`` (single ``Snapshot.FileDiff`` dict); patch parts
+# derive from ``files[]`` (list of per-file diff items). diffStats is injected
+# AFTER thresholding so it is never elligible for omission.
+# ---------------------------------------------------------------------------
+
+from oc_slimapi.skeleton import (
+    _compute_diffstats as _cd,
+    _compute_diffstats_from_files as _cdf,
+)
+
+
+def test_diffstats_from_single_filediff():
+    """Single filediff dict → additions/deletions extracted, files=1."""
+    result = _cd({"file": "src/foo.ts", "additions": 42, "deletions": 12})
+    assert result == {"additions": 42, "deletions": 12, "files": 1}
+
+
+def test_diffstats_from_filediff_missing_additions_deletions():
+    """Filediff dict missing additions/deletions → defaults to 0."""
+    result = _cd({"file": "src/foo.ts"})
+    assert result == {"additions": 0, "deletions": 0, "files": 1}
+
+
+def test_diffstats_from_filediff_partial_numbers():
+    """Filediff with only additions → deletions=0."""
+    result = _cd({"file": "src/foo.ts", "additions": 5})
+    assert result == {"additions": 5, "deletions": 0, "files": 1}
+
+
+def test_diffstats_from_filediff_none():
+    """None → None."""
+    assert _cd(None) is None
+
+
+def test_diffstats_from_filediff_empty_list():
+    """Empty list → None (no files to count)."""
+    assert _cd([]) is None
+
+
+def test_diffstats_from_filediff_list():
+    """List of filediff dicts → summed across all items."""
+    result = _cd([
+        {"file": "a.ts", "additions": 10, "deletions": 3},
+        {"file": "b.ts", "additions": 5, "deletions": 1},
+    ])
+    assert result == {"additions": 15, "deletions": 4, "files": 2}
+
+
+def test_diffstats_from_files_empty():
+    """Empty files list → None."""
+    assert _cdf([]) is None
+
+
+def test_diffstats_from_files_none():
+    """None → None."""
+    assert _cdf(None) is None
+
+
+def test_diffstats_from_files_non_list():
+    """Non-list → None."""
+    assert _cdf("not-a-list") is None
+
+
+def test_diffstats_from_files_single():
+    """Single file with additions/deletions."""
+    result = _cdf([{"path": "a.ts", "additions": 5, "deletions": 2}])
+    assert result == {"additions": 5, "deletions": 2, "files": 1}
+
+
+def test_diffstats_from_files_multiple():
+    """Multiple files → summed."""
+    result = _cdf([
+        {"path": "a.ts", "additions": 5, "deletions": 2},
+        {"path": "b.ts", "additions": 10, "deletions": 0},
+    ])
+    assert result == {"additions": 15, "deletions": 2, "files": 2}
+
+
+def test_diffstats_from_files_missing_additions():
+    """Item missing additions → treated as 0."""
+    result = _cdf([{"path": "a.ts", "deletions": 3}])
+    assert result == {"additions": 0, "deletions": 3, "files": 1}
+
+
+def test_tool_with_filediff_injects_diffstats_into_metadata():
+    """Tool part with filediff → diffStats appears in state.metadata."""
+    source = [{
+        "info": {"id": "m1"},
+        "parts": [{
+            "id": "p1", "type": "tool", "messageID": "m1", "tool": "edit",
+            "state": {
+                "status": "completed",
+                "title": "src/foo.ts",
+                "input": {"filePath": "/abs/src/foo.ts", "oldString": "a", "newString": "b"},
+                "output": "Edit applied successfully.",
+                "metadata": {
+                    "filediff": {"file": "src/foo.ts", "additions": 12, "deletions": 4},
+                    "diagnostics": {"severity": 1},
+                    "diff": "--- a/src/foo.ts\n+++ b/src/foo.ts\n@@ -1 +1 @@\n-old\n+new",
+                },
+            },
+        }],
+    }]
+    tool = skeleton_messages(source)[0]["parts"][0]
+    assert tool["state"]["metadata"]["diffStats"] == {"additions": 12, "deletions": 4, "files": 1}
+    # Other metadata keys (sessionId etc.) are absent from this fixture; only
+    # diffStats and the always-present whitelist keys survive.
+    assert "filediff" not in tool["state"]["metadata"]
+    assert "diagnostics" not in tool["state"]["metadata"]
+    assert "diff" not in tool["state"]["metadata"]
+
+
+def test_tool_without_filediff_no_diffstats():
+    """Tool part without filediff (bash/read/glob) → no diffStats injected."""
+    source = [{
+        "info": {"id": "m1"},
+        "parts": [{
+            "id": "p1", "type": "tool", "messageID": "m1", "tool": "bash",
+            "state": {
+                "status": "completed",
+                "title": "ls -la",
+                "input": {"command": "ls -la"},
+                "output": "total 42\n",
+                "metadata": {"exit": 0, "output": "total 42\n", "truncated": False},
+            },
+        }],
+    }]
+    tool = skeleton_messages(source)[0]["parts"][0]
+    metadata = tool["state"].get("metadata")
+    # metadata is whitelist-only; bash has no whitelist keys, so it's absent.
+    # Even if it were present (e.g. sessionId), diffStats must NOT be there.
+    if metadata is not None:
+        assert "diffStats" not in metadata
+
+
+def test_tool_with_filediff_no_additions_defaults():
+    """Filediff without additions/deletions → diffStats with 0s."""
+    source = [{
+        "info": {"id": "m1"},
+        "parts": [{
+            "id": "p1", "type": "tool", "messageID": "m1", "tool": "edit",
+            "state": {
+                "status": "completed",
+                "title": "src/foo.ts",
+                "input": {"filePath": "/abs/src/foo.ts"},
+                "output": "Edit applied successfully.",
+                "metadata": {
+                    "filediff": {"file": "src/foo.ts"},
+                },
+            },
+        }],
+    }]
+    tool = skeleton_messages(source)[0]["parts"][0]
+    assert tool["state"]["metadata"]["diffStats"] == {"additions": 0, "deletions": 0, "files": 1}
+
+
+def test_patch_with_files_injects_diffstats():
+    """Patch part with files[] → diffStats on result, matching file data."""
+    source = [{
+        "info": {"id": "m1"},
+        "parts": [{
+            "id": "p1", "type": "patch", "messageID": "m1",
+            "metadata": {"path": "src/foo.ts"},
+            "files": [
+                {"path": "src/foo.ts", "additions": 12, "deletions": 4, "status": "modified"},
+            ],
+            "state": {"status": "completed", "title": "Patch src/foo.ts"},
+        }],
+    }]
+    result = skeleton_messages(source)[0]["parts"][0]
+    assert result["diffStats"] == {"additions": 12, "deletions": 4, "files": 1}
+    # files[] is still projected as before
+    assert result["files"][0]["path"] == "src/foo.ts"
+    assert result["files"][0]["additions"] == 12
+
+
+def test_patch_without_files_no_diffstats():
+    """Patch without files[] → no diffStats on result."""
+    source = [{
+        "info": {"id": "m1"},
+        "parts": [{
+            "id": "p1", "type": "patch", "messageID": "m1",
+            "metadata": {"path": "src/foo.ts"},
+            "state": {"status": "completed"},
+        }],
+    }]
+    result = skeleton_messages(source)[0]["parts"][0]
+    assert "diffStats" not in result
+
+
+def test_diffstats_survives_thresholding_no_false_omit():
+    """diffStats is a tiny object (~50 B) and is injected AFTER thresholding,
+    so even when output/error are omitted due to size, diffStats stays."""
+    big_output = _ascii_str_of_json_bytes(_skel_config.skeleton_inline_output_max_bytes + 1)
+    source = [{
+        "info": {"id": "m1"},
+        "parts": [{
+            "id": "p1", "type": "tool", "messageID": "m1", "tool": "edit",
+            "state": {
+                "status": "completed",
+                "title": "src/foo.ts",
+                "input": {"filePath": "/abs/src/foo.ts"},
+                "output": big_output,
+                "metadata": {
+                    "filediff": {"file": "src/foo.ts", "additions": 42, "deletions": 12},
+                },
+            },
+        }],
+    }]
+    tool = skeleton_messages(source)[0]["parts"][0]
+    # output is omitted (large)
+    assert "output" not in tool["state"]
+    assert "state.output" in tool["omitted"]
+    # diffStats is still present
+    assert tool["state"]["metadata"]["diffStats"] == {"additions": 42, "deletions": 12, "files": 1}
+
+
+def test_diffstats_consistent_with_patch_files():
+    """For a multi-file patch, diffStats aggregated from files[] equals
+    the sum of per-file additions/deletions."""
+    source = [{
+        "info": {"id": "m1"},
+        "parts": [{
+            "id": "p1", "type": "patch", "messageID": "m1",
+            "metadata": {"path": "src/"},
+            "files": [
+                {"path": "a.ts", "additions": 5, "deletions": 2, "status": "modified"},
+                {"path": "b.ts", "additions": 10, "deletions": 0, "status": "modified"},
+                {"path": "c.ts", "additions": 3, "deletions": 8, "status": "modified"},
+            ],
+            "state": {"status": "completed", "title": "Patch 3 files"},
+        }],
+    }]
+    result = skeleton_messages(source)[0]["parts"][0]
+    assert result["diffStats"] == {"additions": 18, "deletions": 10, "files": 3}
+    # Each file item still carries its individual stats
+    assert result["files"][0]["additions"] == 5
+    assert result["files"][1]["deletions"] == 0
+    assert result["files"][2]["additions"] == 3
 
 
 # ---------------------------------------------------------------------------
