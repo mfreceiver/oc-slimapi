@@ -105,11 +105,17 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=oc-slimapi
 
+# Memory hard cap. max_transforms=1 + max_response_bytes=64MiB + 16MiB inline
+# cap + Python/Baseline RSS fits under 384M（见 design-v2 §0.10、transform.py docstring）。
+# cgroup-enforced OOM kill 保护宿主，防 runaway upstream body 绕过 read_with_cap。
+# 与 deploy/oc-slimapi.service 一致（该文件为权威模板）。
+MemoryMax=384M
+
 [Install]
 WantedBy=default.target
 ```
 
-> 这是 **user service** 模板（`systemctl --user`）：**不含** `ProtectSystem`/`ProtectHome` 等 sandbox 指令——它们需要 root（capability drop），user manager 无权设置。进程隔离靠 stunnel mTLS（:14097/:14096）+ Tailscale ACL（见 §10）。仓库内 `deploy/oc-slimapi.service` 是同结构模板（含注释）。
+> 这是 **user service** 模板（`systemctl --user`）：**不含** `ProtectSystem`/`ProtectHome` 等 sandbox 指令——它们需要 root（capability drop），user manager 无权设置。进程隔离靠 stunnel mTLS（:14097/:14096）+ Tailscale ACL（见 §10）。仓库内 `deploy/oc-slimapi.service` 是同结构模板（含注释），**以它为权威模板**（本节示例若与之冲突以 deploy 为准）。
 
 调参（订阅上限、buffer 字节预算、transform 并发等）只需在 `[Service]` 加 `Environment=OC_SLIMAPI_*` 行，参见 [`develop.md`](develop.md) §配置。
 
@@ -389,6 +395,8 @@ curl -s --cert client-cert.pem --key client-key.pem \
 ```
 
 ### 10.4 Cert 复用说明
+
+> **路径约定（通用模板 vs 本机实例）**：仓库内 `deploy/stunnel.conf` 用系统级路径 `/etc/stunnel/`（`cert`/`key`/`CAfile` 均指向 `/etc/stunnel/*.pem`），是**通用部署模板**的写法。本机实际部署把证书放在 `~/.config/stunnel/certs/`（user-space 实例，无需 root），本节下文以本机路径为准。两者是"通用模板 `/etc/stunnel/` ↔ 本机实例 `~/.config/stunnel/certs/`"的关系，**不是错误**——部署时按实际 stunnel 实例类型选择其一即可。
 
 - **Server cert/key**：`/home/mar/.config/stunnel/certs/server-cert.pem` + `server-key.pem`，SAN=`opencode.vectory.cn`，已用于 `:14097` mTLS 入口。
 - **CA cert**：`/home/mar/.config/stunnel/certs/ca-cert.pem`，用于签发客户端证书。

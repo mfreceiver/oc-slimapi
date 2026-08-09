@@ -1,7 +1,9 @@
 # 流量记录与分析（省流实证）使用手册
 
 > 如何查询与解读 oc-slimapi 的**双向字节账本** + **结构化 access log** + **内存账本周期快照**，实证 sidecar 的省流效果。
-> 特性版本：**v0.7.0+**（`/slimapi/metrics.traffic` + access log）；**2026-07-29**（按天切分 + client 标识字段 + traffic snapshot）；**2026-08-01**（turn-token fence scope 简化为仅 sid；移除 serverGroupFp 字段）。
+> 特性版本：**v0.7.0+**（`/slimapi/metrics` 响应的 `traffic` 块 + access log）；**2026-07-29**（按天切分 + client 标识字段 + traffic snapshot）；**2026-08-01**（turn-token fence scope 简化为仅 sid；移除 serverGroupFp 字段）。
+>
+> **术语澄清**：本手册中出现的 `/slimapi/metrics.traffic` / `/metrics.traffic` 等写法，**不是**独立 HTTP 路由——代码里只有 `GET /slimapi/metrics`（`src/oc_slimapi/routes/metrics.py`），流量账本是该响应 JSON 的 `traffic` 子键。下文为简洁起见用 "`metrics.traffic`" 作为该数据块的简称。
 > 性质：**加性 ops 可观测面**，不 bump `X-Slimapi-Version`；ocdroid 对接无变化（`/slimapi/metrics` 为 T3 ops 端点，非客户端契约）。
 > 实现：`src/oc_slimapi/traffic.py`、`src/oc_slimapi/traffic_snapshot.py`、`src/oc_slimapi/middleware/traffic_accounting.py`、`src/oc_slimapi/access_log.py`。
 
@@ -193,9 +195,9 @@ done | jq -s 'group_by(.bucket) | map({bucket:.[0].bucket, upIn:(map(.upIn)|add)
 
 > `jq -s` 把整个文件 slurp 进内存（适合单文件几 MB 级）。大文件可改用 `jq` 逐行 + `awk` 求和，或导出给其它工具。
 
-### 跟 `/metrics.traffic` 对不上？
+### 跟 `metrics.traffic` 块对不上？
 
-access log 的 `downOut` 是 **wire 级**字节（中间件视角，含 SSE 连接的真实响应体）；而 ledger 的 SSE 桶 `downOut` 是 **per-subscriber-per-frame 聚合**（见 §4 fanout）。两者口径不同，**不应直接对照**。SSE 统计以 `/slimapi/metrics.traffic` 为准；逐请求审计以 access log 为准。
+access log 的 `downOut` 是 **wire 级**字节（中间件视角，含 SSE 连接的真实响应体）；而 ledger 的 SSE 桶 `downOut` 是 **per-subscriber-per-frame 聚合**（见 §4 fanout）。两者口径不同，**不应直接对照**。SSE 统计以 `GET /slimapi/metrics` 响应的 `traffic` 块为准；逐请求审计以 access log 为准。
 
 ---
 
@@ -233,7 +235,7 @@ access log 的 `downOut` 是 **wire 级**字节（中间件视角，含 SSE 连�
 
 ## 9. 内存账本周期快照（`traffic-snapshot-YYYY-MM-DD.jsonl`）
 
-> **2026-07-29 加性 ops 面**。`/slimapi/metrics.traffic` 是内存账本的实时快照（per-process、in-memory），进程重启即清零。`TrafficSnapshotter` 周期（默认 300s）把 ledger 的 **cumulative 视角**写入 JSONL 文件，用于跨重启的长期趋势分析。
+> **2026-07-29 加性 ops 面**。`GET /slimapi/metrics` 响应的 `traffic` 块是内存账本的实时快照（per-process、in-memory），进程重启即清零。`TrafficSnapshotter` 周期（默认 300s）把 ledger 的 **cumulative 视角**写入 JSONL 文件，用于跨重启的长期趋势分析。
 
 ### 9.1 它记什么
 
@@ -247,13 +249,13 @@ access log 的 `downOut` 是 **wire 级**字节（中间件视角，含 SSE 连�
   "uptimeS": 18000,                      // 自启动秒数（time.monotonic 差，抗 NTP 回拨）
   "pid": 12345,
   "enabled": true,
-  "buckets": { /* 同 /metrics.traffic.buckets，cumulative */ },
-  "totals": { /* 同 /metrics.traffic.totals */ },
-  "ratios": { /* 同 /metrics.traffic.ratios */ }
+  "buckets": { /* 同 metrics 响应 .traffic.buckets，cumulative */ },
+  "totals": { /* 同 metrics 响应 .traffic.totals */ },
+  "ratios": { /* 同 metrics 响应 .traffic.ratios */ }
 }
 ```
 
-- **cumulative 语义**：`buckets`/`totals` 是该进程**自启动以来**的累计值（含 SSE 真实成本 `upIn`/`downOut`），即 `/metrics.traffic` 的内存账本逐字段 dump。
+- **cumulative 语义**：`buckets`/`totals` 是该进程**自启动以来**的累计值（含 SSE 真实成本 `upIn`/`downOut`），即 `GET /slimapi/metrics` 响应 `traffic` 块的内存账本逐字段 dump。
 - **跨进程分段**：进程重启后 `bootTs`/`runId` 变化、`uptimeS` 归零 → 新的一段 cumulative。分析侧通过 `bootTs`/`runId` 识别进程边界，对相邻两帧算 delta 得到该段时间增量。
 - **跨天切分**：日期变更时自动切新文件 `traffic-snapshot-YYYY-MM-DD.jsonl`（当天文件 append 写入，不压缩）。**snapshot 文件不经 access log 的 compress/prune 维护**（后者只认 `access-` 前缀），即不自动压缩、不自动清理。
 - **inactive（首帧失败即停，不重试）**：snapshotter 首帧写入失败（磁盘满 / 路径不可写 / 权限不足）→ 标 **inactive**：**不创建后台 task、不周期重试**，该进程内不再写快照。需运维排查磁盘/路径后**重启**服务恢复。这是有意的 fail-loud 设计（避免无声重试掩盖根因）。
@@ -288,15 +290,15 @@ jq -s '
 jq -c '{ts, ratio: .ratios.messages.downOutOverUpIn}' /tmp/snap-all.jsonl
 ```
 
-### 9.3 与 access log / `/metrics.traffic` 的口径差异
+### 9.3 与 access log / `metrics.traffic` 块的口径差异
 
 | 来源 | 口径 | 重启后 |
 |---|---|---|
-| `/slimapi/metrics.traffic` | 内存账本实时快照（per-process cumulative） | 清零 |
-| `traffic-snapshot-YYYY-MM-DD.jsonl` | 内存账本周期 dump（同 `/metrics.traffic`，持久化；按天切分，不经自动压缩/prune） | 新段（`bootTs`/`runId` 变化） |
+| `GET /slimapi/metrics` 响应 `traffic` 块 | 内存账本实时快照（per-process cumulative） | 清零 |
+| `traffic-snapshot-YYYY-MM-DD.jsonl` | 内存账本周期 dump（同 `metrics.traffic` 块，持久化；按天切分，不经自动压缩/prune） | 新段（`bootTs`/`runId` 变化） |
 | access log（`access-*.jsonl`） | **逐请求** wire 级字节（含 `requestId`/`client*`） | 不受影响（按天文件） |
 
-三者为**不同口径**，不直接对照：snapshot 是聚合 cumulative，access log 是逐请求明细，`/metrics.traffic` 是实时聚合。分析"某时段省了多少"用 access log（§5）；分析"长期趋势 / 跨重启累计"用 snapshot。
+三者为**不同口径**，不直接对照：snapshot 是聚合 cumulative，access log 是逐请求明细，`metrics.traffic` 块是实时聚合。分析"某时段省了多少"用 access log（§5）；分析"长期趋势 / 跨重启累计"用 snapshot。
 
 ---
 

@@ -83,7 +83,7 @@
 
 ### 监控
 
-`GET /slimapi/metrics.traffic` 已有独立 `command` / `agent` 桶（upIn/downOut/省流比）；access log 每条带 `bucket` 字段。
+`GET /slimapi/metrics` 响应的 `traffic` 块已有独立 `command` / `agent` 桶（upIn/downOut/省流比）；access log 每条带 `bucket` 字段。
 
 ### 未做（待需求确认）
 
@@ -116,7 +116,7 @@
 
 ### 监控
 
-`GET /slimapi/metrics.traffic` 已有独立 `directories` 桶（upIn/downOut/省流比）；access log 每条带 `bucket` 字段。
+`GET /slimapi/metrics` 响应的 `traffic` 块已有独立 `directories` 桶（upIn/downOut/省流比）；access log 每条带 `bucket` 字段。
 
 ### 非 slim 模式 / 旧 sidecar 降级方案
 

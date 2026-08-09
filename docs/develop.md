@@ -23,7 +23,7 @@ python -m venv .venv
 | `OC_SLIMAPI_SERVER_API_VERSION` | `2` | 服务端当前整数 API 版本 |
 | `OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS` | `2,2` | 接受的客户端版本闭区间 |
 | `OC_SLIMAPI_SKELETON_INLINE_OUTPUT_MAX_BYTES` | `4096` | 骨架投影单字段 inline 字节上限（超阈值则降级为引用占位） |
-| `OC_SLIMAPI_TRAFFIC_METRICS_ENABLED` | `1` | 双向字节账本总开关；`0` 时 `/slimapi/metrics.traffic` 与 ledger 全 no-op |
+| `OC_SLIMAPI_TRAFFIC_METRICS_ENABLED` | `1` | 双向字节账本总开关；`0` 时 traffic 账本快照（嵌入 `/slimapi/metrics` 响应的 `traffic` 块）与 ledger 全 no-op |
 | `OC_SLIMAPI_ACCESS_LOG_DIR` | `logs` | access log 目录（按天文件 `access-YYYY-MM-DD.jsonl`）；生产 systemd 覆盖为 `%S/oc-slimapi/logs` |
 | `OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS` | `0` | prune 早于 N 天的 `access-YYYY-MM-DD.jsonl(.gz)`（**代码默认 `0`=不删**；生产 unit 配 `3`） |
 | `OC_SLIMAPI_TRAFFIC_SNAPSHOT_ENABLED` | `1` | 内存账本周期快照开关（按天 `traffic-snapshot-YYYY-MM-DD.jsonl`） |

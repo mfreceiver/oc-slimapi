@@ -60,6 +60,7 @@ curl --fail -H 'X-Slimapi-Version: 2' http://127.0.0.1:4097/slimapi/health
 | [`docs/specs/INTERFACE_MAP.md`](docs/specs/INTERFACE_MAP.md) | 端点级实现追踪 |
 | [`docs/specs/CLIENT_CHANGES.md`](docs/specs/CLIENT_CHANGES.md) | ocdroid 侧配套改动清单 |
 | [`docs/operations.md`](docs/operations.md) | 部署 / 运维 / 日志 |
+| [`docs/develop.md`](docs/develop.md) | 开发 / 运行 / 测试备忘 |
 | [`docs/manual/traffic-accounting.md`](docs/manual/traffic-accounting.md) | 流量/省流查询手册 |
 | [`docs/release.md`](docs/release.md) | 发版流程规范 |
 | [`CHANGELOG.md`](CHANGELOG.md) | 接口行为变更记录 |
