@@ -28,7 +28,9 @@ ocdroid 对接时：
 
 ## [Unreleased]
 
-（空）
+### Ops
+
+- **本机 `~/.config/oc-slimapi/actions.toml` 新增第 5 个 action `archive_cascade_apply`（manifest 配置，无代码改动；未 bump `X-Slimapi-Version`，仍 2）**：`kind=exec`、`require_confirm=true`、`argv=["/usr/bin/python3","/home/mar/.config/opencode/scripts/archive_cascade.py","--apply"]`、`timeout_s=60`、`min_interval_s=120`。调用复用已有的 `archive_cascade.py` 脚本（沿 `parent_id` 递归 CTE 级联归档"祖先已归档、自身未归档"的 subagent，主会话不动），`--apply` 单事务写 `time_archived` + 落 undo 文件到 `~/.config/opencode/scripts/.archive_cascade_<ts>.txt`、仅回显 result code（与 exec 的 status-envelope 契约一致：stdout 被丢弃，只返回 `{ok,exit_code,duration_ms}`；undo 路径不在响应里，需从落盘文件取）。`GET /slimapi/actions` catalog 从 4 项变 5 项。**加性**：actions 框架 wire 契约（v1.3.0）未变，客户端仅多观察到一条 catalog 项。manifest 为机器本地配置（非代码），模板见 `deploy/actions.manifest.example.toml`；运维细节见 `docs/operations.md` §11。
 
 ---
 
