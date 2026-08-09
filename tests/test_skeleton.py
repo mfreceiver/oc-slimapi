@@ -547,7 +547,7 @@ def test_tool_with_filediff_no_additions_defaults():
 
 
 def test_patch_with_files_injects_diffstats():
-    """Patch part with files[] → diffStats on result, matching file data."""
+    """Patch part with files[] → diffStats in state.metadata, matching file data."""
     source = [{
         "info": {"id": "m1"},
         "parts": [{
@@ -560,14 +560,15 @@ def test_patch_with_files_injects_diffstats():
         }],
     }]
     result = skeleton_messages(source)[0]["parts"][0]
-    assert result["diffStats"] == {"additions": 12, "deletions": 4, "files": 1}
+    assert result["state"]["metadata"]["diffStats"] == {"additions": 12, "deletions": 4, "files": 1}
+    assert "diffStats" not in result  # never at top level (ocdroid reads state.metadata)
     # files[] is still projected as before
     assert result["files"][0]["path"] == "src/foo.ts"
     assert result["files"][0]["additions"] == 12
 
 
 def test_patch_without_files_no_diffstats():
-    """Patch without files[] → no diffStats on result."""
+    """Patch without files[] → no diffStats (neither top-level nor state.metadata)."""
     source = [{
         "info": {"id": "m1"},
         "parts": [{
@@ -578,6 +579,7 @@ def test_patch_without_files_no_diffstats():
     }]
     result = skeleton_messages(source)[0]["parts"][0]
     assert "diffStats" not in result
+    assert "diffStats" not in result.get("state", {}).get("metadata", {})
 
 
 def test_diffstats_survives_thresholding_no_false_omit():
@@ -624,11 +626,56 @@ def test_diffstats_consistent_with_patch_files():
         }],
     }]
     result = skeleton_messages(source)[0]["parts"][0]
-    assert result["diffStats"] == {"additions": 18, "deletions": 10, "files": 3}
+    assert result["state"]["metadata"]["diffStats"] == {"additions": 18, "deletions": 10, "files": 3}
+    assert "diffStats" not in result  # never at top level
     # Each file item still carries its individual stats
     assert result["files"][0]["additions"] == 5
     assert result["files"][1]["deletions"] == 0
     assert result["files"][2]["additions"] == 3
+
+
+def test_patch_with_files_but_no_state_creates_state_metadata():
+    """Patch with files[] but NO upstream state → still creates state.metadata.diffStats,
+    so the client read path (state.metadata?.get) does not chain-break."""
+    source = [{
+        "info": {"id": "m1"},
+        "parts": [{
+            "id": "p1", "type": "patch", "messageID": "m1",
+            "metadata": {"path": "src/foo.ts"},
+            "files": [
+                {"path": "src/foo.ts", "additions": 7, "deletions": 2, "status": "modified"},
+            ],
+            # NOTE: no "state" key — verify minimal container is created.
+        }],
+    }]
+    result = skeleton_messages(source)[0]["parts"][0]
+    assert result["state"]["metadata"]["diffStats"] == {"additions": 7, "deletions": 2, "files": 1}
+    assert "diffStats" not in result  # never at top level
+
+
+def test_patch_and_tool_diffstats_same_wire_location():
+    """Within one message, a tool part (filediff) and a patch part (files[]) both
+    surface diffStats at the SAME wire location — state.metadata.diffStats — so the
+    client consumes both with one read path."""
+    source = [{
+        "info": {"id": "m1"},
+        "parts": [
+            {"id": "p1", "type": "tool", "messageID": "m1", "tool": "edit",
+             "state": {"status": "completed", "metadata": {
+                 "filediff": {"file": "a.ts", "additions": 3, "deletions": 1}}},
+             },
+            {"id": "p2", "type": "patch", "messageID": "m1",
+             "files": [{"path": "b.ts", "additions": 5, "deletions": 2}],
+             "state": {"status": "completed"},
+             },
+        ],
+    }]
+    parts = skeleton_messages(source)[0]["parts"]
+    assert parts[0]["state"]["metadata"]["diffStats"] == {"additions": 3, "deletions": 1, "files": 1}
+    assert parts[1]["state"]["metadata"]["diffStats"] == {"additions": 5, "deletions": 2, "files": 1}
+    # Neither carries a top-level diffStats (the pre-fix patch bug location).
+    assert "diffStats" not in parts[0]
+    assert "diffStats" not in parts[1]
 
 
 # ---------------------------------------------------------------------------

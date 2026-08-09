@@ -248,15 +248,6 @@ def _patch(part: dict[str, Any], *, budget: dict[str, int] | None = None) -> dic
     metadata = part.get("metadata")
     if isinstance(metadata, dict) and "path" in metadata:
         result["metadata"] = {"path": deepcopy(metadata["path"])}
-    # Inject compact diffStats from files[] (computed, injected AFTER
-    # thresholding — no thresholding is applied to diffStats). Patch parts
-    # project files[] with additions/deletions; diffStats is a compact
-    # aggregate consistent with the per-file data. digest 对账为后续 SSE
-    # 实测验证项，本轮不实现。
-    if isinstance(files, list):
-        diffStats = _compute_diffstats_from_files(files)
-        if diffStats is not None:
-            result["diffStats"] = diffStats
     state = part.get("state")
     if isinstance(state, dict):
         thin_state = _pick(state, {"status", "title", "time"})
@@ -275,6 +266,23 @@ def _patch(part: dict[str, Any], *, budget: dict[str, int] | None = None) -> dic
         for key in SKELETON_INLINE_FIELDS:
             _maybe_inline_state_field(thin_state, state, key, omitted, budget)
         result["state"] = thin_state
+    # Inject compact diffStats from files[] into state.metadata.diffStats,
+    # mirroring _tool() above. ocdroid reads state.metadata?.get("diffStats")
+    # — a top-level result["diffStats"] is NEVER read (PartStateSerializer
+    # only drops diagnostics, does not relocate). Injected AFTER thresholding;
+    # the ~50 B object is never omit-eligible. A patch part may carry files[]
+    # WITHOUT an upstream state object — create the minimal state.metadata
+    # container so the client read path (state.metadata?.get) does not
+    # chain-break.
+    if isinstance(files, list):
+        diffStats = _compute_diffstats_from_files(files)
+        if diffStats is not None:
+            if "state" not in result:
+                result["state"] = {}
+            thin_state = result["state"]
+            if "metadata" not in thin_state:
+                thin_state["metadata"] = {}
+            thin_state["metadata"]["diffStats"] = diffStats
     for key in part:
         if key not in PART_IDS | {"files", "metadata", "state"}:
             omitted.append(key)
