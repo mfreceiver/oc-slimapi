@@ -30,6 +30,14 @@ ocdroid 对接时：
 
 ---
 
+## [1.3.1] - 2026-08-09 — patch/apply_patch 工具卡 diffStats 徽章修复（wire 行为修复，未 bump `X-Slimapi-Version`，仍 2）
+
+### Fixed
+
+- **patch 类工具卡（apply_patch / 多文件 write）现在正确显示 diffStats 徽章（未 bump `X-Slimapi-Version`，仍 2）**：骨架投影（`GET /slimapi/messages/{sid}`）中，patch part 的 `diffStats = {additions, deletions, files}` 此前被写到一个客户端从不读取的顶层位置（part 根级 `diffStats`），导致 patch/apply_patch 工具卡的增删行数徽章从未出现；而 edit 类工具（走不同代码路径）一直正常。现已统一到客户端唯一读入口 `state.metadata.diffStats`，与 edit 类一致。**加性修复**：旧顶层位置无任何消费者（ocdroid `displayDiffStats` 只读 `state.metadata?.get("diffStats")`），故对已知客户端无破坏性；patch 工具卡从"徽章缺失"变为"徽章正常"。`files[]` per-file 明细保留不变。注：`/slimapi/messages/{sid}/full/{mid}` 走独立投影（仅删 diagnostics，不注入计算型 diffStats），不在本修复范围。
+
+---
+
 ## [1.3.0] - 2026-08-09 — `/slimapi/actions` 通用能力框架（exec/query 两类，配置驱动 manifest，加性）；未 bump `X-Slimapi-Version`，仍 2
 
 ### Added
