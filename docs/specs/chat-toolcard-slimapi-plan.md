@@ -77,7 +77,7 @@ state.metadata?.get("diffStats")   // ocdroid 读法（JsonObject → additions/
 
 **改动点**: `src/oc_slimapi/skeleton.py`，函数 `_patch()`（行 239-281）。
 
-#### 改动前（行 251-260 + 行 260-281）
+#### 改动前（行 251-259 + 行 260-281）
 
 ```python
     # Inject compact diffStats from files[] (computed, injected AFTER
@@ -112,7 +112,7 @@ state.metadata?.get("diffStats")   // ocdroid 读法（JsonObject → additions/
 
 #### 改动后
 
-**删除** 行 251-260 的旧 diffStats 块；**在 `result["state"] = thin_state` 之后**（原行 277 后）插入新的统一注入块。理由：diffStats 目标位置是 `result["state"]["metadata"]`，必须在 `result["state"]` 赋值之后操作；并处理 patch 有 `files[]` 但无 `state` 的边界（此时需创建最小 `state.metadata` 容器，否则客户端 `state.metadata?.get(...)` 链断）。
+**删除** 行 251-259 的旧 diffStats 块；**在 `result["state"] = thin_state` 之后**（即 `result["state"] = thin_state` 那一行之后）插入新的统一注入块。理由：diffStats 目标位置是 `result["state"]["metadata"]`，必须在 `result["state"]` 赋值之后操作；并处理 patch 有 `files[]` 但无 `state` 的边界（此时需创建最小 `state.metadata` 容器，否则客户端 `state.metadata?.get(...)` 链断）。
 
 ```python
     state = part.get("state")
@@ -229,13 +229,15 @@ state.metadata.diffStats = {
 - `additions` / `deletions` 缺失 → 0；`files` = list 长度（≥1，因空 list 返回 None 不注入）。
 - ocdroid 侧 `toIntOrNull()` 对 null / 非数字字符串返回 null，slimapi 永不发 null（恒 int）——**容错对齐，slimapi 侧更严格**。
 
-**文档补录动作**（建议，**不**在本任务执行——属契约文档变更，需 omni 批准 + 走 §2.1 流程）:
+**文档补录动作**（建议，**不**在本任务执行——属契约文档变更，需 omni 批准 + 走 §2.1 流程；以下三项均待 omni 决策，本任务不做）:
 
-在 `docs/specs/v2-contract.md` §2（HTTP 契约）骨架投影小节增补一段：
+1. 在 `docs/specs/v2-contract.md` §2（HTTP 契约）骨架投影小节增补一段：
 
-> **diffStats（v2+additive，未 bump）**: tool / patch part 的 `state.metadata` 注入紧凑聚合 `diffStats = {additions:int≥0, deletions:int≥0, files:int≥1}`。来源：tool part ← `state.metadata.filediff`（单 dict 或 list）；patch part ← `files[]`。注入位置统一为 `state.metadata.diffStats`（ocdroid `PartDisplayExtensions.displayDiffStats` 唯一读入口）。注入在 thresholding 之后，~50 B 永不进 omit 集合。无 filediff / 无 files[] → 不注入（键缺省）。
+   > **diffStats（v2+additive，未 bump）**: tool / patch part 的 `state.metadata` 注入紧凑聚合 `diffStats = {additions:int≥0, deletions:int≥0, files:int≥1}`。来源：tool part ← `state.metadata.filediff`（单 dict 或 list）；patch part ← `files[]`。注入位置统一为 `state.metadata.diffStats`（ocdroid `PartDisplayExtensions.displayDiffStats` 唯一读入口）。注入在 thresholding 之后，~50 B 永不进 omit 集合。无 filediff / 无 files[] → 不注入（键缺省）。
 
-**同步**: `docs/specs/INTERFACE_MAP.md` 的 `/slimapi/messages` 条目增补 diffStats 投影说明。
+2. `docs/specs/INTERFACE_MAP.md` 的 `/slimapi/messages` 条目增补 diffStats 投影说明。
+
+3. **`CHANGELOG.md`**：记录批次4 diffStats 投影的加性 wire 行为变更，标注"历史欠账补录"。
 
 ---
 
@@ -257,7 +259,7 @@ state.metadata.diffStats = {
 import asyncio
 import orjson
 from oc_slimapi.sse.global_hub import GlobalHub
-from oc_slimapi.sse.hub_types import Subscriber, sse_frame
+from oc_slimapi.sse.hub_types import STOP, Subscriber, sse_frame
 
 async def _drain(subscriber, timeout=0.5):
     """抽出 subscriber queue 当前已入队的所有帧（不阻塞）。"""
@@ -265,12 +267,13 @@ async def _drain(subscriber, timeout=0.5):
     try:
         for _ in range(subscriber.queue.qsize()):
             item = subscriber.queue.get_nowait()
-            if item is not subscriber.__class__.__mro__[0]:  # skip sentinel
+            if item is not STOP:  # skip sentinel
                 frames.append(item)
             subscriber.ack(item)
     except asyncio.QueueEmpty:
         pass
     return frames
+# 用例 A 场景下 publish+flush 不产生 STOP（仅 overflow/unsubscribe 入队），此检查为防御性
 
 def _make_global_event(directory, event_type, properties):
     """构造上游 /global/event 单帧 JSON（global_hub.publish 入参形状）。"""
@@ -278,6 +281,18 @@ def _make_global_event(directory, event_type, properties):
         "directory": directory,
         "payload": {"type": event_type, "properties": properties},
     }
+
+
+def _parse_digest_payload(frame: bytes) -> dict:
+    """Parse a session.digest SSE frame's JSON payload into a dict.
+
+    orjson tolerates trailing whitespace including \n\n, but we rstrip()
+    for robustness. Existing tests (test_hub_behavior_lock.py etc.) use
+    a similar parse(f) pattern; the implementing agent may reuse shared
+    helpers or keep this local copy.
+    """
+    _, _, data = frame.partition(b"data: ")
+    return orjson.loads(data.rstrip())
 ```
 
 ### 3.3 用例 A：tool.* 与 message.part.* 不进 digest（slimapi 保证）
@@ -286,48 +301,59 @@ def _make_global_event(directory, event_type, properties):
 
 ```python
 def test_tool_events_dropped_part_events_no_digest_bump():
+    """三段式实证：tool.* / part 事件不进 digest 且不 bump updatedAt，
+    message.updated 才 bump。"""
     hub = GlobalHub(client=None)
     sub = Subscriber()
     hub.subscribers.add(sub)
 
-    # T0: session busy
+    # === Phase 1: T0+T1 → flush → baseline updatedAt ===
     hub.publish(_make_global_event("/d", "session.status",
                 {"sessionID": "s1", "status": "busy"}))
-    # T1: message.updated（工具开始，messageID 出现）
     hub.publish(_make_global_event("/d", "message.updated",
                 {"sessionID": "s1", "info": {"id": "m1"}}))
-    # T2: tool.* — 应丢弃
+    hub.flush()
+    frames_p1 = _drain(sub)
+    p1_digests = [_parse_digest_payload(f) for f in frames_p1
+                  if f.startswith(b"event: session.digest")]
+    ua1 = next(p["updatedAt"] for p in p1_digests if "updatedAt" in p)
+    assert any(p.get("messageID") == "m1" for p in p1_digests)
+    assert all(b"tool.call" not in f and b"tool.input" not in f for f in frames_p1)
+    assert all(b"message.part.updated" not in f for f in frames_p1)
+
+    # === Phase 2: T2+T3 → flush → part 事件不产出 digest 帧 ===
     hub.publish(_make_global_event("/d", "tool.call",
                 {"sessionID": "s1", "messageID": "m1", "tool": "edit"}))
     hub.publish(_make_global_event("/d", "tool.input",
                 {"sessionID": "s1", "tool": "edit", "input": {"filePath": "a.ts"}}))
-    # T3: message.part.updated（part state running）— 不进 digest
     hub.publish(_make_global_event("/d", "message.part.updated",
                 {"sessionID": "s1", "part": {
                     "id": "p1", "messageID": "m1", "sessionID": "s1",
                     "type": "tool", "state": {"status": "running"}}}))
-    # T4: message.updated（step-finish，工具完成）— 应进 digest
+    hub.flush()
+    frames_p2 = _drain(sub)
+    # 无 tool.* / part 帧透传；part 事件不应触发任何 digest 帧
+    assert all(b"tool.call" not in f and b"tool.input" not in f for f in frames_p2)
+    assert all(b"message.part.updated" not in f for f in frames_p2)
+    p2_digests = [_parse_digest_payload(f) for f in frames_p2
+                  if f.startswith(b"event: session.digest")]
+    assert len(p2_digests) == 0, (
+        f"tool.* / part 事件不应产出 digest 帧，得到 {len(p2_digests)} 帧")
+
+    # === Phase 3: T4+T5 → flush → updatedAt bump ===
     hub.publish(_make_global_event("/d", "message.updated",
                 {"sessionID": "s1", "info": {"id": "m1"}}))
-    # T5: session idle
     hub.publish(_make_global_event("/d", "session.status",
                 {"sessionID": "s1", "status": "idle"}))
-
-    hub.flush()  # 强制吐 debounce 窗口内所有 pending
-    frames = _drain(sub)
-
-    # 断言：只有 session.digest 帧，无 tool.* / message.part.* 帧透传
-    digest_payloads = [
-        orjson.loads(f.split(b"data: ", 1)[1]) for f in frames
-        if f.startswith(b"event: session.digest") or b"sessionID" in f
-    ]
-    # 过滤掉 server.connected 首帧（subscribe 时入队，本测试用 hub.subscribers.add 绕过）
-    assert all(b"tool.call" not in f and b"tool.input" not in f for f in frames)
-    assert all(b"message.part.updated" not in f for f in frames)
-    # digest 序列：busy → (messageID m1 + updatedAt) → idle
-    assert any(p.get("status") == "busy" for p in digest_payloads)
-    assert any(p.get("messageID") == "m1" for p in digest_payloads)
-    assert any(p.get("status") == "idle" for p in digest_payloads)
+    hub.flush()
+    frames_p3 = _drain(sub)
+    p3_digests = [_parse_digest_payload(f) for f in frames_p3
+                  if f.startswith(b"event: session.digest")]
+    ua3 = next(p["updatedAt"] for p in p3_digests if "updatedAt" in p)
+    assert ua3 > ua1, (
+        f"message.updated 应 bump updatedAt: {ua3} <= 基线 {ua1}")
+    assert any(p.get("messageID") == "m1" for p in p3_digests)
+    assert any(p.get("status") == "idle" for p in p3_digests)
 ```
 
 **断言要点**:
@@ -406,7 +432,7 @@ def test_skeleton_after_patch_complete_has_diffstats_in_state_metadata():
 | R1 | **上游依赖（Q2 未实测）**: opencode 工具完成时是否发 `message.updated` + filediff 落库时机 | 若不发或竞态，客户端看不到完成/diffStats | §3.5 live 实测；若失败需 omni 决策（上游改 vs slimapi 主动 bump） |
 | R2 | **既有测试固化错误行为**（test_skeleton.py:563/580/627） | 改实现后测试红 | 代码修改 agent 必须同步改这 3 处断言 + 补 §2 新增用例 |
 | R3 | **另一个 agent 正在改 src/**（本任务约束） | 写域冲突 | 本任务**不动 src/tests**；实施 agent 拿本方案后在其分支落地，避免与在途改动冲突 |
-| R4 | **patch 有 files[] 无 state 的边界** | 修复后创建空 state 容器，`_is_renderable` 行为微变（False→True） | §2 已论证无回归（files[] 存在本就应 renderable）；补 `test_patch_with_files_but_no_state_creates_state_metadata` |
+| R4 | **patch 有 files[] 无 state 的边界** | **无行为变化**——`_is_renderable` 操作输入 `part`（files[] 存在即返回 True），修复仅改变输出 `result` 形状，不影响 `_is_renderable` 判定 | §2 已论证无回归；`test_patch_with_files_but_no_state_creates_state_metadata` 仍保留，但定位为"验证 state 容器创建边界"而非"验证 renderable 行为变化" |
 | R5 | **契约文档未记录 diffStats**（F2） | 后续 agent 不知 wire 位置 | 项2 建议补录 v2-contract.md + INTERFACE_MAP.md（需 omni 批准，本任务不做） |
 | R6 | **diffStats 注入位置改到 state.metadata，与 `/full/{mid}` 的 diagnostics strip 共存** | strip_diagnostics_message 只 pop diagnostics，不动 diffStats → 无冲突 | 已核 `skeleton.py:382-415`，strip 只动 `metadata.diagnostics`，diffStats 保留。无风险 |
 
