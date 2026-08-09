@@ -28,11 +28,21 @@ ocdroid 对接时：
 
 ## [Unreleased]
 
-本节记录**部署侧配置**变更（无代码改动、未 bump `X-Slimapi-Version`，仍 2）。actions 框架本身已在 v1.3.0 实现，此处仅配置 manifest 使其可用。
+（空）
+
+---
+
+## [1.3.2] - 2026-08-09 — `/slimapi/actions` 生产部署启用（manifest 配置，无代码改动；未 bump `X-Slimapi-Version`，仍 2）
+
+> **部署侧配置**变更：无代码改动、未 bump `X-Slimapi-Version`（仍 2）。actions 框架本身已在 v1.3.0 实现，此处仅配置 manifest 使其可用；同时补 `docs/specs/CLIENT_CHANGES.md` §"通用管理动作" slim-fail-open 授权说明（omni 裁决 SSOT，消除未来文档/实现分歧）。
 
 ### Ops
 
 - **`/slimapi/actions` 已在本机部署启用（manifest 配置，未 bump `X-Slimapi-Version`，仍 2）**：通过 `OC_SLIMAPI_ACTIONS_FILE`（`~/.config/oc-slimapi/actions.toml`，`chmod 0600`）声明 4 个 actions —— 3 个 query（`plan_limit` / `list_model` / `list_agent`，只读，echo stdout 为 markdown）+ 1 个 exec（`restart`，`require_confirm=true`，重启 `opencode-web`）。`GET /slimapi/actions` 从 `enabled:false`（空）变为 `enabled:true` + 4 actions。**加性**：actions 框架 wire 契约（v1.3.0）未变，客户端仅多观察到非空 catalog。manifest 为机器本地配置（非代码），参考模板见 `deploy/actions.manifest.example.toml`；运维细节见 `docs/operations.md` §11.2。
+
+### Docs
+
+- **`docs/specs/CLIENT_CHANGES.md` §"通用管理动作" 补 slim-fail-open 授权说明（omni 裁决 SSOT，未 bump `X-Slimapi-Version`，仍 2）**：明确两种"无可用动作"信号对客户端**等价**——(1) 旧 sidecar（pre-v1.3.0）`GET /slimapi/actions` → `404 thin_route_not_found`（路由不存在）；(2) 新 sidecar（v1.3.0+）未配 manifest → `200 {"enabled":false,"actions":[]}`（空 catalog）。两种情况下管理动作入口**常驻** UI、渲染为 disabled/空状态即**合规透明回退**（不展示管理动作列表，不报错、不崩溃）；客户端无需（也不应）据信号类型条件性显示/隐藏入口。此为 omni 裁决，作为"入口是否常驻"的**单一事实源（SSOT）**，消除未来文档/实现分歧。仅文档澄清，无 wire 行为变化。
 
 ---
 

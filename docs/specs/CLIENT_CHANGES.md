@@ -173,6 +173,17 @@
 
 `400 version_required`/`version_incompatible`、`404 thin_route_not_found`（旧 sidecar，回退信号）、`404 action_not_found`、`409 action_confirm_required`、`413 request_too_large`、`429 action_throttled`+`Retry-After`、`503 actions_disabled`/`action_unavailable`/`action_busy`+`Retry-After:2`、`504 action_timeout`+`timeout_s`、`422`。
 
+### slim-fail-open 授权（入口常驻 + 空状态 = 透明回退合规，omni 裁决 SSOT）
+
+管理动作存在**两种"无可用动作"信号**，客户端均授权做**透明回退（fail-open）**，且**管理动作入口在客户端 UI 常驻**（不随信号有无而出现/消失）：
+
+1. **旧 sidecar（pre-v1.3.0）**：`GET /slimapi/actions` → **404 `thin_route_not_found`**（路由不存在）。
+2. **新 sidecar（v1.3.0+）但未配置 manifest**：`GET /slimapi/actions` → **200 `{"enabled":false,"actions":[]}`**（空 catalog）。
+
+两者对客户端**等价**：入口常驻、渲染为 **disabled / 空状态**即合规（不展示管理动作列表，不报错、不崩溃）。客户端**无需（也不应）**根据信号类型条件性显示/隐藏入口——这是 **omni 裁决**，作为本节"管理动作入口是否常驻"的**单一事实源（SSOT）**，消除未来文档/实现分歧。
+
+**不降级触发条件**（与全局 fallback 规则一致）：**仅** 404 `thin_route_not_found`（场景 1）走透明回退；**绝不**对 503（`actions_disabled` / `action_unavailable` / `action_busy`）/413/timeout/版本错误隐藏入口或清空列表——这些是临时故障，入口保持、按错误码提示/重试。
+
 ## 路由与失败策略
 
 - thin 使用 stunnel 14097，direct 14096。
