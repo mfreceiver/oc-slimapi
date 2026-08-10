@@ -28,7 +28,7 @@
   - **已部署稳态**：绑定 `0.0.0.0:4097`（所有接口），**用户接受**；直接 `:4097` 明文访问须经网络边界（防火墙/Tailscale ACL）阻断；外部客户端经 `:14097` mTLS 隧道（stunnel `requireCert=yes verifyChain=yes`，复用既有证书）可达。
   - **`:14097`** 为公网唯一 mTLS 入口；upstream 始终固定 `127.0.0.1:4096`（SSRF guard 不随 host 放松）。
   - **loopback-only（`127.0.0.1:4097`）** 属更严格替代姿态，非当前部署；代码允许该配置。
-- **不读 opencode SQLite**；仅 legacy `/session` API；upstream 始终固定 loopback HTTP（SSRF guard 不随 host 放松）。
+- **不读 opencode SQLite**；仅 legacy `/session` API；upstream 始终固定 loopback HTTP（SSRF guard 不随 host 放松）。本句及全文的「legacy」**仅指 opencode 上游 `/session/**` 等 HTTP API**（`GET /session`、`GET /session/{sid}/message`、`GET /question` 等挂在 `:4096` 的端点），**非** sidecar 自身的 `/slimapi/**` 路由——sidecar 路由不存在「legacy/已废弃」之分，统一受版本门禁管理。
 - v2 目标：**2-5 台同用户设备**（T3 硬化进 v2）。
 - 客户端通过"切换服务器"进省流（R8：`mtls×slim` 两布尔→4 配置），非连接属性开关。
 - **v2 删减面（相对 v1）**：移除 `routeToken`、discovery allowlist 数据流、children 投影缓存、Stage B 单条 fingerprint（`_part_state`/`contentRevisions`/`X-Message-Event-Seq`/304/`?known.*`）、Opt-A partial-envelope、BatchLedger，以及 10+ 依赖性端点（`/projects`、`/permissions`、`/sessions/{sid}/children`、`/messages/{sid}/since/{ts}`、q/p 写端点、`/full?ids=` 批量）。（`GET /slimapi/sessions/status` 曾在 lite-v2 删除，2026-08-03 加性回归，见 §2。`GET /slimapi/questions` 曾在 lite-v2 删除，2026-08-05 加性回归为跨目录聚合端点，见 §2。）
@@ -41,6 +41,7 @@
 - `/slimapi/health` 与 `/slimapi/ready` 返回 `sidecar.ok`（health）/ `upstream`（ready）+ `server.api_version` + `accepted_client_versions` + `schema:{degraded, version, clientMin, clientMax}`（`version`/`clientMin`/`clientMax` 从 config 读，与 `server.*` 同源；**诊断用 wire 范围回显，非 feature discovery**）。**S-E**：`health` 响应 `server` 对象可选加 `deploymentRevision` 字段（当通过 `OC_SLIMAPI_DEPLOYMENT_REVISION(_FILE)` 设置时出现；未设置时整字段省略）。
 - **不再有 Opt-A 能力头**：`X-Slimapi-Capabilities` 在 v2 中**忽略**（v1 的 `mid-partial-envelope=1` 已随 Opt-A 删除而失效；客户端仍可发，sidecar 不分支）。
 - bump 规则：整数，仅破坏性变更 bump；加性变更同版本。v2 → v1 是破坏性 bump（端点删除 + 字段删除 + 版本门闩收紧）。
+- **`slimapi_contract` 是静态常量 `2`**（`src/oc_slimapi/routes/health.py` 内硬编码字面量，不从 `SERVER_API_VERSION` 自动派生），由 `/slimapi/health` 响应在根级回显。任何 wire 契约破坏性 bump 必须**同时**：改代码该常量 + 更新本文档（§2 health 行 / §1 本条 / change-log 表）+ bump `X-Slimapi-Version`；加性 wire 变更**不**触碰该常量。
 
 ## §2 端点
 
@@ -449,7 +450,7 @@ sidecar 作为 ocdroid 与 opencode 之间的 Python 中继层，可观察所有
 - 400 `version_required` / `version_incompatible` / `directory_not_allowed` / `invalid_directory_count`（**v2 无独立生产路径**——q/p 聚合路由删除后此码无触发路径；保留作结构性守卫文档参考，实现中无对应 wire 输出）
   - **`invalid_path`**（catch-all 反代）：归一化后路径含 `..` / `.` 段 → 400（与 `//` 折叠同在 `_normalize_path`；defense-in-depth，合法路径不含此类段）。
   - **`invalid_directory`**：thin 路由与 catch-all 的 `?directory=` query / `X-Opencode-Directory` 头含 `..` 段 / NUL / 控制字符 / 长度 > 4096 → 400（`validate_directory()`；安全守卫，不 gate 合法 directory）。
-  - **`directory_not_allowed` 适用范围**：**仅** messages `/**`（list / full/{mid}）当 query `directory` 与 `X-Opencode-Directory` 头同时存在且冲突时返 400——这是结构性歧义（slimapi 不能猜该透传哪个），与上游能否服务无关。其它结构性守卫（`invalid_directory_count` 显式 list 0 / >32、版本门禁）不变。
+  - **`directory_not_allowed` 适用范围**：messages `/**`（list / full/{mid}）**与 token-stream `GET /slimapi/sessions/{sid}/stream`** 共用此结构性守卫——当 directory query 参数与 `X-Opencode-Directory` header 同时存在且**冲突**（trailing-slash 归一后不等）时返 400。这是结构性歧义（slimapi 不能猜该透传哪个），与上游能否服务无关、与 directory 是否被下游消费无关（token-stream 累加器以 sessionID 为键，directory 对 fanout 本就是 no-op，但仍校验冲突）。其它结构性守卫（`invalid_directory_count` 显式 list 0 / >32、版本门禁）不变。
   - **v2 删除**：v1 的 `invalid_route_token`（routeToken 校验失败）已删除（routeToken 整体下线）；v1 的 `invalid_ids`（G6 top-level：`ids` 空 / 超 20 / 解析后无有效 mid）已删除（G6 端点不存在）。
 - 403 `shell_not_allowed`（catch-all shell/PTY deny-list；ops 可关，非安全保证）
 - 404 `session_not_found`（`GET /slimapi/messages/{sid}` 与 `/full/{mid}` 的 upstream 404；top-level，带 `sessionID`）；`thin_route_not_found`
@@ -491,6 +492,11 @@ sidecar 作为 ocdroid 与 opencode 之间的 Python 中继层，可观察所有
 所有 JSON 路由的 `json_response` 调用转发 `accept_encoding=request.headers.get("accept-encoding")`。sessions 已做；health/ready 等补齐。
 
 > **SSE gzip 例外（v1 rev J，v2 保留）**：历史「SSE 永不 gzip」由 token stream 打破——`GET /slimapi/sessions/{sid}/stream` **默认 gzip**（杠杆2，首个 SSE gzip 例外，详见 §3.x.3）；控制面 `GET /slimapi/events` **仍不 gzip**。
+>
+> **gzip 三层语义（务必区分，勿笼统说「SSE 都不 gzip」）**：
+> 1. **控制面 SSE `GET /slimapi/events`（GlobalHub）恒 identity，不 gzip**——纯控制面 SSE，无 `Content-Encoding`。
+> 2. **token 面 SSE `GET /slimapi/sessions/{sid}/stream` 可 gzip**——同样是 SSE，但按 `Accept-Encoding: gzip` 协商后流式 zlib `Z_SYNC_FLUSH` 压缩（首个 SSE gzip 例外）。即「SSE」不等于「不 gzip」：token stream 是 SSE 但允许 gzip。
+> 3. **普通 JSON / catalog 响应**（sessions / messages / command / agent / health / ready / metrics / questions / directories / actions）按内容协商（`Accept-Encoding`），仅 beneficial 时压缩（`json_response` + `Vary: Accept-Encoding`）。
 
 ## §10 延后（非 v2）
 
@@ -525,7 +531,7 @@ skeleton 共享缓存（YAGNI，先指标）、多用户（独立 stack）、Par
 
 ## §12 流量/省流查询与 accounting（运维诊断）
 
-> 客户端 / 运维查询"哪些请求未省流"或"省流比率"的入口：access log（按天切分 `access-YYYY-MM-DD.jsonl`，早于今天的文件启动压缩为 `.gz`；每条记录含 `method` / `path` / `bucket`（`slimapi` / `passthrough`）/ `requestId` / 可选 `client`/`clientVer`/`clientId` / `bytes` / `status` / 时延）+ `/slimapi/metrics`（T3 订阅者/queue/hub 指标，`batch` 恒 `null`）+ 内存账本周期快照 `traffic-snapshot-YYYY-MM-DD.jsonl`（按天切分、不经自动压缩/prune；cumulative，含 SSE 真实成本，跨进程靠 `bootTs`/`runId`/`uptimeS` 分段）。详见 §7 access log 文件发现规则与 `docs/manual/traffic-accounting.md`。
+> 客户端 / 运维查询"哪些请求未省流"或"省流比率"的入口：access log（按天切分 `access-YYYY-MM-DD.jsonl`，早于今天的文件启动压缩为 `.gz`；每条记录含 `method` / `path` / `bucket`（`slimapi` / `passthrough`）/ `requestId` / 可选 `client`/`clientVer`/`clientId` / `bytes` / `status` / 时延）+ `/slimapi/metrics`（T3 订阅者/queue/hub 指标，`batch` 恒 `null`）+ 内存账本周期快照 `traffic-snapshot-YYYY-MM-DD.jsonl`（按天切分、不经自动压缩；按 OC_SLIMAPI_TRAFFIC_SNAPSHOT_RETAIN_DAYS 自动 prune；cumulative，含 SSE 真实成本，跨进程靠 `bootTs`/`runId`/`uptimeS` 分段）。详见 §7 access log 文件发现规则与 `docs/manual/traffic-accounting.md`。
 
 - 查"哪些请求未省流"：按 `bucket=="passthrough"` 过滤 access log、聚合 `method+path`，再对照本契约 §2 端点表看有无 `/slimapi` 等价省流路由。
 - `/slimapi/metrics.traffic`（如有实现，加性诊断端点）提供聚合视角；本契约不强制要求该端点存在，详见 `docs/manual/traffic-accounting.md`。

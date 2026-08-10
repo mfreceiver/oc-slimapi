@@ -139,6 +139,19 @@ async def test_slimapi_unknown_still_404(upstream_factory):
     assert response.json()["code"] == "thin_route_not_found"
 
 
+async def test_exact_slimapi_root_not_proxied(upstream_factory):
+    """T3: exact /slimapi (no trailing slash) must return 404 without proxying."""
+    handler, seen = _upstream_passthrough()
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/slimapi")
+    assert response.status_code == 404
+    assert response.json()["code"] == "thin_route_not_found"
+    assert seen["path"] is None  # zero upstream calls
+
+
 async def test_forward_injects_request_id_header(upstream_factory):
     """Proxy request to upstream includes X-Request-ID when scope.state has it."""
     from oc_slimapi.middleware.request_id import REQUEST_ID_KEY, RequestIdMiddleware

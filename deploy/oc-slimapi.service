@@ -18,6 +18,10 @@ WorkingDirectory=/home/mar/personal_projects/oc-slimapi
 ExecStart=/home/mar/personal_projects/oc-slimapi/.venv/bin/python -m oc_slimapi.app
 Restart=on-failure
 RestartSec=5
+# P0-1: systemd 15s upper bound for SIGTERM graceful shutdown — sits above
+# uvicorn's 5s timeout_graceful_shutdown so the process has a chance to drain
+# active SSE connections before the 90s SIGKILL default kicks in.
+TimeoutStopSec=15
 
 # OC_SLIMAPI_HOST=0.0.0.0 允许 Tailscale 直连；如仅 loopback（stunnel 本机转发）改 127.0.0.1。
 # :4097 为明文，远程暴露必须靠 stunnel mTLS / Tailscale ACL 隔离。
@@ -35,7 +39,19 @@ Environment=PYTHONUNBUFFERED=1
 StateDirectory=oc-slimapi
 Environment=OC_SLIMAPI_ACCESS_LOG_DIR=%S/oc-slimapi/logs
 Environment=OC_SLIMAPI_TRAFFIC_SNAPSHOT_PATH=%S/oc-slimapi/logs/traffic-snapshot.jsonl
+# Task 10 (P2-1): prune traffic-snapshot-YYYY-MM-DD.jsonl(.gz) older than 30
+# days. Reuses the access-log maintenance loop (single ``today`` per tick,
+# no separate background task). 0 = never prune (code default for local dev).
+Environment=OC_SLIMAPI_TRAFFIC_SNAPSHOT_RETAIN_DAYS=30
 Environment=OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS=3
+# T9 (P1-4): incarnation state lives in its OWN dir, separate from access
+# logs (%S/oc-slimapi/incarnation vs %S/oc-slimapi/logs). On first upgrade
+# from a pre-T9 deployment, the legacy incarnation file under the old
+# access-log dir is read + migrated (value+1 written to the new path,
+# monotonic — no reset); the legacy file is preserved (never deleted).
+# New path takes priority; legacy is consulted only when the new path is
+# missing/corrupt.
+Environment=OC_SLIMAPI_STATE_DIR=%S/oc-slimapi
 
 # /slimapi/actions manifest (opt-in; unset = feature disabled).
 # Manifest must be a regular file, owner-only-write (chmod 0600), owned by the

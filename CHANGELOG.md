@@ -30,7 +30,23 @@ ocdroid 对接时：
 
 ### Ops
 
+- **traffic snapshot 按 `OC_SLIMAPI_TRAFFIC_SNAPSHOT_RETAIN_DAYS` 自动 prune（P2-1，运维行为，未 bump `X-Slimapi-Version`，仍 2）**：此前 `traffic-snapshot-YYYY-MM-DD.jsonl`（内存账本周期快照，用于跨重启的长期省流趋势分析）**不经任何自动清理**，长期累积需运维手动 `rm`。现新增 ops knob `OC_SLIMAPI_TRAFFIC_SNAPSHOT_RETAIN_DAYS`（**代码默认 `0` = 不删**，本地开发/测试；**生产 systemd unit 配置 `30`**——见 `deploy/oc-slimapi.service`），按天 prune 早于 N 天的 `traffic-snapshot-YYYY-MM-DD.jsonl` 与 `.jsonl.gz`。实现复用既有 access-log maintenance loop（`run_access_log_maintenance_loop` 新增 keyword-only 参数 `extra_prune: Callable[[date], int] | None`）：每个 tick 与 access-log prune **共享同一 `today`**，调用 `prune_old_snapshots(directory, stem, retain_days, today)`，**不另起后台 task**、不引入新的 shutdown 漂移面。**边界保留**：`today - retain_days` 当天的文件**保留**（与 access-log prune 同语义），仅严格更老的文件被删；**不压缩** snapshot（仅按天清理，compress 仍只对 `access-` 前缀）。`Settings.validate()` 新增 `>= 0` 校验。仅运维行为变更，非 wire；客户端无感知。详见 `docs/manual/traffic-accounting.md` §6/§9 + `docs/operations.md` §5.3/§5.4。
+- incarnation 状态文件迁移至独立的 `OC_SLIMAPI_STATE_DIR`（默认 `state/`；生产 systemd unit 设为 `%S/oc-slimapi`）。首次启动从旧 access-log 目录原子迁移（单调 +1），旧文件保留不删；新路径损坏回退读取旧路径。运维行为变更，不涉及 wire。
 - **本机 `~/.config/oc-slimapi/actions.toml` 新增第 5 个 action `archive_cascade_apply`（manifest 配置，无代码改动；未 bump `X-Slimapi-Version`，仍 2）**：`kind=exec`、`require_confirm=true`、`argv=["/usr/bin/python3","/home/mar/.config/opencode/scripts/archive_cascade.py","--apply"]`、`timeout_s=60`、`min_interval_s=120`。调用复用已有的 `archive_cascade.py` 脚本（沿 `parent_id` 递归 CTE 级联归档"祖先已归档、自身未归档"的 subagent，主会话不动），`--apply` 单事务写 `time_archived` + 落 undo 文件到 `~/.config/opencode/scripts/.archive_cascade_<ts>.txt`、仅回显 result code（与 exec 的 status-envelope 契约一致：stdout 被丢弃，只返回 `{ok,exit_code,duration_ms}`；undo 路径不在响应里，需从落盘文件取）。`GET /slimapi/actions` catalog 从 4 项变 5 项。**加性**：actions 框架 wire 契约（v1.3.0）未变，客户端仅多观察到一条 catalog 项。manifest 为机器本地配置（非代码），模板见 `deploy/actions.manifest.example.toml`；运维细节见 `docs/operations.md` §11。
+- **sidecar 现以显式 graceful shutdown 超时运行（未 bump `X-Slimapi-Version`，仍 2）**：SIGTERM 后 uvicorn 给活跃连接（含 SSE 订阅者 drain）最多 5s 宽限（`timeout_graceful_shutdown`），然后强制关闭未完成连接。systemd `TimeoutStopSec=15` 作为上限（高于 uvicorn 5s，覆盖默认 90s SIGKILL），避免连接残留导致长时间阻塞。
+
+### Fixed
+
+- **`GET /slimapi`（精确根，无尾斜杠）现在与 `/slimapi/**` 一致返回 404 `thin_route_not_found`（未 bump `X-Slimapi-Version`，仍 2）**：此前精确 `/slimapi`（不带尾斜杠）的请求因 catch-all 路径前缀匹配不满足 `norm_path.startswith("/slimapi/")` 而透传上游 opencode，绕过 sidecar 的路由门禁。现统一为 `norm_path == "/slimapi" or norm_path.startswith("/slimapi/")`，确保精确根路径与子路径均拒绝透传。
+- **`GET /slimapi/sessions` 转换池饱和时与 catalog 路由一致返回 503 + `retry_after:2`（加性，未 bump `X-Slimapi-Version`，仍 2）**：转换池饱和时此前返回裸 503 `{"code":"transform_busy"}`，无 `retry_after` body 字段与 `Retry-After` 响应头。现已改用 catalog 公共的 `busy_response` 辅助，返回 `503 {"code":"transform_busy","retry_after":2}` + 响应头 `Retry-After: 2`。**加性 wire**（新增可选 body 字段 + 头，客户端可忽略，不 bump `X-Slimapi-Version`，仍 2）。
+
+### Internal
+
+- **`/slimapi/questions` 内存预算与 sliding window scheduler（P1-1，未 bump `X-Slimapi-Version`，仍 2）**：消除 16×64MiB 病态上界。新增 3 个内部 ops knob（`OC_SLIMAPI_QUESTIONS_MAX_RESPONSE_BYTES` 默认 2 MiB、`OC_SLIMAPI_QUESTIONS_MAX_AGGREGATE_BYTES` 默认 16 MiB、`OC_SLIMAPI_QUESTIONS_FANOUT_CONCURRENCY` 默认 8，范围 1..16）——均非 wire，仅影响 sidecar 内存/并发。模块级 `_FANOUT_CONCURRENCY`/`_fanout_sem` 移除，改用 `app.state.questions_semaphore`（全局跨请求并发上限）。fan-out 从 `asyncio.gather` 改为 sliding window scheduler（`_collect_with_byte_budget`）：严格原序消费、在途任务 ≤ `questions_fanout_concurrency`、按 `_MAX_AGGREGATE_ITEMS`（10000，保留为第二层 item cap）与 aggregate byte cap 双预算触发截断。任一预算触发时复用既有加性字段 `truncated:true` + `authoritativeDirectories` 降级为 succeeded 列表（partial-replace），不 bump wire 版本。截断路径保证所有已打开 response 被 `aclose`（含已取消的 in-flight 任务）。`config.validate()` 新增四项校验（concurrency [1,16]；per_dir > 0；aggregate >= per_dir；aggregate ≤ 128 MiB）。详见 `docs/operations.md` §5.5 与 `docs/specs/INTERFACE_MAP.md` questions 行。
+
+### Security
+
+- /slimapi/actions 子进程改为 fail-closed 环境 allowlist：仅继承 PATH/HOME/LANG/LC_ALL/LC_CTYPE/TMPDIR/XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS，剔除 OC_SLIMAPI_* 等 sidecar 专属变量。安全加固，不涉及 wire（X-Slimapi-Version 仍 2）。
 
 ---
 

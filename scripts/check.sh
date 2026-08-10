@@ -3,8 +3,8 @@
 # 详见 AGENTS.md 与 docs/release.md。
 #
 # 用法:
-#   ./scripts/check.sh           # pytest（默认，每次改动必跑）
-#   ./scripts/check.sh --full    # pytest + compileall
+#   ./scripts/check.sh           # 默认：pytest + 路由↔INTERFACE_MAP 一致性 gate + compileall
+#   ./scripts/check.sh --full    # 兼容别名（行为等价于默认）
 #
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -24,12 +24,11 @@ echo "==> pytest tests/"
 echo "==> 路由↔文档一致性（防漂移）"
 "$PY" "$ROOT/scripts/check_routes_doc.py"
 
+echo "==> compileall src"
+"$PY" -m compileall -q src
+
 case "$MODE" in
-  --full)
-    echo "==> compileall src"
-    "$PY" -m compileall -q src
-    ;;
-  default|"")
+  --full|default|"")
     ;;
   *)
     echo "用法: check.sh [--full]"; exit 1 ;;

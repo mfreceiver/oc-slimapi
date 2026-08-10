@@ -327,6 +327,71 @@ def test_validate_accepts_boundary_transform_product():
     _base(max_transforms=2, max_response_bytes=256 * 1024 * 1024).validate()
 
 
+# ---------------------------------------------------------------------------
+# T5-C6: questions budget fields defaults + validation
+# ---------------------------------------------------------------------------
+
+
+def test_questions_budget_defaults():
+    """T5-C6: Settings() defaults → 2 MiB / 16 MiB / 8."""
+    s = _base()
+    assert s.questions_max_response_bytes == 2 * 1024 * 1024
+    assert s.questions_max_aggregate_bytes == 16 * 1024 * 1024
+    assert s.questions_fanout_concurrency == 8
+
+
+def test_validate_rejects_fanout_concurrency_zero():
+    settings = _base(questions_fanout_concurrency=0)
+    with pytest.raises(RuntimeError, match=r"FANOUT_CONCURRENCY must be in \[1, 16\]"):
+        settings.validate()
+
+
+def test_validate_rejects_fanout_concurrency_17():
+    settings = _base(questions_fanout_concurrency=17)
+    with pytest.raises(RuntimeError, match=r"FANOUT_CONCURRENCY must be in \[1, 16\]"):
+        settings.validate()
+
+
+def test_validate_accepts_fanout_concurrency_1():
+    """Boundary: 1 is acceptable."""
+    _base(questions_fanout_concurrency=1).validate()
+
+
+def test_validate_accepts_fanout_concurrency_16():
+    """Boundary: 16 is acceptable."""
+    _base(questions_fanout_concurrency=16).validate()
+
+
+def test_validate_rejects_questions_max_response_bytes_zero():
+    settings = _base(questions_max_response_bytes=0)
+    with pytest.raises(RuntimeError, match=r"QUESTIONS_MAX_RESPONSE_BYTES must be > 0"):
+        settings.validate()
+
+
+def test_validate_rejects_aggregate_less_than_per_dir():
+    """questions_max_aggregate_bytes < questions_max_response_bytes → reject."""
+    settings = _base(
+        questions_max_response_bytes=2 * 1024 * 1024,
+        questions_max_aggregate_bytes=1 * 1024 * 1024,
+    )
+    with pytest.raises(RuntimeError, match=r"QUESTIONS_MAX_AGGREGATE_BYTES must be >="):
+        settings.validate()
+
+
+def test_validate_rejects_aggregate_exceeds_128_mib():
+    settings = _base(questions_max_aggregate_bytes=129 * 1024 * 1024)
+    with pytest.raises(RuntimeError, match=r"128 MiB"):
+        settings.validate()
+
+
+def test_validate_accepts_aggregate_equal_to_per_dir():
+    """Boundary: aggregate == per_dir (>=, equality OK)."""
+    _base(
+        questions_max_response_bytes=2 * 1024 * 1024,
+        questions_max_aggregate_bytes=2 * 1024 * 1024,
+    ).validate()
+
+
 def test_validate_rejects_server_version_outside_accepted_range():
     """server_api_version must be within accepted_client_versions range.
 
@@ -494,3 +559,22 @@ def test_access_log_custom_dir_wins(monkeypatch):
     d, used = s.effective_access_log_dir()
     assert d == "/custom/dir"
     assert used is False
+
+
+# ---------------------------------------------------------------------------
+# Task 10 (P2-1): traffic_snapshot_retain_days validation
+# ---------------------------------------------------------------------------
+
+
+def test_traffic_snapshot_retain_days_default_zero_valid():
+    """Default retain_days=0 is valid (= never prune)."""
+    s = _base(traffic_snapshot_retain_days=0)
+    # validate() must NOT raise.
+    s.validate()
+
+
+def test_traffic_snapshot_retain_days_negative_rejected():
+    """Negative retain_days is rejected by validate()."""
+    s = _base(traffic_snapshot_retain_days=-1)
+    with pytest.raises(RuntimeError, match="TRAFFIC_SNAPSHOT_RETAIN_DAYS"):
+        s.validate()

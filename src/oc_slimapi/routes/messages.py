@@ -10,7 +10,7 @@ from starlette.responses import Response
 
 from ..errors import CodedHTTPException
 from ..gzip_util import compress_if_beneficial, error_response
-from ..skeleton import skeleton_messages
+from ..skeleton import SkeletonLimits, skeleton_messages
 from ..transform import (
     TransformBusy,
     read_with_cap,
@@ -61,7 +61,7 @@ def _created_sort_key(msg: dict) -> int:
 
 
 def _project_list_sorted_and_pack(
-    body: bytes, *, accept_encoding: str | None,
+    body: bytes, *, accept_encoding: str | None, limits: SkeletonLimits,
 ) -> tuple[bytes, dict[str, str]]:
     """Worker entry: parse + sort by ``info.time.created`` ASC + skeleton
     project + serialize (+ optional gzip).
@@ -70,6 +70,11 @@ def _project_list_sorted_and_pack(
     ``info.time.created`` ASC. Sort defensively rather than relying on
     upstream opencode's default ordering. Mirrors ``transform._pack_json``
     inline (kept private to that module) so this stays self-contained.
+
+    ``limits`` carries the per-call inline caps (built by the route from
+    ``request.app.state.config``) so two apps with different Settings project
+    the same upstream body differently — the worker never reads module-level
+    config (T8-C1 / T8-C6).
     """
     parsed = orjson.loads(body)
     if not isinstance(parsed, list) or not all(
@@ -82,7 +87,7 @@ def _project_list_sorted_and_pack(
         # route maps to 503.
         raise ValueError("upstream message body is not a list of message dicts")
     parsed.sort(key=_created_sort_key)
-    projected = skeleton_messages(parsed)
+    projected = skeleton_messages(parsed, limits=limits)
     encoded = orjson.dumps(projected)
     return compress_if_beneficial(encoded, accept_encoding)
 
@@ -311,11 +316,18 @@ async def messages(
                 # consistent shape whether they consume list or since.
                 next_cursor = _parse_link_next_cursor(response.headers.get("Link"))
                 # Full parse + sort (§8) + project + serialize/gzip chain in
-                # the worker pool.
+                # the worker pool. SkeletonLimits is built per-request from
+                # this app's config so two apps with different caps project
+                # the same upstream body differently (P1-3 config de-double-
+                # tracking; T8-C4 / T8-C6).
                 try:
                     encoded, extra = await pool.offload(
                         _project_list_sorted_and_pack, body,
                         accept_encoding=request.headers.get("accept-encoding"),
+                        limits=SkeletonLimits(
+                            field_bytes=config.skeleton_inline_output_max_bytes,
+                            message_bytes=config.skeleton_inline_output_max_message_bytes,
+                        ),
                     )
                 except (orjson.JSONDecodeError, ValueError, TypeError, AttributeError) as exc:
                     raise_upstream_unavailable(exc)

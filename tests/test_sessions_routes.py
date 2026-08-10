@@ -734,11 +734,38 @@ async def test_sessions_status_non_dict_entry_value_passed_through(upstream_fact
     assert data["s_bad"] == "busy"
 
 
+# ---------------------------------------------------------------------------
+# TransformBusy admission saturation → 503 + Retry-After (T4)
+# ---------------------------------------------------------------------------
 
+async def test_sessions_transform_busy_returns_retry_after_without_upstream_call(upstream_factory):
+    """Pre-acquire the single admission slot (max_transforms=1), then call
+    GET /slimapi/sessions — must emit 503 transform_busy with Retry-After
+    header and body retry_after field, and must NOT hit upstream (admission
+    is acquired BEFORE the GET)."""
+    calls: dict[str, int] = {"n": 0}
 
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, content=b"[]",
+                              headers={"Content-Type": "application/json"})
 
-
-
-
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream, settings=_settings())
+    pool = app.state.transforms
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with pool:  # saturate the single admission slot
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                response = await client.get("/slimapi/sessions", headers=VERSION_HEADERS)
+            assert response.status_code == 503
+            body = response.json()
+            assert body["code"] == "transform_busy"
+            assert body["retry_after"] == 2
+            assert response.headers["Retry-After"] == "2"
+        # admission-before-GET → zero upstream calls.
+        assert calls["n"] == 0
+    finally:
+        app.state.transforms.shutdown()
 
 

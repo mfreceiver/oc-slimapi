@@ -271,7 +271,7 @@ ocdroid 可在每个请求（含 SSE）**可选**附加三个 request header：
 ### stream 客户端生命周期（必须）
 
 - 前台 opt-in 连 `GET /slimapi/sessions/{sid}/stream`；切后台 / 换 session / 关页面 → **立即断开**（token 订阅独立 T3 账本，预算「同时最多 1 条前台 stream」）。
-- 连接独立于控制面 `/slimapi/events`——两条连接，互不替代。
+- 连接独立于控制面 `/slimapi/events`——两条连接，互不替代。**gzip 三层语义（勿笼统说「SSE 都不 gzip」）**：(1) 控制面 `/slimapi/events` 恒 identity、不 gzip；(2) 本 token stream 是 SSE 但**允许 gzip**（按 `Accept-Encoding: gzip` 协商，流式 zlib `Z_SYNC_FLUSH`，首个 SSE gzip 例外）——建议带 `Accept-Encoding: gzip`；(3) 普通 JSON/catalog 响应按 `Accept-Encoding` 内容协商。即「SSE」≠「不 gzip」：控制面 SSE 不 gzip、token 面 SSE 可 gzip。
 - `Last-Event-ID` 可带但**值被忽略**，仅触发首帧 `resync{reason:"reconnect_no_replay",sessionID}`。stream **不发 SSE `id:`、无 replay buffer**——客户端不得依赖 `id:` 续传。
 
 ### streamOwned 渲染算法（必须）
@@ -285,7 +285,7 @@ ocdroid 可在每个请求（含 SSE）**可选**附加三个 request header：
 
 ### truncated / 降级（必须）
 
-- 收 **`message.part.snapshot{truncated:true}`**（`done:false` 或 `done:true` 均可能）→ 清该 part `streamOwned`、停 append、走 `/slimapi/messages/{sid}` 重拉权威（可能被上游截断，但那是真值）。单 part >1MiB **不**走 resync，而是本路径。
+- 收 **`message.part.snapshot{truncated:true}`**（`event: message.part.snapshot`，`done:false` 或 `done:true` 均可能，携带自身的 `partEventRevision`——该帧消费**自己**的 revision，严格大于该 part 上一帧，故用 strict `>` 比较的客户端可直接接受）→ 这是**单 part 级**截断（part 累计文本超 `token_stream_max_frame_bytes`≈1MiB，或 part 被服务端 drop_part）：清该 part `streamOwned`、停 append、走 `/slimapi/messages/{sid}` 重拉权威（可能被上游截断，但那是真值）。**不影响**该 session 其它 part；单 part >1MiB **不**走 resync，而是本路径。
 
 ### resync 处理（必须）— 两档恢复
 
@@ -297,7 +297,7 @@ ocdroid 可在每个请求（含 SSE）**可选**附加三个 request header：
 | `subscriber_backpressure` | 是 | **是** | 慢消费者被断；须重连 |
 | `token_memory_limit` | 是 | **是** | 服务端 LRU 驱逐一个 LivePart 后**保持连接**、**不**对现有 sub 重发 snapshot；仅清态会让后续 delta 成 orphan → **必须**重连以 `attach_subscriber` 重建锚点 |
 | `session_idle` | 是 | 否 | 上游 idle，该 sid live parts 已 retire；socket 可留 |
-| `session_deleted` | 是 | 否 | 会话终态；eviction 由 `/events` digest 独立驱动 |
+| `session_deleted` | 是 | 否 | 会话**终态**——服务端在发完 `resync{session_deleted}` 后**主动关闭该 token-stream 连接**（`sub.terminate` → STOP，非软 resync），客户端收 STOP 即断；清态 + 重拉权威消息后**不得**重订阅该 sid 的 stream。会话删除本身由控制面 `/events` 的 `session.digest{deleted:true}` 独立驱动，两条信号不互相替代 |
 | 未知 reason（客户端 fallback） | 是 | 否（建议） | 与 idle 同保守路径；勿静默丢帧 |
 
 - token resync **恒带 `sessionID`**；若极端情况收到无 `sessionID` 的 resync，从**连接**推断 sid（token 流每连接绑单 sid）。

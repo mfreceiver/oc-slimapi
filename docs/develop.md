@@ -71,12 +71,20 @@ X-Slimapi-Version: 2
 
 缺头、非整数或区间外版本均返回 400；非 `/slimapi/**` 的透明反代不受门闩影响。
 
-## 测试
+## 测试 / 质量门禁
+
+**本机 `./scripts/check.sh` 是质量门禁**，默认已含三项（每次改动必跑）：
+
+1. `pytest tests/`
+2. 路由↔INTERFACE_MAP 一致性 gate（`scripts/check_routes_doc.py`，防 `/slimapi` 路由与文档漂移）
+3. `compileall src`（字节码编译检查）
 
 ```bash
-.venv/bin/python -m pytest tests/
-.venv/bin/python -m compileall -q src
+./scripts/check.sh           # 默认：上述三项全跑
+./scripts/check.sh --full    # 兼容别名，行为等价于默认
 ```
+
+> **验证策略**：本项目**本机验证，不使用线上 CI**（用户决策 2026-08-09）。所有改动校验在本机通过 `./scripts/check.sh` 完成。
 
 gzip 检查：
 

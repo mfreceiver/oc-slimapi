@@ -292,6 +292,15 @@ class Settings:
     traffic_snapshot_path: str = os.getenv(
         "OC_SLIMAPI_TRAFFIC_SNAPSHOT_PATH", "logs/traffic-snapshot.jsonl"
     )
+    # Task 10 (P2-1): prune old daily snapshot files. 0 = never prune
+    # (default; local dev / tests). Production systemd unit sets 30 (see
+    # deploy/oc-slimapi.service). The prune reuses the access-log maintenance
+    # loop's ``extra_prune`` hook so there is no separate background task
+    # and a single ``today`` is shared between access-log and snapshot prune
+    # per tick.
+    traffic_snapshot_retain_days: int = int(
+        os.getenv("OC_SLIMAPI_TRAFFIC_SNAPSHOT_RETAIN_DAYS", "0")
+    )
 
     # Client identity in the access log (additive wire input, no version bump).
     # ocdroid sends X-Client-Name / X-Client-Version / X-Client-Id. The device
@@ -313,6 +322,26 @@ class Settings:
     skeleton_inline_output_max_message_bytes: int = int(
         os.getenv("OC_SLIMAPI_SKELETON_INLINE_OUTPUT_MAX_MESSAGE_BYTES", str(16 * 1024))
     )
+
+    # Questions fan-out budget (P1-1 / Task 5): per-dir read cap, cross-dir
+    # aggregate byte cap, and global /question concurrency. All three are
+    # internal resource knobs — changing them does NOT change the wire contract
+    # (truncated / authoritativeDirectories are additive fields, no bump).
+    questions_max_response_bytes: int = int(
+        os.getenv("OC_SLIMAPI_QUESTIONS_MAX_RESPONSE_BYTES", str(2 * 1024 * 1024))
+    )
+    questions_max_aggregate_bytes: int = int(
+        os.getenv("OC_SLIMAPI_QUESTIONS_MAX_AGGREGATE_BYTES", str(16 * 1024 * 1024))
+    )
+    questions_fanout_concurrency: int = int(
+        os.getenv("OC_SLIMAPI_QUESTIONS_FANOUT_CONCURRENCY", "8")
+    )
+
+    # T9 (P1-4): incarnation state lives in its own directory, separate from
+    # access logs. Legacy deployments kept the incarnation file inside the
+    # access-log dir; the new path takes priority with monotonic migration
+    # (no reset, no deletion of the legacy file).
+    state_dir: str = os.getenv("OC_SLIMAPI_STATE_DIR", "state")
 
     def read_deployment_revision(self) -> str | None:
         """Best-effort deployment revision (env or file). Returns None if unset.
@@ -576,6 +605,33 @@ class Settings:
             raise RuntimeError("OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS must be >= 0")
         if self.traffic_snapshot_interval_s < 1:
             raise RuntimeError("OC_SLIMAPI_TRAFFIC_SNAPSHOT_INTERVAL_S must be >= 1")
+        # Task 10 (P2-1): snapshot retain_days >= 0 (0 = never prune).
+        if self.traffic_snapshot_retain_days < 0:
+            raise RuntimeError("OC_SLIMAPI_TRAFFIC_SNAPSHOT_RETAIN_DAYS must be >= 0")
+
+        # Questions fan-out budget (T5-C6): concurrency in [1, 16]; per-dir>0;
+        # aggregate >= per-dir; aggregate <= 128 MiB.
+        if not 1 <= self.questions_fanout_concurrency <= 16:
+            raise RuntimeError(
+                "OC_SLIMAPI_QUESTIONS_FANOUT_CONCURRENCY must be in [1, 16]"
+            )
+        if self.questions_max_response_bytes <= 0:
+            raise RuntimeError(
+                "OC_SLIMAPI_QUESTIONS_MAX_RESPONSE_BYTES must be > 0"
+            )
+        if self.questions_max_aggregate_bytes < self.questions_max_response_bytes:
+            raise RuntimeError(
+                "OC_SLIMAPI_QUESTIONS_MAX_AGGREGATE_BYTES must be >= "
+                "OC_SLIMAPI_QUESTIONS_MAX_RESPONSE_BYTES"
+            )
+        if self.questions_max_aggregate_bytes > 128 * 1024 * 1024:
+            raise RuntimeError(
+                "OC_SLIMAPI_QUESTIONS_MAX_AGGREGATE_BYTES must be <= 128 MiB"
+            )
+
+        # T9 (P1-4): incarnation state dir must be non-empty.
+        if not self.state_dir or not self.state_dir.strip():
+            raise RuntimeError("OC_SLIMAPI_STATE_DIR must be non-empty")
 
 
 settings = Settings()

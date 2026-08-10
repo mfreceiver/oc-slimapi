@@ -1,6 +1,8 @@
 import asyncio
+import functools
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import date
+from pathlib import Path
 
 from fastapi import FastAPI
 import uvicorn
@@ -26,7 +28,7 @@ from .sse.hub import HubRegistry
 from .sse.token_hub import TokenStreamHub, TokenStreamRegistry
 from .sse.tokenstream.hub import apply_debug_budget_overrides
 from .traffic import TrafficLedger
-from .traffic_snapshot import TrafficSnapshotter
+from .traffic_snapshot import TrafficSnapshotter, prune_old_snapshots
 from .transform import TransformConfig, TransformPool
 from .upstream import create_client
 from .versioning import SlimapiVersionMiddleware
@@ -68,6 +70,12 @@ _MAINT_DRAIN_TIMEOUT = 30.0
 # uvicorn graceful-shutdown window so a hot reload / systemd stop is not
 # stalled by a single slow worker.
 _TRANSFORM_DRAIN_TIMEOUT = 10.0
+
+# Graceful shutdown timeout for uvicorn's active-connection (SSE) drain
+# (P0-1). uvicorn waits this long for active connections to finish before
+# forcing close. systemd's TimeoutStopSec=15 sits above this value so the
+# unit's 90s SIGKILL default is overridden by a shorter, explicit bound.
+_GRACEFUL_SHUTDOWN_TIMEOUT = 5.0
 
 
 def _log_maint_task_exception(task: asyncio.Task) -> None:
@@ -296,6 +304,11 @@ async def lifespan(app: FastAPI):
                 get_logger("app").warning("transforms.shutdown failed", exc_info=exc)
         stack.callback(_shutdown_transforms)
         app.state.schema_degraded = False
+        # Questions fan-out semaphore (T5): global per-request /question
+        # concurrency cap. Sized by config (1..16); no close/cleanup needed.
+        app.state.questions_semaphore = asyncio.Semaphore(
+            settings.questions_fanout_concurrency
+        )
         # P1-36: smoke status defaults to not_run; smoke() updates it.
         app.state.smoke_status = SMOKE_NOT_RUN
         # S-E: best-effort deployment revision (env or file, swallow errors)
@@ -384,7 +397,10 @@ async def lifespan(app: FastAPI):
         # time (S9).
         from .turn_registry import IncarnationStore, TurnRegistry
 
-        inc_store = IncarnationStore(state_dir=access_log_dir)
+        inc_store = IncarnationStore(
+            state_dir=settings.state_dir,
+            legacy_state_dir=access_log_dir,
+        )
         incarnation = inc_store.load_or_bump()
         app.state.turn_registry = TurnRegistry(incarnation=incarnation)
         app.state.hubs.set_turn_registry(app.state.turn_registry)
@@ -426,12 +442,30 @@ async def lifespan(app: FastAPI):
         if access_log_active:
             stop_event = asyncio.Event()
             app.state._access_log_stop_event = stop_event
+            # Task 10 (P2-1): bind the traffic-snapshot prune as the loop's
+            # ``extra_prune`` so it piggybacks on the existing access-log
+            # maintenance loop (no separate background task, single shared
+            # ``today`` per tick). ``functools.partial`` binds positionally
+            # (directory, stem, retain_days); the loop passes ``today`` as a
+            # positional arg → ``extra_prune(today)``. Keyword binding would
+            # collide with the ``today`` positional in the loop body (the
+            # original bug: ``TypeError: prune_old_snapshots() got multiple
+            # values for argument 'directory'`` swallowed by the loop's
+            # ``except Exception``).
+            snapshot_path_obj = Path(settings.traffic_snapshot_path)
+            snapshot_prune = functools.partial(
+                prune_old_snapshots,
+                snapshot_path_obj.parent,
+                snapshot_path_obj.stem,
+                settings.traffic_snapshot_retain_days,
+            )
             maint_task = asyncio.create_task(
                 run_access_log_maintenance_loop(
                     dir=access_log_dir,
                     retain_days=settings.access_log_retain_days,
                     interval_s=settings.access_log_maintenance_interval_s,
                     stop_event=stop_event,
+                    extra_prune=snapshot_prune,
                 )
             )
             app.state._access_log_maintenance_task = maint_task
@@ -517,7 +551,13 @@ def main() -> None:
     except RuntimeError as exc:
         get_logger("app").error("configuration error: %s", exc)
         raise SystemExit(1)
-    uvicorn.run("oc_slimapi.app:app", host=settings.host, port=settings.port, workers=1)
+    uvicorn.run(
+        "oc_slimapi.app:app",
+        host=settings.host,
+        port=settings.port,
+        workers=1,
+        timeout_graceful_shutdown=_GRACEFUL_SHUTDOWN_TIMEOUT,
+    )
 
 
 if __name__ == "__main__":

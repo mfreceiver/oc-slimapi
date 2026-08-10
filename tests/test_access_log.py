@@ -1077,3 +1077,61 @@ def test_setup_registers_active_handler_ref(tmp_path):
     assert mod._active_handler_ref is None
 
 
+def test_emit_writes_single_call_with_newline(tmp_path):
+    handler = DailyAccessHandler(directory=str(tmp_path))
+    writes: list[str] = []
+    flush_calls = 0
+    class Spy:
+        def write(self, s: str) -> None:
+            writes.append(s)
+        def flush(self) -> None:
+            nonlocal flush_calls
+            flush_calls += 1
+    handler._current_date = date.today()
+    handler._current_fh = Spy()
+    record = logging.LogRecord("oc_slimapi.access", logging.INFO, "", 0, "{}", None, None)
+    handler.emit(record)
+    assert writes == ["{}\n"]
+    assert flush_calls == 1  # 若 spy 缺 flush，emit 会捕获 AttributeError 假绿，必须同时断言 flush
+
+
+# ---------------------------------------------------------------------------
+# Task 10 (P2-1): extra_prune hook — snapshot prune reuses access-log loop
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_maintenance_loop_calls_extra_prune(tmp_path):
+    """The maintenance loop invokes the optional ``extra_prune`` callable
+    once per tick, passing the same ``today`` (a ``date``) it uses for the
+    access-log prune. This lets the traffic-snapshot prune piggyback on the
+    existing loop without a separate background task."""
+    stop_event = asyncio.Event()
+    extra_calls: list = []  # captured arg(s)
+
+    def _spy_extra_prune(today_arg):
+        extra_calls.append(today_arg)
+
+    with patch("oc_slimapi.access_log.date") as mock_date:
+        mock_date.today.return_value = date(2026, 8, 10)
+        mock_date.fromisoformat = date.fromisoformat
+
+        task = asyncio.create_task(
+            run_access_log_maintenance_loop(
+                dir=str(tmp_path),
+                retain_days=0,
+                interval_s=0.05,
+                stop_event=stop_event,
+                extra_prune=_spy_extra_prune,
+            )
+        )
+        await asyncio.sleep(0.12)
+        stop_event.set()
+        await task
+
+    assert len(extra_calls) >= 1
+    # The arg is the same `date` the loop computed for access-log prune.
+    assert all(isinstance(c, date) for c in extra_calls)
+    assert extra_calls[0] == date(2026, 8, 10)
+
+

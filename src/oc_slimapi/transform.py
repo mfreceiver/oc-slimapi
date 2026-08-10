@@ -193,22 +193,30 @@ class TransformPool:
             max_workers=config.max_transforms,
             thread_name_prefix="oc-slimapi-transform",
         )
+        self._active = 0
+        self._waiting = 0
 
     @property
     def config(self) -> TransformConfig:
         return self._config
 
     async def __aenter__(self) -> "TransformPool":
+        self._waiting += 1
         try:
-            await asyncio.wait_for(
-                self._semaphore.acquire(),
-                timeout=self._config.transform_wait_seconds,
-            )
-        except TimeoutError as exc:
-            raise TransformBusy() from exc
+            try:
+                await asyncio.wait_for(
+                    self._semaphore.acquire(),
+                    timeout=self._config.transform_wait_seconds,
+                )
+            except TimeoutError as exc:
+                raise TransformBusy() from exc
+        finally:
+            self._waiting -= 1
+        self._active += 1
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
+        self._active -= 1
         self._semaphore.release()
 
     async def offload(self, func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
@@ -232,20 +240,14 @@ class TransformPool:
         ``active``: permits currently held (i.e., transforms in-flight),
         ``waiting``: acquirers blocked on the semaphore.
 
-        Encapsulates :attr:`asyncio.Semaphore._value` and
-        :attr:`asyncio.Semaphore._waiters` so callers
+        Counters are maintained internally (P2-3) so callers
         (:class:`~oc_slimapi.sse.hub.HubRegistry`) do not reach into
-        private semaphore fields.
+        private ``asyncio.Semaphore`` fields. ``__aenter__`` increments
+        ``_waiting`` before acquire and decrements it in a ``finally``
+        (covers timeout/cancel/exception); ``_active`` is bumped only on a
+        successful acquire and reversed in ``__aexit__`` before release.
         """
-        waiters = self._semaphore._waiters
-        if waiters is not None:
-            waiting = len(waiters)
-        else:
-            waiting = 0
-        return {
-            "active": self._config.max_transforms - self._semaphore._value,
-            "waiting": waiting,
-        }
+        return {"active": self._active, "waiting": self._waiting}
 
     def shutdown(self, wait_seconds: float = 10.0) -> None:
         """Drain in-flight workers bounded by ``wait_seconds`` (P1-41).

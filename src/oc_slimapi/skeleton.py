@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any
 
 import orjson
-
-from .config import settings
 
 PLACEHOLDER_TEXT = "[内容已折叠，点开查看]"
 PART_IDS = {"id", "type", "messageID", "sessionID"}
@@ -19,6 +18,38 @@ TOOL_INPUT_KEYS = {
 TOOL_METADATA_KEYS = {"sessionId", "sessionID", "description", "agent", "diffStats"}
 FILE_URL_LIMIT = 8 * 1024
 COMPACTION_PART_LIMIT = 64 * 1024
+
+
+# ---------------------------------------------------------------------------
+# Per-call skeleton limits (P1-3 config de-double-tracking).
+#
+# ``skeleton.py`` no longer reads the global ``settings`` singleton. The two
+# inline caps are passed explicitly as an immutable ``SkeletonLimits`` value,
+# threaded through every projection function. Defaults (4 KiB / 16 KiB) live
+# here as module constants — they match the prior ``Settings`` defaults so
+# direct pure-function tests are unchanged; production callers (the messages
+# route) construct a fresh ``SkeletonLimits`` from
+# ``request.app.state.config`` per request, so two apps with different Settings
+# see different projections (T8-C1 / T8-C6).
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True, slots=True)
+class SkeletonLimits:
+    """Per-call inline caps for skeleton thresholding.
+
+    ``field_bytes`` caps a single inlined ``state.output`` / ``state.error``
+    field (per-field cap). ``message_bytes`` caps the cumulative inlined bytes
+    across all parts of one message in part order (per-message budget). Both
+    are JSON-wire bytes (measured by :func:`_field_byte_size`).
+    """
+
+    field_bytes: int
+    message_bytes: int
+
+
+# Defaults for direct pure-function tests; production paths construct from
+# request.app.state.config (see routes/messages.py).
+DEFAULT_SKELETON_LIMITS = SkeletonLimits(field_bytes=4 * 1024, message_bytes=16 * 1024)
+
 
 # ---------------------------------------------------------------------------
 # Thresholded skeleton (additive; wire version UNCHANGED — stays 1).
@@ -152,11 +183,11 @@ def _maybe_inline_state_field(
     key: str,
     omitted: list[str],
     budget: dict[str, int] | None,
+    limits: SkeletonLimits,
 ) -> None:
     """Inline ``state[key]`` into ``thin_state`` iff it fits BOTH the per-field
-    cap (``Settings.skeleton_inline_output_max_bytes``) and the remaining
-    per-message budget (``Settings.skeleton_inline_output_max_message_bytes``);
-    otherwise record
+    cap (``limits.field_bytes``) and the remaining per-message budget
+    (``limits.message_bytes``); otherwise record
     ``state.<key>`` in ``omitted`` (no partial truncation — the field is either
     fully present or fully expandable via ``/full``). Mutates ``thin_state`` /
     ``omitted`` / ``budget`` in place. Only called for
@@ -165,10 +196,10 @@ def _maybe_inline_state_field(
     if key not in state:
         return
     size = _field_byte_size(state[key])
-    field_ok = size <= settings.skeleton_inline_output_max_bytes
+    field_ok = size <= limits.field_bytes
     budget_ok = (
         budget is None
-        or budget["used"] + size <= settings.skeleton_inline_output_max_message_bytes
+        or budget["used"] + size <= limits.message_bytes
     )
     if field_ok and budget_ok:
         thin_state[key] = deepcopy(state[key])
@@ -178,7 +209,7 @@ def _maybe_inline_state_field(
         omitted.append(f"state.{key}")
 
 
-def _tool(part: dict[str, Any], *, budget: dict[str, int] | None = None) -> dict[str, Any]:
+def _tool(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS) -> dict[str, Any]:
     result = _pick(part, TOOL_KEYS)
     omitted: list[str] = []
     state = part.get("state")
@@ -207,7 +238,7 @@ def _tool(part: dict[str, Any], *, budget: dict[str, int] | None = None) -> dict
         # omit large or budget-spent ones. A field is fully inlined or fully
         # omitted — never half-truncated.
         for key in SKELETON_INLINE_FIELDS:
-            _maybe_inline_state_field(thin_state, state, key, omitted, budget)
+            _maybe_inline_state_field(thin_state, state, key, omitted, budget, limits=limits)
         # Always-omit heavy nested fields (giant JSON / binary-ish payloads).
         for key in SKELETON_ALWAYS_OMIT_FIELDS:
             if key in state:
@@ -236,7 +267,7 @@ def _tool(part: dict[str, Any], *, budget: dict[str, int] | None = None) -> dict
     return _mark(result, omitted)
 
 
-def _patch(part: dict[str, Any], *, budget: dict[str, int] | None = None) -> dict[str, Any]:
+def _patch(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS) -> dict[str, Any]:
     result = _pick(part, PART_IDS)
     omitted: list[str] = []
     files = part.get("files")
@@ -264,7 +295,7 @@ def _patch(part: dict[str, Any], *, budget: dict[str, int] | None = None) -> dic
         # budget-spent. Patch parts share the per-message budget with tool
         # parts (part order) so neither can starve the other.
         for key in SKELETON_INLINE_FIELDS:
-            _maybe_inline_state_field(thin_state, state, key, omitted, budget)
+            _maybe_inline_state_field(thin_state, state, key, omitted, budget, limits=limits)
         result["state"] = thin_state
     # Inject compact diffStats from files[] into state.metadata.diffStats,
     # mirroring _tool() above. ocdroid reads state.metadata?.get("diffStats")
@@ -306,7 +337,7 @@ def _file(part: dict[str, Any]) -> dict[str, Any]:
     return _mark(result, omitted)
 
 
-def skeleton_part(part: dict[str, Any], *, budget: dict[str, int] | None = None) -> dict[str, Any]:
+def skeleton_part(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS) -> dict[str, Any]:
     part_type = part.get("type")
     if part_type == "text":
         return deepcopy(part)
@@ -314,9 +345,9 @@ def skeleton_part(part: dict[str, Any], *, budget: dict[str, int] | None = None)
         result = _pick(part, PART_IDS | {"text"})
         return _mark(result, [key for key in part if key not in PART_IDS | {"text"}])
     if part_type == "tool":
-        return _tool(part, budget=budget)
+        return _tool(part, budget=budget, limits=limits)
     if part_type == "patch":
-        return _patch(part, budget=budget)
+        return _patch(part, budget=budget, limits=limits)
     if part_type == "file":
         return _file(part)
     if part_type in {"step-start", "step-finish"}:
@@ -330,7 +361,7 @@ def skeleton_part(part: dict[str, Any], *, budget: dict[str, int] | None = None)
     return _mark(_pick(part, PART_IDS), [key for key in part if key not in PART_IDS] or ["*"])
 
 
-def skeleton_message(message: dict[str, Any]) -> dict[str, Any]:
+def skeleton_message(message: dict[str, Any], *, limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS) -> dict[str, Any]:
     # P1-29: normalise nested fields defensively. A malformed upstream message
     # where ``info`` is null or ``parts`` is a non-list (int/bool/string) would
     # crash the projection: ``None.get("id")`` → AttributeError,
@@ -349,7 +380,7 @@ def skeleton_message(message: dict[str, Any]) -> dict[str, Any]:
     # cap. Created here (per-message) and threaded through skeleton_part.
     budget = {"used": 0}
     thin_parts = [
-        skeleton_part(part, budget=budget)
+        skeleton_part(part, budget=budget, limits=limits)
         for part in parts if isinstance(part, dict)
     ]
     if not any(_is_renderable(part) for part in thin_parts):
@@ -366,8 +397,8 @@ def skeleton_message(message: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def skeleton_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [skeleton_message(message) for message in messages]
+def skeleton_messages(messages: list[dict[str, Any]], *, limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS) -> list[dict[str, Any]]:
+    return [skeleton_message(message, limits=limits) for message in messages]
 
 
 # ---------------------------------------------------------------------------

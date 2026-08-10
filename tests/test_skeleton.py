@@ -794,3 +794,31 @@ def test_skeleton_catalogs_filter_non_dict_items():
     out_a = skeleton_agents(agent_src)
     assert len(out_a) == 1
     assert out_a[0] == {"name": "build", "mode": "primary"}
+
+
+def test_skeleton_limits_injectable_no_cross_app_leak():
+    """T8-C1: SkeletonLimits is injectable per-call — two invocations of the
+    same pure function with different ``limits`` produce different projections,
+    and the second call is NOT contaminated by the first (no module-level /
+    app-level leak). ``state.output`` sized between the small and big caps is
+    omitted under small caps and inlined under big caps."""
+    from oc_slimapi.skeleton import SkeletonLimits, skeleton_messages
+
+    output = "x" * (2 * 1024)  # 2 KiB — between the two caps below
+    msg = {"info": {"id": "m1"}, "parts": [{
+        "id": "p1", "type": "tool", "messageID": "m1", "tool": "bash",
+        "state": {"status": "completed", "output": output},
+    }]}
+    small = SkeletonLimits(field_bytes=512, message_bytes=512)  # 2KiB > 512 -> omit
+    big = SkeletonLimits(field_bytes=8 * 1024, message_bytes=8 * 1024)  # 2KiB < 8KiB -> inline
+
+    small_result = skeleton_messages([msg], limits=small)[0]["parts"][0]
+    big_result = skeleton_messages([msg], limits=big)[0]["parts"][0]
+
+    # Small caps -> output omitted (hasFull + state.output recorded).
+    assert "output" not in small_result["state"]
+    assert small_result.get("hasFull") is True
+    assert "state.output" in small_result.get("omitted", [])
+    # Big caps -> output inlined (no hasFull iff it was the only field).
+    assert "output" in big_result["state"]
+    assert big_result.get("hasFull") is not True or "state.output" not in big_result.get("omitted", [])

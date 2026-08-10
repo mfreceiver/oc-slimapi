@@ -125,7 +125,7 @@ def install_proxy(app: FastAPI) -> None:
                 accept_encoding=request.headers.get("accept-encoding"),
             )
 
-        if norm_path.startswith("/slimapi/"):
+        if norm_path == "/slimapi" or norm_path.startswith("/slimapi/"):
             return error_response(
                 "thin_route_not_found", 404,
                 accept_encoding=request.headers.get("accept-encoding"),

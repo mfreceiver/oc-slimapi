@@ -401,3 +401,82 @@ def test_shutdown_default_wait_seconds_is_10():
     sig = inspect.signature(pool.shutdown)
     assert sig.parameters["wait_seconds"].default == 10.0
     pool.shutdown(wait_seconds=0.01)  # fast cleanup
+
+
+# ---------------------------------------------------------------------------
+# TransformPool — snapshot_metrics counters (P2-3)
+# ---------------------------------------------------------------------------
+
+
+async def test_metrics_active_increments_and_decrements():
+    pool = _pool(max_transforms=1)
+    try:
+        assert pool.snapshot_metrics() == {"active": 0, "waiting": 0}
+        async with pool:
+            assert pool.snapshot_metrics() == {"active": 1, "waiting": 0}
+        assert pool.snapshot_metrics() == {"active": 0, "waiting": 0}
+    finally:
+        pool.shutdown()
+
+
+async def test_metrics_waiting_increments_while_blocked():
+    pool = _pool(max_transforms=1, transform_wait_seconds=2.0)
+    try:
+        async with pool:
+            waiting_seen = []
+
+            async def waiter():
+                try:
+                    async with pool:
+                        pass
+                except TransformBusy:
+                    pass
+
+            t = asyncio.create_task(waiter())
+            # Let waiter enter acquire wait.
+            await asyncio.sleep(0.1)
+            m = pool.snapshot_metrics()
+            waiting_seen.append(m["waiting"])
+            assert m["active"] == 1
+            assert m["waiting"] == 1
+        # After release the waiter enters, then exits.
+        await t
+        assert pool.snapshot_metrics() == {"active": 0, "waiting": 0}
+    finally:
+        pool.shutdown()
+
+
+async def test_metrics_waiting_not_leaked_on_timeout():
+    pool = _pool(max_transforms=1, transform_wait_seconds=0.1)
+    try:
+        async with pool:
+            with pytest.raises(TransformBusy):
+                async with pool:
+                    pass
+            # waiting must be zeroed after timeout (no leak).
+            assert pool.snapshot_metrics()["waiting"] == 0
+        assert pool.snapshot_metrics() == {"active": 0, "waiting": 0}
+    finally:
+        pool.shutdown()
+
+
+async def test_metrics_waiting_not_leaked_on_cancel():
+    pool = _pool(max_transforms=1, transform_wait_seconds=5.0)
+    try:
+        async with pool:
+
+            async def waiter():
+                async with pool:
+                    pass
+
+            t = asyncio.create_task(waiter())
+            await asyncio.sleep(0.1)  # let waiter enter waiting
+            assert pool.snapshot_metrics()["waiting"] == 1
+            t.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await t
+            # waiting must be zeroed after cancel (no leak).
+            assert pool.snapshot_metrics()["waiting"] == 0
+        assert pool.snapshot_metrics() == {"active": 0, "waiting": 0}
+    finally:
+        pool.shutdown()

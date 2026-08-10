@@ -916,3 +916,121 @@ class TestActiveProperty:
         assert snap.active is False
         await snap.start()
         assert snap.active is False  # no task created
+
+
+# ---------------------------------------------------------------------------
+# Task 10: prune_old_snapshots — daily-file retention
+# ---------------------------------------------------------------------------
+
+
+class TestPruneOldSnapshots:
+    """Task 10 (P2-1): prune_old_snapshots deletes daily snapshot files
+    older than retain_days. Boundary (today - retain_days) is KEPT; only
+    strictly older files are removed. Both ``.jsonl`` and ``.jsonl.gz`` are
+    deleted. Unrelated files (access log, no-date stems) are untouched.
+    """
+
+    def test_prune_retain_zero_noop(self, tmp_path: Path) -> None:
+        """retain_days=0 → no-op (never prune)."""
+        from datetime import date
+
+        from oc_slimapi.traffic_snapshot import prune_old_snapshots
+
+        old = tmp_path / "traffic-snapshot-2020-01-01.jsonl"
+        old.write_text('{"x":1}\n')
+        count = prune_old_snapshots(
+            directory=tmp_path,
+            stem="traffic-snapshot",
+            retain_days=0,
+            today=date(2026, 8, 10),
+        )
+        assert count == 0
+        assert old.exists()
+
+    def test_prune_keeps_boundary(self, tmp_path: Path) -> None:
+        """today=2026-08-10, retain_days=3 → deadline = 2026-08-07.
+        File dated 2026-08-07 (= deadline) is KEPT; 2026-08-06 (< deadline)
+        is deleted."""
+        from datetime import date
+
+        from oc_slimapi.traffic_snapshot import prune_old_snapshots
+
+        boundary = tmp_path / "traffic-snapshot-2026-08-07.jsonl"
+        boundary.write_text('{"keep":true}\n')
+        older = tmp_path / "traffic-snapshot-2026-08-06.jsonl"
+        older.write_text('{"delete":true}\n')
+        count = prune_old_snapshots(
+            directory=tmp_path,
+            stem="traffic-snapshot",
+            retain_days=3,
+            today=date(2026, 8, 10),
+        )
+        assert count == 1
+        assert boundary.exists()
+        assert not older.exists()
+
+    def test_prune_deletes_old(self, tmp_path: Path) -> None:
+        """A clearly-old file is deleted and counted."""
+        from datetime import date
+
+        from oc_slimapi.traffic_snapshot import prune_old_snapshots
+
+        old = tmp_path / "traffic-snapshot-2026-01-01.jsonl"
+        old.write_text('{"old":true}\n')
+        count = prune_old_snapshots(
+            directory=tmp_path,
+            stem="traffic-snapshot",
+            retain_days=3,
+            today=date(2026, 8, 10),
+        )
+        assert count == 1
+        assert not old.exists()
+
+    def test_prune_deletes_gz_too(self, tmp_path: Path) -> None:
+        """Both ``.jsonl`` and ``.jsonl.gz`` snapshot files are pruned."""
+        from datetime import date
+
+        from oc_slimapi.traffic_snapshot import prune_old_snapshots
+
+        old_jsonl = tmp_path / "traffic-snapshot-2026-01-01.jsonl"
+        old_jsonl.write_text('{"a":1}\n')
+        old_gz = tmp_path / "traffic-snapshot-2026-01-02.jsonl.gz"
+        old_gz.write_bytes(b"\x1f\x8b\x08\x00")  # fake gzip bytes; not parsed
+        count = prune_old_snapshots(
+            directory=tmp_path,
+            stem="traffic-snapshot",
+            retain_days=3,
+            today=date(2026, 8, 10),
+        )
+        assert count == 2
+        assert not old_jsonl.exists()
+        assert not old_gz.exists()
+
+    def test_prune_ignores_unrelated_files(self, tmp_path: Path) -> None:
+        """Files not matching the strict stem-YYYY-MM-DD pattern are
+        untouched: access log files, foreign stems with dates, and stem
+        files without a date."""
+        from datetime import date
+
+        from oc_slimapi.traffic_snapshot import prune_old_snapshots
+
+        access_log = tmp_path / "access-2020-01-01.jsonl"
+        access_log.write_text('{"access":true}\n')
+        foreign = tmp_path / "foo-2026-01-01.jsonl"
+        foreign.write_text('{"foreign":true}\n')
+        nodate = tmp_path / "traffic-snapshot-nodate.jsonl"
+        nodate.write_text('{"nodate":true}\n')
+        # A real old snapshot that SHOULD be pruned (sanity that the loop runs).
+        old_snap = tmp_path / "traffic-snapshot-2020-01-01.jsonl"
+        old_snap.write_text('{"snap":true}\n')
+        count = prune_old_snapshots(
+            directory=tmp_path,
+            stem="traffic-snapshot",
+            retain_days=3,
+            today=date(2026, 8, 10),
+        )
+        assert count == 1
+        assert access_log.exists()
+        assert foreign.exists()
+        assert nodate.exists()
+        assert not old_snap.exists()

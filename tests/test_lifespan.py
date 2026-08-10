@@ -201,7 +201,7 @@ async def test_maintenance_crash_exception_recovered_on_shutdown(
 ):
     """P1-38: maintenance task dies with an unhandled exception → the exception
     is recovered (logged + consumed via task.exception()) on shutdown."""
-    async def _crash_loop(*, dir, retain_days, interval_s, stop_event):
+    async def _crash_loop(*, dir, retain_days, interval_s, stop_event, extra_prune=None):
         raise RuntimeError("maintenance loop crashed")
 
     _patch_lifespan_for_shutdown_test(monkeypatch, tmp_path, _crash_loop)
@@ -223,7 +223,7 @@ async def test_maintenance_cancelled_cleanly(monkeypatch, tmp_path):
     # Short drain timeout so the test does not wait 30 s.
     monkeypatch.setattr("oc_slimapi.app._MAINT_DRAIN_TIMEOUT", 0.1)
 
-    async def _sleep_forever(*, dir, retain_days, interval_s, stop_event):
+    async def _sleep_forever(*, dir, retain_days, interval_s, stop_event, extra_prune=None):
         await asyncio.Event().wait()  # never returns on its own
 
     _patch_lifespan_for_shutdown_test(monkeypatch, tmp_path, _sleep_forever)

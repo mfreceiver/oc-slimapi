@@ -84,68 +84,66 @@ class IncarnationStore:
       the fallback, do NOT crash.
     """
 
-    def __init__(self, state_dir: str) -> None:
+    def __init__(self, state_dir: str, legacy_state_dir: str | None = None) -> None:
+        # Save two paths: the new state_dir and the legacy (old access_log dir).
+        # New path takes priority; legacy is only consulted when the new path
+        # is missing or corrupt (monotonic migration without reset).
         self._path = Path(state_dir) / _INCARNATION_FILENAME
+        self._legacy_path = (
+            Path(legacy_state_dir) / _INCARNATION_FILENAME
+            if legacy_state_dir else None
+        )
 
-    def load_or_bump(self) -> int:
-        """Read persisted → +1 → write back → return new incarnation.
+    def _read_path(self, path: Path | None) -> tuple[bool, int]:
+        """Return (exists_and_valid, value).
 
-        Returns :data:`_FALLBACK_INCARNATION` (1) on any best-effort path
-        (missing file, corrupt content, unwritable). Never raises.
+        missing → silent (False, 0); empty/corrupt/unreadable → (False, 0)
+        with a warning (same logging semantics as the prior _read_persisted).
+        A None path (no legacy configured) → (False, 0) silent.
         """
-        persisted_last = self._read_persisted()
-        inc = persisted_last + 1
-        if not self._write_persisted(inc):
-            # Persistence failed — but the in-memory incarnation is still
-            # valid for this process lifetime. A restart will re-read the
-            # stale file and pick a possibly-colliding value; ocdroid's
-            # lex compare keeps this correct in practice (the contract
-            # only requires monotonic-within-process).
-            logger.warning(
-                "turn-registry: failed to persist incarnation %d to %s; "
-                "using value in-memory only (restart may re-use a stale "
-                "incarnation from disk)",
-                inc,
-                self._path,
-            )
-        return inc
-
-    def _read_persisted(self) -> int:
-        """Return the persisted integer, or ``_FALLBACK_INCARNATION - 1`` (0).
-
-        Missing file → 0 (so first run yields inc=1). Corrupt content → 0
-        (fallback) after a warning. Never raises.
-        """
+        if path is None or not path.exists():
+            return False, 0
         try:
-            text = self._path.read_text(encoding="utf-8").strip()
-        except FileNotFoundError:
-            # First run — no persisted value. Treated as 0 (inc → 1).
-            return _FALLBACK_INCARNATION - 1
+            text = path.read_text(encoding="utf-8").strip()
         except OSError:
             logger.warning(
-                "turn-registry: unreadable incarnation file %s; "
-                "treating as fresh start",
-                self._path,
-                exc_info=True,
+                "turn-registry: unreadable incarnation file %s; treating as fresh",
+                path, exc_info=True,
             )
-            return _FALLBACK_INCARNATION - 1
+            return False, 0
         if not text:
-            return _FALLBACK_INCARNATION - 1
+            logger.warning("turn-registry: empty incarnation file %s; treating as fresh", path)
+            return False, 0
         try:
             value = int(text)
         except ValueError:
-            logger.warning(
-                "turn-registry: corrupt incarnation file %s (content=%r); "
-                "treating as fresh start",
-                self._path,
-                text[:64],
-            )
-            return _FALLBACK_INCARNATION - 1
-        # Negative / absurd values are normalized to the fresh-start base;
-        # we do not trust junk on disk.
+            logger.warning("turn-registry: corrupt incarnation file %s; treating as fresh", path)
+            return False, 0
         if value < 0:
-            return _FALLBACK_INCARNATION - 1
-        return value
+            logger.warning("turn-registry: negative incarnation in %s; treating as fresh", path)
+            return False, 0
+        return True, value
+
+    def load_or_bump(self) -> int:
+        # 1) Read new path first: valid → use new value.
+        # 2) Else read legacy: valid → use legacy value (new path missing/corrupt
+        #    but legacy valid → fall back to legacy, avoiding incarnation
+        #    regression; only consult legacy when new is absent/corrupt).
+        # 3) Else base = 0 (fresh start).
+        # inc = base + 1; write ONLY the new path; legacy file is never deleted.
+        valid, base = self._read_path(self._path)
+        if not valid and self._legacy_path is not None:
+            valid, base = self._read_path(self._legacy_path)
+        inc = base + 1
+        # Write only the new path; on failure still return the computed inc
+        # (best-effort, no crash, no fixed fallback).
+        if not self._write_persisted(inc):
+            logger.warning(
+                "turn-registry: failed to persist incarnation %d to %s; "
+                "using value in-memory only (restart may re-read a stale value)",
+                inc, self._path,
+            )
+        return inc
 
     def _write_persisted(self, inc: int) -> bool:
         """Best-effort **atomic** write of ``inc`` to the persistence file.

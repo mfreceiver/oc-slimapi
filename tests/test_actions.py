@@ -971,3 +971,48 @@ def test_name_trailing_newline_dropped(tmp_path):
     past the name gate (``$`` also matches just before a final ``\\n``)."""
     reg = _registry(tmp_path, {"good": _base_exec(), "bad\n": _base_exec()})
     assert {e["name"] for e in reg.discover()} == {"good"}
+
+
+# ---------------------------------------------------------------------------
+# P2-2 (Task 11): action subprocess environment allowlist
+# ---------------------------------------------------------------------------
+
+
+def test_build_action_env_copies_only_allowlist_keys():
+    """``_build_action_env`` must copy only allowlist keys present in *source*.
+
+    A non-allowlisted-but-sane var like USER, plus sidecar vars
+    (OC_SLIMAPI_UPSTREAM) and arbitrary secrets (SECRET_TOKEN), are dropped.
+    """
+    from oc_slimapi.actions import _build_action_env
+
+    source = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/root",
+        "USER": "root",                # benign but NOT in allowlist → dropped
+        "OC_SLIMAPI_UPSTREAM": "http://127.0.0.1:4096",  # sidecar var → dropped
+        "SECRET_TOKEN": "hunter2",     # arbitrary secret → dropped
+    }
+    result = _build_action_env(source)
+    assert set(result.keys()) == {"PATH", "HOME"}
+    assert result["PATH"] == "/usr/bin:/bin"
+    assert result["HOME"] == "/root"
+
+
+def test_build_action_env_drops_oc_slimapi_vars():
+    """All ``OC_SLIMAPI_*`` vars are dropped even if PATH is present.
+
+    No fuzzy "name contains secret" rule — this is a strict allowlist, so the
+    entire OC_SLIMAPI_* family is excluded by construction.
+    """
+    from oc_slimapi.actions import _build_action_env
+
+    source = {
+        "OC_SLIMAPI_UPSTREAM": "http://127.0.0.1:4096",
+        "OC_SLIMAPI_STATE_DIR": "/var/lib/oc-slimapi",
+        "OC_SLIMAPI_ACCESS_LOG_DIR": "/var/log/oc-slimapi",
+        "PATH": "/usr/bin:/bin",
+    }
+    result = _build_action_env(source)
+    assert set(result.keys()) == {"PATH"}
+    assert all(not k.startswith("OC_SLIMAPI_") for k in result)

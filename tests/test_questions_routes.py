@@ -10,6 +10,8 @@ catch-all proxy are wired exactly as in production.
 """
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import orjson
 import pytest
@@ -25,30 +27,46 @@ from oc_slimapi.versioning import SlimapiVersionMiddleware
 VERSION_HEADERS = {"X-Slimapi-Version": "2"}
 
 
-def _settings() -> Settings:
-    return Settings(
+def _settings(**overrides) -> Settings:
+    """Build Settings with base defaults + per-test overrides.
+
+    The base dict provides the minimal valid settings; calling tests may
+    override any field (including the 3 new questions-budget fields which
+    default to 2 MiB / 16 MiB / 8 so existing tests are unaffected).
+    """
+    base = dict(
         host="127.0.0.1", port=4097, upstream="http://127.0.0.1:4096",
         max_message_bytes=32 * 1024 * 1024,
         max_transforms=1, transform_wait_seconds=0.5, max_response_bytes=64 * 1024,
         smoke_session_id=None,
         server_api_version=2, accepted_client_versions=(2, 2),
+        # Per-dir /question read cap: match max_response_bytes so the existing
+        # test_per_dir_cap_exceeded_errors_that_dir (>64 KiB body) still triggers.
+        questions_max_response_bytes=64 * 1024,
     )
+    base.update(overrides)
+    return Settings(**base)
 
 
-def _build_app(upstream: httpx.AsyncClient) -> FastAPI:
+def _build_app(upstream: httpx.AsyncClient, *, _settings_obj: Settings | None = None) -> FastAPI:
     """Construct a fresh FastAPI app with the questions router wired up.
 
     Mirrors the real app: version middleware → questions router (before
     catch-all) → catch-all proxy → coded-exception handler. The transform
     pool is attached even though this handler doesn't use it, in case other
-    middleware touches it.
+    middleware touches it. Creates ``app.state.questions_semaphore`` from
+    settings for the per-request fan-out concurrency bound.
+
+    If ``_settings_obj`` is provided, it is used directly; otherwise a default
+    ``_settings()`` is created. This allows tests that override settings to
+    construct the app with the same settings instance.
     """
     app = FastAPI(title="oc-slimapi-questions-test")
     app.add_middleware(
         SlimapiVersionMiddleware,
         accepted_client_versions=(2, 2),
     )
-    settings = _settings()
+    settings = _settings_obj if _settings_obj is not None else _settings()
     app.state.config = settings
     app.state.upstream = upstream
     app.state.schema_degraded = False
@@ -57,6 +75,7 @@ def _build_app(upstream: httpx.AsyncClient) -> FastAPI:
         transform_wait_seconds=settings.transform_wait_seconds,
         max_response_bytes=settings.max_response_bytes,
     ))
+    app.state.questions_semaphore = asyncio.Semaphore(settings.questions_fanout_concurrency)
     app.include_router(questions.router)
     register_error_handlers(app)
     install_proxy(app)
@@ -946,18 +965,17 @@ async def test_partial_failure_with_complete_discovery_lists_succeeded(upstream_
 
 
 # ---------------------------------------------------------------------------
-# Fan-out concurrency bound: more dirs than _FANOUT_CONCURRENCY still
-# completes correctly (no deadlock, per-dir isolation intact).
+# Fan-out concurrency bound: more dirs than the config fan-out concurrency cap
+# still completes correctly (no deadlock, per-dir isolation intact).
 # ---------------------------------------------------------------------------
 
 
 async def test_fanout_concurrency_bound_completes_with_many_dirs(upstream_factory):
-    """Discover more dirs than _FANOUT_CONCURRENCY; the semaphore must bound
-    in-flight /question calls without deadlock. Every dir succeeds → all items
-    merged, no errors, global authority (discovery complete)."""
-    from oc_slimapi.routes.questions import _FANOUT_CONCURRENCY
-
-    n_dirs = _FANOUT_CONCURRENCY + 8  # exceed the cap to exercise the wait path
+    """Discover more dirs than the fan-out concurrency cap; the semaphore must
+    bound in-flight /question calls without deadlock. Every dir succeeds →
+    all items merged, no errors, global authority (discovery complete)."""
+    settings = _settings()
+    n_dirs = settings.questions_fanout_concurrency + 8  # exceed cap
     dirs = [f"/dir{i}" for i in range(n_dirs)]
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -975,7 +993,7 @@ async def test_fanout_concurrency_bound_completes_with_many_dirs(upstream_factor
         return httpx.Response(404)
 
     upstream = upstream_factory(handler)
-    app = _build_app(upstream)
+    app = _build_app(upstream, _settings_obj=settings)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get("/slimapi/questions", headers=VERSION_HEADERS)
@@ -993,9 +1011,8 @@ async def test_fanout_concurrency_bound_isolates_errors_with_many_dirs(upstream_
     """With many dirs and one failing (5xx), the failing dir lands in errors[]
     and the rest succeed — proves per-dir isolation holds under the bounded
     fan-out."""
-    from oc_slimapi.routes.questions import _FANOUT_CONCURRENCY
-
-    n_dirs = _FANOUT_CONCURRENCY + 4
+    settings = _settings()
+    n_dirs = settings.questions_fanout_concurrency + 4
     dirs = [f"/dir{i}" for i in range(n_dirs)]
     failing_dir = dirs[len(dirs) // 2]
 
@@ -1016,7 +1033,7 @@ async def test_fanout_concurrency_bound_isolates_errors_with_many_dirs(upstream_
         return httpx.Response(404)
 
     upstream = upstream_factory(handler)
-    app = _build_app(upstream)
+    app = _build_app(upstream, _settings_obj=settings)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get("/slimapi/questions", headers=VERSION_HEADERS)
@@ -1244,3 +1261,283 @@ async def test_serialise_offload_returns_valid_response(upstream_factory):
     assert len(body["items"]) == 1
     assert body["items"][0]["directory"] == "/a"
     assert body["authoritativeDirectories"] is None
+
+
+# ---------------------------------------------------------------------------
+# T5-C1: fan-out concurrency respects config.questions_fanout_concurrency
+# ---------------------------------------------------------------------------
+
+
+class _CountingSem:
+    """Semaphore wrapper that records the peak number of concurrent holders.
+
+    Each ``__aenter__`` increments ``_active`` and updates ``high`` (peak),
+    then yields control via ``sleep(0)`` so sibling tasks in the initial
+    scheduler window can also enter before any of them proceed to the actual
+    work (making the peak deterministic for the test).
+    """
+
+    def __init__(self, n: int):
+        self._sem = asyncio.Semaphore(n)
+        self._active = 0
+        self.high = 0
+
+    async def __aenter__(self):
+        await self._sem.acquire()
+        self._active += 1
+        self.high = max(self.high, self._active)
+        await asyncio.sleep(0)   # deterministic overlap: let siblings enter
+        return self
+
+    async def __aexit__(self, *exc):
+        self._active -= 1
+        self._sem.release()
+
+
+async def test_fanout_concurrency_respects_config_cap(upstream_factory):
+    """T5-C1: single-request fanout never exceeds config.questions_fanout_concurrency.
+
+    Build app with fanout=3, replace the semaphore with _CountingSem(3),
+    discover 8 dirs. The sliding window scheduler launches 3 tasks initially;
+    all 3 acquire the semaphore → high reaches exactly 3. All 8 items present,
+    no errors.
+    """
+    settings = _settings(questions_fanout_concurrency=3)
+    dirs = [f"/d{i}" for i in range(8)]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/experimental/session":
+            return httpx.Response(
+                200, content=_sessions_body(*dirs),
+                headers={"Content-Type": "application/json"},
+            )
+        if request.url.path == "/question":
+            return httpx.Response(
+                200, content=orjson.dumps([_question(f"que_d{dirs.index(request.headers.get('x-opencode-directory',''))}")]),
+                headers={"Content-Type": "application/json"},
+            )
+        return httpx.Response(404)
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream, _settings_obj=settings)
+    app.state.questions_semaphore = _CountingSem(3)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/slimapi/questions", headers=VERSION_HEADERS)
+    assert response.status_code == 200
+    body = response.json()
+    # Peak concurrency reached exactly 3 (initial window).
+    assert app.state.questions_semaphore.high == 3
+    assert len(body["items"]) == 8
+    assert body["errors"] == []
+
+
+# ---------------------------------------------------------------------------
+# T5-C2: per-dir read cap applies questions_max_response_bytes
+# ---------------------------------------------------------------------------
+
+
+async def test_per_dir_read_cap_applies_questions_budget(upstream_factory):
+    """T5-C2: a dir whose /question body exceeds questions_max_response_bytes
+    → that dir in errors[] (upstream_unavailable) with body_bytes=0 (does NOT
+    occupy aggregate budget). The aggregate cap is set large enough to prove
+    the per-dir cap is the binding constraint and the failed dir doesn't
+    trigger truncation.
+    """
+    settings = _settings(
+        questions_max_response_bytes=256,
+        questions_max_aggregate_bytes=4096,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/experimental/session":
+            return httpx.Response(
+                200, content=_sessions_body("/a", "/b"),
+                headers={"Content-Type": "application/json"},
+            )
+        if request.url.path == "/question":
+            d = request.headers.get("x-opencode-directory")
+            if d == "/a":
+                # Small body (~80 bytes) — under per-dir cap
+                return httpx.Response(
+                    200, content=orjson.dumps([_question("que_a")]),
+                    headers={"Content-Type": "application/json"},
+                )
+            if d == "/b":
+                # Body > 256 bytes — exceeds per-dir cap
+                large_text = "X" * 500
+                return httpx.Response(
+                    200, content=orjson.dumps([{
+                        "id": "que_b", "sessionID": "01HSESSION",
+                        "questions": [{"id": "que_b", "name": "confirm", "text": large_text}],
+                        "tool": {"name": "Bash"},
+                    }]),
+                    headers={"Content-Type": "application/json"},
+                )
+        return httpx.Response(404)
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream, _settings_obj=settings)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/slimapi/questions", headers=VERSION_HEADERS)
+    assert response.status_code == 200
+    body = response.json()
+    # /a's question present; /b in errors
+    assert len(body["items"]) == 1
+    assert body["items"][0]["directory"] == "/a"
+    assert len(body["errors"]) == 1
+    assert body["errors"][0] == {"directory": "/b", "code": "upstream_unavailable"}
+    # Aggregate cap not triggered → no truncated field
+    assert "truncated" not in body
+    assert body["authoritativeDirectories"] == ["/a"]
+
+
+# ---------------------------------------------------------------------------
+# T5-C3: aggregate byte budget truncation + cancellation
+# ---------------------------------------------------------------------------
+
+
+def _approx_250_byte_question(qid: str) -> bytes:
+    """Return a /question response body of exactly 250 bytes (1 question with padding).
+
+    Validated empirically: ``text="pad_" + "X" * 130`` produces a 250-byte
+    JSON array body. This gives deterministic budget arithmetic in tests."""
+    text = "pad_" + "X" * 130  # 134 chars, total body = 250 bytes
+    return orjson.dumps([{
+        "id": qid, "sessionID": "01HSESSION",
+        "questions": [{"id": qid, "name": "confirm", "text": text}],
+        "tool": {"name": "Bash"},
+    }])
+
+
+async def test_aggregate_byte_budget_truncates_and_cancels_remaining(upstream_factory):
+    """T5-C3: aggregate byte cap exceeded → truncated:true, current dir not
+    added, remaining dirs not started, in-flight unconsumed tasks cancelled."""
+    settings = _settings(
+        questions_max_response_bytes=4096,
+        questions_max_aggregate_bytes=500,
+        questions_fanout_concurrency=3,
+    )
+    dirs = [f"/d{i}" for i in range(6)]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/experimental/session":
+            return httpx.Response(
+                200, content=_sessions_body(*dirs),
+                headers={"Content-Type": "application/json"},
+            )
+        if request.url.path == "/question":
+            return httpx.Response(
+                200, content=_approx_250_byte_question("que"),
+                headers={"Content-Type": "application/json"},
+            )
+        return httpx.Response(404)
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream, _settings_obj=settings)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/slimapi/questions", headers=VERSION_HEADERS)
+    assert response.status_code == 200
+    body = response.json()
+    # d0 (250) + d1 (250) = 500 accepted; d2 (250) triggers 500+250>500
+    assert body.get("truncated") is True
+    assert len(body["items"]) == 2
+    assert body["errors"] == []
+    assert body["authoritativeDirectories"] == ["/d0", "/d1"]
+
+
+# ---------------------------------------------------------------------------
+# T5-C4: item-cap truncation degrades authority
+# ---------------------------------------------------------------------------
+
+
+async def test_aggregate_truncation_degrades_authority(upstream_factory, monkeypatch):
+    """T5-C4: item cap (_MAX_AGGREGATE_ITEMS) triggers truncated + partial
+    authority. Cancelled/un-started dirs absent from both errors and items."""
+    monkeypatch.setattr(questions, "_MAX_AGGREGATE_ITEMS", 2)
+    dirs = ["/a", "/b", "/c"]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/experimental/session":
+            return httpx.Response(
+                200, content=_sessions_body(*dirs),
+                headers={"Content-Type": "application/json"},
+            )
+        if request.url.path == "/question":
+            d = request.headers.get("x-opencode-directory")
+            return httpx.Response(
+                200, content=orjson.dumps([_question(f"que_{d[1:]}")]),
+                headers={"Content-Type": "application/json"},
+            )
+        return httpx.Response(404)
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/slimapi/questions", headers=VERSION_HEADERS)
+    assert response.status_code == 200
+    body = response.json()
+    # /a (1 item) + /b (1 item) accepted; /c triggers 1+1+1 > 2 → truncate
+    assert body.get("truncated") is True
+    assert body["authoritativeDirectories"] == ["/a", "/b"]
+    assert body["errors"] == []
+    assert len(body["items"]) == 2
+    assert {item["directory"] for item in body["items"]} == {"/a", "/b"}
+
+
+# ---------------------------------------------------------------------------
+# T5-C5: cancellation closes all in-flight responses
+# ---------------------------------------------------------------------------
+
+
+async def test_cancel_closes_inflight_responses(upstream_factory):
+    """T5-C5: on truncation/cancellation, every opened response is aclose()d
+    (no leak), including cancelled in-flight tasks."""
+    settings = _settings(
+        questions_max_response_bytes=4096,
+        questions_max_aggregate_bytes=500,
+        questions_fanout_concurrency=3,
+    )
+    dirs = [f"/d{i}" for i in range(6)]
+
+    aclose_count = 0
+
+    class _SpiedResponse(httpx.Response):
+        async def aclose(self):
+            nonlocal aclose_count
+            aclose_count += 1
+            await super().aclose()
+
+    requests_seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/experimental/session":
+            return httpx.Response(
+                200, content=_sessions_body(*dirs),
+                headers={"Content-Type": "application/json"},
+            )
+        if request.url.path == "/question":
+            requests_seen.append(request.headers.get("x-opencode-directory", "?"))
+            return _SpiedResponse(
+                200, content=_approx_250_byte_question("que"),
+                headers={"Content-Type": "application/json"},
+            )
+        return httpx.Response(404)
+
+    upstream = upstream_factory(handler)
+    app = _build_app(upstream, _settings_obj=settings)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/slimapi/questions", headers=VERSION_HEADERS)
+    assert response.status_code == 200
+    # Every opened response must be closed — success, overflow, AND cancelled.
+    # Scheduler: initial window launches d0,d1,d2; consumes d0 (launches d3),
+    # d1 (launches d4), d2 → truncate (cancels d3,d4). So 5 requests total.
+    assert aclose_count == len(requests_seen), (
+        f"aclose_count={aclose_count} != requests_seen={len(requests_seen)}"
+    )
+    body = response.json()
+    assert body.get("truncated") is True

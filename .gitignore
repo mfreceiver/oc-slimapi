@@ -12,3 +12,6 @@ __pycache__/
 
 # traffic access log runtime output (docs/manual/traffic-accounting.md; OC_SLIMAPI_ACCESS_LOG_PATH default logs/access.jsonl)
 logs/
+
+# runtime state (incarnation counter etc.); prod unit overrides via OC_SLIMAPI_STATE_DIR=%S/oc-slimapi
+state/

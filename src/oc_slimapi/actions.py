@@ -36,7 +36,7 @@ import stat
 import time
 import tomllib
 from dataclasses import dataclass, field
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Mapping
 
 from .errors import CodedHTTPException
 
@@ -74,6 +74,30 @@ _INTERPOLATION_MARKERS = ("${", "%(", "$(")
 
 _AUDIT_LOGGER = logging.getLogger("oc_slimapi.actions_audit")
 _APP_LOGGER = logging.getLogger("oc_slimapi.actions")
+
+# P2-2 (Task 11): action subprocess environment allowlist.
+# Fail-closed: only these vars are inherited by spawned action subprocesses.
+# Rationale: the sidecar's own OC_SLIMAPI_* config vars (upstream URL, paths,
+# version gate, salt, …) must NEVER leak into an action's environment — an
+# action could otherwise exfiltrate sidecar internals or be influenced by them.
+# No fuzzy "name contains secret" rule; this is a strict allowlist. Existing
+# manifest actions (e.g. /usr/bin/systemctl --user) depend on DBUS_SESSION_BUS_ADDRESS
+# and XDG_RUNTIME_DIR, both included below.
+_ACTION_ENV_ALLOWLIST = (
+    "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE",
+    "TMPDIR", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS",
+)
+
+
+def _build_action_env(source: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Build a fail-closed env dict for action subprocesses.
+
+    Only keys in :data:`_ACTION_ENV_ALLOWLIST` present in *source* (default
+    ``os.environ``) are copied. ``OC_SLIMAPI_*`` and every other sidecar-specific
+    variable is dropped because it is not in the allowlist. Returns a fresh dict.
+    """
+    env = dict(os.environ) if source is None else dict(source)
+    return {k: v for k, v in env.items() if k in _ACTION_ENV_ALLOWLIST}
 
 
 def _ms(start: float) -> int:
@@ -763,6 +787,7 @@ class ActionRegistry:
             start_new_session=True,       # own process group → killpg works
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=_build_action_env(),      # P2-2: fail-closed allowlist; drops OC_SLIMAPI_*
         )
 
     @staticmethod

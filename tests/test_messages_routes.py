@@ -233,6 +233,63 @@ async def test_messages_route_returns_503_for_single_message_when_admission_satu
         assert response.json()["code"] == "transform_busy"
 
 
+async def test_messages_route_uses_per_app_skeleton_limits(upstream_factory):
+    """T8-C6: the messages route must build SkeletonLimits from
+    ``request.app.state.config`` per-app, so two apps with different
+    ``skeleton_inline_output_max_*`` Settings project the SAME upstream payload
+    differently. A 2 KiB ``state.output`` is omitted under small caps and
+    inlined under large caps — proving the route reads per-app config (not a
+    module-level singleton)."""
+    output = "x" * (2 * 1024)  # 2 KiB — between the two caps below
+    payload = orjson.dumps([{
+        "info": {"id": "m1", "role": "assistant"},
+        "parts": [{
+            "id": "p1", "type": "tool", "messageID": "m1", "tool": "bash",
+            "state": {"status": "completed", "output": output},
+        }],
+    }])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, content=payload, headers={"Content-Type": "application/json"},
+        )
+
+    # app A: small caps -> output omitted
+    upstream_a = upstream_factory(handler)
+    app_a = _build_app(
+        _settings(
+            skeleton_inline_output_max_bytes=512,
+            skeleton_inline_output_max_message_bytes=512,
+        ),
+        upstream_a,
+    )
+    # app B: large caps -> output inlined
+    upstream_b = upstream_factory(handler)
+    app_b = _build_app(
+        _settings(
+            skeleton_inline_output_max_bytes=8192,
+            skeleton_inline_output_max_message_bytes=8192,
+        ),
+        upstream_b,
+    )
+    try:
+        transport_a = httpx.ASGITransport(app_a)
+        async with httpx.AsyncClient(transport=transport_a, base_url="http://test") as client:
+            resp_a = await client.get("/slimapi/messages/s1", headers=VERSION_HEADERS)
+        transport_b = httpx.ASGITransport(app_b)
+        async with httpx.AsyncClient(transport=transport_b, base_url="http://test") as client:
+            resp_b = await client.get("/slimapi/messages/s1", headers=VERSION_HEADERS)
+        body_a = orjson.loads(resp_a.content)[0]["parts"][0]
+        body_b = orjson.loads(resp_b.content)[0]["parts"][0]
+        # Small caps -> output omitted
+        assert "output" not in body_a["state"]
+        # Large caps -> output inlined
+        assert "output" in body_b["state"]
+    finally:
+        app_a.state.transforms.shutdown()
+        app_b.state.transforms.shutdown()
+
+
 def _msg(mid: str, updated: int | None, *, text: str = "x" * 200) -> dict:
     """Build an upstream-shape message with ``info.time.updated`` set.
 
@@ -258,11 +315,11 @@ async def test_health_stays_responsive_during_slow_transform(app_and_client, mon
     original_pack = msgs_mod._project_list_sorted_and_pack
     slow_packs_started = asyncio.Event()
 
-    def slow_pack(body, *, accept_encoding):
+    def slow_pack(body, *, accept_encoding, limits):
         # Signal that the worker has picked up the job, then park it.
         slow_packs_started.set()
         time.sleep(0.5)
-        return original_pack(body, accept_encoding=accept_encoding)
+        return original_pack(body, accept_encoding=accept_encoding, limits=limits)
 
     monkeypatch.setattr(msgs_mod, "_project_list_sorted_and_pack", slow_pack)
 

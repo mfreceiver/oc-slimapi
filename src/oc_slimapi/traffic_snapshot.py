@@ -57,13 +57,48 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Task 10 (P2-1): prune old daily snapshot files
+# ---------------------------------------------------------------------------
+
+
+def _snapshot_file_re(stem: str) -> re.Pattern:
+    return re.compile(rf"^{re.escape(stem)}-(\d{{4}}-\d{{2}}-\d{{2}})\.jsonl(\.gz)?$")
+
+
+def prune_old_snapshots(directory: Path, stem: str, retain_days: int, today: date) -> int:
+    if retain_days <= 0:
+        return 0
+    deadline = date.fromordinal(today.toordinal() - retain_days)
+    pattern = _snapshot_file_re(stem)
+    count = 0
+    for p in directory.glob(f"{stem}-*.jsonl*"):
+        m = pattern.match(p.name)
+        if not m:
+            continue
+        try:
+            file_date = date.fromisoformat(m.group(1))
+        except ValueError:
+            continue
+        if file_date < deadline:
+            try:
+                p.unlink()
+                count += 1
+            except OSError:
+                logger.warning(
+                    "traffic-snapshot prune: failed to remove %s", p, exc_info=True,
+                )
+    return count
 
 
 class TrafficSnapshotter:

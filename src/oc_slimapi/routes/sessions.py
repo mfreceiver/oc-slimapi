@@ -12,7 +12,7 @@ from ..traffic import stash_up_in
 from ..transform import TransformBusy, read_with_cap
 from ..upstream import forward_directory_headers
 from ..upstream_errors import raise_upstream_status, raise_upstream_unavailable
-from ._catalog_common import read_upstream_response
+from ._catalog_common import busy_response, read_upstream_response
 
 router = APIRouter(prefix="/slimapi", tags=["sessions"])
 
@@ -98,7 +98,7 @@ async def sessions(
             finally:
                 await response.aclose()
     except TransformBusy as exc:
-        raise CodedHTTPException(503, code="transform_busy") from exc
+        return busy_response(request.headers.get("accept-encoding"))
     # v6 §1.1: completeness signal header (200-only — 503 / 502 paths above
     # do not emit it, by design).
     complete = len(sessions) < limit

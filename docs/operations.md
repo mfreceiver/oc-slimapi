@@ -95,11 +95,14 @@ Environment=PYTHONUNBUFFERED=1
 
 # v1.0.0: access log + traffic snapshot 落 StateDirectory（systemd 自动建
 # ~/.local/state/oc-slimapi）。代码默认相对 logs/（本地开发 cwd 可写），
-# 生产由下面三行 env 覆盖到 state dir。RETAIN_DAYS=3 自动清理早于 3 天的 access log。
+# 生产由下面几行 env 覆盖到 state dir。RETAIN_DAYS=3 自动清理早于 3 天的 access log。
+# T9/P1-4: incarnation 状态文件分离到独立 %S/oc-slimapi（与 access logs 平级，
+# 不再放进 logs/ 子目录）；详见 §5.2.1。
 StateDirectory=oc-slimapi
 Environment=OC_SLIMAPI_ACCESS_LOG_DIR=%S/oc-slimapi/logs
 Environment=OC_SLIMAPI_TRAFFIC_SNAPSHOT_PATH=%S/oc-slimapi/logs/traffic-snapshot.jsonl
 Environment=OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS=3
+Environment=OC_SLIMAPI_STATE_DIR=%S/oc-slimapi
 
 StandardOutput=journal
 StandardError=journal
@@ -157,6 +160,8 @@ sudo loginctl enable-linger "$USER"
 | 关闭自启 | `systemctl --user disable oc-slimapi` |
 | 改了 unit 文件后 | `systemctl --user daemon-reload` 然后 `restart` |
 
+> **shutdown 语义**：`systemctl --user stop` / `restart` 发出 SIGTERM 后，uvicorn 给活跃连接（含 SSE 订阅者 drain）最多 5 秒宽限（`timeout_graceful_shutdown`）自然结束，再强制关闭未完成的连接。systemd 的 `TimeoutStopSec=15` 作为上限（高于 uvicorn 的 5s 窗口，覆盖默认 90s SIGKILL），避免连接残留导致长时间阻塞。若需调整，在 service unit `[Service]` 修改 `TimeoutStopSec=`（须 ≥ uvicorn 的 5s 宽限窗口）。
+
 代码升级 / 发版后部署流程（**三步缺一不可**）：
 
 ```bash
@@ -181,8 +186,8 @@ oc-slimapi 有两类日志输出，**分别处理**：
 | 类别 | 落点 | 内容 | 持久化策略 |
 |---|---|---|---|
 | **应用日志** | journald（stdout/stderr） | uvicorn access / app INFO/WARN/ERROR、startup banner | systemd journald 自动轮转 |
-| **access log**（结构化） | 落盘 JSONL | 每请求一行 `{ts,method,path,bucket,status,durationMs,bytes,requestId,client?,clientVer?,clientId?}` | **按天切分** `access-YYYY-MM-DD.jsonl`，启动压缩早于今天 → `.gz`，后台 retain |
-| **traffic snapshot**（内存账本） | 落盘 JSONL | 周期（默认 300s）cumulative 字节账本（含 SSE 真实成本） | 按天切分 `traffic-snapshot-YYYY-MM-DD.jsonl`，shutdown 写终态；不经自动压缩/prune |
+| **access log**（结构化） | 落盘 JSONL | 每请求一行 `{ts,method,path,bucket,status,durationMs,bytes,requestId,client?,clientVer?,clientId?}`（`ts` 为请求**完成时刻**的时间戳——响应已发出的时间点，非请求开始时刻；`durationMs` 才是耗时） | **按天切分** `access-YYYY-MM-DD.jsonl`，启动压缩早于今天 → `.gz`，后台 retain |
+| **traffic snapshot**（内存账本） | 落盘 JSONL | 周期（默认 300s）cumulative 字节账本（含 SSE 真实成本） | 按天切分 `traffic-snapshot-YYYY-MM-DD.jsonl`，shutdown 写终态；不经自动压缩；按 OC_SLIMAPI_TRAFFIC_SNAPSHOT_RETAIN_DAYS 自动 prune |
 
 **应用日志走 journald** 是有意的决定：一个请求的 INFO/WARN/ERROR 留在同一流里，重建时序方便。journald 提供持久化 / 按级别 / 按时间窗 / tail -f / 轮转 / grep，无需应用配置额外 handler。
 
@@ -197,6 +202,25 @@ oc-slimapi 有两类日志输出，**分别处理**：
 
 > **为何用 StateDirectory**：把 access log / snapshot 收拢到 XDG 标准的 state 目录（`~/.local/state/oc-slimapi/`），而非污染项目工作树（`<cwd>/logs/` 会落在 git-tracked 目录下）。systemd 自动创建目录并设置属主；`StateDirectory=oc-slimapi` 是 user service 的标准做法。代码默认仍为相对 `logs/`（本地开发 cwd 可写），生产由 unit env 覆盖。
 
+### 5.2.1 incarnation 状态文件（与 access logs 分离，T9/P1-4）
+
+> T9（P1-4）起，incarnation 状态文件与 access logs **分离**到独立目录。这是**运维行为变更**，不涉及 wire（未 bump `X-Slimapi-Version`，仍 2）。
+
+| 路径 | 来源 |
+|---|---|
+| **systemd 生产** | `%S/oc-slimapi/incarnation`（即 `~/.local/state/oc-slimapi/incarnation`），由 unit `Environment=OC_SLIMAPI_STATE_DIR=%S/oc-slimapi` 指定 |
+| **本地开发**（手动跑） | `<cwd>/state/incarnation`（代码默认 `state`） |
+| **旧位置（已弃用，仍可读）** | `<access_log_dir>/incarnation`（如 `%S/oc-slimapi/logs/incarnation`） |
+
+- **新路径优先**：启动时先读 `OC_SLIMAPI_STATE_DIR` 下的 `incarnation` 文件。
+- **单调迁移，不 reset**：当新路径文件**缺失或损坏**而旧 access-log 目录下的 `incarnation` 文件存在且有效时，sidecar 回退读取旧值（`legacy + 1`）并写入新路径——incarnation **不**归零、**不**回退。
+- **旧文件保留不删**：迁移是非破坏性的 copy-on-upgrade，旧位置文件**永久保留**（不自动清理、不删除）。
+- **首次升级流程**：升级到 T9+ 后首次启动，旧 access-log 目录下的 incarnation 文件被读取 → `+1` 后写入新 `OC_SLIMAPI_STATE_DIR/incarnation`；后续重启新路径即权威来源。
+- **新路径损坏**：若新路径文件可读但内容损坏（非整数 / 负数 / 空），fallback 读取旧路径；若旧路径也无效则视为 fresh start（base=0 → inc=1，仅当两个文件都缺失/损坏时才发生）。
+- **持久化失败**：写新路径失败（目录不可写 / 权限不足）→ 计算出的 inc 值在内存中继续生效（best-effort，不 crash lifespan）；重启会重新读盘可能拿到 stale 值，但 fence 的"进程内单调"保证仍成立。
+
+代码实现见 `src/oc_slimapi/turn_registry.py::IncarnationStore`（`__init__(state_dir, legacy_state_dir=None)`）与 `src/oc_slimapi/app.py` lifespan（`legacy_state_dir=access_log_dir`）。
+
 ### 5.3 access log 维护（压缩 / retain / 后台 loop）
 
 - **按天切分**：文件名 `access-YYYY-MM-DD.jsonl`（`YYYY-MM-DD` = 当天日期）。跨天自动切新文件。
@@ -205,15 +229,27 @@ oc-slimapi 有两类日志输出，**分别处理**：
 - **`access-legacy-*.jsonl.gz` 不受 retain 自动清理**：prune 的严格匹配只认 `access-YYYY-MM-DD.jsonl(.gz)`，迁移产物**永久保留**，清理由运维手动处理。
 - **后台 maintenance loop**（默认 1h 周期，`OC_SLIMAPI_ACCESS_LOG_MAINTENANCE_INTERVAL_S`）：周期执行 compress + prune，不依赖重启。
 - **prune**：`OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS`（**代码默认 `0` = 不删**；**生产 unit 配置 `3`**——见 `deploy/oc-slimapi.service` / §3.2），删除早于 N 天的 `access-YYYY-MM-DD.jsonl(.gz)`（**不含** `access-legacy-*.jsonl.gz`）。
-- **snapshot 不在此维护范围**：`traffic-snapshot-YYYY-MM-DD.jsonl` 不经 access log 的 compress/prune（后者只认 `access-` 前缀），不自动压缩、不自动清理。
+- **snapshot 不在此维护范围**：`traffic-snapshot-YYYY-MM-DD.jsonl` 不经 access log 的 compress（后者只认 `access-` 前缀，不自动压缩）。**Task 10 (P2-1) 起，snapshot 经同一维护循环的 `extra_prune` 钩子按天清理**（`OC_SLIMAPI_TRAFFIC_SNAPSHOT_RETAIN_DAYS`，**代码默认 `0` = 不删**；**生产 unit 配置 `30`**——见 `deploy/oc-slimapi.service` / §3.2）：每个 tick 与 access-log prune 共享同一 `today`，删除早于 N 天的 `traffic-snapshot-YYYY-MM-DD.jsonl(.gz)`（边界 `today - retain_days` 保留；删 `.jsonl` 与 `.jsonl.gz`）。不另起后台 task、不压缩。
 
 ### 5.4 磁盘增长估算
 
 - **access log**：单日 raw 视请求量约 **50–100 MB**（每行 ~200–400 B × 请求数）；压缩后约 **1/8**（~6–12 MB/天）。
-- **traffic snapshot**：极小（每帧 ~1–2 KB × 每 300s = ~300 KB/天）；**不经自动压缩/prune**，长期累积需手动清理。
-- **建议**：生产 unit 已配 `OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS=3`（保留 3 天 access log，约 3×6–12 MB ≈ 20–36 MB 压缩后）；如需更久的历史可调大此值。snapshot 与 `access-legacy-*.jsonl.gz` **不受 retain**（永久保留），需定期手动清理。journald 自身由 systemd 按 `/etc/systemd/journald.conf` 轮转，不在此列。
+- **traffic snapshot**：极小（每帧 ~1–2 KB × 每 300s = ~300 KB/天）；**不经自动压缩**，**Task 10 (P2-1) 起按 `OC_SLIMAPI_TRAFFIC_SNAPSHOT_RETAIN_DAYS` 自动 prune**（代码默认 `0`=不删；生产 unit `30`）。30 天保留上限约 30 × 300 KB ≈ 9 MB。
+- **建议**：生产 unit 已配 `OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS=3`（保留 3 天 access log，约 3×6–12 MB ≈ 20–36 MB 压缩后）+ `OC_SLIMAPI_TRAFFIC_SNAPSHOT_RETAIN_DAYS=30`（保留 30 天 snapshot，约 9 MB）；如需更久的历史可调大此两值。`access-legacy-*.jsonl.gz` **不受 retain**（永久保留），需定期手动清理。journald 自身由 systemd 按 `/etc/systemd/journald.conf` 轮转，不在此列。
 
-### 5.5 journald 查询手册（应用日志）
+### 5.5 Questions 内存预算（内部 knob，非 wire）
+
+> 以下三个环境变量控制 `/slimapi/questions` 的资源预算。它们是**内部 ops knob**（不改变 wire 契约），仅影响 sidecar 的内存/并发行为。
+
+| 变量 | 默认值 | 范围 | 说明 |
+|---|---|---|---|
+| `OC_SLIMAPI_QUESTIONS_MAX_RESPONSE_BYTES` | 2 MiB | > 0 | 单个 `/question` 上游响应的读取上限（per-dir cap）。超过该上限时该目录进 `errors[]`（`upstream_unavailable`），不占用 aggregate 预算。 |
+| `OC_SLIMAPI_QUESTIONS_MAX_AGGREGATE_BYTES` | 16 MiB | >= per_dir, <= 128 MiB | 跨目录聚合的累积字节预算。超过时 envelope 标记 `truncated: true`，取消后续未消费的目录。 |
+| `OC_SLIMAPI_QUESTIONS_FANOUT_CONCURRENCY` | 8 | 1–16 | 跨请求全局 `/question` 并发上限。单次 `/slimapi/questions` 请求的 fan-out 不超过此值。 |
+
+触发任一预算上限时，envelope 复用既有的加性字段 `truncated`（`true`）和 `authoritativeDirectories`（降级为已成功目录列表，非 null），**不 bump** `X-Slimapi-Version`。详见 [`../CHANGELOG.md`](../CHANGELOG.md) Unreleased 与 [`docs/specs/INTERFACE_MAP.md`](specs/INTERFACE_MAP.md) questions 行。
+
+### 5.6 journald 查询手册（应用日志）
 
 ```bash
 # 实时跟踪（最常用）
@@ -282,7 +318,7 @@ curl -s -H 'X-Slimapi-Version: 2' http://127.0.0.1:4097/slimapi/health | jq .
 }
 ```
 
-- `slimapi_contract` = 当前 wire 契约版本（v2）。
+- `slimapi_contract` = 当前 wire 契约版本（v2）。该值是 `src/oc_slimapi/routes/health.py` 内的**静态常量 2**（硬编码字面量，不从 `SERVER_API_VERSION` 派生）——wire 契约破坏性 bump 时须同时改代码该常量 + 更新 `docs/specs/v2-contract.md` + bump `X-Slimapi-Version`，加性变更不触碰。
 - `sidecar.version` = `pyproject.toml` 的版本。
 - `server.api_version` = 2；`accepted_client_versions` = `[2, 2]`（门闩 (2,2)，发 v1 会被 `400 version_incompatible` 拒绝）。
 - `schema.degraded=true` → 启动 smoke 探针发现 opencode 响应字段漂移，需查上游是否升级/改了 schema。
@@ -488,6 +524,6 @@ require_confirm = true
 - **action 脚本勿 daemonize**：脚本若 fork 子进程后父进程退出，sidecar 的 `killpg` 无法收回孤儿进程（进程组 ID 会变）。action 脚本应同步执行，不要后台化/daemonize。
 - **exec 200 ok:true ≠ opencode ready**：exec 动作返回 `ok:true` 仅表示子进程 exit 0。如果动作涉及重启 opencode（如 `restart_opencode`），客户端须轮询 `/slimapi/ready` 确认 opencode 重新就绪。
 - **query stdout 可能含任意内容**：`markdown` 字段是脚本 stdout 投影。运维定义 action 时应注意脚本输出内容；客户端渲染应使用 sandboxed markdown renderer。
-- **子进程环境**：子进程继承 sidecar 环境变量（含 `DBUS_SESSION_BUS_ADDRESS`、`HOME`、`PATH` 等），以 sidecar 运行用户（`mar`）身份执行，可读 `~/.config/opencode/` 凭证。这是有意设计（systemctl/plan_limit 需此环境）。
+- **子进程环境（P2-2 fail-closed allowlist）**：action 子进程**不**继承 sidecar 全量环境，而是只继承固定 allowlist：`PATH`/`HOME`/`LANG`/`LC_ALL`/`LC_CTYPE`/`TMPDIR`/`XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS`，以 sidecar 运行用户（`mar`）身份执行，可读 `~/.config/opencode/` 凭证。这是有意设计（systemctl/plan_limit 需 `DBUS_SESSION_BUS_ADDRESS`/`XDG_RUNTIME_DIR`）。sidecar 自身的 `OC_SLIMAPI_*` 等配置变量（upstream URL、路径、版本门禁、salt……）被 **fail-closed 剔除**，绝不泄漏进 action 环境——无模糊的「name contains secret」规则，纯 allowlist 白名单。
 - **审计**：所有 action 调用（含 timeout/spawn-fail/disconnect/throttle）以 WARNING 级别写入 journald，不受 `OC_SLIMAPI_LOG_LEVEL` 影响。查询审计：`journalctl --user -u oc-slimapi -p warning | rg action`。
 - **进程重启 = 限频归零**：min_interval 限频是内存态（`time.monotonic()`），sidecar 进程重启后清零。这是有意设计（启动后各 action 均可立即调用一次）。

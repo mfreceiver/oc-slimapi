@@ -36,6 +36,7 @@ import threading
 import uuid
 from datetime import date, datetime
 from pathlib import Path
+from typing import Callable
 
 from .logging_config import get_logger
 
@@ -191,8 +192,7 @@ class DailyAccessHandler(logging.Handler):
             msg = self.format(record)
             if self._current_fh is None:
                 return  # defensive — should not happen after _open_file above
-            self._current_fh.write(msg)
-            self._current_fh.write("\n")
+            self._current_fh.write(msg + "\n")   # P1-2: 单调用行写入，缩小两次调用间的半行窗口（best-effort，非 fsync/事务）
             self._current_fh.flush()
         except Exception:
             self.handleError(record)
@@ -578,6 +578,7 @@ async def run_access_log_maintenance_loop(
     retain_days: int,
     interval_s: int,
     stop_event: asyncio.Event,
+    extra_prune: Callable[[date], int] | None = None,
 ) -> None:
     """Periodically compress + prune old access log files.
 
@@ -587,6 +588,12 @@ async def run_access_log_maintenance_loop(
 
     Does **not** call :func:`migrate_legacy_access_log` (migration is done once
     at startup by the caller).
+
+    Task 10 (P2-1): the optional ``extra_prune`` callable is invoked once per
+    tick with the same ``today`` used for the access-log prune. It lets the
+    traffic-snapshot prune piggyback on this loop without spawning a separate
+    background task. The callable returns an ``int`` (count, ignored) and runs
+    via :func:`asyncio.to_thread` like the access-log compress/prune.
 
     **Shutdown / cancellation contract (caller responsibility)**: each tick
     dispatches ``compress`` / ``prune`` via :func:`asyncio.to_thread`, which
@@ -607,8 +614,8 @@ async def run_access_log_maintenance_loop(
             pass  # Expected — timeout expired, run maintenance.
         if stop_event.is_set():
             break
+        today = date.today()
         try:
-            today = date.today()
             # Run compress/prune via to_thread to avoid blocking the event
             # loop with synchronous gzip I/O (a single worker process must
             # not freeze request/SSE handling during maintenance).
@@ -619,3 +626,8 @@ async def run_access_log_maintenance_loop(
             await asyncio.to_thread(prune_old_access_logs, dir, retain_days, today)
         except Exception:
             log.warning("Access log maintenance prune failed", exc_info=True)
+        if extra_prune is not None:
+            try:
+                await asyncio.to_thread(extra_prune, today)
+            except Exception:
+                log.warning("Access log maintenance extra_prune failed", exc_info=True)

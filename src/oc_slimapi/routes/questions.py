@@ -19,21 +19,12 @@ from ..upstream_errors import (
 
 router = APIRouter(prefix="/slimapi", tags=["questions"])
 
-# Bounds concurrent per-dir /question fan-out within a single
-# /slimapi/questions request so a burst of many session-dirs cannot queue an
-# unbounded number of in-flight requests against the shared upstream client
-# (httpx max_connections=32). Acquired inside _fetch_questions_for_dir around
-# the upstream GET. Module-level (single uvicorn worker / single event loop in
-# production; modern asyncio.Semaphore does not bind a loop at construction).
-_FANOUT_CONCURRENCY = 16
-_fanout_sem = asyncio.Semaphore(_FANOUT_CONCURRENCY)
-
-# P1-28: aggregate item budget. Each per-dir /question response is capped by
-# max_response_bytes, but items.extend() across all dirs can accumulate far
-# beyond a single dir's cap (10k dirs × cap). Once the merged item count
-# exceeds this safety limit, further dirs are skipped and the envelope is
-# marked ``truncated: true`` (additive diagnostic — client degrades to
-# partial-replace, same as discovery truncation).
+# P1-28: aggregate item budget (second-layer cap, T5-C10). Each per-dir
+# /question response is capped by per_dir_cap, but items.extend() across all
+# dirs can accumulate far beyond a single dir's cap. Once the merged item
+# count exceeds this safety limit (or the byte budget), the envelope is marked
+# ``truncated: true`` and remaining dirs are cancelled. The sliding window
+# scheduler passes this as ``item_cap``.
 _MAX_AGGREGATE_ITEMS = 10_000
 
 # Discovery page size for GET /experimental/session?roots=true — imported
@@ -149,45 +140,19 @@ async def questions(request: Request):
     ))
 
     # ------------------------------------------------------------------
-    # Step 3: fan out concurrently over each directory (bounded by
-    # _fanout_sem). Per-dir errors are isolated into errors[] (one bad dir
-    # never aborts the request). gather([]) == [] handles the zero-directory
-    # case naturally.
+    # Step 3: sliding-window fan-out with per-dir byte cap, aggregate byte
+    # budget, and aggregate item cap. Replaces the former asyncio.gather
+    # approach. The semaphore (app.state.questions_semaphore) limits cross-
+    # request /question concurrency globally.
     # ------------------------------------------------------------------
-    results = await asyncio.gather(
-        *(
-            _fetch_questions_for_dir(upstream_client, request, d)
-            for d in directories
-        ),
-        return_exceptions=True,
+    config = request.app.state.config
+    items, errors, succeeded, truncated = await _collect_with_byte_budget(
+        upstream_client, request, directories,
+        concurrency=config.questions_fanout_concurrency,
+        per_dir_cap=config.questions_max_response_bytes,
+        aggregate_cap=config.questions_max_aggregate_bytes,
+        item_cap=_MAX_AGGREGATE_ITEMS,
     )
-
-    items: list[dict] = []
-    errors: list[dict] = []
-    succeeded: list[str] = []
-    truncated = False
-    for directory, result in zip(directories, results):
-        # _fetch_questions_for_dir catches httpx.RequestError internally, but
-        # guard against any unexpected exception so one bad dir cannot abort
-        # the whole response. CancelledError is re-raised (cancellation must
-        # propagate, not be swallowed as a partial failure).
-        if isinstance(result, asyncio.CancelledError):
-            raise result
-        if isinstance(result, Exception):
-            errors.append({"directory": directory, "code": UPSTREAM_UNAVAILABLE})
-            continue
-        dir_items, error_code = result
-        if error_code is not None:
-            errors.append({"directory": directory, "code": error_code})
-            continue
-        # P1-28: aggregate item budget — stop extending once the merged list
-        # exceeds the safety cap. Remaining dirs are not collected into
-        # succeeded[] so authoritativeDirectories degrades to partial-replace.
-        if len(items) + len(dir_items) > _MAX_AGGREGATE_ITEMS:
-            truncated = True
-            break
-        items.extend(dir_items)
-        succeeded.append(directory)
 
     # ------------------------------------------------------------------
     # Step 4: authoritativeDirectories — null ONLY on full success AND
@@ -242,28 +207,28 @@ async def _fetch_questions_for_dir(
     upstream_client: httpx.AsyncClient,
     request: Request,
     directory: str,
-) -> tuple[list[dict], str | None]:
+    *,
+    cap: int,
+) -> tuple[list[dict], str | None, int]:
     """Fetch pending questions for a single directory.
 
-    Returns ``(items, error_code)``. On success ``error_code`` is ``None`` and
-    ``items`` is a list of upstream question entries each stamped with the
-    ``directory`` they came from (only dict entries are stamped; non-dict
-    entries are skipped defensively — lenient, do not over-engineer). On
-    failure ``items`` is empty and ``error_code`` is the contract §7 code
-    string (``upstream_unavailable`` for network/5xx/non-list,
-    ``upstream_http_<N>`` for 4xx).
+    Returns ``(items, error_code, body_bytes)``. On success ``error_code`` is
+    ``None``, ``items`` is a list of upstream question entries each stamped
+    with the ``directory`` they came from, and ``body_bytes`` is the raw body
+    byte count (from ``read_with_cap`` — used for aggregate budget accounting).
+    On failure ``items`` is empty, ``error_code`` is the contract §7 code
+    string, and ``body_bytes`` is 0 (does not occupy the accepted aggregate).
 
-    The upstream GET is bounded by the module-level ``_fanout_sem`` so a
-    single /slimapi/questions request cannot queue an unbounded number of
-    in-flight calls against the shared upstream client.
+    The upstream GET is bounded by ``request.app.state.questions_semaphore``
+    (cross-request global /question concurrency cap) and by ``cap`` (per-dir
+    byte ceiling via ``read_with_cap``).
 
     Never raises for upstream/network failures — the caller isolates per-dir
     errors into the envelope's ``errors[]``. ``asyncio.CancelledError``
     propagates (it is a ``BaseException`` subclass, so the ``except`` clauses
     below never swallow it).
     """
-    async with _fanout_sem:
-        config = request.app.state.config
+    async with request.app.state.questions_semaphore:
         try:
             response = await upstream_client.send(
                 upstream_client.build_request(
@@ -273,39 +238,137 @@ async def _fetch_questions_for_dir(
                 stream=True,
             )
         except httpx.RequestError:
-            return [], UPSTREAM_UNAVAILABLE
+            return [], UPSTREAM_UNAVAILABLE, 0
         try:
-            try:
-                status = response.status_code
-                if status >= 400:
-                    # 4xx (incl. unlikely 404) → upstream_http_N; 5xx →
-                    # upstream_unavailable (per-dir, do NOT raise — isolated
-                    # into the envelope errors[]). Drain the body for reuse.
-                    err_body = await response.aread()
-                    stash_up_in(request, len(err_body))
-                    return [], upstream_error_code_for_status(status)
-                body, _ = await read_with_cap(
-                    response, config.max_response_bytes,
-                    on_read=lambda n: stash_up_in(request, n),
+            status = response.status_code
+            if status >= 400:
+                # 4xx (incl. unlikely 404) → upstream_http_N; 5xx →
+                # upstream_unavailable (per-dir, do NOT raise — isolated
+                # into the envelope errors[]). Bounded drain via read_with_cap
+                # (NOT unbounded aread).
+                await read_with_cap(
+                    response, cap, on_read=lambda n: stash_up_in(request, n),
                 )
-                if body is None:
-                    return [], UPSTREAM_UNAVAILABLE
-                try:
-                    payload = orjson.loads(body)
-                except (orjson.JSONDecodeError, ValueError):
-                    return [], UPSTREAM_UNAVAILABLE
-                if not isinstance(payload, list):
-                    # Non-list body for this single dir → treat the dir as failed.
-                    return [], UPSTREAM_UNAVAILABLE
-                items: list[dict] = []
-                for entry in payload:
-                    if isinstance(entry, dict):
-                        # Stamp directory last (after id, sessionID, questions, tool)
-                        # so the upstream field order is preserved verbatim.
-                        entry["directory"] = directory
-                        items.append(entry)
-                return items, None
-            except httpx.RequestError:
-                return [], UPSTREAM_UNAVAILABLE
+                return [], upstream_error_code_for_status(status), 0
+            body, total = await read_with_cap(
+                response, cap, on_read=lambda n: stash_up_in(request, n),
+            )
+            # per-dir cap exceeded / read failure → error + body_bytes=0.
+            # Read bytes are still counted via stash_up_in (traffic), but
+            # do NOT occupy the accepted aggregate budget.
+            if body is None:
+                return [], UPSTREAM_UNAVAILABLE, 0
+            try:
+                payload = orjson.loads(body)
+            except (orjson.JSONDecodeError, ValueError):
+                return [], UPSTREAM_UNAVAILABLE, 0
+            if not isinstance(payload, list):
+                return [], UPSTREAM_UNAVAILABLE, 0
+            items = [
+                {**entry, "directory": directory}
+                for entry in payload if isinstance(entry, dict)
+            ]
+            return items, None, total
+        except httpx.RequestError:
+            return [], UPSTREAM_UNAVAILABLE, 0
         finally:
             await response.aclose()
+
+
+async def _collect_with_byte_budget(
+    upstream_client, request, directories, *,
+    concurrency: int, per_dir_cap: int, aggregate_cap: int, item_cap: int,
+) -> tuple[list[dict], list[dict], list[str], bool]:
+    """Sliding-window fan-out scheduler for cross-directory question aggregation.
+
+    Replaces the former ``asyncio.gather`` approach with a sliding-window that:
+    * Launches at most ``concurrency`` tasks at any time.
+    * Consumes results in **strict index order** (original directory order).
+    * Tracks aggregate **raw body bytes** (``body_bytes`` from the worker) and
+      **item count** (``_MAX_AGGREGATE_ITEMS``).
+    * On either cap being exceeded: marks ``truncated=True``, cancels all
+      unconsumed tasks (index > current), awaits their cancellation (so the
+      worker's ``finally: response.aclose()`` runs), and breaks.
+    * Errors (per-dir failure / cap overflow) record only consumed-and-failed
+      directories in ``errors[]``. Cancelled / un-started dirs are NOT in
+      ``errors[]`` — the presence of ``truncated=True`` + partial
+      ``authoritativeDirectories`` communicates the gap.
+
+    Returns ``(items, errors, succeeded, truncated)``.
+    """
+    tasks: dict[int, asyncio.Task] = {}
+    next_to_launch = 0             # next directory index to launch
+    consume_index = 0              # next index to consume (strict order)
+    used_bytes = 0
+    used_items = 0
+    truncated = False
+    items: list[dict] = []
+    errors: list[dict] = []
+    succeeded: list[str] = []
+
+    def launch(index: int) -> None:
+        tasks[index] = asyncio.create_task(
+            _fetch_questions_for_dir(
+                upstream_client, request, directories[index], cap=per_dir_cap,
+            )
+        )
+
+    # Initial window: at most concurrency tasks
+    while next_to_launch < len(directories) and next_to_launch < concurrency:
+        launch(next_to_launch)
+        next_to_launch += 1
+
+    try:
+        while consume_index < len(directories):
+            task = tasks.get(consume_index)
+            if task is None:        # not launched (should not happen after truncation)
+                break
+            try:
+                outcome = await task   # each index consumed/charged exactly once
+            except asyncio.CancelledError:
+                raise                 # self-cancelled → finally handles cleanup
+            except Exception as exc:
+                outcome = exc         # regular exceptions → treat as dir failure
+
+            if isinstance(outcome, Exception):
+                errors.append({
+                    "directory": directories[consume_index],
+                    "code": UPSTREAM_UNAVAILABLE,
+                })
+            else:
+                dir_items, error_code, body_bytes = outcome
+                if error_code is not None:
+                    # per-dir cap exceeded / upstream error: body_bytes=0
+                    errors.append({
+                        "directory": directories[consume_index],
+                        "code": error_code,
+                    })
+                elif (used_bytes + body_bytes > aggregate_cap
+                      or used_items + len(dir_items) > item_cap):
+                    # Budget triggered: current dir NOT added to items/succeeded
+                    truncated = True
+                    for idx, t in tasks.items():
+                        if idx > consume_index:
+                            t.cancel()
+                    await asyncio.gather(*tasks.values(), return_exceptions=True)
+                    break
+                else:
+                    items.extend(dir_items)
+                    succeeded.append(directories[consume_index])
+                    used_bytes += body_bytes
+                    used_items += len(dir_items)
+
+            # After consuming index i, launch next (window ≤ concurrency)
+            if next_to_launch < len(directories):
+                launch(next_to_launch)
+                next_to_launch += 1
+            consume_index += 1
+    finally:
+        # Cleanup: cancel + await any unconsumed tasks (ensures aclose runs)
+        pending = [t for idx, t in tasks.items() if idx > consume_index]
+        for t in pending:
+            t.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    return items, errors, succeeded, truncated

@@ -688,3 +688,87 @@ async def test_v10_busy_flush_carries_frozen_stamp():
         assert digests[0]["lastError"] is None
     finally:
         await _close_hub(hub)
+
+
+# ── 7. T9 (P1-4): incarnation state dir split + legacy migration ────────────────
+#
+# IncarnationStore now takes (state_dir, legacy_state_dir=None). The new
+# state_dir wins; the legacy (old access_log dir) is consulted only when
+# the new path is missing/corrupt — monotonic migration without reset,
+# without deleting the legacy file.
+
+
+def test_legacy_migration_preserves_monotonicity(tmp_path):
+    """Only legacy file present (value=5) → load_or_bump returns 6; the new
+    path file is written with 6; the legacy file is left at 5."""
+    new_dir = tmp_path / "state"
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    (legacy_dir / "incarnation").write_text("5\n", encoding="utf-8")
+
+    store = IncarnationStore(state_dir=str(new_dir), legacy_state_dir=str(legacy_dir))
+    inc = store.load_or_bump()
+    assert inc == 6
+    # New path now carries the migrated value.
+    assert (new_dir / "incarnation").read_text(encoding="utf-8").strip() == "6"
+    # Legacy file untouched.
+    assert (legacy_dir / "incarnation").read_text(encoding="utf-8").strip() == "5"
+
+
+def test_new_path_preferred_over_legacy(tmp_path):
+    """Both new (10) and legacy (5) present → new wins → load_or_bump returns 11."""
+    new_dir = tmp_path / "state"
+    legacy_dir = tmp_path / "legacy"
+    new_dir.mkdir()
+    legacy_dir.mkdir()
+    (new_dir / "incarnation").write_text("10\n", encoding="utf-8")
+    (legacy_dir / "incarnation").write_text("5\n", encoding="utf-8")
+
+    store = IncarnationStore(state_dir=str(new_dir), legacy_state_dir=str(legacy_dir))
+    assert store.load_or_bump() == 11
+
+
+def test_corrupt_new_path_falls_back_to_legacy(tmp_path):
+    """New path corrupt ("abc"), legacy=5 → fallback to legacy → returns 6
+    (no reset to 1)."""
+    new_dir = tmp_path / "state"
+    legacy_dir = tmp_path / "legacy"
+    new_dir.mkdir()
+    legacy_dir.mkdir()
+    (new_dir / "incarnation").write_text("abc\n", encoding="utf-8")
+    (legacy_dir / "incarnation").write_text("5\n", encoding="utf-8")
+
+    store = IncarnationStore(state_dir=str(new_dir), legacy_state_dir=str(legacy_dir))
+    # Returns legacy+1=6 (NOT 1 — corrupt new path must not reset incarnation).
+    assert store.load_or_bump() == 6
+
+
+def test_legacy_file_remains_after_migration(tmp_path):
+    """After migration the legacy file is preserved (never deleted)."""
+    new_dir = tmp_path / "state"
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    (legacy_dir / "incarnation").write_text("5\n", encoding="utf-8")
+
+    store = IncarnationStore(state_dir=str(new_dir), legacy_state_dir=str(legacy_dir))
+    store.load_or_bump()
+    # The legacy file must still exist on disk after migration.
+    assert (legacy_dir / "incarnation").exists()
+    # And its content is unchanged (monotonic migration, not destructive move).
+    assert (legacy_dir / "incarnation").read_text(encoding="utf-8").strip() == "5"
+
+
+def test_unwritable_new_path_returns_computed_inc(tmp_path, monkeypatch):
+    """New path unwritable (write fails) → still returns the computed inc
+    (base+1), does not crash, does not return a fixed fallback."""
+    new_dir = tmp_path / "state"
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    (legacy_dir / "incarnation").write_text("5\n", encoding="utf-8")
+
+    store = IncarnationStore(state_dir=str(new_dir), legacy_state_dir=str(legacy_dir))
+    # Force the write to fail — simulates a read-only / unavailable state dir.
+    monkeypatch.setattr(store, "_write_persisted", lambda inc: False)
+    # Legacy base = 5 → inc = 6 (computed in-memory even though persist failed).
+    inc = store.load_or_bump()
+    assert inc == 6  # NOT a fixed fallback like 1
