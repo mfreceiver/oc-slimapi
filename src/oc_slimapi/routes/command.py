@@ -39,6 +39,7 @@ async def command(request: Request, directory: str | None = None):
             read_with_cap=read_with_cap,
             err_label="command",
             read_timeout=300.0,
+            cache=getattr(request.app.state, "catalog_cache", None),
         )
     except TransformBusy:
         return busy_response(request.headers.get("accept-encoding"))

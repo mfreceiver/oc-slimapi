@@ -3,10 +3,12 @@ from __future__ import annotations
 import httpx
 import orjson
 from fastapi import APIRouter, Query, Request
+from starlette.responses import Response
 
 from ..directory import validate_directory
 from ..errors import CodedHTTPException
-from ..gzip_util import json_response
+from .. import etag as etag_mod
+from ..gzip_util import accepts_gzip, json_response
 from ..skeleton import skeleton_session
 from ..traffic import stash_up_in
 from ..transform import TransformBusy, read_with_cap
@@ -15,6 +17,221 @@ from ..upstream_errors import raise_upstream_status, raise_upstream_unavailable
 from ._catalog_common import busy_response, read_upstream_response
 
 router = APIRouter(prefix="/slimapi", tags=["sessions"])
+
+
+# ---------------------------------------------------------------------------
+# Upstream-fetch coalescing (traffic plan Batch 1 / A3, §3.x join-first).
+#
+# Both endpoints share ONLY the upstream GET (+ cap-read / status mapping):
+# the skeleton projection, ``X-Complete`` computation and the TurnRegistry
+# merge stay per-caller. A full registry budget (``fetch_or_bypass`` →
+# ``None``) falls back to the unchanged admission-first direct path.
+# ---------------------------------------------------------------------------
+
+def _canonical_sessions_query(
+    limit: int, roots: bool, start: int | None, search: str | None,
+) -> str:
+    """Deterministic sorted query for the list key (directory is a separate
+    key component — it is both a query param and a routing header)."""
+    parts: dict[str, str] = {"limit": str(limit), "roots": str(roots).lower()}
+    if start is not None:
+        parts["start"] = str(start)
+    if search is not None:
+        parts["search"] = search
+    return "&".join(f"{name}={parts[name]}" for name in sorted(parts))
+
+
+async def _fetch_sessions_raw(
+    request: Request, params: dict, directory: str | None, *, cap: int,
+) -> bytes | None:
+    """Shared factory body: ONE upstream ``GET /session`` + cap-read."""
+    try:
+        response = await request.app.state.upstream.send(
+            request.app.state.upstream.build_request(
+                "GET", "/session",
+                params=params, headers=forward_directory_headers(directory),
+            ),
+            stream=True,
+        )
+    except httpx.RequestError as exc:
+        raise_upstream_unavailable(exc)
+    try:
+        return await read_upstream_response(
+            request, response,
+            cap=cap,
+            read_with_cap=read_with_cap,
+        )
+    finally:
+        await response.aclose()
+
+
+def _finalize_sessions_response(
+    request: Request, sessions: list[dict], limit: int,
+    accept_encoding: str | None,
+) -> Response:
+    """Shared response tail for BOTH sessions-list paths.
+
+    Batch 2 / B1: per-caller conditional-request evaluation AFTER the
+    pipeline (shared or direct GET + projection) has fully run. The
+    canonical ETag input is the identity serialization of the projected
+    list — note this ``orjson.dumps`` runs on the event loop, but so does
+    the one inside ``json_response`` (pre-existing shape); the duplicated
+    pass is the cost of keeping ``json_response`` untouched.
+
+    ``etag_enabled=false`` (rep ``None``) → the exact pre-ETag response,
+    byte-identical.
+    """
+    complete = len(sessions) < limit
+    rep = etag_mod.response_rep_version(request.app.state.config)
+    if rep is None:
+        return json_response(
+            sessions,
+            headers={"X-Complete": "true" if complete else "false"},
+            accept_encoding=accept_encoding,
+        )
+    identity = orjson.dumps(sessions)
+    coding = "gzip" if accepts_gzip(accept_encoding) else "identity"
+    etag_value = etag_mod.compute_etag(identity, coding, rep)
+    vary = etag_mod.merged_vary("Accept-Encoding")
+    not_modified = etag_mod.conditional_304(
+        {"ETag": etag_value, "Vary": vary},
+        request.headers.get("if-none-match"),
+        aux={"X-Complete": "true" if complete else "false"},
+    )
+    if not_modified is not None:
+        return not_modified
+    response = json_response(
+        sessions,
+        headers={"X-Complete": "true" if complete else "false"},
+        accept_encoding=accept_encoding,
+    )
+    # json_response owns Vary (unconditionally sets Accept-Encoding);
+    # decorate post-hoc so the merged directory dimension survives.
+    response.headers["ETag"] = etag_value
+    response.headers["Vary"] = vary
+    return response
+
+
+async def _sessions_via_lease(
+    request: Request, registry, pool, config, params: dict,
+    directory: str | None, limit: int,
+    *, roots: bool, start: int | None, search: str | None,
+):
+    """Join-first lease path for the sessions list. Returns ``None`` when
+    the registry budget is full (caller takes the direct path)."""
+    accept_encoding = request.headers.get("accept-encoding")
+
+    async def _factory() -> bytes | None:
+        return await _fetch_sessions_raw(
+            request, params, directory, cap=config.max_response_bytes,
+        )
+
+    lease = await registry.fetch_or_bypass(
+        (
+            "sessions-list", id(request.app.state.upstream), directory,
+            _canonical_sessions_query(limit, roots, start, search),
+        ),
+        _factory,
+        reserve_bytes=config.max_response_bytes,
+    )
+    if lease is None:
+        return None
+    async with lease:
+        body = lease.body
+        if body is None:
+            raise CodedHTTPException(
+                413, code="response_too_large",
+                limit=config.max_response_bytes,
+            )
+        try:
+            # rev-gpt B1: the caller's OWN admission + offload — identical
+            # admission-before-projection discipline (and byte-identical
+            # ``transform_busy`` 503 shape) as the direct path below; only
+            # the raw GET moved out (join-first). The lease context still
+            # releases the caller ref on the busy exit (no budget leak).
+            # rev-gpt B1-residual: the JSON parse + payload guards live
+            # INSIDE the admission section (mirroring the direct path's
+            # fetch→parse→project-under-admission and messages.py:710-723),
+            # so joiners queued on the transform slot hold only the shared
+            # raw body — never a per-caller expanded object graph
+            # (plan :110,179 per-caller memory bound).
+            async with pool:
+                try:
+                    payload = orjson.loads(body)
+                except (orjson.JSONDecodeError, ValueError) as exc:
+                    raise_upstream_unavailable(exc)
+                if not isinstance(payload, list):
+                    raise_upstream_unavailable()
+                if payload and not all(isinstance(s, dict) for s in payload):
+                    raise_upstream_unavailable()
+                sessions = await pool.offload(_project_sessions, payload)
+        except TransformBusy:
+            return busy_response(accept_encoding)
+    # X-Complete is computed per-caller from the caller's own limit; the
+    # ETag/304 evaluation is per-caller too (Batch 2 / B1).
+    return _finalize_sessions_response(request, sessions, limit, accept_encoding)
+
+
+async def _fetch_status_raw(
+    request: Request, params: dict, directory: str | None,
+) -> bytes:
+    """Shared factory body: ONE upstream ``GET /session/status`` (including
+    the status mapping — a 5xx fails the flight for every joiner)."""
+    try:
+        response = await request.app.state.upstream.get(
+            "/session/status",
+            params=params,
+            headers=forward_directory_headers(directory),
+        )
+    except httpx.RequestError as exc:
+        raise_upstream_unavailable(exc)
+    stash_up_in(request, len(response.content))
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise_upstream_status(exc)
+    return response.content
+
+
+async def _status_via_lease(
+    request: Request, registry, directory: str | None,
+):
+    """Join-first lease path for sessions/status. The TurnRegistry merge is
+    deliberately OUTSIDE the factory (plan A3): turn state changes with
+    time, so every caller merges the CURRENT registry state into the shared
+    body — never frozen at factory time."""
+    async def _factory() -> bytes:
+        return await _fetch_status_raw(request, {"directory": directory}
+                                       if directory is not None else {},
+                                       directory)
+
+    lease = await registry.fetch_or_bypass(
+        ("sessions-status", id(request.app.state.upstream), directory),
+        _factory,
+        reserve_bytes=request.app.state.config.max_response_bytes,
+    )
+    if lease is None:
+        return None
+    async with lease:
+        body = lease.body  # bytes are immutable — safe to parse post-release
+    try:
+        payload = orjson.loads(body)
+    except (orjson.JSONDecodeError, ValueError) as exc:
+        raise_upstream_unavailable(exc)
+    if not isinstance(payload, dict):
+        raise_upstream_unavailable()
+    # Per-caller turn merge — identical to the direct path (contract §3.y.1).
+    turn_registry = getattr(request.app.state, "turn_registry", None)
+    if turn_registry is not None:
+        for sid, info in payload.items():
+            if isinstance(info, dict):
+                inc, turn = turn_registry.snapshot(sid)
+                info["turnIncarnation"] = inc
+                info["turn"] = turn
+    return json_response(
+        payload,
+        accept_encoding=request.headers.get("accept-encoding"),
+    )
 
 
 @router.get("/sessions")
@@ -42,6 +259,16 @@ async def sessions(
     # projection) by max_transforms so a burst cannot monopolise memory /
     # event-loop CPU. The slot is held across fetch→parse→project.
     config = request.app.state.config
+    registry = getattr(request.app.state, "raw_fetch_registry", None)
+    if registry is not None and config.coalesce_enabled:
+        leased = await _sessions_via_lease(
+            request, registry, request.app.state.transforms, config,
+            params, directory, limit,
+            roots=roots, start=start, search=search,
+        )
+        if leased is not None:
+            return leased
+        # budget full → unchanged admission-first direct path below
     try:
         async with request.app.state.transforms as pool:
             # Stream + cap-read so an oversized upstream /session body cannot
@@ -100,14 +327,9 @@ async def sessions(
     except TransformBusy as exc:
         return busy_response(request.headers.get("accept-encoding"))
     # v6 §1.1: completeness signal header (200-only — 503 / 502 paths above
-    # do not emit it, by design).
-    complete = len(sessions) < limit
-    return json_response(
-        sessions,
-        headers={
-            "X-Complete": "true" if complete else "false",
-        },
-        accept_encoding=request.headers.get("accept-encoding"),
+    # do not emit it, by design). ETag/304 per-caller (Batch 2 / B1).
+    return _finalize_sessions_response(
+        request, sessions, limit, request.headers.get("accept-encoding"),
     )
 
 
@@ -145,6 +367,12 @@ async def sessions_status(request: Request, directory: str | None = None):
     params: dict[str, str] = {}
     if directory is not None:
         params["directory"] = directory
+    registry = getattr(request.app.state, "raw_fetch_registry", None)
+    if registry is not None and request.app.state.config.coalesce_enabled:
+        leased = await _status_via_lease(request, registry, directory)
+        if leased is not None:
+            return leased
+        # budget full → unchanged direct path below
     try:
         response = await request.app.state.upstream.get(
             "/session/status",

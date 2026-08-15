@@ -107,6 +107,12 @@ _MAX_RESPONSE_BYTES_CAP = 256 * 1024 * 1024   # 256 MiB
 # max_response_bytes=128 MiB = 1 GiB) from risking OOM under systemd
 # MemoryMax. 512 MiB leaves headroom for the rest of the process.
 _MAX_TRANSFORM_TOTAL_BYTES = 512 * 1024 * 1024  # 512 MiB
+# Aggregate memory bound (traffic plan Batch 1 / A2): raw-fetch coalescing
+# budget + transform pool budget, summed. Derived as the P1-30 transform
+#口径 (512 MiB) plus the raw-fetch default口径 (64 MiB) — see validate().
+_MAX_RAW_PLUS_TRANSFORM_TOTAL_BYTES = (
+    _MAX_TRANSFORM_TOTAL_BYTES + 64 * 1024 * 1024
+)  # 576 MiB
 
 # Default values for the access-log dir / path fields (P1-34). These mirror
 # the hardcoded defaults in the dataclass field definitions below and are
@@ -173,6 +179,59 @@ class Settings:
     max_transforms: int = int(os.getenv("OC_SLIMAPI_MAX_TRANSFORMS", "1"))
     transform_wait_seconds: float = float(os.getenv("OC_SLIMAPI_TRANSFORM_WAIT_SECONDS", "2"))
     max_response_bytes: int = int(os.getenv("OC_SLIMAPI_MAX_RESPONSE_BYTES", str(64 * 1024 * 1024)))
+    # Catalog TTL cache (traffic plan Batch 1 / A1): successful upstream
+    # catalog bodies (/slimapi/agent, /slimapi/command) are cached for a TTL
+    # window so repeat catalog GETs stop hitting upstream. Only successful
+    # bodies within the byte budgets are retained; ``ttl_seconds=0``
+    # disables the cache entirely (byte-identical to the uncached path).
+    catalog_cache_ttl_seconds: float = float(
+        os.getenv("OC_SLIMAPI_CATALOG_CACHE_TTL_SECONDS", "300")
+    )
+    catalog_cache_max_entries: int = int(
+        os.getenv("OC_SLIMAPI_CATALOG_CACHE_MAX_ENTRIES", "16")
+    )
+    catalog_cache_max_bytes: int = int(
+        os.getenv("OC_SLIMAPI_CATALOG_CACHE_MAX_BYTES", str(16 * 1024 * 1024))
+    )
+    catalog_cache_max_entry_bytes: int = int(
+        os.getenv("OC_SLIMAPI_CATALOG_CACHE_MAX_ENTRY_BYTES", str(1024 * 1024))
+    )
+    # Upstream-fetch coalescing (traffic plan Batch 1 / A2-A4): a per-app
+    # ``LeasedSingleFlight`` registry dedupes identical upstream GETs (list
+    # routes) under a byte budget. ``raw_fetch_max_bytes`` bounds the total
+    # reservation for concurrent DISTINCT flights (each reserves
+    # ``max_response_bytes`` — deliberately conservative; see the capacity
+    # note in validate()); ``raw_fetch_concurrency`` caps in-flight upstream
+    # GETs independently of memory; ``coalesce_enabled=false`` bypasses the
+    # registry entirely (byte-identical to the pre-coalescing path).
+    coalesce_enabled: bool = os.getenv(
+        "OC_SLIMAPI_COALESCE_ENABLED", "true"
+    ).lower() in ("1", "true", "yes", "on")
+    raw_fetch_concurrency: int = int(
+        os.getenv("OC_SLIMAPI_RAW_FETCH_CONCURRENCY", "4")
+    )
+    raw_fetch_max_bytes: int = int(
+        os.getenv("OC_SLIMAPI_RAW_FETCH_MAX_BYTES", str(64 * 1024 * 1024))
+    )
+    # Traffic plan Batch 2 / B1 — ETag/304 conditional requests (additive
+    # wire): when enabled, list/catalog routes emit a per-coding validator
+    # and answer a matching ``If-None-Match`` with 304 (pipeline still
+    # runs; only the downstream body is saved). ``etag_enabled=false``
+    # restores the pre-ETag behaviour byte-for-byte (no header, no 304).
+    etag_enabled: bool = os.getenv(
+        "OC_SLIMAPI_ETAG_ENABLED", "true"
+    ).lower() in ("1", "true", "yes", "on")
+    # Traffic plan Batch 4 / B3 — message content fingerprint (additive
+    # field ``contentFingerprint`` on every message skeleton; merged mode
+    # recomputes after the full-parts splice — design doc
+    # ``docs/specs/design-message-watermark.md``). Ops rollback switch:
+    # ``message_fingerprint_enabled=false`` omits the field everywhere and
+    # restores today's byte-for-byte response. The switch state is embedded
+    # in ``REP_VERSION`` (etag.py), so a flip invalidates every ETag — no
+    # stale 304s across the flip.
+    message_fingerprint_enabled: bool = os.getenv(
+        "OC_SLIMAPI_MESSAGE_FINGERPRINT_ENABLED", "true"
+    ).lower() in ("1", "true", "yes", "on")
     smoke_session_id: str | None = os.getenv("OC_SLIMAPI_SMOKE_SESSION_ID")
     server_api_version: int = int(os.getenv("OC_SLIMAPI_SERVER_API_VERSION", str(SERVER_API_VERSION)))
     accepted_client_versions: tuple[int, int] = _version_range(
@@ -533,6 +592,65 @@ class Settings:
                 f"{_MAX_TRANSFORM_TOTAL_BYTES // (1024 * 1024)} MiB — risk of "
                 f"OOM under MemoryMax (reduce one or both). See transform.py "
                 f"shutdown/RSS comment for the memory model."
+            )
+        # Raw-fetch coalescing guards (traffic plan Batch 1 / A2): the knob
+        # itself must be usable, and — because a coalesced raw body is held
+        # across "GET → admission → consumption" while admitted transforms
+        # hold their own bodies — the raw-fetch budget and the transform
+        # pool budget peak CONCURRENTLY. Their SUM (not each independently)
+        # must fit the aggregate memory口径: the P1-30 transform bound
+        # (512 MiB) plus the raw-fetch default口径 (64 MiB). The legacy
+        # transform-only boundary (transform total == 512 MiB with the
+        # DEFAULT raw budget) sits exactly on this bound and still passes.
+        # Capacity note: each leased flight reserves the full
+        # ``max_response_bytes``, so the default 64 MiB × 64 MiB admits ONE
+        # concurrent distinct flight — deliberately conservative; operators
+        # wanting N parallel coalesced fetches should raise
+        # raw_fetch_max_bytes to >= N × max_response_bytes deliberately.
+        if self.raw_fetch_concurrency < 1:
+            raise RuntimeError("OC_SLIMAPI_RAW_FETCH_CONCURRENCY must be >= 1")
+        if self.raw_fetch_max_bytes <= 0:
+            raise RuntimeError("OC_SLIMAPI_RAW_FETCH_MAX_BYTES must be > 0")
+        _raw_plus_transform = self.raw_fetch_max_bytes + _transform_total_bytes
+        if _raw_plus_transform > _MAX_RAW_PLUS_TRANSFORM_TOTAL_BYTES:
+            raise RuntimeError(
+                f"OC_SLIMAPI_RAW_FETCH_MAX_BYTES ({self.raw_fetch_max_bytes}) "
+                f"+ OC_SLIMAPI_MAX_TRANSFORMS ({self.max_transforms}) × "
+                f"OC_SLIMAPI_MAX_RESPONSE_BYTES ({self.max_response_bytes}) "
+                f"= {_raw_plus_transform} bytes exceeds "
+                f"{_MAX_RAW_PLUS_TRANSFORM_TOTAL_BYTES // (1024 * 1024)} MiB "
+                f"— raw-fetch and transform budgets peak concurrently; "
+                f"reduce one or both (see config.py aggregate memory note)."
+            )
+        # Catalog TTL cache guards (traffic plan Batch 1 / A1): TTL must be
+        # non-negative (0 disables the cache — a valid configuration); the
+        # entry cap must leave room for at least one entry; the total byte
+        # budget has a 1 MiB lower bound; and a single entry may never
+        # exceed the total budget (such an entry could never be stored, so
+        # the config is self-contradictory).
+        if self.catalog_cache_ttl_seconds < 0:
+            raise RuntimeError(
+                "OC_SLIMAPI_CATALOG_CACHE_TTL_SECONDS must be >= 0 "
+                "(0 disables the cache)"
+            )
+        if self.catalog_cache_max_entries < 1:
+            raise RuntimeError("OC_SLIMAPI_CATALOG_CACHE_MAX_ENTRIES must be >= 1")
+        if self.catalog_cache_max_bytes < 1024 * 1024:
+            raise RuntimeError(
+                f"OC_SLIMAPI_CATALOG_CACHE_MAX_BYTES must be >= 1 MiB "
+                f"(got {self.catalog_cache_max_bytes})"
+            )
+        if self.catalog_cache_max_entry_bytes < 1:
+            # rev-gpt C1: 0 / negative caps the cache at nothing while the
+            # config claims a live cache — self-contradictory, reject early.
+            raise RuntimeError(
+                "OC_SLIMAPI_CATALOG_CACHE_MAX_ENTRY_BYTES must be >= 1"
+            )
+        if self.catalog_cache_max_entry_bytes > self.catalog_cache_max_bytes:
+            raise RuntimeError(
+                "OC_SLIMAPI_CATALOG_CACHE_MAX_ENTRY_BYTES must be <= "
+                "OC_SLIMAPI_CATALOG_CACHE_MAX_BYTES (an oversize entry could "
+                "never be stored)"
             )
         # Skeleton projection inline caps: per-field and per-message.
         if self.skeleton_inline_output_max_bytes <= 0:

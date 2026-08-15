@@ -17,13 +17,15 @@ from .access_log import (
     setup_access_log,
 )
 from .actions import load_registry as actions_load_registry
+from .catalog_cache import CatalogCache
+from .leased_singleflight import LeasedSingleFlight
 from .config import settings
 from .errors import register_error_handlers
 from .logging_config import get_logger, setup_logging
 from .middleware.request_id import RequestIdMiddleware
 from .middleware.traffic_accounting import TrafficAccountingMiddleware
 from .proxy import install_proxy
-from .routes import actions, agent, command, directories, events, health, messages, metrics, permissions, questions, sessions, token_stream
+from .routes import actions, agent, children, command, directories, events, health, messages, metrics, permissions, questions, sessions, todo, token_stream
 from .sse.hub import HubRegistry
 from .sse.singleflight import fulls
 from .sse.token_hub import TokenStreamHub, TokenStreamRegistry
@@ -322,6 +324,48 @@ async def lifespan(app: FastAPI):
                     "singleflight shutdown failed", exc_info=exc
                 )
         stack.callback(_shutdown_fulls)
+        # Traffic plan Batch 1 / A1: catalog TTL body cache for
+        # /slimapi/agent + /slimapi/command. Holds its own plain SingleFlight
+        # for refresh-stampede protection. Teardown converges both (clears
+        # retained bodies + cancels grace timers) while upstream is still
+        # open — same LIFO rationale as _shutdown_fulls above.
+        app.state.catalog_cache = CatalogCache(
+            ttl_seconds=settings.catalog_cache_ttl_seconds,
+            max_entries=settings.catalog_cache_max_entries,
+            max_bytes=settings.catalog_cache_max_bytes,
+            max_entry_bytes=settings.catalog_cache_max_entry_bytes,
+        )
+
+        def _shutdown_catalog_cache():
+            try:
+                app.state.catalog_cache.shutdown()
+            except Exception as exc:
+                get_logger("app").warning(
+                    "catalog cache shutdown failed", exc_info=exc
+                )
+        stack.callback(_shutdown_catalog_cache)
+
+        # Traffic plan Batch 1 / A2-A4: per-app raw-fetch coalescing registry
+        # (LeasedSingleFlight) for list-route upstream GETs. Attached only
+        # when enabled — ``coalesce_enabled=false`` leaves the attribute
+        # absent so routes take the unchanged direct path. Teardown calls
+        # shutdown() (clears active entries, cancels grace timers; detached
+        # in-flight entries converge in the retired layer) while upstream is
+        # still open — same LIFO rationale as _shutdown_fulls above.
+        if settings.coalesce_enabled:
+            app.state.raw_fetch_registry = LeasedSingleFlight(
+                max_bytes=settings.raw_fetch_max_bytes,
+                network_concurrency=settings.raw_fetch_concurrency,
+            )
+
+            def _shutdown_raw_fetch_registry():
+                try:
+                    app.state.raw_fetch_registry.shutdown()
+                except Exception as exc:
+                    get_logger("app").warning(
+                        "raw fetch registry shutdown failed", exc_info=exc
+                    )
+            stack.callback(_shutdown_raw_fetch_registry)
         app.state.schema_degraded = False
         # Questions fan-out semaphore (T5): global per-request /question
         # concurrency cap. Sized by config (1..16); no close/cleanup needed.
@@ -561,7 +605,7 @@ app.add_middleware(RequestIdMiddleware)
 # install_proxy's catch-all (design §5.1: route must precede the reverse
 # proxy). Its path ``/slimapi/sessions/{sid}/stream`` does not shadow
 # ``/{sid}/status`` or ``/{sid}/children`` (different literal suffixes).
-for router in (health.router, actions.router, agent.router, command.router, sessions.router, messages.router, events.router, metrics.router, questions.router, permissions.router, directories.router, token_stream.router):
+for router in (health.router, actions.router, agent.router, command.router, sessions.router, children.router, todo.router, messages.router, events.router, metrics.router, questions.router, permissions.router, directories.router, token_stream.router):
     app.include_router(router)
 install_proxy(app)
 

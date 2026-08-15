@@ -42,6 +42,7 @@ async def agent(request: Request, directory: str | None = None):
             read_with_cap=read_with_cap,
             err_label="agent",
             read_timeout=None,
+            cache=getattr(request.app.state, "catalog_cache", None),
         )
     except TransformBusy:
         return busy_response(request.headers.get("accept-encoding"))

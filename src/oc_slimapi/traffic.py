@@ -97,6 +97,26 @@ def bucketize(method: str, path: str) -> str:
 # route handlers; read at request end by the middleware).
 _UP_IN_KEY: Final[str] = "traffic_up_in"
 _UP_OUT_KEY: Final[str] = "traffic_up_out"
+_CACHE_KEY: Final[str] = "traffic_cache"
+
+
+def stash_cache(request: Any, state_value: str | None) -> None:
+    """Stash the catalog-cache outcome (``"hit"``/``"miss"``) for this request.
+
+    Traffic plan Batch 1 / A1: catalog routes record whether the response
+    body came from the TTL cache so the access-log row can attribute
+    upstream traffic correctly. ``None`` (cache disabled / not applicable)
+    is a no-op — rows without cache semantics keep their exact key set.
+    """
+    if state_value is None:
+        return
+    scope = getattr(request, "scope", None)
+    if not isinstance(scope, dict):
+        return
+    state = scope.setdefault("state", {})
+    if not isinstance(state, dict):
+        return
+    state[_CACHE_KEY] = state_value
 
 
 def stash_up_in(request: Any, n: int) -> None:

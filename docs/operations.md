@@ -273,6 +273,23 @@ oc-slimapi 有两类日志输出，**分别处理**：
 |---|---|---|---|
 | `OC_SLIMAPI_TRANSFORM_ABSORB_BUDGET_SECONDS` | 2.5 | > 0 | `transform_busy` 503 前的服务端吸收预算（single-flight + 按剩余预算收窄的池等待重试）。503 形状不变，频率大幅下降。 |
 
+**Catalog TTL 缓存与上游去重（2026-08-16 起）**
+
+> 以下 8 个 knob 控制省流 sidecar 的上游流量优化与内容指纹（前者内部行为 wire 响应字节不变，后者为加性 wire 字段开关）：`/slimapi/agent`、`/slimapi/command` 的 catalog TTL 缓存，与列表类端点（messages 列表 / sessions 列表与 status / questions / permissions 的 discovery + per-dir 抓取）的 join-first single-flight 去重，以及 messages skeleton 的 `contentFingerprint` 字段。
+
+| 变量 | 默认值 | 范围 | 说明 |
+|---|---|---|---|
+| `OC_SLIMAPI_CATALOG_CACHE_TTL_SECONDS` | 300 | >= 0 | catalog 响应缓存窗口（秒）。`0` 完全禁用（行为回到逐请求直取，access log 亦不产生 `cache` 字段）。仅缓存成功（200）且合法的 catalog body；4xx/5xx/坏 JSON 不缓存。 |
+| `OC_SLIMAPI_CATALOG_CACHE_MAX_ENTRIES` | 16 | >= 1 | catalog 缓存最大条目数（按 `(kind, directory)` 分桶）。 |
+| `OC_SLIMAPI_CATALOG_CACHE_MAX_BYTES` | 16 MiB | >= 1 MiB | catalog 缓存总字节预算；超限按最旧优先即时淘汰。 |
+| `OC_SLIMAPI_CATALOG_CACHE_MAX_ENTRY_BYTES` | 1 MiB | <= MAX_BYTES | 单条缓存上限；超过该大小的响应旁路缓存直接透传（不入账）。 |
+| `OC_SLIMAPI_COALESCE_ENABLED` | true | bool | 上游去重总开关。`false` = 完全旁路（行为与未上线去重时逐字节一致）。 |
+| `OC_SLIMAPI_RAW_FETCH_CONCURRENCY` | 4 | >= 1 | 同时 in-flight 的去重上游 GET 数上限（纯网络并发限制，与内存预算解耦）。 |
+| `OC_SLIMAPI_RAW_FETCH_MAX_BYTES` | 64 MiB | > 0，与 transform 预算之和 <= 576 MiB | 去重 flight 的字节预算：每个 distinct flight 预扣整笔 `OC_SLIMAPI_MAX_RESPONSE_BYTES`（读取完成后不返还差额——保守正确性优先）。 |
+| `OC_SLIMAPI_MESSAGE_FINGERPRINT_ENABLED` | true | bool | messages skeleton 加性字段 `contentFingerprint`（`"<vN>:<sha256hex>"`）开关。`false` = 不输出该字段（逐字节等价开关关闭前行为）。**注意**：开关状态参与 ETag `REP_VERSION`——关闭/重开会轮换全部 ETag 验证器（客户端 304 全部 miss 一次，属预期）。 |
+
+> **默认容量退化说明（重要）**：默认 `RAW_FETCH_MAX_BYTES=64 MiB` × `MAX_RESPONSE_BYTES=64 MiB` → **默认配置下同时只有 1 个去重 flight**；`RAW_FETCH_CONCURRENCY=4` 在默认预算下不可达（预算先到顶）。这是刻意的保守默认（内存证明优先）。**调优指引**：期望 N 个并行去重抓取时，设 `OC_SLIMAPI_RAW_FETCH_MAX_BYTES >= N × OC_SLIMAPI_MAX_RESPONSE_BYTES`；预算满时新 key 自动降级为现行直取路径（行为正确，只是不去重）。聚合内存校验：`RAW_FETCH_MAX_BYTES + MAX_TRANSFORMS × MAX_RESPONSE_BYTES <= 576 MiB`（两项预算并发峰值之和，超限启动失败）。
+
 ### 5.6 journald 查询手册（应用日志）
 
 ```bash

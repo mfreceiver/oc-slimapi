@@ -26,6 +26,40 @@ ocdroid 对接时：
 
 ---
 
+## [Unreleased]
+
+### Added（内部性能 + 两点行为披露；无 wire 契约变更，`X-Slimapi-Version` 不变）
+
+- **上游流量优化（内部，响应字节不变）**：
+  - **Catalog TTL 缓存**：`/slimapi/agent`、`/slimapi/command` 的成功响应按 `(kind, directory)` 缓存（默认 TTL 300s，字节/条目双预算；`OC_SLIMAPI_CATALOG_CACHE_*` 可调）。仅缓存成功（200）响应；错误不缓存。
+  - **行为披露 ①（catalog 新鲜度）**：catalog 响应可能滞后上游至多 TTL 秒（默认 300s）。需要强新鲜度的运维场景设 `OC_SLIMAPI_CATALOG_CACHE_TTL_SECONDS=0` 关闭（行为回到逐请求直取）。
+  - **上游去重（join-first single-flight）**：messages 列表、sessions 列表、sessions/status、questions/permissions（discovery + per-dir 两级）的相同上游 GET 在并发时合并为一次抓取；预算/开关见 `OC_SLIMAPI_COALESCE_ENABLED` / `OC_SLIMAPI_RAW_FETCH_*`（默认容量下同时只有 1 个去重 flight，超额自动降级直取，详见 `docs/operations.md` §5.5）。
+  - **行为披露 ②（join-first 等待语义）**：去重路径下，同 key 并发 caller 共同等待**一次**上游 GET——上游 hang 时这些 caller 一起等到 httpx 超时（映射为 503 `upstream_unavailable`），而非部分 caller 更早收到 503 `transform_busy`。正常路径响应字节与直取一致。
+  - **Access log 加性字段**：`/slimapi/agent`、`/slimapi/command` 的 access log 记录新增可选字段 `cache: "hit" | "miss"`（仅 catalog 缓存路径且 `OC_SLIMAPI_CATALOG_CACHE_TTL_SECONDS > 0` 时写入；TTL=0 禁用缓存则不产生该字段），供省流审计使用。
+
+### Added（加性 wire：ETag/304 条件请求 — 流量优化 Batch 2/B1；未 bump `X-Slimapi-Version`，仍 2）
+
+- **4 个 GET 端点支持 `ETag` + `If-None-Match` → 304**：`/slimapi/sessions`（列表）、`/slimapi/messages/{sid}`（列表，`mode=merged` 同样适用，以最终 splice 后 body 为准）、`/slimapi/agent`、`/slimapi/command`。验证器按实际 coding 派生（identity 强 ETag / gzip 弱 ETag，sha256 输入恒为 identity body + coding id；`REP_VERSION` 含投影版本与 config 指纹，投影/配置变化 → 全部验证器轮换，构造上不可能误 304）。304 头集合 = `ETag` 同值 + `Vary` 与 200 一致 + `Cache-Control: no-store` + 路由辅助头复制（`X-Next-Cursor` / `X-Complete`，值来自本次管线计算），无 body。`If-None-Match` 弱比较 + `*`。**管线照常执行不短路**（上游 GET/投影照跑，上游去重照常摊薄；命中仅省下行传输体，gzip 命中 = canonical hash 后零压缩零传输）。4xx/5xx 不带 `ETag` 不参与 304。
+- **Vary 合并（加性）**：上述 4 端点 200/304 的 `Vary` 由 `Accept-Encoding` 追加合并为 `Accept-Encoding, X-Opencode-Directory`（directory 影响上游 workspace 路由与 catalog/list 投影）。
+- **Ops 开关**：`OC_SLIMAPI_ETAG_ENABLED`（默认 `true`）；`false` → 不输出 `ETag`、不判 304、`Vary` 不合并（逐字节等价开关关闭前行为）。客户端接入指引见 `docs/specs/CLIENT_CHANGES.md`「ETag 接入」。
+
+### Added（加性 wire：T17 todo/children thin 路由 — 流量优化 Batch 3/C2a；未 bump `X-Slimapi-Version`，仍 2）
+
+- **`GET /slimapi/sessions/{sid}/todo`**：透传路由 thin 化。上游 `Todo.Info[]`（`{content,status,priority}`）schema 已最小 → **近恒等投影**（无字段可省，路由价值 = gzip 协商 + `max_response_bytes` cap + 转换池 admission + 结构化错误映射）。省流依据 T16 top#1（3d ~1.35 MiB passthrough，gzip 杠杆 ~22-30%）。
+- **`GET /slimapi/sessions/{sid}/children`**：加性回归（v1 曾有、lite-v2 删、无状态重加——`/slimapi/sessions/status` 同款先例）。每项经既有 `skeleton_session()` 投影，与 `/slimapi/sessions` 列表**逐字相同** keep/drop（丢 `cost`/`tokens`/`location`/`subpath`）。**状态量护栏**（设计稿 §6.2）：不引入 `X-Children-Version`、`childrenVersion` digest、`childrenIDs[]` list hints、cache/single-flight/SSE 失效——纯读。省流依据 T16 top#2。
+- **共性**：`directory` 可选 query（`validate_directory` 400 `invalid_directory`）+ `X-Opencode-Directory` 转发；转换池 admission 先于上游 GET；错误映射与 sessions/messages 对齐（上游 404→404 `session_not_found`（带 `sessionID`）；其他 4xx→502 `upstream_http_N`；5xx/网络/坏 JSON/非 list→503 `upstream_unavailable`；超 cap→413 `response_too_large`；池满→503 `transform_busy`+`Retry-After:2`）。旧 sidecar 无此路由 → 客户端 capability detection：404 `thin_route_not_found` 时 fallback 透传 `GET /session/{sid}/todo|children`。设计稿：`docs/specs/traffic-route-todo-2026-08-10.md`、`docs/specs/traffic-route-children-2026-08-10.md`。
+
+### Added（加性 wire：消息内容指纹 contentFingerprint — 流量优化 Batch 4/B3；未 bump `X-Slimapi-Version`，仍 2）
+
+- **`GET /slimapi/messages/{sid}`（缺省与 `mode=merged`）每条消息 skeleton 加性字段 `contentFingerprint: string`**，格式 `"<vN>:<sha256hex>"`（全量 hex 不截断）。定位：`(updatedAt, messageId)` 双水印去重的**补充证据**（内容级等价性判定），不替代、不改变 digest 帧或水印推进规则（消费侧推进规则见 ocdroid 联合计划）。生成位置：缺省列表 = skeleton 投影完成时；`mode=merged` = placeholder 内联 splice 完成后**重算覆盖**（full 抓取失败/预算不足/坏响应等降级路径**不重算**，保留 skeleton 期指纹）。规范化：排除字段自身 + `sort_keys` 序列化（parts 保持上游序、无数值规范化）后 SHA-256。
+- **终态语义**：同输入（同投影/规范化/`vN`）→ 恒同指纹（跨进程重启确定性）；指纹不同 ⟹ 输入不同；指纹相同 → 输入相同（以 SHA-256 碰撞可忽略为前提）。**不提供单调性**（非序号/revision，不得用于排序或版本比较）。**跨表示模式不可比较**：缺省与 merged 对同一消息产生不同指纹（merged 输入含 full 内容），`vN` 前缀不区分模式，客户端仅在同模式内比较。
+- **Ops 开关**：`OC_SLIMAPI_MESSAGE_FINGERPRINT_ENABLED`（默认 `true`）；`false` → 不输出该字段（逐字节等价开关关闭前行为）；开关状态参与 ETag `REP_VERSION`（关闭 → 全部 ETag 验证器轮换，304 全 miss 一次属预期）。设计稿：`docs/specs/design-message-watermark.md`；客户端接入指引见 `docs/specs/CLIENT_CHANGES.md`「内容指纹消费」。
+
+### Fixed（内部可靠性：questions/permissions 去重共享内存不变数 — 终审 B1；无 wire 变更，响应字节不变）
+
+- **questions/permissions 的 discovery 去重共享值由展开 JSON 改为 capped raw bytes**：并发去重下，各 caller 在租约窗口内自行解析、派生自有目录字符串副本后即丢弃展开图——消除"joiner 持有可达数倍于 raw 上限的共享 JSON 图跨 await"的内存不变数违规。per-dir 去重（`/question`、`/permission`）本就共享 raw bytes（审计确认，回归测试钉住）。行为/响应字节不变，纯内部修复。
+- **租约释放切断引用（终审复评 rev-1）**：`Lease` 释放时切断对共享 body/entry 的引用（释放后 `lease.body` 恒 `None`）——已释放租约句柄不再跨后续 await 持有旧 generation raw body；messages/sessions/questions/permissions 全部租约路径统一免疫。行为/响应字节不变，纯内部修复。
+
 ## [1.4.0] - 2026-08-15
 
 ### Added

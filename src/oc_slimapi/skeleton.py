@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
@@ -10,6 +11,57 @@ import orjson
 
 PLACEHOLDER_TEXT = "[内容已折叠，点开查看]"
 PART_IDS = {"id", "type", "messageID", "sessionID"}
+
+# ---------------------------------------------------------------------------
+# Message content fingerprint (traffic plan Batch 4 / B3).
+#
+# Design authority: docs/specs/design-message-watermark.md (frozen). The
+# fingerprint is a pure function of the message's FINAL external
+# representation (projected info + final parts). ``FINGERPRINT_VERSION`` is
+# an INDEPENDENT constant — it bumps ONLY when the normalisation rules below
+# change (fields added/removed from the input, serialisation change), never
+# with package releases or ``REP_VERSION``.
+#
+# Normalisation (frozen, design doc §4.3):
+#   1. exclude ``contentFingerprint`` itself (no self-reference);
+#   2. orjson ``OPT_SORT_KEYS``; parts stay in upstream order (upstream
+#      order IS the semantic order — never re-sorted);
+#   3. numbers/strings participate verbatim (no numeric normalisation);
+#   4. full sha256 hex, ``"vN:"`` prefix, never truncated.
+#
+# Semantics (frozen, design doc §4.4): same normalised input → same
+# fingerprint (determinism, survives restarts); different fingerprint ⟹
+# different input; same fingerprint indicates same content ONLY under the
+# engineering assumption that SHA-256 collisions are negligible (2^-256).
+# NO monotonicity/timing semantics. Fingerprints are NOT comparable across
+# representation modes (default skeleton vs mode=merged) — the ``vN`` prefix
+# deliberately does NOT encode the mode; the contract text binds the
+# comparison namespace.
+# ---------------------------------------------------------------------------
+FINGERPRINT_VERSION = 1
+FINGERPRINT_FIELD = "contentFingerprint"
+
+
+def compute_message_fingerprint(message: dict[str, Any]) -> str:
+    """Fingerprint a message's final representation.
+
+    ``message`` is a projected message (``{info, parts, ...}``) — possibly
+    already carrying a stale ``contentFingerprint`` (excluded from the
+    hash input, so recomputation is idempotent-safe).
+    """
+    canonical = {
+        key: value for key, value in message.items()
+        if key != FINGERPRINT_FIELD
+    }
+    digest = hashlib.sha256(
+        orjson.dumps(canonical, option=orjson.OPT_SORT_KEYS)
+    ).hexdigest()
+    return f"v{FINGERPRINT_VERSION}:{digest}"
+
+
+def recompute_fingerprint(message: dict[str, Any]) -> None:
+    """Overwrite the message's fingerprint in place (merged splice site)."""
+    message[FINGERPRINT_FIELD] = compute_message_fingerprint(message)
 TOOL_KEYS = PART_IDS | {"tool", "callID"}
 TOOL_INPUT_KEYS = {
     "path", "filePath", "file_path", "command", "agent", "description",
@@ -34,16 +86,22 @@ COMPACTION_PART_LIMIT = 64 * 1024
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True, slots=True)
 class SkeletonLimits:
-    """Per-call inline caps for skeleton thresholding.
+    """Per-call inline caps + projection switches for skeleton thresholding.
 
     ``field_bytes`` caps a single inlined ``state.output`` / ``state.error``
     field (per-field cap). ``message_bytes`` caps the cumulative inlined bytes
     across all parts of one message in part order (per-message budget). Both
     are JSON-wire bytes (measured by :func:`_field_byte_size`).
+
+    ``fingerprint`` (Batch 4 / B3) carries the per-call
+    ``message_fingerprint_enabled`` switch: the route builds it from config
+    alongside the caps and the projection reads it here — the pack-worker
+    signatures stay unchanged (existing monkeypatch stand-ins keep working).
     """
 
     field_bytes: int
     message_bytes: int
+    fingerprint: bool = False
 
 
 # Defaults for direct pure-function tests; production paths construct from
@@ -361,7 +419,11 @@ def skeleton_part(part: dict[str, Any], *, budget: dict[str, int] | None = None,
     return _mark(_pick(part, PART_IDS), [key for key in part if key not in PART_IDS] or ["*"])
 
 
-def skeleton_message(message: dict[str, Any], *, limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS) -> dict[str, Any]:
+def skeleton_message(
+    message: dict[str, Any], *,
+    limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS,
+    fingerprint: bool = False,
+) -> dict[str, Any]:
     # P1-29: normalise nested fields defensively. A malformed upstream message
     # where ``info`` is null or ``parts`` is a non-list (int/bool/string) would
     # crash the projection: ``None.get("id")`` → AttributeError,
@@ -394,11 +456,26 @@ def skeleton_message(message: dict[str, Any], *, limits: SkeletonLimits = DEFAUL
             "omitted": ["parts"],
         })
     result["parts"] = thin_parts
+    if fingerprint or limits.fingerprint:
+        # B3: inject at projection-completion time (the message's final
+        # assembly point for non-merged lists; merged splices overwrite
+        # this later via recompute_fingerprint). Default stays OFF so the
+        # pure functions keep their historical output shape (existing
+        # tests unchanged); routes thread the config switch through
+        # ``SkeletonLimits.fingerprint`` (worker signatures unchanged).
+        recompute_fingerprint(result)
     return result
 
 
-def skeleton_messages(messages: list[dict[str, Any]], *, limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS) -> list[dict[str, Any]]:
-    return [skeleton_message(message, limits=limits) for message in messages]
+def skeleton_messages(
+    messages: list[dict[str, Any]], *,
+    limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS,
+    fingerprint: bool = False,
+) -> list[dict[str, Any]]:
+    return [
+        skeleton_message(message, limits=limits, fingerprint=fingerprint)
+        for message in messages
+    ]
 
 
 # ---------------------------------------------------------------------------

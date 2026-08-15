@@ -20,6 +20,7 @@ sidecar 是 ocdroid 与 opencode 之间的字节中继。账本按**路由桶**�
 | `downIn` | ocdroid 发给 sidecar 的请求体字节 | downstream 请求 |
 | `upOut` | sidecar 发给 opencode 的请求体字节 | upstream 请求 |
 | `requests` | 请求 / SSE 连接数 | — |
+| `cache` | 可选字段：`"hit" | "miss"`（仅 catalog 缓存路径——`/slimapi/agent`、`/slimapi/command`——且 `OC_SLIMAPI_CATALOG_CACHE_TTL_SECONDS > 0` 时的 access log 记录写入；TTL=0 禁用缓存与其余记录均无此字段） | — |
 
 **省流的核心判据**：`downOut / upIn`（记为 `downOutOverUpIn`）。
 - `< 1.0` → 下发比拉取少 = **省了**（如 `0.2` = 省了 80%）。

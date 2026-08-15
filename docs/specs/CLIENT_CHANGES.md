@@ -184,6 +184,47 @@
 
 **不降级触发条件**（与全局 fallback 规则一致）：**仅** 404 `thin_route_not_found`（场景 1）走透明回退；**绝不**对 503（`actions_disabled` / `action_unavailable` / `action_busy`）/413/timeout/版本错误隐藏入口或清空列表——这些是临时故障，入口保持、按错误码提示/重试。
 
+## ETag 接入（可选，推荐 — 2026-08-16）
+
+`/slimapi/sessions`、`/slimapi/messages/{sid}`（含 `mode=merged`）、`/slimapi/agent`、`/slimapi/command` 的 200 响应带 `ETag` 头；下次请求以 `If-None-Match: <上次 ETag>` 回发，命中时服务端返回 **304**（无 body）——省下行传输体。接入建议：
+
+1. **验证器内存保留**：只需保留上次请求的 **ETag 字符串**（<100B，可按 URL 做 per-URL 内存 LRU），**无需保留响应 body**。304 命中时继续用本地已有 body 渲染。服务端管线照常执行（ETag 不跳过抓取/投影），命中仅省下行字节。
+2. **OkHttp HTTP cache 不适用**：本仓全部响应 `Cache-Control: no-store`，OkHttp `Cache` 不会存储——验证器须在**应用层自存**（OkHttp 层配了也不生效，勿依赖）。
+3. **coding 固定建议**：同一 URL 的请求尽量固定同一 `Accept-Encoding`（identity 或 gzip）。验证器按 coding 派生（identity 强 tag / gzip 弱 tag），跨 coding 交叉必得保守 200（等于放弃命中）。
+4. **弱比较语义**：`If-None-Match` 为 RFC 9110 弱比较（服务端忽略 `W/` 前缀），回发原样字符串即可；`*` 匹配任意当前验证器。
+5. **辅助头照常读**：304 响应同样携带 `X-Next-Cursor` / `X-Complete`（值来自本次服务端管线计算），客户端分页/完整性逻辑无需因 304 特判。
+
+## 内容指纹消费（建议随 B2 digest 驱动接入 — 2026-08-16，traffic Batch 4）
+
+`GET /slimapi/messages/{sid}`（缺省与 `mode=merged`）每条消息含加性字段 `contentFingerprint`（`"<vN>:<sha256hex>"`）。定位：**内容级等价性证据**，与 digest 驱动的 `(updatedAt, messageId)` 双水印去重**配合**使用——水印判定「可能是同一条」时，指纹相同（同表示模式内）⟹ 内容未变可跳过重渲染；指纹不同 ⟹ 内容确实变了需刷新。
+
+1. **仅在同一表示模式内比较**：缺省列表与 `mode=merged` 对同一消息产生不同指纹（merged splice 后输入含 full 内容），`vN` 前缀不区分模式——跨模式比较无意义，客户端按模式分桶存储。
+2. **不提供单调性**：指纹非序号/revision，不得用于排序或版本先后判断；仅做等价/不等价判定。
+3. **存储建议**：per-(sid, mid, mode) 保留最近一次指纹字符串即可（<80B）；与 ETag 验证器同样属应用层自存（响应均 `no-store`）。
+4. **联调项指引**（详见 ocdroid 仓联合计划 `docs/ocmar/plans/2026-07-26-slim-message-reliability-joint-plan.md` §4.3/§4.4/§7）：token idle/resync 触发策略、resync 后 reconcile 三分法（full 重拉/列表重拉/跳过）等消费侧推进规则**不在本仓冻结范围**——本仓只冻结指纹的生成与语义（确定性、终态语义、跨模式约束、降级不重算），推进规则由联合计划冻结。
+5. **降级兼容**：full 抓取失败/预算不足等降级路径下 merged 指纹回落为 skeleton 期指纹（内容仍是列表级投影）；服务端 ops 关闭指纹（`OC_SLIMAPI_MESSAGE_FINGERPRINT_ENABLED=false`）时字段整体消失——客户端对「无该字段」必须已有兼容（加性字段缺省处理）。
+
+## T17 thin 路由：todo / children（加性 — 2026-08-16，traffic Batch 3）
+
+两条新 GET 薄路由，承接此前走 catch-all 透传的等价上游调用（配合「直连退役」的上游去载）：
+
+- `GET /slimapi/sessions/{sid}/todo` → 200 `Todo.Info[]` 裸数组 `{content,status,priority}`（近恒等投影——上游 schema 已最小，无字段被删）。
+- `GET /slimapi/sessions/{sid}/children` → 200 children skeleton 裸数组（每项 `skeleton_session()` 投影，与 `/slimapi/sessions` 列表同 keep/drop：丢 `cost`/`tokens`/`location`/`subpath`，留 `id`/`parentID`/`projectID`/`title`/`agent`/`model`/`time`）。**无状态重加**：v1 的 `X-Children-Version` / `childrenVersion` / `childrenIDs[]` 等 list hints **不回归**——纯读。
+
+### 客户端必须
+
+- 迁移：把 todo / children 拉取从 catch-all 透传（`GET /session/{sid}/todo`、`GET /session/{sid}/children`）切到 thin 路由；旧 sidecar 404 `thin_route_not_found` 时回退透传（capability detection，同 catalog 路由模式）。
+- `directory` 可选 query（与 messages 路由同语义，sidecar 转发为 `X-Opencode-Directory`）。
+- 空 `[]` 响应为 identity（<64B 跳过 gzip）；非空按 `Accept-Encoding` 协商。
+
+### 无 ETag（本批）
+
+两路由**不在**「ETag 接入」清单内：响应无 `ETag` 头，`If-None-Match` 被忽略（恒 200）——不要为它们保存验证器（后续批次接入时另行公告）。
+
+### 错误码（thin 路由统一 `{"code":"..."}`）
+
+- 404 `session_not_found`（上游 404，带 `sessionID`）；502 `upstream_http_N`（其他上游 4xx）；503 `upstream_unavailable`（5xx/网络/坏 JSON/形状非法——含逐项非 dict）；413 `response_too_large`（超 `max_response_bytes`）；503 `transform_busy` + `Retry-After: 2`（池满）。
+
 ## 路由与失败策略
 
 - thin 使用 stunnel 14097，direct 14096。

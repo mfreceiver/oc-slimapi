@@ -27,8 +27,9 @@ import httpx
 from fastapi import Request
 from starlette.responses import Response
 
+from .. import etag as etag_mod
 from ..gzip_util import accepts_gzip, error_response
-from ..traffic import stash_up_in
+from ..traffic import stash_cache, stash_up_in
 from ..upstream import forward_upstream_headers, request_id_from_scope
 from ..upstream_errors import (
     raise_upstream_status_code,
@@ -140,7 +141,11 @@ def make_project_and_pack(
     *,
     err_label: str,
     accept_encoding: str | None,
-) -> tuple[bytes, dict[str, str]]:
+    rep_version: bytes | None = None,
+    if_none_match: str | None = None,
+    merge_directory_vary: bool = False,
+    min_gzip_bytes: int | None = None,
+) -> tuple[bytes | None, dict[str, str]]:
     """Worker entry: parse + whitelist project + serialize (+ optional gzip).
 
     Catalog listings are NOT time-ordered; upstream order is preserved (no
@@ -152,14 +157,49 @@ def make_project_and_pack(
 
     ``accept_encoding`` is evaluated via :func:`~oc_slimapi.gzip_util.accepts_gzip`
     so an explicit ``gzip;q=0`` is honoured (RFC 7231).
+
+    Traffic plan Batch 2 / B1: when ``rep_version`` (a
+    :func:`~oc_slimapi.etag.response_rep_version` value) is set, the worker
+    derives the canonical validator from the identity (pre-gzip) bytes and
+    judges ``If-None-Match`` BEFORE compressing (plan §4: a gzip hit is
+    canonical-hash-only — zero compression, zero transport). A hit returns
+    ``encoded=None`` with the ``ETag``/merged-``Vary`` headers; the route
+    emits the 304. A miss compresses as before and the headers carry the
+    same validator the 304 would have. ``rep_version=None`` keeps the
+    return shape's headers byte-identical to the pre-ETag path.
+
+    rev-6 B1/C2 (traffic plan Batch 3): ``rep_version=None`` routes may
+    still pass ``merge_directory_vary=True`` (todo/children: ETag opted
+    out per plan §5, but the directory variance is real — keep the merged
+    ``Vary`` so caches key on ``X-Opencode-Directory``) and
+    ``min_gzip_bytes`` (benefit gate: identity bodies below the threshold
+    skip gzip). The gate is ONLY for routes without a pre-compression
+    validator judgment — agent/command compress unconditionally so the
+    judged coding == the served coding (Batch 2 final design); combining
+    ``rep_version`` with ``min_gzip_bytes`` would break that exactness and
+    is not done.
     """
     parsed = orjson.loads(body)
     if not isinstance(parsed, list):
         raise ValueError(f"non-list {err_label} catalog body")
     projected = project_fn(parsed)
-    encoded = orjson.dumps(projected)
+    identity = orjson.dumps(projected)
+    encoded = identity
     headers: dict[str, str] = {"Vary": "Accept-Encoding"}
-    if accepts_gzip(accept_encoding):
+    gzip_wanted = accepts_gzip(accept_encoding)
+    if min_gzip_bytes is not None and len(identity) < min_gzip_bytes:
+        gzip_wanted = False
+    if rep_version is not None:
+        # Exact prediction: this route compresses unconditionally on
+        # accepts_gzip, so the judgment coding == the served coding.
+        coding = "gzip" if gzip_wanted else "identity"
+        headers["ETag"] = etag_mod.compute_etag(identity, coding, rep_version)
+        headers["Vary"] = etag_mod.merged_vary(headers["Vary"])
+        if etag_mod.if_none_match_matches(if_none_match, headers["ETag"]):
+            return None, headers  # 304: canonical hash only — no compress
+    elif merge_directory_vary:
+        headers["Vary"] = etag_mod.merged_vary(headers["Vary"])
+    if gzip_wanted:
         encoded = gzip.compress(encoded, compresslevel=6)
         headers["Content-Encoding"] = "gzip"
     return encoded, headers
@@ -174,6 +214,11 @@ async def handle_catalog_request(
     read_with_cap,
     err_label: str,
     read_timeout: float | None = None,
+    cache=None,
+    sid: str | None = None,
+    enable_etag: bool = True,
+    merge_directory_vary: bool = False,
+    min_gzip_bytes: int | None = None,
 ) -> Response:
     """Skeleton catalog GET handler — admission → stream upstream → cap-read
     → error mapping → offload project+pack → Response.
@@ -182,9 +227,42 @@ async def handle_catalog_request(
     parameter via :func:`~oc_slimapi.directory.validate_directory`, then
     delegates the remainder to this shared function. ``read_with_cap`` is a
     parameter so test monkey-patches on the route module pass through.
+
+    Traffic plan Batch 1 / A1: ``cache`` (a
+    :class:`~oc_slimapi.catalog_cache.CatalogCache` or ``None``) enables the
+    TTL body cache. Absent (legacy test apps / knob off) → the uncached path
+    below, byte-identical to today. Present → admission-first order is
+    preserved: the upstream GET still happens inside transform admission,
+    deduplicated through the cache's refresh single-flight.
+
+    Traffic plan Batch 3 / C2a: ``sid`` (session-scoped routes — todo /
+    children) toggles the 404 → ``session_not_found`` mapping in
+    :func:`read_upstream_response`. Catalog routes omit it (unchanged
+    404 → 502 ``upstream_http_404`` behaviour).
+
+    rev-6 B1: ``enable_etag=False`` (todo/children — plan §5 keeps Batch 3
+    off the Batch 2 ETag wiring) forces ``rep_version=None``: no ``ETag``
+    header, no 304 judgment, while ``merge_directory_vary=True`` keeps the
+    directory-merged ``Vary`` on 200s (the variance is real regardless of
+    validator support) and ``min_gzip_bytes`` adds the tiny-body benefit
+    gate (rev-6 C2). Defaults leave agent/command byte-identical.
     """
+    if cache is not None:
+        return await _handle_catalog_cached(
+            request,
+            cache=cache,
+            upstream_path=upstream_path,
+            directory=directory,
+            project_fn=project_fn,
+            read_with_cap=read_with_cap,
+            err_label=err_label,
+            read_timeout=read_timeout,
+        )
     config = request.app.state.config
     pool = request.app.state.transforms
+    rep_version = (
+        etag_mod.response_rep_version(config) if enable_etag else None
+    )
     async with pool:
         response = await stream_upstream(request, upstream_path, directory, read_timeout)
         try:
@@ -192,6 +270,7 @@ async def handle_catalog_request(
                 request, response,
                 cap=config.max_response_bytes,
                 read_with_cap=read_with_cap,
+                sid=sid,
             )
             if body is None:
                 return error_response(
@@ -204,12 +283,128 @@ async def handle_catalog_request(
                     make_project_and_pack, project_fn, body,
                     err_label=err_label,
                     accept_encoding=request.headers.get("accept-encoding"),
+                    rep_version=rep_version,
+                    if_none_match=request.headers.get("if-none-match"),
+                    merge_directory_vary=merge_directory_vary,
+                    min_gzip_bytes=min_gzip_bytes,
                 )
             except (orjson.JSONDecodeError, ValueError) as exc:
                 raise_upstream_unavailable(exc)
         finally:
             await response.aclose()
+    if encoded is None:
+        # Pre-compression validator hit (judged in the worker on the
+        # identity bytes — plan §4): 304 with zero compression.
+        return etag_mod.conditional_304(
+            extra, request.headers.get("if-none-match"),
+        )
     return Response(
         encoded, status_code=200, media_type="application/json",
         headers={"Cache-Control": "no-store", **extra},
     )
+
+
+async def _offload_catalog_body(
+    request: Request, pool, project_fn, body: bytes, err_label: str,
+    rep_version: bytes | None = None,
+) -> Response:
+    """Project+pack a (cached or freshly read) body under admission.
+
+    Shared by the cached paths only — the uncached path above keeps its
+    inline form byte-for-byte. Bad JSON / non-list bodies map to 503
+    ``upstream_unavailable`` exactly like the uncached path (a cached body
+    was validated at store time, but the check stays for parity).
+
+    Batch 2 / B1: ``rep_version`` flows into the pack worker (validator on
+    the FINAL projected body — a cached raw body re-projected per config is
+    hashed after projection) and a pre-compression ``If-None-Match`` hit
+    short-circuits with 304 BEFORE any gzip work (the upstream GET / cache
+    refresh has already run — the pipeline is never skipped).
+    """
+    try:
+        encoded, extra = await pool.offload(
+            make_project_and_pack, project_fn, body,
+            err_label=err_label,
+            accept_encoding=request.headers.get("accept-encoding"),
+            rep_version=rep_version,
+            if_none_match=request.headers.get("if-none-match"),
+        )
+    except (orjson.JSONDecodeError, ValueError) as exc:
+        raise_upstream_unavailable(exc)
+    if encoded is None:
+        # Pre-compression validator hit (judged in the worker on the
+        # identity bytes — plan §4): 304 with zero compression.
+        return etag_mod.conditional_304(
+            extra, request.headers.get("if-none-match"),
+        )
+    return Response(
+        encoded, status_code=200, media_type="application/json",
+        headers={"Cache-Control": "no-store", **extra},
+    )
+
+
+async def _handle_catalog_cached(
+    request: Request,
+    *,
+    cache,
+    upstream_path: str,
+    directory: str | None,
+    project_fn,
+    read_with_cap,
+    err_label: str,
+    read_timeout: float | None = None,
+) -> Response:
+    """Cached catalog chain (traffic plan Batch 1 / A1).
+
+    * Fresh hit → skip the upstream GET entirely; admission + offload only.
+    * Miss → admission-first refresh (today's order): acquire transform
+      admission, then GET (deduplicated across concurrent callers by the
+      cache's refresh single-flight) + cap-read + store + offload.
+    * Only successful 200 bodies are ever cached (factory errors, cap
+      overflow, bad/non-list JSON bypass the store) — see CatalogCache.
+    * ttl=0 disables the cache entirely: refresh returns state ``None`` and
+      no ``cache`` field is reported (the access-log key stays omitted).
+    """
+    config = request.app.state.config
+    pool = request.app.state.transforms
+    rep_version = etag_mod.response_rep_version(config)
+    key = (upstream_path, directory)
+    body = cache.lookup(key)
+    if body is not None:
+        stash_cache(request, "hit")
+        async with pool:
+            return await _offload_catalog_body(
+                request, pool, project_fn, body, err_label,
+                rep_version,
+            )
+
+    async def _fetch_body() -> bytes | None:
+        response = await stream_upstream(
+            request, upstream_path, directory, read_timeout
+        )
+        try:
+            return await read_upstream_response(
+                request, response,
+                cap=config.max_response_bytes,
+                read_with_cap=read_with_cap,
+            )
+        finally:
+            await response.aclose()
+
+    async with pool:
+        body, cache_state = await cache.refresh(key, _fetch_body)
+        # rev-gpt addendum: ttl=0 disables the cache — refresh returns
+        # state None and NO ``cache`` semantics are reported (the field is
+        # omitted, consistent with the None-omits-key rule). A live miss
+        # reports "miss" only when the cache actually made a decision.
+        stash_cache(request, cache_state)
+        if body is None:
+            return error_response(
+                "response_too_large", 413,
+                limit=config.max_response_bytes,
+                accept_encoding=request.headers.get("accept-encoding"),
+            )
+        return await _offload_catalog_body(
+            request, pool, project_fn, body, err_label,
+            rep_version,
+        )

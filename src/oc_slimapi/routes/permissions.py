@@ -7,17 +7,36 @@ import orjson
 from fastapi import APIRouter, Request
 from starlette.responses import Response
 
-from ..discovery import _DISCOVERY_LIMIT, fetch_global_root_sessions
+from ..discovery import (
+    _DISCOVERY_LIMIT,
+    fetch_global_root_sessions,
+    fetch_global_root_sessions_raw,
+)
 from ..gzip_util import compress_if_beneficial
 from ..traffic import stash_up_in
 from ..transform import read_with_cap
 from ..upstream import forward_directory_headers
 from ..upstream_errors import (
     UPSTREAM_UNAVAILABLE,
+    raise_upstream_unavailable,
     upstream_error_code_for_status,
 )
 
 router = APIRouter(prefix="/slimapi", tags=["permissions"])
+
+
+class _DirFetchFailure(Exception):
+    """Per-dir upstream failure raised INSIDE a shared flight factory
+    (traffic plan Batch 1 / A4) so the flight FAILS — immediate budget
+    refund, never grace-retained (no negative caching) — while every joiner
+    re-raises the same instance and isolates its ``code`` into its own
+    envelope ``errors[]`` (per-dir errors never abort the request)."""
+
+    __slots__ = ("code",)
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
 
 # P1-28: aggregate item budget (second-layer cap, mirrors questions.py). Each
 # per-dir /permission response is capped by per_dir_cap, but items.extend()
@@ -25,6 +44,25 @@ router = APIRouter(prefix="/slimapi", tags=["permissions"])
 # merged item count exceeds this safety limit (or the byte budget), the
 # envelope is marked ``truncated: true`` and remaining dirs are cancelled.
 _MAX_AGGREGATE_ITEMS = 10_000
+
+
+def _directories_from_sessions(sessions_payload: list) -> list[str]:
+    """Step 2 helper (mirrors questions.py): derive the DISTINCT set of
+    workdir directories (first-seen order) from each session's REAL
+    ``directory`` field. Skip non-string/empty defensively.
+
+    Returns a caller-owned list of strings, so the (transient) expanded
+    session graph can be dropped as soon as this returns — in the coalesced
+    path it is called INSIDE the discovery lease and the graph is ``del``'d
+    before the lease releases (final review B1 fix, 2026-08-16).
+    """
+    return list(dict.fromkeys(
+        s["directory"]
+        for s in sessions_payload
+        if isinstance(s, dict)
+           and isinstance(s.get("directory"), str)
+           and s["directory"]
+    ))
 
 # B1 (upstream `GET /permission` field-level shape, opencode v1.18.16):
 # `PermissionV1.Request` (packages/schema/src/v1/permission.ts) =
@@ -123,39 +161,95 @@ async def permissions(request: Request):
     # 503 upstream_unavailable (total failure, contract §7 discovery
     # exception — do NOT leak upstream status).
     # ------------------------------------------------------------------
-    sessions_payload, discovery_complete = await fetch_global_root_sessions(
-        upstream_client, request, limit=_DISCOVERY_LIMIT,
-    )
+    upstream_client = request.app.state.upstream
+    config = request.app.state.config
+    registry = getattr(request.app.state, "raw_fetch_registry", None)
+    coalesce = registry is not None and config.coalesce_enabled
 
+    # Coalescing LEVEL 1 (plan A4): the discovery GET is single-flighted
+    # under the SAME fixed key as questions.py — concurrent /permissions
+    # bursts (and concurrent /questions, which shares the key) all join ONE
+    # discovery flight. The shared flight value is the CAPPED RAW BODY
+    # (≤ max_response_bytes == the flight's reserve_bytes), never the
+    # expanded session graph: each joiner parses INSIDE its lease window,
+    # derives its OWN copy of the directory strings, and drops the expanded
+    # graph + raw body BEFORE releasing the lease — budget ownership covers
+    # the caller's entire consumption of the shared GET (plan §3.x
+    # GET→caller-consumption invariant; final review B1 fix, 2026-08-16;
+    # mirrors questions.py / sessions.py).
+    #
+    # status>=400 / RequestError / bad JSON / non-list / cap-exceeded →
+    # 503 upstream_unavailable (total failure, contract §7 discovery
+    # exception — do NOT leak upstream status).
     # ------------------------------------------------------------------
-    # Step 2: derive the DISTINCT set of workdir directories (first-seen
-    # order) from each session's REAL `directory` field. Skip
-    # non-string/empty defensively (mirrors questions.py).
-    # ------------------------------------------------------------------
-    directories: list[str] = list(dict.fromkeys(
-        s["directory"]
-        for s in sessions_payload
-        if isinstance(s, dict)
-           and isinstance(s.get("directory"), str)
-           and s["directory"]
-    ))
+    if coalesce:
+        async def _discovery_factory():
+            return await fetch_global_root_sessions_raw(
+                upstream_client, request, limit=_DISCOVERY_LIMIT,
+            )
+
+        lease = await registry.fetch_or_bypass(
+            ("discovery", id(upstream_client), _DISCOVERY_LIMIT),
+            _discovery_factory,
+            reserve_bytes=config.max_response_bytes,
+        )
+        if lease is not None:
+            async with lease:
+                raw_body, discovery_complete = lease.body
+                # leader validated list shape before the flight succeeded;
+                # this defensive guard keeps the §7 mapping if it ever fails
+                try:
+                    sessions_payload = orjson.loads(raw_body)
+                except (orjson.JSONDecodeError, ValueError) as exc:
+                    raise_upstream_unavailable(exc)
+                if not isinstance(sessions_payload, list):
+                    raise_upstream_unavailable()
+                directories = _directories_from_sessions(sessions_payload)
+                # drop the expanded graph + shared raw bytes inside the
+                # lease — only the caller-owned directory strings survive
+                del sessions_payload, raw_body
+            # Defense-in-depth (final review rev-1): the registry-level
+            # release already severs Lease→body/_entry; dropping the local
+            # handle keeps this route free of ANY post-release flight state
+            # across the fan-out awaits below.
+            del lease
+        else:  # budget full → direct discovery fetch (caller-private)
+            sessions_payload, discovery_complete = (
+                await fetch_global_root_sessions(
+                    upstream_client, request, limit=_DISCOVERY_LIMIT,
+                )
+            )
+            directories = _directories_from_sessions(sessions_payload)
+            del sessions_payload
+    else:
+        sessions_payload, discovery_complete = await fetch_global_root_sessions(
+            upstream_client, request, limit=_DISCOVERY_LIMIT,
+        )
+        directories = _directories_from_sessions(sessions_payload)
+        del sessions_payload
+
+    # (Step 2 — directory derivation — happened inside the discovery block
+    # above: `directories` is a caller-owned list of strings; mirrors
+    # questions.py's _directories_from_sessions semantics exactly.)
 
     # ------------------------------------------------------------------
     # Step 3: sliding-window fan-out with per-dir byte cap, aggregate byte
     # budget, and aggregate item cap (mirrors questions.py's
     # _collect_with_byte_budget). The semaphore
     # (app.state.permissions_semaphore) limits cross-request /permission
-    # concurrency globally. Budgets are the T0 internal knobs
+    # concurrency globally. Coalescing LEVEL 2 (plan A4): each per-dir GET
+    # may be shared with concurrent requests through the registry; the
+    # aggregation itself stays per-caller. Budgets are the T0 internal knobs
     # (permissions_max_response_bytes / permissions_fanout /
     # permissions_max_aggregate_bytes) — ops-facing, not wire.
     # ------------------------------------------------------------------
-    config = request.app.state.config
     items, errors, succeeded, truncated = await _collect_with_byte_budget(
         upstream_client, request, directories,
         concurrency=config.permissions_fanout,
         per_dir_cap=config.permissions_max_response_bytes,
         aggregate_cap=config.permissions_max_aggregate_bytes,
         item_cap=_MAX_AGGREGATE_ITEMS,
+        registry=registry if coalesce else None,
     )
 
     # ------------------------------------------------------------------
@@ -212,6 +306,7 @@ async def _fetch_permissions_for_dir(
     directory: str,
     *,
     cap: int,
+    registry=None,
 ) -> tuple[list[dict], str | None, int]:
     """Fetch pending permission cards for a single directory.
 
@@ -226,63 +321,109 @@ async def _fetch_permissions_for_dir(
     (cross-request global /permission concurrency cap) and by ``cap`` (per-dir
     byte ceiling via ``read_with_cap``).
 
+    Coalescing LEVEL 2 (traffic plan Batch 1 / A4): when ``registry`` is
+    given, the raw GET + cap-read runs through ``fetch_or_bypass`` keyed
+    ``("permission-dir", id(upstream), directory)`` — concurrent requests
+    aggregating the same directory share ONE upstream GET. Only the RAW
+    body is shared: the whitelist projection + ``directory`` stamping +
+    budget accounting stay per-caller, so the envelope is byte-identical to
+    the direct path. Upstream failures raise ``_DirFetchFailure`` inside the
+    factory (flight fails — immediate refund, never retained), re-raised to
+    every joiner as the same instance and isolated per-caller into
+    ``errors[]``. A budget bypass (``None`` lease) falls back to this
+    function's direct path.
+
     Never raises for upstream/network failures — the caller isolates per-dir
     errors into the envelope's ``errors[]``. ``asyncio.CancelledError``
     propagates (it is a ``BaseException`` subclass, so the ``except`` clauses
     below never swallow it).
     """
-    async with request.app.state.permissions_semaphore:
-        try:
-            response = await upstream_client.send(
-                upstream_client.build_request(
-                    "GET", "/permission",
-                    headers=forward_directory_headers(directory),
-                ),
-                stream=True,
-            )
-        except httpx.RequestError:
-            return [], UPSTREAM_UNAVAILABLE, 0
-        try:
-            status = response.status_code
-            if status >= 400:
-                # 4xx (incl. unlikely 404) → upstream_http_N; 5xx →
-                # upstream_unavailable (per-dir, do NOT raise — isolated
-                # into the envelope errors[]). Bounded drain via read_with_cap
-                # (NOT unbounded aread).
-                await read_with_cap(
-                    response, cap, on_read=lambda n: stash_up_in(request, n),
-                )
-                return [], upstream_error_code_for_status(status), 0
-            body, total = await read_with_cap(
-                response, cap, on_read=lambda n: stash_up_in(request, n),
-            )
-            # per-dir cap exceeded / read failure → error + body_bytes=0.
-            # Read bytes are still counted via stash_up_in (traffic), but
-            # do NOT occupy the accepted aggregate budget.
-            if body is None:
-                return [], UPSTREAM_UNAVAILABLE, 0
+    config = request.app.state.config
+
+    async def _raw() -> tuple[bytes, int]:
+        async with request.app.state.permissions_semaphore:
             try:
-                payload = orjson.loads(body)
-            except (orjson.JSONDecodeError, ValueError):
-                return [], UPSTREAM_UNAVAILABLE, 0
-            if not isinstance(payload, list):
-                return [], UPSTREAM_UNAVAILABLE, 0
-            items = [
-                {**{
-                    k: entry[k] for k in _PERMISSION_FIELDS if k in entry
-                }, "directory": directory}
-                for entry in payload if isinstance(entry, dict)
-            ]
-            return items, None, total
-        except httpx.RequestError:
-            return [], UPSTREAM_UNAVAILABLE, 0
-        finally:
-            await response.aclose()
+                response = await upstream_client.send(
+                    upstream_client.build_request(
+                        "GET", "/permission",
+                        headers=forward_directory_headers(directory),
+                    ),
+                    stream=True,
+                )
+            except httpx.RequestError:
+                raise _DirFetchFailure(UPSTREAM_UNAVAILABLE)
+            try:
+                status = response.status_code
+                if status >= 400:
+                    # 4xx (incl. unlikely 404) → upstream_http_N; 5xx →
+                    # upstream_unavailable (per-dir, do NOT raise — isolated
+                    # into the envelope errors[]). Bounded drain via
+                    # read_with_cap (NOT unbounded aread).
+                    await read_with_cap(
+                        response, cap,
+                        on_read=lambda n: stash_up_in(request, n),
+                    )
+                    raise _DirFetchFailure(
+                        upstream_error_code_for_status(status))
+                body, total = await read_with_cap(
+                    response, cap,
+                    on_read=lambda n: stash_up_in(request, n),
+                )
+                # per-dir cap exceeded / read failure → error + body_bytes=0.
+                # Read bytes are still counted via stash_up_in (traffic), but
+                # do NOT occupy the accepted aggregate budget.
+                if body is None:
+                    raise _DirFetchFailure(UPSTREAM_UNAVAILABLE)
+                return body, total
+            except httpx.RequestError:
+                raise _DirFetchFailure(UPSTREAM_UNAVAILABLE)
+            finally:
+                await response.aclose()
+
+    body: bytes
+    total: int
+    if registry is not None:
+        try:
+            lease = await registry.fetch_or_bypass(
+                ("permission-dir", id(upstream_client), directory),
+                _raw,
+                reserve_bytes=config.max_response_bytes,
+            )
+        except _DirFetchFailure as exc:
+            return [], exc.code, 0
+        if lease is not None:
+            async with lease:
+                body, total = lease.body
+        else:  # budget full → direct fetch (unchanged behaviour)
+            try:
+                body, total = await _raw()
+            except _DirFetchFailure as exc:
+                return [], exc.code, 0
+    else:
+        try:
+            body, total = await _raw()
+        except _DirFetchFailure as exc:
+            return [], exc.code, 0
+
+    try:
+        payload = orjson.loads(body)
+    except (orjson.JSONDecodeError, ValueError):
+        return [], UPSTREAM_UNAVAILABLE, 0
+    if not isinstance(payload, list):
+        return [], UPSTREAM_UNAVAILABLE, 0
+    items = [
+        {**{
+            k: entry[k] for k in _PERMISSION_FIELDS if k in entry
+        }, "directory": directory}
+        for entry in payload if isinstance(entry, dict)
+    ]
+    return items, None, total
 
 
 async def _collect_with_byte_budget(
     upstream_client, request, directories, *,
     concurrency: int, per_dir_cap: int, aggregate_cap: int, item_cap: int,
+    registry=None,
 ) -> tuple[list[dict], list[dict], list[str], bool]:
     """Sliding-window fan-out scheduler for cross-directory permission aggregation.
 
@@ -316,7 +457,8 @@ async def _collect_with_byte_budget(
     def launch(index: int) -> None:
         tasks[index] = asyncio.create_task(
             _fetch_permissions_for_dir(
-                upstream_client, request, directories[index], cap=per_dir_cap,
+                upstream_client, request, directories[index],
+                cap=per_dir_cap, registry=registry,
             )
         )
 

@@ -143,7 +143,7 @@ async def test_skeleton_projection(app_and_client):
         response = await client.get("/slimapi/command", headers=VERSION_HEADERS)
     assert response.status_code == 200
     assert response.headers["Cache-Control"] == "no-store"
-    assert response.headers["Vary"] == "Accept-Encoding"
+    assert response.headers["Vary"] == "Accept-Encoding, X-Opencode-Directory"  # Batch 2/B1: directory merged into Vary
     body = orjson.loads(response.content)
     assert isinstance(body, list)
     assert len(body) == 2
@@ -206,7 +206,7 @@ async def test_gzip_negotiation(upstream_factory):
             ) as resp:
                 assert resp.status_code == 200
                 assert resp.headers["Content-Encoding"] == "gzip"
-                assert resp.headers["Vary"] == "Accept-Encoding"
+                assert resp.headers["Vary"] == "Accept-Encoding, X-Opencode-Directory"  # Batch 2/B1: directory merged into Vary
                 raw = b""
                 async for chunk in resp.aiter_raw():
                     raw += chunk

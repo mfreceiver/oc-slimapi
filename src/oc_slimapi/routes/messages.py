@@ -11,8 +11,14 @@ from fastapi import APIRouter, Query, Request
 from starlette.responses import Response
 
 from ..errors import CodedHTTPException
+from .. import etag as etag_mod
 from ..gzip_util import compress_if_beneficial, error_response
-from ..skeleton import SkeletonLimits, skeleton_messages, strip_diagnostics_message
+from ..skeleton import (
+    SkeletonLimits,
+    recompute_fingerprint,
+    skeleton_messages,
+    strip_diagnostics_message,
+)
 from ..sse.singleflight import full_fetch_key, fulls
 from ..transform import (
     TransformBusy,
@@ -72,6 +78,11 @@ def _parse_sort_project(
     Shared by the default pack worker (:func:`_project_list_sorted_and_pack`)
     and the L2-CD-2 merged path, which needs the projected dicts (to detect
     placeholder messages and later splice inlined fulls) before packing.
+
+    Batch 4 / B3: the fingerprint switch rides on ``limits.fingerprint``
+    (built by the route from config) so this worker's signature is
+    unchanged — the projection injects ``contentFingerprint`` at completion
+    time; merged splices overwrite it later (``_merge_fulls_and_pack``).
     """
     parsed = orjson.loads(body)
     if not isinstance(parsed, list) or not all(
@@ -89,8 +100,8 @@ def _parse_sort_project(
 
 def _project_list_sorted_and_pack(
     body: bytes, *, accept_encoding: str | None, limits: SkeletonLimits,
-) -> tuple[bytes, dict[str, str]]:
-    """Worker entry: parse + sort + project + serialize (+ optional gzip).
+) -> bytes:
+    """Worker entry: parse + sort + project + serialize to identity bytes.
 
     lite-v2 §8: skeleton list endpoint must return messages sorted by
     ``info.time.created`` ASC. Sort defensively rather than relying on
@@ -101,10 +112,16 @@ def _project_list_sorted_and_pack(
     ``request.app.state.config``) so two apps with different Settings project
     the same upstream body differently — the worker never reads module-level
     config (T8-C1 / T8-C6).
+
+    Traffic plan Batch 2 / B1 (pre-compression validator): compression moved
+    OUT of the worker to the route, which derives the canonical ETag from
+    the identity bytes, judges ``If-None-Match`` (a gzip hit = canonical
+    hash only — zero compression, plan §4) and only then compresses.
+    ``accept_encoding`` is retained in the signature for call-site symmetry
+    (and existing slow-pack monkeypatches); the route owns coding choice.
     """
     projected = _parse_sort_project(body, limits=limits)
-    encoded = orjson.dumps(projected)
-    return compress_if_beneficial(encoded, accept_encoding)
+    return orjson.dumps(projected)
 
 
 _REL_PARAM_RE = re.compile(
@@ -467,9 +484,13 @@ async def _fetch_full_shared(
 async def _merge_fulls(
     request: Request, pool, config, projected: list[dict],
     sid: str, directory: str | None, *, accept_encoding: str | None,
-) -> tuple[bytes, dict[str, str]]:
+    fingerprint: bool = False,
+) -> bytes:
     """Merged phases B + C: budgeted fan-out fetch, then single-offload
-    splice+pack.
+    splice to identity bytes.
+
+    (Batch 2 / B1: returns the pre-gzip identity body — the route judges
+    ``If-None-Match`` on it before any compression, plan §4.)
 
     Phase B (no pool slot) — ``merged_max_bytes`` is a TRUE FETCH budget
     (rev-fix 2), not a post-hoc filter. A request-level ``remaining`` pool
@@ -561,15 +582,16 @@ async def _merge_fulls(
         return await pool.offload(
             _merge_fulls_and_pack, projected, fetched,
             accept_encoding=accept_encoding,
+            fingerprint=fingerprint,
         )
 
 
 def _merge_fulls_and_pack(
     projected: list[dict], fetched: dict[int, bytes],
-    *, accept_encoding: str | None,
-) -> tuple[bytes, dict[str, str]]:
+    *, accept_encoding: str | None, fingerprint: bool = False,
+) -> bytes:
     """Worker entry (phase C): splice fetched fulls into the projected list,
-    then serialize (+ optional gzip) — the merged analogue of
+    then serialize to identity bytes — the merged analogue of
     ``_project_list_sorted_and_pack``.
 
     For each fetched message: parse the full body, strip the never-consumed
@@ -578,6 +600,21 @@ def _merge_fulls_and_pack(
     the LIST's ``info`` (order key unchanged, byte-parity with the default
     projection elsewhere). Malformed per-item bodies (bad JSON / non-dict /
     non-list parts) degrade that item — never the page.
+
+    Batch 2 / B1 (pre-compression validator): returns the identity bytes
+    only; the route judges ``If-None-Match`` on them BEFORE compressing (a
+    changed /full detail changes the merged body → a new validator, even
+    when the list page body is unchanged). ``accept_encoding`` is retained
+    for call-site symmetry.
+
+    Batch 4 / B3 (merged fingerprint recomputation): after a successful
+    splice the message's final representation CHANGED (skeleton parts →
+    full parts), so the skeleton-period ``contentFingerprint`` is stale —
+    recompute over the spliced message. The FIVE degrade paths below
+    (fetch error / budget skip happen upstream in ``_merge_fulls`` and never
+    reach ``fetched``; bad JSON / non-dict / non-list ``parts`` bail before
+    the splice) do NOT recompute: the final representation IS the original
+    skeleton, whose fingerprint is already correct.
     """
     for index, body in fetched.items():
         try:
@@ -589,8 +626,200 @@ def _merge_fulls_and_pack(
         parts = strip_diagnostics_message(full).get("parts")
         if isinstance(parts, list):
             projected[index]["parts"] = parts
-    encoded = orjson.dumps(projected)
-    return compress_if_beneficial(encoded, accept_encoding)
+            if fingerprint:
+                recompute_fingerprint(projected[index])
+    return orjson.dumps(projected)
+
+
+# ---------------------------------------------------------------------------
+# Upstream-fetch coalescing (traffic plan Batch 1 / A2, §3.x join-first).
+#
+# The SHARED unit is the upstream list GET + cap-read (NOT the projection):
+# callers first obtain the raw body through the per-app
+# ``LeasedSingleFlight`` registry (``app.state.raw_fetch_registry``), then
+# each runs its own pool admission + offload projection — byte-identical to
+# the direct path. A full registry budget returns ``None`` and the caller
+# falls back to the unchanged admission-first direct path below.
+# ---------------------------------------------------------------------------
+
+def _canonical_list_query(limit: int, before: str | None, mode: str | None) -> str:
+    """Deterministic, sorted query string for the coalescing key.
+
+    Key-order normalisation (sorted) prevents semantically identical queries
+    from splitting the flight key. ``mode`` participates even though it is
+    not forwarded upstream: ``mode=merged`` callers keep their own flight so
+    merged and default pages never observe each other's shared bodies (the
+    upstream resource is identical, but A2-C2 locks the conservative split).
+    """
+    parts: dict[str, str] = {"limit": str(limit)}
+    if before is not None:
+        parts["before"] = before
+    if mode is not None:
+        parts["mode"] = mode
+    return "&".join(f"{name}={parts[name]}" for name in sorted(parts))
+
+
+def _messages_list_key(
+    request: Request, sid: str, directory: str | None,
+    limit: int, before: str | None, mode: str | None,
+) -> tuple:
+    """Flight key for the list GET: embeds the upstream client identity
+    (defense-in-depth against cross-app sharing, mirroring
+    ``full_fetch_key``'s ``id(scope)`` convention), the session, the
+    directory (same resource under another directory = another upstream
+    resource) and the canonical query."""
+    return (
+        "messages-list", id(request.app.state.upstream), sid, directory,
+        _canonical_list_query(limit, before, mode),
+    )
+
+
+async def _fetch_list_raw(
+    request: Request, sid: str, params: dict, directory: str | None,
+    *, cap: int,
+) -> tuple[bytes | None, str | None]:
+    """Shared factory body: ONE upstream list GET + cap-read, plus the
+    Link→cursor capture that must happen before ``aclose()``. The result
+    tuple is what every joiner of the flight receives — same upstream
+    response, same opaque cursor."""
+    response = await _stream_upstream(
+        request, f"/session/{sid}/message", params, directory,
+    )
+    try:
+        body = await read_upstream_response(
+            request, response,
+            cap=cap,
+            read_with_cap=read_with_cap,
+            sid=sid,
+        )
+        next_cursor = _parse_link_next_cursor(response.headers.get("Link"))
+        return body, next_cursor
+    finally:
+        await response.aclose()
+
+
+async def _messages_via_lease(
+    request: Request, registry, pool, config, sid: str,
+    directory: str | None, params: dict,
+    limit: int, before: str | None, mode: str | None,
+    *, merged_mode: bool,
+) -> Response | None:
+    """Join-first lease path (plan §3.x): fetch the raw list body through
+    the registry, then run the caller's OWN pool admission + offload
+    projection — identical shapes, headers, error mappings and busy
+    semantics to the direct path.
+
+    Returns ``None`` when the registry budget is full (``fetch_or_bypass``
+    bypass) — the caller then takes the unchanged admission-first direct
+    path for this request.
+    """
+    accept_encoding = request.headers.get("accept-encoding")
+
+    async def _factory() -> tuple[bytes | None, str | None]:
+        return await _fetch_list_raw(
+            request, sid, params, directory, cap=config.max_response_bytes,
+        )
+
+    lease = await registry.fetch_or_bypass(
+        _messages_list_key(request, sid, directory, limit, before, mode),
+        _factory,
+        reserve_bytes=config.max_response_bytes,
+    )
+    if lease is None:
+        return None  # budget full → direct path (plan §3.x bypass rule)
+    async with lease:
+        body, next_cursor = lease.body
+        if body is None:
+            return error_response(
+                "response_too_large", 413,
+                limit=config.max_response_bytes,
+                accept_encoding=accept_encoding,
+            )
+        limits = SkeletonLimits(
+            field_bytes=config.skeleton_inline_output_max_bytes,
+            message_bytes=config.skeleton_inline_output_max_message_bytes,
+            fingerprint=config.message_fingerprint_enabled,
+        )
+        projected: list[dict] | None = None
+        identity: bytes | None = None
+        try:
+            # The caller's own admission + offload — the same
+            # admission-before-projection discipline (and the same
+            # ``transform_busy`` 503 shape) as the direct path; only the
+            # raw GET moved out (join-first, plan §3.x).
+            async with pool:
+                try:
+                    if merged_mode:
+                        projected = await pool.offload(
+                            _parse_sort_project, body, limits=limits,
+                        )
+                    else:
+                        identity = await pool.offload(
+                            _project_list_sorted_and_pack, body,
+                            accept_encoding=accept_encoding,
+                            limits=limits,
+                        )
+                except (orjson.JSONDecodeError, ValueError, TypeError, AttributeError) as exc:
+                    raise_upstream_unavailable(exc)
+            if projected is not None:
+                # Merged phases B+C: fan-out via the UNCHANGED
+                # ``singleflight.fulls`` registry, then one splice offload
+                # (oracle §C-2 — two-level dedup, no interference).
+                identity = await _merge_fulls(
+                    request, pool, config, projected, sid, directory,
+                    accept_encoding=accept_encoding,
+                    fingerprint=config.message_fingerprint_enabled,
+                )
+            base_headers: dict[str, str] = {"Cache-Control": "no-store"}
+            if next_cursor:
+                base_headers["X-Next-Cursor"] = next_cursor
+            # Batch 2 / B1-1R (rev-5): coding-specific SINGLE-candidate 304
+            # judgment, pre-compression (plan §4 :222-229 — a validator hit
+            # is zero compression). Identity-only / sub-min requests judge
+            # the identity strong tag exactly; gzip-capable requests judge
+            # ONLY the gzip weak tag (an identity tag gets a conservative
+            # 200 — B1-C5 reverse direction). ``*`` compresses once and
+            # echoes the actual coding's tag. The 200 below labels its
+            # validator with the coding it ACTUALLY carries (B1-1R).
+            rep_version = etag_mod.response_rep_version(config)
+            vary_value = "Accept-Encoding"
+            if rep_version is not None:
+                vary_value = etag_mod.merged_vary(vary_value)
+                aux = ({"X-Next-Cursor": next_cursor}
+                       if next_cursor else None)
+                verdict = etag_mod.judge_conditional(
+                    identity,
+                    request.headers.get("if-none-match"),
+                    rep_version,
+                    accept_encoding=accept_encoding,
+                )
+                if verdict == "*":
+                    encoded, c_headers = compress_if_beneficial(
+                        identity, accept_encoding)
+                    actual = (
+                        "gzip" if "Content-Encoding" in c_headers
+                        else "identity")
+                    return etag_mod.not_modified_response(
+                        etag_mod.compute_etag(identity, actual, rep_version),
+                        vary_value, aux=aux,
+                    )
+                if verdict is not None:
+                    return etag_mod.not_modified_response(
+                        verdict, vary_value, aux=aux)
+            encoded, c_headers = compress_if_beneficial(identity, accept_encoding)
+            final_headers = dict(c_headers)
+            if rep_version is not None:
+                actual_coding = (
+                    "gzip" if "Content-Encoding" in c_headers else "identity")
+                final_headers["ETag"] = etag_mod.compute_etag(
+                    identity, actual_coding, rep_version)
+                final_headers["Vary"] = vary_value
+            return Response(
+                encoded, status_code=200, media_type="application/json",
+                headers={**base_headers, **final_headers},
+            )
+        except TransformBusy:
+            return _busy_response(accept_encoding)
 
 
 @router.get("")
@@ -636,7 +865,19 @@ async def messages(
     config = request.app.state.config
     pool = request.app.state.transforms
     merged_mode = mode == "merged"
+    # Join-first coalescing (plan §3.x / A2): try the registry FIRST; a
+    # ``None`` return (budget full, disabled, or no registry on old app
+    # instances) falls through to the unchanged admission-first path.
+    registry = getattr(request.app.state, "raw_fetch_registry", None)
+    if registry is not None and config.coalesce_enabled:
+        leased = await _messages_via_lease(
+            request, registry, pool, config, sid, directory, params,
+            limit, before, mode, merged_mode=merged_mode,
+        )
+        if leased is not None:
+            return leased
     projected: list[dict] | None = None
+    identity: bytes | None = None
     try:
         # Admission BEFORE the upstream GET: this is the key fix. The prior
         # code buffered the entire upstream body and only then tried to
@@ -686,15 +927,17 @@ async def messages(
                             limits=SkeletonLimits(
                                 field_bytes=config.skeleton_inline_output_max_bytes,
                                 message_bytes=config.skeleton_inline_output_max_message_bytes,
+                                fingerprint=config.message_fingerprint_enabled,
                             ),
                         )
                     else:
-                        encoded, extra = await pool.offload(
+                        identity = await pool.offload(
                             _project_list_sorted_and_pack, body,
                             accept_encoding=request.headers.get("accept-encoding"),
                             limits=SkeletonLimits(
                                 field_bytes=config.skeleton_inline_output_max_bytes,
                                 message_bytes=config.skeleton_inline_output_max_message_bytes,
+                                fingerprint=config.message_fingerprint_enabled,
                             ),
                         )
                 except (orjson.JSONDecodeError, ValueError, TypeError, AttributeError) as exc:
@@ -702,18 +945,61 @@ async def messages(
             finally:
                 await response.aclose()
         if projected is not None:
-            # Merged phases B+C: fan-out (no slot) → single splice/pack
-            # offload under admission with the EXISTING busy semantics.
-            encoded, extra = await _merge_fulls(
+            # Merged phases B+C: fan-out (no slot) → single splice offload
+            # under admission with the EXISTING busy semantics.
+            identity = await _merge_fulls(
                 request, pool, config, projected, sid, directory,
                 accept_encoding=request.headers.get("accept-encoding"),
+                fingerprint=config.message_fingerprint_enabled,
             )
         base_headers: dict[str, str] = {"Cache-Control": "no-store"}
         if next_cursor:
             base_headers["X-Next-Cursor"] = next_cursor
+        # Batch 2 / B1-1R (rev-5, same tail as the lease path): coding-
+        # specific SINGLE-candidate pre-compression judgment (identity-only
+        # / sub-min → exact identity tag; gzip-capable → gzip tag only,
+        # identity tag gets a conservative 200 per B1-C5; ``*`` compresses
+        # once and echoes the actual coding). Zero compression on every
+        # non-star 304. The 200 labels its validator with the coding it
+        # ACTUALLY carries. Aux header value comes from THIS run.
+        rep_version = etag_mod.response_rep_version(config)
+        vary_value = "Accept-Encoding"
+        if rep_version is not None:
+            vary_value = etag_mod.merged_vary(vary_value)
+            aux = ({"X-Next-Cursor": next_cursor}
+                   if next_cursor else None)
+            verdict = etag_mod.judge_conditional(
+                identity,
+                request.headers.get("if-none-match"),
+                rep_version,
+                accept_encoding=request.headers.get("accept-encoding"),
+            )
+            if verdict == "*":
+                encoded, c_headers = compress_if_beneficial(
+                    identity, request.headers.get("accept-encoding"))
+                actual = (
+                    "gzip" if "Content-Encoding" in c_headers
+                    else "identity")
+                return etag_mod.not_modified_response(
+                    etag_mod.compute_etag(identity, actual, rep_version),
+                    vary_value, aux=aux,
+                )
+            if verdict is not None:
+                return etag_mod.not_modified_response(
+                    verdict, vary_value, aux=aux)
+        encoded, c_headers = compress_if_beneficial(
+            identity, request.headers.get("accept-encoding"),
+        )
+        final_headers = dict(c_headers)
+        if rep_version is not None:
+            actual_coding = (
+                "gzip" if "Content-Encoding" in c_headers else "identity")
+            final_headers["ETag"] = etag_mod.compute_etag(
+                identity, actual_coding, rep_version)
+            final_headers["Vary"] = vary_value
         return Response(
             encoded, status_code=200, media_type="application/json",
-            headers={**base_headers, **extra},
+            headers={**base_headers, **final_headers},
         )
     except TransformBusy:
         return _busy_response(request.headers.get("accept-encoding"))

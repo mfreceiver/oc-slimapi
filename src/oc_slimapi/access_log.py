@@ -280,6 +280,7 @@ def write_access_log(
     client: str | None = None,
     client_ver: str | None = None,
     client_id: str | None = None,
+    cache: str | None = None,
 ) -> None:
     """Emit one JSON-lines access record.
 
@@ -288,7 +289,10 @@ def write_access_log(
 
     ``client``, ``clientVer``, ``clientId`` are optional fields for client
     identity tracking.  When ``None`` these are written as JSON ``null`` so
-    every row has a stable set of keys (``jq``-friendly).
+    every row has a stable set of keys (``jq``-friendly). ``cache``
+    ("hit"/"miss", traffic plan Batch 1 / A1) is the exception: it is only
+    written when set, because rows from non-catalog routes (and deployments
+    with the cache disabled) have no cache semantics at all.
     """
     if logger.disabled:
         return
@@ -309,6 +313,8 @@ def write_access_log(
         "clientVer": client_ver,
         "clientId": client_id,
     }
+    if cache is not None:
+        record["cache"] = cache
     logger.info(json.dumps(record, separators=(",", ":")))
 
 

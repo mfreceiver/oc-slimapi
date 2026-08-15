@@ -167,7 +167,7 @@ async def test_skeleton_messages_route_returns_projected_json(app_and_client):
     tool_part = body[0]["parts"][1]
     assert tool_part["state"]["input"] == {"command": "ls"}
     assert "output" not in tool_part["state"]
-    assert response.headers["Vary"] == "Accept-Encoding"
+    assert response.headers["Vary"] == "Accept-Encoding, X-Opencode-Directory"  # Batch 2/B1: directory merged into Vary
     assert response.headers["Cache-Control"] == "no-store"
 
 

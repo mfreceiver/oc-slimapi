@@ -273,6 +273,7 @@ def _record(
         client_name = state.get("traffic_client_name")
         client_ver = state.get("traffic_client_ver")
         client_id_raw = state.get("traffic_client_id_raw")
+        cache_state = state.get("traffic_cache")
 
         # Resolve client_id: hash vs plaintext (fail-closed: default hash).
         client_id: str | None = None
@@ -303,6 +304,7 @@ def _record(
             client=client_name,
             client_ver=client_ver,
             client_id=client_id,
+            cache=cache_state,
         )
     except Exception as exc:
         logger.warning("write_access_log failed", exc_info=exc)
