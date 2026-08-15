@@ -26,7 +26,7 @@ ocdroid 对接时：
 
 ---
 
-## [Unreleased]
+## [1.4.0] - 2026-08-15
 
 ### Added
 
