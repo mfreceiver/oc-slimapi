@@ -81,6 +81,7 @@ from ...config import (
     TOKEN_RESYNC_QUEUE_CAP,
 )
 from ...logging_config import get_logger
+from ..hub_types import TOKEN_FRAME_TYPE
 from .frames import (
     STOP,
     _connected_frame,
@@ -91,6 +92,7 @@ from .frames import (
     _resync_frame,
     _snapshot_frame,
     _truncated_frame,
+    sse_frame,
 )
 from .frames import PartKey
 from .models import DeltaAccumulator, LivePart, _TokenMetrics
@@ -152,6 +154,27 @@ def apply_debug_budget_overrides(settings: Any) -> None:
         TOKEN_LIVE_PARTS_MAX = settings.token_stream_debug_live_parts_max
 
 
+def _events_token_frame(key: PartKey, text: str) -> bytes:
+    """Curated-events token frame (L2-A, ``/slimapi/events?tokens=1``).
+
+    A lean projection distinct from the per-session stream's
+    :func:`_delta_frame`: ``{type:"token", sessionID, messageID, partID,
+    delta}`` with NO ``partEventRevision`` and NO ``directory``. SessionID is
+    globally unique in single-user T3, so ``directory`` is redundant here;
+    authoritative part-revision / full-text tracking stays on the per-session
+    stream and ``/messages/{sid}`` (events token frames are the animation
+    layer only). No ``event:`` name — the curated-events client dispatches on
+    ``data.type`` (mirrors the raw IMMEDIATE passthrough style).
+    """
+    return sse_frame({
+        "type": TOKEN_FRAME_TYPE,
+        "sessionID": key[0],
+        "messageID": key[1],
+        "partID": key[2],
+        "delta": text,
+    })
+
+
 class TokenStreamHub:
     """Part-lifecycle-gated accumulator + flush engine for the token stream.
 
@@ -205,6 +228,16 @@ class TokenStreamHub:
         # Stage C subscriber fanout (§5.5 handshake). Stage D's TokenSubscriber
         # registers here; until then attach_subscriber is exercised by tests.
         self._subs_by_sid: dict[str, set[Any]] = {}
+        # L2-A (plan Task L2-A / oracle §A-1): curated-events token taps.
+        # Control-plane subscribers on ``/slimapi/events?tokens=1`` register
+        # their ``put`` (a :class:`~oc_slimapi.sse.hub_types.Subscriber`
+        # method) here so every flushed ``(sid, mid, pid)`` window concat is
+        # enqueued as a lean ``{type:"token", ...}`` frame. Reusing
+        # ``Subscriber.put`` means the unchanged T3 backpressure guard
+        # (overflow → ``resync{subscriber_backpressure}`` + disconnect)
+        # applies with no new path. Empty list = zero per-flush overhead
+        # (the ``if self.events_tap:`` gate in :meth:`flush`).
+        self.events_tap: list[Any] = []
         # Per-frame byte ceiling for safe_put / emit_snapshot_or_truncated.
         self._max_frame_bytes: int = max_frame_bytes
         # Background flush task (None until start(); cancelled by stop()).
@@ -283,6 +316,26 @@ class TokenStreamHub:
         """
         return sum(len(subs) for subs in self._subs_by_sid.values())
 
+    def has_consumers(self) -> bool:
+        """True while ANY token consumer remains.
+
+        Unified liveness predicate for the flush-loop watchdog
+        (:meth:`_on_flush_done`): per-session token subscribers
+        (``_subs_by_sid`` via :attr:`subscriber_count`) **OR** curated-events
+        token taps (``events_tap``, i.e. ``/slimapi/events?tokens=1``
+        subscribers).
+
+        The events-token ledger (``TokenStreamRegistry.events_tokens``) is
+        kept in lockstep with ``events_tap`` — attach/detach add/remove one
+        ``put`` per subscriber — so a non-empty ``events_tap`` is exactly
+        "events ledger non-empty" (no parallel counter to drift). An
+        events-only stream (zero per-session subs) therefore keeps the loop
+        alive across an abnormal death: with the old
+        ``subscriber_count > 0`` check the loop would never rebuild and
+        token frames would stop forever while the connection stayed up.
+        """
+        return self.subscriber_count > 0 or len(self.events_tap) > 0
+
     @property
     def orphan_deltas(self) -> int:
         """Cumulative count of orphan ``message.part.delta`` events (C3)."""
@@ -336,10 +389,11 @@ class TokenStreamHub:
           close — expected).
         * normal exit → return (``flush_loop`` is ``while True`` so this is
           unreachable; defensive).
-        * exception death → if subscribers remain, log CRITICAL and rebuild
-          via :meth:`start` so deltas do not silently stop; else leave it
-          dead (no consumers → no point rebuilding; the next first-attach
-          :meth:`start` will create a fresh task).
+        * exception death → if any token consumer remains (per-session subs
+          OR events-token taps, via :meth:`has_consumers`), log CRITICAL and
+          rebuild via :meth:`start` so deltas do not silently stop; else
+          leave it dead (no consumers → no point rebuilding; the next
+          first-attach :meth:`start` will create a fresh task).
         """
         if task.cancelled():
             return
@@ -355,10 +409,11 @@ class TokenStreamHub:
         if exc is None:
             return  # defensive — flush_loop is while True
         logger.critical(
-            "token flush_loop died unexpectedly; %d subscriber(s) remain",
-            self.subscriber_count, exc_info=exc,
+            "token flush_loop died unexpectedly; %d per-session + %d events-token "
+            "consumer(s) remain",
+            self.subscriber_count, len(self.events_tap), exc_info=exc,
         )
-        if self.subscriber_count > 0:
+        if self.has_consumers():
             self._flush_task = None
             self.start()
 
@@ -442,6 +497,19 @@ class TokenStreamHub:
                         part_revision=self._next_part_revision(key),
                     ),
                 )
+                # L2-A (plan Task L2-A): curated-events token tap — every
+                # completed (sid, mid, pid) window concat is fanned to the
+                # ``/slimapi/events?tokens=1`` subscribers as a lean
+                # ``{type:"token", ...}`` frame. Fires on the 100ms
+                # flush_loop cadence (NOT the handshake-only flush_sid) so
+                # events-token consumers see live tokens. Empty list → no-op
+                # (zero per-flush overhead when no events-token subscriber).
+                # The tap reuses ``Subscriber.put`` so the unchanged T3
+                # backpressure guard applies (A-C4).
+                if self.events_tap:
+                    token_frame = _events_token_frame(key, text)
+                    for tap in self.events_tap:
+                        tap(token_frame)
             # Clean up empty accumulators (drain cleared their chunks).
             for key in [k for k, v in self._pending.items() if not v.chunks]:
                 self._pending.pop(key, None)

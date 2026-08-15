@@ -107,8 +107,24 @@ curl -s -H "$H" $BASE/slimapi/metrics | jq '
 | `command` | `/slimapi/command`、`/slimapi/command/**` | **骨架投影**：catalog whitelist（`name/description/agent/hints`），丢 `template`（~97.7%） |
 | `agent` | `/slimapi/agent`、`/slimapi/agent/**` | **骨架投影**：catalog whitelist（`name/description/mode/hidden/native`），丢 `prompt`+`permission`（>96%） |
 | `questions` | `/slimapi/questions`（跨目录聚合，加性回归） | 聚合 envelope（envelope 透传，per-dir fan-out） |
+| `other` | `/slimapi/permissions`（跨目录 pending permission 聚合，加性回归）等 | **归 `other`**（bucketize 无独立 `permissions` 桶——见下「§3.3 permissions 聚合 bucket 口径」）；**非 passthrough** |
 | `passthrough` | catch-all `/**`（发消息等写） | **不省流**，透传（基线，比值≈1） |
 | `health` / `metrics` / `other` | 各自端点 | 元数据/探活 |
+
+### 3.3 新 bucket 口径（L1–L3 slim 整合，2026-08-15）
+
+**`/slimapi/permissions` 归 slim 侧（非 passthrough），但 bucketize 无独立 `permissions` 桶 → 落入 `other`**：
+
+- `GET /slimapi/permissions`（跨目录 pending permission 聚合，镜像 `/slimapi/questions`）在 `bucketize()`（`traffic.py`）中**未设独立桶**——`/slimapi/**` 前缀命中后无 `permissions` 分支，回落到 `return "other"`（`traffic.py` line 91）。因此该端点流量与其它无专属桶的 `/slimapi/**` 端点一起计入 **`other`** 桶，**不**进 `passthrough`（`passthrough` 仅 catch-all `/**`）。
+- **记账内容**：`upIn` = 聚合抓取的上游字节（发现 `/experimental/session` + 各 directory 的 `/permission` fan-out 成本，经 `stash_up_in` 计入）；`downOut` = 聚合 envelope 下发字节（白名单投影后）。
+- **运维含义**：查"permissions 省了多少"不能在 `ratios.permissions` 找到独立比值——需从 `other` 桶读数，或按 access log 的 `bucket=="other"` + `path=="/slimapi/permissions"` 过滤（见 §5）。未来如需独立桶，可在 `bucketize()` 加 `permissions` 分支（纯 ops 面，不 bump wire）。
+
+**events SSE 在非 gzip 下，`tokens=1` 的 `token` 帧增量流量**：
+
+- `events_sse` 桶**恒不 gzip**（控制面 SSE 无 `Content-Encoding`，契约 §9 gzip 三层语义第 1 层）。`GET /slimapi/events?tokens=1` 激活后，该连接额外收到 lean `token` 帧（`{type:"token",sessionID,messageID,partID,delta}`），每帧经 `record_sse_downstream(bucket="events_sse", bytes_out=len(frame))` **计入 `events_sse` 桶的 `downOut`**（per-subscriber-per-frame，与 digest/q-p 帧同路径同桶，不另设子桶）。
+- **增量流量性质**：`token` 帧是 token flush loop（100ms/4KiB 窗口）的增量 concat 明文下发，**未经 gzip 压缩**——`tokens=1` 时 `events_sse.downOut` 明显高于纯 digest 流（动画层成本）。**非异常**：这是 lean token 帧的设计代价（换取端到端低延迟实时性）；若需对照纯控制面省流比，须**分时段**统计（`tokens=1` 连接存在期间单开时段），或对比同窗口内 `upIn`（上游 token 流成本与 digest 共享同一条 `/global/event`，只计一次）。
+- **背压不累计**：`token` 帧溢出走 `Subscriber.put` T3 守卫（`resync{subscriber_backpressure}` + 断连），溢出帧不记账（发出前即丢弃），故 `downOut` 反映**实际发出**的 token 帧字节。
+- **多订阅 fanout**：同 `tokens=1` 语义与 §4 SSE fanout 例外一致——`downOut` 按订阅者翻倍，`upIn` 只计一条共享上游连接。
 
 ---
 

@@ -14,6 +14,7 @@ ocdroid ──(stunnel mTLS 14097)──▶ oc-slimapi :4097 (loopback)
                                       └────────▶ opencode :4096 (legacy /session API)
 
 ocdroid ──(stunnel mTLS 14096)──▶ opencode :4096   # 直连回退，不经 sidecar
+                                                    # 目标态：ocdroid 完成 C1/C3 前置后此直连退役，仅服务匿名消费方（见 docs/specs/CLIENT_CHANGES.md「直连退役」）
 ```
 
 - **只**通过 HTTP 调 opencode **legacy** `/session/**`（及 `/global/event` 等），**不读** opencode SQLite。
@@ -35,7 +36,7 @@ ocdroid ──(stunnel mTLS 14096)──▶ opencode :4096   # 直连回退，�
 | **opencode 源码（在 ocdroid 内）** | `/home/mar/personal_projects/ocdroid/opencode-src/current` | 上游 server 源码快照，供对照 legacy 行为 |
 
 **opencode 源码目录（相对 ocdroid 根）**：`opencode-src/current/`（稳定符号链接 → 当前对齐版本的子目录）。  
-**当前对齐版本**：`opencode-src/current` → **v1.18.13**（完整 monorepo 树；非部分抽取）。后续定期更新时，仅 repoint `current` 符号链接即可，本仓文档路径不需改。`opencode-src/` 在 ocdroid `.gitignore` 中，符号链接不污染 ocdroid git。
+**当前对齐版本**：`opencode-src/current` → **v1.18.16**（完整 monorepo 树；非部分抽取）。后续定期更新时，仅 repoint `current` 符号链接即可，本仓文档路径不需改。`opencode-src/` 在 ocdroid `.gitignore` 中，符号链接不污染 ocdroid git。
 
 ### 上游对照常用路径（相对 `opencode-src/current/`）
 

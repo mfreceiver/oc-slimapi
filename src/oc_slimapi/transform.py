@@ -200,19 +200,41 @@ class TransformPool:
     def config(self) -> TransformConfig:
         return self._config
 
-    async def __aenter__(self) -> "TransformPool":
+    async def acquire(self, timeout: float | None = None) -> None:
+        """Acquire admission, optionally bounded by an explicit per-attempt
+        ``timeout`` (L2-CD-1 budget narrowing: callers that retry admission
+        pass the REMAINING wall-clock budget so the worst-case cumulative
+        wait stays within their total budget; a naive retry at the full
+        ``transform_wait_seconds`` could wait N× that long).
+
+        ``TransformBusy`` semantics are unchanged from the async-with
+        protocol: raised when the wait (``timeout`` here, otherwise
+        ``transform_wait_seconds``) elapses without admission. Callers must
+        pair a successful acquire with exactly one :meth:`release`.
+        """
+        wait_seconds = (
+            self._config.transform_wait_seconds if timeout is None else timeout
+        )
         self._waiting += 1
         try:
             try:
                 await asyncio.wait_for(
                     self._semaphore.acquire(),
-                    timeout=self._config.transform_wait_seconds,
+                    timeout=wait_seconds,
                 )
             except TimeoutError as exc:
                 raise TransformBusy() from exc
         finally:
             self._waiting -= 1
         self._active += 1
+
+    def release(self) -> None:
+        """Release admission granted by :meth:`acquire` (or ``__aenter__``)."""
+        self._active -= 1
+        self._semaphore.release()
+
+    async def __aenter__(self) -> "TransformPool":
+        await self.acquire()
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:

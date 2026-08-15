@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Request
 from starlette.responses import StreamingResponse
 
+from ..errors import CodedHTTPException
 from ..gzip_util import json_response
 from ..sse.hub import STOP, SubscriberCapacityError, sse_frame
 
@@ -8,7 +9,7 @@ router = APIRouter(prefix="/slimapi", tags=["events"])
 
 
 @router.get("/events")
-async def events(request: Request):
+async def events(request: Request, tokens: str | None = None):
     """Process-wide curated SSE stream.
 
     No directory / sessionId / stream parameters: the sidecar holds one
@@ -19,7 +20,20 @@ async def events(request: Request):
     exceeding per-directory or total caps raises ``SubscriberCapacityError``
     which we map to a 503 with ``Retry-After`` so the client backs off and
     retries instead of burning an upstream connection.
+
+    ``?tokens=1`` (L2-A, additive): additionally receive lean ``token``
+    frames — coalesced per-``(sessionID, messageID, partID)`` window concats
+    fanned from the token-stream flush loop (reusing its existing 100ms /
+    4KiB coalescing). Absent (default) = current behaviour unchanged. Only
+    the literal value ``"1"`` is legal; anything else → 400 ``invalid_tokens``
+    (same strictness as the messages ``directory_not_allowed`` structural
+    guard). ``tokens=1`` covers ALL sessions' coalesced deltas (no per-sid
+    filter, MVP) and is mutually exclusive with the per-session token stream
+    at the CLIENT (server does not force-disconnect a double-subscriber).
     """
+
+    if tokens is not None and tokens != "1":
+        raise CodedHTTPException(400, code="invalid_tokens")
 
     try:
         subscriber = request.app.state.hubs.subscribe()
@@ -32,6 +46,13 @@ async def events(request: Request):
         )
 
     subscriber_id = subscriber.id
+    # L2-A: opt-in token frames. The events subscriber becomes a first-class
+    # consumer of the token flush loop (TokenStreamRegistry.events_tokens +
+    # TokenStreamHub.events_tap) so token frames arrive at ~100ms cadence and
+    # the flush loop stays alive even when no per-session stream is open.
+    token_registry = getattr(request.app.state, "token_registry", None)
+    if tokens == "1" and token_registry is not None:
+        token_registry.attach_events_subscriber(subscriber)
     # Pull the traffic ledger here (not in the generator) so a missing /
     # disabled ledger does not crash the SSE path on the first yield.
     traffic_ledger = getattr(request.app.state, "traffic_ledger", None)
@@ -73,6 +94,11 @@ async def events(request: Request):
                         pass
                 yield item
         finally:
+            # L2-A: release the events-token ledger slot before the control
+            # admission slot, so the flush loop stops on the true last-detach
+            # (both ledgers empty) and GlobalHub grace re-arms symmetrically.
+            if tokens == "1" and token_registry is not None:
+                token_registry.detach_events_subscriber(subscriber)
             # Must go through HubRegistry.unsubscribe (not GlobalHub) so
             # total_subscribers is decremented — otherwise the registry
             # counter leaks and admission permanently 503s after the cap.

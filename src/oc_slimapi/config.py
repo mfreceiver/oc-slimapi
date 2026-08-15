@@ -337,6 +337,39 @@ class Settings:
         os.getenv("OC_SLIMAPI_QUESTIONS_FANOUT_CONCURRENCY", "8")
     )
 
+    # L2 consolidation resource knobs (T0; consumed read-only by the A/B/CD
+    # lanes). Mirrors the questions three-knob pattern above.
+    #
+    # B (permission cold-start aggregation, GET /slimapi/permissions):
+    #   per-dir read cap / cross-dir fan-out / cross-dir aggregate byte cap.
+    # C (server-side merge, mode=merged):
+    #   fan-out concurrency / per-page full cap / merged response byte cap.
+    # D (503 transform_busy absorption):
+    #   bounded internal wait budget for the /full/{mid} single-flight retry.
+    # All are internal resource knobs — changing them does NOT change the wire
+    # contract (additive fields, no X-Slimapi-Version bump).
+    permissions_max_response_bytes: int = int(
+        os.getenv("OC_SLIMAPI_PERMISSIONS_MAX_RESPONSE_BYTES", str(2 * 1024 * 1024))
+    )
+    permissions_fanout: int = int(
+        os.getenv("OC_SLIMAPI_PERMISSIONS_FANOUT", "8")
+    )
+    permissions_max_aggregate_bytes: int = int(
+        os.getenv("OC_SLIMAPI_PERMISSIONS_MAX_AGGREGATE_BYTES", str(16 * 1024 * 1024))
+    )
+    merged_fanout: int = int(
+        os.getenv("OC_SLIMAPI_MERGED_FANOUT", "8")
+    )
+    merged_max_fulls_per_page: int = int(
+        os.getenv("OC_SLIMAPI_MERGED_MAX_FULLS_PER_PAGE", "16")
+    )
+    merged_max_bytes: int = int(
+        os.getenv("OC_SLIMAPI_MERGED_MAX_BYTES", str(8 * 1024 * 1024))
+    )
+    transform_absorb_budget_seconds: float = float(
+        os.getenv("OC_SLIMAPI_TRANSFORM_ABSORB_BUDGET_SECONDS", "2.5")
+    )
+
     # T9 (P1-4): incarnation state lives in its own directory, separate from
     # access logs. Legacy deployments kept the incarnation file inside the
     # access-log dir; the new path takes priority with monotonic migration
@@ -627,6 +660,48 @@ class Settings:
         if self.questions_max_aggregate_bytes > 128 * 1024 * 1024:
             raise RuntimeError(
                 "OC_SLIMAPI_QUESTIONS_MAX_AGGREGATE_BYTES must be <= 128 MiB"
+            )
+
+        # L2 consolidation knobs (T0-C2): permissions fan-out in [1, 16];
+        # byte caps positive with aggregate >= per-dir; merged fan-out in
+        # [1, 16]; per-page fulls in [1, 64]; merged byte cap <= 128 MiB;
+        # transform absorb budget strictly positive.
+        if not 1 <= self.permissions_fanout <= 16:
+            raise RuntimeError(
+                "OC_SLIMAPI_PERMISSIONS_FANOUT must be in [1, 16]"
+            )
+        if self.permissions_max_response_bytes <= 0:
+            raise RuntimeError(
+                "OC_SLIMAPI_PERMISSIONS_MAX_RESPONSE_BYTES must be > 0"
+            )
+        if self.permissions_max_aggregate_bytes < self.permissions_max_response_bytes:
+            raise RuntimeError(
+                "OC_SLIMAPI_PERMISSIONS_MAX_AGGREGATE_BYTES must be >= "
+                "OC_SLIMAPI_PERMISSIONS_MAX_RESPONSE_BYTES"
+            )
+        if self.permissions_max_aggregate_bytes > 128 * 1024 * 1024:
+            raise RuntimeError(
+                "OC_SLIMAPI_PERMISSIONS_MAX_AGGREGATE_BYTES must be <= 128 MiB"
+            )
+        if not 1 <= self.merged_fanout <= 16:
+            raise RuntimeError(
+                "OC_SLIMAPI_MERGED_FANOUT must be in [1, 16]"
+            )
+        if not 1 <= self.merged_max_fulls_per_page <= 64:
+            raise RuntimeError(
+                "OC_SLIMAPI_MERGED_MAX_FULLS_PER_PAGE must be in [1, 64]"
+            )
+        if self.merged_max_bytes <= 0:
+            raise RuntimeError(
+                "OC_SLIMAPI_MERGED_MAX_BYTES must be > 0"
+            )
+        if self.merged_max_bytes > 128 * 1024 * 1024:
+            raise RuntimeError(
+                "OC_SLIMAPI_MERGED_MAX_BYTES must be <= 128 MiB"
+            )
+        if self.transform_absorb_budget_seconds <= 0:
+            raise RuntimeError(
+                "OC_SLIMAPI_TRANSFORM_ABSORB_BUDGET_SECONDS must be > 0"
             )
 
         # T9 (P1-4): incarnation state dir must be non-empty.

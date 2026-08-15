@@ -7,14 +7,12 @@
 ## 拓扑
 
 ```text
-                              ┌─ :14096 mTLS ─▶ opencode :4096（直连回退）
 ocdroid ── 公网纯 TCP ──▶ stunnel
-                              └─ :14097 mTLS ─▶ oc-slimapi :4097
-                                                     │ loopback HTTP
-                                                     └────────▶ opencode :4096
+                              ├─ :14097 mTLS ─▶ oc-slimapi :4097 ── loopback HTTP ──▶ opencode :4096（ocdroid 唯一入口）
+                              └─ :14096 mTLS ───────────────────────────────────────▶ opencode :4096（目标态：ocdroid 完成 C1/C3 前置后仅服务匿名消费方）
 ```
 
-sidecar 只监听 loopback，upstream 为固定 loopback HTTP。公网认证靠 stunnel mTLS；双入口确保 sidecar 故障时客户端可真正回退直连。
+sidecar 只监听 loopback，upstream 为固定 loopback HTTP。公网认证靠 stunnel mTLS。**目标态：ocdroid 仅经 `:14097`（slimapi）**——当前 ocdroid 生产流量已 100% 走 `:14097`（实证）；直连 `:14096` **保留至 ocdroid 完成 C1/C3 前置**（此前仍是 ocdroid 的回退路径），前置完成后仅服务匿名消费方（非 ocdroid 的其它 HTTP 客户端直连，sidecar 不干预）。退役说明见 [`docs/specs/CLIENT_CHANGES.md`](docs/specs/CLIENT_CHANGES.md)「直连退役」。
 
 ## 快速开始
 
@@ -36,13 +34,13 @@ curl --fail -H 'X-Slimapi-Version: 2' http://127.0.0.1:4097/slimapi/health
 
 ## 范围（v2 / wire `X-Slimapi-Version: 2`）
 
-- `/slimapi/**`：sessions / sessions/status / messages（list·full skeleton 投影）/ questions（跨目录聚合）/ command / agent（catalog skeleton）/ events（策展 SSE）/ token-stream / metrics / health。每个请求（含 SSE）必须带整数头 `X-Slimapi-Version: 2`；缺失、非整数或不在服务端接受区间返回 400。版本只在破坏性变更时递增，加性变更保持兼容。
+- `/slimapi/**`：sessions / sessions/status / messages（list·full skeleton 投影）/ questions（跨目录聚合）/ permissions（跨目录聚合）/ command / agent（catalog skeleton）/ events（策展 SSE）/ token-stream / metrics / health。每个请求（含 SSE）必须带整数头 `X-Slimapi-Version: 2`；缺失、非整数或不在服务端接受区间返回 400。版本只在破坏性变更时递增，加性变更保持兼容。
 - 其他 HTTP path：流式反代至 `127.0.0.1:4096`（catch-all）。
 - WebSocket：501 语义，不支持 PTY；需要时在前方部署专用 HTTP/WS proxy。
 - REST 精简 JSON：按 `Accept-Encoding` 自 gzip 并返回 `Vary: Accept-Encoding`。
 - SSE：控制面 `/slimapi/events` 永不 gzip；token stream `/slimapi/sessions/{sid}/stream` **默认 gzip**（lever2，首个 SSE gzip 例外，按 `Accept-Encoding` 协商）。
 
-> v2 已移除 routeToken/route_secret，以及 projects / permissions / since / session children 等端点；`questions`（跨目录聚合）与 `sessions/status` 已于 1.1.x 加性回归（详见 [`CHANGELOG.md`](CHANGELOG.md)）。
+> v2 已移除 routeToken/route_secret，以及 projects / since / session children 等端点；`questions`（跨目录聚合）、`sessions/status` 与 `permissions`（跨目录聚合）已加性回归（详见 [`CHANGELOG.md`](CHANGELOG.md)）。
 
 ## 流量记账与日志
 

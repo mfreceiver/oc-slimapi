@@ -5,6 +5,7 @@ Moved from :mod:`oc_slimapi.sse.token_hub`.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import secrets
 from collections import deque
 from dataclasses import dataclass, field
@@ -537,6 +538,58 @@ class TokenStreamRegistry:
         self.total_subscribers = 0
         self.rejected_total = 0
 
+        # L2-A (plan Task L2-A / oracle §A-1 BLOCKER): curated-events token
+        # consumers on ``/slimapi/events?tokens=1``. Each is a control-plane
+        # ``Subscriber`` whose ``put`` is registered on
+        # ``TokenStreamHub.events_tap``; this set is the events side of the
+        # combined flush-loop ledger (first-attach start / last-detach stop)
+        # so the loop keeps running while ONLY events-token consumers remain
+        # (ocdroid retires the per-session stream → zero ``total_subscribers``
+        # must NOT stop the flush that feeds events?tokens=1). A-C5 ledger
+        # symmetry.
+        self.events_tokens: set[Any] = set()
+
+    def attach_events_subscriber(self, sub: Any) -> None:
+        """L2-A: register a control-plane events subscriber as a first-class
+        consumer of the token flush loop (``/slimapi/events?tokens=1``).
+
+        The events subscriber's :meth:`Subscriber.put` is appended to
+        :attr:`TokenStreamHub.events_tap`, so every flushed ``(sid, mid,
+        pid)`` window concat is enqueued as a lean ``{type:"token", ...}``
+        frame. Because the tap reuses ``Subscriber.put``, the UNCHANGED T3
+        backpressure guard (overflow → ``resync{subscriber_backpressure}``
+        + disconnect, A-C4) applies with no new path.
+
+        Lifecycle (A-C5 / NB-C4 extension): this counts toward the combined
+        start/stop ledger — the FIRST events-token attach starts the flush
+        loop even with zero per-session stream subs, and the loop keeps
+        running until BOTH ledgers are empty.
+        """
+        if sub in self.events_tokens:
+            return  # idempotent (same admission slot re-attached)
+        self.events_tokens.add(sub)
+        self.token_hub.events_tap.append(sub.put)
+        # First-attach lifecycle: start the flush loop (idempotent — a
+        # per-session first-attach may already have started it).
+        self.token_hub.start()
+
+    def detach_events_subscriber(self, sub: Any) -> None:
+        """L2-A: mirror of :meth:`attach_events_subscriber`.
+
+        Removes the events subscriber from the tap; stops the flush loop on
+        the true last-detach (both ledgers empty) and re-arms GlobalHub
+        grace symmetrically (B-D1, same predicate as :meth:`unsubscribe`).
+        """
+        if sub not in self.events_tokens:
+            return  # idempotent
+        self.events_tokens.discard(sub)
+        with contextlib.suppress(ValueError):
+            self.token_hub.events_tap.remove(sub.put)
+        if self.total_subscribers == 0 and not self.events_tokens:
+            self.token_hub.stop()
+        if self.hub_registry is not None:
+            self.hub_registry.maybe_arm_grace_if_idle()
+
     def subscribe(self, sid: str) -> TokenSubscriber:
         """Admit one token subscriber for ``sid`` under the cap + handshake.
 
@@ -678,8 +731,9 @@ class TokenStreamRegistry:
         # attach attempt and it failed, the loop is running for nobody
         # (mirrors the unsubscribe last-detach stop). total_subscribers
         # was NOT incremented for the failed sub, so this check correctly
-        # reflects the pre-attempt count.
-        if self.total_subscribers == 0:
+        # reflects the pre-attempt count. L2-A: also keep the loop running
+        # while events-token consumers (``/slimapi/events?tokens=1``) remain.
+        if self.total_subscribers == 0 and not self.events_tokens:
             th.stop()
         # B-D1 symmetric re-arm: we cancelled grace on entry; re-arm it
         # iff no consumer remains across either ledger (control OR token).
@@ -726,7 +780,10 @@ class TokenStreamRegistry:
         if self.total_subscribers < 0:
             # Defensive: should never happen given the membership guard.
             self.total_subscribers = 0
-        if self.total_subscribers == 0:
+        # L2-A (oracle §A-1): stop the flush loop only when BOTH ledgers are
+        # empty — per-session stream subs AND events-token consumers
+        # (``/slimapi/events?tokens=1``). A-C5 ledger symmetry.
+        if self.total_subscribers == 0 and not self.events_tokens:
             th.stop()
         # B-D1: symmetric arm. No-op while any consumer (control OR token)
         # remains; arms the registry grace-removal on the true last-detach.

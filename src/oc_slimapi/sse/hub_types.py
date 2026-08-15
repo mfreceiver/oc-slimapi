@@ -91,6 +91,14 @@ DEBOUNCE_SECONDS = 0.25
 HEARTBEAT_SECONDS = 10.0
 GRACE_SECONDS = 30.0
 
+# Curated-events token frame (L2-A: ``/slimapi/events?tokens=1``). A lean
+# projection distinct from the per-session stream's delta frames: carries
+# ``type:"token"`` + coalesced ``delta`` only — NO ``partEventRevision`` and
+# NO ``directory`` (sessionID is globally unique in single-user T3; the
+# authoritative revision / full-text stays on the per-session stream and
+# ``/messages/{sid}``). See plan Task L2-A.
+TOKEN_FRAME_TYPE = "token"
+
 
 def sse_frame(payload: dict[str, Any], event: str | None = None) -> bytes:
     prefix = f"event: {event}\n" if event else ""

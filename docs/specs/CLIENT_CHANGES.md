@@ -340,3 +340,61 @@ ocdroid 可在每个请求（含 SSE）**可选**附加三个 request header：
 
 - **不需要**任何 ocdroid 侧调整。`TOKEN_FLUSH_SECONDS`(100ms) / `TOKEN_FLUSH_BYTES`(4KiB) 是**服务端 env knob**，不进 wire，服务端可单方面调。
 - **硬约束**：渲染须**对任意 batch 稳健**——每帧 `message.part.delta` 当作「待追加文本段」处理（append `text`），**不按 token 计数**、**不假定帧间隔**、**不假定单帧 token 数**。批式参数服务端调，ocdroid 无需跟随改动。
+
+## 四能力接入（L1–L3 slim 整合，加性 — 2026-08-15）
+
+> **加性 / 向后兼容**：wire 版本未 bump（仍 2）。四能力各自经 `/slimapi/health` 根级 `features` 新 flag 门控（`tokenCoalesce` / `permissionEvents` / `serverMerge` / `transformAbsorb`）；flag 缺省/为 false → 对应能力走既有路径，**零回归**。能力探测结果缓存，勿每连接重复。权威 wire 见 `docs/specs/v2-contract.md` §2 / §3 / §5。
+
+### 1. tokenCoalesce（A）—— `/slimapi/events?tokens=1` 取代 per-session stream
+
+- **门控 flag**：`features.tokenCoalesce === true`。
+- **消费方式**：`GET /slimapi/events?tokens=1`（仅字面 `"1"` 合法，其他→400 `invalid_tokens`）。在既有策展 SSE 流内**额外**收到 lean `token` 帧 `{type:"token", sessionID, messageID, partID, delta}`（无 `event:` 头，按 `data.type=="token"` 分发；**无 `partEventRevision`、无 `directory`**）。`delta` 为 token flush loop（100ms/4KiB 窗口）对每个 `(sessionID, messageID, partID)` 完成窗口拼接的**增量 concat**，覆盖所有 session（MVP 无 per-sid 过滤）。
+- **迁移约束**：
+  - 与 per-session token stream（`GET /slimapi/sessions/{sid}/stream`）在**客户端互斥**——**不要**同时连两者（双份投递；服务端不强制踢）。迁移完成即可弃用 per-session stream（保留其连接=双份成本）。
+  - `token` 帧是**动画层 only**：丢帧/乱序由 digest + `/messages` 兜底；权威全文/修订仍走 `/slimapi/messages/{sid}` + `/full/{mid}`（幂等覆盖，凌驾所有 token 帧）。
+  - 背压：`token` 帧溢出与 per-session stream 同语义——`resync{reason:"subscriber_backpressure"}` + 断连（复用控制面 T3 守卫）。
+  - 无 replay：`token` 帧无 `id:`，重连后靠 digest + `/messages` catch-up；不依赖流内续传。
+
+### 2. permissionEvents（B）—— `/slimapi/permissions` 聚合端点
+
+- **门控 flag**：`features.permissionEvents === true`。
+- **消费方式**：冷启动/SSE 重连后补拉 pending permission 卡片用 `GET /slimapi/permissions`（跨目录聚合，questions 同款 envelope `{items, errors, authoritativeDirectories, discoveryComplete}`）；每条 item = 白名单投影 `PermissionV1.Request`（`id/sessionID/permission/patterns/metadata/always/tool?`）+ 追加 `directory`。**替换**对 catch-all `GET /permission` 的轮询（此前仅见 `process.cwd()` 实例）。
+- **迁移约束**：
+  - `authoritativeDirectories==null`（**errors 空 + `discoveryComplete==true` + `truncated!=true` 三项同时满足**，实现见 `src/oc_slimapi/routes/permissions.py`）→ 全局 replace-all；为数组 → 仅对所列 dir 做 replace，**不得**丢弃未覆盖 dir 的既有 pending 卡（否则用户无法批准 → session 卡死）。**截断风险**：`truncated==true`（聚合超 `_MAX_AGGREGATE_ITEMS` 或 aggregate byte cap）时 `authoritativeDirectories` **必然**为数组（succeeded 列表），**绝不为 null**——客户端判据若漏掉 `truncated` 检查，会在截断响应下误判 null 而错误执行全量 replace-all，丢弃未覆盖 dir 的 pending 卡。判据务必三项齐全。
+  - 发现失败 → 503 `upstream_unavailable`（无 envelope）→ 保留既有状态并重试，**不可**据此推断"无 pending"。
+  - pending permission 应答仍走 catch-all + `X-Opencode-Directory`（本端点只读聚合）。
+
+### 3. serverMerge（C）—— `mode=merged` 删本地合并协调器
+
+- **门控 flag**：`features.serverMerge === true`。
+- **消费方式**：`GET /slimapi/messages/{sid}?mode=merged`（仅字面 `merged`，大小写敏感）。页内 `thin_placeholder_` 折叠消息由服务端按预算内联展开为 full 投影（剥 LSP diagnostics）；其余消息与 `X-Next-Cursor` 与缺省**逐字节一致**。
+- **迁移约束**：
+  - **`mode=full` 及任何非字面 `merged` 值静默忽略**（与缺省逐字节一致，不 400）——过渡期客户端可保持 `mode=full` 旧行为，直到确认支持 `merged` 再切换。
+  - 超预算/超页数/单项失败 → 该项**渐进降级**保持 skeleton 原样（不 413、不报错）；客户端仍可按需 `/full`。
+  - 与 direct `/full` 共享 single-flight：同键并发只打一次上游（≤1s join 窗口）——上游计数/access log `upIn` 只记一次，客户端勿据 `upIn` 推断逐请求上游命中。
+  - 删除本地合并协调器（原 `hasFull` + N 次 `/full/{mid}` 自行展开逻辑）——`serverMerge` 开启后由服务端承担。
+
+### 4. transformAbsorb（D）—— 删 `/full` 的 503 处理路径
+
+- **门控 flag**：`features.transformAbsorb === true`。
+- **消费方式**：无新请求/新字段。行为变化：`/full/{mid}` 的 transform 槽等待在总预算 `OC_SLIMAPI_TRANSFORM_ABSORB_BUDGET_SECONDS`（默认 2.5s）内**吸收**瞬时占用——瞬时占用（>2s 且 <2.5s）现返回 **200**（原先 503）；占用超预算才 503，**503 形状逐字节不变**（`{"code":"transform_busy","retry_after":2}` + `Retry-After: 2`）。
+- **迁移约束**：
+  - 客户端删除对 `/full` 场景 `transform_busy` 的**专门重试路径**（吸收后 503 只在真超预算时出现，且 `Retry-After:2` 仍是重试信号）。若已有 skeleton 的 503 兜底，确认 full 走同一兜底即可。
+  - 503 时上游请求照旧不发出（admission 先于 GET）——客户端**不得**因 503 猜测"上游被打过"。
+
+## 直连退役（目标态：ocdroid 仅经 slimapi；14096 保留至 C1/C3 前置完成）
+
+> **背景（实证）**：ocdroid 现全部流量经 `/slimapi/**`（sidecar），4 天 access log 40853 reqs **100%** slim、0 passthrough；客户端无 slim→direct 自动回退（直连仅供 Manual 连接源 / 非 slim 模式）。直连 `:14096`（mTLS → opencode `:4096`）**目标态：不再服务 ocdroid**——但**在 ocdroid 完成下方 C1/C3 前置前，`:14096` 仍是 ocdroid 的回退路径**（`slim=false` / Manual 连接源仍可用）；前置完成后仅保留给**匿名消费方**（非 ocdroid 的其它 HTTP 客户端仍可直连，sidecar 不干预）。
+>
+> **本仓职责**：锁接口契约与前置条件；**实施由 ocdroid 仓库承担**（见 ocdroid 侧 `docs/slim-mode-api-routing.md` 演进）。本清单供 ocdroid 开发者对照。
+
+### 前置条件（退役前必须完成，均为 ocdroid 侧改动）
+
+- **C1 — 图片走 catch-all `GET /file`**：`HttpImageHolder`（消息图片加载）从直连 opencode 改为走 sidecar catch-all（带 `X-Opencode-Directory` 头，`GET /file` 经反代透传）——图片加载不再依赖 `:14096` 直连。
+- **C3 — 连接自检改打 `/slimapi/health`**：`checkHealthFor`（连接/健康自检）从直连 health 改为 `GET /slimapi/health`（带 `X-Slimapi-Version: 2`；读 `sidecar.ok`/`server.api_version`/`schema.version`）——健康检查不再依赖 `:14096` 直连。
+
+### 退役范围（L2 四能力落地后执行）
+
+- 删除 ocdroid `slim` 开关（`slim=false` 分支）、Manual 连接源、`StreamingMode.Standard` 轴、`4097→14097` 迁移残留、`4096` 默认值。
+- L2 能力落地后删除对应客户端协调器（本节四能力接入章节的迁移约束对应删减：per-session stream 客户端 / permission 轮询 / 本地合并协调器 / transform_busy 处理路径）。
+- 直连保留：仅限匿名消费方（非 ocdroid）。`:14096` stunnel 端口若需下线由部署侧处理（不在本仓 wire 契约内）。

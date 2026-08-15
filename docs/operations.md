@@ -237,9 +237,11 @@ oc-slimapi 有两类日志输出，**分别处理**：
 - **traffic snapshot**：极小（每帧 ~1–2 KB × 每 300s = ~300 KB/天）；**不经自动压缩**，**Task 10 (P2-1) 起按 `OC_SLIMAPI_TRAFFIC_SNAPSHOT_RETAIN_DAYS` 自动 prune**（代码默认 `0`=不删；生产 unit `30`）。30 天保留上限约 30 × 300 KB ≈ 9 MB。
 - **建议**：生产 unit 已配 `OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS=3`（保留 3 天 access log，约 3×6–12 MB ≈ 20–36 MB 压缩后）+ `OC_SLIMAPI_TRAFFIC_SNAPSHOT_RETAIN_DAYS=30`（保留 30 天 snapshot，约 9 MB）；如需更久的历史可调大此两值。`access-legacy-*.jsonl.gz` **不受 retain**（永久保留），需定期手动清理。journald 自身由 systemd 按 `/etc/systemd/journald.conf` 轮转，不在此列。
 
-### 5.5 Questions 内存预算（内部 knob，非 wire）
+### 5.5 Fan-out 与内存预算（内部 knob，非 wire）
 
-> 以下三个环境变量控制 `/slimapi/questions` 的资源预算。它们是**内部 ops knob**（不改变 wire 契约），仅影响 sidecar 的内存/并发行为。
+> 以下三组环境变量控制聚合类端点（`/slimapi/questions`、`/slimapi/permissions`）与 merged 列表（`/slimapi/messages/{sid}?mode=merged`）、`/full` transform 吸收的资源预算。它们是**内部 ops knob**（不改变 wire 契约），仅影响 sidecar 的内存/并发行为。
+
+**Questions（`/slimapi/questions`）**
 
 | 变量 | 默认值 | 范围 | 说明 |
 |---|---|---|---|
@@ -248,6 +250,28 @@ oc-slimapi 有两类日志输出，**分别处理**：
 | `OC_SLIMAPI_QUESTIONS_FANOUT_CONCURRENCY` | 8 | 1–16 | 跨请求全局 `/question` 并发上限。单次 `/slimapi/questions` 请求的 fan-out 不超过此值。 |
 
 触发任一预算上限时，envelope 复用既有的加性字段 `truncated`（`true`）和 `authoritativeDirectories`（降级为已成功目录列表，非 null），**不 bump** `X-Slimapi-Version`。详见 [`../CHANGELOG.md`](../CHANGELOG.md) Unreleased 与 [`docs/specs/INTERFACE_MAP.md`](specs/INTERFACE_MAP.md) questions 行。
+
+**Permissions（`/slimapi/permissions`，2026-08-15 起；语义与 questions 同款）**
+
+| 变量 | 默认值 | 范围 | 说明 |
+|---|---|---|---|
+| `OC_SLIMAPI_PERMISSIONS_MAX_RESPONSE_BYTES` | 2 MiB | > 0 | 单个 `/permission` 上游响应的读取上限（per-dir cap）。超过时该目录进 `errors[]`，不占用 aggregate 预算。 |
+| `OC_SLIMAPI_PERMISSIONS_MAX_AGGREGATE_BYTES` | 16 MiB | >= per_dir, <= 128 MiB | 跨目录聚合的累积字节预算。超过时 envelope 标记 `truncated: true` 并停止后续目录。 |
+| `OC_SLIMAPI_PERMISSIONS_FANOUT` | 8 | 1–16 | 全局 `/permission` 并发上限（专用 semaphore）。 |
+
+**Merged 列表（`/slimapi/messages/{sid}?mode=merged`，2026-08-15 起）**
+
+| 变量 | 默认值 | 范围 | 说明 |
+|---|---|---|---|
+| `OC_SLIMAPI_MERGED_MAX_FULLS_PER_PAGE` | 16 | 1–64 | 单页最多 fan-out 的 `/full` 数量上限；超出的消息保持 skeleton。 |
+| `OC_SLIMAPI_MERGED_MAX_BYTES` | 8 MiB | > 0, <= 128 MiB | 单页内联全文的累计字节预算（预留/退款模型；读取层 chunk 粒度越界至多 `merged_fanout × chunk_size`）。超预算的项降级为 skeleton，不 500 整页。 |
+| `OC_SLIMAPI_MERGED_FANOUT` | 8 | 1–16 | fan-out 并发上限（独立于 transform 池，不占用池槽）。 |
+
+**/full transform 吸收（2026-08-15 起）**
+
+| 变量 | 默认值 | 范围 | 说明 |
+|---|---|---|---|
+| `OC_SLIMAPI_TRANSFORM_ABSORB_BUDGET_SECONDS` | 2.5 | > 0 | `transform_busy` 503 前的服务端吸收预算（single-flight + 按剩余预算收窄的池等待重试）。503 形状不变，频率大幅下降。 |
 
 ### 5.6 journald 查询手册（应用日志）
 

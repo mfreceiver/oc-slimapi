@@ -23,8 +23,9 @@ from .logging_config import get_logger, setup_logging
 from .middleware.request_id import RequestIdMiddleware
 from .middleware.traffic_accounting import TrafficAccountingMiddleware
 from .proxy import install_proxy
-from .routes import actions, agent, command, directories, events, health, messages, metrics, questions, sessions, token_stream
+from .routes import actions, agent, command, directories, events, health, messages, metrics, permissions, questions, sessions, token_stream
 from .sse.hub import HubRegistry
+from .sse.singleflight import fulls
 from .sse.token_hub import TokenStreamHub, TokenStreamRegistry
 from .sse.tokenstream.hub import apply_debug_budget_overrides
 from .traffic import TrafficLedger
@@ -303,11 +304,35 @@ async def lifespan(app: FastAPI):
             except Exception as exc:
                 get_logger("app").warning("transforms.shutdown failed", exc_info=exc)
         stack.callback(_shutdown_transforms)
+        # rev-9 (L2-CD): converge the process-level single-flight registry
+        # (direct /full + merged fan-out shared upstream GETs) — cancel the
+        # pending grace-expiry timers and drop retained bodies so a stopped
+        # app leaves no stale app-domain bytes or timer callbacks behind.
+        # Registered AFTER transforms → LIFO cleanup runs BEFORE
+        # transforms.shutdown and upstream.aclose: in-flight fetches may
+        # still be awaiting upstream GETs, so the registry must converge
+        # while the upstream client is still open (its consumers sit
+        # "inside" the transform pool, which drains afterwards). Isolated
+        # try/except so a failure here cannot break the rest of the chain.
+        def _shutdown_fulls():
+            try:
+                fulls.shutdown()
+            except Exception as exc:
+                get_logger("app").warning(
+                    "singleflight shutdown failed", exc_info=exc
+                )
+        stack.callback(_shutdown_fulls)
         app.state.schema_degraded = False
         # Questions fan-out semaphore (T5): global per-request /question
         # concurrency cap. Sized by config (1..16); no close/cleanup needed.
         app.state.questions_semaphore = asyncio.Semaphore(
             settings.questions_fanout_concurrency
+        )
+        # Permissions fan-out semaphore (L2-B): global per-request /permission
+        # concurrency cap. Mirrors the questions semaphore; sized by config
+        # (1..16); no close/cleanup needed.
+        app.state.permissions_semaphore = asyncio.Semaphore(
+            settings.permissions_fanout
         )
         # P1-36: smoke status defaults to not_run; smoke() updates it.
         app.state.smoke_status = SMOKE_NOT_RUN
@@ -536,7 +561,7 @@ app.add_middleware(RequestIdMiddleware)
 # install_proxy's catch-all (design §5.1: route must precede the reverse
 # proxy). Its path ``/slimapi/sessions/{sid}/stream`` does not shadow
 # ``/{sid}/status`` or ``/{sid}/children`` (different literal suffixes).
-for router in (health.router, actions.router, agent.router, command.router, sessions.router, messages.router, events.router, metrics.router, questions.router, directories.router, token_stream.router):
+for router in (health.router, actions.router, agent.router, command.router, sessions.router, messages.router, events.router, metrics.router, questions.router, permissions.router, directories.router, token_stream.router):
     app.include_router(router)
 install_proxy(app)
 

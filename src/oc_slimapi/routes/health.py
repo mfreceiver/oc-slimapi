@@ -3,6 +3,7 @@ import time
 from fastapi import APIRouter, Request
 
 from .. import __version__
+from ..features import FEATURES
 from ..gzip_util import json_response
 from ..traffic import stash_up_in
 from ..upstream import forward_upstream_headers, request_id_from_scope
@@ -51,6 +52,10 @@ async def health(request: Request):
         # ``skeletonInlineOutputMaxBytes`` lets ops confirm the tuned cap; it
         # does not bump ``X-Slimapi-Version`` (additive wire shape change).
         "features": {
+            # L2-T0: static all-true announcements for the consolidated
+            # capabilities (tokenCoalesce / permissionEvents / serverMerge /
+            # transformAbsorb). Same release train — not gradual flags.
+            **FEATURES,
             "tokenStream": True,
             "thresholdedSkeleton": True,
             "skeletonInlineOutputMaxBytes": request.app.state.config.skeleton_inline_output_max_bytes,
