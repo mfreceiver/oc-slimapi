@@ -150,7 +150,7 @@ curl -s "$BASE/slimapi/metrics?$V" | jq '
 
 ## 5. access log 离线分析
 
-**每个 HTTP 请求一行 `recordType=="request"`**；另有 SSE 连接建立/断开各一行的 `sse_open`/`sse_close` 生命周期行（`events_sse`/`token_stream_sse` 两端点，及 catch-all 透传 SSE `/event`、`/global/event`（bucket=`passthrough`，`selectorResult=not_applicable`），2026-08-16 起，见 §5.1）。按天切分文件 `access-YYYY-MM-DD.jsonl`（`YYYY-MM-DD` = 当天日期）。默认目录 `logs/`（相对服务 CWD）；生产 systemd 覆盖到 `~/.local/state/oc-slimapi/logs/`（见 `docs/operations.md` §5.2）。
+**每个 HTTP 请求一行 `recordType=="request"`**；另有 SSE 连接建立/断开各一行的 `sse_open`/`sse_close` 生命周期行（`events_sse`/`token_stream_sse` 两端点，见 §5.1）。**历史注记**：≤2.x 的 catch-all 透传 SSE（`/event`、`/global/event`，bucket=`passthrough`，`selectorResult=not_applicable`）也写过这对生命周期行（2026-08-16 起）；**3.0.0 起 catch-all 关闭，这些路径 404，不再产生任何生命周期行**——旧日志文件中仍可查到。按天切分文件 `access-YYYY-MM-DD.jsonl`（`YYYY-MM-DD` = 当天日期）。默认目录 `logs/`（相对服务 CWD）；生产 systemd 覆盖到 `~/.local/state/oc-slimapi/logs/`（见 `docs/operations.md` §5.2）。
 
 ```jsonc
 {"ts":"2026-07-24T13:02:11+08:00","method":"GET","path":"/slimapi/messages/ses_x","bucket":"messages","status":200,"durationMs":12.3,"downIn":0,"downOut":4321,"upIn":20480,"upOut":0,"requestId":"a1b2c3...","client":"ocdroid","clientVer":"1.2.3","clientId":"5f4d3c2b1a098765"}
@@ -174,7 +174,7 @@ curl -s "$BASE/slimapi/metrics?$V" | jq '
 
 ### 5.1 SSE 生命周期行（2026-08-16 加性）
 
-`GET /slimapi/events` 与 `GET /slimapi/sessions/{sid}/stream`（`token_stream_sse`）在流真正开始产出（200 + `text/event-stream` 确立）时写一行 `sse_open`，生成器退出（客户端断开/服务端终结）时写一行 `sse_close`。**catch-all 透传 SSE**（`/event`、`/global/event` → bucket=`passthrough`）同样写这对生命周期行（`selectorResult=not_applicable`、`wireVersion=null`——透传面不判定版本）；其判定口径=**响应性质**：上游响应 200 且 content-type 为 `text/event-stream`（容忍 charset 等参数）才算 SSE——404/503/JSON 等非 SSE 响应**无生命周期行**，仅按普通 request 行记账。close 行在生成器 teardown 的 finally 中、于任何 `await` 之前写入——aclose 失败/取消路径 close 行必达（open/close 配对不泄漏）。两行**不含**字节/耗时字段（`downIn`/`downOut`/`upIn`/`upOut`/`durationMs` 不出现——生命周期行是标记，不是账目；字节记在该连接的 `request` 行与 ledger 桶里），字段为：`ts`/`method`/`path`/`bucket`/`status`/`recordType`/`lifecycleId`/`wireVersion`/`selectorResult`/`directoryForm`/`requestId`。旧文件没有这些行 → 分析脚本须容忍缺失（jq 对缺 key 的 `select` 天然跳过）。
+`GET /slimapi/events` 与 `GET /slimapi/sessions/{sid}/stream`（`token_stream_sse`）在流真正开始产出（200 + `text/event-stream` 确立）时写一行 `sse_open`，生成器退出（客户端断开/服务端终结）时写一行 `sse_close`。**catch-all 透传 SSE（≤2.x 历史）**：`/event`、`/global/event`（bucket=`passthrough`）在 2.x 同样写过这对生命周期行（`selectorResult=not_applicable`、`wireVersion=null`）；**3.0.0 起 catch-all 关闭（404），不再产生**——其判定口径=**响应性质**：上游响应 200 且 content-type 为 `text/event-stream`（容忍 charset 等参数）才算 SSE——404/503/JSON 等非 SSE 响应**无生命周期行**，仅按普通 request 行记账。close 行在生成器 teardown 的 finally 中、于任何 `await` 之前写入——aclose 失败/取消路径 close 行必达（open/close 配对不泄漏）。两行**不含**字节/耗时字段（`downIn`/`downOut`/`upIn`/`upOut`/`durationMs` 不出现——生命周期行是标记，不是账目；字节记在该连接的 `request` 行与 ledger 桶里），字段为：`ts`/`method`/`path`/`bucket`/`status`/`recordType`/`lifecycleId`/`wireVersion`/`selectorResult`/`directoryForm`/`requestId`。旧文件没有这些行 → 分析脚本须容忍缺失（jq 对缺 key 的 `select` 天然跳过）。
 
 ### 文件切分与压缩
 
@@ -359,7 +359,7 @@ jq -c '{ts, ratio: .ratios.messages.downOutOverUpIn}' /tmp/snap-all.jsonl
 ```
 
 - **matrix** 维度 = 契约 v3 §9.2 的 `date × selectorResult × wireVersion × directoryForm × recordType × statusClass × bucket` 计数矩阵（内存视角无 date 维，跨日用 §9.4 末尾的离线聚合或按天 snapshot 帧对齐）；`statusClass` 形如 `"2xx"`，无 status 时 `"none"`。**3.0.0 终态：`v2`/`absent` 维度值已不可达（无 `v`/`?v=2` 一律 400 记 `rejected`）——矩阵保留全枚举维度供 ≤2.x 历史帧对账。**
-- **sseActive 语义**：`not_applicable` = catch-all 透传 SSE（`/event`、`/global/event`，不经省流面但计入观测）；`absent` = 无 `v` 参数的旧客户端 SSE。`rejected`/`exempt` 无 SSE 端点，恒不出现。**3.0.0 终态：`v2`/`absent` 维度自然归零（旧客户端开流前即 400）；四维枚举保留供历史帧对账与退役判据（§9.3）核验。**
+- **sseActive 语义**：`not_applicable` = catch-all 透传 SSE（≤2.x 历史维度：`/event`、`/global/event` 曾不经省流面但计入观测；**3.0.0 起 catch-all 关闭，该维度不再增长**）；`absent` = 无 `v` 参数的旧客户端 SSE。`rejected`/`exempt` 无 SSE 端点，恒不出现。**3.0.0 终态：`v2`/`absent` 维度自然归零（旧客户端开流前即 400）；四维枚举保留供历史帧对账与退役判据（§9.3）核验。**
 - **离线对账**：跨日 carry-in 公式 `sseActive[D+1,k] = sseActive[D,k] + sse_open[D,k] − matched_sse_close[D,k]`（`sseActive[D,k]` 取 D 日首行时的窗口起点存量）。**matched/orphan 配对按 `lifecycleId`**（§11.8）：close 行的 `lifecycleId` 能配到先前未匹配 open（同 dim、跨日 carry）→ `matched_sse_close`（计入 close 当日，并从待配对集合移除）；配不到（open 早于数据窗口 / sidecar 重启后集合已空 / id 缺失）→ **孤儿 close**，只补记计数，**不冲减存量**（避免错误消耗他人活跃连接）。`traffic_snapshot.aggregate_v3_observability(records)` 提供该纯函数实现（输入按天 access log 解析出的记录列表，输出 `counts`/`countsByDate`/`sseActive`/`sseOpens`/`sseMatchedCloses`/`sseOrphanCloses`/`sseLive`），供运维脚本与测试对账复用。
 
 ---

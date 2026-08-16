@@ -63,7 +63,7 @@ journalctl --user -u oc-slimapi -f      # 实时日志
 
 > 应用日志走 journald；**access log（`logs/access-YYYY-MM-DD.jsonl`）与流量快照（`logs/traffic-snapshot-YYYY-MM-DD.jsonl`）落盘**到 `access_log_dir`（systemd 下为 `StateDirectory` `~/.local/state/oc-slimapi/logs`）。理由与查询手册见 `operations.md` §5。
 
-所有 `/slimapi/**` 请求（包括 `/slimapi/events` SSE）必须带查询参数 `?v=3`（v3-only 终态）：缺 `v` / `v=2` / 不支持值 → 400 `unsupported_version supported=[3]`（SSE 在开流前拒）；`X-Slimapi-Version` 头已删除、出现不解读；词法非法的 `v` → 400 `invalid_version_selector`。非 `/slimapi/**` 路径已随 catch-all 关闭统一 404 `thin_route_not_found`（§8.2）。
+所有 `/slimapi/**` 请求（包括 `/slimapi/events` SSE）必须带查询参数 `?v=3`（v3-only 终态）：缺 `v` / `v=2` / 不支持值 → 400 `unsupported_version supported=[3]`（SSE 在开流前拒）；`X-Slimapi-Version` 头已删除、出现不解读；词法非法的 `v` → 400 `invalid_version_selector`。**唯一豁免：`GET /slimapi/versions`（发现端点，无条件免 selector、免版本头）**。非 `/slimapi/**` 路径已随 catch-all 关闭统一 404 `thin_route_not_found`（§8.2）。
 
 ## 测试 / 质量门禁
 
