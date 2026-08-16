@@ -197,7 +197,7 @@ async def test_agent_route_returns_projected_skeleton(app_and_client):
     assert [e["name"] for e in body] == ["build", "plan", "review"]
     # Contract headers.
     assert response.headers["Cache-Control"] == "no-store"
-    assert response.headers["Vary"] == "Accept-Encoding, X-Opencode-Directory"  # Batch 2/B1: directory merged into Vary
+    assert response.headers["Vary"] == "Accept-Encoding"  # Batch 2/B1: directory merged into Vary
 
 
 # ---------------------------------------------------------------------------
@@ -231,7 +231,7 @@ async def test_agent_gzip_negotiation_gunzips_to_plain_projection(upstream_facto
             ) as resp:
                 assert resp.status_code == 200
                 assert resp.headers["Content-Encoding"] == "gzip"
-                assert resp.headers["Vary"] == "Accept-Encoding, X-Opencode-Directory"  # Batch 2/B1: directory merged into Vary
+                assert resp.headers["Vary"] == "Accept-Encoding"  # Batch 2/B1: directory merged into Vary
                 raw = b""
                 async for chunk in resp.aiter_raw():
                     raw += chunk

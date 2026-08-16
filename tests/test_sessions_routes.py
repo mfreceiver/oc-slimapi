@@ -264,8 +264,8 @@ async def test_sessions_list_unknown_directory_passes_through(upstream_factory):
             "/slimapi/sessions?directory=/nope", headers=VERSION_HEADERS,
         )
     assert response.status_code == 200
-    # Forwarded as both query and X-Opencode-Directory header.
-    assert captured["query"] == "/nope"
+    # v3 terminal: consumed by the sidecar, forwarded as the header only.
+    assert captured["query"] is None
     assert captured["dir"] == "/nope"
 
 
@@ -290,15 +290,16 @@ async def test_sessions_list_normalizes_trailing_slash_before_forward(upstream_f
             "/slimapi/sessions?directory=/app/", headers=VERSION_HEADERS,
         )
     assert response.status_code == 200
-    assert captured["query"] == "/app"
+    # v3 terminal: ?directory is consumed by the sidecar and forwarded as
+    # the X-Opencode-Directory header only (no upstream query re-add).
+    assert captured["query"] is None
     assert captured["dir"] == "/app"
 
 
 # ---------------------------------------------------------------------------
-# v6 §1.1: GET /slimapi/sessions response headers
-#   * X-Complete        : "true" iff len(sessions) < limit (200 only)
-# (lite-v2: X-Discovery-Directories / X-Discovery-Ready removed per §6)
-# Error responses (502 / 503) must NOT carry X-Complete.
+# v6 §1.1 (v3 terminal): GET /slimapi/sessions envelope
+#   * complete: true iff len(sessions) < limit (200 only; body field)
+# Error responses (502 / 503) are NOT enveloped.
 # ---------------------------------------------------------------------------
 
 async def test_sessions_completeness_headers_absent_on_5xx(upstream_factory):
@@ -314,8 +315,8 @@ async def test_sessions_completeness_headers_absent_on_5xx(upstream_factory):
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.get("/slimapi/sessions", headers=VERSION_HEADERS)
         assert response.status_code in (502, 503)
-        # 503 path: "upstream_unavailable" with no completeness headers.
-        assert "X-Complete" not in response.headers
+        # 503 path: "upstream_unavailable" — error bodies are not enveloped.
+        assert "items" not in response.json()
 
 
 async def test_sessions_x_complete_true_when_below_limit(upstream_factory):
@@ -334,7 +335,7 @@ async def test_sessions_x_complete_true_when_below_limit(upstream_factory):
             "/slimapi/sessions?limit=10", headers=VERSION_HEADERS,
         )
     assert response.status_code == 200
-    assert response.headers["X-Complete"] == "true"
+    assert response.json()["complete"] is True
 
 
 async def test_sessions_x_complete_false_at_limit(upstream_factory):
@@ -353,7 +354,7 @@ async def test_sessions_x_complete_false_at_limit(upstream_factory):
             "/slimapi/sessions?limit=5", headers=VERSION_HEADERS,
         )
     assert response.status_code == 200
-    assert response.headers["X-Complete"] == "false"
+    assert response.json()["complete"] is False
 
 
 async def test_sessions_roots_default_unchanged_false(upstream_factory):
@@ -508,7 +509,9 @@ async def test_sessions_status_directory_validated_and_forwarded(upstream_factor
             "/slimapi/sessions/status?directory=/app/", headers=VERSION_HEADERS,
         )
     assert response.status_code == 200
-    assert captured["query"] == "/app"
+    # v3 terminal: ?directory is consumed by the sidecar and forwarded as
+    # the X-Opencode-Directory header only (no upstream query re-add).
+    assert captured["query"] is None
     assert captured["header"] == "/app"
 
 

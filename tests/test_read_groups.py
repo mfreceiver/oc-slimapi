@@ -145,7 +145,7 @@ async def test_file_list_v3_happy_passthrough(stack):
     assert resp.headers["content-type"].startswith("application/json")
     assert resp.headers["cache-control"] == "no-store"
     assert "etag" in resp.headers
-    assert "x-opencode-directory" in resp.headers["vary"].lower()
+    assert resp.headers["vary"].lower() == "accept-encoding"  # §6.2 terminal
     upstream = seen[0]
     assert upstream.url.path == "/file"
     assert upstream.url.params["path"] == "readme.md"
@@ -313,7 +313,7 @@ async def test_providers_directory_sensitive(stack):
                             headers=IDENTITY)
     assert resp.status_code == 200
     assert resp.content == _read_payloads()["/config/providers"]
-    assert "x-opencode-directory" in resp.headers["vary"].lower()
+    assert resp.headers["vary"].lower() == "accept-encoding"  # §6.2 terminal
     resp = await client.get("/slimapi/config/providers?v=3&directory=/w",
                             headers=IDENTITY)
     assert resp.status_code == 200

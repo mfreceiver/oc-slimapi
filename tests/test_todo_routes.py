@@ -88,7 +88,7 @@ async def test_todo_happy_path_identity_projection(upstream_factory):
         assert r.json() == orjson.loads(TODO_BODY)
         # catalog-chain Vary (Batch 2 onward: directory merged on 200s)
         assert r.headers["Vary"] == (
-            "Accept-Encoding, X-Opencode-Directory")
+            "Accept-Encoding")
         assert seen == ["/session/s1/todo"]
 
 

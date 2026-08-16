@@ -9,9 +9,9 @@ chain, factored here:
   additionally stripped on v3 consuming routes — are embedded in the
   upstream URL so httpx never re-encodes them (proxy.py:196-203
   semantics). Unknown params, repeats, percent-encodings and ``+`` survive
-  byte-identically. v2 requests forward ``?directory=`` verbatim too
-  (v2 does not consume it — the upstream schema decides); the v2 client's
-  ``X-Opencode-Directory`` header remains the v2 channel (route-level);
+  byte-identically. Tolerant routes keep ``directory`` verbatim (no
+  consumption, §5.5); consuming routes had it stripped by the selector
+  (§5.2).
 * streaming upstream GET (``stream_upstream`` — resolved directory
   forwarded as ``X-Opencode-Directory``);
 * two-tier frozen error mapping: upstream 5xx / network → 503
@@ -56,9 +56,8 @@ from fastapi import Request
 from starlette.responses import Response
 
 from .. import etag as etag_mod
-from ..directory import validate_directory
 from ..gzip_util import compress_if_beneficial, error_response
-from ..selector import _strip_v_segments, wire_view_from_scope
+from ..selector import _strip_v_segments
 from ..traffic import stash_up_in
 from ..transform import TransformBusy, TransformPool, read_with_cap
 from ..upstream_errors import raise_upstream_unavailable
@@ -104,10 +103,10 @@ def _upstream_passthrough_headers(
 def _raw_upstream_url(request: Request, upstream_path: str) -> str:
     """§5.2 verbatim-query upstream URL.
 
-    The selector has already forked by wire view: v2 keeps ``directory``
-    (and everything else) verbatim; v3 consuming routes had ``directory``
-    stripped; v3 tolerant routes keep it (no consumption).  Stripping
-    ``v`` again here is idempotent — it covers selector-less stacks so the
+    The selector has already done the view fork (terminal: only v3
+    semantics exist): consuming routes had ``directory`` stripped;
+    tolerant routes keep it (no consumption, §5.5). Stripping ``v``
+    again here is idempotent — it covers selector-less stacks so the
     sidecar-reserved parameter can never reach the upstream.
     """
     raw_qs = request.scope.get("query_string", b"") or b""
@@ -115,24 +114,6 @@ def _raw_upstream_url(request: Request, upstream_path: str) -> str:
     if raw_qs:
         return f"{upstream_path}?{raw_qs.decode('latin-1')}"
     return upstream_path
-
-
-def _validate_v2_query_directory(request: Request) -> None:
-    """v2 directory-validation duty on consuming routes (v2-contract:483).
-
-    v2 view (§5.2 frozen): ``?directory=`` is NOT consumed — it forwards
-    verbatim — so every value is validated before the request leaves the
-    sidecar (proxy.py:146-154 pattern via ``query_params.getlist``).
-    Validation is not a rebuild: the forwarded query bytes are untouched.
-
-    v3 consuming routes had ``directory`` consumed + validated by the
-    selector (nothing left in the query); tolerant routes never validate
-    (§5.5 ignore = don't consume, don't validate).
-    """
-    if wire_view_from_scope(request.scope) != 2:
-        return
-    for dir_val in request.query_params.getlist("directory"):
-        validate_directory(dir_val)
 
 
 @asynccontextmanager
@@ -178,7 +159,6 @@ async def read_passthrough_get(
     *,
     upstream_path: str,
     directory: str | None = None,
-    directory_sensitive: bool = False,
     project: Callable[[bytes], bytes] | None = None,
 ) -> Response:
     """Controlled-proxy GET for a §10.a read group.
@@ -203,12 +183,9 @@ async def read_passthrough_get(
     config = request.app.state.config
     accept_encoding = request.headers.get("accept-encoding")
     if_none_match = request.headers.get("if-none-match")
-    rep_version = etag_mod.response_rep_version(
-        config, wire_view=wire_view_from_scope(request.scope))
-    vary = (etag_mod.merged_vary("Accept-Encoding")
-            if directory_sensitive else "Accept-Encoding")
-    if directory_sensitive:  # consuming set (1:1 for §10.a read routes)
-        _validate_v2_query_directory(request)
+    rep_version = etag_mod.response_rep_version(config, wire_view=3)
+    # §6.2 terminal: single-value Vary on every route.
+    vary = etag_mod.merged_vary("Accept-Encoding")
     upstream_url = _raw_upstream_url(request, upstream_path)
     # B4: projection routes occupy the transform pool; raw routes don't.
     transforms = (request.app.state.transforms

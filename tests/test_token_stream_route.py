@@ -873,9 +873,13 @@ class TestTokenStreamHandshake:
             )
             assert status == 200
             events = parse_sse_stream(body)
-            # First frame: server.connected bound to s1.
-            assert events[0][0] == "server.connected"
-            assert events[0][1] == {"sessionID": "s1"}
+            # Terminal §7.2: slimapi.meta is the FIRST frame.
+            assert events[0][0] == "slimapi.meta"
+            assert set(events[0][1]) == {"subscriberId", "tokens"}
+            assert events[0][1]["tokens"] is True
+            # Then server.connected bound to s1.
+            assert events[1][0] == "server.connected"
+            assert events[1][1] == {"sessionID": "s1"}
             # Then a snapshot with the full accumulated text.
             snaps = [e for e in events if e[0] == "message.part.snapshot"]
             assert len(snaps) == 1
@@ -901,10 +905,12 @@ class TestTokenStreamHandshake:
             )
             assert status == 200
             events = parse_sse_stream(body)
-            assert events[0][0] == "resync"
-            assert events[0][1] == {"reason": "reconnect_no_replay", "sessionID": "s1"}
+            # Terminal §7.2: meta precedes even the resync frame.
+            assert events[0][0] == "slimapi.meta"
+            assert events[1][0] == "resync"
+            assert events[1][1] == {"reason": "reconnect_no_replay", "sessionID": "s1"}
             # server.connected comes right after.
-            assert events[1][0] == "server.connected"
+            assert events[2][0] == "server.connected"
         finally:
             await _close_app(app)
 
@@ -935,9 +941,11 @@ class TestTokenStreamHandshake:
             assert hdr["content-type"] == "text/event-stream; charset=utf-8"
             assert hdr["cache-control"] == "no-cache, no-transform"
             assert hdr["x-accel-buffering"] == "no"
-            assert hdr["vary"] == "Accept-Encoding"
-            assert hdr["x-slimapi-subscriber-id"].startswith("tok_")
-            # identity → no Content-Encoding.
+            # Terminal §1/§6.2: X-Slimapi-Subscriber-ID retired; SSE
+            # carries no Vary (never content-negotiated).
+            assert "x-slimapi-subscriber-id" not in hdr
+            assert "vary" not in hdr
+            # Always identity → no Content-Encoding.
             assert "content-encoding" not in hdr
         finally:
             await _close_app(app)
@@ -1060,61 +1068,36 @@ class TestGzipLever2:
         # Full round-trip equals the concatenated frames.
         assert accumulated == b"".join(frames)
 
-    async def test_endpoint_negotiates_gzip_content_encoding(self):
-        """Accept-Encoding: gzip → Content-Encoding: gzip + Vary header."""
-        app = _build_app(_settings())
-        try:
-            status, headers, _body = await _drive_stream(
-                app, "/slimapi/sessions/s1/stream",
-                [("X-Slimapi-Version", "1"), ("Accept-Encoding", "gzip")],
-            )
-            assert status == 200
-            hdr = {k.decode().lower(): v.decode() for k, v in headers}
-            assert hdr["content-encoding"] == "gzip"
-            assert hdr["vary"] == "Accept-Encoding"
-        finally:
-            await _close_app(app)
-
-    async def test_endpoint_gzip_body_decompresses_to_complete_events(self):
-        """The raw gzip body round-trips through a decompressobj into whole
-        SSE handshake frames (server.connected + snapshot)."""
+    async def test_terminal_stream_is_always_identity(self):
+        """Terminal §7.2: the token stream is ALWAYS identity — even a
+        gzip-capable client gets no Content-Encoding (the Lever-2 streaming
+        gzip exception is retired with the v2 pipeline)."""
         app = _build_app(_settings())
         try:
             th = app.state.token_hub
             th.on_part_updated(_updated_props("s1", "m1", "p1", text=""))
             th.on_part_delta(_delta_props("s1", "m1", "p1", delta="seeded"))
-            _status, _headers, raw = await _drive_stream(
+            status, headers, raw = await _drive_stream(
                 app, "/slimapi/sessions/s1/stream",
                 [("X-Slimapi-Version", "1"), ("Accept-Encoding", "gzip")],
             )
-            # Raw body is gzip (magic bytes).
-            assert raw[:2] == b"\x1f\x8b"
-            d = zlib.decompressobj(zlib.MAX_WBITS | 16)
-            decompressed = d.decompress(raw) + d.flush()
-            events = parse_sse_stream(decompressed)
-            assert events[0][0] == "server.connected"
+            assert status == 200
+            hdr = {k.decode().lower(): v.decode() for k, v in headers}
+            assert "content-encoding" not in hdr
+            assert "vary" not in hdr
+            assert raw[:2] != b"\x1f\x8b"  # plaintext SSE, no gzip magic
+            events = parse_sse_stream(raw)
+            assert events[0][0] == "slimapi.meta"
+            assert events[1][0] == "server.connected"
             snaps = [e for e in events if e[0] == "message.part.snapshot"]
             assert snaps and snaps[0][1]["text"] == "seeded"
         finally:
             await _close_app(app)
 
-    async def test_identity_body_is_not_gzipped(self):
-        """Accept-Encoding: identity → no gzip magic, body is plaintext SSE."""
-        app = _build_app(_settings())
-        try:
-            _status, _headers, raw = await _drive_stream(
-                app, "/slimapi/sessions/s1/stream",
-                [("X-Slimapi-Version", "1"), ("Accept-Encoding", "identity")],
-            )
-            assert raw[:2] != b"\x1f\x8b"
-            events = parse_sse_stream(raw)
-            assert events[0][0] == "server.connected"
-        finally:
-            await _close_app(app)
-
     async def test_control_plane_events_is_not_gzipped(self):
-        """Lever 2 is the SOLE SSE gzip exception — the control-plane
-        ``/slimapi/events`` must NOT set Content-Encoding: gzip (§7)."""
+        """The control-plane /slimapi/events never sets Content-Encoding:
+        gzip (§7) — and under the terminal state its first frame is the
+        slimapi.meta handshake."""
         app = _build_app(_settings(), include_control_events=True)
         try:
             status, headers, body = await _drive_stream(
@@ -1124,48 +1107,14 @@ class TestGzipLever2:
             assert status == 200
             hdr = {k.decode().lower(): v.decode() for k, v in headers}
             assert "content-encoding" not in hdr
-            # Body is plaintext SSE (server.connected control-plane frame).
             assert body[:2] != b"\x1f\x8b"
             events = parse_sse_stream(body)
-            assert events[0][0] == "server.connected"
+            assert events[0][0] == "slimapi.meta"
+            assert events[1][0] == "server.connected"
         finally:
             await _close_app(app)
 
-    async def test_endpoint_gzip_flush_aligns_per_chunk(self):
-        """NB-D2 (per-chunk flush proof): each ASGI ``http.response.body``
-        chunk fed through a persistent ``decompressobj`` decompresses to
-        output that ``endswith(b"\\n\\n")`` — a whole SSE event boundary.
-        This mirrors the unit-level ``test_flush_aligns_to_event_boundaries_unit``
-        but exercises the real endpoint, proving ``Z_SYNC_FLUSH`` alignment
-        is per-event in the live ASGI body stream (not just a happy-path
-        whole-body artefact)."""
-        app = _build_app(_settings())
-        try:
-            th = app.state.token_hub
-            th.on_part_updated(_updated_props("s1", "m1", "p1", text=""))
-            th.on_part_delta(_delta_props("s1", "m1", "p1", delta="seeded"))
-            _status, _headers, chunks = await _drive_stream_chunks(
-                app, "/slimapi/sessions/s1/stream",
-                [("X-Slimapi-Version", "1"), ("Accept-Encoding", "gzip")],
-            )
-            d = zlib.decompressobj(zlib.MAX_WBITS | 16)
-            non_empty = 0
-            for chunk in chunks:
-                if not chunk:
-                    continue
-                decompressed = d.decompress(chunk)
-                if not decompressed:
-                    # First chunk may carry only the gzip header (zlib emits
-                    # the 10-byte header on the first compress call before any
-                    # data); skip chunks with no decompressed payload.
-                    continue
-                non_empty += 1
-                assert decompressed.endswith(b"\n\n"), \
-                    f"chunk did not align to an SSE event boundary: {decompressed!r}"
-            # At least one non-empty decompressed chunk was asserted.
-            assert non_empty >= 1, "no non-empty decompressed chunks captured"
-        finally:
-            await _close_app(app)
+
 # ===========================================================================
 
 class TestHealthFeaturesTokenStream:
@@ -1277,25 +1226,24 @@ class TestMetricsTokenStream:
             await hubs.close()
             await app.state.upstream.aclose()
 
-    async def test_gzip_flush_bumps_compression_counters(self):
-        """T2-C1: after a gzip flush, gzipRawBytesTotal>0 and
-        gzipCompressedBytesTotal>0."""
+    async def test_terminal_identity_never_bumps_gzip_counters(self):
+        """T2-C1 (terminal): the stream is always identity — even a
+        gzip-capable client never bumps the (now-inert) gzip counters."""
         app = _build_app(_settings())
         try:
             th = app.state.token_hub
             # Seed a part so the handshake snapshot has data.
             th.on_part_updated(_updated_props("s1", "m1", "p1", text=""))
             th.on_part_delta(_delta_props("s1", "m1", "p1", delta="hello" * 100))
-            # Drive the gzip stream.
             _status, _headers, raw = await _drive_stream(
                 app, "/slimapi/sessions/s1/stream",
                 [("X-Slimapi-Version", "1"), ("Accept-Encoding", "gzip")],
             )
-            # The stream round-tripped, so at least one raw frame was compressed.
+            assert raw[:2] != b"\x1f\x8b"
             response = await _get(app, "/slimapi/metrics")
             ts = response.json()["sse"]["tokenStream"]
-            assert ts["gzipRawBytesTotal"] > 0
-            assert ts["gzipCompressedBytesTotal"] > 0
+            assert ts["gzipRawBytesTotal"] == 0
+            assert ts["gzipCompressedBytesTotal"] == 0
         finally:
             await _close_app(app)
 

@@ -156,10 +156,10 @@ async def test_sessions_list_one_get_burst(upstream_factory):
                 client, ["/slimapi/sessions?limit=100"] * 20)
         assert calls["list"] == 1, "burst coalesces to ONE upstream GET"
         assert all(r.status_code == 200 for r in responses)
-        # per-caller projection: identical bodies, per-caller X-Complete
+        # per-caller projection: identical bodies, per-caller complete
         bodies = {r.content for r in responses}
         assert len(bodies) == 1
-        assert {r.headers.get("X-Complete") for r in responses} == {"true"}
+        assert {r.json()["complete"] for r in responses} == {True}
         registry.shutdown()
         assert registry.leased_bytes == 0
     finally:
@@ -186,8 +186,8 @@ async def test_sessions_list_x_complete_false_per_caller(upstream_factory):
             )
         # limit=3 vs limit=100 are DIFFERENT keys → 2 GETs (not shared)
         assert calls["list"] == 2
-        assert big.headers["X-Complete"] == "true"
-        assert tight.headers["X-Complete"] == "false"
+        assert big.json()["complete"] is True
+        assert tight.json()["complete"] is False
     finally:
         _teardown(app)
 

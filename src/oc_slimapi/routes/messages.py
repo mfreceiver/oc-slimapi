@@ -779,17 +779,13 @@ async def _messages_via_lease(
                     accept_encoding=accept_encoding,
                     fingerprint=config.message_fingerprint_enabled,
                 )
-            # v3 (§4.1, Batch B): the packed v2 bare array is spliced into
-            # the envelope verbatim BEFORE any validator work — the envelope
-            # bytes ARE the canonical ETag input (§6.3) — and the v3 view
-            # drops the X-Next-Cursor header (the client reads
-            # ``nextCursor`` from the cached envelope, §6.4).
-            view = wire_view_from_scope(request.scope)
-            if view == 3:
-                identity = messages_envelope_bytes(identity, next_cursor)
+            # §4.1 terminal (v3-only): the packed bare array is spliced
+            # into the envelope verbatim BEFORE any validator work — the
+            # envelope bytes ARE the canonical ETag input (§6.3). The
+            # X-Next-Cursor header is retired (§1): the client reads
+            # ``nextCursor`` from the cached envelope (§6.4).
+            identity = messages_envelope_bytes(identity, next_cursor)
             base_headers: dict[str, str] = {"Cache-Control": "no-store"}
-            if next_cursor and view != 3:
-                base_headers["X-Next-Cursor"] = next_cursor
             # Batch 2 / B1-1R (rev-5): coding-specific SINGLE-candidate 304
             # judgment, pre-compression (plan §4 :222-229 — a validator hit
             # is zero compression). Identity-only / sub-min requests judge
@@ -799,16 +795,16 @@ async def _messages_via_lease(
             # echoes the actual coding's tag. The 200 below labels its
             # validator with the coding it ACTUALLY carries (B1-1R).
             rep_version = etag_mod.response_rep_version(
-                config, wire_view=view)
+                config, wire_view=3)
             # §6.2 (gate C3): directory-sensitive route — the directory
             # Vary dimension is unconditional (cache-correctness semantics,
             # NOT an ETag accessory; Batch 3 merge_directory_vary precedent).
             vary_value = etag_mod.merged_vary("Accept-Encoding")
             if rep_version is not None:
-                # v3 304 never carries aux headers (§6.4).
-                aux = None if view == 3 else (
-                    {"X-Next-Cursor": next_cursor}
-                    if next_cursor else None)
+                # 304 never carries aux headers (§6.4 terminal: the
+                # X-Next-Cursor channel is retired; the cached envelope
+                # carries the cursor).
+                aux = None
                 verdict = etag_mod.judge_conditional(
                     identity,
                     request.headers.get("if-none-match"),
@@ -974,15 +970,12 @@ async def messages(
                 accept_encoding=request.headers.get("accept-encoding"),
                 fingerprint=config.message_fingerprint_enabled,
             )
-        # v3 (§4.1, Batch B — same tail as the lease path above): envelope
-        # splice before validator work; no X-Next-Cursor header on the v3
-        # view (client reads ``nextCursor`` from the cached envelope, §6.4).
-        view = wire_view_from_scope(request.scope)
-        if view == 3:
-            identity = messages_envelope_bytes(identity, next_cursor)
+        # §4.1 terminal (v3-only — same tail as the lease path above):
+        # envelope splice before validator work; X-Next-Cursor retired
+        # (§1) — the client reads ``nextCursor`` from the cached envelope
+        # (§6.4).
+        identity = messages_envelope_bytes(identity, next_cursor)
         base_headers: dict[str, str] = {"Cache-Control": "no-store"}
-        if next_cursor and view != 3:
-            base_headers["X-Next-Cursor"] = next_cursor
         # Batch 2 / B1-1R (rev-5, same tail as the lease path): coding-
         # specific SINGLE-candidate pre-compression judgment (identity-only
         # / sub-min → exact identity tag; gzip-capable → gzip tag only,
@@ -991,15 +984,14 @@ async def messages(
         # non-star 304. The 200 labels its validator with the coding it
         # ACTUALLY carries. Aux header value comes from THIS run.
         rep_version = etag_mod.response_rep_version(
-            config, wire_view=view)
+            config, wire_view=3)
         # §6.2 (gate C3): unconditional directory Vary — same as the lease
         # tail; directory-sensitivity does not depend on validator support.
         vary_value = etag_mod.merged_vary("Accept-Encoding")
         if rep_version is not None:
-            # v3 304 never carries aux headers (§6.4).
-            aux = None if view == 3 else (
-                {"X-Next-Cursor": next_cursor}
-                if next_cursor else None)
+            # 304 never carries aux headers (§6.4 terminal — same as the
+            # lease tail).
+            aux = None
             verdict = etag_mod.judge_conditional(
                 identity,
                 request.headers.get("if-none-match"),

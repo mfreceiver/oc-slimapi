@@ -4,7 +4,7 @@ Surfaces subscriber counts, per-hub upstream counters, per-client queue
 health, and the transform-pool's active / waiting slots so an operator can
 see why a client got a 503 or why the upstream connection was reopened.
 
-The version gate (``SlimapiVersionMiddleware``) already covers every
+The version selector (``?v=3`` terminal) already covers every
 ``/slimapi/**`` route, so this handler does nothing beyond delegating to
 :meth:`HubRegistry.snapshot_metrics` and negotiating gzip with the caller.
 """

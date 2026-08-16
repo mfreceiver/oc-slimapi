@@ -214,13 +214,12 @@ async def test_merged_inlines_full_for_placeholder(upstream_factory):
         plain = await client.get("/slimapi/messages/s1", headers=HDR)
 
     assert merged.status_code == plain.status_code == 200
-    # X-Next-Cursor passthrough is unchanged by the merge.
-    assert merged.headers.get("X-Next-Cursor") == "CURSOR123"
-    assert merged.headers.get("X-Next-Cursor") == \
-        plain.headers.get("X-Next-Cursor")
+    # nextCursor passthrough is unchanged by the merge (v3 envelope).
+    assert merged.json()["nextCursor"] == "CURSOR123"
+    assert merged.json()["nextCursor"] == plain.json()["nextCursor"]
 
-    merged_items = merged.json()
-    plain_items = plain.json()
+    merged_items = merged.json()["items"]
+    plain_items = plain.json()["items"]
 
     # Sanity: the default projection DID collapse msg_1 to a placeholder.
     assert any(
@@ -276,7 +275,7 @@ async def test_merged_degrades_beyond_page_cap(upstream_factory):
 
     assert r.status_code == 200
     assert full_calls["n"] == 16  # page cap, not 20
-    body = r.json()
+    body = r.json()["items"]
     # First 16 (sorted order) inlined: full tool part present, no
     # placeholder marker part.
     for i in range(16):
@@ -310,7 +309,7 @@ async def test_merged_over_byte_budget_keeps_skeleton(upstream_factory):
 
     assert r.status_code == 200
     assert full_calls["n"] == 1  # fetch happened; only the splice was skipped
-    items = r.json()
+    items = r.json()["items"]
     assert any(
         str(p.get("id", "")).startswith("thin_placeholder_")
         for p in items[0]["parts"]
@@ -348,7 +347,7 @@ async def test_merged_item_fetch_failure_degrades_to_skeleton(upstream_factory):
         r = await client.get("/slimapi/messages/s1?mode=merged", headers=HDR)
 
     assert r.status_code == 200
-    items = r.json()
+    items = r.json()["items"]
     # msg_bad: placeholder kept (client can still /full on demand).
     assert any(
         str(p.get("id", "")).startswith("thin_placeholder_")
@@ -395,9 +394,12 @@ async def test_merged_unknown_mode_ignored(upstream_factory):
     # the default mode down to the bytes on the wire.
     assert legacy.content == plain.content
     assert bogus.content == plain.content
-    for header in ("content-type", "content-length", "x-next-cursor"):
+    for header in ("content-type", "content-length"):
         assert legacy.headers[header] == plain.headers[header], header
         assert bogus.headers[header] == plain.headers[header], header
+    # v3 envelope: the cursor lives in the body, headers are stable.
+    assert legacy.json()["nextCursor"] == plain.json()["nextCursor"]
+    assert bogus.json()["nextCursor"] == plain.json()["nextCursor"]
     # No mode other than the literal "merged" ever fans out.
     assert full_calls["n"] == 0
 
@@ -431,7 +433,7 @@ async def test_merged_fetch_dedups_with_direct_full(upstream_factory):
     assert merged.status_code == direct.status_code == 200
     assert calls["n"] == 1  # shared flight: ONE upstream GET for both
     # The inlined parts equal the direct /full parts (same shared body).
-    assert merged.json()[0]["parts"] == direct.json()["parts"]
+    assert merged.json()["items"][0]["parts"] == direct.json()["parts"]
 
 
 # ---------------------------------------------------------------------------
@@ -484,7 +486,7 @@ async def test_merged_fanout_does_not_starve_direct_full(upstream_factory):
     assert direct.status_code == 200  # NOT starved into a 503
     assert direct_elapsed < 1.5  # nowhere near the 2.5s absorb budget
     assert merged.status_code == 200
-    assert merged.json()[0]["parts"] == FULL_MSG_1_PARTS_STRIPPED
+    assert merged.json()["items"][0]["parts"] == FULL_MSG_1_PARTS_STRIPPED
 
 
 # ---------------------------------------------------------------------------
@@ -541,7 +543,7 @@ async def test_merged_byte_budget_caps_fetch_buffers(upstream_factory):
     assert r.status_code == 200
     # Only the two budget-allotted items hit upstream — C/D never started.
     assert full_calls["n"] == 2
-    body = r.json()
+    body = r.json()["items"]
     inlined = [
         m for m in body
         if m["parts"] == stripped_parts
@@ -594,7 +596,7 @@ async def test_merged_budget_refund_lets_serial_items_proceed(upstream_factory):
 
     assert r.status_code == 200
     assert full_calls["n"] == 3  # refund kept the budget alive for all 3
-    body = r.json()
+    body = r.json()["items"]
     assert len(body) == 3
     for message in body:
         assert message["parts"] == stripped_parts  # every item inlined
@@ -694,7 +696,7 @@ async def test_merged_read_chunk_overshoot_bounded(upstream_factory, monkeypatch
         r = await client.get("/slimapi/messages/s1?mode=merged", headers=HDR)
 
     assert r.status_code == 200
-    body = r.json()
+    body = r.json()["items"]
     def _has_placeholder(m: dict) -> bool:
         # skeleton_message APPENDS the thin_placeholder part after the
         # projected (non-renderable) originals — parts[0] is NOT it.
@@ -783,7 +785,7 @@ async def test_direct_full_recovers_after_joined_merged_truncation(
     assert merged_r.status_code == 200
     assert any(
         str(part.get("id", "")).startswith("thin_placeholder_")
-        for part in merged_r.json()[0]["parts"]
+        for part in merged_r.json()["items"][0]["parts"]
     )
     # F1 (merged-led, truncated) + direct's re-lead at its full cap.
     assert full_calls["n"] == 2
@@ -915,6 +917,6 @@ async def test_merged_windfall_from_direct_leader_excluded_at_splice(
     # the item keeps its skeleton placeholder; spliced bytes == 0 ≤ budget.
     assert any(
         str(part.get("id", "")).startswith("thin_placeholder_")
-        for part in merged_r.json()[0]["parts"]
+        for part in merged_r.json()["items"][0]["parts"]
     )
     assert full_calls["n"] == 1

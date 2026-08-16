@@ -40,7 +40,7 @@ opencode v1.18.16 — ``groups/session.ts:203-397``, ``groups/question.ts:32-48`
   (no projection → no ``transform_busy``), gzip re-encode inline like the
   §10.a read groups;
 * success responses carry ``Cache-Control: no-store`` and the merged
-  ``Vary: Accept-Encoding, X-Opencode-Directory`` (§6.2 directory-sensitive
+  ``Vary: Accept-Encoding`` (§6.2 terminal single value
   set: every §10.b write route consumes directory).
 """
 
@@ -52,9 +52,10 @@ from starlette.responses import Response
 
 from ..directory import validate_directory
 from ..gzip_util import compress_if_beneficial, error_response
-from ..selector import resolve_route_directory, wire_view_from_scope
-from ..traffic import stash_up_in
+from ..selector import resolve_route_directory
+from ..traffic import stash_up_in, stash_up_out
 from ..transform import read_with_cap
+from ..turn_registry import extract_sid_from_path, is_turn_bumping_path
 from ..upstream import forward_upstream_headers, request_id_from_scope
 from ..upstream_errors import raise_upstream_unavailable
 from ._read_passthrough import (
@@ -68,20 +69,16 @@ router = APIRouter(prefix="/slimapi", tags=["write-groups"])
 
 
 def _resolve(request: Request) -> str | None:
-    """Workspace directory for a write route (§5.2).
+    """Workspace directory for a write route (§5.2 terminal, v3-only).
 
-    v3: the selector consumed ``?directory=`` into the scope stash
-    (validated) — forward it as the ``X-Opencode-Directory`` header.
-    v2: the header is the channel (bind + validate); the v2 query —
-    ``directory`` included — forwards verbatim (validated per value).
+    The selector consumed ``?directory=`` into the scope stash (validated)
+    — forward it as the ``X-Opencode-Directory`` header. The header is
+    never read as a client channel (§5.7: retired; presence on the wire
+    is rejected by the dispatch layer).
     """
     resolved = resolve_route_directory(request.scope, None)
     if resolved is not None:
         return validate_directory(resolved)
-    if wire_view_from_scope(request.scope) == 2:
-        header_dir = request.headers.get("x-opencode-directory")
-        if header_dir:  # treat empty header as absent
-            return validate_directory(header_dir)
     return None
 
 
@@ -95,12 +92,6 @@ async def _write_passthrough(
     config = request.app.state.config
     accept_encoding = request.headers.get("accept-encoding")
 
-    # v2 duty: validate (not consume) every ?directory= value before it
-    # leaves the sidecar — identical to the §10.a read groups.
-    if wire_view_from_scope(request.scope) == 2:
-        for dir_val in request.query_params.getlist("directory"):
-            validate_directory(dir_val)
-
     # Request body: read once (caps at max_message_bytes — the repo's
     # request-size knob; 413 before any upstream call).
     body = bytearray()
@@ -112,6 +103,12 @@ async def _write_passthrough(
                 limit=config.max_message_bytes,
             )
         body += chunk
+
+    # upOut accounting parity: the retired catch-all forwarder counted the
+    # request bytes it relayed upstream; the annexed write pipeline counts
+    # the buffered body it is about to send.
+    if body:
+        stash_up_out(request, len(body))
 
     directory = _resolve(request)
     headers = forward_upstream_headers(
@@ -128,6 +125,17 @@ async def _write_passthrough(
         content=bytes(body) or None,
         headers=headers,
     )
+
+    # S2 turn-fence commit point (bump-before-send): prompt_async/abort
+    # writes advance the per-sid turn counter before the upstream send —
+    # this is where the retired catch-all forwarder used to bump (the
+    # strong-fence contract tolerates holes on connection-level failure).
+    if method == "POST" and is_turn_bumping_path(upstream_path):
+        turn_registry = getattr(request.app.state, "turn_registry", None)
+        sid = extract_sid_from_path(upstream_path)
+        if turn_registry is not None and sid:
+            turn_registry.bump_turn(sid)
+
     try:
         response = await request.app.state.upstream.send(
             upstream_request, stream=True)
@@ -185,8 +193,9 @@ async def _write_passthrough(
     }
     resp_headers.update(coding)
     # §6.2: every §10.b write route is directory-sensitive (consumer set)
-    # — merged double Vary, overwriting compress_if_beneficial's bare one.
-    resp_headers["Vary"] = "Accept-Encoding, X-Opencode-Directory"
+    # — §6.2 terminal: single-value Vary, overwriting whatever
+    # compress_if_beneficial set.
+    resp_headers["Vary"] = "Accept-Encoding"
     return Response(encoded, status_code=status, headers=resp_headers)
 
 

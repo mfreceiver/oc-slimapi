@@ -24,10 +24,12 @@ from fastapi import FastAPI
 
 from oc_slimapi.config import Settings
 from oc_slimapi.errors import register_error_handlers
-from oc_slimapi.proxy import (
-    _extract_sid_from_path,
-    _is_turn_bumping_path,
-    install_proxy,
+from oc_slimapi.proxy import install_proxy
+from oc_slimapi.routes import write_groups
+from oc_slimapi.selector import SlimapiSelectorMiddleware
+from oc_slimapi.turn_registry import (
+    extract_sid_from_path as _extract_sid_from_path,
+    is_turn_bumping_path as _is_turn_bumping_path,
 )
 from oc_slimapi.sse.global_hub import GlobalHub
 from oc_slimapi.sse.hub import Subscriber
@@ -442,7 +444,9 @@ def _build_app(settings: Settings, upstream: httpx.AsyncClient) -> FastAPI:
     app = FastAPI(title="oc-slimapi-turn-test")
     app.state.config = settings
     app.state.upstream = upstream
+    app.include_router(write_groups.router)
     register_error_handlers(app)
+    app.add_middleware(SlimapiSelectorMiddleware)
     install_proxy(app)
     return app
 
@@ -461,27 +465,29 @@ def _passthrough_handler():
     return handler
 
 
-async def test_proxy_bumps_turn_on_prompt(upstream_factory):
-    """POST /session/{sid}/prompt bumps turn (no header required)."""
+async def test_write_route_bumps_turn_on_prompt_async(upstream_factory):
+    """POST /slimapi/session/{sid}/prompt_async?v=3 bumps turn (terminal:
+    the bump moved from the retired catch-all forwarder into the annexed
+    write pipeline — S2 bump-before-send semantics preserved)."""
     upstream = upstream_factory(_passthrough_handler())
     app = _build_app(_settings(), upstream)
-    reg = TurnRegistry(incarnation=3)
+    reg = TurnRegistry(incarnation=4)
     app.state.turn_registry = reg  # inject into state (lifespan does this)
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.post("/session/ses_abc/prompt")
+        response = await client.post(
+            "/slimapi/session/ses_abc/prompt_async?v=3")
     assert response.status_code == 200
-    # Turn bumped (sid-keyed).
-    assert reg.snapshot("ses_abc") == (3, 1)
-    # A second prompt bumps again (monotonic).
+    assert reg.snapshot("ses_abc") == (4, 1)
+    # Second prompt_async is monotonic.
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        await client.post("/session/ses_abc/prompt")
-    assert reg.snapshot("ses_abc") == (3, 2)
+        await client.post("/slimapi/session/ses_abc/prompt_async?v=3")
+    assert reg.snapshot("ses_abc") == (4, 2)
 
 
-async def test_proxy_bumps_turn_on_abort(upstream_factory):
-    """POST /session/{sid}/abort also bumps (contract §3.y.3 forwards)."""
+async def test_write_route_bumps_turn_on_abort(upstream_factory):
+    """POST /slimapi/session/{sid}/abort?v=3 bumps (contract §3.y.3)."""
     upstream = upstream_factory(_passthrough_handler())
     app = _build_app(_settings(), upstream)
     reg = TurnRegistry(incarnation=1)
@@ -489,35 +495,33 @@ async def test_proxy_bumps_turn_on_abort(upstream_factory):
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.post("/session/ses_abc/abort")
+        response = await client.post(
+            "/slimapi/session/ses_abc/abort?v=3")
     assert response.status_code == 200
     assert reg.snapshot("ses_abc") == (1, 1)
 
 
-async def test_proxy_bumps_turn_on_prompt_async(upstream_factory):
-    """POST /session/{sid}/prompt_async bumps turn — ocdroid's PRODUCTION
-    send path (rev-ogpt BLOCKER regression: regex previously matched only
-    `prompt`, not `prompt_async`, so the fence was dead in real traffic)."""
+async def test_retired_catch_all_prompt_no_longer_bumps(upstream_factory):
+    """The retired legacy passthrough surface is closed (§8.2 3.0.0):
+    POST /session/{sid}/prompt is NOT a collected write endpoint — it now
+    returns 404 thin_route_not_found and never bumps the turn fence."""
     upstream = upstream_factory(_passthrough_handler())
     app = _build_app(_settings(), upstream)
-    reg = TurnRegistry(incarnation=4)
+    reg = TurnRegistry(incarnation=3)
     app.state.turn_registry = reg
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.post("/session/ses_abc/prompt_async")
-    assert response.status_code == 200
-    assert reg.snapshot("ses_abc") == (4, 1)
-    # Second prompt_async is monotonic.
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        await client.post("/session/ses_abc/prompt_async")
-    assert reg.snapshot("ses_abc") == (4, 2)
+        response = await client.post("/session/ses_abc/prompt")
+    assert response.status_code == 404
+    assert reg.snapshot("ses_abc") == (3, 0)
+    assert reg._turns == {}
 
 
-async def test_proxy_does_not_bump_on_non_post_method(upstream_factory):
-    """Method gate: GET/HEAD on /session/{sid}/prompt must NOT bump turn,
-    even though the path matches the bumping suffix (rev-ogpt MAJOR
-    regression). Only POST forwards advance the causal high-water."""
+async def test_write_route_does_not_bump_on_non_post_method(upstream_factory):
+    """Method gate: GET on a bumping-looking path must NOT bump turn.
+    GET /session/{sid}/prompt now 404s (closed surface, no bump); a
+    subsequent POST prompt_async still bumps to 1 (no slot consumed)."""
     upstream = upstream_factory(_passthrough_handler())
     app = _build_app(_settings(), upstream)
     reg = TurnRegistry(incarnation=2)
@@ -525,18 +529,17 @@ async def test_proxy_does_not_bump_on_non_post_method(upstream_factory):
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        # GET /prompt — path matches but method is GET → no bump.
         response = await client.get("/session/ses_abc/prompt")
-    assert response.status_code == 200
+    assert response.status_code == 404
     assert reg.snapshot("ses_abc") == (2, 0)
-    # A subsequent POST prompt then bumps to 1 (the GET did not consume a slot).
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        await client.post("/session/ses_abc/prompt")
+        await client.post("/slimapi/session/ses_abc/prompt_async?v=3")
     assert reg.snapshot("ses_abc") == (2, 1)
 
 
-async def test_proxy_does_not_bump_on_non_bumping_session_request(upstream_factory):
-    """A non-bumping GET /session/{sid}/message does NOT bump turn."""
+async def test_write_route_does_not_bump_on_non_bumping_session_request(upstream_factory):
+    """A non-bumping GET write (session read of the write group's surface
+    is not annexed — the closed catch-all 404s) does NOT bump turn."""
     upstream = upstream_factory(_passthrough_handler())
     app = _build_app(_settings(), upstream)
     reg = TurnRegistry(incarnation=1)
@@ -545,22 +548,24 @@ async def test_proxy_does_not_bump_on_non_bumping_session_request(upstream_facto
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get("/session/ses_abc/message")
-    assert response.status_code == 200
+    assert response.status_code == 404
     # Snapshot still returns a tuple (unobserved sid → (inc, 0)); no bump
     # recorded in the _turns dict.
     assert reg.snapshot("ses_abc") == (1, 0)
     assert reg._turns == {}
 
 
-async def test_proxy_no_turn_registry_in_state_still_works(upstream_factory):
-    """Absence of app.state.turn_registry (getattr default None) → no-op, no crash."""
+async def test_write_route_no_turn_registry_in_state_still_works(upstream_factory):
+    """Absence of app.state.turn_registry (getattr default None) → no-op,
+    no crash, write still completes."""
     upstream = upstream_factory(_passthrough_handler())
     app = _build_app(_settings(), upstream)
     # Deliberately do NOT set app.state.turn_registry.
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.post("/session/ses_abc/prompt")
+        response = await client.post(
+            "/slimapi/session/ses_abc/prompt_async?v=3")
     assert response.status_code == 200
 
 

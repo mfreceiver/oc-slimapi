@@ -590,8 +590,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="oc-slimapi", version=__version__, lifespan=lifespan)
 register_error_handlers(app)
-# v3 Batch A — the version SELECTOR replaces the bare version gate at this
-# position in the stack. It owns an unmodified SlimapiVersionMiddleware
+# v3 terminal — the version selector (the retired Batch-A gate was removed
+# with the v2 pipeline) sits at this position in the stack.
 # Version selector — terminal state: ?v=3 is the only admitted pipeline
 # (scope-state marked; `v` stripped; directory consumed per §5.2/§5.7). Every
 # other /slimapi/** version form is a 400; GET /slimapi/versions is

@@ -44,7 +44,7 @@ from oc_slimapi.transform import TransformConfig, TransformPool
 
 IDENTITY = {"Accept-Encoding": "identity"}
 V2_HEADERS = {"X-Slimapi-Version": "2", **IDENTITY}
-DOUBLE_VARY = "Accept-Encoding, X-Opencode-Directory"
+DOUBLE_VARY = "Accept-Encoding"
 DIRECTORY_DIMENSION = "X-Opencode-Directory"
 
 

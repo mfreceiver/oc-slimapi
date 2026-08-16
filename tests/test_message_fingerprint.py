@@ -173,7 +173,7 @@ async def _get_messages(app, *, merged: bool = False):
     async with _client(app) as client:
         r = await client.get(path, headers=HDRS)
     assert r.status_code == 200, r.text
-    return r.json()
+    return r.json()["items"]
 
 
 # ---------------------------------------------------------------------------
@@ -559,12 +559,13 @@ class TestDisabledSwitch:
             async with _client(app) as client:
                 r = await client.get("/slimapi/messages/s1", headers=HDRS)
             assert r.status_code == 200
-            body = r.json()
+            body = r.json()["items"]
             for m in body:
                 assert "contentFingerprint" not in m
-            # byte-for-byte: the body equals the plain projection dump
-            assert r.content == orjson.dumps(
-                skeleton_messages(orjson.loads(MSG_LIST_BODY)))
+            # byte-for-byte: the envelope's items equal the plain projection
+            # dump (v3 envelope: {"items": <v2 items bytes>, "nextCursor": …})
+            assert body == orjson.loads(
+                orjson.dumps(skeleton_messages(orjson.loads(MSG_LIST_BODY))))
         finally:
             app.state.transforms.shutdown()
 

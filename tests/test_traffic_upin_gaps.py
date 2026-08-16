@@ -200,35 +200,10 @@ async def test_ready_503_path_stashes_upin(upstream_factory):
 # Scenario 3 — proxy try/finally upOut stash (structural + happy-path)
 # ===========================================================================
 
-async def test_proxy_counted_req_stream_happy_path_stashes_upout(
-    upstream_factory,
-):
-    """Structural + happy-path check of the proxy's ``_counted_req_stream``
-    ``try/finally`` upOut stash.
-
-    The proxy wraps the upstream request body in a ``_counted_req_stream``
-    generator whose ``finally`` block calls ``stash_up_out(request, n)`` so
-    the bytes we send upstream are attributed to ``upOut`` even if the
-    generator is torn down early (client disconnect → ``GeneratorExit`` /
-    ``CancelledError``).
-
-    What this test DOES cover (the happy path):
-      * A normal proxied POST with a request body lands ``upOut == len(body)``
-        in the ``passthrough`` bucket — proving the stash code path is
-        reached and the ``finally`` block fires on clean completion.
-      * The upstream response body is passed through 1:1 into ``upIn``.
-
-    What this test does NOT cover (and deliberately so):
-      A genuine mid-stream client disconnect test would require cancelling
-      the ASGI ``receive`` mid-iteration to tear the generator down early,
-      which is extremely fragile under httpx/Starlette and tends to hang or
-      flake. The disconnect → ``finally`` guarantee is therefore backed by
-      **code review** (the ``finally`` is unconditional — it runs on both
-      normal completion and ``GeneratorExit``/``CancelledError``), not by a
-      brittle mid-stream cancellation harness. This keeps the suite fast and
-      deterministic without sacrificing the happy-path coverage that proves
-      the stash wiring works at all.
-    """
+async def test_write_route_stashes_upout(upstream_factory):
+    """Terminal: the annexed write pipeline attributes the buffered request
+    body to ``upOut`` (accounting parity with the retired catch-all
+    forwarder's _counted_req_stream)."""
     body = b"x" * 5000
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -243,36 +218,68 @@ async def test_proxy_counted_req_stream_happy_path_stashes_upout(
 
     upstream = upstream_factory(handler)
     app, ledger = _build_app(
-        _settings(), upstream, include_proxy=True,
+        _settings(), upstream, include_proxy=False,
     )
     assert ledger is not None
 
+    # Add the write router + selector (the bumped/bodied POST surface).
+    from oc_slimapi.routes import write_groups
+    from oc_slimapi.selector import SlimapiSelectorMiddleware
+    app.include_router(write_groups.router)
+    app.add_middleware(SlimapiSelectorMiddleware)
+
     request_body = b'{"command":"echo hello"}'
 
-    # Normal proxied POST through the catch-all reverse proxy. The
-    # ``_counted_req_stream`` finally block fires on clean completion and
-    # stashes the request body bytes as upOut.
     transport = httpx.ASGITransport(app)
     async with httpx.AsyncClient(transport=transport,
                                  base_url="http://test") as client:
         response = await client.post(
-            "/session/s1/command",
+            "/slimapi/session/s1/command?v=3",
             content=request_body,
         )
     assert response.status_code == 200
 
     snap = ledger.snapshot()
     assert snap["enabled"] is True
-    assert "passthrough" in snap["buckets"]
-    bucket = snap["buckets"]["passthrough"]
-    # upOut should include the request body bytes (stashed by
-    # _counted_req_stream's finally block).
+    # /slimapi/session/{sid}/command bucketizes under write_session.
+    assert "write_session" in snap["buckets"]
+    bucket = snap["buckets"]["write_session"]
+    # upOut includes the request body bytes (stashed at send time).
     assert bucket["upOut"] == len(request_body), (
         f"upOut ({bucket['upOut']}) should equal request body length "
         f"({len(request_body)})"
     )
-    # The proxy body is passed through 1:1.
+    # The upstream response body is counted into upIn (cap-read on_read).
     assert bucket["upIn"] == len(body)
+
+
+async def test_closed_catch_all_stashes_no_upstream_bytes(upstream_factory):
+    """Terminal §8.2: the closed catch-all never forwards — a /session POST
+    records the request with zero upOut/upIn (the mid-stream upIn machinery
+    of the retired forwarder is unreachable by construction)."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("closed surface must never reach the upstream")
+
+    upstream = upstream_factory(handler)
+    app, ledger = _build_app(
+        _settings(), upstream, include_proxy=True,
+    )
+    assert ledger is not None
+    transport = httpx.ASGITransport(app)
+    try:
+        async with httpx.AsyncClient(transport=transport,
+                                     base_url="http://test") as client:
+            try:
+                await client.post("/session/s1/command", content=b"{}")
+            except httpx.HTTPError:
+                pass
+        snap = ledger.snapshot()
+        assert "passthrough" in snap["buckets"]
+        bucket = snap["buckets"]["passthrough"]
+        assert bucket["upOut"] == 0
+        assert bucket["upIn"] == 0
+    finally:
+        await _shutdown(app)
 
 
 # ===========================================================================
@@ -343,63 +350,3 @@ async def test_messages_cap_bail_stashes_upin(upstream_factory):
 # Scenario 4 — proxy mid-stream upstream response aclose via finally (P1-10)
 # ===========================================================================
 
-async def test_proxy_mid_stream_response_aclose_via_finally_stashes_upin(
-    upstream_factory,
-):
-    """P1-10: ``_counted_upstream_response``'s ``finally`` block calls
-    ``response.aclose()`` even when the upstream stream fails mid-way.
-
-    The ``response.aclose()`` in the ``finally`` is the last line of defence
-    against connection-pool leaks: ``StreamingResponse``'s
-    ``BackgroundTask(response.aclose)`` only runs after the generator
-    completes normally, so a mid-stream exception would skip it.
-
-    Observable proxy: ``stash_up_in(request, n)`` is the line JUST BEFORE
-    ``response.aclose()`` in the SAME ``finally`` block. If the stash fires
-    (attributing the partial bytes to ``upIn``), the ``finally`` executed —
-    and ``response.aclose()``, being the next unconditional line, also ran.
-    This mirrors how ``test_proxy_counted_req_stream_happy_path_stashes_upout``
-    verifies the request-stream ``finally`` via the ``upOut`` stash.
-    """
-    PARTIAL = b'{"partial":true}'
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        async def body():
-            yield PARTIAL
-            raise httpx.ReadError("mid-stream disconnect", request=request)
-
-        return httpx.Response(
-            200,
-            stream=httpx._content.AsyncIteratorByteStream(body()),
-            headers={"Content-Type": "application/json"},
-        )
-
-    upstream = upstream_factory(handler)
-    app, ledger = _build_app(
-        _settings(), upstream, include_proxy=True,
-    )
-    assert ledger is not None
-    transport = httpx.ASGITransport(app)
-    try:
-        async with httpx.AsyncClient(transport=transport,
-                                     base_url="http://test") as client:
-            # The mid-stream failure propagates through StreamingResponse.
-            # The client may see a partial body or a transport error; we do
-            # not assert on the response shape — the key assertion is the
-            # traffic stash below proving the ``finally`` ran.
-            try:
-                await client.get("/session")
-            except httpx.HTTPError:
-                pass  # partial / incomplete response is expected
-
-        snap = ledger.snapshot()
-        assert "passthrough" in snap["buckets"]
-        bucket = snap["buckets"]["passthrough"]
-        assert bucket["upIn"] == len(PARTIAL), (
-            f"upIn ({bucket['upIn']}) should equal the partial bytes read "
-            f"before failure ({len(PARTIAL)}) — proves "
-            f"_counted_upstream_response's finally ran, and thus "
-            f"response.aclose() (the next unconditional line) also ran"
-        )
-    finally:
-        await _shutdown(app)

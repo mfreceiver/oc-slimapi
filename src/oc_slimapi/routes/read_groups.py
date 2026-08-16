@@ -95,7 +95,6 @@ async def file_list(request: Request, path: str,
     return await read_passthrough_get(
         request, upstream_path="/file",
         directory=_resolve(request, directory),
-        directory_sensitive=True,
     )
 
 
@@ -106,7 +105,6 @@ async def file_content(request: Request, path: str,
     return await read_passthrough_get(
         request, upstream_path="/file/content",
         directory=_resolve(request, directory),
-        directory_sensitive=True,
     )
 
 
@@ -116,7 +114,6 @@ async def file_status(request: Request, directory: str | None = None):
     return await read_passthrough_get(
         request, upstream_path="/file/status",
         directory=_resolve(request, directory),
-        directory_sensitive=True,
     )
 
 
@@ -129,7 +126,6 @@ async def vcs_info(request: Request, directory: str | None = None):
     return await read_passthrough_get(
         request, upstream_path="/vcs",
         directory=_resolve(request, directory),
-        directory_sensitive=True,
     )
 
 
@@ -139,7 +135,6 @@ async def vcs_status(request: Request, directory: str | None = None):
     return await read_passthrough_get(
         request, upstream_path="/vcs/status",
         directory=_resolve(request, directory),
-        directory_sensitive=True,
     )
 
 
@@ -154,7 +149,6 @@ async def vcs_diff(request: Request, directory: str | None = None,
     return await read_passthrough_get(
         request, upstream_path="/vcs/diff",
         directory=_resolve(request, directory),
-        directory_sensitive=True,
     )
 
 
@@ -175,7 +169,6 @@ async def find_file(request: Request, query: str,
     return await read_passthrough_get(
         request, upstream_path="/find/file",
         directory=_resolve(request, directory),
-        directory_sensitive=True,
     )
 
 
@@ -188,7 +181,6 @@ async def config_providers(request: Request, directory: str | None = None):
     return await read_passthrough_get(
         request, upstream_path="/config/providers",
         directory=_resolve(request, directory),
-        directory_sensitive=True,
     )
 
 
@@ -205,7 +197,6 @@ async def session_single(request: Request, sid: str,
     return await read_passthrough_get(
         request, upstream_path=f"/session/{sid}",
         directory=_resolve(request, directory),
-        directory_sensitive=True,
         project=_project_session,
     )
 
@@ -219,7 +210,6 @@ async def session_active(request: Request):
     ``{data: Record<SessionID, SessionActive>}`` verbatim."""
     return await read_passthrough_get(
         request, upstream_path="/api/session/active",
-        directory_sensitive=False,
     )
 
 
@@ -228,5 +218,4 @@ async def global_health(request: Request):
     """Upstream ``GET /global/health`` — ``{healthy, version}`` verbatim."""
     return await read_passthrough_get(
         request, upstream_path="/global/health",
-        directory_sensitive=False,
     )

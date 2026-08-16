@@ -341,35 +341,43 @@ async def test_tokens_non_literal_direct_call_400():
         await _close_app(app)
 
 
-async def test_default_events_builds_stream_server_connected_first():
-    """Default (no tokens) builds the stream; server.connected is the FIRST
-    frame (A-C1 — order, not just presence)."""
+async def test_default_events_builds_stream_meta_then_connected():
+    """Default (no tokens) builds the stream; slimapi.meta is the FIRST
+    frame and server.connected follows (terminal §7.2 + A-C1 order)."""
     app = _build_app(_settings())
     try:
         status, _, body = await _drive_stream(app, "/slimapi/events", _headers())
         assert status == 200
         frames = list(_sse_frames(body))
-        assert frames, "expected at least the server.connected frame"
-        assert frames[0][0] == "server.connected", (
-            f"server.connected must be first, got {frames[0]!r}"
+        assert frames, "expected at least the handshake frames"
+        assert frames[0][0] == "slimapi.meta", (
+            f"slimapi.meta must be first, got {frames[0]!r}"
+        )
+        assert frames[0][1]["tokens"] is False
+        assert frames[1][0] == "server.connected", (
+            f"server.connected must follow meta, got {frames[1]!r}"
         )
     finally:
         await _close_app(app)
 
 
-async def test_tokens_one_builds_stream_server_connected_first():
-    """``?tokens=1`` builds the stream; server.connected is the FIRST frame
-    (A-C1 — order, not just presence; the tokens=1 path must not reorder the
-    handshake)."""
+async def test_tokens_one_builds_stream_meta_tokens_true():
+    """``?tokens=1`` builds the stream; slimapi.meta first with
+    tokens=true, server.connected follows (the tokens=1 path must not
+    reorder the handshake)."""
     app = _build_app(_settings())
     try:
         status, _, body = await _drive_stream(
             app, "/slimapi/events?tokens=1", _headers())
         assert status == 200
         frames = list(_sse_frames(body))
-        assert frames, "expected at least the server.connected frame"
-        assert frames[0][0] == "server.connected", (
-            f"server.connected must be first, got {frames[0]!r}"
+        assert frames, "expected at least the handshake frames"
+        assert frames[0][0] == "slimapi.meta", (
+            f"slimapi.meta must be first, got {frames[0]!r}"
+        )
+        assert frames[0][1]["tokens"] is True
+        assert frames[1][0] == "server.connected", (
+            f"server.connected must follow meta, got {frames[1]!r}"
         )
     finally:
         await _close_app(app)

@@ -481,4 +481,6 @@ async def test_stream_route_no_scope_request_ok():
     req = _NoScopeRequest()
     result = await token_stream(req, SID)
     assert result.status_code == 200
-    assert result.headers.get("x-slimapi-subscriber-id") == "tok_test"
+    # Terminal §1: X-Slimapi-Subscriber-ID is retired — the subscriber id
+    # arrives in the leading slimapi.meta frame instead.
+    assert "x-slimapi-subscriber-id" not in result.headers

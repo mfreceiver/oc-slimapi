@@ -157,12 +157,12 @@ async def test_skeleton_messages_route_returns_projected_json(app_and_client):
     # have transparently decompressed response.content for us, but the header
     # is what the wire contract guarantees to non-httpx clients.
     assert response.headers["Content-Encoding"] == "gzip"
-    body = orjson.loads(response.content)
+    body = orjson.loads(response.content)["items"]
     # Skeleton contract: tool output dropped, command input kept.
     tool_part = body[0]["parts"][1]
     assert tool_part["state"]["input"] == {"command": "ls"}
     assert "output" not in tool_part["state"]
-    assert response.headers["Vary"] == "Accept-Encoding, X-Opencode-Directory"  # Batch 2/B1: directory merged into Vary
+    assert response.headers["Vary"] == "Accept-Encoding"  # Batch 2/B1: directory merged into Vary
     assert response.headers["Cache-Control"] == "no-store"
 
 
@@ -274,8 +274,8 @@ async def test_messages_route_uses_per_app_skeleton_limits(upstream_factory):
         transport_b = httpx.ASGITransport(app_b)
         async with httpx.AsyncClient(transport=transport_b, base_url="http://test") as client:
             resp_b = await client.get("/slimapi/messages/s1", headers=VERSION_HEADERS)
-        body_a = orjson.loads(resp_a.content)[0]["parts"][0]
-        body_b = orjson.loads(resp_b.content)[0]["parts"][0]
+        body_a = orjson.loads(resp_a.content)["items"][0]["parts"][0]
+        body_b = orjson.loads(resp_b.content)["items"][0]["parts"][0]
         # Small caps -> output omitted
         assert "output" not in body_a["state"]
         # Large caps -> output inlined
@@ -712,9 +712,10 @@ async def test_messages_list_passes_through_opencode_link_cursor(upstream_factor
                 "/slimapi/messages/s1?mode=skeleton", headers=VERSION_HEADERS,
             )
         assert response.status_code == 200
-        # Opaque cursor passes through verbatim — NOT a synthesised messageID.
-        assert response.headers.get("X-Next-Cursor") == "ABCopaqueXYZ"
-        assert response.headers.get("X-Next-Cursor") not in ("m1", "m2")
+        # Opaque cursor passes through verbatim (envelope field) — NOT a
+        # synthesised messageID.
+        assert response.json()["nextCursor"] == "ABCopaqueXYZ"
+        assert response.json()["nextCursor"] not in ("m1", "m2")
         # Sidecar's pagination contract is X-Next-Cursor only; opencode's
         # Link header must not bleed through.
         assert "Link" not in response.headers
@@ -742,7 +743,7 @@ async def test_messages_list_no_link_header_means_no_cursor(upstream_factory):
                 "/slimapi/messages/s1?mode=skeleton", headers=VERSION_HEADERS,
             )
         assert response.status_code == 200
-        assert "X-Next-Cursor" not in response.headers
+        assert response.json()["nextCursor"] is None
     finally:
         app.state.transforms.shutdown()
 
@@ -822,10 +823,10 @@ async def test_messages_list_x_next_cursor_is_byte_for_byte_verbatim(upstream_fa
             )
         assert response.status_code == 200
         # Wire-level opaque lock: byte-for-byte equality, NOT "decoded contains".
-        assert response.headers.get("X-Next-Cursor") == _ESCAPED_CURSOR
+        assert response.json()["nextCursor"] == _ESCAPED_CURSOR
         # Explicit guard against the parse_qs regression — if the parser
         # ever goes back to parse_qs/unquote_plus, this assertion fires.
-        assert response.headers.get("X-Next-Cursor") != _ESCAPED_CURSOR_DECODED
+        assert response.json()["nextCursor"] != _ESCAPED_CURSOR_DECODED
     finally:
         app.state.transforms.shutdown()
 
@@ -907,7 +908,7 @@ async def test_outbound_base64url_cursor_is_verbatim_on_list(upstream_factory):
                 "/slimapi/messages/s1?mode=skeleton", headers=VERSION_HEADERS,
             )
         assert response.status_code == 200
-        assert response.headers.get("X-Next-Cursor") == _BASE64URL_CURSOR
+        assert response.json()["nextCursor"] == _BASE64URL_CURSOR
     finally:
         app.state.transforms.shutdown()
 
@@ -1268,7 +1269,7 @@ async def test_messages_list_mode_full_ignored_returns_skeleton_projection(upstr
                 "/slimapi/messages/s1?mode=full", headers=VERSION_HEADERS,
             )
         assert response.status_code == 200
-        body = orjson.loads(response.content)
+        body = orjson.loads(response.content)["items"]
         # Skeleton projection applied — debug input + tool output dropped,
         # not the full-mode passthrough that used to keep them.
         state = body[0]["parts"][0]["state"]
@@ -1316,7 +1317,7 @@ async def test_messages_list_skeleton_returns_created_ascending(upstream_factory
                 "/slimapi/messages/s1?mode=skeleton", headers=VERSION_HEADERS,
             )
         assert response.status_code == 200
-        body = orjson.loads(response.content)
+        body = orjson.loads(response.content)["items"]
         createds = [m["info"]["time"]["created"] for m in body]
         # Strictly ascending — this is the §8 contract.
         assert createds == sorted(createds), (
@@ -1364,7 +1365,7 @@ async def test_messages_list_skeleton_malformed_created_sorts_safely(upstream_fa
                 "/slimapi/messages/s1?mode=skeleton", headers=VERSION_HEADERS,
             )
         assert response.status_code == 200
-        body = orjson.loads(response.content)
+        body = orjson.loads(response.content)["items"]
         ids = [m["info"]["id"] for m in body]
         # Malformed items (key=0) cluster before valid epoch 2000.
         # Stable sort preserves upstream order within the key=0 cluster.

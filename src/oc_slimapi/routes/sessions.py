@@ -10,7 +10,7 @@ from ..envelope import sessions_envelope_payload
 from ..errors import CodedHTTPException
 from .. import etag as etag_mod
 from ..gzip_util import accepts_gzip, json_response
-from ..selector import resolve_route_directory, wire_view_from_scope
+from ..selector import resolve_route_directory
 from ..skeleton import skeleton_session
 from ..traffic import stash_up_in
 from ..transform import TransformBusy, read_with_cap
@@ -83,71 +83,34 @@ def _finalize_sessions_response(
     ``etag_enabled=false`` (rep ``None``) → the exact pre-ETag response,
     byte-identical.
 
-    v3 (§4.2, Batch B): the payload is the envelope
+    v3 terminal (§4.2, v3-only): the payload is the envelope
     ``{"items":[...],"complete":<bool>}`` — the envelope bytes are the
-    canonical ETag input (§6.3), the ``X-Complete`` header is NOT emitted
-    on either 200 or 304 (the client reads ``complete`` from the cached
-    envelope, §6.4), and the validator carries the wire-view marker so
-    v2/v3 tags never cross-match (§6.1).
+    canonical ETag input (§6.3), the ``X-Complete`` header is never
+    emitted on 200 or 304 (§1 retirement: the client reads ``complete``
+    from the cached envelope, §6.4), and the validator carries the
+    wire-view marker so v2-era tags never cross-match (§6.1).
     """
     complete = len(sessions) < limit
-    view = wire_view_from_scope(request.scope)
     rep = etag_mod.response_rep_version(
-        request.app.state.config, wire_view=view)
-    if view == 3:
-        payload: list[dict] | dict = sessions_envelope_payload(sessions, complete)
-        v3_headers: dict[str, str] = {}
-        if rep is None:
-            response = json_response(
-                payload, headers=v3_headers, accept_encoding=accept_encoding,
-            )
-            # §6.2 (gate C3): directory dimension unconditional.
-            response.headers["Vary"] = etag_mod.merged_vary("Accept-Encoding")
-            return response
-        identity = orjson.dumps(payload)
-        coding = "gzip" if accepts_gzip(accept_encoding) else "identity"
-        etag_value = etag_mod.compute_etag(identity, coding, rep)
-        vary = etag_mod.merged_vary("Accept-Encoding")
-        not_modified = etag_mod.conditional_304(
-            {"ETag": etag_value, "Vary": vary},
-            request.headers.get("if-none-match"),
-        )
-        if not_modified is not None:
-            return not_modified
-        response = json_response(
-            payload, headers=v3_headers, accept_encoding=accept_encoding,
-        )
-        response.headers["ETag"] = etag_value
-        response.headers["Vary"] = vary
-        return response
+        request.app.state.config, wire_view=3)
+    payload: list[dict] | dict = sessions_envelope_payload(sessions, complete)
     if rep is None:
-        response = json_response(
-            sessions,
-            headers={"X-Complete": "true" if complete else "false"},
-            accept_encoding=accept_encoding,
-        )
-        # §6.2 (gate C3): directory dimension unconditional — Vary is
-        # cache-correctness semantics, independent of validator support.
+        response = json_response(payload, accept_encoding=accept_encoding)
+        # §6.2 terminal: Vary is Accept-Encoding single value (the
+        # directory header channel is retired).
         response.headers["Vary"] = etag_mod.merged_vary("Accept-Encoding")
         return response
-    identity = orjson.dumps(sessions)
+    identity = orjson.dumps(payload)
     coding = "gzip" if accepts_gzip(accept_encoding) else "identity"
     etag_value = etag_mod.compute_etag(identity, coding, rep)
     vary = etag_mod.merged_vary("Accept-Encoding")
     not_modified = etag_mod.conditional_304(
         {"ETag": etag_value, "Vary": vary},
         request.headers.get("if-none-match"),
-        aux={"X-Complete": "true" if complete else "false"},
     )
     if not_modified is not None:
         return not_modified
-    response = json_response(
-        sessions,
-        headers={"X-Complete": "true" if complete else "false"},
-        accept_encoding=accept_encoding,
-    )
-    # json_response owns Vary (unconditionally sets Accept-Encoding);
-    # decorate post-hoc so the merged directory dimension survives.
+    response = json_response(payload, accept_encoding=accept_encoding)
     response.headers["ETag"] = etag_value
     response.headers["Vary"] = vary
     return response
@@ -292,12 +255,10 @@ async def sessions(
         # upstream opencode decides whether it can serve the directory.
         directory = validate_directory(directory)
     params = {"limit": limit, "roots": str(roots).lower()}
-    if directory is not None and wire_view_from_scope(request.scope) != 3:
-        # v3 (§5.2, Batch B): a consumed directory travels upstream as the
-        # canonical ``X-Opencode-Directory`` header ONLY — the dispatch
-        # layer stripped the client's query pair, and the sidecar does not
-        # re-add it as an upstream query param.
-        params["directory"] = directory
+    # §5.2 terminal (v3-only): a consumed directory travels upstream as
+    # the canonical ``X-Opencode-Directory`` header ONLY — the dispatch
+    # layer stripped the client's query pair, and the sidecar never
+    # re-adds it as an upstream query param.
     if start is not None:
         params["start"] = start
     if search is not None:
@@ -416,10 +377,8 @@ async def sessions_status(request: Request, directory: str | None = None):
     if directory is not None:
         directory = validate_directory(directory)
     params: dict[str, str] = {}
-    if directory is not None and wire_view_from_scope(request.scope) != 3:
-        # v3 (§5.2, Batch B): canonical header only — see the sessions-list
-        # handler above.
-        params["directory"] = directory
+    # §5.2 terminal (v3-only): canonical header only — see the
+    # sessions-list handler above.
     registry = getattr(request.app.state, "raw_fetch_registry", None)
     if registry is not None and request.app.state.config.coalesce_enabled:
         leased = await _status_via_lease(request, registry, directory)

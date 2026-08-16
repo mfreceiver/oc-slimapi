@@ -201,7 +201,7 @@ async def test_write_endpoint_happy_v3(stack, label, path, method, upstream):
     assert seen[0].url.path == upstream
     # frozen response headers on success
     assert resp.headers.get("cache-control") == "no-store"
-    assert resp.headers.get("vary") == "Accept-Encoding, X-Opencode-Directory"
+    assert resp.headers.get("vary") == "Accept-Encoding"
     assert "etag" not in resp.headers  # write routes: no ETag
     if label not in ("delete", "prompt_async"):
         assert resp.headers["content-type"].startswith("application/json")

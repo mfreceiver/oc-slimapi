@@ -1,18 +1,19 @@
-"""v3-contract §9.2 — catch-all SSE (/event, /global/event) observability (B2).
+"""v3-contract §8.2 terminal — the catch-all SSE surface (/event,
+/global/event) is CLOSED.
 
-The catch-all SSE passthrough streams also emit sse_open / sse_close
-lifecycle rows (selectorResult=not_applicable, wireVersion=null, bucket
-passthrough, shared lifecycleId) and bump the ledger's not_applicable
-sseActive dim. Non-SSE catch-all requests emit no lifecycle rows.
+The retired forwarder's catch-all SSE observability (sse_open/sse_close
+rows on the passthrough bucket, B2/B4/B5 semantics) is unreachable by
+construction: /event and /global/event now 404 thin_route_not_found and
+the upstream is never contacted. These tests pin the terminal behaviour:
 
-B4/B5 (rev re-review): the lifecycle open is judged by RESPONSE NATURE
-(upstream 200 + text/event-stream) — not by path; and the close row is
-guaranteed on every teardown path (emitted before the aclose await).
+* closed SSE paths → 404 + exactly one plain request row (no lifecycle
+  rows, no sseActive movement on any dim);
+* the SSE lifecycle rows themselves (open/close pairing, shared
+  lifecycleId, dims) live on the surviving /slimapi SSE endpoints —
+  covered in tests/test_access_log_v3_fields.py and test_traffic_*.
 """
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import json
 import logging
 
@@ -24,7 +25,6 @@ from httpx import ASGITransport
 from oc_slimapi.config import Settings
 from oc_slimapi.middleware.traffic_accounting import TrafficAccountingMiddleware
 from oc_slimapi.proxy import install_proxy
-from oc_slimapi.selector import SlimapiSelectorMiddleware
 from oc_slimapi import sse_observability
 from oc_slimapi.traffic import TrafficLedger
 
@@ -47,6 +47,8 @@ def capture_logger(monkeypatch):
     handler = _ListHandler()
     logger.addHandler(handler)
     monkeypatch.setattr(sse_observability, "_access_logger", lambda: logger)
+    from oc_slimapi.middleware import traffic_accounting as ta
+    monkeypatch.setattr(ta, "get_access_logger", lambda: logger)
     yield logger
     logger.removeHandler(handler)
 
@@ -66,279 +68,56 @@ def _settings(**overrides) -> Settings:
     return Settings(**base)
 
 
-def _build_app(
-    upstream: httpx.AsyncClient,
-    ledger: TrafficLedger | None,
-    *,
-    request_logger: logging.Logger | None = None,
-) -> FastAPI:
-    app = FastAPI(title="proxy-sse-obs-test")
+def _build_app(upstream: httpx.AsyncClient) -> FastAPI:
+    app = FastAPI(title="oc-slimapi-proxy-sse-terminal-test")
     app.state.config = _settings()
     app.state.upstream = upstream
-    if ledger is not None:
-        app.state.traffic_ledger = ledger
-    # Production stack order: selector stashes not_applicable for catch-all
-    # paths, which the sse observability reads for the §9.2 dim. The
-    # accounting middleware (outer) is added only when the test asserts
-    # request rows.
-    app.add_middleware(SlimapiSelectorMiddleware)
-    if request_logger is not None:
-        app.add_middleware(TrafficAccountingMiddleware, logger=request_logger)
+    ledger = TrafficLedger()
+    app.state.traffic_ledger = ledger
     install_proxy(app)
-    return app
+    from oc_slimapi.selector import SlimapiSelectorMiddleware
+    app.add_middleware(SlimapiSelectorMiddleware)
+    app.add_middleware(TrafficAccountingMiddleware)
+    return app, ledger
 
 
-def _sse_upstream():
-    """Streaming text/event-stream upstream: two frames, then clean close.
-
-    Content-type carries a parameter (charset) — the SSE judgement must
-    tolerate parameters per RFC.
-    """
-
+def _never_upstream():
     def handler(request: httpx.Request) -> httpx.Response:
-        async def body():
-            yield b"data: {\"type\":\"a\"}\n\n"
-            yield b"data: {\"type\":\"b\"}\n\n"
-
-        return httpx.Response(
-            200,
-            stream=httpx._content.AsyncIteratorByteStream(body()),
-            headers={"Content-Type": "text/event-stream; charset=utf-8"},
-        )
-
-    return handler
-
-
-async def _consume(app, path: str) -> httpx.Response:
-    transport = ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.send(client.build_request("GET", path), stream=True)
-        # Drain the whole stream so the generator's finally (sse_close) runs
-        # inside this test — mirrors the /slimapi/events SSE test strategy.
-        async for _ in response.aiter_bytes():
-            pass
-        await response.aclose()
-        return response
+        raise AssertionError("closed surface must never reach the upstream")
+    return httpx.MockTransport(handler)
 
 
 @pytest.mark.parametrize("path", ["/event", "/global/event"])
-async def test_catchall_sse_emits_open_and_close_rows(capture_logger, path):
-    upstream = httpx.AsyncClient(
-        transport=httpx.MockTransport(_sse_upstream()),
-        base_url="http://upstream",
-    )
-    app = _build_app(upstream, ledger=None)
-
-    response = await _consume(app, path)
-    assert response.status_code == 200
+async def test_closed_sse_paths_404_one_request_row(capture_logger, path):
+    """§8.2 3.0.0: the retired SSE passthrough paths 404 — exactly one
+    plain request row, no sse_open/sse_close lifecycle rows."""
+    app, _ledger = _build_app(httpx.AsyncClient(transport=_never_upstream()))
+    transport = httpx.ASGITransport(app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            path, headers={"Accept-Encoding": "identity"})
+    assert response.status_code == 404
+    assert response.json() == {"code": "thin_route_not_found"}
 
     rows = _rows(capture_logger)
-    lifecycle = [r for r in rows if r.get("recordType") in ("sse_open", "sse_close")]
-    assert len(lifecycle) == 2
-    opens = [r for r in lifecycle if r["recordType"] == "sse_open"]
-    closes = [r for r in lifecycle if r["recordType"] == "sse_close"]
-    assert len(opens) == 1 and len(closes) == 1
-    open_row, close_row = opens[0], closes[0]
-    # Pairing: same process-monotonic lifecycleId on both rows.
-    assert isinstance(open_row["lifecycleId"], int)
-    assert open_row["lifecycleId"] == close_row["lifecycleId"]
-    # §9.2 dim attribution for the catch-all.
-    for row in (open_row, close_row):
-        assert row["selectorResult"] == "not_applicable"
-        assert row["wireVersion"] is None
-        assert row["bucket"] == "passthrough"
-        assert row["path"] == path
-    assert open_row["status"] == 200
+    assert len(rows) == 1, f"expected exactly the request row, got {rows}"
+    row = rows[0]
+    assert row["recordType"] == "request"
+    assert row["status"] == 404
+    assert row["bucket"] == "passthrough"
+    assert row["selectorResult"] == "not_applicable"
+    assert row["wireVersion"] is None
 
 
-async def test_catchall_sse_ledger_not_applicable_dim(capture_logger):
-    upstream = httpx.AsyncClient(
-        transport=httpx.MockTransport(_sse_upstream()),
-        base_url="http://upstream",
-    )
-    ledger = TrafficLedger(enabled=True)
-    app = _build_app(upstream, ledger=ledger)
-
-    await _consume(app, "/event")
-
-    v3 = ledger.snapshot()["v3"]
-    assert v3["sseLifecycle"]["not_applicable"] == {
-        "opens": 1, "closes": 1, "active": 0, "orphanCloses": 0,
-    }
-    assert v3["sseActive"]["not_applicable"] == 0  # closed within the test
-
-
-async def test_catchall_non_sse_no_lifecycle_rows(capture_logger):
-    def handler(request: httpx.Request) -> httpx.Response:
-        async def body():
-            yield b'{"ok":true}'
-
-        return httpx.Response(
-            200,
-            stream=httpx._content.AsyncIteratorByteStream(body()),
-            headers={"Content-Type": "application/json"},
-        )
-
-    upstream = httpx.AsyncClient(
-        transport=httpx.MockTransport(handler), base_url="http://upstream",
-    )
-    app = _build_app(upstream, ledger=None)
-
-    transport = ASGITransport(app=app)
+@pytest.mark.parametrize("path", ["/event", "/global/event"])
+async def test_closed_sse_paths_leave_sse_active_zero(capture_logger, path):
+    """No lifecycle rows → no sseActive movement on any dim."""
+    app, ledger = _build_app(httpx.AsyncClient(transport=_never_upstream()))
+    transport = httpx.ASGITransport(app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get("/session/ses_probe/messages")
-    assert response.status_code == 200
-    assert _rows(capture_logger) == []
-
-
-# ---------------------------------------------------------------------------
-# B4: response-natured SSE judgement — SSE PATH + non-SSE RESPONSE must not
-# emit lifecycle rows (open is judged on 200 + text/event-stream, not path)
-# ---------------------------------------------------------------------------
-
-
-def _non_stream_upstream(status: int, content_type: str, payload: bytes):
-    def handler(request: httpx.Request) -> httpx.Response:
-        async def body():
-            if payload:
-                yield payload
-
-        return httpx.Response(
-            status,
-            stream=httpx._content.AsyncIteratorByteStream(body()),
-            headers={"Content-Type": content_type},
-        )
-
-    return handler
-
-
-def _lifecycle_rows(rows):
-    return [r for r in rows if r.get("recordType") in ("sse_open", "sse_close")]
-
-
-async def _get_plain(app, path: str) -> httpx.Response:
-    transport = ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        return await client.get(path)
-
-
-@pytest.mark.parametrize(
-    "status,content_type,payload",
-    [
-        (404, "text/plain", b"not found"),
-        (503, "application/json", b'{"code":"busy"}'),
-        (200, "application/json", b'{"ok":true}'),  # 200 but JSON, not SSE
-    ],
-)
-async def test_sse_path_non_sse_response_no_lifecycle_rows(
-    capture_logger, status, content_type, payload
-):
-    upstream = httpx.AsyncClient(
-        transport=httpx.MockTransport(
-            _non_stream_upstream(status, content_type, payload)
-        ),
-        base_url="http://upstream",
-    )
-    app = _build_app(upstream, ledger=None, request_logger=capture_logger)
-
-    response = await _get_plain(app, "/event")
-    assert response.status_code == status
-
-    rows = _rows(capture_logger)
-    # No lifecycle rows — the stream was never an SSE stream.
-    assert _lifecycle_rows(rows) == []
-    # Plain request-row accounting only (B4: 按普通 request 行记账).
-    requests = [r for r in rows if r.get("recordType", "request") == "request"]
-    assert len(requests) == 1
-    assert requests[0]["status"] == status
-    assert requests[0]["bucket"] == "passthrough"
-    assert requests[0]["selectorResult"] == "not_applicable"
-
-
-# ---------------------------------------------------------------------------
-# B5: close-row guarantee on abnormal teardown — emitted BEFORE the aclose
-# await, so aclose failures / cancellation at that point cannot skip it
-# ---------------------------------------------------------------------------
-
-
-def _boom_aclose(monkeypatch, exc_factory):
-    """Make httpx.Response.aclose raise — but ONLY for the proxied upstream
-    response (host "upstream"), not the test client's own response."""
-    original = httpx.Response.aclose
-
-    async def patched(self):
-        request = getattr(self, "request", None)
-        if request is not None and request.url.host == "upstream":
-            raise exc_factory()
-        return await original(self)
-
-    monkeypatch.setattr(httpx.Response, "aclose", patched)
-
-
-@pytest.mark.parametrize(
-    "exc_factory,exc_type",
-    [
-        (lambda: RuntimeError("aclose boom"), RuntimeError),
-        (lambda: asyncio.CancelledError(), asyncio.CancelledError),
-    ],
-)
-async def test_aclose_failure_still_emits_close_row(
-    capture_logger, monkeypatch, exc_factory, exc_type
-):
-    _boom_aclose(monkeypatch, exc_factory)
-    upstream = httpx.AsyncClient(
-        transport=httpx.MockTransport(_sse_upstream()),
-        base_url="http://upstream",
-    )
-    app = _build_app(upstream, ledger=None)
-
-    # The aclose failure surfaces through the ASGI stack — but the close
-    # row must already have been written (open/close stay paired).
-    with pytest.raises(exc_type):
-        await _get_plain(app, "/event")
-
-    lifecycle = _lifecycle_rows(_rows(capture_logger))
-    assert len(lifecycle) == 2
-    open_row = next(r for r in lifecycle if r["recordType"] == "sse_open")
-    close_row = next(r for r in lifecycle if r["recordType"] == "sse_close")
-    assert open_row["lifecycleId"] == close_row["lifecycleId"]
-
-
-async def test_client_cancel_midstream_still_emits_close_row(capture_logger):
-    """True client disconnect: the drain task is cancelled while the
-    upstream stream is live — the finally must still write the close row."""
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        async def body():
-            while True:
-                yield b"data: {\"t\":1}\n\n"
-                await asyncio.sleep(0.01)
-
-        return httpx.Response(
-            200,
-            stream=httpx._content.AsyncIteratorByteStream(body()),
-            headers={"Content-Type": "text/event-stream"},
-        )
-
-    upstream = httpx.AsyncClient(
-        transport=httpx.MockTransport(handler), base_url="http://upstream",
-    )
-    app = _build_app(upstream, ledger=None)
-
-    async def _drain() -> None:
-        transport = ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            await client.get("/event")
-
-    task = asyncio.create_task(_drain())
-    # Let the stream establish and flow a few frames.
-    await asyncio.sleep(0.1)
-    task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await task
-
-    lifecycle = _lifecycle_rows(_rows(capture_logger))
-    assert len(lifecycle) == 2
-    open_row = next(r for r in lifecycle if r["recordType"] == "sse_open")
-    close_row = next(r for r in lifecycle if r["recordType"] == "sse_close")
-    assert open_row["lifecycleId"] == close_row["lifecycleId"]
+        await client.get(path, headers={"Accept-Encoding": "identity"})
+    snap = ledger.snapshot()
+    v3 = snap.get("v3", {})
+    assert v3.get("sseActive", {}) in ({}, {
+        "v2": 0, "v3": 0, "absent": 0, "not_applicable": 0,
+    })

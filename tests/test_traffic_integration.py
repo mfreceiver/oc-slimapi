@@ -220,25 +220,12 @@ async def test_metrics_without_ledger_omits_traffic_block_zero_impact(upstream_f
 # Scenario 2 — proxy passthrough baseline (no 省流; ratio ≈ 1.0).
 # ===========================================================================
 
-async def test_passthrough_records_equal_up_and_down_bytes(upstream_factory):
-    """A /session/... GET through install_proxy() is a 1:1 byte relay: the
-    ``passthrough`` bucket records ``upIn == downOut == len(upstream body)``.
-
-    Uses ``stream=`` for the MockTransport response because the proxy iterates
-    ``aiter_raw`` (httpx marks ``content=`` responses as stream-consumed at
-    construction, which would raise StreamConsumed mid-relay — see test_proxy.py).
-    """
-    body = b"x" * 1000  # fixed, unambiguous baseline payload
-
+async def test_closed_surface_records_no_upstream_bytes(upstream_factory):
+    """Terminal §8.2: /session/... is closed (404 thin_route_not_found) —
+    the passthrough bucket records the request with ZERO upstream bytes
+    (upIn == upOut == 0); downOut is the small coded error body."""
     def handler(request: httpx.Request) -> httpx.Response:
-        async def body_iter():
-            yield body
-
-        return httpx.Response(
-            200,
-            stream=httpx._content.AsyncIteratorByteStream(body_iter()),
-            headers={"Content-Type": "application/octet-stream"},
-        )
+        raise AssertionError("closed surface must never reach the upstream")
 
     upstream = upstream_factory(handler)
     app, ledger = _build_app_with_traffic(
@@ -248,29 +235,25 @@ async def test_passthrough_records_equal_up_and_down_bytes(upstream_factory):
     transport = httpx.ASGITransport(app)
     try:
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            response = await client.get("/session/ses_x")
-        assert response.status_code == 200
-        assert response.content == body
+            response = await client.get(
+                "/session/ses_x", headers={"Accept-Encoding": "identity"})
+        assert response.status_code == 404
+        assert orjson.loads(response.content)["code"] == "thin_route_not_found"
 
         snap = ledger.snapshot()
         assert snap["enabled"] is True
-        # The /session path bucketizes to passthrough.
+        # The closed /session path still bucketizes to passthrough.
         assert "passthrough" in snap["buckets"]
         bucket = snap["buckets"]["passthrough"]
-        # 1:1 relay — upstream bytes in == downstream bytes out == body length.
-        assert bucket["upIn"] == len(body)
-        assert bucket["downOut"] == len(body)
         assert bucket["requests"] == 1
-        # Ratio ≈ 1.0 (no 省流 on the catch-all proxy).
-        ratio = snap["ratios"]["passthrough"]["downOutOverUpIn"]
-        assert ratio == pytest.approx(1.0)
+        # No forwarding happened — zero upstream legs.
+        assert bucket["upIn"] == 0
+        assert bucket["upOut"] == 0
+        # The 404 error body itself went downstream.
+        assert bucket["downOut"] == len(response.content)
     finally:
         await _shutdown(app)
 
-
-# ===========================================================================
-# Scenario 3 — messages skeleton 省流实证 (the headline assertion).
-# ===========================================================================
 
 def _fat_upstream_messages_payload() -> bytes:
     """A sizeable upstream full-messages body whose skeleton projection is
@@ -341,7 +324,7 @@ async def test_messages_skeleton_proves_traffic_saving(upstream_factory):
         # The skeleton body must be non-empty and actually project (the 8 KiB
         # tool output exceeds the inline threshold and is omitted) — otherwise
         # the byte comparison would be meaningless.
-        body = orjson.loads(response.content)
+        body = orjson.loads(response.content)["items"]
         assert len(body) == 3
         for item in body:
             tool_part = item["parts"][1]

@@ -376,21 +376,26 @@ async def test_events_route_streams_server_connected_first(hub):
         # destroys a pending stop_after_grace coroutine.
         await iterator.aclose()
     assert chunks, "expected at least one frame"
-    assert b"event: server.connected" in chunks[0]
+    # Terminal §7.2: slimapi.meta precedes the business handshake.
+    assert chunks[0].startswith(b"event: slimapi.meta")
 
 
 async def test_events_route_honours_last_event_id_with_resync(hub):
     response = await _events_route_chunks(hub, headers={"last-event-id": "anything"})
     iterator = response.body_iterator
-    first = b""
+    chunks: list[bytes] = []
     try:
-        first = await asyncio.wait_for(anext(iterator), timeout=0.5)
+        # Pull the two leading frames: meta (terminal §7.2) then resync.
+        for _ in range(2):
+            chunks.append(await asyncio.wait_for(anext(iterator), timeout=0.5))
     except StopAsyncIteration:
         pass
     finally:
         await iterator.aclose()
-    assert b"event: resync" in first
-    assert b"reconnect_no_replay" in first
+    assert chunks and chunks[0].startswith(b"event: slimapi.meta")
+    combined = b"".join(chunks)
+    assert b"event: resync" in combined
+    assert b"reconnect_no_replay" in combined
 
 
 # ---------------------------------------------------------------------------
@@ -1186,7 +1191,7 @@ async def test_events_teardown_releases_registry_slot():
             iterator = response.body_iterator
             try:
                 first = await asyncio.wait_for(anext(iterator), timeout=0.5)
-                assert b"event: server.connected" in first
+                assert first.startswith(b"event: slimapi.meta")
                 # Slot held while the generator is live.
                 assert registry.total_subscribers == 1
             finally:

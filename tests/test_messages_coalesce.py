@@ -211,7 +211,7 @@ async def test_cursor_header_shared_across_callers(upstream_factory):
             responses = await _get_many(
                 client, ["/slimapi/messages/s1?limit=40"] * 5)
         assert calls["list"] == 1
-        cursors = {r.headers.get("X-Next-Cursor") for r in responses}
+        cursors = {r.json()["nextCursor"] for r in responses}
         assert cursors == {"CURSOR123"}  # Link captured inside the factory
     finally:
         _teardown(app)

@@ -165,16 +165,12 @@ def _opaque_tag(candidate: str) -> str | None:
     return inner
 
 
-MERGED_VARY_EXTRA = "X-Opencode-Directory"
-
-
 def merged_vary(current: str | None) -> str:
-    """Merge the directory dimension into an existing ``Vary`` value
-    (append, never overwrite), keeping ``Accept-Encoding`` first."""
-    parts = [p.strip() for p in (current or "").split(",") if p.strip()]
-    if MERGED_VARY_EXTRA not in parts:
-        parts.append(MERGED_VARY_EXTRA)
-    return ", ".join(parts)
+    """Terminal §6.2: collapse any ``Vary`` input to the single-value form
+    ``Accept-Encoding``. The ``X-Opencode-Directory`` dimension is retired
+    together with the header channel (§5.7); every merged call site
+    therefore emits ``Accept-Encoding`` regardless of what it passes in."""
+    return "Accept-Encoding"
 
 
 def judge_conditional(

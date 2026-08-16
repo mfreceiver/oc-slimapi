@@ -203,9 +203,8 @@ async def test_v3_304_header_set_exact_sessions(client_factory):
     try:
         first = await client.get("/slimapi/sessions?v=3", headers=IDENTITY)
         etag = first.headers["ETag"]
-        # 200 keeps the merged directory Vary (parallel period, §6.2).
-        assert "X-Opencode-Directory" in first.headers["Vary"]
-        assert "Accept-Encoding" in first.headers["Vary"]
+        # §6.2 terminal: Vary shrinks to the single Accept-Encoding value.
+        assert first.headers["Vary"] == "Accept-Encoding"
         reval = await client.get(
             "/slimapi/sessions?v=3",
             headers={**IDENTITY, "If-None-Match": etag},
@@ -233,8 +232,10 @@ async def test_vary_never_mentions_v_or_directory_params(client_factory):
             "/slimapi/sessions?v=3&directory=/w", headers=IDENTITY)
         assert response.status_code == 200
         vary = response.headers["Vary"]
+        # §6.2 terminal: single value — neither v, directory, nor the
+        # retired X-Opencode-Directory dimension appears.
+        assert vary == "Accept-Encoding"
         assert "v" not in [part.strip() for part in vary.split(",")]
         assert "directory" not in [part.strip() for part in vary.split(",")]
-        assert "X-Opencode-Directory" in vary
     finally:
         await client.aclose()

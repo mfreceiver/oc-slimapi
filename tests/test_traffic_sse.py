@@ -193,6 +193,17 @@ async def test_sse_end_to_end_traffic_saving(upstream_factory):
         _make_global_event("/proj", "question.asked",
                            {"id": "q1", "sessionID": "s3"}),
     ]
+    # Terminal §7.2 adds the leading slimapi.meta frame to the downstream
+    # bytes; a realistic upstream burst (repeated statuses for the SAME
+    # sessions — coalesced into digests downstream) keeps the 省流
+    # invariant meaningful rather than calibrating the threshold down.
+    for _ in range(10):
+        global_events.append(_make_global_event(
+            "/proj", "session.status",
+            {"sessionID": "s1", "status": "busy"}))
+        global_events.append(_make_global_event(
+            "/proj", "session.status",
+            {"sessionID": "s2", "status": "idle"}))
 
     # Raw upstream SSE lines the hub would iterate
     raw_lines = _simulate_upstream_lines(global_events)
@@ -312,6 +323,7 @@ async def test_sse_end_to_end_traffic_saving(upstream_factory):
         # Parse frames for structural validation
         frames = _parse_sse_frames(bytes(body))
         frame_events = {e for e, _ in frames}
+        assert "slimapi.meta" in frame_events, "missing terminal meta frame"
         assert "server.connected" in frame_events, "missing welcome frame"
         assert "session.digest" in frame_events, "missing digest frame(s)"
 

@@ -32,6 +32,7 @@ single-loop monotonic visibility).
 from __future__ import annotations
 
 import os
+import re
 from collections import OrderedDict
 from pathlib import Path
 
@@ -272,3 +273,37 @@ class TurnRegistry:
         digest (contract §7.4, V10 acceptance).
         """
         return (self.incarnation, self._turns.get(sid, 0))
+
+
+# --- Path classifiers (moved from the retired catch-all proxy; v3-only
+# terminal keeps the S2 turn-fence bump on the annexed write routes) ---
+
+_SESSION_SID_RE = re.compile(r"^/session/([^/]+)")
+_TURN_BUMPING_SUFFIX_RE = re.compile(
+    r"^/session/[^/]+/(prompt(?:_async)?|abort)/?$")
+
+
+def extract_sid_from_path(norm_path: str) -> str | None:
+    """Extract the ``{sid}`` segment from a ``/session/{sid}/...`` path.
+
+    Returns ``None`` for non-session paths. Does NOT hardcode the opencode
+    ``01HQ...`` id format — any non-empty first segment under ``/session/``
+    qualifies (the upstream will reject malformed ids).
+    """
+    m = _SESSION_SID_RE.match(norm_path)
+    if m is None:
+        return None
+    sid = m.group(1)
+    return sid or None
+
+
+def is_turn_bumping_path(norm_path: str) -> bool:
+    """True iff ``norm_path`` is a turn-bumping write (contract §3.y.3).
+
+    Matches ``/session/{sid}/prompt``, ``/session/{sid}/prompt_async``, or
+    ``/session/{sid}/abort`` (trailing slash tolerant). These are the writes
+    that start/stop a turn of work and therefore must advance the turn
+    counter at the S2 commit point (bump-before-send). Path match alone is
+    NOT sufficient — the caller must additionally require ``POST``.
+    """
+    return _TURN_BUMPING_SUFFIX_RE.match(norm_path) is not None

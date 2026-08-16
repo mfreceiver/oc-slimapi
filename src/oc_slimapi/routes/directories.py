@@ -28,8 +28,8 @@ async def directories(request: Request):
 
     **No query parameters** — this is a GLOBAL discovery call (unlike the
     catalog endpoints' no-op ``directory``, this endpoint accepts none at
-    all to avoid implying it is scoped). Gated by ``SlimapiVersionMiddleware``
-    like every ``/slimapi/**`` route (no route-level ``Depends``).
+    all to avoid implying it is scoped). Admitted via the version selector
+    (``?v=3`` terminal) like every ``/slimapi/**`` route.
 
     Additive (brand-new endpoint); **no** ``X-Slimapi-Version`` bump (still
     2). An older sidecar without this route returns 404

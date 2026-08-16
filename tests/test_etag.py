@@ -25,6 +25,7 @@ import pytest
 from fastapi import FastAPI
 
 from oc_slimapi import etag as etag_mod
+from oc_slimapi.envelope import messages_envelope_bytes
 from oc_slimapi.config import Settings
 from oc_slimapi.errors import register_error_handlers
 from oc_slimapi.leased_singleflight import LeasedSingleFlight
@@ -379,9 +380,9 @@ async def test_c1_messages_list_304_header_set_complete(upstream_factory):
             etag_value = r1.headers["ETag"]
             assert not etag_value.startswith("W/")  # identity → STRONG
             assert r1.headers["Vary"] == (
-                "Accept-Encoding, X-Opencode-Directory")
+                "Accept-Encoding")
             assert r1.headers["Cache-Control"] == "no-store"
-            assert r1.headers["X-Next-Cursor"] == "CURSOR123"
+            assert r1.json()["nextCursor"] == "CURSOR123"
 
             r2 = await client.get(
                 "/slimapi/messages/s1",
@@ -391,7 +392,9 @@ async def test_c1_messages_list_304_header_set_complete(upstream_factory):
             assert r2.headers["ETag"] == etag_value
             assert r2.headers["Vary"] == r1.headers["Vary"]
             assert r2.headers["Cache-Control"] == "no-store"
-            assert r2.headers["X-Next-Cursor"] == "CURSOR123"  # aux copied
+            # §6.4 terminal: 304 carries only ETag/Vary/Cache-Control —
+            # the cursor lives in the client's cached envelope.
+            assert "X-Next-Cursor" not in r2.headers
             assert "content-length" not in r2.headers
 
             r3 = await client.get(
@@ -556,12 +559,12 @@ async def test_c4_directory_isolation(upstream_factory):
 
             # ② merged Vary list, Accept-Encoding FIRST, both codings.
             assert ra.headers["Vary"] == (
-                "Accept-Encoding, X-Opencode-Directory")
+                "Accept-Encoding")
             rg = await client.get(
                 "/slimapi/agent", params={"directory": "/a"},
                 headers={**HDR, "Accept-Encoding": "gzip"})
             assert rg.headers["Vary"] == (
-                "Accept-Encoding, X-Opencode-Directory")
+                "Accept-Encoding")
 
             # ③ per-coding validator regression: identity ≠ gzip.
             assert rg.headers["ETag"] != etag_a
@@ -620,7 +623,7 @@ async def test_c6_disabled_byte_identical_no_etag_no_304(upstream_factory):
                 # directory-sensitive, so Vary stays merged unconditionally
                 # (cache-correctness semantics, not an ETag accessory).
                 assert r.headers["Vary"] == (
-                    "Accept-Encoding, X-Opencode-Directory")
+                    "Accept-Encoding")
                 assert r.content  # full body — 304 judgement disabled
     finally:
         _teardown(app)
@@ -683,13 +686,13 @@ ROUTES = [
 ROUTE_IDS = ["agent", "command", "sessions", "messages"]
 
 
-def _aux_header(path: str) -> tuple[str, str]:
+def _aux_field(path: str) -> tuple[str, object]:
     if path.startswith("/slimapi/messages"):
-        return "X-Next-Cursor", "CURSOR123"
+        return "nextCursor", "CURSOR123"
     if path.startswith("/slimapi/sessions"):
-        # 3 sessions, limit=2 → X-Complete: false (value from THIS run)
-        return "X-Complete", "false"
-    raise AssertionError(f"no aux header for {path}")
+        # 3 sessions, limit=2 → complete: false (value from THIS run)
+        return "complete", False
+    raise AssertionError(f"no aux field for {path}")
 
 
 @pytest.mark.parametrize("path", ROUTES, ids=ROUTE_IDS)
@@ -737,19 +740,22 @@ async def test_c7_disabled_no_etag(path, upstream_factory):
         _teardown(app)
 
 
-async def test_c7_auxiliary_headers_copied_into_304(upstream_factory):
+async def test_c7_envelope_fields_and_terminal_304_set(upstream_factory):
+    """v3 terminal: the completeness/cursor signals live in the envelope
+    body; the 304 header set is EXACTLY ETag + Vary + Cache-Control."""
     upstream = upstream_factory(_catalog_handler())
     app = _build_app(_settings(), upstream)
     try:
         async with _client(app) as client:
             for path in ("/slimapi/messages/s1", "/slimapi/sessions?limit=2"):
                 r1 = await client.get(path, headers=HDR)
-                name, expected = _aux_header(path)
-                assert r1.headers[name] == expected
+                name, expected = _aux_field(path)
+                assert r1.json()[name] == expected
                 r2 = await client.get(
                     path, headers={**HDR, "If-None-Match": r1.headers["ETag"]})
                 assert r2.status_code == 304
-                assert r2.headers[name] == expected  # from THIS pipeline run
+                assert r2.content == b""
+                assert set(r2.headers) == {"etag", "vary", "cache-control"}
     finally:
         _teardown(app)
 
@@ -936,8 +942,8 @@ async def test_b1_4_gzip_hit_does_not_compress_messages(upstream_factory, monkey
                 headers={**gzip_hdr, "If-None-Match": etag_value})
             assert r2.status_code == 304
             assert r2.content == b""
-            # aux header still computed from THIS pipeline run
-            assert r2.headers["X-Next-Cursor"] == "CURSOR123"
+            # §6.4 terminal: no cursor header on the 304 (envelope cached)
+            assert "X-Next-Cursor" not in r2.headers
             assert compress_calls["n"] == 0  # zero compression on the hit
     finally:
         _teardown(app)
@@ -1040,9 +1046,10 @@ async def test_b1_1r_incompressible_body_labels_actual_coding(upstream_factory, 
         return httpx.Response(200, content=b"[]")
 
     settings = _settings()
-    rep = etag_mod.representation_version(settings)
-    strong_tag = etag_mod.compute_etag(identity, "identity", rep)
-    weak_tag = etag_mod.compute_etag(identity, "gzip", rep)
+    rep = etag_mod.representation_version(settings, wire_view=3)
+    enveloped = messages_envelope_bytes(identity, None)
+    strong_tag = etag_mod.compute_etag(enveloped, "identity", rep)
+    weak_tag = etag_mod.compute_etag(enveloped, "gzip", rep)
     assert strong_tag != weak_tag
 
     upstream = upstream_factory(handler)
@@ -1100,10 +1107,12 @@ async def test_b1_1r_rev5_case_matrix(upstream_factory, monkeypatch):
         return httpx.Response(200, content=b"[]")
 
     settings = _settings()
-    rep = etag_mod.representation_version(settings)
+    rep = etag_mod.representation_version(settings, wire_view=3)
 
     def tag(body: bytes, coding: str) -> str:
-        return etag_mod.compute_etag(body, coding, rep)
+        # the route envelopes the pack worker's output before judging
+        return etag_mod.compute_etag(
+            messages_envelope_bytes(body, None), coding, rep)
 
     gzip_hdr = {**HDR, "Accept-Encoding": "gzip"}
     upstream = upstream_factory(handler)
@@ -1208,7 +1217,7 @@ async def test_b1_1r_identity_only_request_excludes_gzip_validator(upstream_fact
         return httpx.Response(200, content=b"[]")
 
     settings = _settings()
-    rep = etag_mod.representation_version(settings)
+    rep = etag_mod.representation_version(settings, wire_view=3)
     weak_tag = etag_mod.compute_etag(identity, "gzip", rep)
 
     upstream = upstream_factory(handler)

@@ -20,7 +20,7 @@ never involved):
 
 Both endpoints negotiate gzip via :func:`json_response` and pin
 ``Cache-Control: no-store`` on every response (200 and coded error — contract
-§5).  The version gate (``SlimapiVersionMiddleware``) already covers every
+§5).  The version selector (``?v=3`` terminal) already covers every
 ``/slimapi/**`` path.
 """
 
