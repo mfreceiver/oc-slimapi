@@ -22,7 +22,7 @@ from fastapi import FastAPI
 
 from oc_slimapi.config import Settings
 from oc_slimapi.errors import register_error_handlers
-from oc_slimapi.etag import representation_version
+from oc_slimapi.etag import representation_version, response_rep_version
 from oc_slimapi.routes import messages, sessions
 from oc_slimapi.selector import SlimapiSelectorMiddleware
 from oc_slimapi.transform import TransformConfig, TransformPool
@@ -95,15 +95,26 @@ async def client_factory():
 
 
 def test_representation_version_wire_marker_unit():
-    """§6.1: the fingerprint carries wire=v2 / wire=v3 — distinct bytes."""
+    """§6.1: the fingerprint carries a per-view wire marker — distinct
+    bytes per view (the domain-isolation MECHANISM; the v2 form is only a
+    mechanism demonstration — v2 traffic no longer exists in M3)."""
     settings = _settings()
     v2_rep = representation_version(settings, wire_view=2)
     v3_rep = representation_version(settings, wire_view=3)
     assert v2_rep != v3_rep
     assert b"wire=v2" in v2_rep
     assert b"wire=v3" in v3_rep
-    # view defaults to 2 (existing callers unchanged)
-    assert representation_version(settings) == v2_rep
+
+
+def test_representation_version_terminal_default_is_v3():
+    """M3-5 (structural terminal enforcement): the DEFAULT view is 3 —
+    a caller that omits ``wire_view`` gets the v3 domain, never the
+    retired v2 one."""
+    settings = _settings()
+    v3_rep = representation_version(settings, wire_view=3)
+    assert representation_version(settings) == v3_rep
+    assert b"wire=v3" in v3_rep
+    assert response_rep_version(settings) == v3_rep
 
 
 async def test_retired_v2_request_never_issues_validator(client_factory):

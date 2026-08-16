@@ -178,8 +178,12 @@ def _has_query_key(query_string: bytes, key: str) -> bool:
 
 
 def _has_directory_header(scope: Scope) -> bool:
-    for name, value in scope.get("headers") or []:
-        if name.lower() == b"x-opencode-directory" and value.strip():
+    """PRESENCE-based (M3-1 / §5.7 terminal): True iff the request carries
+    an ``X-Opencode-Directory`` header AT ALL — an empty or whitespace-only
+    value still counts (``directoryForm`` observes arrival, not usability).
+    """
+    for name, _value in scope.get("headers") or []:
+        if name.lower() == b"x-opencode-directory":
             return True
     return False
 
@@ -217,14 +221,15 @@ def selector_info_from_scope(scope: Scope) -> dict[str, Any]:
 
 
 def wire_view_from_scope(scope: Scope) -> int:
-    """§3a: the wire view this request runs — 3 for v3-selector requests.
+    """§3a: the wire view this request runs — always 3 (v3-only terminal).
 
-    Terminal: every request that reaches a route ran v3 semantics; the
-    legacy 2 return only covers selector-less stacks (direct route
-    invocation in tests), which exercise the same v3 pipeline.
+    The selector rejects every non-v3 request before routes run, so the
+    only scopes reaching route code are v3; selector-less stacks (direct
+    route invocation in tests) get the terminal view too. Kept as a
+    function so the call sites stay explicit about where the view comes
+    from.
     """
-    info = selector_info_from_scope(scope)
-    return 3 if info.get("result") == SELECTOR_V3 else 2
+    return 3
 
 
 def resolve_route_directory(scope: Scope, query_value: str | None) -> str | None:
@@ -270,12 +275,15 @@ def _collect_directory_values(scope: Scope) -> list[str]:
 
 
 def _directory_header_value(scope: Scope) -> str | None:
-    """First non-blank ``X-Opencode-Directory`` header value (raw, as sent)."""
+    """First ``X-Opencode-Directory`` header value (raw, as sent).
+
+    PRESENCE-based (M3-1 / §5.7 terminal): the value is returned even
+    when empty or whitespace-only — header presence alone is retired
+    input on the consuming set; blank values are no escape hatch.
+    """
     for name, value in scope.get("headers") or []:
         if name.lower() == DIRECTORY_HEADER_NAME.encode("ascii"):
-            decoded = value.decode("latin-1")
-            if decoded.strip():
-                return decoded
+            return value.decode("latin-1")
     return None
 
 

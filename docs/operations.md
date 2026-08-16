@@ -204,7 +204,7 @@ oc-slimapi 有两类日志输出，**分别处理**：
 
 ### 5.2.1 incarnation 状态文件（与 access logs 分离，T9/P1-4）
 
-> T9（P1-4）起，incarnation 状态文件与 access logs **分离**到独立目录。这是**运维行为变更**，不涉及 wire（未 bump `X-Slimapi-Version`，仍 2）。
+> T9（P1-4）起，incarnation 状态文件与 access logs **分离**到独立目录。这是**运维行为变更**，不涉及 wire（历史注：该变更发生于 v2 时代、未 bump 版本头；v3-only 终态下 `X-Slimapi-Version` 头已删除，wire 版本由 `?v=3` selector 唯一表达）。
 
 | 路径 | 来源 |
 |---|---|
@@ -249,7 +249,7 @@ oc-slimapi 有两类日志输出，**分别处理**：
 | `OC_SLIMAPI_QUESTIONS_MAX_AGGREGATE_BYTES` | 16 MiB | >= per_dir, <= 128 MiB | 跨目录聚合的累积字节预算。超过时 envelope 标记 `truncated: true`，取消后续未消费的目录。 |
 | `OC_SLIMAPI_QUESTIONS_FANOUT_CONCURRENCY` | 8 | 1–16 | 跨请求全局 `/question` 并发上限。单次 `/slimapi/questions` 请求的 fan-out 不超过此值。 |
 
-触发任一预算上限时，envelope 复用既有的加性字段 `truncated`（`true`）和 `authoritativeDirectories`（降级为已成功目录列表，非 null），**不 bump** `X-Slimapi-Version`。详见 [`../CHANGELOG.md`](../CHANGELOG.md) Unreleased 与 [`docs/specs/INTERFACE_MAP.md`](specs/INTERFACE_MAP.md) questions 行。
+触发任一预算上限时，envelope 复用既有的加性字段 `truncated`（`true`）和 `authoritativeDirectories`（降级为已成功目录列表，非 null）（历史注：该行为加入时未 bump 版本头；v3-only 终态下 `X-Slimapi-Version` 已删除，`?v=3` selector 为唯一版本通道）。详见 [`../CHANGELOG.md`](../CHANGELOG.md) Unreleased 与 [`docs/specs/INTERFACE_MAP.md`](specs/INTERFACE_MAP.md) questions 行。
 
 **Permissions（`/slimapi/permissions`，2026-08-15 起；语义与 questions 同款）**
 
@@ -498,7 +498,7 @@ curl -s --cert client-cert.pem --key client-key.pem \
 
 运维须明确接受本功能与既有 catch-all 相同的风险类：
 
-- **明文 `:4097` 可达**：能访问 `:4097` 的任何设备均可触发 manifest 中声明的任意动作。version 门闩（`X-Slimapi-Version`）≠ 鉴权，`confirm` ≠ 授权，`X-Client-Id` 不可信。
+- **明文 `:4097` 可达**：能访问 `:4097` 的任何设备均可触发 manifest 中声明的任意动作。版本选择器（`?v=3`；`X-Slimapi-Version` 头已删除）≠ 鉴权，`confirm` ≠ 授权，`X-Client-Id` 不可信。
 - **不做 token、不加 loopback 闸门**：本功能延续既有安全模型，不引入额外鉴权层。
 - **缓解措施**（已纳入，非授权替代）：
   - 默认空 manifest（功能 opt-in，默认禁用）

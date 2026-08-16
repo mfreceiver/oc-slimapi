@@ -4,7 +4,7 @@
 > 特性版本：**v0.7.0+**（`/slimapi/metrics` 响应的 `traffic` 块 + access log）；**2026-07-29**（按天切分 + client 标识字段 + traffic snapshot）；**2026-08-01**（turn-token fence scope 简化为仅 sid；移除 serverGroupFp 字段）；**2026-08-16**（v3 Batch A 加性观测字段：`wireVersion`/`selectorResult`/`directoryForm`/`recordType`/`lifecycleId` + SSE 开关行 + snapshot `v3` 节 + `aggregate_v3_observability`，见 §5.1/§9.4）。
 >
 > **术语澄清**：本手册中出现的 `/slimapi/metrics.traffic` / `/metrics.traffic` 等写法，**不是**独立 HTTP 路由——代码里只有 `GET /slimapi/metrics`（`src/oc_slimapi/routes/metrics.py`），流量账本是该响应 JSON 的 `traffic` 子键。下文为简洁起见用 "`metrics.traffic`" 作为该数据块的简称。
-> 性质：**加性 ops 可观测面**，不 bump `X-Slimapi-Version`；ocdroid 对接无变化（`/slimapi/metrics` 为 T3 ops 端点，非客户端契约）。
+> 性质：**加性 ops 可观测面**（v3-only 终态：`X-Slimapi-Version` 头已删除，不再有 bump 概念）；ocdroid 对接无变化（`/slimapi/metrics` 为 T3 ops 端点，非客户端契约）。
 > 实现：`src/oc_slimapi/traffic.py`、`src/oc_slimapi/traffic_snapshot.py`、`src/oc_slimapi/middleware/traffic_accounting.py`、`src/oc_slimapi/access_log.py`。
 
 ---
@@ -31,24 +31,24 @@ sidecar 是 ocdroid 与 opencode 之间的字节中继。账本按**路由桶**�
 
 ## 2. 快速查询
 
-`/slimapi/**` 端点认证二选一：版本头 `X-Slimapi-Version: 2`，或查询参数 `?v=3`（v3 语义，header 可省；详见契约 `docs/specs/v3-contract.md` §2）。`GET /slimapi/versions` 无条件豁免。
+`/slimapi/**` 端点须带查询参数 `?v=3`（v3-only 终态：缺 `v` / `v=2` / 不支持值 → 400 `unsupported_version supported=[3]`；`X-Slimapi-Version` 头已删除、出现不解读；详见契约 `docs/specs/v3-contract.md` §2）。`GET /slimapi/versions` 无条件豁免。
 
 ```bash
 # 本机 loopback（服务默认绑 0.0.0.0:4097）
 BASE=http://127.0.0.1:4097
-H="X-Slimapi-Version: 2"
+V="v=3"
 
 # 整个 traffic 块
-curl -s -H "$H" $BASE/slimapi/metrics | jq '.traffic'
+curl -s "$BASE/slimapi/metrics?$V" | jq '.traffic'
 
 # 仅各桶字节
-curl -s -H "$H" $BASE/slimapi/metrics | jq '.traffic.buckets'
+curl -s "$BASE/slimapi/metrics?$V" | jq '.traffic.buckets'
 
 # 仅省流比
-curl -s -H "$H" $BASE/slimapi/metrics | jq '.traffic.ratios'
+curl -s "$BASE/slimapi/metrics?$V" | jq '.traffic.ratios'
 
 # 累计 totals
-curl -s -H "$H" $BASE/slimapi/metrics | jq '.traffic.totals'
+curl -s "$BASE/slimapi/metrics?$V" | jq '.traffic.totals'
 ```
 
 **远程（mTLS）**：把 `$BASE` 换成 `https://opencode.vectory.cn:14097`，`curl` 带 `--cert`/`--key`/`--cacert`（复用既有客户端证书）。直连 `:4097` 明文仅限 Tailscale/本机。
@@ -58,7 +58,7 @@ curl -s -H "$H" $BASE/slimapi/metrics | jq '.traffic.totals'
 ### 一次算出"每桶省了多少字节"
 
 ```bash
-curl -s -H "$H" $BASE/slimapi/metrics | jq '
+curl -s "$BASE/slimapi/metrics?$V" | jq '
   .traffic.buckets | to_entries
   | map({bucket:.key,
          upIn:.value.upIn,
@@ -255,7 +255,6 @@ access log 的 `downOut` 是 **wire 级**字节（中间件视角，含 SSE 连�
 | `OC_SLIMAPI_TRAFFIC_SNAPSHOT_RETAIN_DAYS` | `0` | Task 10 (P2-1)：prune 早于 N 天的 `traffic-snapshot-YYYY-MM-DD.jsonl(.gz)`；**代码默认 `0`=不删**（本地开发/测试）；**生产 unit 配置 `30`**（见 `deploy/oc-slimapi.service` / `docs/operations.md` §3.2/§5.3）。复用 access-log 维护循环同一 tick 的 `today`，边界（`today - retain_days`）保留；与 access-log 不同，**不压缩**仅按天清理 |
 | `OC_SLIMAPI_CLIENT_ID_HASH` | `1` | 设备 id hash 开关（fail-closed 默认开；读到 false 时才落明文） |
 | `OC_SLIMAPI_CLIENT_ID_SALT` | `None` | HMAC salt（非空时 `sha256`→`hmac_sha256`） |
-| `OC_SLIMAPI_V3_SELECTOR_ENABLED` | `1` | v3 版本选择器灰度开关（`0` 时 `?v=3` 也走 v2 管线，观测记 `selectorResult=absent`；不影响本表其余计量） |
 
 > **deprecated（保留兼容）**：`OC_SLIMAPI_ACCESS_LOG_PATH`（旧单文件路径；若设非默认值，取 parent dir 作 `ACCESS_LOG_DIR` 兜底）、`OC_SLIMAPI_ACCESS_LOG_MAX_BYTES`、`OC_SLIMAPI_ACCESS_LOG_BACKUPS`（后两者 unused since daily rotation，保留字段不影响行为）。
 

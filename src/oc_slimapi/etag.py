@@ -47,7 +47,7 @@ class _ConfigLike(Protocol):
 
 
 def representation_version(
-    config: _ConfigLike, *, wire_view: int = 2,
+    config: _ConfigLike, *, wire_view: int = 3,
 ) -> bytes:
     """REP_VERSION = projection version + config fingerprint.
 
@@ -58,12 +58,14 @@ def representation_version(
     ETag without touching this module (it will start contributing a new
     component to the fingerprint, invalidating all prior validators).
 
-    v3-contract §6.1 (Batch B): the fingerprint also carries a **wire-view
-    marker** (``wire=v2`` / ``wire=v3``) — v2 and v3 validators are
-    domain-isolated (the v3 envelope body differs, so a cross-view
-    ``If-None-Match`` must never 304). Adding the marker rotates every
-    existing v2 ETag once (one extra 304-miss round, by design — the same
-    one-time cost as any representation change).
+    v3-contract §6.1: the fingerprint also carries a **wire-view marker**
+    (``wire=v{view}``) — validators from different wire domains never
+    cross-match (a cross-view ``If-None-Match`` must never 304). The
+    marker is GENERALISED (M3-5 structural terminal enforcement): the
+    default view is the terminal 3 and there is no v2 special-case branch
+    left in the code; any future version simply passes its own integer
+    and gets its own isolated domain (one one-time 304-miss round per
+    rotation, by design — the same cost as any representation change).
     """
     fingerprint_parts = [
         _ETAG_SCHEME_VERSION,
@@ -79,14 +81,15 @@ def representation_version(
     fingerprint_parts.append(
         b"fingerprint=on" if getattr(
             config, "message_fingerprint_enabled", True) else b"fingerprint=off")
-    # v3-contract §6.1 (Batch B): wire-view domain marker — see docstring.
-    fingerprint_parts.append(
-        b"wire=v3" if wire_view == 3 else b"wire=v2")
+    # v3-contract §6.1: wire-view domain marker — see docstring. Default is
+    # the terminal v3; the f-string keeps the mechanism domain-isolating
+    # for ANY view value (incl. a future v4) without a legacy branch.
+    fingerprint_parts.append(f"wire=v{wire_view}".encode("ascii"))
     return b"\x00".join(fingerprint_parts)
 
 
 def response_rep_version(
-    config: _ConfigLike | None, *, wire_view: int = 2,
+    config: _ConfigLike | None, *, wire_view: int = 3,
 ) -> bytes | None:
     """REP_VERSION for response emission, or ``None`` when ETag/304 is
     disabled (``etag_enabled=false`` → byte-identical legacy behaviour)."""

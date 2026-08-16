@@ -205,9 +205,9 @@ async def _status_via_lease(
     time, so every caller merges the CURRENT registry state into the shared
     body — never frozen at factory time."""
     async def _factory() -> bytes:
-        return await _fetch_status_raw(request, {"directory": directory}
-                                       if directory is not None else {},
-                                       directory)
+        # §5.2 terminal (M3-2): header-only — identical to the direct path
+        # below; ``directory`` never travels as an upstream query param.
+        return await _fetch_status_raw(request, {}, directory)
 
     lease = await registry.fetch_or_bypass(
         ("sessions-status", id(request.app.state.upstream), directory),
@@ -367,9 +367,9 @@ async def sessions_status(request: Request, directory: str | None = None):
     matter what directory is (or isn't) supplied; callers SHOULD omit
     ``directory`` and call once for the whole map (see
     ``docs/ocmar/specs/2026-08-05-s4-batch-status-research.md``). When
-    supplied, it is validated + forwarded (as ``?directory=`` query and
-    ``X-Opencode-Directory`` header) for compatibility — upstream treats
-    it as a no-op either way.
+    supplied, it is validated + forwarded as the ``X-Opencode-Directory``
+    header ONLY (§5.2 terminal — same channel on the coalesced lease path
+    and the direct path).
     """
     # v3 (§5, Batch B): stash substitutes the stripped query param (see
     # the sessions-list handler above).

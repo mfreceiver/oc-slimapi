@@ -16,13 +16,15 @@ Design (frozen decisions O2 / O3 / O4 / S2 / S5 — see the implementation brief
 * **O4 no turn persistence**: restart zeroes the turn registry; the
   incarnation bump covers correctness (a restarted process has a strictly
   greater incarnation, so stale turns from the old process compare low).
-* **S2 commit point = bump-before-send**: turn is bumped in the catch-all
-  proxy *before* ``await client.send()``. A connection-level failure (send
-  raises) therefore produces a **hole** (turn number advances but no
-  upstream work happened). This is the approved relaxation of contract
-  §4.2 ("不 increment"); ocdroid's lex comparison tolerates holes and
-  correctness is preserved. The turn counter is keyed by ``sid`` alone;
-  bump only on prompt/abort forward paths.
+* **S2 commit point = bump-before-send**: turn is bumped in the annexed
+  write pipeline (``routes/write_groups.py``; M3-2/C2 moved it there when
+  the catch-all proxy closed) *before* ``await client.send()``. A
+  connection-level failure (send raises) therefore produces a **hole**
+  (turn number advances but no upstream work happened). This is the
+  approved relaxation of contract §4.2 ("不 increment"); ocdroid's lex
+  comparison tolerates holes and correctness is preserved. The turn
+  counter is keyed by ``sid`` alone; bump only on the collected
+  prompt_async/abort write paths (§8.2).
 
 Single process, asyncio, one event loop: every method below is a
 synchronous pure-dict operation, so no locking is required (contract §7.2
@@ -280,7 +282,7 @@ class TurnRegistry:
 
 _SESSION_SID_RE = re.compile(r"^/session/([^/]+)")
 _TURN_BUMPING_SUFFIX_RE = re.compile(
-    r"^/session/[^/]+/(prompt(?:_async)?|abort)/?$")
+    r"^/session/[^/]+/(prompt_async|abort)/?$")
 
 
 def extract_sid_from_path(norm_path: str) -> str | None:
@@ -300,10 +302,13 @@ def extract_sid_from_path(norm_path: str) -> str | None:
 def is_turn_bumping_path(norm_path: str) -> bool:
     """True iff ``norm_path`` is a turn-bumping write (contract §3.y.3).
 
-    Matches ``/session/{sid}/prompt``, ``/session/{sid}/prompt_async``, or
-    ``/session/{sid}/abort`` (trailing slash tolerant). These are the writes
-    that start/stop a turn of work and therefore must advance the turn
-    counter at the S2 commit point (bump-before-send). Path match alone is
-    NOT sufficient — the caller must additionally require ``POST``.
+    Matches ``/session/{sid}/prompt_async`` or ``/session/{sid}/abort``
+    (trailing slash tolerant) — the two collected turn writes (§8.2;
+    M3-3: the sync ``/session/{sid}/prompt`` form was never collected and
+    the closed catch-all makes it unreachable, so it is no longer
+    recognised). These are the writes that start/stop a turn of work and
+    therefore must advance the turn counter at the S2 commit point
+    (bump-before-send). Path match alone is NOT sufficient — the caller
+    must additionally require ``POST``.
     """
     return _TURN_BUMPING_SUFFIX_RE.match(norm_path) is not None

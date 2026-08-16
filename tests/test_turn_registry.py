@@ -586,10 +586,13 @@ def test_extract_sid_from_path(path, expected_sid):
 
 
 @pytest.mark.parametrize("path,expected", [
-    ("/session/ses_abc/prompt", True),
+    # M3-3: plain sync /prompt is NOT collected (§8.2) — the classifier
+    # must not match it; only prompt_async + abort bump.
+    ("/session/ses_abc/prompt", False),
+    ("/session/ses_abc/prompt/", False),
     ("/session/ses_abc/prompt_async", True),   # ocdroid's production send path
+    ("/session/ses_abc/prompt_async/", True),
     ("/session/ses_abc/abort", True),
-    ("/session/ses_abc/prompt/", True),   # trailing slash tolerant
     ("/session/ses_abc/abort/", True),
     ("/session/ses_abc/message", False),
     ("/session/ses_abc", False),

@@ -28,6 +28,7 @@ from oc_slimapi.errors import register_error_handlers
 from oc_slimapi.leased_singleflight import LeasedSingleFlight
 from oc_slimapi.proxy import install_proxy
 from oc_slimapi.routes import events, health, messages, sessions
+from oc_slimapi.selector import SlimapiSelectorMiddleware
 from oc_slimapi.sse.hub import HubRegistry
 from oc_slimapi.transform import TransformConfig, TransformPool
 
@@ -287,6 +288,41 @@ async def test_status_grace_joiner_sees_fresh_turns(upstream_factory):
             "the turn merge must read the registry per-caller, not the "
             "frozen shared body"
         )
+    finally:
+        _teardown(app)
+
+
+async def test_status_lease_directory_header_only_upstream(upstream_factory):
+    """M3-2 (terminal §5.2): the coalesced status lease path must be
+    header-only — the upstream ``GET /session/status`` sees the
+    ``X-Opencode-Directory`` header and NO ``directory`` (or ``v``) query
+    parameter, exactly like the direct path."""
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["query"] = request.url.query
+        captured["directory_header"] = request.headers.get(
+            "x-opencode-directory")
+        return httpx.Response(200, content=STATUS_PAYLOAD)
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    # Production stack: the selector consumes v + directory (query →
+    # stash + strip) before the route runs.
+    app.add_middleware(SlimapiSelectorMiddleware)
+    try:
+        async with _client(app) as client:
+            resp = await client.get(
+                "/slimapi/sessions/status?v=3&directory=/w")
+        assert resp.status_code == 200
+        # The lease path was taken (registry present + coalesce_enabled).
+        assert app.state.raw_fetch_registry is not None
+        # Upstream sees the header channel only — no directory/v query.
+        assert captured["directory_header"] == "/w"
+        query = captured["query"]
+        if isinstance(query, bytes):
+            query = query.decode("latin-1")
+        assert query == ""
     finally:
         _teardown(app)
 

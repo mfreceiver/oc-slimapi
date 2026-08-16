@@ -264,6 +264,21 @@ async def test_priority_directory_chain_within_v3():
         assert resp.json() == {"code": "directory_header_retired"}
 
 
+async def test_blank_directory_header_is_retired():
+    """§5.7 (M3-1): the retirement judgement is header PRESENCE, not a
+    non-empty value — an empty or whitespace-only ``X-Opencode-Directory``
+    on a consuming route is still retired input."""
+    app, _ = _build_app(lambda r: httpx.Response(200, content=b"[]"))
+    async with _client(app) as client:
+        for blank_value in ("", "   ", "\t "):
+            resp = await client.get(
+                "/slimapi/sessions", params={"v": "3"},
+                headers={**IDENTITY, DIRECTORY_HEADER: blank_value})
+            assert resp.status_code == 400, blank_value
+            assert resp.json() == {"code": "directory_header_retired"}, (
+                blank_value)
+
+
 async def test_priority_selector_over_route_miss():
     """② selector 400 evaluated before ④ route miss: an unknown /slimapi
     path without v reports the version error, not 404."""
