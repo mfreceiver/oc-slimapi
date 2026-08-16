@@ -58,6 +58,8 @@
 
 前置：ocdroid 侧协调（联合发版或版本协商），`X-Slimapi-Version` bump 2 → 3。**用户已确认 v3 方向（2026-08-16）：无版本段路径 + 发现端点 + 并行期，webui 直接按 v3 实现。**
 
+> **勘误（2026-08-16，design-v3 rev6 定稿后）**：本节「`X-Slimapi-Version` bump 2 → 3」为 design-v3 评审定稿前的历史表述，**已被 v3-contract.md §1/§2 取代**——终态（sidecar 3.0.0）**删除该头而非 bump**：出现不报错、不解读；版本协商唯一机制 = `?v=3` selector + `GET /slimapi/versions` 发现端点。全部自定义协议头（X-Slimapi-Version / X-Opencode-Directory / X-Next-Cursor / X-Complete / X-Slimapi-Subscriber-ID）在 3.0.0 终态退役，wire 语义见 v3-contract.md §1 退役表。
+
 | 项 | 内容 |
 |---|---|
 | **发现端点**（先行） | `GET /slimapi/versions`（**无版本段、无 `X-Slimapi-Version` 门禁、匿名可访问**）：返回 `{"current":3, "available":[2,3], "capabilities":{...}}`——告知本机可用 API 版本与能力清单；客户端据此按自身规则选取用法。旧客户端零影响（不认识该端点即不用）。 |
