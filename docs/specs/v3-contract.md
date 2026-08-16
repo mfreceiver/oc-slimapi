@@ -160,12 +160,12 @@ GET /slimapi/versions → 200
 `available:[2,3]` 公告前必须全部通过：
 1. selector 全状态（§2 表逐行，词法边界含 `0`/`03`/`+3`/` 3`/`3.0`/空/多值同值异值/405 优先级/**catch-all 携带 `?v=2/3` 逐字透传断言**）；
 2. directory 组合（无/仅 query/仅头/双现同值/双现冲突/非消费集忽略/questions-permissions 断言/**stream：query-only 接受 no-op、双现异值 directory_not_allowed、多值异值前置 invalid_directory_selector**）；
-3. ETag 4 路由 + **收编幂等 GET 路由**（identity/gzip × 200/304，v2/v3 validator 隔离）；
+3. ETag 4 路由 + **§10.a 全集收编 GET 路由**（identity/gzip × 200/304，v2/v3 validator 隔离）；
 4. envelope 两端点（nextCursor/complete 非权威语言）；
 5. 错误面（413/422/version_required + 四新 code）；
 6. 两 SSE 端点（v3 开流/**meta 首帧先于业务帧/heartbeat/resync 回放**/tokens 端点映射断言/lifecycle/`tokens=1` 组合/stream directory 守卫）；
 7. `/versions`（豁免/405/形状/readRoutes capability/未知字段容忍）；
-8. 观测字段（null/exempt/not_applicable/recordType/lifecycleId/sseActive 含 not_applicable 维度）；
+8. 观测字段（null/exempt/not_applicable/recordType/lifecycleId/**sseActive 四维 `{v2,v3,absent,not_applicable}`：无-v 旧客户端 SSE 归 absent 断言、跨日 carry-in 对账（前日 open 存量-当日 close=次日起点存量）、open/close 生命周期配对**）；
 9. **读路由 7 组回归**（每组：happy 透传逐字节/上游 4xx 透传/上游 5xx→503/响应超限 413/directory query 转发断言/幂等 GET ETag 往返（启用子集））；
 10. **写路由 12 端点回归**（每端点：happy/4xx 透传/5xx→503/请求超限 413/directory 转发/PATCH 双 shape/fork messageID body 字段）；
 11. **catch-all raw-query 保序回归**（一切 query 含 `v`/`directory` 编码/顺序/重复项逐字透传——`proxy.py:182-203` 锁定，**无任何剥离**；携带 `?v=2/3` 断言同款）；
