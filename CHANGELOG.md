@@ -26,7 +26,7 @@ ocdroid 对接时：
 
 ---
 
-## [Unreleased]
+## [1.6.0] - 2026-08-16 — T18 `diff` thin 路由（匿名读侧收编最后缺口；加性）；未 bump `X-Slimapi-Version`，仍 2
 
 ## [1.5.0] - 2026-08-16 — 上游流量优化四批（catalog TTL 缓存 + single-flight 去重 / ETag/304 / todo+children thin 路由 / 消息内容指纹；全部加性）；未 bump `X-Slimapi-Version`，仍 2
 
