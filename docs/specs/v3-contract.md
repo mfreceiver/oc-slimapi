@@ -1,6 +1,6 @@
-# oc-slimapi v3 wire 契约（design-v3 rev9 — 终态）
+# oc-slimapi v3 wire 契约（design-v3 rev11 — 终态）
 
-> 状态：**DRAFT rev9**（2026-08-16；rev6 终态重写 → 七评 9.1 → rev8 8.3→9.1 修复 → 八评 9.4 → 本轮闭环 sseActive 维度矛盾 + 4 conditions；待九评 ≥9.5 转正式）。
+> 状态：**DRAFT rev11**（2026-08-16；rev6 终态重写 → 七评 9.1 → rev8 → 八评 9.4 → rev9 → 九评 9.4 → rev10 → 十评 9.4 → 本轮修复 carry-in 公式遗漏当日新开项；待十一评 ≥9.5 转正式）。
 > 方向决策（不可推翻）：单入口终态——`/slimapi/**` 提供完整功能（实测使用集：ocdroid StandardApi 全量端点），catch-all 3.0.0 关闭，全部自定义头退役。两步走（已定）：sidecar 2.0.0 → ocdroid 3.0.0（smoke 门控）→ sidecar 3.0.0。
 > v2 权威：`docs/specs/v2-contract.md`。条款标 **[冻结]** 或 **[计划]**。
 
@@ -165,7 +165,7 @@ GET /slimapi/versions → 200
 5. 错误面（413/422/version_required + 四新 code）；
 6. 两 SSE 端点（v3 开流/**meta 首帧先于业务帧/heartbeat/resync 回放**/tokens 端点映射断言/lifecycle/`tokens=1` 组合/stream directory 守卫）；
 7. `/versions`（豁免/405/形状/readRoutes capability/未知字段容忍）；
-8. 观测字段（null/exempt/not_applicable/recordType/lifecycleId/**sseActive 四维 `{v2,v3,absent,not_applicable}`：无-v 旧客户端 SSE 归 absent 断言、跨日 carry-in 对账（前日 open 存量-当日 close=次日起点存量）、open/close 生命周期配对**）；
+8. 观测字段（null/exempt/not_applicable/recordType/lifecycleId/**sseActive 四维 `{v2,v3,absent,not_applicable}`：无-v 旧客户端 SSE 归 absent 断言、跨日 carry-in 对账 `sseActive[D+1,k] = sseActive[D,k] + sse_open[D,k] − matched_sse_close[D,k]`（k=维度；§9.2 孤儿 close 校正适用；测试序列必须含"当日新开跨日未关"与"跨日后关闭"两种）、open/close 生命周期配对**）；
 9. **读路由 7 组回归**（每组：happy 透传逐字节/上游 4xx 透传/上游 5xx→503/响应超限 413/directory query 转发断言/幂等 GET ETag 往返（启用子集））；
 10. **写路由 12 端点回归**（每端点：happy/4xx 透传/5xx→503/请求超限 413/directory 转发/PATCH 双 shape/fork messageID body 字段）；
 11. **catch-all raw-query 保序回归**（一切 query 含 `v`/`directory` 编码/顺序/重复项逐字透传——`proxy.py:182-203` 锁定，**无任何剥离**；携带 `?v=2/3` 断言同款）；
