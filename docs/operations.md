@@ -90,7 +90,7 @@ Environment=OC_SLIMAPI_PORT=4097
 Environment=OC_SLIMAPI_UPSTREAM=http://127.0.0.1:4096
 Environment=OC_SLIMAPI_MAX_MESSAGE_BYTES=33554432
 Environment=OC_SLIMAPI_SERVER_API_VERSION=2
-Environment=OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS=2,2
+Environment=OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS=2,3
 Environment=PYTHONUNBUFFERED=1
 
 # v1.0.0: access log + traffic snapshot 落 StateDirectory（systemd 自动建
