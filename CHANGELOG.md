@@ -9,7 +9,7 @@
 | 轨道 | 是什么 | 何时变 |
 |---|---|---|
 | **包版本** `vX.Y.Z`（本文件标题 + git tag + `pyproject.toml`） | 产品发版版本 | 每次 `./scripts/release.sh` |
-| **Wire API 版本** `X-Slimapi-Version`（整数，见 `versioning.py` / 契约 §1） | 协议兼容门禁 | **仅破坏性** wire 变更 bump；加性变更 **不** bump |
+| **Wire API 版本**（整数，`versioning.py` / 契约 §1） | 协议兼容门禁 | 仅**破坏性** wire 变更 bump；加性变更 **不** bump。**3.0.0 起 `X-Slimapi-Version` 头已删除**：版本协商唯一机制 = `?v=` selector + `GET /slimapi/versions` 发现端点 |
 
 ocdroid 对接时：
 
@@ -852,7 +852,7 @@ ocdroid 对接时：
 
 ## 链接
 
-- 契约：[`docs/specs/v2-contract.md`](docs/specs/v2-contract.md)（`docs/specs/v1-contract.md` deprecated）
+- 契约：[`docs/specs/v3-contract.md`](docs/specs/v3-contract.md)（≤2.x 历史：`docs/specs/v2-contract.md`）
 - 发版：[`docs/release.md`](docs/release.md)
 - 客户端清单：[`docs/specs/CLIENT_CHANGES.md`](docs/specs/CLIENT_CHANGES.md)
 
