@@ -1,6 +1,6 @@
-# oc-slimapi v3 wire 契约（design-v3 rev7 — 终态）
+# oc-slimapi v3 wire 契约（design-v3 rev9 — 终态）
 
-> 状态：**DRAFT rev7**（2026-08-16；rev6 六评 8.3 → 5B+3C 逐条闭环：读路由收编扩面/selector 作用域/stream 语义修正/退役判据补全/§10 锚点与错误两级制）。待七评 ≥9.5 转正式。
+> 状态：**DRAFT rev9**（2026-08-16；rev6 终态重写 → 七评 9.1 → rev8 8.3→9.1 修复 → 八评 9.4 → 本轮闭环 sseActive 维度矛盾 + 4 conditions；待九评 ≥9.5 转正式）。
 > 方向决策（不可推翻）：单入口终态——`/slimapi/**` 提供完整功能（实测使用集：ocdroid StandardApi 全量端点），catch-all 3.0.0 关闭，全部自定义头退役。两步走（已定）：sidecar 2.0.0 → ocdroid 3.0.0（smoke 门控）→ sidecar 3.0.0。
 > v2 权威：`docs/specs/v2-contract.md`。条款标 **[冻结]** 或 **[计划]**。
 
@@ -9,7 +9,7 @@
 ## §0 继承基线与差异清单 [冻结]
 
 1. **v3 = v2 契约在基线 `v1.6.0`（commit `421ffb4`）的全量继承 + 本文件逐条差异覆盖**。凡未提及语义（投影、SSE 帧形、资源上限、错误映射、gzip 族、指纹、catalog TTL/coalescing、token stream 帧形等）**逐字沿用 v2**。
-2. 差异面（且仅此）：§2 选择器；§3/§3a 发现与 health 双视图；§4 envelope；§5 directory；§6 ETag/Vary/304；§7 SSE 订阅参数与 meta 帧；§8 错误与 catch-all 终局；§9 观测与移除判据；§10 读/写路由收编全集。
+2. 差异面（且仅此）：§1 头退役汇总（§1 仅汇总 §§2/4/5/7 的头语义，无独立差异）；§2 选择器；§3/§3a 发现与 health 双视图；§4 envelope；§5 directory；§6 ETag/Vary/304；§7 SSE 订阅参数与 meta 帧；§8 错误与 catch-all 终局；§9 观测与移除判据；§10 读/写路由收编全集。
 3. **两步走原子性**：
    - **sidecar 2.0.0** = v2/v3 并行。`available:[2,3]` 当且仅当 v3 全表面（§2–§7、§9 观测、**§10 全部收编路由（读 7 组 + 写 12 端点）**、§11 矩阵）就绪并通过门控。
    - **ocdroid 3.0.0** = 全量切 v3 + smoke 证据回收（双方 9.5 门控）。
@@ -90,7 +90,7 @@ GET /slimapi/versions → 200
 
 1. **validator 域隔离**：`representation_version` 输入含 wire 版本标记——v2/v3 validator 互不匹配。
 2. **Vary**：并行期一切 **directory-sensitive 且接受 `X-Opencode-Directory` 头**的路由（原 4 路由 messages/sessions/agent/command + §10.a 收编 directory-消费读路由 + §10.b 写路由）统一 `Vary: Accept-Encoding, X-Opencode-Directory`；directory-不消费路由（active/global health 等）仅 `Vary: Accept-Encoding`。`?v=`/`?directory=` 属 URI 不加 Vary。3.0.0 头退役后全部路由去 directory Vary 值。
-3. ETag/`If-None-Match`/`*`/judge 三态沿用 v2；envelope 路由 canonical 输入 = envelope body。§10 收编路由中**仅幂等 GET 读路由**可启用 ETag（file/vcs/find/providers/session 单查；写路由与非幂等读不启用）。
+3. ETag/`If-None-Match`/`*`/judge 三态沿用 v2；envelope 路由 canonical 输入 = envelope body。**收编路由 ETag = §10.a 全集**（file/vcs/find/providers/session 单查/active/global health 七组全部 GET）；§10.b 写路由不启用。上游自身 ETag 头不透传（sidecar 生成域，§6.1 隔离）。
 4. **v3 304 头集合**：仅 `ETag` + `Vary` + `Cache-Control: no-store`；不复制 `X-Next-Cursor`/`X-Complete`。
 
 ## §7 SSE [冻结]
@@ -110,12 +110,12 @@ GET /slimapi/versions → 200
 ## §9 观测与移除判据 [冻结]
 
 1. **access log 加性字段**（随 2.0.0 交付）：`wireVersion`（`"2"|"3"|null`，null=rejected/exempt/not_applicable）；`selectorResult`（`absent|v2|v3|rejected|exempt|not_applicable`——**catch-all 透传 = not_applicable**）；`directoryForm`（`query|header|both|absent|null`）；`recordType`（`request|sse_open|sse_close`——消费口径按 `recordType=="request"` 过滤，`traffic-accounting.md` 同步）；`lifecycleId`（进程内单调，open/close 同值）。
-2. **snapshot 聚合**（留存 ≥30 天）：`date × selectorResult × wireVersion × directoryForm × recordType × statusClass × bucket` 计数矩阵。`sseActive` **聚合键 = `selectorResult`**（而非 wireVersion）：每日快照记录按 `selectorResult`（`v2`/`v3`/`not_applicable`）分维度的窗口起点活跃 SSE 存量（前日 close 未覆盖的 open 存量，孤儿补记 close 后校正）；`rejected`/`exempt`/`absent` 无 SSE 端点，恒 0。
+2. **snapshot 聚合**（留存 ≥30 天）：`date × selectorResult × wireVersion × directoryForm × recordType × statusClass × bucket` 计数矩阵。`sseActive` **聚合键 = `selectorResult`，维度覆盖 SSE 可达四值 `{v2, v3, absent, not_applicable}`**：每日快照记录各维度窗口起点活跃 SSE 存量（前日 close 未覆盖的 open 存量，孤儿补记 close 后校正）。`absent` = 无 `v` 的 SSE（§2 判 v2——旧客户端回归形态）；`not_applicable` = catch-all SSE；`rejected`/`exempt` 无 SSE 端点恒 0。
 3. **sidecar 3.0.0 启动判据（全部满足，谓词显式化）**：
    - ① ocdroid 3.0.0 已发 + smoke 证据全绿；
    - ② 连续 ≥7 天窗口：REST 成功请求中 **`selectorResult ∈ {v2, absent}`** 为 0（exempt=发现端点自身、rejected=已拒请求、not_applicable=catch-all——三者由 ④/①另行覆盖，不参与本谓词，避免发现轮询永久阻塞判据）；且每日 `sseActive(v2 ∪ absent)` == 0 且窗口内 `selectorResult ∈ {v2, absent}` 的 `sse_open` 为 0；
    - ③ `directoryForm ∈ {header, both}` 成功请求为 0（含写路径）；
-   - ④ **`selectorResult == "not_applicable"`（catch-all/passthrough）的成功 REST 与 SSE 在窗口内为 0**——全部流量已收敛 `/slimapi`；
+   - ④ **`selectorResult == "not_applicable"`（catch-all/passthrough）**：每日 `sseActive(not_applicable) == 0` **且**窗口内该维度 `sse_open` 为 0 **且**其成功 REST 为 0——全部流量已收敛 `/slimapi`；
    - ⑤ webui 生产流量全 `v=3`；⑥ ocdroid 组书面确认。
 
 ## §10 路由收编全集 [冻结]（读 7 组 + 写 12 端点；ocdroid StandardApi 全量 + 实测基线）
@@ -136,7 +136,7 @@ GET /slimapi/versions → 200
 
 （既有 thin：sessions/messages/status/todo/children/diff/permission/question/agent/command 不重复列。）
 
-### 10.b 写路由（12 端点，2.0.0 交付）
+### 10.b 写路由（12 端点，2.0.0 交付；**directory 列 = 全部消费**——上游 `groups/session.ts:203-397`、`groups/question.ts:32-48` 均声明 `WorkspaceRoutingQuery`）
 
 | # | v3 路由 | 上游 | 方法 | 备注 |
 |---|---|---|---|---|
@@ -153,7 +153,7 @@ GET /slimapi/versions → 200
 | 11 | `/slimapi/question/{requestId}/reject` | 同名 | POST | rejectQuestion |
 | 12 | `/slimapi/session/{id}/command` | `/session/{id}/command` | POST | CommandPayload 透传 |
 
-**统一行为**（依据上游快照 **opencode v1.18.16**（`opencode-src/current`，后续 repoint 时本节逐条复核））：请求 body（含 content-type）透传；上游**响应头透传集合冻结** = `Content-Type`、`Location`（上游 3xx 重定向按状态码逐字透传，sidecar 不跟随不重写）、`Retry-After`、上游 `X-Request-ID`/`Last-Request-ID` 追踪头；其余上游自定义头不透传。**ETag 冻结子集**：§10.a 全部 GET 路由启用（含 file/content——大正文 304 收益最大；受既有 gzip 受益门与 validator 规则约束）；§10.b 写路由不启用。§10 头部错误两级制与 admission 冻结条款适用全集。
+**统一行为**（依据上游快照 **opencode v1.18.16**（`opencode-src/current`，后续 repoint 时本节逐条复核））：请求 body（含 content-type）透传；上游**响应头透传集合冻结** = `Content-Type`、`Location`（上游 3xx 重定向：状态码 + body 均逐字透传，sidecar 不跟随不重写）、`Retry-After`、上游 `X-Request-ID`/`Last-Request-ID` 追踪头；其余上游自定义头不透传。**content-coding 规则**：上游 `Content-Encoding` 不透传——上游响应经解码后取实体字节（httpx 自动解码，与既有读路由一致），admission 按实体字节计，sidecar 按自身 gzip 族重新编码并生成自己的 `Content-Encoding`/`ETag`（"body 逐字透传"均指实体字节）。**ETag 冻结子集**：§10.a 全部 GET 路由启用（含 file/content——大正文 304 收益最大；受既有 gzip 受益门与 validator 规则约束）；§10.b 写路由不启用。错误两级制与 admission 冻结条款适用全集。
 
 ## §11 测试矩阵 [冻结]
 
