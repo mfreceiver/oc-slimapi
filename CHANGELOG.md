@@ -26,7 +26,7 @@ ocdroid 对接时：
 
 ---
 
-## [Unreleased]
+## [2.0.0] - 2026-08-16 — v3 wire 全表面（M1 中间版：版本选择器 + envelope + directory query + ETag 域隔离 + SSE meta + 读 11 路由 + 写 12 端点收编；全部加性，v2 逐字节不变）；未 bump `X-Slimapi-Version`，仍 2
 
 ### Added（加性 wire：v3 Batch C2——写路径 12 端点收编；未 bump `X-Slimapi-Version`，仍 2）
 
@@ -855,3 +855,5 @@ ocdroid 对接时：
 - 契约：[`docs/specs/v2-contract.md`](docs/specs/v2-contract.md)（`docs/specs/v1-contract.md` deprecated）
 - 发版：[`docs/release.md`](docs/release.md)
 - 客户端清单：[`docs/specs/CLIENT_CHANGES.md`](docs/specs/CLIENT_CHANGES.md)
+
+## [Unreleased]
