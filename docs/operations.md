@@ -21,7 +21,7 @@ ocdroid (Android)
 
 - **两个 :4097 入口**（明文）：
   - **`127.0.0.1:4097`**（默认，loopback）：仅供本机 + stunnel mTLS（:14097）终结后转发的推荐路径。
-  - **`0.0.0.0:4097`**（可选，明文直连入口）：允许通过 Tailscale 地址直接访问，**不强制 mTLS**。**安全模型**：远程暴露需依赖 Tailscale ACL / 主机防火墙隔离；该入口**无**应用层鉴权（thin routes 自身不验证客户端身份），版本门禁（`X-Slimapi-Version`）仍生效。
+  - **`0.0.0.0:4097`**（可选，明文直连入口）：允许通过 Tailscale 地址直接访问，**不强制 mTLS**。**安全模型**：远程暴露需依赖 Tailscale ACL / 主机防火墙隔离；该入口**无**应用层鉴权（thin routes 自身不验证客户端身份），版本选择器（`?v=3` 终态门禁）仍生效。
 - **:14097 仍为推荐的 mTLS 入口**；明文直连仅为 Tailscale 内网/运维便利，不应在不可信网络暴露。
 - upstream 固定 `http://127.0.0.1:4096`（opencode legacy HTTP API）——**无论 host 如何**，`config.validate()` 始终强制 upstream 必须是 fixed loopback HTTP（SSRF guard 不放松）。
 - **单进程单 worker**：多 worker 会为同一 directory 重复建立 upstream SSE，禁止。
@@ -56,7 +56,7 @@ systemctl --user restart oc-slimapi
 验证：
 
 ```bash
-curl -s -H 'X-Slimapi-Version: 2' http://127.0.0.1:4097/slimapi/health
+curl -s 'http://127.0.0.1:4097/slimapi/health?v=3'
 # 期望 sidecar.version 与 pyproject.toml / 刚发的 tag 一致
 ```
 
@@ -89,8 +89,8 @@ Environment=OC_SLIMAPI_HOST=0.0.0.0   # 或 127.0.0.1（仅 loopback，更保守
 Environment=OC_SLIMAPI_PORT=4097
 Environment=OC_SLIMAPI_UPSTREAM=http://127.0.0.1:4096
 Environment=OC_SLIMAPI_MAX_MESSAGE_BYTES=33554432
-Environment=OC_SLIMAPI_SERVER_API_VERSION=2
-Environment=OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS=2,3
+Environment=OC_SLIMAPI_SERVER_API_VERSION=3
+Environment=OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS=3,3   # M3 v3-only 终态（升级必须改，见 CHANGELOG [Unreleased]）
 Environment=PYTHONUNBUFFERED=1
 
 # v1.0.0: access log + traffic snapshot 落 StateDirectory（systemd 自动建
@@ -169,7 +169,7 @@ cd /home/mar/personal_projects/oc-slimapi
 git pull                                          # 1. 拉代码（含 pyproject version）
 .venv/bin/pip install -e '.[test]'                # 2. 刷新 editable dist-info（否则 health.version 滞后）
 systemctl --user restart oc-slimapi               # 3. 重启进程加载新代码 + 新 __version__
-curl -s -H 'X-Slimapi-Version: 2' http://127.0.0.1:4097/slimapi/health
+curl -s 'http://127.0.0.1:4097/slimapi/health?v=3'
 # 确认 sidecar.ok=true 且 sidecar.version 与 tag 一致
 ```
 
@@ -287,7 +287,6 @@ oc-slimapi 有两类日志输出，**分别处理**：
 | `OC_SLIMAPI_RAW_FETCH_CONCURRENCY` | 4 | >= 1 | 同时 in-flight 的去重上游 GET 数上限（纯网络并发限制，与内存预算解耦）。 |
 | `OC_SLIMAPI_RAW_FETCH_MAX_BYTES` | 64 MiB | > 0，与 transform 预算之和 <= 576 MiB | 去重 flight 的字节预算：每个 distinct flight 预扣整笔 `OC_SLIMAPI_MAX_RESPONSE_BYTES`（读取完成后不返还差额——保守正确性优先）。 |
 | `OC_SLIMAPI_MESSAGE_FINGERPRINT_ENABLED` | true | bool | messages skeleton 加性字段 `contentFingerprint`（`"<vN>:<sha256hex>"`）开关。`false` = 不输出该字段（逐字节等价开关关闭前行为）。**注意**：开关状态参与 ETag `REP_VERSION`——关闭/重开会轮换全部 ETag 验证器（客户端 304 全部 miss 一次，属预期）。 |
-| `OC_SLIMAPI_V3_SELECTOR_ENABLED` | true | bool | v3 版本选择器（`?v=3`）总开关。`false` = 灰度回退：`v` 参数整体忽略按 v2 管线处理（观测记 `selectorResult=absent`；`v` 剥离仍生效——回退管线是 v2 请求）。版本头门禁范围不受影响。 |
 
 > **默认容量退化说明（重要）**：默认 `RAW_FETCH_MAX_BYTES=64 MiB` × `MAX_RESPONSE_BYTES=64 MiB` → **默认配置下同时只有 1 个去重 flight**；`RAW_FETCH_CONCURRENCY=4` 在默认预算下不可达（预算先到顶）。这是刻意的保守默认（内存证明优先）。**调优指引**：期望 N 个并行去重抓取时，设 `OC_SLIMAPI_RAW_FETCH_MAX_BYTES >= N × OC_SLIMAPI_MAX_RESPONSE_BYTES`；预算满时新 key 自动降级为现行直取路径（行为正确，只是不去重）。聚合内存校验：`RAW_FETCH_MAX_BYTES + MAX_TRANSFORMS × MAX_RESPONSE_BYTES <= 576 MiB`（两项预算并发峰值之和，超限启动失败）。
 
@@ -345,31 +344,31 @@ systemctl --user is-enabled oc-slimapi   # enabled
 
 ```bash
 # 必须带版本头
-curl -s -H 'X-Slimapi-Version: 2' http://127.0.0.1:4097/slimapi/health | jq .
+curl -s 'http://127.0.0.1:4097/slimapi/health?v=3' | jq .
 ```
 
 期望响应：
 
 ```json
 {
-  "slimapi_contract": 2,
+  "slimapi_contract": 3,
   "sidecar": { "ok": true, "version": "1.1.1" },
-  "server":  { "api_version": 2, "accepted_client_versions": [2, 2] },
-  "schema":  { "degraded": false, "version": 2, "clientMin": 2, "clientMax": 2 },
+  "server":  { "api_version": 3, "accepted_client_versions": [3, 3] },
+  "schema":  { "degraded": false, "version": 3, "clientMin": 3, "clientMax": 3 },
   "features": { "tokenStream": true, "thresholdedSkeleton": true, "skeletonInlineOutputMaxBytes": 4096 }
 }
 ```
 
-- `slimapi_contract` = 当前 wire 契约版本（v2）。该值是 `src/oc_slimapi/routes/health.py` 内的**静态常量 2**（硬编码字面量，不从 `SERVER_API_VERSION` 派生）——wire 契约破坏性 bump 时须同时改代码该常量 + 更新 `docs/specs/v2-contract.md` + bump `X-Slimapi-Version`，加性变更不触碰。
+- `slimapi_contract` = 当前 wire 契约版本（M3 v3-only 终态恒 3）。该值是 `src/oc_slimapi/routes/health.py` 内的 `WIRE_VIEW` 常量（与 `server.api_version`/`schema.version` 同源，3/2 组合结构性不存在）；权威契约= `docs/specs/v3-contract.md`。
 - `sidecar.version` = `pyproject.toml` 的版本。
-- `server.api_version` = 2；`accepted_client_versions` = `[2, 2]`（门闩 (2,2)，发 v1 会被 `400 version_incompatible` 拒绝）。
+- `server.api_version` = 3；`accepted_client_versions` = `[3, 3]`（M3 v3-only 终态；无 `?v=3` 或 `v=2` 会被 `400 unsupported_version` 拒绝——`X-Slimapi-Version` 头已删除）。
 - `schema.degraded=true` → 启动 smoke 探针发现 opencode 响应字段漂移，需查上游是否升级/改了 schema。
-- 不带版本头 → `400 version_required`（版本门禁生效，符合契约）。
+- 不带 `?v=3` → `400 unsupported_version`（版本选择器终态门禁，符合契约）。
 
 ### 6.3 ready 检查（轻量）
 
 ```bash
-curl -s -H 'X-Slimapi-Version: 2' http://127.0.0.1:4097/slimapi/ready
+curl -s 'http://127.0.0.1:4097/slimapi/ready?v=3'
 ```
 
 ---
@@ -383,7 +382,7 @@ ocdroid 客户端**不直接操作** sidecar 进程，只通过 stunnel mTLS 接
 | 经 sidecar mTLS 入口（推荐） | stunnel `:14097` → sidecar `127.0.0.1:4097` |
 | 经 sidecar 明文直连入口（Tailscale 等） | Tailscale 地址`:4097` → sidecar `0.0.0.0:4097`（依赖 Tailscale ACL / 防火墙；无 mTLS） |
 | 直连回退（不经 sidecar） | stunnel `:14096` → opencode `127.0.0.1:4096` |
-| 所有 `/slimapi/**` 请求必带头 | `X-Slimapi-Version: 2`（缺/非整数 → `400 version_required`；越界 → `400 version_incompatible`） |
+| 所有 `/slimapi/**` 请求必带 query | `?v=3`（无 `v`/`v=2`/不支持值 → `400 unsupported_version supported:[3]`；`X-Slimapi-Version` 头已删除不解读） |
 | 非 `/slimapi/**` | 透明反代 opencode，**不带**版本头 |
 | 健康自检（客户端侧） | `GET /slimapi/health` 读 `server.api_version` / `accepted_client_versions` 做运行时兼容判断 |
 | Wire 行为变更来源 | 本仓 [`CHANGELOG.md`](../CHANGELOG.md)（路径/头/错误码以本仓 + [`v2-contract.md`](specs/v2-contract.md) 为准） |
@@ -399,7 +398,7 @@ sidecar 进程的启停、日志、升级由 **服务端运维** 负责，ocdroi
 |---|---|
 | 服务起不来 | `journalctl --user -u oc-slimapi -n 50`；多半是 upstream / host 校验失败 |
 | `schema.degraded=true` | opencode 升级了；查 `opencode-src/current/` 对照字段，或临时设 `OC_SLIMAPI_SMOKE_SESSION_ID` 跳过随机探针 |
-| 客户端连上但 400 | 版本头缺失/越界；查 `accepted_client_versions` 与客户端发的 `X-Slimapi-Version` |
+| 客户端连上但 400 | 无 `?v=3` / `v=2` / 不支持值 → `unsupported_version`；directory 相关 → `invalid_directory_selector`/`directory_conflict`/`directory_header_retired`（消费集头通道已退役，用 `?directory=`） |
 | SSE 卡顿/断 | `journalctl --user -u oc-slimapi \| rg 'backpressure\|resync\|503'`；查 `/slimapi/metrics` 的订阅者计数 |
 | 升级后行为变化 | 先看 [`CHANGELOG.md`](../CHANGELOG.md) 对应版本节 |
 
@@ -452,7 +451,7 @@ curl -v https://opencode.vectory.cn:14097/slimapi/health
 curl http://opencode.vectory.cn:4097/slimapi/health
 
 # 本机 loopback 验证（明文可达——此路径应被边界阻止，但本机不受限）
-curl -s -H 'X-Slimapi-Version: 2' http://127.0.0.1:4097/slimapi/health
+curl -s 'http://127.0.0.1:4097/slimapi/health?v=3'
 
 # mTLS 回环（须带客户端证书；本机可用 stunnel 自签名测试）
 curl -s --cert client-cert.pem --key client-key.pem \
@@ -465,7 +464,7 @@ curl -s --cert client-cert.pem --key client-key.pem \
 
 ```bash
 # sidecar 健康（本机 loopback 明文）
-curl -s -H 'X-Slimapi-Version: 2' http://127.0.0.1:4097/slimapi/health
+curl -s 'http://127.0.0.1:4097/slimapi/health?v=3'
 
 # mTLS 回环（须带客户端证书）
 curl -s --cert client-cert.pem --key client-key.pem \

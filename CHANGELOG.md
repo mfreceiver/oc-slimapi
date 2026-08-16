@@ -857,3 +857,17 @@ ocdroid 对接时：
 - 客户端清单：[`docs/specs/CLIENT_CHANGES.md`](docs/specs/CLIENT_CHANGES.md)
 
 ## [Unreleased]
+
+### Removed（M3 破坏性：v3-only 终态——v2 wire 语义整体退役；权威= `docs/specs/v3-contract.md` §1/§2/§5.7/§6.2/§8.2/§8.3）
+
+> 本次为**破坏性变更集**。升级前置条件（生产 systemd 单元）：`OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS=3,3`（原 `2,3`）后**重启** oc-slimapi；ocdroid 必须已全部走 `?v=3` 形态。
+
+- **v2 管线删除**：`/slimapi/**` 无 `v`、`v=2`、合法但不支持的值 → 400 `{"code":"unsupported_version","supported":[3]}`（端点存在、协议版本退役；绝不静默 404）。SSE 端点同表（400 先于流打开）。
+- **`X-Slimapi-Version` 头退役**：不再读取、不解读（出现不报错）；`versioning.py::SlimapiVersionMiddleware` 门禁类删除。`accepted_client_versions` 终态 `[3,3]`（`/slimapi/health` 回显）；`OC_SLIMAPI_V3_SELECTOR_ENABLED` 灰度开关删除（v2 管线已不存在，回退无意义）。
+- **`X-Opencode-Directory` 请求头退役（消费集）**：消费集路由上该头出现 → 400 `{"code":"directory_header_retired"}`（canonical 通道 = `?directory=`）；双现同值亦 400（头通道整体退役，无"同值放行"）。
+- **响应头退役**：`X-Next-Cursor`（messages 列表改由 envelope `nextCursor` 字段承载）、`X-Complete`（sessions 列表改由 envelope `complete` 字段承载）、`X-Slimapi-Subscriber-ID`（SSE 改由首帧 `slimapi.meta` 的 `subscriberId` 承载）永不产出。
+- **SSE 终态**：`/slimapi/events` 与 `/slimapi/sessions/{sid}/stream` 首帧恒 `event: slimapi.meta`（`{"subscriberId","tokens"}`，先于业务帧/心跳/重放）；token stream 恒 identity（lever2 gzip 压缩路径移除）。
+- **Vary 收缩**：全路由 `Vary: Accept-Encoding` 单值（directory 维度随头退役退出 Vary）。
+- **catch-all 反代关闭**：未收编路径（含原 `GET /event`、`GET /global/event`、`/session/**` 透传等）全方法 → 404 `{"code":"thin_route_not_found"}`；WebSocket 仍 501 stub。**turn fence 迁移**：`prompt_async`/`abort` 写路由的 `turnIncarnation`/`turn` bump-before-send 随收编路由保留（原 catch-all 前递器职责迁至 `write_groups.py`）。
+- **终态错误优先级链（§8.3）**：① 非 GET `/slimapi/versions` → 405 → ② selector 400（`invalid_version_selector`/`unsupported_version`）→ ③ directory 400（多值 `invalid_directory_selector` → 双现异值 `directory_conflict` → 消费集头 `directory_header_retired`）→ ④ 路由未命中 404 `thin_route_not_found`。
+- **观测不变式**：access log/snapshot 字段与枚举（`selectorResult` 六值、`sseActive` 四维）**不变**——`absent`/`v2` 维度自然归零是预期（不再有 v2 语义请求）。
