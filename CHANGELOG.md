@@ -51,6 +51,10 @@ ocdroid 对接时：
 - **`GET /slimapi/sessions/{sid}/children`**：加性回归（v1 曾有、lite-v2 删、无状态重加——`/slimapi/sessions/status` 同款先例）。每项经既有 `skeleton_session()` 投影，与 `/slimapi/sessions` 列表**逐字相同** keep/drop（丢 `cost`/`tokens`/`location`/`subpath`）。**状态量护栏**（设计稿 §6.2）：不引入 `X-Children-Version`、`childrenVersion` digest、`childrenIDs[]` list hints、cache/single-flight/SSE 失效——纯读。省流依据 T16 top#2。
 - **共性**：`directory` 可选 query（`validate_directory` 400 `invalid_directory`）+ `X-Opencode-Directory` 转发；转换池 admission 先于上游 GET；错误映射与 sessions/messages 对齐（上游 404→404 `session_not_found`（带 `sessionID`）；其他 4xx→502 `upstream_http_N`；5xx/网络/坏 JSON/非 list→503 `upstream_unavailable`；超 cap→413 `response_too_large`；池满→503 `transform_busy`+`Retry-After:2`）。旧 sidecar 无此路由 → 客户端 capability detection：404 `thin_route_not_found` 时 fallback 透传 `GET /session/{sid}/todo|children`。设计稿：`docs/specs/traffic-route-todo-2026-08-10.md`、`docs/specs/traffic-route-children-2026-08-10.md`。
 
+### Added（加性 wire：diff thin 路由 — T18；未 bump `X-Slimapi-Version`，仍 2）
+
+- **`GET /slimapi/sessions/{sid}/diff`**：会话文件变更（diff）thin 读路由，todo/children（T17）同款管线（转换池 admission 先于上游 GET + `read_with_cap` 上限 413 + worker gzip + 结构化错误）。投影近恒等（上游 `Snapshot.FileDiff` `{file?,patch?,additions,deletions,status?}` schema 已最小，`patch` 大字段保留——gzip 是省流杠杆）。**`messageID` 可选 query 同名原样透传上游**（缺省不发，上游语义 = 返回 `[]`：缺省/未知消息/非 user 角色均答 200 `[]`，空结果为正常 body 非错误）；`directory` 可选仅 header 转发。空 `[]` 跳过 gzip（<64B 受益门）；本路由无 ETag/304（`If-None-Match` 忽略恒 200）。旧 sidecar 无此路由→catch-all 404 `thin_route_not_found`，客户端可回退透传 `GET /session/{sid}/diff`。
+
 ### Added（加性 wire：消息内容指纹 contentFingerprint — 流量优化 Batch 4/B3；未 bump `X-Slimapi-Version`，仍 2）
 
 - **`GET /slimapi/messages/{sid}`（缺省与 `mode=merged`）每条消息 skeleton 加性字段 `contentFingerprint: string`**，格式 `"<vN>:<sha256hex>"`（全量 hex 不截断）。定位：`(updatedAt, messageId)` 双水印去重的**补充证据**（内容级等价性判定），不替代、不改变 digest 帧或水印推进规则（消费侧推进规则见 ocdroid 联合计划）。生成位置：缺省列表 = skeleton 投影完成时；`mode=merged` = placeholder 内联 splice 完成后**重算覆盖**（full 抓取失败/预算不足/坏响应等降级路径**不重算**，保留 skeleton 期指纹）。规范化：排除字段自身 + `sort_keys` 序列化（parts 保持上游序、无数值规范化）后 SHA-256。
