@@ -29,7 +29,7 @@
 
 ## §2 版本选择器状态机 [冻结]
 
-**作用域**：selector 仅覆盖 `/slimapi/**` 路由。**非-slim catch-all（透传代理）不经 selector、不经版本头门禁**（现状：`proxy.py:106-132`、INTERFACE_MAP:12）；catch-all 请求携带 `?v=` 时**逐字透传上游**（上游不识别 v，无害），sidecar 不消费。3.0.0 catch-all 关闭后此例外自然消失。
+**作用域**：selector 仅覆盖 `/slimapi/**` 路由。**非-slim catch-all（透传代理）不经 selector、不经版本头门禁、零消费零剥离**——一切 query 参数（含 `?v=`、`?directory=`）逐字透传上游（现状：`proxy.py:106-132`、INTERFACE_MAP:12）。`v` 的消费剥离**仅发生在 `/slimapi/**` 路由**（§5.2）。不存在"v3 形态 catch-all"——v3 消费者使用 §10 收编路由（2.0.0 全就绪）。3.0.0 catch-all 关闭后此类别消失。
 
 选择器 = query 参数 `v`（sidecar **保留参数**，dispatch 层消费，**永不转发上游**——v2/v3 请求均剥离，见 §5.2）。
 
@@ -39,7 +39,7 @@
 |---|---|---|
 | 无 `v` | v2（缺省） | 现行 v2 管线，含 `X-Slimapi-Version` 头门禁（缺头 → `version_required`）。 |
 | `v=3` | v3 | v3 语义；版本头若同时出现被忽略不报错。 |
-| `v=2` | v2（显式） | 同缺省（含头门禁）；`v` 剥离后其余 raw query 逐字转发（§5.2）。 |
+| `v=2` | v2（显式） | 同缺省（含头门禁）；`v` 在 `/slimapi/**` 被消费（§5.2），不影响该路由其余参数的既有语义。 |
 | `v` 词法合法但不在支持集（4、5…） | 不支持 | 400 `{"code":"unsupported_version","supported":[2,3]}`（3.0.0 起 `[3]`）。 |
 | `v` 词法非法（含 `0`）/ 多值不同 | 畸形 | 400 `{"code":"invalid_version_selector"}`。多值**同值**宽容折叠。 |
 | `GET /slimapi/versions`（归一化路径） | 无条件豁免 | 不经 selector、不经头门禁；**非 GET → 405 + `Allow: GET`，优先级高于一切**（§8.3）。 |
@@ -78,9 +78,9 @@ GET /slimapi/versions → 200
 
 1. **canonical：`?directory=` query**（v=3）；语义与 v2 头逐字相同。
 2. **消费剥离规则（按参数拆分）**：
-   - `v`：**无条件消费剥离**（v2/v3 均剥离，永不转发；§2）。
-   - `directory`：消费/转换**限 v3**（消费集内转上游 `X-Opencode-Directory`——wire 等价）。v2 语义请求不消费不剥离；仅当 `v` 被剥离时其余 query（含 `directory`）**保持编码、顺序、重复项逐字**（`proxy.py:182-203` 锁定）。无 `v` 的 catch-all：query 逐字原样。
-3. **消费集**：`messages/{sid}`、`sessions`（列表+status）、`todo`/`children`/`diff`、`agent`/`command`、**§10 全部新收编读路由（file/vcs/find/providers 目录语义按上游 WorkspaceRoutingQuery——file.ts:8-27、instance.ts vcs 组均含 directory query）与 12 写路由**、catch-all 代理路径（v3 形态，2.0.0 过渡期）。
+   - `v`：在 `/slimapi/**` 路由上**无条件消费剥离**（v2/v3 均剥离，永不转发；§2）。
+   - `directory`：消费/转换**限 v3**（消费集内转上游 `X-Opencode-Directory`——wire 等价）。v2 语义请求不消费不剥离；显式 `v=2` 时 `v` 被剥离、其余 query（含 `directory`）**保持编码、顺序、重复项逐字**（`proxy.py:182-203` 锁定）。非-slim catch-all：一切 query 逐字原样透传（§2 作用域，零消费零剥离）。
+3. **消费集**：`messages/{sid}`、`sessions`（列表+status）、`todo`/`children`/`diff`、`agent`/`command`、**§10 全部收编路由（按 §10.a/§10.b 各自 directory 列——以上游组声明为准：file=FileQuery、file/status=WorkspaceRoutingQuery、vcs=WorkspaceRoutingQuery、find=FindFileQuery、providers=WorkspaceRoutingQuery、session 单查=WorkspaceRoutingQuery 等）**。catch-all 代理**不在消费集**（§2 作用域：零消费零剥离）。
 4. **双现规则（仅消费集）**：query 与 `X-Opencode-Directory` 头同时出现——归一化后同值 → 正常；不同值 → 400 `{"code":"directory_conflict","queryDirectory":<str>,"headerDirectory":<str>}`。
 5. **不在消费集**（宽容忽略）：`questions`/`permissions`（跨目录自发现聚合）、`events`、`health`/`versions`/`ready`/`metrics`/`actions`/`directories`。
 6. **stream 例外（v2 守卫逐字继承 + v3 多值前置新增）**：v2 单值行为 = **query-only directory 接受**（no-op，不报错）；仅 query 与头**同时存在且归一化后不同值** → 400 `directory_not_allowed`（`token_stream.py:51-69` 实际语义，rev6 表述有误以此为准）。v3 新增仅一条前置：`?directory=` **多值异值** → 400 `invalid_directory_selector`（消费集统一规则）；单值化后按上述 v2 规则判定。
@@ -89,7 +89,7 @@ GET /slimapi/versions → 200
 ## §6 ETag / Vary / 304 [冻结]
 
 1. **validator 域隔离**：`representation_version` 输入含 wire 版本标记——v2/v3 validator 互不匹配。
-2. **Vary**：并行期 4 路由（messages/sessions/agent/command）`Vary: Accept-Encoding, X-Opencode-Directory` 照旧；`?v=`/`?directory=` 属 URI 不加 Vary。3.0.0 评估去 directory Vary。
+2. **Vary**：并行期一切 **directory-sensitive 且接受 `X-Opencode-Directory` 头**的路由（原 4 路由 messages/sessions/agent/command + §10.a 收编 directory-消费读路由 + §10.b 写路由）统一 `Vary: Accept-Encoding, X-Opencode-Directory`；directory-不消费路由（active/global health 等）仅 `Vary: Accept-Encoding`。`?v=`/`?directory=` 属 URI 不加 Vary。3.0.0 头退役后全部路由去 directory Vary 值。
 3. ETag/`If-None-Match`/`*`/judge 三态沿用 v2；envelope 路由 canonical 输入 = envelope body。§10 收编路由中**仅幂等 GET 读路由**可启用 ETag（file/vcs/find/providers/session 单查；写路由与非幂等读不启用）。
 4. **v3 304 头集合**：仅 `ETag` + `Vary` + `Cache-Control: no-store`；不复制 `X-Next-Cursor`/`X-Complete`。
 
@@ -103,19 +103,19 @@ GET /slimapi/versions → 200
 
 1. 错误体沿用 v2 全集；新增：`unsupported_version`（`supported`）、`invalid_version_selector`、`directory_conflict`（`queryDirectory`/`headerDirectory`）、`invalid_directory_selector`；3.0.0 追加 `directory_header_retired`。422 形态不变。
 2. **catch-all 终局**：
-   - 2.0.0：catch-all 照旧盲转（v2 语义）；v3 形态经 catch-all → 正常转发 + `directory` 按 §5.3 转换（过渡兜底）。
+   - 2.0.0：catch-all 照旧盲转——**零消费零剥离**（§2 作用域），一切 query（含 `?v=`/`?directory=`）逐字透传，**不因 `?v=3` 改变行为**；v3 消费者应使用 §10 收编路由，误经 catch-all 的请求按 v2 盲转处理（安全兜底，非 v3 语义）。
    - 3.0.0：catch-all **关闭**。未收编路径 → 404 `{"code":"thin_route_not_found"}`；**收编全集 = 既有读路由 + §10 读 7 组 + 写 12 端点 + `versions`/`health`/`ready`/`metrics`/`actions`/`directories`**（= ocdroid StandardApi 全量端点闭包 + 匿名消费方实测基线）。
 3. **终态错误优先级（3.0.0，高→低）**：① 非 GET `/versions` → 405；② selector 400（`invalid_version_selector`/`unsupported_version`）；③ directory 400（`invalid_directory_selector` 多值异值 → `directory_conflict` 双现 → `directory_header_retired` 头出现）；④ 路由匹配失败 → 404 `thin_route_not_found`。低优先级仅在更高优先级全部通过后评估。
 
 ## §9 观测与移除判据 [冻结]
 
 1. **access log 加性字段**（随 2.0.0 交付）：`wireVersion`（`"2"|"3"|null`，null=rejected/exempt/not_applicable）；`selectorResult`（`absent|v2|v3|rejected|exempt|not_applicable`——**catch-all 透传 = not_applicable**）；`directoryForm`（`query|header|both|absent|null`）；`recordType`（`request|sse_open|sse_close`——消费口径按 `recordType=="request"` 过滤，`traffic-accounting.md` 同步）；`lifecycleId`（进程内单调，open/close 同值）。
-2. **snapshot 聚合**（留存 ≥30 天）：`date × selectorResult × wireVersion × directoryForm × recordType × statusClass × bucket` 计数矩阵 + 按 `wireVersion`（含 not_applicable 维度）分维度**窗口起点活跃 SSE 存量** `sseActive`（孤儿补记 close 后校正）。
+2. **snapshot 聚合**（留存 ≥30 天）：`date × selectorResult × wireVersion × directoryForm × recordType × statusClass × bucket` 计数矩阵。`sseActive` **聚合键 = `selectorResult`**（而非 wireVersion）：每日快照记录按 `selectorResult`（`v2`/`v3`/`not_applicable`）分维度的窗口起点活跃 SSE 存量（前日 close 未覆盖的 open 存量，孤儿补记 close 后校正）；`rejected`/`exempt`/`absent` 无 SSE 端点，恒 0。
 3. **sidecar 3.0.0 启动判据（全部满足，谓词显式化）**：
    - ① ocdroid 3.0.0 已发 + smoke 证据全绿；
-   - ② 连续 ≥7 天窗口：REST **`wireVersion ∈ {"2", null}`** 的成功请求为 0；且每日 `sseActive(v2 ∪ null)` == 0 **且**窗口内 `wireVersion ∈ {"2", null}` 的 `sse_open` 为 0；
+   - ② 连续 ≥7 天窗口：REST 成功请求中 **`selectorResult ∈ {v2, absent}`** 为 0（exempt=发现端点自身、rejected=已拒请求、not_applicable=catch-all——三者由 ④/①另行覆盖，不参与本谓词，避免发现轮询永久阻塞判据）；且每日 `sseActive(v2 ∪ absent)` == 0 且窗口内 `selectorResult ∈ {v2, absent}` 的 `sse_open` 为 0；
    - ③ `directoryForm ∈ {header, both}` 成功请求为 0（含写路径）；
-   - ④ **`selectorResult == "not_applicable"` 的成功 REST（catch-all/passthrough）与其 SSE 在窗口内为 0**——全部流量已收敛 `/slimapi`；
+   - ④ **`selectorResult == "not_applicable"`（catch-all/passthrough）的成功 REST 与 SSE 在窗口内为 0**——全部流量已收敛 `/slimapi`；
    - ⑤ webui 生产流量全 `v=3`；⑥ ocdroid 组书面确认。
 
 ## §10 路由收编全集 [冻结]（读 7 组 + 写 12 端点；ocdroid StandardApi 全量 + 实测基线）
@@ -126,13 +126,13 @@ GET /slimapi/versions → 200
 
 | 组 | v3 路由 | 上游 legacy | 方法 | directory | ETag |
 |---|---|---|---|---|---|
-| file | `/slimapi/file`、`/slimapi/file/content`、`/slimapi/file/status` | `/file*` | GET | 消费（FileQuery） | 幂等 GET 可启 |
-| vcs | `/slimapi/vcs`、`/slimapi/vcs/status`、`/slimapi/vcs/diff` | `/vcs*`（instance.ts:46-48） | GET | 消费 | 幂等 GET 可启 |
-| find | `/slimapi/find/file` | `/find/file`（FindFileQuery） | GET | 消费 | 幂等 GET 可启 |
-| providers | `/slimapi/config/providers` | `/config/providers` | GET | 不消费 | 可启 |
-| session 单查 | `/slimapi/session/{id}` | `/session/{id}` | GET | 消费 | 可启 |
-| active | `/slimapi/api/session/active` | `/api/session/active` | GET | 不消费 | 可启 |
-| global health | `/slimapi/global/health` | `/global/health` | GET | 不消费 | 可启 |
+| file | `/slimapi/file`、`/slimapi/file/content`、`/slimapi/file/status` | `/file*` | GET | 消费（`/file`、`/file/content`=FileQuery 族；**`/file/status`=WorkspaceRoutingQuery**） | **启用** |
+| vcs | `/slimapi/vcs`、`/slimapi/vcs/status`、`/slimapi/vcs/diff` | `/vcs*`（instance.ts:46-48） | GET | 消费（WorkspaceRoutingQuery） | **启用** |
+| find | `/slimapi/find/file` | `/find/file`（FindFileQuery） | GET | 消费 | **启用** |
+| providers | `/slimapi/config/providers` | `/config/providers` | GET | **消费**（`WorkspaceRoutingQuery`，`groups/config.ts:38-40`） | **启用** |
+| session 单查 | `/slimapi/session/{id}` | `/session/{id}` | GET | 消费 | **启用** |
+| active | `/slimapi/api/session/active` | `/api/session/active` | GET | 不消费 | **启用** |
+| global health | `/slimapi/global/health` | `/global/health` | GET | 不消费 | **启用** |
 
 （既有 thin：sessions/messages/status/todo/children/diff/permission/question/agent/command 不重复列。）
 
@@ -153,7 +153,7 @@ GET /slimapi/versions → 200
 | 11 | `/slimapi/question/{requestId}/reject` | 同名 | POST | rejectQuestion |
 | 12 | `/slimapi/session/{id}/command` | `/session/{id}/command` | POST | CommandPayload 透传 |
 
-**统一行为**：请求 body（含 content-type）与上游响应追踪头（`X-Request-ID` 类）透传；§10 头部错误两级制与 admission 冻结条款适用全集。
+**统一行为**（依据上游快照 **opencode v1.18.16**（`opencode-src/current`，后续 repoint 时本节逐条复核））：请求 body（含 content-type）透传；上游**响应头透传集合冻结** = `Content-Type`、`Location`（上游 3xx 重定向按状态码逐字透传，sidecar 不跟随不重写）、`Retry-After`、上游 `X-Request-ID`/`Last-Request-ID` 追踪头；其余上游自定义头不透传。**ETag 冻结子集**：§10.a 全部 GET 路由启用（含 file/content——大正文 304 收益最大；受既有 gzip 受益门与 validator 规则约束）；§10.b 写路由不启用。§10 头部错误两级制与 admission 冻结条款适用全集。
 
 ## §11 测试矩阵 [冻结]
 
@@ -168,7 +168,7 @@ GET /slimapi/versions → 200
 8. 观测字段（null/exempt/not_applicable/recordType/lifecycleId/sseActive 含 not_applicable 维度）；
 9. **读路由 7 组回归**（每组：happy 透传逐字节/上游 4xx 透传/上游 5xx→503/响应超限 413/directory query 转发断言/幂等 GET ETag 往返（启用子集））；
 10. **写路由 12 端点回归**（每端点：happy/4xx 透传/5xx→503/请求超限 413/directory 转发/PATCH 双 shape/fork messageID body 字段）；
-11. v=2 catch-all 保序回归（`v` 剥离后其余 raw query 编码/顺序/重复项逐字）；
+11. **catch-all raw-query 保序回归**（一切 query 含 `v`/`directory` 编码/顺序/重复项逐字透传——`proxy.py:182-203` 锁定，**无任何剥离**；携带 `?v=2/3` 断言同款）；
 12. 退役形态模拟（无 v/`v=2` → 400 `[3]`；头 → `directory_header_retired`；catch-all 404；**§8.3 优先级链逐级断言**）；
 13. 存量回归：旧 ocdroid 形态（无 v + header=2）逐字节不变。
 
