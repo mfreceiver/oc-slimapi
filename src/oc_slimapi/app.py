@@ -26,6 +26,7 @@ from .middleware.request_id import RequestIdMiddleware
 from .middleware.traffic_accounting import TrafficAccountingMiddleware
 from .proxy import install_proxy
 from .routes import actions, agent, children, command, directories, events, health, messages, metrics, permissions, questions, sessions, todo, token_stream
+from .routes import diff as diff_routes
 from .sse.hub import HubRegistry
 from .sse.singleflight import fulls
 from .sse.token_hub import TokenStreamHub, TokenStreamRegistry
@@ -605,7 +606,7 @@ app.add_middleware(RequestIdMiddleware)
 # install_proxy's catch-all (design §5.1: route must precede the reverse
 # proxy). Its path ``/slimapi/sessions/{sid}/stream`` does not shadow
 # ``/{sid}/status`` or ``/{sid}/children`` (different literal suffixes).
-for router in (health.router, actions.router, agent.router, command.router, sessions.router, children.router, todo.router, messages.router, events.router, metrics.router, questions.router, permissions.router, directories.router, token_stream.router):
+for router in (health.router, actions.router, agent.router, command.router, sessions.router, children.router, todo.router, diff_routes.router, messages.router, events.router, metrics.router, questions.router, permissions.router, directories.router, token_stream.router):
     app.include_router(router)
 install_proxy(app)
 

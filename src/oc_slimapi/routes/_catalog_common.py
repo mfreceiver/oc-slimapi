@@ -56,6 +56,7 @@ async def stream_upstream(
     upstream_path: str,
     directory: str | None,
     read_timeout: float | None = None,
+    upstream_params: dict[str, str] | None = None,
 ):
     """Build & send a streaming GET so we can cap-read the body (413 on oversize)
     instead of buffering the whole catalog into memory at once.
@@ -65,12 +66,18 @@ async def stream_upstream(
     P0-6: forwards ``X-Request-ID`` alongside the directory header so the
     sidecar access log line can be correlated with opencode's logs
     (contract §7). The two headers have distinct names → no collision.
+
+    T18: ``upstream_params`` (optional) is forwarded verbatim as the
+    upstream GET's query parameters (``None`` → no query, byte-identical
+    to today for every existing caller). Used by the sid-scoped diff route
+    for the optional ``messageID`` passthrough.
     """
     headers = forward_upstream_headers(
         directory, request_id_from_scope(request.scope),
     )
     upstream_request = request.app.state.upstream.build_request(
         "GET", upstream_path,
+        params=upstream_params,
         headers=headers,
     )
     if read_timeout is not None:
@@ -219,6 +226,7 @@ async def handle_catalog_request(
     enable_etag: bool = True,
     merge_directory_vary: bool = False,
     min_gzip_bytes: int | None = None,
+    upstream_params: dict[str, str] | None = None,
 ) -> Response:
     """Skeleton catalog GET handler — admission → stream upstream → cap-read
     → error mapping → offload project+pack → Response.
@@ -246,6 +254,9 @@ async def handle_catalog_request(
     directory-merged ``Vary`` on 200s (the variance is real regardless of
     validator support) and ``min_gzip_bytes`` adds the tiny-body benefit
     gate (rev-6 C2). Defaults leave agent/command byte-identical.
+
+    T18: ``upstream_params`` (optional) forwards verbatim query parameters
+    on the upstream GET (``None`` → no query, byte-identical to today).
     """
     if cache is not None:
         return await _handle_catalog_cached(
@@ -264,7 +275,10 @@ async def handle_catalog_request(
         etag_mod.response_rep_version(config) if enable_etag else None
     )
     async with pool:
-        response = await stream_upstream(request, upstream_path, directory, read_timeout)
+        response = await stream_upstream(
+            request, upstream_path, directory, read_timeout,
+            upstream_params=upstream_params,
+        )
         try:
             body = await read_upstream_response(
                 request, response,
