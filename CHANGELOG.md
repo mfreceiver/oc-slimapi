@@ -871,3 +871,5 @@ ocdroid 对接时：
 - **catch-all 反代关闭**：未收编路径（含原 `GET /event`、`GET /global/event`、`/session/**` 透传等）全方法 → 404 `{"code":"thin_route_not_found"}`；WebSocket 仍 501 stub。**turn fence 迁移**：`prompt_async`/`abort` 写路由的 `turnIncarnation`/`turn` bump-before-send 随收编路由保留（原 catch-all 前递器职责迁至 `write_groups.py`）。
 - **终态错误优先级链（§8.3）**：① 非 GET `/slimapi/versions` → 405 → ② selector 400（`invalid_version_selector`/`unsupported_version`）→ ③ directory 400（多值 `invalid_directory_selector` → 双现异值 `directory_conflict` → 消费集头 `directory_header_retired`）→ ④ 路由未命中 404 `thin_route_not_found`。
 - **观测不变式**：access log/snapshot 字段与枚举（`selectorResult` 六值、`sseActive` 四维）**不变**——`absent`/`v2` 维度自然归零是预期（不再有 v2 语义请求）。
+
+## [Unreleased]
