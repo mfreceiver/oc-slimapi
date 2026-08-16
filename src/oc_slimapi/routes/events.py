@@ -3,7 +3,9 @@ from starlette.responses import StreamingResponse
 
 from ..errors import CodedHTTPException
 from ..gzip_util import json_response
+from ..selector import wire_view_from_scope
 from ..sse.hub import STOP, SubscriberCapacityError, sse_frame
+from ..sse_observability import sse_close, sse_open
 
 router = APIRouter(prefix="/slimapi", tags=["events"])
 
@@ -30,6 +32,14 @@ async def events(request: Request, tokens: str | None = None):
     guard). ``tokens=1`` covers ALL sessions' coalesced deltas (no per-sid
     filter, MVP) and is mutually exclusive with the per-session token stream
     at the CLIENT (server does not force-disconnect a double-subscriber).
+
+    v3 (§7.2, Batch D): a ``?v=3`` request gets a leading
+    ``slimapi.meta`` first frame — ``{"subscriberId": <id>, "tokens": <bool>}``
+    (``tokens`` = whether ``tokens=1`` was attached) — before ANY business
+    frame, heartbeat, or Last-Event-ID resync replay; the response-header id
+    channel (``X-Slimapi-Subscriber-ID``) is NOT produced on v3 (the meta
+    frame replaces it; removal lands at 3.0.0 per §1). v2 streams are
+    byte-identical to before (no meta frame, header kept).
     """
 
     if tokens is not None and tokens != "1":
@@ -46,6 +56,12 @@ async def events(request: Request, tokens: str | None = None):
         )
 
     subscriber_id = subscriber.id
+    # ``getattr`` — direct route-invocation tests may pass mock requests
+    # without ``.scope`` (no scope ⇒ v2 view, same defensive pattern as the
+    # sse_open/sse_close helpers below; ``wire_view_from_scope`` itself is
+    # not None-safe).
+    _scope = getattr(request, "scope", None)
+    wire_v3 = _scope is not None and wire_view_from_scope(_scope) == 3
     # L2-A: opt-in token frames. The events subscriber becomes a first-class
     # consumer of the token flush loop (TokenStreamRegistry.events_tokens +
     # TokenStreamHub.events_tap) so token frames arrive at ~100ms cadence and
@@ -58,7 +74,29 @@ async def events(request: Request, tokens: str | None = None):
     traffic_ledger = getattr(request.app.state, "traffic_ledger", None)
 
     async def generate():
+        # v3 §9.1 (Batch A): sse_open row when the stream actually starts
+        # (generator first runs = 200 stream open); sse_close + same
+        # lifecycleId in the finally below. Best-effort observability —
+        # mock requests without ``.scope`` (direct route-invocation tests)
+        # no-op inside the helper.
+        lifecycle_id = sse_open(getattr(request, "scope", None), bucket="events_sse")
         try:
+            if wire_v3:
+                # v3 §7.2: meta FIRST — before any business frame, heartbeat,
+                # and the Last-Event-ID resync replay below. Frame bytes are
+                # counted like every other handed-to-ASGI-send frame.
+                meta = sse_frame(
+                    {"subscriberId": subscriber_id, "tokens": tokens == "1"},
+                    event="slimapi.meta",
+                )
+                if traffic_ledger is not None:
+                    try:
+                        traffic_ledger.record_sse_downstream(
+                            bucket="events_sse", bytes_out=len(meta),
+                        )
+                    except Exception:
+                        pass
+                yield meta
             if request.headers.get("last-event-id"):
                 resync = sse_frame({"reason": "reconnect_no_replay"}, event="resync")
                 if traffic_ledger is not None:
@@ -103,17 +141,23 @@ async def events(request: Request, tokens: str | None = None):
             # total_subscribers is decremented — otherwise the registry
             # counter leaks and admission permanently 503s after the cap.
             request.app.state.hubs.unsubscribe(subscriber)
+            sse_close(getattr(request, "scope", None), bucket="events_sse", lifecycle_id=lifecycle_id)
+
+    response_headers = {
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",
+    }
+    if not wire_v3:
+        # Ephemeral per-connection id; clients echo it back in logs /
+        # support tickets so an operator can correlate it with the
+        # ``sse.clients[]`` entry on /slimapi/metrics. Not an auth
+        # identity. v3 (§7.2) does NOT produce this header — the meta
+        # frame's ``subscriberId`` is the id channel (§1 removes the
+        # header at 3.0.0).
+        response_headers["X-Slimapi-Subscriber-ID"] = subscriber_id
 
     return StreamingResponse(
         generate(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache, no-transform",
-            "X-Accel-Buffering": "no",
-            # Ephemeral per-connection id; clients echo it back in logs /
-            # support tickets so an operator can correlate it with the
-            # ``sse.clients[]`` entry on /slimapi/metrics. Not an auth
-            # identity.
-            "X-Slimapi-Subscriber-ID": subscriber_id,
-        },
+        headers=response_headers,
     )

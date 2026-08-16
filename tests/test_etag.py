@@ -622,7 +622,12 @@ async def test_c6_disabled_byte_identical_no_etag_no_304(upstream_factory):
                     path, headers={**HDR, "If-None-Match": '"anything"'})
                 assert r.status_code == 200
                 assert "ETag" not in r.headers
-                assert r.headers["Vary"] == "Accept-Encoding"  # un-merged
+                # v3-contract §6.2 (gate C3): the directory Vary dimension
+                # survives the ETag switch — these routes are
+                # directory-sensitive, so Vary stays merged unconditionally
+                # (cache-correctness semantics, not an ETag accessory).
+                assert r.headers["Vary"] == (
+                    "Accept-Encoding, X-Opencode-Directory")
                 assert r.content  # full body — 304 judgement disabled
     finally:
         _teardown(app)

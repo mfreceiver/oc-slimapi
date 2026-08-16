@@ -208,6 +208,11 @@ def test_write_emits_one_json_line_with_all_fields(tmp_path):
         "ts", "method", "path", "bucket", "status", "durationMs",
         "downIn", "downOut", "upIn", "upOut", "requestId",
         "client", "clientVer", "clientId",
+        # v3 Batch A (§9.1) — additive tail fields, always present on rows
+        # written by the upgraded producer; rows from older versions simply
+        # lack them (consumers must tolerate the absence).
+        "wireVersion", "selectorResult", "directoryForm", "recordType",
+        "lifecycleId",
     }
     assert set(record) == expected_keys
     assert record["method"] == "GET"

@@ -281,6 +281,11 @@ def write_access_log(
     client_ver: str | None = None,
     client_id: str | None = None,
     cache: str | None = None,
+    wire_version: str | None = None,
+    selector_result: str | None = None,
+    directory_form: str | None = None,
+    record_type: str = "request",
+    lifecycle_id: int | None = None,
 ) -> None:
     """Emit one JSON-lines access record.
 
@@ -293,6 +298,20 @@ def write_access_log(
     ("hit"/"miss", traffic plan Batch 1 / A1) is the exception: it is only
     written when set, because rows from non-catalog routes (and deployments
     with the cache disabled) have no cache semantics at all.
+
+    v3 Batch A (v3-contract §9.1) — additive tail fields, always present on
+    rows written by this function (``null`` when unknown); OLD rows written
+    before the upgrade simply lack them, and consumers must tolerate the
+    absence (jq/orjson default behaviour):
+
+    * ``wireVersion``: "2" | "3" | null (null = rejected/exempt/not_applicable).
+    * ``selectorResult``: absent|v2|v3|rejected|exempt|not_applicable.
+    * ``directoryForm``: query|header|both|absent|null (null = non-consuming
+      route per §5.3 static table).
+    * ``recordType``: "request" for the per-request rows this function owns;
+      "sse_open"/"sse_close" rows come from :func:`write_sse_lifecycle_log`.
+    * ``lifecycleId``: null on request rows; the process-monotonic pairing id
+      on SSE lifecycle rows.
     """
     if logger.disabled:
         return
@@ -315,6 +334,52 @@ def write_access_log(
     }
     if cache is not None:
         record["cache"] = cache
+    record["wireVersion"] = wire_version
+    record["selectorResult"] = selector_result
+    record["directoryForm"] = directory_form
+    record["recordType"] = record_type
+    record["lifecycleId"] = lifecycle_id
+    logger.info(json.dumps(record, separators=(",", ":")))
+
+
+def write_sse_lifecycle_log(
+    logger: logging.Logger,
+    *,
+    method: str,
+    path: str,
+    bucket: str,
+    record_type: str,
+    lifecycle_id: int,
+    wire_version: str | None = None,
+    selector_result: str | None = None,
+    directory_form: str | None = None,
+    request_id: str | None = None,
+    status: int | None = None,
+) -> None:
+    """Emit one SSE lifecycle access record (v3-contract §9.1, Batch A).
+
+    ``record_type`` is ``"sse_open"`` (stream started — status 200) or
+    ``"sse_close"`` (generator finally — status null). Byte/duration fields
+    are intentionally absent: they are meaningless for lifecycle marks and
+    belong to the per-request row + the per-frame byte ledger. The
+    ``lifecycleId`` is the process-monotonic pairing key (same value on the
+    open and the matching close). Silently no-op when the logger is disabled.
+    """
+    if logger.disabled:
+        return
+    record = {
+        "ts": datetime.now().astimezone().isoformat(),
+        "method": method,
+        "path": path,
+        "bucket": bucket,
+        "status": status,
+        "recordType": record_type,
+        "lifecycleId": lifecycle_id,
+        "wireVersion": wire_version,
+        "selectorResult": selector_result,
+        "directoryForm": directory_form,
+        "requestId": request_id,
+    }
     logger.info(json.dumps(record, separators=(",", ":")))
 
 

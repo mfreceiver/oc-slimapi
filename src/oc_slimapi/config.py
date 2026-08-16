@@ -240,6 +240,16 @@ class Settings:
             f"{ACCEPTED_CLIENT_VERSIONS[0]},{ACCEPTED_CLIENT_VERSIONS[1]}",
         )
     )
+    # v3 Batch A — version-selector gradual-rollout switch (v3-contract §2 /
+    # §A-5). Default ON: the 2.0.0 sidecar must announce available=[2,3] on
+    # GET /slimapi/versions, so v=3 has to select the v3 pipeline out of the
+    # box. ``false`` is the rollback position: ?v=3 is then handled by the
+    # plain v2 pipeline (header gate still applies) and observability records
+    # selectorResult=absent for it — the `v` parameter is ignored entirely
+    # (even lexically invalid values do not 400).
+    v3_selector_enabled: bool = os.getenv(
+        "OC_SLIMAPI_V3_SELECTOR_ENABLED", "true"
+    ).lower() in ("1", "true", "yes", "on")
     # T3 subscriber / SSE-buffer guards (v1 contract §6). All must be strictly
     # positive; total >= per-directory so the broader cap can never be the
     # binding constraint in a single-hub world without making admission
@@ -526,21 +536,19 @@ class Settings:
         minimum, maximum = self.accepted_client_versions
         if self.server_api_version < 1 or minimum < 1 or minimum > maximum:
             raise RuntimeError("slimapi version configuration is invalid")
-        # P1-13: production version gate is fail-closed to v2. The env knob
-        # OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS is parsed syntactically (so a
-        # malformed value still fails fast at import), but the resolved range
-        # MUST be exactly (2, 2) — an operator cannot widen the accepted range
-        # via env to admit v1 clients. This runs BEFORE the server-version
-        # consistency check so the error message is unambiguous: the real
-        # problem is the pin, not a mismatched server version. No dev override
-        # is provided: the env IS the attack surface we are hardening against,
-        # so an env-based escape hatch would defeat the purpose. A developer
-        # who genuinely needs to test v1 behaviour can temporarily edit the
-        # constant in versioning.py.
+        # P1-13: production version gate is fail-closed to the pinned range.
+        # The env knob OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS is parsed
+        # syntactically (so a malformed value still fails fast at import),
+        # but the resolved range MUST be exactly ACCEPTED_CLIENT_VERSIONS —
+        # an operator cannot widen OR narrow the accepted range via env.
+        # (v3 Batch A: the pin value moved from (2, 2) to (2, 3) by editing
+        # the constant in versioning.py — the fail-closed posture itself is
+        # unchanged.) A developer who genuinely needs to test another range
+        # can temporarily edit the constant in versioning.py.
         if self.accepted_client_versions != ACCEPTED_CLIENT_VERSIONS:
             raise RuntimeError(
-                f"OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS must be (2, 2) — the "
-                f"production version gate is fail-closed to v2 and cannot be "
+                f"OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS must be {ACCEPTED_CLIENT_VERSIONS} — the "
+                f"production version gate is fail-closed to the pinned range and cannot be "
                 f"widened via env (got {self.accepted_client_versions})"
             )
         # Version consistency (P1-35): the advertised server version must fall

@@ -101,6 +101,127 @@ def prune_old_snapshots(directory: Path, stem: str, retain_days: int, today: dat
     return count
 
 
+# ---------------------------------------------------------------------------
+# v3 observability aggregation (v3-contract §9.2, Batch A) — pure analysis
+# ---------------------------------------------------------------------------
+
+# §9.2 sseActive dims. rejected/exempt have no SSE endpoints — always 0.
+_SSE_DIMS: tuple[str, ...] = ("v2", "v3", "absent", "not_applicable")
+
+
+def _v3_row_key(row: dict) -> str:
+    """Flat §9.2 matrix key for one access-log row."""
+    status = row.get("status")
+    status_class = "none" if isinstance(status, bool) or not isinstance(status, int) else f"{status // 100}xx"
+    return "|".join((
+        str(row.get("selectorResult") or "null"),
+        str(row.get("wireVersion") or "null"),
+        str(row.get("directoryForm") or "null"),
+        str(row.get("recordType") or "request"),
+        status_class,
+        str(row.get("bucket") or "null"),
+    ))
+
+
+def aggregate_v3_observability(records: list[dict]) -> dict:
+    """Aggregate parsed access-log rows into the §9.2 matrix + sseActive series.
+
+    Input: chronological (append-ordered, as written by the access log) rows
+    — any ``recordType`` (request / sse_open / sse_close). Rows from BEFORE
+    the v3 upgrade simply lack the new fields and land in the ``null`` dims —
+    the additive-fields contract (§9.1) means consumers tolerate exactly that.
+
+    Output shape (all day-scoped maps keyed ``"YYYY-MM-DD"``):
+
+    * ``counts``: cumulative flat-key ``selectorResult|wireVersion|
+      directoryForm|recordType|statusClass|bucket`` → count (all days).
+    * ``countsByDate``: same keys per day.
+    * ``sseActive[date][dim]``: **window-start** live SSE stock for each day —
+      the first row seen on a date freezes the running stock as that day's
+      opening balance. Satisfies the §9.2 formula
+      ``sseActive[D+1,k] = sseActive[D,k] + sse_open[D,k] − matched_sse_close[D,k]``.
+    * ``sseOpens`` / ``sseMatchedCloses`` per (date, dim): lifecycle pairing
+      by ``lifecycleId`` (§11.8) — a close matches iff its id is in the
+      dim's still-unmatched open set (pairing crosses day boundaries:
+      cross-day streams carry; the match counts on the close's day). A
+      matching close is removed from the set; a close whose id is unknown
+      (restart emptied the set / open predates the window / id missing) is
+      an **orphan** — counted, stock untouched.
+    * ``sseOrphanCloses``: closes with no pairable prior open — never
+      decrement ``sseActive`` (孤儿补记 close 校正; a mismatched close must
+      not drain another live connection's slot).
+    * ``sseLive[dim]``: end-of-window running stock.
+    """
+    counts: dict[str, int] = {}
+    counts_by_date: dict[str, dict[str, int]] = {}
+    day_order: list[str] = []
+    opens: dict[str, dict[str, int]] = {}
+    matched: dict[str, dict[str, int]] = {}
+    orphan: dict[str, dict[str, int]] = {}
+    active: dict[str, int] = {}
+    day_start_stock: dict[str, dict[str, int]] = {}
+    # §11.8 pairing state: per-dim set of open-but-not-yet-closed lifecycle
+    # ids visible in the aggregation window.
+    open_ids: dict[str, set[int]] = {}
+
+    def _bump(target: dict, date: str, dim: str) -> None:
+        per_day = target.setdefault(date, {})
+        per_day[dim] = per_day.get(dim, 0) + 1
+
+    def _full_dims(stock: dict[str, int]) -> dict[str, int]:
+        # jq-friendly stability: every day's map carries all four dims.
+        return {dim: stock.get(dim, 0) for dim in _SSE_DIMS}
+
+    for row in records:
+        date = str(row.get("ts", ""))[:10] or "unknown"
+        if date not in counts_by_date:
+            counts_by_date[date] = {}
+            day_order.append(date)
+            # Window-start stock: freeze the running live stock at the FIRST
+            # row of the date (this IS the carry-in from the previous day).
+            day_start_stock[date] = _full_dims(active)
+            # jq-friendly: every day carries all four dims in the lifecycle
+            # maps, even all-zero.
+            opens[date] = _full_dims({})
+            matched[date] = _full_dims({})
+            orphan[date] = _full_dims({})
+        key = _v3_row_key(row)
+        counts[key] = counts.get(key, 0) + 1
+        counts_by_date[date][key] = counts_by_date[date].get(key, 0) + 1
+
+        record_type = row.get("recordType") or "request"
+        if record_type in ("sse_open", "sse_close"):
+            dim = row.get("selectorResult")
+            dim = dim if dim in _SSE_DIMS else "absent"
+            lifecycle_id = row.get("lifecycleId")
+            if record_type == "sse_open":
+                active[dim] = active.get(dim, 0) + 1
+                _bump(opens, date, dim)
+                if isinstance(lifecycle_id, int):
+                    open_ids.setdefault(dim, set()).add(lifecycle_id)
+            else:
+                # §11.8 pairing: match by lifecycleId within the dim — a
+                # stock-count decrement would let an unmatched close drain
+                # another live connection's slot.
+                ids = open_ids.get(dim)
+                if isinstance(lifecycle_id, int) and ids and lifecycle_id in ids:
+                    ids.discard(lifecycle_id)
+                    active[dim] -= 1
+                    _bump(matched, date, dim)
+                else:
+                    _bump(orphan, date, dim)
+
+    return {
+        "counts": counts,
+        "countsByDate": counts_by_date,
+        "sseActive": day_start_stock,
+        "sseOpens": opens,
+        "sseMatchedCloses": matched,
+        "sseOrphanCloses": orphan,
+        "sseLive": _full_dims(active),
+    }
+
+
 class TrafficSnapshotter:
     """Periodic cumulative snapshot writer for a :class:`TrafficLedger`.
 
@@ -288,6 +409,15 @@ class TrafficSnapshotter:
             "buckets": snap.get("buckets", {}),
             "totals": snap.get("totals", {}),
             "ratios": snap.get("ratios", {}),
+            # v3 §9 (long-term retirement evidence): the daily JSONL is the
+            # ONLY ≥7-day carrier of the selector/sseActive evidence (the
+            # access log retains ~3 days), so every frame carries the
+            # same-source v3 node from ledger.snapshot() — matrix (7-dim
+            # flat counters) / sseLifecycle (per-dim open-close pairing) /
+            # sseActive (4-dim live stock). Additive tail: legacy field
+            # names and order unchanged.
+            "v3": snap.get(
+                "v3", {"matrix": {}, "sseLifecycle": {}, "sseActive": {}}),
         }
 
         # Derive the daily path from the SAME `now` so the ts field and the

@@ -56,6 +56,7 @@ from typing import Any, Callable
 
 import orjson
 
+from .etag import merged_vary as etag_merged_vary
 from .gzip_util import compress_if_beneficial
 from .skeleton import (
     strip_diagnostics_message,
@@ -75,7 +76,10 @@ class TransformBusy(Exception):
     """Raised when admission times out — pool saturated, caller emits ``503``."""
 
 
-def _pack_json(value: Any, accept_encoding: str | None) -> tuple[bytes, dict[str, str]]:
+def _pack_json(
+    value: Any, accept_encoding: str | None,
+    *, merge_directory_vary: bool = False,
+) -> tuple[bytes, dict[str, str]]:
     """Serialize ``value`` to JSON bytes and optionally gzip them.
 
     Returns ``(payload, extra_headers)``; ``extra_headers`` always carries
@@ -83,13 +87,23 @@ def _pack_json(value: Any, accept_encoding: str | None) -> tuple[bytes, dict[str
     compression is both negotiated and beneficial (see
     :func:`oc_slimapi.gzip_util.compress_if_beneficial`). Pure-CPU; safe to
     call from a worker thread.
+
+    ``merge_directory_vary=True`` (v3-contract §6.2, gate B1) appends the
+    ``X-Opencode-Directory`` dimension — for directory-sensitive routes the
+    body varies with the selected workdir instance, so caches must key on
+    it regardless of validator support. Default ``False`` keeps the
+    historical single-dimension Vary for every other caller.
     """
     encoded = orjson.dumps(value)
-    return compress_if_beneficial(encoded, accept_encoding)
+    payload, extra = compress_if_beneficial(encoded, accept_encoding)
+    if merge_directory_vary:
+        extra["Vary"] = etag_merged_vary(extra.get("Vary"))
+    return payload, extra
 
 
 def strip_diagnostics_and_pack(
     body: bytes, *, accept_encoding: str | None,
+    merge_directory_vary: bool = False,
 ) -> tuple[bytes, dict[str, str]]:
     """Worker entrypoint for the ``/full`` route: ``orjson.loads`` → strip the
     never-consumed LSP ``diagnostics`` map from the single message →
@@ -120,7 +134,10 @@ def strip_diagnostics_and_pack(
         # client. Treat as malformed upstream → route maps to 503.
         raise ValueError("upstream single-message body is not a dict")
     projected = strip_diagnostics_message(parsed)
-    return _pack_json(projected, accept_encoding)
+    return _pack_json(
+        projected, accept_encoding,
+        merge_directory_vary=merge_directory_vary,
+    )
 
 
 async def read_with_cap(

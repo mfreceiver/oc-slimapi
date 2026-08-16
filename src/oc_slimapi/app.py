@@ -25,8 +25,9 @@ from .logging_config import get_logger, setup_logging
 from .middleware.request_id import RequestIdMiddleware
 from .middleware.traffic_accounting import TrafficAccountingMiddleware
 from .proxy import install_proxy
-from .routes import actions, agent, children, command, directories, events, health, messages, metrics, permissions, questions, sessions, todo, token_stream
+from .routes import actions, agent, children, command, directories, events, health, messages, metrics, permissions, questions, read_groups, sessions, todo, token_stream, versions, write_groups
 from .routes import diff as diff_routes
+from .selector import SlimapiSelectorMiddleware
 from .sse.hub import HubRegistry
 from .sse.singleflight import fulls
 from .sse.token_hub import TokenStreamHub, TokenStreamRegistry
@@ -35,7 +36,6 @@ from .traffic import TrafficLedger
 from .traffic_snapshot import TrafficSnapshotter, prune_old_snapshots
 from .transform import TransformConfig, TransformPool
 from .upstream import create_client
-from .versioning import SlimapiVersionMiddleware
 
 
 # ---------------------------------------------------------------------------
@@ -590,9 +590,17 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="oc-slimapi", version=__version__, lifespan=lifespan)
 register_error_handlers(app)
+# v3 Batch A — the version SELECTOR replaces the bare version gate at this
+# position in the stack. It owns an unmodified SlimapiVersionMiddleware
+# instance (same params as before) wrapping the router: no-`v` / v2 requests
+# are dispatched through that gate (byte-identical v2 pipeline), v3 requests
+# are marked (scope state) and bypass the gate, and GET /slimapi/versions is
+# unconditionally exempt (non-GET there → 405 + Allow: GET, first priority).
+# Catch-all (non /slimapi) requests pass through untouched.
 app.add_middleware(
-    SlimapiVersionMiddleware,
+    SlimapiSelectorMiddleware,
     accepted_client_versions=settings.accepted_client_versions,
+    v3_enabled=settings.v3_selector_enabled,
 )
 # Traffic-accounting middleware. Added AFTER the version gate so it is the
 # OUTERMOST middleware — it wraps every HTTP route including the version
@@ -606,7 +614,7 @@ app.add_middleware(RequestIdMiddleware)
 # install_proxy's catch-all (design §5.1: route must precede the reverse
 # proxy). Its path ``/slimapi/sessions/{sid}/stream`` does not shadow
 # ``/{sid}/status`` or ``/{sid}/children`` (different literal suffixes).
-for router in (health.router, actions.router, agent.router, command.router, sessions.router, children.router, todo.router, diff_routes.router, messages.router, events.router, metrics.router, questions.router, permissions.router, directories.router, token_stream.router):
+for router in (health.router, versions.router, actions.router, agent.router, command.router, sessions.router, children.router, todo.router, diff_routes.router, messages.router, events.router, metrics.router, questions.router, permissions.router, directories.router, token_stream.router, read_groups.router, write_groups.router):
     app.include_router(router)
 install_proxy(app)
 

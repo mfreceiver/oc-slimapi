@@ -29,6 +29,7 @@ from starlette.responses import Response
 
 from .. import etag as etag_mod
 from ..gzip_util import accepts_gzip, error_response
+from ..selector import wire_view_from_scope
 from ..traffic import stash_cache, stash_up_in
 from ..upstream import forward_upstream_headers, request_id_from_scope
 from ..upstream_errors import (
@@ -268,11 +269,17 @@ async def handle_catalog_request(
             read_with_cap=read_with_cap,
             err_label=err_label,
             read_timeout=read_timeout,
+            merge_directory_vary=merge_directory_vary,
         )
     config = request.app.state.config
     pool = request.app.state.transforms
+    # v3-contract §6.1 (Batch B): the validator carries the wire-view marker
+    # so v2/v3 ETags never cross-match (envelope bodies differ).
     rep_version = (
-        etag_mod.response_rep_version(config) if enable_etag else None
+        etag_mod.response_rep_version(
+            config, wire_view=wire_view_from_scope(request.scope),
+        )
+        if enable_etag else None
     )
     async with pool:
         response = await stream_upstream(
@@ -321,6 +328,7 @@ async def handle_catalog_request(
 async def _offload_catalog_body(
     request: Request, pool, project_fn, body: bytes, err_label: str,
     rep_version: bytes | None = None,
+    merge_directory_vary: bool = False,
 ) -> Response:
     """Project+pack a (cached or freshly read) body under admission.
 
@@ -342,6 +350,7 @@ async def _offload_catalog_body(
             accept_encoding=request.headers.get("accept-encoding"),
             rep_version=rep_version,
             if_none_match=request.headers.get("if-none-match"),
+            merge_directory_vary=merge_directory_vary,
         )
     except (orjson.JSONDecodeError, ValueError) as exc:
         raise_upstream_unavailable(exc)
@@ -367,6 +376,7 @@ async def _handle_catalog_cached(
     read_with_cap,
     err_label: str,
     read_timeout: float | None = None,
+    merge_directory_vary: bool = False,
 ) -> Response:
     """Cached catalog chain (traffic plan Batch 1 / A1).
 
@@ -381,7 +391,10 @@ async def _handle_catalog_cached(
     """
     config = request.app.state.config
     pool = request.app.state.transforms
-    rep_version = etag_mod.response_rep_version(config)
+    # §6.1 (Batch B): wire-view marker in the cached-path validator too.
+    rep_version = etag_mod.response_rep_version(
+        config, wire_view=wire_view_from_scope(request.scope),
+    )
     key = (upstream_path, directory)
     body = cache.lookup(key)
     if body is not None:
@@ -390,6 +403,7 @@ async def _handle_catalog_cached(
             return await _offload_catalog_body(
                 request, pool, project_fn, body, err_label,
                 rep_version,
+                merge_directory_vary=merge_directory_vary,
             )
 
     async def _fetch_body() -> bytes | None:
@@ -421,4 +435,5 @@ async def _handle_catalog_cached(
         return await _offload_catalog_body(
             request, pool, project_fn, body, err_label,
             rep_version,
+            merge_directory_vary=merge_directory_vary,
         )

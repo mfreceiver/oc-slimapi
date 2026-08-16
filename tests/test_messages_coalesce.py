@@ -89,7 +89,7 @@ def _settings(**overrides) -> Settings:
         max_response_bytes=64 * 1024,
         smoke_session_id=None,
         server_api_version=2,
-        accepted_client_versions=(2, 2),
+        accepted_client_versions=(2, 3),
         coalesce_enabled=True,
         raw_fetch_concurrency=4,
         # default test budget: 4 concurrent leased flights at the 64 KiB

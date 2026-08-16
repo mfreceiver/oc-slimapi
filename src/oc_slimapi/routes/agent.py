@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Request
 
 from ..directory import validate_directory
+from ..selector import resolve_route_directory
 from ..skeleton import skeleton_agents
 from ..transform import TransformBusy, read_with_cap
 from ._catalog_common import (
@@ -31,6 +32,9 @@ async def agent(request: Request, directory: str | None = None):
     sidecar without it gets 404 ``thin_route_not_found`` from the catch-all
     proxy and falls back to the passthrough ``GET /agent``.
     """
+    # v3 (§5, Batch B): a consumed ``?directory=`` was validated + stripped
+    # at dispatch — the stash replaces the (absent) query param here.
+    directory = resolve_route_directory(request.scope, directory)
     if directory is not None:
         directory = validate_directory(directory)
     try:
@@ -40,7 +44,7 @@ async def agent(request: Request, directory: str | None = None):
             directory=directory,
             project_fn=skeleton_agents,
             read_with_cap=read_with_cap,
-            err_label="agent",
+            err_label="agent", merge_directory_vary=True,
             read_timeout=None,
             cache=getattr(request.app.state, "catalog_cache", None),
         )

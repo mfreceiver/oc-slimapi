@@ -136,6 +136,10 @@ GET /slimapi/versions → 200
 
 （既有 thin：sessions/messages/status/todo/children/diff/permission/question/agent/command 不重复列。）
 
+**§10.b「统一行为」段对本节的适用性 [冻结]**：上游响应头透传集合冻结（`Content-Type`、`Location`、`Retry-After`、上游 `X-Request-ID`/`Last-Request-ID`）、content-coding 规则（上游 `Content-Encoding` 不透传、实体字节口径）、错误两级制、admission 冻结条款——**均同样适用于本节全部读路由**（"统一行为"是 §10 全集行为，非仅写路由）。
+
+**错误 body 读取的资源上限 [冻结]**：错误两级制的"4xx status+body 逐字透传"以 body 可安全读入为前提——错误路径 body 读取同样受 response cap（`max_response_bytes`）保护；超限时无法逐字透传，降级为 503 `upstream_unavailable`（资源保护优先于逐字义务）。**投影路由（session 单查）的投影执行域**：仅当上游响应为 2xx 且 body 为合法 JSON object 时投影；其余一切状态（含 204 空 body、3xx 非 JSON）逐字透传不投影。投影属转换工作，须按 admission 冻结条款经转换池 offload 执行（事件循环不承载 JSON 解析/序列化）。
+
 ### 10.b 写路由（12 端点，2.0.0 交付；**directory 列 = 全部消费**——上游 `groups/session.ts:203-397`、`groups/question.ts:32-48` 均声明 `WorkspaceRoutingQuery`）
 
 | # | v3 路由 | 上游 | 方法 | 备注 |

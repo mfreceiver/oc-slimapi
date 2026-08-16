@@ -1,7 +1,7 @@
 # 流量记录与分析（省流实证）使用手册
 
 > 如何查询与解读 oc-slimapi 的**双向字节账本** + **结构化 access log** + **内存账本周期快照**，实证 sidecar 的省流效果。
-> 特性版本：**v0.7.0+**（`/slimapi/metrics` 响应的 `traffic` 块 + access log）；**2026-07-29**（按天切分 + client 标识字段 + traffic snapshot）；**2026-08-01**（turn-token fence scope 简化为仅 sid；移除 serverGroupFp 字段）。
+> 特性版本：**v0.7.0+**（`/slimapi/metrics` 响应的 `traffic` 块 + access log）；**2026-07-29**（按天切分 + client 标识字段 + traffic snapshot）；**2026-08-01**（turn-token fence scope 简化为仅 sid；移除 serverGroupFp 字段）；**2026-08-16**（v3 Batch A 加性观测字段：`wireVersion`/`selectorResult`/`directoryForm`/`recordType`/`lifecycleId` + SSE 开关行 + snapshot `v3` 节 + `aggregate_v3_observability`，见 §5.1/§9.4）。
 >
 > **术语澄清**：本手册中出现的 `/slimapi/metrics.traffic` / `/metrics.traffic` 等写法，**不是**独立 HTTP 路由——代码里只有 `GET /slimapi/metrics`（`src/oc_slimapi/routes/metrics.py`），流量账本是该响应 JSON 的 `traffic` 子键。下文为简洁起见用 "`metrics.traffic`" 作为该数据块的简称。
 > 性质：**加性 ops 可观测面**，不 bump `X-Slimapi-Version`；ocdroid 对接无变化（`/slimapi/metrics` 为 T3 ops 端点，非客户端契约）。
@@ -31,7 +31,7 @@ sidecar 是 ocdroid 与 opencode 之间的字节中继。账本按**路由桶**�
 
 ## 2. 快速查询
 
-所有 `/slimapi/**` 端点都要版本头 `X-Slimapi-Version: 2`。
+`/slimapi/**` 端点认证二选一：版本头 `X-Slimapi-Version: 2`，或查询参数 `?v=3`（v3 语义，header 可省；详见契约 `docs/specs/v3-contract.md` §2）。`GET /slimapi/versions` 无条件豁免。
 
 ```bash
 # 本机 loopback（服务默认绑 0.0.0.0:4097）
@@ -150,13 +150,13 @@ curl -s -H "$H" $BASE/slimapi/metrics | jq '
 
 ## 5. access log 离线分析
 
-每请求一行 JSON-lines，**按天切分**文件 `access-YYYY-MM-DD.jsonl`（`YYYY-MM-DD` = 当天日期）。默认目录 `logs/`（相对服务 CWD）；生产 systemd 覆盖到 `~/.local/state/oc-slimapi/logs/`（见 `docs/operations.md` §5.2）。
+**每个 HTTP 请求一行 `recordType=="request"`**；另有 SSE 连接建立/断开各一行的 `sse_open`/`sse_close` 生命周期行（`events_sse`/`token_stream_sse` 两端点，及 catch-all 透传 SSE `/event`、`/global/event`（bucket=`passthrough`，`selectorResult=not_applicable`），2026-08-16 起，见 §5.1）。按天切分文件 `access-YYYY-MM-DD.jsonl`（`YYYY-MM-DD` = 当天日期）。默认目录 `logs/`（相对服务 CWD）；生产 systemd 覆盖到 `~/.local/state/oc-slimapi/logs/`（见 `docs/operations.md` §5.2）。
 
 ```jsonc
 {"ts":"2026-07-24T13:02:11+08:00","method":"GET","path":"/slimapi/messages/ses_x","bucket":"messages","status":200,"durationMs":12.3,"downIn":0,"downOut":4321,"upIn":20480,"upOut":0,"requestId":"a1b2c3...","client":"ocdroid","clientVer":"1.2.3","clientId":"5f4d3c2b1a098765"}
 ```
 
-字段说明（`client`/`clientVer`/`clientId` 为 2026-07-29 加性字段；缺省 `null`）：
+字段说明（`client`/`clientVer`/`clientId` 为 2026-07-29 加性字段；`wireVersion`/`selectorResult`/`directoryForm`/`recordType`/`lifecycleId` 为 2026-08-16 v3 Batch A 加性字段；缺省 `null`）：
 
 | 字段 | 含义 |
 |---|---|
@@ -166,6 +166,15 @@ curl -s -H "$H" $BASE/slimapi/metrics | jq '
 | `client` | 客户端 app 名（来自 `X-Client-Name`，明文，**不 hash**） |
 | `clientVer` | 客户端版本（来自 `X-Client-Version`，明文，**不 hash**） |
 | `clientId` | 设备标识 hash（来自 `X-Client-Id`，默认 `sha256(raw)[:16]`；设 `OC_SLIMAPI_CLIENT_ID_SALT` 时为 `hmac_sha256(salt,raw)[:16]`） |
+| `wireVersion` | `"2"` \| `"3"` \| `null`——该请求生效的 wire 语义（`?v=3` → `"3"`；v2 管线（无 `v` 或 `?v=2`）→ `"2"`；被拒/豁免/非 `/slimapi` → `null`） |
+| `selectorResult` | `absent`（无 `v`）\| `v2`（`?v=2`）\| `v3`（`?v=3`）\| `rejected`（词法/不支持被 400）\| `exempt`（`GET /slimapi/versions`）\| `not_applicable`（catch-all 非 `/slimapi` 路由） |
+| `directoryForm` | `query` \| `header` \| `both` \| `absent` \| `null`——directory 输入形态（仅 directory 消费集路由非 null：messages list/full、sessions 列表/status、todo/children/diff、agent/command、stream；其余含 catch-all = `null`） |
+| `recordType` | `request`（每 HTTP 请求一行）\| `sse_open` \| `sse_close`（SSE 建立断开标记行）。**消费口径：统计请求数/字节时必须过滤 `recordType=="request"`** |
+| `lifecycleId` | 进程内单调递增 int；同一条 SSE 连接的 `sse_open`/`sse_close` 行同值（配对键）。仅生命周期行有值，`request` 行为 `null`。`requestId` 在 SSE 重连时可复用，仅辅助关联，**配对以 `lifecycleId` 为准** |
+
+### 5.1 SSE 生命周期行（2026-08-16 加性）
+
+`GET /slimapi/events` 与 `GET /slimapi/sessions/{sid}/stream`（`token_stream_sse`）在流真正开始产出（200 + `text/event-stream` 确立）时写一行 `sse_open`，生成器退出（客户端断开/服务端终结）时写一行 `sse_close`。**catch-all 透传 SSE**（`/event`、`/global/event` → bucket=`passthrough`）同样写这对生命周期行（`selectorResult=not_applicable`、`wireVersion=null`——透传面不判定版本）；其判定口径=**响应性质**：上游响应 200 且 content-type 为 `text/event-stream`（容忍 charset 等参数）才算 SSE——404/503/JSON 等非 SSE 响应**无生命周期行**，仅按普通 request 行记账。close 行在生成器 teardown 的 finally 中、于任何 `await` 之前写入——aclose 失败/取消路径 close 行必达（open/close 配对不泄漏）。两行**不含**字节/耗时字段（`downIn`/`downOut`/`upIn`/`upOut`/`durationMs` 不出现——生命周期行是标记，不是账目；字节记在该连接的 `request` 行与 ledger 桶里），字段为：`ts`/`method`/`path`/`bucket`/`status`/`recordType`/`lifecycleId`/`wireVersion`/`selectorResult`/`directoryForm`/`requestId`。旧文件没有这些行 → 分析脚本须容忍缺失（jq 对缺 key 的 `select` 天然跳过）。
 
 ### 文件切分与压缩
 
@@ -178,12 +187,14 @@ curl -s -H "$H" $BASE/slimapi/metrics | jq '
 
 ### 常用分析（`jq`）
 
+> 2026-08-16 起 access log 混有 SSE 生命周期行——**字节/请求数统计一律先 `select(.recordType == "request")`**（旧文件无该字段，容错写法 `select(.recordType != "sse_open" and .recordType != "sse_close")`）。
+
 ```bash
 # 当天文件
 LOG=logs/access-$(date +%F).jsonl
 
 # 各桶累计 upIn / downOut / 省流字节（按成本降序）
-jq -s 'group_by(.bucket)
+jq -s 'map(select(.recordType == "request")) | group_by(.bucket)
        | map({bucket:.[0].bucket,
               upIn:(map(.upIn)|add),
               downOut:(map(.downOut)|add)})
@@ -191,23 +202,33 @@ jq -s 'group_by(.bucket)
        | sort_by(-.upIn)' "$LOG"
 
 # 某时段（按 ts 前缀，如某小时）的累计省流
-jq -s 'map(select(.ts >= "2026-07-24T13" and .ts < "2026-07-24T14"))
+jq -s 'map(select(.recordType == "request" and .ts >= "2026-07-24T13" and .ts < "2026-07-24T14"))
        | {upIn:(map(.upIn)|add), downOut:(map(.downOut)|add)}' "$LOG"
 
 # 慢请求 Top 10（按 durationMs）
-jq -s 'map({path,durationMs,bucket,status}) | sort_by(-.durationMs) | .[0:10]' "$LOG"
+jq -s 'map(select(.recordType == "request")) | map({path,durationMs,bucket,status}) | sort_by(-.durationMs) | .[0:10]' "$LOG"
 
 # 非 2xx 请求
-jq -s 'map(select(.status >= 400)) | length' "$LOG"
+jq -s 'map(select(.recordType == "request" and .status >= 400)) | length' "$LOG"
 
 # 按设备 hash 分组请求量（区分多设备）
-jq -s 'group_by(.clientId) | map({clientId:.[0].clientId, count:length, client:.[0].client, clientVer:.[0].clientVer})' "$LOG"
+jq -s 'map(select(.recordType == "request")) | group_by(.clientId) | map({clientId:.[0].clientId, count:length, client:.[0].client, clientVer:.[0].clientVer})' "$LOG"
+
+# v3 观测：按 selectorResult 分组请求量（v3 采用率速览）
+jq -s 'map(select(.recordType == "request")) | group_by(.selectorResult) | map({selectorResult:.[0].selectorResult, count:length})' "$LOG"
+
+# v3 观测：SSE 活跃连接核对（open/close 按 lifecycleId 配对）
+jq -s 'map(select(.recordType == "sse_open" or .recordType == "sse_close"))
+       | group_by(.selectorResult)
+       | map({selectorResult:.[0].selectorResult,
+              opens:(map(select(.recordType == "sse_open"))|length),
+              closes:(map(select(.recordType == "sse_close"))|length)})' "$LOG"
 
 # 跨多天（含压缩历史）汇总
 for f in logs/access-2026-07-2*.jsonl logs/access-2026-07-2*.jsonl.gz; do
   [ -f "$f" ] || continue
   case "$f" in *.gz) zcat "$f";; *) cat "$f";; esac
-done | jq -s 'group_by(.bucket) | map({bucket:.[0].bucket, upIn:(map(.upIn)|add)})'
+done | jq -s 'map(select(.recordType == "request")) | group_by(.bucket) | map({bucket:.[0].bucket, upIn:(map(.upIn)|add)})'
 ```
 
 > `jq -s` 把整个文件 slurp 进内存（适合单文件几 MB 级）。大文件可改用 `jq` 逐行 + `awk` 求和，或导出给其它工具。
@@ -234,6 +255,7 @@ access log 的 `downOut` 是 **wire 级**字节（中间件视角，含 SSE 连�
 | `OC_SLIMAPI_TRAFFIC_SNAPSHOT_RETAIN_DAYS` | `0` | Task 10 (P2-1)：prune 早于 N 天的 `traffic-snapshot-YYYY-MM-DD.jsonl(.gz)`；**代码默认 `0`=不删**（本地开发/测试）；**生产 unit 配置 `30`**（见 `deploy/oc-slimapi.service` / `docs/operations.md` §3.2/§5.3）。复用 access-log 维护循环同一 tick 的 `today`，边界（`today - retain_days`）保留；与 access-log 不同，**不压缩**仅按天清理 |
 | `OC_SLIMAPI_CLIENT_ID_HASH` | `1` | 设备 id hash 开关（fail-closed 默认开；读到 false 时才落明文） |
 | `OC_SLIMAPI_CLIENT_ID_SALT` | `None` | HMAC salt（非空时 `sha256`→`hmac_sha256`） |
+| `OC_SLIMAPI_V3_SELECTOR_ENABLED` | `1` | v3 版本选择器灰度开关（`0` 时 `?v=3` 也走 v2 管线，观测记 `selectorResult=absent`；不影响本表其余计量） |
 
 > **deprecated（保留兼容）**：`OC_SLIMAPI_ACCESS_LOG_PATH`（旧单文件路径；若设非默认值，取 parent dir 作 `ACCESS_LOG_DIR` 兜底）、`OC_SLIMAPI_ACCESS_LOG_MAX_BYTES`、`OC_SLIMAPI_ACCESS_LOG_BACKUPS`（后两者 unused since daily rotation，保留字段不影响行为）。
 
@@ -269,7 +291,8 @@ access log 的 `downOut` 是 **wire 级**字节（中间件视角，含 SSE 连�
   "enabled": true,
   "buckets": { /* 同 metrics 响应 .traffic.buckets，cumulative */ },
   "totals": { /* 同 metrics 响应 .traffic.totals */ },
-  "ratios": { /* 同 metrics 响应 .traffic.ratios */ }
+  "ratios": { /* 同 metrics 响应 .traffic.ratios */ },
+  "v3": { /* 2026-08-16 加性：v3 观测节，见 §9.4 */ }
 }
 ```
 
@@ -312,16 +335,38 @@ jq -c '{ts, ratio: .ratios.messages.downOutOverUpIn}' /tmp/snap-all.jsonl
 
 | 来源 | 口径 | 重启后 |
 |---|---|---|
-| `GET /slimapi/metrics` 响应 `traffic` 块 | 内存账本实时快照（per-process cumulative） | 清零 |
+| `GET /slimapi/metrics` 响应 `traffic` 块 | 内存账本实时快照（per-process cumulative；含加性 `v3` 节） | 清零 |
 | `traffic-snapshot-YYYY-MM-DD.jsonl` | 内存账本周期 dump（同 `metrics.traffic` 块，持久化；按天切分；**不经自动压缩**；Task 10 起按 `OC_SLIMAPI_TRAFFIC_SNAPSHOT_RETAIN_DAYS` 自动 prune，默认 `0`=不删） | 新段（`bootTs`/`runId` 变化） |
-| access log（`access-*.jsonl`） | **逐请求** wire 级字节（含 `requestId`/`client*`） | 不受影响（按天文件） |
+| access log（`access-*.jsonl`） | **逐请求** wire 级字节（含 `requestId`/`client*`/v3 观测字段）+ SSE 生命周期行 | 不受影响（按天文件） |
 
 三者为**不同口径**，不直接对照：snapshot 是聚合 cumulative，access log 是逐请求明细，`metrics.traffic` 块是实时聚合。分析"某时段省了多少"用 access log（§5）；分析"长期趋势 / 跨重启累计"用 snapshot。
+
+### 9.4 v3 观测节（2026-08-16 加性）
+
+`metrics.traffic.v3` 与每帧 snapshot 的 `v3` 键（同源，均来自内存 ledger）：
+
+```jsonc
+{
+  "matrix": {                       // 扁平键 "selectorResult|wireVersion|directoryForm|recordType|statusClass|bucket" → 计数
+    "v2|2|null|request|2xx|sessions": 42,
+    ...
+  },
+  "sseLifecycle": {                 // 按 SSE 可达四维 {v2,v3,absent,not_applicable}
+    "v3": { "opens": 3, "closes": 2, "active": 1, "orphanCloses": 0 },
+    ...
+  },
+  "sseActive": { "v2": 0, "v3": 1, "absent": 0, "not_applicable": 0 }  // 当前活跃（= sseLifecycle[k].active）
+}
+```
+
+- **matrix** 维度 = 契约 v3 §9.2 的 `date × selectorResult × wireVersion × directoryForm × recordType × statusClass × bucket` 计数矩阵（内存视角无 date 维，跨日用 §9.4 末尾的离线聚合或按天 snapshot 帧对齐）；`statusClass` 形如 `"2xx"`，无 status 时 `"none"`。
+- **sseActive 语义**：`not_applicable` = catch-all 透传 SSE（`/event`、`/global/event`，不经省流面但计入观测）；`absent` = 无 `v` 参数的旧客户端 SSE。`rejected`/`exempt` 无 SSE 端点，恒不出现。
+- **离线对账**：跨日 carry-in 公式 `sseActive[D+1,k] = sseActive[D,k] + sse_open[D,k] − matched_sse_close[D,k]`（`sseActive[D,k]` 取 D 日首行时的窗口起点存量）。**matched/orphan 配对按 `lifecycleId`**（§11.8）：close 行的 `lifecycleId` 能配到先前未匹配 open（同 dim、跨日 carry）→ `matched_sse_close`（计入 close 当日，并从待配对集合移除）；配不到（open 早于数据窗口 / sidecar 重启后集合已空 / id 缺失）→ **孤儿 close**，只补记计数，**不冲减存量**（避免错误消耗他人活跃连接）。`traffic_snapshot.aggregate_v3_observability(records)` 提供该纯函数实现（输入按天 access log 解析出的记录列表，输出 `counts`/`countsByDate`/`sseActive`/`sseOpens`/`sseMatchedCloses`/`sseOrphanCloses`/`sseLive`），供运维脚本与测试对账复用。
 
 ---
 
 ## 10. 相关
 
-- 契约 / 设计：[`docs/specs/v2-contract.md`](../specs/v2-contract.md)（§2 `/slimapi/metrics`、§7 可观测性/access log/client header、§12 流量查询）
+- 契约 / 设计：[`docs/specs/v2-contract.md`](../specs/v2-contract.md)（§2 `/slimapi/metrics`、§7 可观测性/access log/client header、§12 流量查询）、[`docs/specs/v3-contract.md`](../specs/v3-contract.md)（§9 v3 观测字段口径）
 - 运维手册：[`docs/operations.md`](../operations.md)（§5 日志策略、§5.2 落盘目录、§5.3 维护）
 - 变更记录：[`CHANGELOG.md`](../CHANGELOG.md) `[0.7.0]`（access log + traffic 首版）、`[1.0.0]`（按天切分 + client header + snapshot）

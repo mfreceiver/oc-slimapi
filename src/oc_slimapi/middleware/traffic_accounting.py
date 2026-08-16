@@ -57,6 +57,7 @@ from typing import Any, Awaitable, Callable
 
 from ..access_log import get_access_logger, hash_client_id, write_access_log
 from ..logging_config import get_logger
+from ..selector import DIRECTORY_FORM_STATE_KEY, SELECTOR_STATE_KEY
 from ..traffic import SSE_BUCKETS, _read_state_int, _UP_IN_KEY, _UP_OUT_KEY, bucketize
 from .request_id import REQUEST_ID_KEY
 
@@ -265,6 +266,16 @@ def _record(
     duration_ms = (time.perf_counter() - start_perf) * 1000.0
     up_in = _read_state_int(scope, _UP_IN_KEY)
     up_out = _read_state_int(scope, _UP_OUT_KEY)
+    # v3 Batch A (§9.1): selector outcome stashed by the (inner) selector
+    # middleware — visible here because the scope dict is shared and the
+    # selector runs before the inner app completes. Missing state (test apps
+    # without the selector) → null fields on the row.
+    sel_state = scope.get("state", {}) or {}
+    sel_info = sel_state.get(SELECTOR_STATE_KEY)
+    sel_info = sel_info if isinstance(sel_info, dict) else {}
+    selector_result = sel_info.get("result")
+    wire_version = sel_info.get("wire")
+    directory_form = sel_state.get(DIRECTORY_FORM_STATE_KEY)
     # Access log: always (when the logger is enabled). For SSE buckets we log
     # the wire-level down_out so an operator sees the real connection payload.
     try:
@@ -305,6 +316,11 @@ def _record(
             client_ver=client_ver,
             client_id=client_id,
             cache=cache_state,
+            wire_version=wire_version,
+            selector_result=selector_result,
+            directory_form=directory_form,
+            record_type="request",
+            lifecycle_id=None,
         )
     except Exception as exc:
         logger.warning("write_access_log failed", exc_info=exc)
@@ -341,6 +357,15 @@ def _record(
             req_bytes=down_in,
             resp_bytes=resp_for_ledger,
             duration_ms=duration_ms,
+        )
+        # v3 §9.2 matrix (best-effort, additive): one request row per request.
+        ledger.record_selector_request(
+            bucket=bucket,
+            status=status,
+            selector_result=selector_result,
+            wire_version=wire_version,
+            directory_form=directory_form,
+            record_type="request",
         )
         # Upstream bytes for SSE buckets come from record_sse_upstream in the
         # hub — ignore the stash so the single shared /global/event

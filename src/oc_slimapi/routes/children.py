@@ -23,6 +23,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Request
 
 from ..directory import validate_directory
+from ..selector import resolve_route_directory
 from ..gzip_util import MIN_GZIP_BYTES
 from ..skeleton import skeleton_session
 from ..transform import TransformBusy, read_with_cap
@@ -66,6 +67,9 @@ async def session_children(request: Request, sid: str,
     merged ``Vary`` kept (directory variance is real); tiny-body gzip
     benefit gate applies (empty ``[]`` → identity).
     """
+    # v3 (§5, Batch B): a consumed ``?directory=`` was validated + stripped
+    # at dispatch — the stash replaces the (absent) query param here.
+    directory = resolve_route_directory(request.scope, directory)
     if directory is not None:
         directory = validate_directory(directory)
     try:

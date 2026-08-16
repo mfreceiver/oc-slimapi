@@ -1034,3 +1034,104 @@ class TestPruneOldSnapshots:
         assert foreign.exists()
         assert nodate.exists()
         assert not old_snap.exists()
+
+
+# ---------------------------------------------------------------------------
+# v3 observability node in real JSONL frames (§9 long-term evidence)
+# ---------------------------------------------------------------------------
+
+
+class TestV3NodeInFrames:
+    """Real-TrafficSnapshotter JSONL frames carry the ledger's v3 node.
+
+    §9 (v3-contract): the access log retains only ~3 days, so the daily
+    snapshot JSONL is the ONLY ≥7-day carrier of the selector/sseActive
+    retirement evidence. Every persisted frame must therefore contain the
+    same-source ``v3`` node (matrix / sseLifecycle / sseActive) the
+    in-memory ``ledger.snapshot()`` reports.
+    """
+
+    def _ledger_with_v3_data(self) -> TrafficLedger:
+        """Ledger with matrix counters + a paired SSE open/close cycle."""
+        ledger = TrafficLedger(enabled=True)
+        ledger.record_selector_request(
+            bucket="messages", status=200,
+            selector_result="v3", wire_version="3",
+            directory_form="query", record_type="request")
+        ledger.record_selector_request(
+            bucket="health", status=200,
+            selector_result="absent", wire_version="2",
+            directory_form="null", record_type="request")
+        # Paired open/close → opens==closes, active back to 0.
+        ledger.record_sse_lifecycle(result="v3", opened=True)
+        ledger.record_sse_lifecycle(result="v3", opened=False)
+        # Unclosed open → stays active.
+        ledger.record_sse_lifecycle(result="absent", opened=True)
+        return ledger
+
+    async def test_frames_contain_v3_node_with_matrix_and_sse(
+            self, tmp_path: Path) -> None:
+        path = str(tmp_path / "snap.jsonl")
+        snap = TrafficSnapshotter(
+            ledger=self._ledger_with_v3_data(),
+            interval_s=300, path=path)
+        await snap.start()
+        await snap.stop()
+
+        lines = _read_lines(path)
+        assert len(lines) >= 1
+        for line in lines:
+            v3 = line.get("v3")
+            assert isinstance(v3, dict)
+            # Matrix: flat 7-dim keys, cumulative counts.
+            assert isinstance(v3["matrix"], dict)
+            assert any(
+                key.startswith("v3|3|query|request|2xx|messages")
+                for key in v3["matrix"])
+            assert any(
+                key.startswith("absent|2|null|request|2xx|health")
+                for key in v3["matrix"])
+            # sseActive: ledger shape is sparse-additive — only dims that
+            # have seen SSE traffic appear (all within the §9.2 four).
+            assert set(v3["sseActive"]) <= {"v2", "v3", "absent",
+                                            "not_applicable"}
+            assert v3["sseActive"]["v3"] == 0  # paired open/close
+            assert v3["sseActive"]["absent"] == 1  # unclosed open
+            # sseLifecycle: pairing evidence (opens == closes for v3).
+            assert v3["sseLifecycle"]["v3"]["opens"] == 1
+            assert v3["sseLifecycle"]["v3"]["closes"] == 1
+            assert v3["sseLifecycle"]["absent"]["opens"] == 1
+
+    async def test_v3_node_is_additive_tail_after_ratios(
+            self, tmp_path: Path) -> None:
+        """Existing field names/order unchanged; v3 rides as the tail."""
+        path = str(tmp_path / "snap.jsonl")
+        snap = TrafficSnapshotter(
+            ledger=self._ledger_with_v3_data(),
+            interval_s=300, path=path)
+        await snap.start()
+        await snap.stop()
+
+        lines = _read_lines(path)
+        assert lines
+        keys = list(lines[0].keys())
+        # Legacy prefix intact and in order.
+        assert keys[:10] == ["ts", "bootTs", "runId", "uptimeS", "pid",
+                             "enabled", "buckets", "totals", "ratios", "v3"]
+
+    async def test_v3_node_present_but_empty_for_fresh_ledger(
+            self, tmp_path: Path) -> None:
+        """No v3 traffic yet → the node still exists (empty, not absent):
+        consumers of every frame can rely on the same shape."""
+        path = str(tmp_path / "snap.jsonl")
+        snap = TrafficSnapshotter(
+            ledger=TrafficLedger(enabled=True),
+            interval_s=300, path=path)
+        await snap.start()
+        await snap.stop()
+
+        lines = _read_lines(path)
+        assert lines
+        for line in lines:
+            assert line["v3"] == {
+                "matrix": {}, "sseLifecycle": {}, "sseActive": {}}

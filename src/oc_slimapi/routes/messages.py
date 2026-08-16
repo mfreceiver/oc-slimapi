@@ -12,7 +12,9 @@ from starlette.responses import Response
 
 from ..errors import CodedHTTPException
 from .. import etag as etag_mod
+from ..envelope import messages_envelope_bytes
 from ..gzip_util import compress_if_beneficial, error_response
+from ..selector import resolve_route_directory, wire_view_from_scope
 from ..skeleton import (
     SkeletonLimits,
     recompute_fingerprint,
@@ -258,7 +260,14 @@ async def _resolve_messages_directory(request: Request, directory: str | None) -
       directories are involved — slimapi refuses to guess which one to forward).
 
     Returns the normalised directory to forward (or None).
+
+    v3 (§5, Batch B): the dispatch selector already consumed + validated the
+    ``?directory=`` query on consuming routes and stripped it from the query
+    — ``resolve_route_directory`` substitutes that stash for the (absent)
+    query param, so the rest of this resolver runs unchanged on an
+    already-validated value (header conflicts were decided at dispatch).
     """
+    directory = resolve_route_directory(request.scope, directory)
     if directory is None:
         return None
     header_dir = request.headers.get("x-opencode-directory")
@@ -770,8 +779,16 @@ async def _messages_via_lease(
                     accept_encoding=accept_encoding,
                     fingerprint=config.message_fingerprint_enabled,
                 )
+            # v3 (§4.1, Batch B): the packed v2 bare array is spliced into
+            # the envelope verbatim BEFORE any validator work — the envelope
+            # bytes ARE the canonical ETag input (§6.3) — and the v3 view
+            # drops the X-Next-Cursor header (the client reads
+            # ``nextCursor`` from the cached envelope, §6.4).
+            view = wire_view_from_scope(request.scope)
+            if view == 3:
+                identity = messages_envelope_bytes(identity, next_cursor)
             base_headers: dict[str, str] = {"Cache-Control": "no-store"}
-            if next_cursor:
+            if next_cursor and view != 3:
                 base_headers["X-Next-Cursor"] = next_cursor
             # Batch 2 / B1-1R (rev-5): coding-specific SINGLE-candidate 304
             # judgment, pre-compression (plan §4 :222-229 — a validator hit
@@ -781,12 +798,17 @@ async def _messages_via_lease(
             # 200 — B1-C5 reverse direction). ``*`` compresses once and
             # echoes the actual coding's tag. The 200 below labels its
             # validator with the coding it ACTUALLY carries (B1-1R).
-            rep_version = etag_mod.response_rep_version(config)
-            vary_value = "Accept-Encoding"
+            rep_version = etag_mod.response_rep_version(
+                config, wire_view=view)
+            # §6.2 (gate C3): directory-sensitive route — the directory
+            # Vary dimension is unconditional (cache-correctness semantics,
+            # NOT an ETag accessory; Batch 3 merge_directory_vary precedent).
+            vary_value = etag_mod.merged_vary("Accept-Encoding")
             if rep_version is not None:
-                vary_value = etag_mod.merged_vary(vary_value)
-                aux = ({"X-Next-Cursor": next_cursor}
-                       if next_cursor else None)
+                # v3 304 never carries aux headers (§6.4).
+                aux = None if view == 3 else (
+                    {"X-Next-Cursor": next_cursor}
+                    if next_cursor else None)
                 verdict = etag_mod.judge_conditional(
                     identity,
                     request.headers.get("if-none-match"),
@@ -808,12 +830,12 @@ async def _messages_via_lease(
                         verdict, vary_value, aux=aux)
             encoded, c_headers = compress_if_beneficial(identity, accept_encoding)
             final_headers = dict(c_headers)
+            final_headers["Vary"] = vary_value
             if rep_version is not None:
                 actual_coding = (
                     "gzip" if "Content-Encoding" in c_headers else "identity")
                 final_headers["ETag"] = etag_mod.compute_etag(
                     identity, actual_coding, rep_version)
-                final_headers["Vary"] = vary_value
             return Response(
                 encoded, status_code=200, media_type="application/json",
                 headers={**base_headers, **final_headers},
@@ -952,8 +974,14 @@ async def messages(
                 accept_encoding=request.headers.get("accept-encoding"),
                 fingerprint=config.message_fingerprint_enabled,
             )
+        # v3 (§4.1, Batch B — same tail as the lease path above): envelope
+        # splice before validator work; no X-Next-Cursor header on the v3
+        # view (client reads ``nextCursor`` from the cached envelope, §6.4).
+        view = wire_view_from_scope(request.scope)
+        if view == 3:
+            identity = messages_envelope_bytes(identity, next_cursor)
         base_headers: dict[str, str] = {"Cache-Control": "no-store"}
-        if next_cursor:
+        if next_cursor and view != 3:
             base_headers["X-Next-Cursor"] = next_cursor
         # Batch 2 / B1-1R (rev-5, same tail as the lease path): coding-
         # specific SINGLE-candidate pre-compression judgment (identity-only
@@ -962,12 +990,16 @@ async def messages(
         # once and echoes the actual coding). Zero compression on every
         # non-star 304. The 200 labels its validator with the coding it
         # ACTUALLY carries. Aux header value comes from THIS run.
-        rep_version = etag_mod.response_rep_version(config)
-        vary_value = "Accept-Encoding"
+        rep_version = etag_mod.response_rep_version(
+            config, wire_view=view)
+        # §6.2 (gate C3): unconditional directory Vary — same as the lease
+        # tail; directory-sensitivity does not depend on validator support.
+        vary_value = etag_mod.merged_vary("Accept-Encoding")
         if rep_version is not None:
-            vary_value = etag_mod.merged_vary(vary_value)
-            aux = ({"X-Next-Cursor": next_cursor}
-                   if next_cursor else None)
+            # v3 304 never carries aux headers (§6.4).
+            aux = None if view == 3 else (
+                {"X-Next-Cursor": next_cursor}
+                if next_cursor else None)
             verdict = etag_mod.judge_conditional(
                 identity,
                 request.headers.get("if-none-match"),
@@ -991,12 +1023,12 @@ async def messages(
             identity, request.headers.get("accept-encoding"),
         )
         final_headers = dict(c_headers)
+        final_headers["Vary"] = vary_value
         if rep_version is not None:
             actual_coding = (
                 "gzip" if "Content-Encoding" in c_headers else "identity")
             final_headers["ETag"] = etag_mod.compute_etag(
                 identity, actual_coding, rep_version)
-            final_headers["Vary"] = vary_value
         return Response(
             encoded, status_code=200, media_type="application/json",
             headers={**base_headers, **final_headers},
@@ -1099,6 +1131,7 @@ async def message(
                 encoded, extra = await pool.offload(
                     strip_diagnostics_and_pack, body,
                     accept_encoding=accept_encoding,
+                    merge_directory_vary=True,
                 )
             except (orjson.JSONDecodeError, ValueError, TypeError, AttributeError) as exc:
                 raise_upstream_unavailable(exc)

@@ -8,6 +8,7 @@ from starlette.responses import StreamingResponse
 from .directory import validate_directory
 from .errors import CodedHTTPException
 from .gzip_util import error_response
+from .sse_observability import sse_close, sse_open
 from .traffic import stash_up_in, stash_up_out
 from .upstream import strip_hop_by_hop, DIRECTORY_HEADER
 
@@ -251,6 +252,22 @@ def install_proxy(app: FastAPI) -> None:
             # send() call itself; mid-stream breaks (send already returned)
             # surface via _counted_upstream_response's finally.
             raise CodedHTTPException(503, code="upstream_unavailable") from exc
+        # v3 §9.2 (Batch A/B4): catch-all SSE observability is judged by
+        # RESPONSE NATURE, not by path — the lifecycle rows open only when
+        # the upstream actually established an SSE stream (status 200 AND
+        # content-type text/event-stream, parameters tolerated). A 404/503/
+        # JSON response on /event or /global/event keeps the plain
+        # request-row accounting only (no sse_open/sse_close). The response
+        # headers are already received here (client.send(stream=True) has
+        # returned), so this decision never guesses ahead of the upstream.
+        content_type = (
+            (response.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+        )
+        is_upstream_sse = (
+            is_sse
+            and response.status_code == 200
+            and content_type == "text/event-stream"
+        )
         # Wrap the upstream response iterator so we count the bytes returned
         # to the client (``upIn`` — the upstream leg of THIS request). The
         # finally guarantees the count lands even on disconnect / error mid
@@ -263,6 +280,13 @@ def install_proxy(app: FastAPI) -> None:
         # reentrant) — the normal path closes twice harmlessly, the exception
         # path closes exactly once via this finally (P1-10).
         async def _counted_upstream_response():
+            # Lifecycle rows (dim not_applicable — the selector already
+            # stashed that for non-/slimapi paths; wireVersion null).
+            # Best-effort: sse_observability swallows its own failures —
+            # zero effect on the passthrough bytes or timing semantics.
+            lifecycle_id = (
+                sse_open(request.scope, bucket="passthrough") if is_upstream_sse else None
+            )
             n = 0
             try:
                 async for chunk in response.aiter_raw():
@@ -271,6 +295,16 @@ def install_proxy(app: FastAPI) -> None:
             finally:
                 if n > 0:
                     stash_up_in(request, n)
+                # B5: the close row is emitted BEFORE the aclose await — it
+                # is synchronous, so once the finally is entered no aclose
+                # failure or cancellation at that await point can skip it
+                # (§9 pairing: an open without its close leaks sseActive).
+                if lifecycle_id is not None:
+                    sse_close(
+                        request.scope,
+                        bucket="passthrough",
+                        lifecycle_id=lifecycle_id,
+                    )
                 await response.aclose()
 
         return StreamingResponse(

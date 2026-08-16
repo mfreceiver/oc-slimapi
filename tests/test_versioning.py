@@ -6,16 +6,16 @@ from oc_slimapi.versioning import ACCEPTED_CLIENT_VERSIONS, SlimapiVersionMiddle
 
 
 def test_production_default_accepted_versions():
-    """lite-v2 §9.3: the production default constant MUST be (2, 2) —
-    v2-only, no back-compat with v1."""
-    assert ACCEPTED_CLIENT_VERSIONS == (2, 2)
+    """v3 Batch A (2.0.0): the production pin is (2, 3) — the header gate
+    admits 2 and 3 while the selector routes ?v semantics. Still no v1."""
+    assert ACCEPTED_CLIENT_VERSIONS == (2, 3)
 
 
 def make_client() -> TestClient:
     app = FastAPI()
     app.add_middleware(
         SlimapiVersionMiddleware,
-        accepted_client_versions=(2, 2),
+        accepted_client_versions=(2, 3),
     )
 
     @app.get("/slimapi/health")
@@ -35,7 +35,7 @@ def test_missing_version_header_is_rejected():
     assert response.status_code == 400
     assert response.json() == {
         "code": "version_required",
-        "accepted": [2, 2],
+        "accepted": [2, 3],
     }
 
 
@@ -52,7 +52,7 @@ def test_supported_version_is_allowed():
 def test_out_of_range_versions_are_rejected():
     client = make_client()
 
-    for version in (1, 3):
+    for version in (1, 4):
         response = client.get(
             "/slimapi/health",
             headers={"X-Slimapi-Version": str(version)},
@@ -61,7 +61,7 @@ def test_out_of_range_versions_are_rejected():
         assert response.json() == {
             "code": "version_incompatible",
             "client": version,
-            "accepted": [2, 2],
+            "accepted": [2, 3],
         }
 
 
@@ -74,7 +74,7 @@ def test_non_integer_version_is_reported_as_required():
     assert response.status_code == 400
     assert response.json() == {
         "code": "version_required",
-        "accepted": [2, 2],
+        "accepted": [2, 3],
     }
 
 

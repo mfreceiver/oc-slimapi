@@ -46,7 +46,9 @@ class _ConfigLike(Protocol):
     skeleton_inline_output_max_message_bytes: int
 
 
-def representation_version(config: _ConfigLike) -> bytes:
+def representation_version(
+    config: _ConfigLike, *, wire_view: int = 2,
+) -> bytes:
     """REP_VERSION = projection version + config fingerprint.
 
     The config fingerprint covers everything that changes the bytes of a
@@ -55,6 +57,13 @@ def representation_version(config: _ConfigLike) -> bytes:
     with a default of ``True`` so that flipping it later rotates every
     ETag without touching this module (it will start contributing a new
     component to the fingerprint, invalidating all prior validators).
+
+    v3-contract §6.1 (Batch B): the fingerprint also carries a **wire-view
+    marker** (``wire=v2`` / ``wire=v3``) — v2 and v3 validators are
+    domain-isolated (the v3 envelope body differs, so a cross-view
+    ``If-None-Match`` must never 304). Adding the marker rotates every
+    existing v2 ETag once (one extra 304-miss round, by design — the same
+    one-time cost as any representation change).
     """
     fingerprint_parts = [
         _ETAG_SCHEME_VERSION,
@@ -70,15 +79,20 @@ def representation_version(config: _ConfigLike) -> bytes:
     fingerprint_parts.append(
         b"fingerprint=on" if getattr(
             config, "message_fingerprint_enabled", True) else b"fingerprint=off")
+    # v3-contract §6.1 (Batch B): wire-view domain marker — see docstring.
+    fingerprint_parts.append(
+        b"wire=v3" if wire_view == 3 else b"wire=v2")
     return b"\x00".join(fingerprint_parts)
 
 
-def response_rep_version(config: _ConfigLike | None) -> bytes | None:
+def response_rep_version(
+    config: _ConfigLike | None, *, wire_view: int = 2,
+) -> bytes | None:
     """REP_VERSION for response emission, or ``None`` when ETag/304 is
     disabled (``etag_enabled=false`` → byte-identical legacy behaviour)."""
     if config is None or not getattr(config, "etag_enabled", True):
         return None
-    return representation_version(config)
+    return representation_version(config, wire_view=wire_view)
 
 
 def compute_etag(identity_body: bytes, coding: str, rep_version: bytes) -> str:

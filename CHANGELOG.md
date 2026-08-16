@@ -28,6 +28,57 @@ ocdroid 对接时：
 
 ## [Unreleased]
 
+### Added（加性 wire：v3 Batch C2——写路径 12 端点收编；未 bump `X-Slimapi-Version`，仍 2）
+
+> 权威契约：`docs/specs/v3-contract.md`（2.0.0 实施基线）§10.b。**ocdroid 写流量从 catch-all 盲转迁移到一等 `/slimapi` 路由**（受控代理：校验 + 上限 + 审计 + directory 路由）；v2 语义请求仍可走 catch-all（3.0.0 前不关闭）。
+
+- **12 个写端点**（body/Content-Type 透传，请求超 `max_message_bytes` → 413 `request_too_large` **先于上游调用**）：`POST /slimapi/session`（创建）、`PATCH /slimapi/session/{session_id}`（**双 shape**：title/metadata/permission 与 `time.archived`）、`DELETE /slimapi/session/{session_id}`、`POST /slimapi/session/{sid}/prompt_async`、`POST /slimapi/session/{sid}/abort`、`POST /slimapi/session/{sid}/summarize`、`POST /slimapi/session/{sid}/fork`（`messageID` 为**可选 body 字段**，非 query）、`POST /slimapi/session/{sid}/revert`、`POST /slimapi/session/{sid}/permissions/{permission_id}`（respond）、`POST /slimapi/question/{request_id}/reply`（body `answers`）、`POST /slimapi/question/{request_id}/reject`、`POST /slimapi/command`。
+- **错误两级制（契约 §10.a）**：上游 4xx → 状态 + body 逐字透传；上游 5xx/网络错误 → 503 `upstream_unavailable`。**错误 body 同样受 `max_response_bytes` cap**——超限统一降级 503（资源保护优先于逐字义务）。2xx/3xx 状态逐字（3xx 不跟随重定向）。
+- **响应头冻结集**：仅透传上游实有头（`content-type`/`location`/`retry-after`/`x-request-id`/`last-request-id`）——上游无 `Content-Type` 时**不注入缺省值**；成功响应 gzip 受益门 + `Cache-Control: no-store` + `Vary: Accept-Encoding, X-Opencode-Directory`。
+- **query 逐字透传**（`v`/`directory` 消费剥离后其余参数逐字节保持）；**directory 全 12 端点消费**（v2 = 头通道；v3 = `?directory=` canonical）；无 ETag/304、不占转换池。
+- **观测**：`write_session`/`write_question` 桶（method-aware：POST 才落写桶，GET 405 落 `other`）。
+
+### Added（加性 wire：v3 Batch C1——读路径 7 组 11 路由收编；未 bump `X-Slimapi-Version`，仍 2）
+
+> 权威契约：`docs/specs/v3-contract.md`（2.0.0 实施基线）§10.a。**匿名/ocdroid 读流量从 catch-all 盲转迁移到一等 `/slimapi` 路由**；旧 sidecar 无这些路由 → catch-all 404 `thin_route_not_found`，客户端可回退透传。
+
+- **11 个 GET 读路由**：`/slimapi/file`、`/slimapi/file/content`、`/slimapi/file/status`、`/slimapi/vcs`、`/slimapi/vcs/status`、`/slimapi/vcs/diff`、`/slimapi/find/file`、`/slimapi/config/providers`、`/slimapi/session/{sid}`（单查，**经 `skeleton_session()` 白名单投影**，与列表逐字同 keep/drop）、`/slimapi/api/session/active`（宽容）、`/slimapi/global/health`（宽容——上游 global health，非 sidecar `/slimapi/health`）。
+- **统一管线**：流式 GET → 两级错误（4xx 状态+body 逐字 / 5xx·网络 → 503 `upstream_unavailable`，**错误 body 同受 cap**，超限 503）→ response cap（413 `response_too_large`）→ **ETag/304**（validator 含 wire 版本域，v2/v3 隔离）→ gzip 受益门 64B。
+- **投影门控（契约 §10.a 冻结）**：仅 2xx + 合法 JSON object 投影（session 单查）；204 空 body / 3xx 非 JSON 逐字透传；坏 JSON → 503；投影经转换池 offload（池满 503 `transform_busy` + `Retry-After: 2`）。raw 路由（file/vcs/find 等）零投影零池。
+- **query 逐字透传**（v2/v3 均 `v` 剥离后逐字节）；directory：v2 = 头通道（query 中 `directory` 非法值 → 400 `invalid_directory`）；v3 = `?directory=` canonical；宽容路由（active/global-health）v2/v3 均不校验。
+- **上游状态透传**：成功分支透传上游实际状态码（201/202/204/206/3xx 逐字，不跟随重定向）。
+
+### Added（加性 wire：v3 Batch D——SSE meta 首帧；未 bump `X-Slimapi-Version`，仍 2）
+
+> 权威契约：`docs/specs/v3-contract.md`（2.0.0 实施基线）§7。**`X-Slimapi-Subscriber-ID` 响应头的 v3 替代**（3.0.0 全头退役前置）。v2 流逐字节不变。
+
+- **v3 SSE 开流首帧**：`event: slimapi.meta`，data `{"subscriberId": "<id>", "tokens": <bool>}`——`/slimapi/events` 的 `tokens` 反映 `?tokens=1` 实际值；`/slimapi/sessions/{sid}/stream` 恒 `true`。首帧早于任何业务帧/heartbeat/`Last-Event-ID` resync 回放；meta 帧计入 `downOut` 流量记账。
+- **v3 不再下发 `X-Slimapi-Subscriber-ID` 响应头**（v2 照旧）。
+- **v3 `/stream` 恒 identity**（token 帧字节原样冻结，`Content-Encoding`/`Vary` 不产出）；gzip 压缩降为 v2-only lever（`/events` v3 仍按 Accept-Encoding 协商）。
+- 配套测试 `tests/test_v3_sse_meta.py`（18 用例，含 v2 字节级回归）。
+
+### Added（加性 wire：v3 Batch B——envelope + directory query + ETag 域隔离；未 bump `X-Slimapi-Version`，仍 2）
+
+> 权威契约：`docs/specs/v3-contract.md`（rev11）§4/§5/§6。**仅 `?v=3` 请求**获得下列 v3 视图；无 `v`/`?v=2` 的 wire 形状逐字节不变。
+
+- **Envelope（契约 §4）**：`GET /slimapi/messages/{sid}?v=3` → `{"items":[<v2 裸数组逐字节>],"nextCursor":<string|null>}`（`nextCursor` 语义同 v2 `X-Next-Cursor`，游标不回退照旧；无 `complete`）；`GET /slimapi/sessions?v=3` → `{"items":[…],"complete":<bool>}`（`complete` 语义同 v2 `X-Complete`，继承非权威性；无 `nextCursor`）。v3 200 **不再下发** `X-Next-Cursor`/`X-Complete` 头（值移入 envelope）。`GET /slimapi/sessions/status?v=3` **不 envelope**；错误响应不 envelope；304 无 body。
+- **Directory query（契约 §5）**：v3 canonical = `?directory=` query（语义同 v2 头：选工作目录实例）。消费集（本批既有路由）：`messages/{sid}`、`sessions` 列表+`status`、`todo/children/diff`、`agent/command`（`stream` 见下条）。仅 v3：query 与头双现——归一化（尾斜杠）同值正常；异值 → 400 `directory_conflict`（字段 `queryDirectory`/`headerDirectory` 冻结）；query 多值同值折叠、异值 → 400 `invalid_directory_selector`。消费到的 directory（query **或兼容头**，含 header-only）→ 上游 `X-Opencode-Directory` 头转发，且 query 中的 `directory` 参数对**剥离不转发**（其余参数逐字节保持）。v2 请求：不消费不剥离 v3 语义（`?directory=` 照旧按 v2 路由逻辑转发；sessions v2 仍补上游 query）。宽容忽略集（questions/permissions/events/health/versions/directories/actions）：任何形式不报错不消费。
+- **Stream 特例（契约 §5.6）**：`GET /slimapi/sessions/{sid}/stream` 守卫逐字继承 v2 现逻辑（query-only 接受 no-op；query+header 异值 → 400 `directory_not_allowed` 现有码）+ v3 前置多值异值 → 400 `invalid_directory_selector`（选择器层前置拦截，路由守卫兜底同码）。stream 不做 v3 stash/剥离——单值 query 原样流经守卫。
+- **ETag 域隔离（契约 §6.1）**：`representation_version` 指纹输入加入 wire 版本标记（`wire=v2`/`wire=v3`）——v2/v3 validator 互不匹配，防 envelope 语义跨视图误 304。**副作用（设计内）**：本次升级后所有既有 v2 ETag 轮换一次（指纹域变更）；客户端缓存条目一次性 revalidate。v3 304 头集合仅 `ETag`+`Vary`+`Cache-Control: no-store`（**不复制** `X-Next-Cursor`/`X-Complete`——客户端从缓存 envelope 取）；v3 200 envelope 路由 ETag canonical 输入 = envelope body（envelope 内容变 → ETag 变）。Vary 并行期保持 `Accept-Encoding, X-Opencode-Directory`（4 条 directory 敏感路由）；`?v=`/`?directory=` 属 URI 进 cache key 不加 Vary。
+- **directoryForm 观测（契约 §9.1）**：v3 消费集按实际 client 形态记 `query|header|both|absent`（含 header-only 消费）；非消费路由 `null` 不变。
+- **Vary 矩阵修正（契约 §6.2，门控 B1/C3；缓存正确性修复，行为变化仅限 Vary 头加值）**：directory-sensitive 路由的 `Vary` **无条件**含 `X-Opencode-Directory`，与 ETag 开关无关——修复 `messages/{sid}/full/{mid}` 此前仅 `Vary: Accept-Encoding`（该路由消费转发 directory、body 随工作目录实例变化），以及 `OC_SLIMAPI_ETAG_ENABLED=false` 时 messages/sessions 列表与 cached agent/command 退化成 AE-only。affected：`full/{mid}`（恒）、etag 关闭时的 messages 列表（v2/v3）、sessions 列表（v2/v3）、agent/command（cached 与 uncached）。非 directory 路由（questions/permissions/health/versions 等）Vary 不变（AE-only 或无 Vary）。
+
+### Added（加性 wire：v3 Batch A——版本选择器 + 发现端点 + health 双视图 + 观测字段；未 bump `X-Slimapi-Version`，仍 2）
+
+> 权威契约：`docs/specs/v3-contract.md`（2.0.0 实施基线，rev11）。本批为 v3 奠基：**`?v=3` 请求的响应 body 仍是 v2 形状**（envelope 等 v3 视图改造属 Batch B/C/D）；本批只加选择器判定、发现端点、health 双视图与观测。
+
+- **版本选择器（契约 §2）**：`/slimapi/**` 路由支持查询参数 `v` 选择 wire 语义。`v=3` → v3 语义（`X-Slimapi-Version` 头若同时出现**忽略不报错**，头门禁豁免）；`v=2` 或无 `v` → 现行 v2 管线（头门禁照旧：缺头 → 400 `version_required`）。词法非法（`0`/`03`/`+3`/`3.0`/空串/多值异值）→ 400 `invalid_version_selector`；合法但不支持（`1`/`4`/`5`…）→ 400 `unsupported_version`（`supported:[2,3]`）。多值同值折叠。**`v` 消费剥离（契约 §5.2）**：判定后所有转发的 `/slimapi/**` 请求（v2/v3/`versions` 豁免/回退模式）的 `v` 参数对从下游 query **无条件剥离、永不转发**，其余参数逐字节保持（编码/顺序/重复项不变）。catch-all（非 `/slimapi`）零改动，不消费 `v`/`directory`，`?v=2/3` 逐字透传上游。
+- **头门禁范围放宽（加性）**：`X-Slimapi-Version` 接受范围由 `[2,2]` → `[2,3]`（`/slimapi/health` 的 `accepted_client_versions` 与 400 错误体的 `accepted` 同步）。缺头仍 400 `version_required`（v2 语义请求不变）。
+- **发现端点（契约 §3）**：`GET /slimapi/versions` 返回 `{current:3, available:[2,3], capabilities:{2:{etag,contentFingerprint,thinRoutes:[todo,children,diff]}, 3:{envelope:[messages,sessions],directoryQuery,versionHeaderOptional,writeRoutes,readRoutes:[file,vcs,find,providers,sessionSingle,activeSessions,globalHealth]}}, sidecarVersion}`；`Cache-Control: no-store`、无 ETag、gzip 协商族。该端点**无条件豁免**（不要头、不吃 `v`）；**非 GET → 405 + `Allow: GET`**（优先级高于选择器判定）。
+- **health 双视图（契约 §3a）**：`GET /slimapi/health` 根级 `slimapi_contract`、`server.api_version`、`schema.version` 随请求语义双视图——v2 语义请求见 2，`?v=3` 请求见 3（三字段同源同步，禁止 3/2 组合）；`accepted_client_versions`/`schema.clientMin/clientMax` 恒 `[2,3]`。`GET /slimapi/ready` 无 contract 字段，`schema` 三字段同款双视图。
+- **观测字段（契约 §9，加性 ops 面）**：access log 新增尾缀字段 `wireVersion`（`"2"|"3"|null`）、`selectorResult`（`absent|v2|v3|rejected|exempt|not_applicable`；catch-all=`not_applicable`）、`directoryForm`（`query|header|both|absent|null`；非 directory 消费路由=`null`）、`recordType`（`request|sse_open|sse_close`；**字节/请求数统计须过滤 `recordType=="request"`**）、`lifecycleId`（进程内单调，SSE open/close 行配对键）；`/slimapi/events`、`/slimapi/sessions/{sid}/stream` **及 catch-all 透传 SSE（`/event`、`/global/event`，`not_applicable` 维度）** 建立断开各记一行生命周期行。`/slimapi/metrics` 的 `traffic` 块与 traffic snapshot 新增加性 `v3` 节（`matrix` 七维计数 + `sseLifecycle` + `sseActive` 四维 `{v2,v3,absent,not_applicable}`）；离线对账的 matched/orphan close **按 `lifecycleId` 配对**（配不到 → 孤儿补记，不冲减存量）。旧行无新字段——消费方须容忍缺失。查询口径见 `docs/manual/traffic-accounting.md` §5.1/§9.4。
+- **Ops 开关**：`OC_SLIMAPI_V3_SELECTOR_ENABLED`（默认 `true`；`false` 时 `?v=3` 也走 v2 管线，观测记 `selectorResult=absent`——灰度回滚用）。
+
 ## [1.6.0] - 2026-08-16 — T18 `diff` thin 路由（匿名读侧收编最后缺口；加性）；未 bump `X-Slimapi-Version`，仍 2
 
 ## [1.5.0] - 2026-08-16 — 上游流量优化四批（catalog TTL 缓存 + single-flight 去重 / ETag/304 / todo+children thin 路由 / 消息内容指纹；全部加性）；未 bump `X-Slimapi-Version`，仍 2

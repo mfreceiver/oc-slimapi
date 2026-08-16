@@ -33,6 +33,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Request
 
 from ..directory import validate_directory
+from ..selector import resolve_route_directory
 from ..gzip_util import MIN_GZIP_BYTES
 from ..transform import TransformBusy, read_with_cap
 from ._catalog_common import (
@@ -82,6 +83,9 @@ async def session_diff(request: Request, sid: str,
     still real, so ``Vary`` keeps the merged form; the tiny-body gzip
     benefit gate applies (empty ``[]`` → identity).
     """
+    # v3 (§5, Batch B): a consumed ``?directory=`` was validated + stripped
+    # at dispatch — the stash replaces the (absent) query param here.
+    directory = resolve_route_directory(request.scope, directory)
     if directory is not None:
         directory = validate_directory(directory)
     upstream_params: dict[str, str] | None = (

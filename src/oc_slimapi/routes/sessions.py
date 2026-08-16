@@ -6,9 +6,11 @@ from fastapi import APIRouter, Query, Request
 from starlette.responses import Response
 
 from ..directory import validate_directory
+from ..envelope import sessions_envelope_payload
 from ..errors import CodedHTTPException
 from .. import etag as etag_mod
 from ..gzip_util import accepts_gzip, json_response
+from ..selector import resolve_route_directory, wire_view_from_scope
 from ..skeleton import skeleton_session
 from ..traffic import stash_up_in
 from ..transform import TransformBusy, read_with_cap
@@ -80,15 +82,54 @@ def _finalize_sessions_response(
 
     ``etag_enabled=false`` (rep ``None``) → the exact pre-ETag response,
     byte-identical.
+
+    v3 (§4.2, Batch B): the payload is the envelope
+    ``{"items":[...],"complete":<bool>}`` — the envelope bytes are the
+    canonical ETag input (§6.3), the ``X-Complete`` header is NOT emitted
+    on either 200 or 304 (the client reads ``complete`` from the cached
+    envelope, §6.4), and the validator carries the wire-view marker so
+    v2/v3 tags never cross-match (§6.1).
     """
     complete = len(sessions) < limit
-    rep = etag_mod.response_rep_version(request.app.state.config)
+    view = wire_view_from_scope(request.scope)
+    rep = etag_mod.response_rep_version(
+        request.app.state.config, wire_view=view)
+    if view == 3:
+        payload: list[dict] | dict = sessions_envelope_payload(sessions, complete)
+        v3_headers: dict[str, str] = {}
+        if rep is None:
+            response = json_response(
+                payload, headers=v3_headers, accept_encoding=accept_encoding,
+            )
+            # §6.2 (gate C3): directory dimension unconditional.
+            response.headers["Vary"] = etag_mod.merged_vary("Accept-Encoding")
+            return response
+        identity = orjson.dumps(payload)
+        coding = "gzip" if accepts_gzip(accept_encoding) else "identity"
+        etag_value = etag_mod.compute_etag(identity, coding, rep)
+        vary = etag_mod.merged_vary("Accept-Encoding")
+        not_modified = etag_mod.conditional_304(
+            {"ETag": etag_value, "Vary": vary},
+            request.headers.get("if-none-match"),
+        )
+        if not_modified is not None:
+            return not_modified
+        response = json_response(
+            payload, headers=v3_headers, accept_encoding=accept_encoding,
+        )
+        response.headers["ETag"] = etag_value
+        response.headers["Vary"] = vary
+        return response
     if rep is None:
-        return json_response(
+        response = json_response(
             sessions,
             headers={"X-Complete": "true" if complete else "false"},
             accept_encoding=accept_encoding,
         )
+        # §6.2 (gate C3): directory dimension unconditional — Vary is
+        # cache-correctness semantics, independent of validator support.
+        response.headers["Vary"] = etag_mod.merged_vary("Accept-Encoding")
+        return response
     identity = orjson.dumps(sessions)
     coding = "gzip" if accepts_gzip(accept_encoding) else "identity"
     etag_value = etag_mod.compute_etag(identity, coding, rep)
@@ -243,12 +284,19 @@ async def sessions(
     start: int | None = Query(None, ge=0),
     search: str | None = None,
 ):
+    # v3 (§5, Batch B): a consumed ``?directory=`` was validated + stripped
+    # at dispatch — the stash replaces the (absent) query param here.
+    directory = resolve_route_directory(request.scope, directory)
     if directory is not None:
         # slimapi no longer gates directories — normalize and forward; the
         # upstream opencode decides whether it can serve the directory.
         directory = validate_directory(directory)
     params = {"limit": limit, "roots": str(roots).lower()}
-    if directory is not None:
+    if directory is not None and wire_view_from_scope(request.scope) != 3:
+        # v3 (§5.2, Batch B): a consumed directory travels upstream as the
+        # canonical ``X-Opencode-Directory`` header ONLY — the dispatch
+        # layer stripped the client's query pair, and the sidecar does not
+        # re-add it as an upstream query param.
         params["directory"] = directory
     if start is not None:
         params["start"] = start
@@ -362,10 +410,15 @@ async def sessions_status(request: Request, directory: str | None = None):
     ``X-Opencode-Directory`` header) for compatibility — upstream treats
     it as a no-op either way.
     """
+    # v3 (§5, Batch B): stash substitutes the stripped query param (see
+    # the sessions-list handler above).
+    directory = resolve_route_directory(request.scope, directory)
     if directory is not None:
         directory = validate_directory(directory)
     params: dict[str, str] = {}
-    if directory is not None:
+    if directory is not None and wire_view_from_scope(request.scope) != 3:
+        # v3 (§5.2, Batch B): canonical header only — see the sessions-list
+        # handler above.
         params["directory"] = directory
     registry = getattr(request.app.state, "raw_fetch_registry", None)
     if registry is not None and request.app.state.config.coalesce_enabled:

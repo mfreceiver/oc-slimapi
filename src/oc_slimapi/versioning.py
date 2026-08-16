@@ -9,7 +9,13 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from .gzip_util import json_response
 
 SERVER_API_VERSION = 2
-ACCEPTED_CLIENT_VERSIONS: tuple[int, int] = (2, 2)
+# v3 Batch A (2.0.0): accepted client range widens to (2, 3) — the X-Slimapi-
+# Version gate admits header=3 alongside header=2 (a client that adopted
+# sending header 3 before switching to the ?v=3 selector). The gate LOGIC is
+# unchanged (version_required / version_incompatible); only the range moves.
+# Config.validate() pins accepted_client_versions to exactly this constant —
+# widening/narrowing via env stays forbidden (P1-13 posture preserved).
+ACCEPTED_CLIENT_VERSIONS: tuple[int, int] = (2, 3)
 VERSION_HEADER = "X-Slimapi-Version"
 
 # P1-14: collapse duplicate slashes for the version-gate path decision only.

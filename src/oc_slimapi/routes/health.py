@@ -5,6 +5,7 @@ from fastapi import APIRouter, Request
 from .. import __version__
 from ..features import FEATURES
 from ..gzip_util import json_response
+from ..selector import wire_view_from_scope
 from ..traffic import stash_up_in
 from ..upstream import forward_upstream_headers, request_id_from_scope
 
@@ -13,28 +14,36 @@ router = APIRouter(prefix="/slimapi", tags=["health"])
 
 @router.get("/health")
 async def health(request: Request):
+    # v3-contract §3a (Batch A): the wire view this request runs — 3 for
+    # ?v=3 (selector) requests, 2 otherwise (absent / v=2 / legacy stacks
+    # without the selector). One variable drives slimapi_contract,
+    # server.api_version AND schema.version — a 3/2 combination is
+    # structurally impossible. accepted_client_versions / clientMin /
+    # clientMax stay config-driven (2.0.0: [2, 3]) in BOTH views.
+    view = wire_view_from_scope(request.scope)
     resp = {
         # lite-v2: expose the slim API contract revision as a top-level
-        # static field. Ocdroid dual-reads ``slimapi_contract`` during the
-        # cutover and pins its protocol behaviour (digest 6 字段 /
+        # field. Ocdroid dual-reads ``slimapi_contract`` during the cutover
+        # and pins its protocol behaviour (digest 6 字段 /
         # digest.updatedAt 严格单调 / skeleton 升序 / token stream 透传 /
         # /full/{mid} 无 304) to value 2 (ocdroid-lite-aggressive-plan §2.5).
         # Bumped ONLY on contract-breaking changes; additive wire changes
-        # (e.g. optional fields) do NOT bump this.
-        "slimapi_contract": 2,
+        # (e.g. optional fields) do NOT bump this. v3 Batch A: the value is
+        # now view-derived (v2 view → 2, v3 view → 3) per v3-contract §3a.
+        "slimapi_contract": view,
         "sidecar": {"ok": True, "version": __version__},
         "server": {
-            "api_version": request.app.state.config.server_api_version,
+            "api_version": view,
             "accepted_client_versions": list(request.app.state.config.accepted_client_versions),
         },
         "schema": {
             "degraded": request.app.state.schema_degraded,
             # v6 §4: diagnostic re-exposure of the wire-version triplet. These
-            # are *config values*, NOT a feature-discovery surface — the value
-            # now matches the v2 wire (SERVER_API_VERSION=2) but remains a
-            # diagnostic re-exposure, not a capability-negotiation mechanism.
-            # Existing ``server.*`` keys are preserved for back-compat.
-            "version": request.app.state.config.server_api_version,
+            # are *view values*, NOT a feature-discovery surface — same source
+            # as server.api_version above (v3-contract §3a: v2 view=2, v3
+            # view=3, never a 3/2 combination). Existing ``server.*`` keys are
+            # preserved for back-compat.
+            "version": view,
             "clientMin": request.app.state.config.accepted_client_versions[0],
             "clientMax": request.app.state.config.accepted_client_versions[1],
         },
@@ -70,6 +79,10 @@ async def health(request: Request):
 
 @router.get("/ready")
 async def ready(request: Request):
+    # v3-contract §3a: same dual-view rule as /health for the schema triple —
+    # NO contract field on this endpoint (shape locked). Legacy stacks
+    # without the selector always view 2.
+    view = wire_view_from_scope(request.scope)
     started = time.monotonic()
     try:
         # P0-6: forward X-Request-ID so the sidecar access log line can be
@@ -92,12 +105,12 @@ async def ready(request: Request):
     return json_response({
         "upstream": {"ok": ok, "latencyMs": round((time.monotonic() - started) * 1000)},
         "server": {
-            "api_version": request.app.state.config.server_api_version,
+            "api_version": view,
             "accepted_client_versions": list(request.app.state.config.accepted_client_versions),
         },
         "schema": {
             "degraded": request.app.state.schema_degraded,
-            "version": request.app.state.config.server_api_version,
+            "version": view,
             "clientMin": request.app.state.config.accepted_client_versions[0],
             "clientMax": request.app.state.config.accepted_client_versions[1],
         },

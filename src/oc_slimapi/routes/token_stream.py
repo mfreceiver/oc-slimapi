@@ -24,6 +24,10 @@ Stage-D scope (design-token-stream.md §5.1 / §5.5 / §5.6 / §7):
   critical: a half-event gzip flush would make the client's SSE parser see a
   truncated ``data:`` line. The control-plane ``/slimapi/events`` is NOT
   gzipped — this is the sole SSE exception (CHANGELOG note is Stage E).
+  **v3 exception-to-the-exception (v3-contract §7.2, Batch D)**: a ``?v=3``
+  stream is ALWAYS identity — no ``Content-Encoding``, no gzip deflater,
+  frames raw — regardless of ``Accept-Encoding``; gzip negotiation remains
+  a v2-only lever.
 * Lifecycle: ``subscribe`` starts the flush loop on first-attach; the
   generator's ``finally`` detaches on disconnect / client-close, and the
   last-detach stops the loop (NB-C4). Idempotent and leak-free.
@@ -39,7 +43,14 @@ from starlette.responses import StreamingResponse
 from ..directory import validate_directory
 from ..errors import CodedHTTPException
 from ..gzip_util import accepts_gzip, json_response
-from ..sse.token_hub import STOP, TokenSubscriberCapacityError, _resync_frame
+from ..selector import wire_view_from_scope
+from ..sse.token_hub import (
+    STOP,
+    TokenSubscriberCapacityError,
+    _resync_frame,
+    sse_frame,
+)
+from ..sse_observability import sse_close, sse_open
 
 router = APIRouter(prefix="/slimapi", tags=["token-stream"])
 
@@ -58,7 +69,22 @@ def _resolve_directory_conflict(request: Request, directory: str | None) -> None
     ambiguous regardless of whether the value is consumed downstream —
     slimapi refuses to guess which one to honour. Normalisation is applied
     for parity with the messages route even though the result is unused.
+
+    v3 (§5.6, Batch B): exactly ONE new pre-check — a multi-value
+    ``?directory=`` with differing (normalised) values → 400
+    ``invalid_directory_selector`` (the consuming-set-wide rule). After
+    single-valuing, everything below runs verbatim (the v2 guard is
+    inherited unchanged: query-only accepted no-op; query+header
+    normalised-different → ``directory_not_allowed``). This route is NOT
+    dispatch-consumed — the stream query keeps its ``directory`` bytes.
     """
+    if wire_view_from_scope(getattr(request, "scope", None) or {}) == 3:
+        values = [
+            value
+            for value in request.query_params.getlist("directory")
+        ]
+        if len({(value.rstrip("/") or "/") for value in values}) > 1:
+            raise CodedHTTPException(400, code="invalid_directory_selector")
     if directory is None:
         return
     header_dir = request.headers.get("x-opencode-directory")
@@ -84,7 +110,6 @@ async def token_stream(request: Request, sid: str, directory: str | None = None)
     # NB-D7: structural directory conflict guard (before admission).
     _resolve_directory_conflict(request, directory)
     registry = request.app.state.token_registry
-    use_gzip = _accepts_gzip(request)
     last_event_id = request.headers.get("last-event-id")
 
     try:
@@ -101,6 +126,17 @@ async def token_stream(request: Request, sid: str, directory: str | None = None)
         )
 
     subscriber_id = subscriber.id
+    # v3 §7.2 (Batch D): the meta first frame replaces the response-header
+    # id channel on v3 streams (see headers below), AND the frozen "SSE 流
+    # 不做 content-encoding（帧字节原样）" clause — a v3 stream is ALWAYS
+    # identity regardless of Accept-Encoding (meta/handshake/business/resync
+    # frames raw). gzip negotiation stays a v2-only lever (Lever 2).
+    # ``getattr`` — direct route-invocation tests may pass mock requests
+    # without ``.scope`` (no scope ⇒ v2 view, same defensive pattern as
+    # events.py).
+    _scope = getattr(request, "scope", None)
+    wire_v3 = _scope is not None and wire_view_from_scope(_scope) == 3
+    use_gzip = _accepts_gzip(request) and not wire_v3
     # Pull the traffic ledger here so a missing / disabled ledger does not
     # crash the SSE path on the first yield.
     traffic_ledger = getattr(request.app.state, "traffic_ledger", None)
@@ -145,6 +181,23 @@ async def token_stream(request: Request, sid: str, directory: str | None = None)
                 pass
 
         try:
+            # v3 §9.1 (Batch A): sse_open row when the stream actually
+            # starts; sse_close + same lifecycleId in the finally below.
+            # ``getattr`` — direct route-invocation tests may pass mock
+            # requests without ``.scope`` (helper then no-ops).
+            lifecycle_id = sse_open(getattr(request, "scope", None), bucket="token_stream_sse")
+            if wire_v3:
+                # v3 §7.2 (Batch D): meta FIRST — before the handshake frames
+                # subscribe() already enqueued AND the Last-Event-ID resync
+                # replay below. ``tokens`` is frozen ``true`` on /stream (a
+                # token stream always carries tokens). Rides the negotiated
+                # gzip stream like every other frame (encode → account).
+                out = encode(sse_frame(
+                    {"subscriberId": subscriber_id, "tokens": True},
+                    event="slimapi.meta",
+                ))
+                _account(out)
+                yield out
             # §5.5 step 1: Last-Event-ID (value ignored) → leading
             # reconnect_no_replay resync BEFORE server.connected. The
             # handshake (server.connected → snapshot …) was already enqueued
@@ -168,15 +221,27 @@ async def token_stream(request: Request, sid: str, directory: str | None = None)
             # Detach via the registry so total_subscribers is decremented and
             # the flush loop is stopped on last-detach (NB-C4). Idempotent.
             registry.unsubscribe(subscriber)
+            sse_close(getattr(request, "scope", None), bucket="token_stream_sse", lifecycle_id=lifecycle_id)
 
     headers = {
         "Cache-Control": "no-cache, no-transform",
         "X-Accel-Buffering": "no",
-        # Ephemeral per-connection id (mirrors /slimapi/events); not an auth
-        # identity — clients echo it in logs / support tickets.
-        "X-Slimapi-Subscriber-ID": subscriber_id,
-        "Vary": "Accept-Encoding",
     }
+    if wire_v3:
+        # v3 §7.2: frames are always identity → the representation does not
+        # depend on Accept-Encoding, so no Vary is emitted (the §6.2 Vary
+        # matrix covers the JSON routes, not SSE; minimal correctness — an
+        # AE-independent representation needs no AE variance marker, and
+        # the stream is no-cache anyway).
+        pass
+    else:
+        headers["Vary"] = "Accept-Encoding"
+        # Ephemeral per-connection id (mirrors /slimapi/events); not an auth
+        # identity — clients echo it in logs / support tickets. v3 (§7.2)
+        # does NOT produce this header — the slimapi.meta first frame's
+        # ``subscriberId`` is the id channel (§1 removes the header at
+        # 3.0.0).
+        headers["X-Slimapi-Subscriber-ID"] = subscriber_id
     if use_gzip:
         headers["Content-Encoding"] = "gzip"
 

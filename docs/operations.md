@@ -287,6 +287,7 @@ oc-slimapi 有两类日志输出，**分别处理**：
 | `OC_SLIMAPI_RAW_FETCH_CONCURRENCY` | 4 | >= 1 | 同时 in-flight 的去重上游 GET 数上限（纯网络并发限制，与内存预算解耦）。 |
 | `OC_SLIMAPI_RAW_FETCH_MAX_BYTES` | 64 MiB | > 0，与 transform 预算之和 <= 576 MiB | 去重 flight 的字节预算：每个 distinct flight 预扣整笔 `OC_SLIMAPI_MAX_RESPONSE_BYTES`（读取完成后不返还差额——保守正确性优先）。 |
 | `OC_SLIMAPI_MESSAGE_FINGERPRINT_ENABLED` | true | bool | messages skeleton 加性字段 `contentFingerprint`（`"<vN>:<sha256hex>"`）开关。`false` = 不输出该字段（逐字节等价开关关闭前行为）。**注意**：开关状态参与 ETag `REP_VERSION`——关闭/重开会轮换全部 ETag 验证器（客户端 304 全部 miss 一次，属预期）。 |
+| `OC_SLIMAPI_V3_SELECTOR_ENABLED` | true | bool | v3 版本选择器（`?v=3`）总开关。`false` = 灰度回退：`v` 参数整体忽略按 v2 管线处理（观测记 `selectorResult=absent`；`v` 剥离仍生效——回退管线是 v2 请求）。版本头门禁范围不受影响。 |
 
 > **默认容量退化说明（重要）**：默认 `RAW_FETCH_MAX_BYTES=64 MiB` × `MAX_RESPONSE_BYTES=64 MiB` → **默认配置下同时只有 1 个去重 flight**；`RAW_FETCH_CONCURRENCY=4` 在默认预算下不可达（预算先到顶）。这是刻意的保守默认（内存证明优先）。**调优指引**：期望 N 个并行去重抓取时，设 `OC_SLIMAPI_RAW_FETCH_MAX_BYTES >= N × OC_SLIMAPI_MAX_RESPONSE_BYTES`；预算满时新 key 自动降级为现行直取路径（行为正确，只是不去重）。聚合内存校验：`RAW_FETCH_MAX_BYTES + MAX_TRANSFORMS × MAX_RESPONSE_BYTES <= 576 MiB`（两项预算并发峰值之和，超限启动失败）。
 

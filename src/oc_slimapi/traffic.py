@@ -88,6 +88,45 @@ def bucketize(method: str, path: str) -> str:
         # Generic /slimapi/sessions/**.
         if path.startswith("/slimapi/sessions"):
             return "sessions"
+        # §10.a read groups (v3 Batch C1) — distinct buckets per group so
+        # annexed-read traffic stays visible in /slimapi/metrics.traffic.
+        if path == "/slimapi/file" or path.startswith("/slimapi/file/"):
+            return "file"
+        if path == "/slimapi/vcs" or path.startswith("/slimapi/vcs/"):
+            return "vcs"
+        if path == "/slimapi/find" or path.startswith("/slimapi/find/"):
+            return "find"
+        if path.startswith("/slimapi/config/"):
+            return "providers"
+        # §10.b write routes (v3 Batch C2): /slimapi/session (POST) and
+        # the write methods on /slimapi/session/{sid} (+ sub-actions) get
+        # their own bucket; the §10.a session-single GET keeps its own.
+        # Method-aware split BEFORE the generic session_single branch.
+        if path == "/slimapi/session" and method.upper() == "POST":
+            return "write_session"
+        if path.startswith("/slimapi/session/") and method.upper() != "GET":
+            # PATCH/DELETE on {sid} + prompt_async/abort/summarize/fork/
+            # revert/permissions/{pid}/command sub-actions (all POST except
+            # the PATCH/DELETE pair).
+            return "write_session"
+        if (
+            path.startswith("/slimapi/question/")
+            and method.upper() == "POST"
+            and (path.endswith("/reply") or path.endswith("/reject"))
+        ):
+            # Method-aware (C2 gate): only the actual POST write endpoints
+            # bucket as write_question — a GET on reply/reject is a FastAPI
+            # 405 (routes registered for POST only) and must not count as
+            # write traffic; it falls through to the generic buckets.
+            return "write_question"
+        # /slimapi/session/{sid} (session single — NOT the plural sessions
+        # surface above) and the two tolerant global reads.
+        if path.startswith("/slimapi/session/"):
+            return "session_single"
+        if path == "/slimapi/api/session/active":
+            return "session_active"
+        if path == "/slimapi/global/health":
+            return "global_health"
         return "other"
     # Anything else is the catch-all reverse proxy.
     return "passthrough"
@@ -176,6 +215,8 @@ class TrafficLedger:
         "_buckets",     # bucket -> {requests, downIn, downOut, upIn, upOut, errors4xx, errors5xx}
         "_sse",         # bucket -> {bytesIn, bytesOut, framesEmitted}
         "_latencies",   # bucket -> deque[float] (bounded duration_ms samples)
+        "_v3_matrix",   # flat "selectorResult|wireVersion|directoryForm|recordType|statusClass|bucket" -> count (v3 §9.2)
+        "_v3_sse",      # sseActive dim -> {opens, closes, active, orphanCloses} (v3 §9.2)
     )
 
     def __init__(self, *, enabled: bool = True) -> None:
@@ -184,6 +225,8 @@ class TrafficLedger:
         self._buckets: dict[str, dict[str, int]] = {}
         self._sse: dict[str, dict[str, int]] = {}
         self._latencies: dict[str, deque] = {}
+        self._v3_matrix: dict[str, int] = {}
+        self._v3_sse: dict[str, dict[str, int]] = {}
 
     @property
     def enabled(self) -> bool:
@@ -308,6 +351,70 @@ class TrafficLedger:
     def _new_sse() -> dict[str, int]:
         return {"bytesIn": 0, "bytesOut": 0, "framesEmitted": 0}
 
+    # ---- v3 observability (v3-contract §9.2, Batch A) ----
+
+    @staticmethod
+    def _v3_status_class(status: int | None) -> str:
+        if isinstance(status, bool) or not isinstance(status, int):
+            return "none"
+        return f"{status // 100}xx"
+
+    def record_selector_request(
+        self,
+        *,
+        bucket: str,
+        status: int | None,
+        selector_result: str | None = None,
+        wire_version: str | None = None,
+        directory_form: str | None = None,
+        record_type: str = "request",
+    ) -> None:
+        """Count one access row into the §9.2 aggregation matrix.
+
+        Key = ``selectorResult|wireVersion|directoryForm|recordType|
+        statusClass|bucket`` with ``null`` placeholders for absent dims.
+        Cumulative since boot (the cross-day series is derived at analysis
+        time from the access log via
+        :func:`oc_slimapi.traffic_snapshot.aggregate_v3_observability`).
+        """
+        if not self._enabled:
+            return
+        key = "|".join((
+            selector_result or "null",
+            wire_version or "null",
+            directory_form or "null",
+            record_type,
+            self._v3_status_class(status),
+            bucket,
+        ))
+        with self._lock:
+            self._v3_matrix[key] = self._v3_matrix.get(key, 0) + 1
+
+    def record_sse_lifecycle(self, *, result: str, opened: bool) -> None:
+        """Count one SSE open/close for the per-dim sseActive stock.
+
+        ``result`` is the §9.2 dim (v2|v3|absent|not_applicable — the caller
+        normalizes; rejected/exempt have no SSE endpoints). ``active`` is the
+        live stock; a close with no tracked open (restart loss / window-start
+        carry) clamps at zero and counts in ``orphanCloses`` — never negative.
+        """
+        if not self._enabled:
+            return
+        with self._lock:
+            entry = self._v3_sse.setdefault(
+                result, {"opens": 0, "closes": 0, "active": 0, "orphanCloses": 0}
+            )
+            if opened:
+                entry["opens"] += 1
+                entry["active"] += 1
+            else:
+                entry["closes"] += 1
+                if entry["active"] > 0:
+                    entry["active"] -= 1
+                else:
+                    entry["orphanCloses"] += 1
+
+
     # ---- snapshot for /slimapi/metrics ----
 
     def snapshot(self) -> dict:
@@ -419,4 +526,17 @@ class TrafficLedger:
                 "buckets": out_buckets,
                 "totals": totals,
                 "ratios": ratios,
+                # v3 Batch A (§9.2): additive observability section —
+                # cumulative matrix counters + live SSE stock per dim since
+                # boot. The per-day series (window-start carry) is analysis
+                # time over the daily access logs.
+                "v3": {
+                    "matrix": dict(self._v3_matrix),
+                    "sseLifecycle": {
+                        dim: dict(entry) for dim, entry in self._v3_sse.items()
+                    },
+                    "sseActive": {
+                        dim: entry["active"] for dim, entry in self._v3_sse.items()
+                    },
+                },
             }
