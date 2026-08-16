@@ -38,7 +38,6 @@ from oc_slimapi.skeleton import (
 from oc_slimapi.sse.global_hub import GlobalHub
 from oc_slimapi.sse.registry import HubRegistry
 from oc_slimapi.transform import TransformConfig, TransformPool
-from oc_slimapi.versioning import SlimapiVersionMiddleware
 
 # ---------------------------------------------------------------------------
 # Fixtures (mirror tests/test_etag.py upstream mocks)
@@ -95,8 +94,6 @@ def _settings(**overrides) -> Settings:
         transform_wait_seconds=0.5,
         max_response_bytes=64 * 1024,
         smoke_session_id=None,
-        server_api_version=2,
-        accepted_client_versions=(2, 2),
         coalesce_enabled=False,
     )
     base.update(overrides)
@@ -105,10 +102,6 @@ def _settings(**overrides) -> Settings:
 
 def _build_app(settings: Settings, upstream: httpx.AsyncClient) -> FastAPI:
     app = FastAPI(title="oc-slimapi-test")
-    app.add_middleware(
-        SlimapiVersionMiddleware,
-        accepted_client_versions=settings.accepted_client_versions,
-    )
     app.state.config = settings
     app.state.upstream = upstream
     app.state.transforms = TransformPool(TransformConfig(

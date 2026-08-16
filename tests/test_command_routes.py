@@ -20,7 +20,6 @@ from oc_slimapi.proxy import install_proxy
 from oc_slimapi.routes import command, health, sessions
 from oc_slimapi.sse.hub import HubRegistry
 from oc_slimapi.transform import TransformConfig, TransformPool
-from oc_slimapi.versioning import SlimapiVersionMiddleware
 
 VERSION_HEADERS = {"X-Slimapi-Version": "2"}
 
@@ -35,8 +34,6 @@ def _settings(**overrides) -> Settings:
         transform_wait_seconds=0.5,
         max_response_bytes=64 * 1024,
         smoke_session_id=None,
-        server_api_version=2,
-        accepted_client_versions=(2, 2),
     )
     base.update(overrides)
     return Settings(**base)
@@ -45,10 +42,6 @@ def _settings(**overrides) -> Settings:
 def _build_app(settings: Settings, upstream: httpx.AsyncClient) -> FastAPI:
     """Construct a fresh FastAPI app with command router wired up."""
     app = FastAPI(title="oc-slimapi-test")
-    app.add_middleware(
-        SlimapiVersionMiddleware,
-        accepted_client_versions=settings.accepted_client_versions,
-    )
     app.state.config = settings
     app.state.upstream = upstream
     app.state.transforms = TransformPool(TransformConfig(
@@ -600,8 +593,9 @@ async def test_transform_busy(upstream_factory):
 # ---------------------------------------------------------------------------
 
 
-async def test_version_gating(upstream_factory):
-    """No X-Slimapi-Version header → 400 version_required."""
+async def test_retired_version_header_ignored_at_route_level(upstream_factory):
+    """§1 terminal: X-Slimapi-Version is dead input (selector owns
+    admission); the route answers regardless of its value."""
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=b"[]")
 
@@ -610,8 +604,8 @@ async def test_version_gating(upstream_factory):
     transport = httpx.ASGITransport(app)
     try:
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            response = await client.get("/slimapi/command")
-        assert response.status_code == 400
-        assert response.json()["code"] == "version_required"
+            response = await client.get("/slimapi/command",
+                                        headers={"X-Slimapi-Version": "9"})
+        assert response.status_code == 200
     finally:
         app.state.transforms.shutdown()

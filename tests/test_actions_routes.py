@@ -36,7 +36,6 @@ from oc_slimapi.config import Settings
 from oc_slimapi.errors import register_error_handlers
 from oc_slimapi.proxy import install_proxy
 from oc_slimapi.routes import actions
-from oc_slimapi.versioning import SlimapiVersionMiddleware
 
 # Wire version 2 is the current contract revision; the middleware accepts
 # exactly [2, 2].
@@ -53,8 +52,6 @@ def _settings(**overrides) -> Settings:
         transform_wait_seconds=0.5,
         max_response_bytes=64 * 1024,
         smoke_session_id=None,
-        server_api_version=2,
-        accepted_client_versions=(2, 2),
     )
     base.update(overrides)
     return Settings(**base)
@@ -76,10 +73,6 @@ def _build_app(registry: ActionRegistry) -> FastAPI:
     ``app.state.actions_registry`` pre-populated, mirroring the real wiring
     (version gate + router + catch-all + coded error handler)."""
     app = FastAPI(title="oc-slimapi-test")
-    app.add_middleware(
-        SlimapiVersionMiddleware,
-        accepted_client_versions=(2, 2),
-    )
     app.state.config = _settings()
     app.state.actions_registry = registry
     app.state.upstream = _ExplodingUpstream()
@@ -561,15 +554,16 @@ async def test_post_body_single_huge_chunk_413():
 # ---------------------------------------------------------------------------
 
 
-async def test_version_gate_missing_header_400():
+async def test_retired_version_header_ignored_at_route_level():
+    """§1 terminal: the X-Slimapi-Version header is dead input — the route
+    (selector owns admission) neither requires nor interprets it."""
     reg = ActionRegistry(enabled=True, actions={"run": _spec("run")}, max_concurrent=4)
     client, _ = await _client(reg)
     async with client:
-        response = await client.get("/slimapi/actions")  # no version header
-    assert response.status_code == 400
-    body = response.json()
-    assert body["code"] == "version_required"
-    assert body["accepted"] == [2, 2]
+        response = await client.get("/slimapi/actions",
+                                    headers={"X-Slimapi-Version": "garbage"})
+    assert response.status_code == 200
+    assert "actions" in response.json()
 
 
 async def test_gzip_negotiation_on_coded_error():

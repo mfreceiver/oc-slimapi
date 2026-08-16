@@ -1,4 +1,4 @@
-"""v3-contract §3 — GET /slimapi/versions discovery endpoint (Batch A)."""
+"""v3-contract §3 — GET /slimapi/versions discovery endpoint (terminal)."""
 from __future__ import annotations
 
 import httpx
@@ -13,11 +13,7 @@ from oc_slimapi.selector import SlimapiSelectorMiddleware
 
 def _build_app() -> FastAPI:
     app = FastAPI(title="versions-test")
-    app.add_middleware(
-        SlimapiSelectorMiddleware,
-        accepted_client_versions=(2, 3),
-        v3_enabled=True,
-    )
+    app.add_middleware(SlimapiSelectorMiddleware)
     app.include_router(versions.router)
     register_error_handlers(app)
     return app
@@ -37,7 +33,7 @@ async def test_versions_shape_exact():
             "current", "available", "capabilities", "sidecarVersion",
         ]
         assert body["current"] == 3
-        assert body["available"] == [2, 3]
+        assert body["available"] == [3]
         # current ∈ available; available unique ascending
         assert body["current"] in body["available"]
         assert body["available"] == sorted(set(body["available"]))
@@ -47,12 +43,7 @@ async def test_versions_capabilities_map():
     async with _client(_build_app()) as client:
         body = (await client.get("/slimapi/versions")).json()
         caps = body["capabilities"]
-        assert set(caps.keys()) == {"2", "3"}
-        assert caps["2"] == {
-            "etag": True,
-            "contentFingerprint": True,
-            "thinRoutes": ["todo", "children", "diff"],
-        }
+        assert set(caps.keys()) == {"3"}
         assert caps["3"]["envelope"] == ["messages", "sessions"]
         assert caps["3"]["directoryQuery"] is True
         assert caps["3"]["versionHeaderOptional"] is True
@@ -105,4 +96,4 @@ async def test_versions_unknown_fields_tolerated_by_consumer():
     async with _client(_build_app()) as client:
         body = (await client.get("/slimapi/versions")).json()
         assert body["current"] == 3
-        assert body["available"] == [2, 3]
+        assert body["available"] == [3]

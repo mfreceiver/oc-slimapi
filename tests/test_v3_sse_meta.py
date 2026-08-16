@@ -30,6 +30,7 @@ import logging
 from types import SimpleNamespace
 
 import httpx
+import orjson
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport
@@ -135,8 +136,6 @@ def _settings(**overrides) -> Settings:
         transform_wait_seconds=0.5,
         max_response_bytes=64 * 1024,
         smoke_session_id=None,
-        server_api_version=2,
-        accepted_client_versions=(2, 3),
     )
     base.update(overrides)
     return Settings(**base)
@@ -146,11 +145,7 @@ def _build_app(
     *, hubs: _FakeHubs | None = None, token_registry=None,
 ) -> FastAPI:
     app = FastAPI(title="v3-sse-meta-test")
-    app.add_middleware(
-        SlimapiSelectorMiddleware,
-        accepted_client_versions=(2, 3),
-        v3_enabled=True,
-    )
+    app.add_middleware(SlimapiSelectorMiddleware)
     app.state.config = _settings()
     app.state.schema_degraded = False
     app.state.deployment_revision = None
@@ -273,37 +268,34 @@ async def test_v3_events_response_has_no_subscriber_id_header():
 
 
 # ---------------------------------------------------------------------------
-# /events v2 regression (byte shape unchanged)
+# /events retired v2 forms (terminal §2 — reject before the stream opens)
 # ---------------------------------------------------------------------------
 
-async def test_v2_events_no_meta_and_header_kept():
+async def test_v2_events_form_rejected_before_stream():
     hubs = _FakeHubs()
     _put_business_frame(hubs.sub)
     app = _build_app(hubs=hubs)
     response, body = await _read_stream(
         app, "/slimapi/events", headers=V2_HEADER,
     )
-    assert response.status_code == 200
-    frames = list(_frames(body))
-    # no meta anywhere; first frame is the business frame (v2 bytes)
-    assert all(event != "slimapi.meta" for event, _ in frames)
-    assert frames[0] == ("server.heartbeat", {"sessionID": SID})
-    assert response.headers.get("x-slimapi-subscriber-id") == "sub_test"
+    assert response.status_code == 400
+    assert orjson.loads(body) == {
+        "code": "unsupported_version", "supported": [3]}
+    assert "text/event-stream" not in response.headers.get(
+        "content-type", "")
+    assert "x-slimapi-subscriber-id" not in response.headers
 
 
-async def test_v2_events_resync_first_without_meta():
+async def test_v2_events_explicit_selector_rejected():
     hubs = _FakeHubs()
     hubs.sub.queue.put_nowait(HUB_STOP)
     app = _build_app(hubs=hubs)
     response, body = await _read_stream(
-        app, "/slimapi/events",
+        app, "/slimapi/events?v=2",
         headers={**V2_HEADER, "Last-Event-ID": "anything"},
     )
-    assert response.status_code == 200
-    frames = list(_frames(body))
-    assert frames[0] == ("resync", {"reason": "reconnect_no_replay"})
-    assert all(event != "slimapi.meta" for event, _ in frames)
-    assert response.headers.get("x-slimapi-subscriber-id") == "sub_test"
+    assert response.status_code == 400
+    assert orjson.loads(body)["code"] == "unsupported_version"
 
 
 # ---------------------------------------------------------------------------
@@ -379,32 +371,33 @@ async def test_v3_stream_identity_despite_gzip_accept():
 # /stream v2 regression
 # ---------------------------------------------------------------------------
 
-async def test_v2_stream_no_meta_header_kept_handshake_first():
+async def test_v2_stream_form_rejected_before_stream():
+    """Terminal §2/§7: the retired v2 form never opens the token stream —
+    a complete JSON 400 precedes any SSE bytes and the subscriber header
+    is never produced."""
     registry = _FakeTokenRegistry()
     _put_handshake(registry.sub)
     app = _build_app(token_registry=registry)
     response, body = await _read_stream(
         app, f"/slimapi/sessions/{SID}/stream", headers=V2_HEADER,
     )
-    assert response.status_code == 200
-    frames = list(_frames(body))
-    assert all(event != "slimapi.meta" for event, _ in frames)
-    assert frames[0] == ("server.connected", {"sessionID": SID})
-    assert response.headers.get("x-slimapi-subscriber-id") == "tok_test"
+    assert response.status_code == 400
+    assert orjson.loads(body) == {
+        "code": "unsupported_version", "supported": [3]}
+    assert "text/event-stream" not in response.headers.get(
+        "content-type", "")
+    assert "x-slimapi-subscriber-id" not in response.headers
 
 
-async def test_v2_explicit_selector_stream_no_meta():
-    """Explicit ``?v=2`` (+ version header, gate applies) — v2 bytes."""
+async def test_v2_explicit_selector_stream_rejected():
     registry = _FakeTokenRegistry()
     _put_handshake(registry.sub)
     app = _build_app(token_registry=registry)
     response, body = await _read_stream(
         app, f"/slimapi/sessions/{SID}/stream?v=2", headers=V2_HEADER,
     )
-    assert response.status_code == 200
-    frames = list(_frames(body))
-    assert all(event != "slimapi.meta" for event, _ in frames)
-    assert response.headers.get("x-slimapi-subscriber-id") == "tok_test"
+    assert response.status_code == 400
+    assert orjson.loads(body)["code"] == "unsupported_version"
 
 
 # ---------------------------------------------------------------------------
@@ -461,71 +454,11 @@ async def test_v3_stream_close_after_meta_pairs_lifecycle(capture_logger, monkey
 
 
 # ---------------------------------------------------------------------------
-# D3 — v2 byte-exact regressions (full frame byte sequences)
+# D3 — byte-exact regressions were v2-only; deleted at the 3.0.0 terminal
+# (the v2 SSE byte shape no longer exists — the meta frame is unconditional
+# and the stream is always identity-coded). v3 meta/ordering/identity are
+# covered by the v3 sections above.
 # ---------------------------------------------------------------------------
-
-_V2_STREAM_EXPECTED = (
-    b'event: server.connected\n'
-    b'data: {"sessionID":"s1"}\n\n'
-)
-_V2_EVENTS_EXPECTED = (
-    b'event: server.heartbeat\n'
-    b'data: {"sessionID":"s1"}\n\n'
-)
-
-
-async def test_v2_stream_identity_bytes_exact():
-    """D3: v2 /stream (no AE) — the FULL body equals the fixed expected
-    frame bytes (no meta anywhere; handshake first)."""
-    registry = _FakeTokenRegistry()
-    _put_handshake(registry.sub)
-    app = _build_app(token_registry=registry)
-    response, body = await _read_stream(
-        app, f"/slimapi/sessions/{SID}/stream",
-        headers={**V2_HEADER, "Accept-Encoding": "identity"},
-    )
-    assert response.status_code == 200
-    assert "content-encoding" not in response.headers
-    assert response.headers.get("x-slimapi-subscriber-id") == "tok_test"
-    assert body == _V2_STREAM_EXPECTED
-
-
-async def test_v2_stream_gzip_negotiation_bytes_exact():
-    """D3: v2 /stream gzip negotiation unchanged — Content-Encoding: gzip +
-    Vary, and the decompressed full frame byte sequence equals the fixed
-    expected bytes (Lever-2 v2 behaviour is frozen)."""
-    import zlib
-
-    registry = _FakeTokenRegistry()
-    _put_handshake(registry.sub)
-    app = _build_app(token_registry=registry)
-    response, body = await _read_stream(
-        app, f"/slimapi/sessions/{SID}/stream",
-        headers={**V2_HEADER, "Accept-Encoding": "gzip"},
-    )
-    assert response.status_code == 200
-    assert response.headers.get("content-encoding") == "gzip"
-    assert response.headers.get("vary") == "Accept-Encoding"
-    assert response.headers.get("x-slimapi-subscriber-id") == "tok_test"
-    # httpx transparently decompresses `body`; to prove the WIRE bytes were
-    # gzip we re-request raw... simpler: decompress is identity here, so
-    # assert the (already-decompressed) full sequence byte-exactly — the
-    # Content-Encoding header above proves the gzip negotiation happened.
-    assert body == _V2_STREAM_EXPECTED
-
-
-async def test_v2_events_identity_bytes_exact():
-    """D3: v2 /events — full body equals the fixed expected frame bytes
-    (control-plane events were never gzipped; unchanged)."""
-    hubs = _FakeHubs()
-    _put_business_frame(hubs.sub)
-    app = _build_app(hubs=hubs)
-    response, body = await _read_stream(
-        app, "/slimapi/events", headers=V2_HEADER,
-    )
-    assert response.status_code == 200
-    assert "content-encoding" not in response.headers
-    assert body == _V2_EVENTS_EXPECTED
 
 
 # ---------------------------------------------------------------------------

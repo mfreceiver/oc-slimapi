@@ -58,7 +58,6 @@ def _settings(**overrides) -> Settings:
         max_message_bytes=32 * 1024 * 1024,
         max_transforms=1, transform_wait_seconds=0.5,
         max_response_bytes=64 * 1024, smoke_session_id=None,
-        server_api_version=2, accepted_client_versions=(2, 3),
     )
     base.update(overrides)
     return Settings(**base)
@@ -116,10 +115,7 @@ def _build_app(handler, *, settings: Settings | None = None):
     ):
         app.include_router(router)
     register_error_handlers(app)
-    app.add_middleware(
-        SlimapiSelectorMiddleware,
-        accepted_client_versions=(2, 3),
-    )
+    app.add_middleware(SlimapiSelectorMiddleware)
     return app, seen
 
 
@@ -174,30 +170,32 @@ async def test_agent_matrix_query_only_consumed_and_forwarded(stack):
         await client.aclose()
 
 
-async def test_agent_matrix_header_only_consumed_and_forwarded(stack):
-    """§5.2: v3 consumes the compatible header even without a query."""
+async def test_agent_matrix_header_only_retired(stack):
+    """Terminal §5.7: the header-only channel is retired — ``?directory=``
+    is the sole canonical form on consuming routes."""
     client, seen = await stack()
     try:
         response = await client.get(
             "/slimapi/agent?v=3",
             headers={**IDENTITY, DIRECTORY_HEADER: "/w"})
-        assert response.status_code == 200
-        upstream = _last_upstream(seen)
-        assert upstream.headers.get(DIRECTORY_HEADER) == "/w"
+        assert response.status_code == 400
+        assert orjson.loads(response.content)["code"] == "directory_header_retired"
+        assert not seen
     finally:
         await client.aclose()
 
 
-async def test_agent_matrix_dual_same_normalized_ok(stack):
-    """Trailing-slash header normalizes equal to the query → accepted."""
+async def test_agent_matrix_dual_same_normalized_retired(stack):
+    """Terminal §5.7: a normalized-equal dual presence is still rejected —
+    the conflict check (§5.4) runs first, then the retired-header rule."""
     client, seen = await stack()
     try:
         response = await client.get(
             "/slimapi/agent?v=3&directory=/w",
             headers={**IDENTITY, DIRECTORY_HEADER: "/w/"})
-        assert response.status_code == 200
-        upstream = _last_upstream(seen)
-        assert upstream.headers.get(DIRECTORY_HEADER) == "/w"
+        assert response.status_code == 400
+        assert orjson.loads(response.content)["code"] == "directory_header_retired"
+        assert not seen
     finally:
         await client.aclose()
 
@@ -326,44 +324,43 @@ async def test_diff_forwards_messageid_without_directory(stack):
 # v2 regression — directory semantics unchanged
 # ---------------------------------------------------------------------------
 
-async def test_v2_agent_directory_query_still_forwarded_as_header(stack):
+async def test_v2_agent_directory_query_form_unsupported(stack):
     client, seen = await stack()
     try:
         response = await client.get(
             "/slimapi/agent?directory=/w", headers=V2_HEADERS)
-        assert response.status_code == 200
-        upstream = _last_upstream(seen)
-        assert upstream.headers.get(DIRECTORY_HEADER) == "/w"
+        assert response.status_code == 400
+        assert orjson.loads(response.content)["code"] == "unsupported_version"
+        assert not seen
     finally:
         await client.aclose()
 
 
-async def test_v2_agent_header_only_not_forwarded(stack):
-    """v2 routes never forwarded a bare client header — must stay that way
-    (the v3 header-consumption must not leak into v2 semantics)."""
+async def test_v2_agent_header_only_unsupported(stack):
+    """Terminal: the selector error (②) outranks the retired-header rule
+    (③) — the v2 form is rejected before the header is even examined."""
     client, seen = await stack()
     try:
         response = await client.get(
             "/slimapi/agent",
             headers={**V2_HEADERS, DIRECTORY_HEADER: "/w"})
-        assert response.status_code == 200
-        upstream = _last_upstream(seen)
-        assert upstream.headers.get(DIRECTORY_HEADER) is None
+        assert response.status_code == 400
+        assert orjson.loads(response.content)["code"] == "unsupported_version"
+        assert not seen
     finally:
         await client.aclose()
 
 
-async def test_v2_sessions_still_sends_directory_query_upstream(stack):
-    """v2 sessions re-adds ``?directory=`` upstream — frozen v2 wire
-    behavior that the v3 header-only canonicalization must not touch."""
+async def test_v2_sessions_form_unsupported(stack):
+    """Terminal: the frozen v2 sessions re-add behavior is gone with the
+    v2 pipeline itself — the form is rejected at the selector."""
     client, seen = await stack()
     try:
         response = await client.get(
             "/slimapi/sessions?directory=/w", headers=V2_HEADERS)
-        assert response.status_code == 200
-        upstream = _last_upstream(seen)
-        assert upstream.url.params.get("directory") == "/w"
-        assert upstream.headers.get(DIRECTORY_HEADER) == "/w"
+        assert response.status_code == 400
+        assert orjson.loads(response.content)["code"] == "unsupported_version"
+        assert not seen
     finally:
         await client.aclose()
 
@@ -464,7 +461,7 @@ async def test_stream_selector_precheck_rejects_multi_different():
 
     capture = _Capture()
     middleware = SlimapiSelectorMiddleware(
-        capture, accepted_client_versions=(2, 3))
+        capture)
     scope = {
         "type": "http", "http_version": "1.1", "method": "GET",
         "path": "/slimapi/sessions/s1/stream",
@@ -513,7 +510,7 @@ async def test_stream_selector_single_value_not_consumed():
 
     capture = _Capture()
     middleware = SlimapiSelectorMiddleware(
-        capture, accepted_client_versions=(2, 3))
+        capture)
     scope = {
         "type": "http", "http_version": "1.1", "method": "GET",
         "path": "/slimapi/sessions/s1/stream",
@@ -592,7 +589,7 @@ async def test_selector_never_consumes_tolerant_paths():
     ):
         sink = _Sink()
         middleware = SlimapiSelectorMiddleware(
-            sink, accepted_client_versions=(2, 3))
+            sink)
         scope = {
             "type": "http", "http_version": "1.1", "method": "GET",
             "path": path, "raw_path": path.encode(),
@@ -640,19 +637,23 @@ async def test_directory_form_observable_values_v3(stack):
                 await send({"type": "http.response.body", "body": b"[]"})
 
         # Drive the selector directly for each form and read the stash.
+        # Terminal §5.7: the header channel is retired — the header/both
+        # forms are rejected (400) but their directoryForm is still stashed
+        # (the form is computed before the rejection); query/absent proceed.
         cases = [
-            ("query", b"v=3&directory=/w", None),
-            ("header", b"v=3", "/w"),
-            ("both", b"v=3&directory=/w", "/w"),
-            ("absent", b"v=3", None),
+            ("query", 200, b"v=3&directory=/w", None),
+            ("header", 400, b"v=3", "/w"),
+            ("both", 400, b"v=3&directory=/w", "/w"),
+            ("absent", 200, b"v=3", None),
         ]
-        for expected, query, header in cases:
+        for expected, expected_status, query, header in cases:
             probe = _Probe()
             middleware = SlimapiSelectorMiddleware(
-                probe, accepted_client_versions=(2, 3))
+                probe)
             headers: list[tuple[bytes, bytes]] = []
             if header is not None:
                 headers.append((b"x-opencode-directory", header.encode()))
+            status_holder: list[int] = []
             scope = {
                 "type": "http", "http_version": "1.1", "method": "GET",
                 "path": "/slimapi/agent", "raw_path": b"/slimapi/agent",
@@ -666,11 +667,12 @@ async def test_directory_form_observable_values_v3(stack):
                         "more_body": False}
 
             async def send(message: dict) -> None:
-                pass
+                if message["type"] == "http.response.start":
+                    status_holder.append(message["status"])
 
             await middleware(scope, receive, send)
-            assert probe.scope is not None
-            forms[expected] = probe.scope["state"].get(DIRECTORY_FORM_STATE_KEY)
+            assert status_holder == [expected_status]
+            forms[expected] = scope["state"].get(DIRECTORY_FORM_STATE_KEY)
 
         assert forms["query"] == "query"
         assert forms["header"] == "header"
@@ -697,7 +699,7 @@ async def test_directory_form_null_on_tolerant_route(stack):
                 await send({"type": "http.response.body", "body": b"{}"})
 
         middleware = SlimapiSelectorMiddleware(
-            _Probe(), accepted_client_versions=(2, 3))
+            _Probe())
         scope = {
             "type": "http", "http_version": "1.1", "method": "GET",
             "path": "/slimapi/health", "raw_path": b"/slimapi/health",

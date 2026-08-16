@@ -50,7 +50,6 @@ from oc_slimapi.routes import messages, metrics
 from oc_slimapi.sse.hub import HubRegistry
 from oc_slimapi.traffic import TrafficLedger
 from oc_slimapi.transform import TransformConfig, TransformPool
-from oc_slimapi.versioning import SlimapiVersionMiddleware
 
 VERSION_HEADERS = {"X-Slimapi-Version": "1"}
 
@@ -103,10 +102,6 @@ def _build_app_with_traffic(
     app = FastAPI(title="oc-slimapi-traffic-test")
     # Version gate added FIRST = innermost. Traffic middleware added LAST =
     # outermost (see docstring).
-    app.add_middleware(
-        SlimapiVersionMiddleware,
-        accepted_client_versions=settings.accepted_client_versions,
-    )
     app.state.config = settings
     app.state.upstream = upstream
     app.state.transforms = TransformPool(TransformConfig(

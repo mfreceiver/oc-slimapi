@@ -37,7 +37,6 @@ def _settings(**overrides) -> Settings:
         max_message_bytes=32 * 1024 * 1024,
         max_transforms=1, transform_wait_seconds=0.5,
         max_response_bytes=64 * 1024, smoke_session_id=None,
-        server_api_version=2, accepted_client_versions=(2, 3),
     )
     base.update(overrides)
     return Settings(**base)
@@ -74,10 +73,7 @@ def _build_app(handler) -> FastAPI:
     app.include_router(messages.router)
     app.include_router(sessions.router)
     register_error_handlers(app)
-    app.add_middleware(
-        SlimapiSelectorMiddleware,
-        accepted_client_versions=(2, 3),
-    )
+    app.add_middleware(SlimapiSelectorMiddleware)
     return app
 
 
@@ -110,28 +106,31 @@ def test_representation_version_wire_marker_unit():
     assert representation_version(settings) == v2_rep
 
 
-async def test_v2_etag_does_not_304_a_v3_request(client_factory):
-    """§6.1 integration: a v2-issued validator re-sent on a v3 request
-    must NOT 304 — the envelope body is a different representation."""
+async def test_retired_v2_request_never_issues_validator(client_factory):
+    """Terminal: a v2 request is rejected — it can neither issue nor
+    present a validator; only the v3 envelope domain remains."""
     client = await client_factory(lambda req: httpx.Response(
         200, content=_message_payload(),
         headers={"Content-Type": "application/json"}))
     try:
         v2 = await client.get("/slimapi/messages/s1", headers=V2_HEADERS)
-        assert v2.status_code == 200
-        v2_etag = v2.headers["ETag"]
+        assert v2.status_code == 400
+        assert "etag" not in v2.headers
         v3 = await client.get(
+            "/slimapi/messages/s1?v=3", headers=IDENTITY)
+        assert v3.status_code == 200
+        reval = await client.get(
             "/slimapi/messages/s1?v=3",
-            headers={**IDENTITY, "If-None-Match": v2_etag},
+            headers={**IDENTITY, "If-None-Match": v3.headers["ETag"]},
         )
-        assert v3.status_code == 200  # cross-view → never 304
-        assert v3.headers["ETag"] != v2_etag
+        assert reval.status_code == 304
     finally:
         await client.aclose()
 
 
-async def test_v3_etag_does_not_304_a_v2_request(client_factory):
-    """§6.1 reverse direction: a v3-issued validator on a v2 request → 200."""
+async def test_v3_validator_on_retired_v2_form_rejected(client_factory):
+    """Terminal: a v3 validator presented on the retired v2 form is
+    rejected before any ETag judgement."""
     client = await client_factory(lambda req: httpx.Response(
         200, content=_message_payload(),
         headers={"Content-Type": "application/json"}))
@@ -142,8 +141,8 @@ async def test_v3_etag_does_not_304_a_v2_request(client_factory):
             "/slimapi/messages/s1",
             headers={**V2_HEADERS, "If-None-Match": v3_etag},
         )
-        assert v2.status_code == 200
-        assert v2.headers["ETag"] != v3_etag
+        assert v2.status_code == 400
+        assert orjson.loads(v2.content)["code"] == "unsupported_version"
     finally:
         await client.aclose()
 

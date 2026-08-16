@@ -54,7 +54,6 @@ def _settings(**overrides) -> Settings:
         max_message_bytes=32 * 1024 * 1024,
         max_transforms=1, transform_wait_seconds=0.5,
         max_response_bytes=64 * 1024, smoke_session_id=None,
-        server_api_version=2, accepted_client_versions=(2, 3),
     )
     base.update(overrides)
     return Settings(**base)
@@ -120,10 +119,7 @@ def _build_app(*, settings: Settings, cache: CatalogCache | None = None,
     ):
         app.include_router(router)
     register_error_handlers(app)
-    app.add_middleware(
-        SlimapiSelectorMiddleware,
-        accepted_client_versions=(2, 3),
-    )
+    app.add_middleware(SlimapiSelectorMiddleware)
     return app
 
 
@@ -159,13 +155,15 @@ def _has_directory_dimension(response: httpx.Response) -> bool:
 # B1 — /full/{mid} Vary (unconditional; both wire views)
 # ---------------------------------------------------------------------------
 
-async def test_full_message_vary_double_v2(stack):
+async def test_full_message_vary_v2_form_rejected(stack):
+    """Terminal §2: the v2 form (header only) is retired — 400 before any
+    Vary semantics apply."""
     client = await stack()
     try:
         response = await client.get(
             "/slimapi/messages/s1/full/m1", headers=V2_HEADERS)
-        assert response.status_code == 200
-        assert _vary(response) == DOUBLE_VARY
+        assert response.status_code == 400
+        assert response.json()["code"] == "unsupported_version"
     finally:
         await client.aclose()
 
@@ -209,33 +207,29 @@ async def test_full_message_vary_double_with_directory_forwarded(stack):
 #       Vary dimension unconditionally
 # ---------------------------------------------------------------------------
 
-async def test_messages_list_etag_off_vary_double_both_views(stack):
+async def test_messages_list_etag_off_vary_double_v3(stack):
     client = await stack(settings=_settings(etag_enabled=False))
     try:
         v2 = await client.get("/slimapi/messages/s1", headers=V2_HEADERS)
         v3 = await client.get("/slimapi/messages/s1?v=3", headers=IDENTITY)
-        assert v2.status_code == v3.status_code == 200
-        assert _vary(v2) == DOUBLE_VARY
+        assert v2.status_code == 400  # terminal: v2 form retired
+        assert v3.status_code == 200
         assert _vary(v3) == DOUBLE_VARY
         # ETag really is off (this is the degradation under repair).
-        assert "ETag" not in v2.headers
         assert "ETag" not in v3.headers
     finally:
         await client.aclose()
 
 
-async def test_sessions_list_etag_off_vary_double_both_views(stack):
+async def test_sessions_list_etag_off_vary_double_v3(stack):
     client = await stack(settings=_settings(etag_enabled=False))
     try:
         v2 = await client.get("/slimapi/sessions", headers=V2_HEADERS)
         v3 = await client.get("/slimapi/sessions?v=3", headers=IDENTITY)
-        assert v2.status_code == v3.status_code == 200
-        assert _vary(v2) == DOUBLE_VARY
+        assert v2.status_code == 400  # terminal: v2 form retired
+        assert v3.status_code == 200
         assert _vary(v3) == DOUBLE_VARY
-        assert "ETag" not in v2.headers
         assert "ETag" not in v3.headers
-        # v2 pagination header untouched by the Vary fix
-        assert v2.headers["X-Complete"] == "true"
     finally:
         await client.aclose()
 

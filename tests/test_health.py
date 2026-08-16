@@ -21,7 +21,6 @@ from fastapi import FastAPI
 from oc_slimapi.config import Settings
 from oc_slimapi.errors import register_error_handlers
 from oc_slimapi.routes import health
-from oc_slimapi.versioning import SlimapiVersionMiddleware
 
 VERSION_HEADERS = {"X-Slimapi-Version": "2"}
 
@@ -36,8 +35,6 @@ def _settings(**overrides) -> Settings:
         transform_wait_seconds=0.5,
         max_response_bytes=64 * 1024,
         smoke_session_id=None,
-        server_api_version=2,
-        accepted_client_versions=(2, 2),
     )
     base.update(overrides)
     return Settings(**base)
@@ -48,10 +45,6 @@ def _build_app(settings: Settings, upstream: httpx.AsyncClient) -> FastAPI:
     pre-populating ``app.state`` the same way ``oc_slimapi.app.lifespan`` does
     but without running the smoke probe."""
     app = FastAPI(title="oc-slimapi-test")
-    app.add_middleware(
-        SlimapiVersionMiddleware,
-        accepted_client_versions=settings.accepted_client_versions,
-    )
     app.state.config = settings
     app.state.upstream = upstream
     app.state.schema_degraded = False
@@ -124,9 +117,9 @@ async def test_health_with_accept_encoding_gzip_returns_gzip(upstream_factory):
     # Decoding the (already decompressed) content must match a fresh gzip round-trip.
     body = orjson.loads(response.content)
     assert body["sidecar"]["ok"] is True
-    assert body["server"]["accepted_client_versions"] == [2, 2]
+    assert body["server"]["accepted_client_versions"] == [3, 3]
     assert body["schema"]["degraded"] is False
-    assert body["slimapi_contract"] == 2
+    assert body["slimapi_contract"] == 3
 
 
 async def test_health_without_accept_encoding_is_not_gzipped(upstream_factory):
@@ -218,18 +211,20 @@ async def test_ready_503_path_also_negotiates_gzip(upstream_factory):
 # Regression guard: version gate still enforced.
 # ---------------------------------------------------------------------------
 
-async def test_health_rejects_missing_version_header(upstream_factory):
-    """Cross-check: the version gate fires on /slimapi/health so future gzip
-    refactors can't accidentally bypass it."""
+async def test_health_ignores_retired_version_header(upstream_factory):
+    """§1 retirement parity: the X-Slimapi-Version header is dead input —
+    this route-only stack (no selector) must neither require nor interpret
+    it. (The selector-level 400s for no-v/v=2 live in test_selector.py.)"""
     upstream = upstream_factory(_make_upstream_ok())
     app = _build_app(_settings(), upstream)
 
     transport = httpx.ASGITransport(app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get("/slimapi/health")  # no version header
+        response = await client.get("/slimapi/health",
+                                    headers={"X-Slimapi-Version": "9"})
 
-    assert response.status_code == 400
-    assert response.json()["code"] == "version_required"
+    assert response.status_code == 200
+    assert response.json()["slimapi_contract"] == 3
 
 
 # ---------------------------------------------------------------------------
@@ -332,33 +327,34 @@ async def test_health_schema_includes_version_and_client_range(upstream_factory)
     # New keys exist and are read from config (not hard-coded).
     assert body["schema"] == {
         "degraded": False,
-        "version": 2,
-        "clientMin": 2,
-        "clientMax": 2,
+        "version": 3,
+        "clientMin": 3,
+        "clientMax": 3,
     }
     # Old ``server.*`` keys still there for back-compat.
-    assert body["server"]["api_version"] == 2
-    assert body["server"]["accepted_client_versions"] == [2, 2]
+    assert body["server"]["api_version"] == 3
+    assert body["server"]["accepted_client_versions"] == [3, 3]
     # lite-v2: static contract revision.
-    assert body["slimapi_contract"] == 2
+    assert body["slimapi_contract"] == 3
 
 
 async def test_health_schema_reflects_non_default_config(upstream_factory):
-    """With a wider accepted range, clientMin/clientMax follow the config.
+    """clientMin/clientMax follow the config.
 
-    Locks that the new keys are NOT hard-coded to 1,1 — they come from
-    ``Settings.accepted_client_versions`` at request time.
+    Locks that the keys are NOT hard-coded — they come from
+    ``Settings.accepted_client_versions`` at request time. (This route-only
+    test stack has no selector, so a Settings override is observable.)
     """
     upstream = upstream_factory(_make_upstream_ok())
-    settings = _settings(accepted_client_versions=(1, 3))
+    settings = _settings(accepted_client_versions=(3, 3))
     app = _build_app(settings, upstream)
 
     response = await _get(app, "/slimapi/health")
     assert response.status_code == 200
     body = response.json()
-    assert body["schema"]["clientMin"] == 1
+    assert body["schema"]["clientMin"] == 3
     assert body["schema"]["clientMax"] == 3
-    assert body["server"]["accepted_client_versions"] == [1, 3]
+    assert body["server"]["accepted_client_versions"] == [3, 3]
 
 
 async def test_ready_schema_includes_version_and_client_range(upstream_factory):
@@ -371,9 +367,9 @@ async def test_ready_schema_includes_version_and_client_range(upstream_factory):
     body = response.json()
     assert body["schema"] == {
         "degraded": False,
-        "version": 2,
-        "clientMin": 2,
-        "clientMax": 2,
+        "version": 3,
+        "clientMin": 3,
+        "clientMax": 3,
     }
 
 
@@ -389,9 +385,9 @@ async def test_ready_503_path_preserves_schema_fields(upstream_factory):
     response = await _get(app, "/slimapi/ready")
     assert response.status_code == 503
     body = response.json()
-    assert body["schema"]["version"] == 2
-    assert body["server"]["api_version"] == 2
-    assert body["server"]["accepted_client_versions"] == [2, 2]
+    assert body["schema"]["version"] == 3
+    assert body["server"]["api_version"] == 3
+    assert body["server"]["accepted_client_versions"] == [3, 3]
 
 
 async def test_health_schema_reflects_schema_degraded_state(upstream_factory):
@@ -405,7 +401,7 @@ async def test_health_schema_reflects_schema_degraded_state(upstream_factory):
     body = response.json()
     assert body["schema"]["degraded"] is True
     # Other keys still present.
-    assert body["schema"]["version"] == 2
+    assert body["schema"]["version"] == 3
 
 
 # ---------------------------------------------------------------------------

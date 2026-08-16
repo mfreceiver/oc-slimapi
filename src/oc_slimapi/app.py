@@ -592,16 +592,13 @@ app = FastAPI(title="oc-slimapi", version=__version__, lifespan=lifespan)
 register_error_handlers(app)
 # v3 Batch A — the version SELECTOR replaces the bare version gate at this
 # position in the stack. It owns an unmodified SlimapiVersionMiddleware
-# instance (same params as before) wrapping the router: no-`v` / v2 requests
-# are dispatched through that gate (byte-identical v2 pipeline), v3 requests
-# are marked (scope state) and bypass the gate, and GET /slimapi/versions is
+# Version selector — terminal state: ?v=3 is the only admitted pipeline
+# (scope-state marked; `v` stripped; directory consumed per §5.2/§5.7). Every
+# other /slimapi/** version form is a 400; GET /slimapi/versions is
 # unconditionally exempt (non-GET there → 405 + Allow: GET, first priority).
-# Catch-all (non /slimapi) requests pass through untouched.
-app.add_middleware(
-    SlimapiSelectorMiddleware,
-    accepted_client_versions=settings.accepted_client_versions,
-    v3_enabled=settings.v3_selector_enabled,
-)
+# Catch-all (non /slimapi) requests pass through untouched (and are answered
+# 404 by the closed proxy).
+app.add_middleware(SlimapiSelectorMiddleware)
 # Traffic-accounting middleware. Added AFTER the version gate so it is the
 # OUTERMOST middleware — it wraps every HTTP route including the version
 # gate's own 400 ``version_required`` responses and the catch-all reverse

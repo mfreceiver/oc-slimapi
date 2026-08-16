@@ -41,7 +41,6 @@ from oc_slimapi.proxy import install_proxy
 from oc_slimapi.routes import messages
 from oc_slimapi.sse import singleflight as sf_mod
 from oc_slimapi.transform import TransformConfig, TransformPool
-from oc_slimapi.versioning import SlimapiVersionMiddleware
 
 HDR = {"X-Slimapi-Version": "2"}
 
@@ -64,7 +63,6 @@ def _settings(**overrides) -> Settings:
         transform_absorb_budget_seconds=2.5,
         max_response_bytes=64 * 1024,
         smoke_session_id=None,
-        server_api_version=2, accepted_client_versions=(2, 2),
     )
     base.update(overrides)
     return Settings(**base)
@@ -75,10 +73,6 @@ def _build_app(upstream: httpx.AsyncClient, settings: Settings) -> FastAPI:
     coded-exception handlers. Mirrors the other route test modules (no
     module-level lifespan, no smoke probe)."""
     app = FastAPI(title="oc-slimapi-cd1-test")
-    app.add_middleware(
-        SlimapiVersionMiddleware,
-        accepted_client_versions=settings.accepted_client_versions,
-    )
     app.state.config = settings
     app.state.upstream = upstream
     app.state.transforms = TransformPool(TransformConfig(

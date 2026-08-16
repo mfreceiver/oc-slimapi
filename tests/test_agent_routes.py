@@ -27,7 +27,6 @@ from oc_slimapi.proxy import install_proxy
 from oc_slimapi.routes import agent, health
 from oc_slimapi.sse.hub import HubRegistry
 from oc_slimapi.transform import TransformConfig, TransformPool
-from oc_slimapi.versioning import SlimapiVersionMiddleware
 
 # Wire version 2 is the current contract revision; the middleware accepts
 # exactly [2, 2].
@@ -47,8 +46,6 @@ def _settings(**overrides) -> Settings:
         transform_wait_seconds=0.5,
         max_response_bytes=64 * 1024,
         smoke_session_id=None,
-        server_api_version=2,
-        accepted_client_versions=(2, 2),
     )
     base.update(overrides)
     return Settings(**base)
@@ -59,10 +56,6 @@ def _build_app(settings: Settings, upstream: httpx.AsyncClient) -> FastAPI:
     ``app.state`` pre-populated, mirroring ``oc_slimapi.app.lifespan`` but
     without running the smoke probe against the mocked upstream."""
     app = FastAPI(title="oc-slimapi-test")
-    app.add_middleware(
-        SlimapiVersionMiddleware,
-        accepted_client_versions=settings.accepted_client_versions,
-    )
     app.state.config = settings
     app.state.upstream = upstream
     app.state.transforms = TransformPool(TransformConfig(
@@ -475,15 +468,14 @@ async def test_agent_transform_busy_when_admission_saturated(upstream_factory):
 # 12. version gating — missing X-Slimapi-Version → 400 version_required.
 # ---------------------------------------------------------------------------
 
-async def test_agent_missing_version_header_returns_400(app_and_client):
+async def test_agent_retired_version_header_ignored(app_and_client):
+    """§1 terminal: X-Slimapi-Version is dead input; the route answers."""
     app, _ = app_and_client
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get("/slimapi/agent")  # no version header
-    assert response.status_code == 400
-    body = response.json()
-    assert body["code"] == "version_required"
-    assert body["accepted"] == [2, 2]
+        response = await client.get("/slimapi/agent",
+                                    headers={"X-Slimapi-Version": "garbage"})
+    assert response.status_code == 200
 
 
 # ---------------------------------------------------------------------------

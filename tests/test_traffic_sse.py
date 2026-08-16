@@ -28,7 +28,6 @@ from oc_slimapi.middleware.traffic_accounting import TrafficAccountingMiddleware
 from oc_slimapi.routes import events
 from oc_slimapi.sse.hub import HubRegistry, GlobalHub, _upstream_line_bytes
 from oc_slimapi.traffic import TrafficLedger
-from oc_slimapi.versioning import SlimapiVersionMiddleware
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -107,10 +106,6 @@ def _build_app(
     test_token_stream_route.py.
     """
     app = FastAPI(title="oc-slimapi-sse-traffic-test")
-    app.add_middleware(
-        SlimapiVersionMiddleware,
-        accepted_client_versions=(1, 1),
-    )
     app.state.upstream = upstream
 
     ledger = TrafficLedger()

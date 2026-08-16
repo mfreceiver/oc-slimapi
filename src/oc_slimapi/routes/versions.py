@@ -1,11 +1,14 @@
-"""``GET /slimapi/versions`` — v3-contract §3 discovery endpoint (Batch A).
+"""``GET /slimapi/versions`` — v3-contract §3 discovery endpoint.
 
 Producer-owned shape (consumers MUST ignore unknown fields for forward
 compat; this endpoint never rejects requests over unknown anything — it takes
-no parameters at all). Exempt from the version header gate AND the selector
-(v3-contract §2): reachable headerless, so a client can discover before it
-knows which versions exist. Non-GET → 405 + ``Allow: GET`` (enforced by the
-selector middleware with priority over everything).
+no parameters at all). Exempt from the selector judgement (v3-contract §2):
+reachable without any ``v``, so a client can discover before it knows which
+versions exist. Non-GET → 405 + ``Allow: GET`` (enforced by the selector
+middleware with priority over everything).
+
+Terminal state (3.0.0): ``available == [3]`` and the capability map carries
+ONLY the ``"3"`` key — v2 is deleted.
 
 Response constraints (§3, frozen):
 
@@ -29,15 +32,10 @@ from ..gzip_util import json_response
 router = APIRouter(prefix="/slimapi", tags=["versions"])
 
 CURRENT_VERSION = 3
-AVAILABLE_VERSIONS: list[int] = [2, 3]
+AVAILABLE_VERSIONS: list[int] = [3]
 
 # Capability map keyed by version STRING (contract §3 shape, verbatim).
 CAPABILITIES: dict[str, dict] = {
-    "2": {
-        "etag": True,
-        "contentFingerprint": True,
-        "thinRoutes": ["todo", "children", "diff"],
-    },
     "3": {
         "envelope": ["messages", "sessions"],
         "directoryQuery": True,

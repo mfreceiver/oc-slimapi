@@ -32,8 +32,6 @@ def _base(**overrides) -> Settings:
         host="127.0.0.1",
         port=4097,
         upstream="http://127.0.0.1:4096",
-        server_api_version=2,
-        accepted_client_versions=(2, 3),
     )
     base.update(overrides)
     return Settings(**base)
@@ -112,44 +110,44 @@ def test_validate_accepts_wildcard_host_with_loopback_upstream():
 
 def test_validate_rejects_inverted_version_range():
     """Range sanity in validate() is independent of host policy; still fires."""
-    settings = _base(server_api_version=2, accepted_client_versions=(2, 1))
+    settings = _base(accepted_client_versions=(3, 1))
     with pytest.raises(RuntimeError, match=r"slimapi version configuration is invalid"):
         settings.validate()
 
 
 # ---------------------------------------------------------------------------
-# P1-13 (updated v3 Batch A): production version gate is fail-closed to the
-# pinned range — now (2, 3) (versioning.py constant). The env knob is parsed
-# syntactically but MUST resolve to exactly the pin — no env-based widening
-# OR narrowing.
+# P1-13 (v3-only terminal): production version gate is fail-closed to the
+# pinned range — now (3, 3) (versioning.py constant, v3-only terminal state).
+# The env knob is parsed syntactically but MUST resolve to exactly the pin —
+# no env-based widening OR narrowing.
 # ---------------------------------------------------------------------------
 
 def test_validate_rejects_non_pinned_version_range_1_2():
     """OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS=1,2 must be rejected — production
     gate is fail-closed to the pinned range and cannot be widened via env."""
     settings = _base(accepted_client_versions=(1, 2))
-    with pytest.raises(RuntimeError, match=r"must be \(2, 3\)"):
+    with pytest.raises(RuntimeError, match=r"must be \(3, 3\)"):
         settings.validate()
 
 
 def test_validate_rejects_non_pinned_version_range_1_1():
     """OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS=1,1 must be rejected — no v1."""
-    settings = _base(server_api_version=1, accepted_client_versions=(1, 1))
-    with pytest.raises(RuntimeError, match=r"must be \(2, 3\)"):
+    settings = _base(accepted_client_versions=(1, 1))
+    with pytest.raises(RuntimeError, match=r"must be \(3, 3\)"):
         settings.validate()
 
 
-def test_validate_rejects_narrowed_version_range_2_2():
-    """v3 Batch A: the pin moved to (2, 3) — narrowing back to (2, 2) via
-    env is equally rejected (exact-pin posture, neither widen nor narrow)."""
-    settings = _base(accepted_client_versions=(2, 2))
-    with pytest.raises(RuntimeError, match=r"must be \(2, 3\)"):
+def test_validate_rejects_retired_v2_v3_range():
+    """v3-only terminal: the retired (2, 3) range is equally rejected
+    (exact-pin posture, neither widen nor narrow)."""
+    settings = _base(accepted_client_versions=(2, 3))
+    with pytest.raises(RuntimeError, match=r"must be \(3, 3\)"):
         settings.validate()
 
 
 def test_validate_accepts_pinned_range():
-    """The production pin (2, 3) validates cleanly."""
-    _base(server_api_version=2, accepted_client_versions=(2, 3)).validate()
+    """The production pin (3, 3) validates cleanly (v3-only terminal)."""
+    _base(server_api_version=3, accepted_client_versions=(3, 3)).validate()
 
 
 # ---------------------------------------------------------------------------
@@ -399,20 +397,20 @@ def test_validate_rejects_server_version_outside_accepted_range():
     """server_api_version must be within accepted_client_versions range.
 
     With the pin to (2, 3), server_api_version must fall inside the range."""
-    settings = _base(server_api_version=5, accepted_client_versions=(2, 3))
+    settings = _base(server_api_version=5, accepted_client_versions=(3, 3))
     with pytest.raises(RuntimeError, match=r"SERVER_API_VERSION .* must be within .* range"):
         settings.validate()
 
 
 def test_validate_rejects_server_version_below_accepted_range():
-    settings = _base(server_api_version=1, accepted_client_versions=(2, 3))
+    settings = _base(server_api_version=1, accepted_client_versions=(3, 3))
     with pytest.raises(RuntimeError, match=r"SERVER_API_VERSION .* must be within .* range"):
         settings.validate()
 
 
 def test_validate_accepts_server_version_at_range_boundaries():
-    """With the pin to (2, 3), server versions 2 and 3 are valid."""
-    _base(server_api_version=2, accepted_client_versions=(2, 3)).validate()
+    """With the pin to (3, 3), server version 3 is the sole valid value."""
+    _base(server_api_version=3, accepted_client_versions=(3, 3)).validate()
 
 
 # ---------------------------------------------------------------------------

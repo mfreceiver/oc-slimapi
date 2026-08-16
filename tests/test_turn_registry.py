@@ -433,7 +433,6 @@ def _settings(**overrides) -> Settings:
         max_message_bytes=32 * 1024 * 1024,
         max_transforms=1, transform_wait_seconds=0.5, max_response_bytes=64 * 1024,
         smoke_session_id=None,
-        server_api_version=2, accepted_client_versions=(2, 2),
     )
     base.update(overrides)
     return Settings(**base)

@@ -36,7 +36,6 @@ def _settings(**overrides) -> Settings:
         max_message_bytes=32 * 1024 * 1024,
         max_transforms=1, transform_wait_seconds=0.5,
         max_response_bytes=64 * 1024, smoke_session_id=None,
-        server_api_version=2, accepted_client_versions=(2, 3),
     )
     base.update(overrides)
     return Settings(**base)
@@ -82,10 +81,7 @@ def _build_app(handler) -> FastAPI:
     app.include_router(messages.router)
     app.include_router(sessions.router)
     register_error_handlers(app)
-    app.add_middleware(
-        SlimapiSelectorMiddleware,
-        accepted_client_versions=(2, 3),
-    )
+    app.add_middleware(SlimapiSelectorMiddleware)
     return app
 
 
@@ -135,58 +131,53 @@ async def client_factory():
 # ---------------------------------------------------------------------------
 
 async def test_messages_v3_envelope_null_cursor_byte_verbatim(client_factory):
-    """v3: body = {"items":<v2 bytes verbatim>,"nextCursor":null}; no
-    X-Next-Cursor header (the client reads the cursor from the envelope)."""
+    """Terminal §4: the messages list body is the
+    {"items":…,"nextCursor":null} envelope (bare arrays no longer exist on
+    the wire); the pagination header is NOT produced (the client reads the
+    cursor from the envelope)."""
     client = await client_factory(_message_handler())
     try:
-        v2 = await client.get("/slimapi/messages/s1", headers=V2_HEADERS)
         v3 = await client.get("/slimapi/messages/s1?v=3", headers=IDENTITY)
-        assert v2.status_code == 200 and v3.status_code == 200
-        assert v2.content.startswith(b"[")  # v2: bare array
-        # Byte-verbatim splice (identity coding, orjson compact on both paths).
-        assert v3.content == b'{"items":' + v2.content + b',"nextCursor":null}'
+        assert v3.status_code == 200
+        assert v3.content.startswith(b'{"items":')
         assert "x-next-cursor" not in v3.headers
         assert "X-Next-Cursor" not in v3.headers
         body = orjson.loads(v3.content)
         assert list(body.keys()) == ["items", "nextCursor"]
         assert body["nextCursor"] is None
         assert "complete" not in body
+        # Projection passes through both fixed-payload messages.
+        assert [item["info"]["id"] for item in body["items"]] == ["m1", "m2"]
     finally:
         await client.aclose()
 
 
 async def test_messages_v3_envelope_non_null_cursor(client_factory):
     """Upstream Link → envelope nextCursor carries the opaque cursor
-    verbatim (same value the v2 X-Next-Cursor header reports)."""
+    verbatim."""
     link = '</session/s1/message?limit=40&before=CURSOR123>; rel="next"'
     client = await client_factory(_message_handler(link=link))
     try:
-        v2 = await client.get("/slimapi/messages/s1", headers=V2_HEADERS)
         v3 = await client.get("/slimapi/messages/s1?v=3", headers=IDENTITY)
-        assert v2.headers["X-Next-Cursor"] == "CURSOR123"
-        assert v3.content == (
-            b'{"items":' + v2.content + b',"nextCursor":"CURSOR123"}'
-        )
         assert orjson.loads(v3.content)["nextCursor"] == "CURSOR123"
         assert "x-next-cursor" not in v3.headers
     finally:
         await client.aclose()
 
 
-async def test_messages_v2_explicit_and_implicit_identical_shape(client_factory):
-    """v2 regression: no `v` and explicit ?v=2 produce the byte-identical v2
-    wire shape (bare array + X-Next-Cursor when present)."""
+async def test_messages_retired_v2_forms_rejected(client_factory):
+    """Terminal §2: implicit and explicit v2 requests are both rejected with
+    unsupported_version — the bare-array wire shape no longer exists."""
     link = '</session/s1/message?limit=40&before=CURSOR123>; rel="next"'
     client = await client_factory(_message_handler(link=link))
     try:
         implicit = await client.get("/slimapi/messages/s1", headers=V2_HEADERS)
         explicit = await client.get(
             "/slimapi/messages/s1?v=2", headers=V2_HEADERS)
-        assert implicit.status_code == explicit.status_code == 200
-        assert implicit.content == explicit.content
-        assert implicit.content.startswith(b"[")
-        assert implicit.headers["X-Next-Cursor"] == "CURSOR123"
-        assert explicit.headers["X-Next-Cursor"] == "CURSOR123"
+        assert implicit.status_code == explicit.status_code == 400
+        expected = {"code": "unsupported_version", "supported": [3]}
+        assert orjson.loads(implicit.content) == expected
+        assert orjson.loads(explicit.content) == expected
     finally:
         await client.aclose()
 
@@ -232,19 +223,20 @@ async def test_messages_v3_304_empty_body_no_aux_headers(client_factory):
         await client.aclose()
 
 
-async def test_messages_v2_304_still_carries_x_next_cursor(client_factory):
-    """v2 regression: the v2 304 keeps its aux X-Next-Cursor header."""
+async def test_messages_retired_v2_304_form_rejected(client_factory):
+    """Terminal: no v2 pipeline → no v2 304 aux headers exist; the retired
+    form is rejected before any validator is consulted."""
     link = '</session/s1/message?limit=40&before=CURSOR123>; rel="next"'
     client = await client_factory(_message_handler(link=link))
     try:
-        first = await client.get("/slimapi/messages/s1", headers=V2_HEADERS)
+        first = await client.get("/slimapi/messages/s1?v=3", headers=IDENTITY)
         etag = first.headers["ETag"]
         reval = await client.get(
             "/slimapi/messages/s1",
             headers={**V2_HEADERS, "If-None-Match": etag},
         )
-        assert reval.status_code == 304
-        assert reval.headers["X-Next-Cursor"] == "CURSOR123"
+        assert reval.status_code == 400
+        assert orjson.loads(reval.content)["code"] == "unsupported_version"
     finally:
         await client.aclose()
 
@@ -254,19 +246,18 @@ async def test_messages_v2_304_still_carries_x_next_cursor(client_factory):
 # ---------------------------------------------------------------------------
 
 async def test_sessions_v3_envelope_complete_true(client_factory):
-    """v3: {"items":[...],"complete":true} — items bytes verbatim, no
-    X-Complete header on 200."""
+    """Terminal §4: the sessions list body is the
+    {"items":…,"complete":true} envelope; X-Complete is never produced."""
     client = await client_factory(_message_handler())
     try:
-        v2 = await client.get("/slimapi/sessions", headers=V2_HEADERS)
         v3 = await client.get("/slimapi/sessions?v=3", headers=IDENTITY)
-        assert v2.status_code == v3.status_code == 200
-        assert v2.content.startswith(b"[")
-        assert v2.headers["X-Complete"] == "true"
-        assert v3.content == b'{"items":' + v2.content + b',"complete":true}'
+        assert v3.status_code == 200
+        assert v3.content.startswith(b'{"items":')
         body = orjson.loads(v3.content)
         assert list(body.keys()) == ["items", "complete"]
         assert body["complete"] is True
+        assert body["items"] == [{"id": "s1", "title": "one"},
+                                 {"id": "s2", "title": "two"}]
         assert "nextCursor" not in body
         assert "x-complete" not in v3.headers
     finally:
@@ -289,8 +280,8 @@ async def test_sessions_v3_envelope_complete_false(client_factory):
 
 
 async def test_sessions_v3_304_no_x_complete_header(client_factory):
-    """§6.4: v3 sessions 304 carries no X-Complete (client reads
-    ``complete`` from the cached envelope); v2 304 still does."""
+    """§6.4: the 304 carries no X-Complete (the client reads ``complete``
+    from the cached envelope)."""
     client = await client_factory(_message_handler())
     try:
         v3_first = await client.get("/slimapi/sessions?v=3", headers=IDENTITY)
@@ -303,14 +294,6 @@ async def test_sessions_v3_304_no_x_complete_header(client_factory):
         assert v3_reval.content == b""
         assert "x-complete" not in v3_reval.headers
         assert "X-Complete" not in v3_reval.headers
-        v2_first = await client.get("/slimapi/sessions", headers=V2_HEADERS)
-        etag2 = v2_first.headers["ETag"]
-        v2_reval = await client.get(
-            "/slimapi/sessions",
-            headers={**V2_HEADERS, "If-None-Match": etag2},
-        )
-        assert v2_reval.status_code == 304
-        assert v2_reval.headers["X-Complete"] == "true"
     finally:
         await client.aclose()
 

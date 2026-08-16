@@ -62,7 +62,6 @@ def _settings(**overrides) -> Settings:
         max_message_bytes=32 * 1024 * 1024,
         max_transforms=1, transform_wait_seconds=0.5,
         max_response_bytes=64 * 1024, smoke_session_id=None,
-        server_api_version=2, accepted_client_versions=(2, 3),
     )
     base.update(overrides)
     return Settings(**base)
@@ -85,10 +84,7 @@ def _build_app(handler, *, settings: Settings | None = None):
     app.state.schema_degraded = False
     app.include_router(write_groups.router)
     register_error_handlers(app)
-    app.add_middleware(
-        SlimapiSelectorMiddleware,
-        accepted_client_versions=settings.accepted_client_versions,
-        v3_enabled=True)
+    app.add_middleware(SlimapiSelectorMiddleware)
     return app, seen
 
 
@@ -237,12 +233,15 @@ async def test_write_endpoint_body_and_content_type_forwarded(
 @pytest.mark.parametrize("label,path,method,upstream", ENDPOINTS)
 async def test_write_directory_v2_header_channel(stack, label, path, method,
                                                  upstream):
+    """Converted (terminal §2): the v2 form is rejected before the route;
+    §8.3 ② (selector) outranks ③ (retired header)."""
     client, seen = stack
     resp = await _send(
         client, label, path, method, v3=False,
         headers={**V2_HEADERS, DIRECTORY_HEADER: "/w"})
-    assert resp.status_code < 500
-    assert seen[0].headers.get(DIRECTORY_HEADER) == "/w"
+    assert resp.status_code == 400
+    assert orjson.loads(resp.content)["code"] == "unsupported_version"
+    assert not seen
 
 
 @pytest.mark.parametrize("label,path,method,upstream", ENDPOINTS)
@@ -278,26 +277,28 @@ async def test_write_directory_v3_invalid_query_400(stack, label, path, method,
     assert not seen  # nothing reached the upstream
 
 
-async def test_write_directory_v2_query_values_validated_verbatim():
-    """v2 ``?directory=`` NOT consumed: validated, forwarded verbatim."""
+async def test_write_directory_v2_query_values_unsupported():
+    """Converted (terminal): v=2 is a retired protocol version."""
     app, seen = _build_app(_ok)
     async with _client(app) as client:
         resp = await client.request(
             "POST", "/slimapi/session/s1/abort?v=2&directory=/w",
             headers=V2_HEADERS)
-    assert resp.status_code == 200
-    assert seen[0].url.params.get("directory") == "/w"
-    assert seen[0].headers.get(DIRECTORY_HEADER) is None  # v2 query channel
+    assert resp.status_code == 400
+    assert orjson.loads(resp.content) == {
+        "code": "unsupported_version", "supported": [3]}
+    assert not seen
 
 
-async def test_write_directory_v2_query_invalid_400():
+async def test_write_directory_v2_query_invalid_unsupported():
+    """§8.3: the selector error (②) outranks the directory error (③)."""
     app, seen = _build_app(_ok)
     async with _client(app) as client:
         resp = await client.request(
             "POST", "/slimapi/session/s1/abort?v=2&directory=../etc",
             headers=V2_HEADERS)
     assert resp.status_code == 400
-    assert orjson.loads(resp.content)["code"] == "invalid_directory"
+    assert orjson.loads(resp.content)["code"] == "unsupported_version"
     assert not seen
 
 
@@ -406,13 +407,14 @@ async def test_write_response_over_cap_413():
 
 
 async def test_write_query_verbatim_unknown_and_repeats():
-    """Unknown / repeated query params forward byte-identically (v2)."""
+    """Unknown / repeated query params forward byte-identically (v3 —
+    the byte-fidelity semantics moved wholesale to the v3 channel)."""
     app, seen = _build_app(_ok)
     async with _client(app) as client:
         resp = await client.request(
             "POST",
-            "/slimapi/session/s1/abort?v=2&zz=a%20b&zz=c&x=1&x=2",
-            headers=V2_HEADERS)
+            "/slimapi/session/s1/abort?v=3&zz=a%20b&zz=c&x=1&x=2",
+            headers=IDENTITY)
     assert resp.status_code == 200
     assert seen[0].url.query.decode("latin-1") == "zz=a%20b&zz=c&x=1&x=2"
 

@@ -36,6 +36,7 @@ from fastapi import FastAPI
 from oc_slimapi.config import Settings, TOKEN_FLUSH_SECONDS
 from oc_slimapi.errors import register_error_handlers
 from oc_slimapi.routes import events, health, metrics, token_stream
+from oc_slimapi.selector import SlimapiSelectorMiddleware
 from oc_slimapi.sse.hub import HubRegistry, Subscriber, sse_frame as hub_sse_frame
 from oc_slimapi.sse.token_hub import (
     STOP,
@@ -48,7 +49,6 @@ from oc_slimapi.sse.token_hub import (
     _resync_frame,
     _snapshot_frame,
 )
-from oc_slimapi.versioning import SlimapiVersionMiddleware
 
 VERSION_HEADERS = {"X-Slimapi-Version": "1"}
 
@@ -145,10 +145,6 @@ def _build_app(settings: Settings, *, include_control_events: bool = False) -> F
     come from the accumulator directly, not the upstream connection.
     """
     app = FastAPI(title="oc-slimapi-token-stream-test")
-    app.add_middleware(
-        SlimapiVersionMiddleware,
-        accepted_client_versions=settings.accepted_client_versions,
-    )
     app.state.config = settings
     app.state.schema_degraded = False
     app.state.deployment_revision = None
@@ -946,19 +942,24 @@ class TestTokenStreamHandshake:
         finally:
             await _close_app(app)
 
-    async def test_version_gate_rejects_missing_header(self):
+    async def test_version_gate_rejects_missing_selector(self):
+        """Terminal §2: the selector (not a header gate) protects the SSE
+        surface — a request without ?v never opens the stream. This stack
+        wires the real selector; the 400 is emitted before the route."""
         app = _build_app(_settings())
         try:
+            app.add_middleware(SlimapiSelectorMiddleware)
             transport = httpx.ASGITransport(app)
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-                # No X-Slimapi-Version header → middleware 400 (complete
-                # JSON response; does not reach the streaming route).
                 response = await client.get(
                     "/slimapi/sessions/s1/stream",
                     headers={"Accept-Encoding": "identity"},
                 )
             assert response.status_code == 400
-            assert response.json()["code"] == "version_required"
+            assert response.json() == {
+                "code": "unsupported_version", "supported": [3]}
+            assert "text/event-stream" not in response.headers.get(
+                "content-type", "")
         finally:
             await _close_app(app)
 
@@ -1261,9 +1262,6 @@ class TestMetricsTokenStream:
         """Control-plane metrics shape is unchanged when no token registry is
         wired (test app parity with test_metrics.py)."""
         app = FastAPI(title="no-token")
-        app.add_middleware(
-            SlimapiVersionMiddleware, accepted_client_versions=(1, 1),
-        )
         app.state.config = _settings()
         app.state.upstream = httpx.AsyncClient()
         hubs = HubRegistry(client=None)

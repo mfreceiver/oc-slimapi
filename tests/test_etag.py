@@ -39,7 +39,6 @@ from oc_slimapi.routes import (
 )
 from oc_slimapi.sse.hub import HubRegistry
 from oc_slimapi.transform import TransformConfig, TransformPool
-from oc_slimapi.versioning import SlimapiVersionMiddleware
 
 HDR = {
     "X-Slimapi-Version": "2",
@@ -118,8 +117,6 @@ def _settings(**overrides) -> Settings:
         transform_wait_seconds=0.5,
         max_response_bytes=64 * 1024,
         smoke_session_id=None,
-        server_api_version=2,
-        accepted_client_versions=(2, 2),
         # Batch 1 knobs off by default here — ETag is tested in isolation;
         # the A-batch interplay has its own dedicated test below.
         coalesce_enabled=False,
@@ -136,10 +133,6 @@ def _build_app(
     with_catalog_cache: bool = False,
 ) -> FastAPI:
     app = FastAPI(title="oc-slimapi-test")
-    app.add_middleware(
-        SlimapiVersionMiddleware,
-        accepted_client_versions=settings.accepted_client_versions,
-    )
     app.state.config = settings
     app.state.upstream = upstream
     app.state.transforms = TransformPool(TransformConfig(

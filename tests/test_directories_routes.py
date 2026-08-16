@@ -22,7 +22,6 @@ from oc_slimapi.proxy import install_proxy
 from oc_slimapi.routes import directories
 from oc_slimapi.traffic import bucketize
 from oc_slimapi.transform import TransformConfig, TransformPool
-from oc_slimapi.versioning import SlimapiVersionMiddleware
 
 VERSION_HEADERS = {"X-Slimapi-Version": "2"}
 
@@ -33,7 +32,6 @@ def _settings() -> Settings:
         max_message_bytes=32 * 1024 * 1024,
         max_transforms=1, transform_wait_seconds=0.5, max_response_bytes=64 * 1024,
         smoke_session_id=None,
-        server_api_version=2, accepted_client_versions=(2, 2),
     )
 
 
@@ -44,10 +42,6 @@ def _build_app(upstream: httpx.AsyncClient) -> FastAPI:
     catch-all) → catch-all proxy → coded-exception handler.
     """
     app = FastAPI(title="oc-slimapi-directories-test")
-    app.add_middleware(
-        SlimapiVersionMiddleware,
-        accepted_client_versions=(2, 2),
-    )
     settings = _settings()
     app.state.config = settings
     app.state.upstream = upstream
@@ -512,14 +506,15 @@ async def test_discovery_complete_false_when_page_full(upstream_factory, monkeyp
 # ---------------------------------------------------------------------------
 
 
-async def test_version_gate_no_header_returns_400(upstream_factory):
+async def test_retired_version_header_ignored_at_route_level(upstream_factory):
+    """§1 terminal: X-Slimapi-Version is dead input; discovery answers."""
     upstream = upstream_factory(_discovery_handler())
     app = _build_app(upstream)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get("/slimapi/directories")  # no version header
-    assert response.status_code == 400
-    assert response.json()["code"] == "version_required"
+        response = await client.get("/slimapi/directories",
+                                    headers={"X-Slimapi-Version": "9"})
+    assert response.status_code == 200
 
 
 async def test_directory_query_param_ignored_no_filter(upstream_factory):

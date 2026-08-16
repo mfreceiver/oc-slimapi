@@ -33,7 +33,6 @@ from oc_slimapi.errors import register_error_handlers
 from oc_slimapi.middleware.request_id import RequestIdMiddleware
 from oc_slimapi.routes import agent, command
 from oc_slimapi.transform import TransformConfig, TransformPool
-from oc_slimapi.versioning import SlimapiVersionMiddleware
 
 
 # ---------------------------------------------------------------------------
@@ -61,8 +60,6 @@ def _settings(**overrides) -> Settings:
         transform_wait_seconds=0.5,
         max_response_bytes=64 * 1024,
         smoke_session_id=None,
-        server_api_version=2,
-        accepted_client_versions=(2, 3),
     )
     base.update(overrides)
     return Settings(**base)
@@ -72,10 +69,6 @@ def _build_app(settings: Settings, upstream: httpx.AsyncClient,
                cache: CatalogCache | None) -> FastAPI:
     """Minimal app mirroring test_agent_routes._build_app + catalog cache."""
     app = FastAPI(title="oc-slimapi-catalog-cache-test")
-    app.add_middleware(
-        SlimapiVersionMiddleware,
-        accepted_client_versions=settings.accepted_client_versions,
-    )
     app.state.config = settings
     app.state.upstream = upstream
     app.state.transforms = TransformPool(TransformConfig(
@@ -412,7 +405,6 @@ def test_config_defaults_from_env_shape_match_plan():
         max_message_bytes=32 * 1024 * 1024, max_transforms=1,
         transform_wait_seconds=0.5, max_response_bytes=64 * 1024,
         smoke_session_id=None, server_api_version=2,
-        accepted_client_versions=(2, 3),
     )
     assert s.catalog_cache_ttl_seconds == 300
     assert s.catalog_cache_max_entries == 16

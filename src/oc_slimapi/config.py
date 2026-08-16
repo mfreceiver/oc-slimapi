@@ -240,16 +240,6 @@ class Settings:
             f"{ACCEPTED_CLIENT_VERSIONS[0]},{ACCEPTED_CLIENT_VERSIONS[1]}",
         )
     )
-    # v3 Batch A — version-selector gradual-rollout switch (v3-contract §2 /
-    # §A-5). Default ON: the 2.0.0 sidecar must announce available=[2,3] on
-    # GET /slimapi/versions, so v=3 has to select the v3 pipeline out of the
-    # box. ``false`` is the rollback position: ?v=3 is then handled by the
-    # plain v2 pipeline (header gate still applies) and observability records
-    # selectorResult=absent for it — the `v` parameter is ignored entirely
-    # (even lexically invalid values do not 400).
-    v3_selector_enabled: bool = os.getenv(
-        "OC_SLIMAPI_V3_SELECTOR_ENABLED", "true"
-    ).lower() in ("1", "true", "yes", "on")
     # T3 subscriber / SSE-buffer guards (v1 contract §6). All must be strictly
     # positive; total >= per-directory so the broader cap can never be the
     # binding constraint in a single-hub world without making admission

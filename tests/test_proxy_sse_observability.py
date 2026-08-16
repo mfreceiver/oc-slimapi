@@ -61,7 +61,6 @@ def _settings(**overrides) -> Settings:
         max_message_bytes=32 * 1024 * 1024,
         max_transforms=1, transform_wait_seconds=0.5, max_response_bytes=64 * 1024,
         smoke_session_id=None,
-        server_api_version=2, accepted_client_versions=(2, 3),
     )
     base.update(overrides)
     return Settings(**base)
@@ -82,11 +81,7 @@ def _build_app(
     # paths, which the sse observability reads for the §9.2 dim. The
     # accounting middleware (outer) is added only when the test asserts
     # request rows.
-    app.add_middleware(
-        SlimapiSelectorMiddleware,
-        accepted_client_versions=(2, 3),
-        v3_enabled=True,
-    )
+    app.add_middleware(SlimapiSelectorMiddleware)
     if request_logger is not None:
         app.add_middleware(TrafficAccountingMiddleware, logger=request_logger)
     install_proxy(app)

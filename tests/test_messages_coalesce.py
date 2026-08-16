@@ -40,7 +40,6 @@ from oc_slimapi.proxy import install_proxy
 from oc_slimapi.routes import events, health, messages, sessions
 from oc_slimapi.sse.hub import HubRegistry
 from oc_slimapi.transform import TransformConfig, TransformPool
-from oc_slimapi.versioning import SlimapiVersionMiddleware
 
 HDR = {"X-Slimapi-Version": "2"}
 
@@ -88,8 +87,6 @@ def _settings(**overrides) -> Settings:
         transform_wait_seconds=0.5,
         max_response_bytes=64 * 1024,
         smoke_session_id=None,
-        server_api_version=2,
-        accepted_client_versions=(2, 3),
         coalesce_enabled=True,
         raw_fetch_concurrency=4,
         # default test budget: 4 concurrent leased flights at the 64 KiB
@@ -106,10 +103,6 @@ def _build_app(settings: Settings, upstream: httpx.AsyncClient) -> FastAPI:
     attach the raw-fetch registry exactly when the real lifespan would
     (``coalesce_enabled=true``)."""
     app = FastAPI(title="oc-slimapi-test")
-    app.add_middleware(
-        SlimapiVersionMiddleware,
-        accepted_client_versions=settings.accepted_client_versions,
-    )
     app.state.config = settings
     app.state.upstream = upstream
     app.state.transforms = TransformPool(TransformConfig(

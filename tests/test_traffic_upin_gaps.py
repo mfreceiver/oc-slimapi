@@ -35,7 +35,6 @@ from oc_slimapi.routes import health, messages, sessions
 from oc_slimapi.sse.hub import HubRegistry
 from oc_slimapi.traffic import TrafficLedger
 from oc_slimapi.transform import TransformConfig, TransformPool
-from oc_slimapi.versioning import SlimapiVersionMiddleware
 
 VERSION_HEADERS = {"X-Slimapi-Version": "2"}
 
@@ -54,8 +53,6 @@ def _settings(**overrides) -> Settings:
         transform_wait_seconds=0.5,
         max_response_bytes=64 * 1024,
         smoke_session_id=None,
-        server_api_version=2,
-        accepted_client_versions=(2, 2),
 
     )
     base.update(overrides)
@@ -76,10 +73,6 @@ def _build_app(
     Uses the same approach as ``test_traffic_integration._build_app_with_traffic``.
     """
     app = FastAPI(title="oc-slimapi-upin-gaps-test")
-    app.add_middleware(
-        SlimapiVersionMiddleware,
-        accepted_client_versions=settings.accepted_client_versions,
-    )
     app.state.config = settings
     app.state.upstream = upstream
     app.state.schema_degraded = False

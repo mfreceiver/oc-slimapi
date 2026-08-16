@@ -22,7 +22,6 @@ from oc_slimapi.errors import register_error_handlers
 from oc_slimapi.routes import metrics
 from oc_slimapi.sse.hub import HubRegistry
 from oc_slimapi.transform import TransformConfig, TransformPool
-from oc_slimapi.versioning import SlimapiVersionMiddleware
 
 VERSION_HEADERS = {"X-Slimapi-Version": "1"}
 
@@ -51,10 +50,6 @@ def _settings(**overrides) -> Settings:
 
 def _build_app(settings: Settings) -> tuple[FastAPI, HubRegistry, httpx.AsyncClient]:
     app = FastAPI(title="oc-slimapi-metrics-test")
-    app.add_middleware(
-        SlimapiVersionMiddleware,
-        accepted_client_versions=settings.accepted_client_versions,
-    )
     upstream = httpx.AsyncClient()
     app.state.config = settings
     app.state.upstream = upstream
@@ -135,16 +130,16 @@ async def test_metrics_route_reports_live_subscriber_after_subscribe():
         await upstream.aclose()
 
 
-async def test_metrics_route_rejects_missing_version_header():
-    """The /slimapi/** version gate covers metrics too — a missing header
-    yields 400 ``version_required`` rather than the snapshot."""
+async def test_metrics_route_ignores_retired_version_header():
+    """§1 terminal: X-Slimapi-Version is dead input — the snapshot is served
+    regardless (the selector owns /slimapi admission)."""
     app, hubs, upstream = _build_app(_settings())
     transport = httpx.ASGITransport(app)
     try:
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            response = await client.get("/slimapi/metrics")
-        assert response.status_code == 400
-        assert response.json()["code"] == "version_required"
+            response = await client.get("/slimapi/metrics",
+                                        headers={"X-Slimapi-Version": "9"})
+        assert response.status_code == 200
     finally:
         await hubs.close()
         app.state.transforms.shutdown()

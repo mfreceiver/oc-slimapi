@@ -66,8 +66,6 @@ def _settings(**overrides) -> Settings:
         transform_wait_seconds=0.5,
         max_response_bytes=64 * 1024,
         smoke_session_id=None,
-        server_api_version=2,
-        accepted_client_versions=(2, 3),
     )
     base.update(overrides)
     return Settings(**base)
@@ -87,11 +85,7 @@ def _build_app(logger, *, ledger: TrafficLedger | None = None) -> FastAPI:
     if ledger is not None:
         app.state.traffic_ledger = ledger
     # Add in production order: selector first (inner), traffic last (outer).
-    app.add_middleware(
-        SlimapiSelectorMiddleware,
-        accepted_client_versions=(2, 3),
-        v3_enabled=True,
-    )
+    app.add_middleware(SlimapiSelectorMiddleware)
     app.add_middleware(TrafficAccountingMiddleware, logger=logger)
     app.include_router(health.router)
     app.include_router(versions.router)
@@ -107,29 +101,30 @@ def _client(app: FastAPI) -> httpx.AsyncClient:
 # request rows: selectorResult × wireVersion × directoryForm × recordType
 # ---------------------------------------------------------------------------
 
-async def test_row_absent(capture_logger):
+async def test_row_no_v_rejected(capture_logger):
+    """Terminal: no selector at all → 400, row records rejected/null."""
     app = _build_app(capture_logger)
     async with _client(app) as client:
         r = await client.get("/slimapi/health", headers=V2_HEADER)
-        assert r.status_code == 200
+        assert r.status_code == 400  # header not read; retired-version request
     rows = _rows(capture_logger)
     assert len(rows) == 1
     row = rows[0]
-    assert row["selectorResult"] == "absent"
-    assert row["wireVersion"] == "2"
+    assert row["selectorResult"] == "rejected"
+    assert row["wireVersion"] is None
     assert row["directoryForm"] is None  # health is not a directory consumer
     assert row["recordType"] == "request"
     assert row["lifecycleId"] is None
 
 
-async def test_row_v2_explicit(capture_logger):
+async def test_row_v2_explicit_rejected(capture_logger):
     app = _build_app(capture_logger)
     async with _client(app) as client:
         r = await client.get("/slimapi/health?v=2", headers=V2_HEADER)
-        assert r.status_code == 200
+        assert r.status_code == 400
     row = _rows(capture_logger)[0]
-    assert row["selectorResult"] == "v2"
-    assert row["wireVersion"] == "2"
+    assert row["selectorResult"] == "rejected"
+    assert row["wireVersion"] is None
 
 
 async def test_row_v3(capture_logger):
@@ -224,9 +219,11 @@ async def test_directory_form_absent_on_consuming_route(capture_logger):
 async def test_directory_form_null_on_non_consuming_route(capture_logger):
     app = _build_app(capture_logger)
     async with _client(app) as client:
+        # v=3 admitted; health is tolerant — the header form is ignored
+        # (not an error), directoryForm stays None (non-consuming route).
         r = await client.get(
-            "/slimapi/health?directory=/proj",
-            headers={"X-Opencode-Directory": "/proj", **V2_HEADER},
+            "/slimapi/health?directory=/proj&v=3",
+            headers={"X-Opencode-Directory": "/proj"},
         )
         assert r.status_code == 200
     row = _rows(capture_logger)[0]
@@ -240,7 +237,7 @@ async def test_directory_form_null_on_non_consuming_route(capture_logger):
 async def test_legacy_row_key_prefix_preserved(capture_logger):
     app = _build_app(capture_logger)
     async with _client(app) as client:
-        r = await client.get("/slimapi/health", headers=V2_HEADER)
+        r = await client.get("/slimapi/health?v=3")
         assert r.status_code == 200
     row = _rows(capture_logger)[0]
     assert list(row.keys())[:14] == [
@@ -253,15 +250,14 @@ async def test_legacy_row_key_prefix_preserved(capture_logger):
         assert key in row
 
 
-async def test_legacy_old_ocdroid_form_no_v_header_2(capture_logger):
-    """Old ocdroid: no `v` + header 2 — behaviour byte-identical (regression)."""
+async def test_legacy_old_ocdroid_form_rejected(capture_logger):
+    """Old ocdroid form (no `v` + header 2): terminal outcome is the version
+    retirement 400 — the endpoint exists, the protocol version does not."""
     app = _build_app(capture_logger)
     async with _client(app) as client:
         r = await client.get("/slimapi/health", headers=V2_HEADER)
-        assert r.status_code == 200
-        body = r.json()
-        assert body["slimapi_contract"] == 2
-        assert body["server"]["api_version"] == 2
+        assert r.status_code == 400
+        assert r.json() == {"code": "unsupported_version", "supported": [3]}
 
 
 # ---------------------------------------------------------------------------

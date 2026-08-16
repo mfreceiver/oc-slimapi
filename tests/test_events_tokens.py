@@ -45,7 +45,6 @@ from oc_slimapi.sse.token_hub import (
     TokenStreamHub,
     TokenStreamRegistry,
 )
-from oc_slimapi.versioning import SlimapiVersionMiddleware
 
 VERSION_HEADERS = {"X-Slimapi-Version": "1"}
 
@@ -185,10 +184,6 @@ def _build_app(settings: Settings) -> FastAPI:
     not an upstream connection.
     """
     app = FastAPI(title="oc-slimapi-events-tokens-test")
-    app.add_middleware(
-        SlimapiVersionMiddleware,
-        accepted_client_versions=settings.accepted_client_versions,
-    )
     app.state.config = settings
     app.state.schema_degraded = False
     app.state.deployment_revision = None

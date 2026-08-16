@@ -5,31 +5,29 @@ from fastapi import APIRouter, Request
 from .. import __version__
 from ..features import FEATURES
 from ..gzip_util import json_response
-from ..selector import wire_view_from_scope
 from ..traffic import stash_up_in
 from ..upstream import forward_upstream_headers, request_id_from_scope
 
 router = APIRouter(prefix="/slimapi", tags=["health"])
 
+# v3-contract §3a terminal state: single v3 view. Every request that reaches
+# these routes ran v3 semantics (?v=3 enforced by the selector) — there is no
+# v2 view left to fork on.
+WIRE_VIEW = 3
+
 
 @router.get("/health")
 async def health(request: Request):
-    # v3-contract §3a (Batch A): the wire view this request runs — 3 for
-    # ?v=3 (selector) requests, 2 otherwise (absent / v=2 / legacy stacks
-    # without the selector). One variable drives slimapi_contract,
-    # server.api_version AND schema.version — a 3/2 combination is
-    # structurally impossible. accepted_client_versions / clientMin /
-    # clientMax stay config-driven (2.0.0: [2, 3]) in BOTH views.
-    view = wire_view_from_scope(request.scope)
+    # One constant drives slimapi_contract, server.api_version AND
+    # schema.version — a 3/2 combination is structurally impossible.
+    # accepted_client_versions / clientMin / clientMax stay config-driven
+    # (3.0.0: [3, 3]).
+    view = WIRE_VIEW
     resp = {
         # lite-v2: expose the slim API contract revision as a top-level
-        # field. Ocdroid dual-reads ``slimapi_contract`` during the cutover
-        # and pins its protocol behaviour (digest 6 字段 /
-        # digest.updatedAt 严格单调 / skeleton 升序 / token stream 透传 /
-        # /full/{mid} 无 304) to value 2 (ocdroid-lite-aggressive-plan §2.5).
-        # Bumped ONLY on contract-breaking changes; additive wire changes
-        # (e.g. optional fields) do NOT bump this. v3 Batch A: the value is
-        # now view-derived (v2 view → 2, v3 view → 3) per v3-contract §3a.
+        # field. Bumped ONLY on contract-breaking changes; additive wire
+        # changes (e.g. optional fields) do NOT bump this. v3 terminal:
+        # the single view is 3 (v3-contract §3a).
         "slimapi_contract": view,
         "sidecar": {"ok": True, "version": __version__},
         "server": {
@@ -79,10 +77,9 @@ async def health(request: Request):
 
 @router.get("/ready")
 async def ready(request: Request):
-    # v3-contract §3a: same dual-view rule as /health for the schema triple —
-    # NO contract field on this endpoint (shape locked). Legacy stacks
-    # without the selector always view 2.
-    view = wire_view_from_scope(request.scope)
+    # v3-contract §3a terminal: same single-view constant as /health for the
+    # schema triple — NO contract field on this endpoint (shape locked).
+    view = WIRE_VIEW
     started = time.monotonic()
     try:
         # P0-6: forward X-Request-ID so the sidecar access log line can be

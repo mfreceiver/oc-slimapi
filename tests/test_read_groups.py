@@ -41,7 +41,6 @@ def _settings(**overrides) -> Settings:
         max_message_bytes=32 * 1024 * 1024,
         max_transforms=1, transform_wait_seconds=0.5,
         max_response_bytes=64 * 1024, smoke_session_id=None,
-        server_api_version=2, accepted_client_versions=(2, 3),
     )
     base.update(overrides)
     return Settings(**base)
@@ -111,10 +110,7 @@ def _build_app(handler, *, settings: Settings | None = None):
         max_response_bytes=settings.max_response_bytes))
     app.include_router(read_groups.router)
     register_error_handlers(app)
-    app.add_middleware(
-        SlimapiSelectorMiddleware,
-        accepted_client_versions=settings.accepted_client_versions,
-        v3_enabled=True)
+    app.add_middleware(SlimapiSelectorMiddleware)
     return app, seen
 
 
@@ -155,26 +151,27 @@ async def test_file_list_v3_happy_passthrough(stack):
     assert upstream.url.params["path"] == "readme.md"
 
 
-async def test_file_v2_query_directory_forwards_verbatim_not_converted(stack):
+async def test_file_v2_query_directory_form_is_unsupported(stack):
+    """Terminal §2: the v2 form (no v, header only) is a retired-version
+    request → 400 unsupported_version, never forwarded upstream."""
     client, seen = stack
     resp = await client.get(
         "/slimapi/file?path=readme.md&directory=/w", headers=V2_HEADERS)
-    assert resp.status_code == 200
-    upstream = seen[0]
-    # §5.2 (v2): directory is NOT consumed — it forwards in the raw query,
-    # byte-identical; the sidecar does not convert it into a header.
-    assert upstream.url.query.decode("latin-1") == "path=readme.md&directory=/w"
-    assert upstream.headers.get(DIRECTORY_HEADER) is None
+    assert resp.status_code == 400
+    assert orjson.loads(resp.content) == {
+        "code": "unsupported_version", "supported": [3]}
+    assert seen == []
 
 
-async def test_file_v2_header_directory_channel_forwarded(stack):
+async def test_file_v2_header_directory_form_is_unsupported(stack):
     client, seen = stack
     resp = await client.get(
         "/slimapi/file?path=readme.md",
         headers={**V2_HEADERS, DIRECTORY_HEADER: "/w"})
-    assert resp.status_code == 200
-    assert seen[0].headers.get(DIRECTORY_HEADER) == "/w"
-    assert seen[0].url.query.decode("latin-1") == "path=readme.md"
+    # §8.3: the selector error (②) precedes the retired-header error (③).
+    assert resp.status_code == 400
+    assert orjson.loads(resp.content)["code"] == "unsupported_version"
+    assert seen == []
 
 
 async def test_file_v2_invalid_directory_header_400(stack):
@@ -182,30 +179,31 @@ async def test_file_v2_invalid_directory_header_400(stack):
     resp = await client.get(
         "/slimapi/file?path=r",
         headers={**V2_HEADERS, DIRECTORY_HEADER: "../escape"})
+    # §8.3: even an invalid directory header is outranked by the selector
+    # error — the v2 form is rejected as unsupported_version first.
     assert resp.status_code == 400
-    assert orjson.loads(resp.content)["code"] == "invalid_directory"
+    assert orjson.loads(resp.content)["code"] == "unsupported_version"
 
 
-async def test_file_v2_query_and_header_both_forwarded(stack):
+async def test_file_v2_query_and_header_both_unsupported(stack):
     client, seen = stack
-    # v2 read groups follow catch-all semantics: both channels forward,
-    # no dual-present conflict check (§5.4 is a v3 consuming-set rule).
     resp = await client.get(
         "/slimapi/file?path=r&directory=/q",
         headers={**V2_HEADERS, DIRECTORY_HEADER: "/h"})
-    assert resp.status_code == 200
-    assert seen[0].url.query.decode("latin-1") == "path=r&directory=/q"
-    assert seen[0].headers.get(DIRECTORY_HEADER) == "/h"
+    assert resp.status_code == 400
+    assert orjson.loads(resp.content)["code"] == "unsupported_version"
+    assert seen == []
 
 
-async def test_v2_unknown_duplicate_encoded_query_verbatim(stack):
+async def test_v2_unknown_duplicate_encoded_query_unsupported(stack):
+    """Converted (terminal): the v2 form is rejected; the byte-fidelity
+    semantics live on in the v3 sibling test below."""
     client, seen = stack
     resp = await client.get(
         "/slimapi/file?path=r&a=1&a=2&b=%2F&c=a+b", headers=V2_HEADERS)
-    assert resp.status_code == 200
-    # Byte fidelity (§5.2 / proxy.py:182-203 semantics): unknown params,
-    # repeats, percent-encodings and '+' survive verbatim.
-    assert seen[0].url.query.decode("latin-1") == "path=r&a=1&a=2&b=%2F&c=a+b"
+    assert resp.status_code == 400
+    assert orjson.loads(resp.content)["code"] == "unsupported_version"
+    assert seen == []
 
 
 async def test_v3_unknown_duplicate_encoded_query_verbatim(stack):
@@ -216,11 +214,13 @@ async def test_v3_unknown_duplicate_encoded_query_verbatim(stack):
     assert seen[0].url.query.decode("latin-1") == "path=r&a=1&a=2&b=%2F&c=a+b"
 
 
-async def test_v2_explicit_selector_strips_v_rest_verbatim(stack):
+async def test_v2_explicit_selector_is_unsupported(stack):
     client, seen = stack
     resp = await client.get("/slimapi/vcs?v=2&a=1", headers=V2_HEADERS)
-    assert resp.status_code == 200
-    assert seen[0].url.query.decode("latin-1") == "a=1"
+    assert resp.status_code == 400
+    assert orjson.loads(resp.content) == {
+        "code": "unsupported_version", "supported": [3]}
+    assert seen == []
 
 
 async def test_file_v3_directory_query_consumed_and_stripped(stack):
@@ -468,18 +468,18 @@ async def test_etag_present_and_304_revalidation(stack):
 
 
 async def test_etag_v2_v3_validator_isolation(stack):
+    """Terminal: a single v3 domain remains — the v2 form never yields a
+    validator (it is rejected), and the v3 validator revalidates."""
     client, _ = stack
     v2 = await client.get("/slimapi/file?path=r", headers=V2_HEADERS)
-    assert "etag" in v2.headers
-    v3 = await client.get(
+    assert v2.status_code == 400
+    assert "etag" not in v2.headers
+    v3 = await client.get("/slimapi/file?v=3&path=r", headers=IDENTITY)
+    assert "etag" in v3.headers
+    reval = await client.get(
         "/slimapi/file?v=3&path=r",
-        headers={**IDENTITY, "If-None-Match": v2.headers["etag"]})
-    assert v3.status_code == 200  # cross-domain validator: no 304
-    v3b = await client.get("/slimapi/file?v=3&path=r", headers=IDENTITY)
-    back = await client.get(
-        "/slimapi/file?path=r",
-        headers={**V2_HEADERS, "If-None-Match": v3b.headers["etag"]})
-    assert back.status_code == 200
+        headers={**IDENTITY, "If-None-Match": v3.headers["etag"]})
+    assert reval.status_code == 304
 
 
 async def test_etag_disabled_config_yields_no_etag():
@@ -563,13 +563,16 @@ async def test_v3_dual_present_conflict_400_directory_conflict(stack):
     assert body["headerDirectory"] == "/b"
 
 
-async def test_v3_dual_present_same_value_ok(stack):
+async def test_v3_dual_present_same_value_retired(stack):
+    """Terminal §5.7: even a normalized-equal dual presence is rejected —
+    the header channel itself is retired on consuming routes."""
     client, seen = stack
     resp = await client.get(
         "/slimapi/file?v=3&path=r&directory=/w",
         headers={**IDENTITY, DIRECTORY_HEADER: "/w"})
-    assert resp.status_code == 200
-    assert seen[0].headers.get(DIRECTORY_HEADER) == "/w"
+    assert resp.status_code == 400
+    assert orjson.loads(resp.content)["code"] == "directory_header_retired"
+    assert seen == []
 
 
 async def test_v3_multi_value_directory_conflict(stack):
@@ -589,12 +592,15 @@ async def test_v3_multi_value_same_directory_folds(stack):
     assert seen[0].headers.get(DIRECTORY_HEADER) == "/w"
 
 
-async def test_v3_header_only_directory_consumed(stack):
+async def test_v3_header_only_directory_retired(stack):
+    """Terminal §5.7: the header-only channel is retired on consuming
+    routes — the query channel (?directory=) is the canonical form."""
     client, seen = stack
     resp = await client.get("/slimapi/vcs?v=3",
                             headers={**IDENTITY, DIRECTORY_HEADER: "/w"})
-    assert resp.status_code == 200
-    assert seen[0].headers.get(DIRECTORY_HEADER) == "/w"
+    assert resp.status_code == 400
+    assert orjson.loads(resp.content)["code"] == "directory_header_retired"
+    assert seen == []
 
 
 async def test_v3_invalid_directory_selector_on_find(stack):
@@ -617,22 +623,21 @@ async def test_v3_directory_not_stripped_on_tolerant_route(stack):
     assert seen[0].url.query.decode("latin-1") == "directory=/w"
 
 
-async def test_v2_directory_not_consumed_by_selector(stack):
+async def test_v2_directory_form_unsupported(stack):
     client, seen = stack
     resp = await client.get(
         "/slimapi/session/s1?directory=/w", headers=V2_HEADERS)
-    assert resp.status_code == 200
-    # v2 (§5.2): directory query forwards verbatim in the raw query and is
-    # NOT converted to a header — no sidecar smart handling.
-    assert seen[0].url.query.decode("latin-1") == "directory=/w"
-    assert seen[0].headers.get(DIRECTORY_HEADER) is None
+    assert resp.status_code == 400
+    assert orjson.loads(resp.content)["code"] == "unsupported_version"
+    assert seen == []
 
 
 async def test_v3_missing_selector_on_read_route_gated(stack):
     client, _ = stack
     resp = await client.get("/slimapi/file?path=r", headers=IDENTITY)
     assert resp.status_code == 400
-    assert orjson.loads(resp.content)["code"] == "version_required"
+    assert orjson.loads(resp.content) == {
+        "code": "unsupported_version", "supported": [3]}
 
 
 async def test_missing_required_query_params_422(stack):
@@ -793,7 +798,7 @@ async def test_upstream_301_not_followed_location_passthrough():
 # B3: v2 query directory validation on consuming routes (v2-contract:483)
 # ---------------------------------------------------------------------------
 
-async def test_v2_invalid_directory_query_400():
+async def test_v2_invalid_directory_query_unsupported():
     def handler(request, payloads):
         return httpx.Response(200, content=b"[]",
                               headers={"Content-Type": "application/json"})
@@ -802,13 +807,14 @@ async def test_v2_invalid_directory_query_400():
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport,
                                  base_url="http://t") as client:
+        # §8.3: selector error (②) outranks the directory error (③).
         resp = await client.get("/slimapi/file?path=r&directory=../..",
                                 headers=V2_HEADERS)
         assert resp.status_code == 400
-        assert resp.json()["code"] == "invalid_directory"
+        assert resp.json()["code"] == "unsupported_version"
 
 
-async def test_v2_multi_directory_any_invalid_400():
+async def test_v2_multi_directory_any_invalid_unsupported():
     def handler(request, payloads):
         return httpx.Response(200, content=b"[]",
                               headers={"Content-Type": "application/json"})
@@ -820,10 +826,10 @@ async def test_v2_multi_directory_any_invalid_400():
         resp = await client.get("/slimapi/file?path=r&directory=/w1&directory=../x",
                                 headers=V2_HEADERS)
         assert resp.status_code == 400
-        assert resp.json()["code"] == "invalid_directory"
+        assert resp.json()["code"] == "unsupported_version"
 
 
-async def test_v2_multi_directory_all_legal_still_verbatim():
+async def test_v2_multi_directory_all_legal_unsupported():
     def handler(request, payloads):
         return httpx.Response(200, content=b"[]",
                               headers={"Content-Type": "application/json"})
@@ -835,10 +841,9 @@ async def test_v2_multi_directory_all_legal_still_verbatim():
         resp = await client.get(
             "/slimapi/file?path=r&directory=/w1&directory=/w2",
             headers=V2_HEADERS)
-        assert resp.status_code == 200
-        # Validation is NOT a rebuild: legal multi-values stay verbatim.
-        assert seen[0].url.query.decode("latin-1") == \
-            "path=r&directory=/w1&directory=/w2"
+        assert resp.status_code == 400
+        assert resp.json()["code"] == "unsupported_version"
+        assert seen == []
 
 
 async def test_v3_tolerant_route_invalid_directory_passthrough():
