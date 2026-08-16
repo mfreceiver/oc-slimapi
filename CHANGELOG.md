@@ -856,9 +856,9 @@ ocdroid 对接时：
 - 发版：[`docs/release.md`](docs/release.md)
 - 客户端清单：[`docs/specs/CLIENT_CHANGES.md`](docs/specs/CLIENT_CHANGES.md)
 
-## [Unreleased]
+## [3.0.0] - 2026-08-17 — M3 v3-only 终态（v2 wire 语义整体退役；破坏性，`X-Slimapi-Version` 头删除非 bump——版本协商唯一机制 = `?v=3` selector + `/slimapi/versions`）
 
-### Removed（M3 破坏性：v3-only 终态——v2 wire 语义整体退役；权威= `docs/specs/v3-contract.md` §1/§2/§5.7/§6.2/§8.2/§8.3）
+### Removed（权威= `docs/specs/v3-contract.md` §1/§2/§5.7/§6.2/§8.2/§8.3）
 
 > 本次为**破坏性变更集**。升级前置条件（生产 systemd 单元）：`OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS=3,3`（原 `2,3`）后**重启** oc-slimapi；ocdroid 必须已全部走 `?v=3` 形态。
 
