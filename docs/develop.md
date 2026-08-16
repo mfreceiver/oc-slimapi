@@ -20,8 +20,8 @@ python -m venv .venv
 | `OC_SLIMAPI_UPSTREAM` | `http://127.0.0.1:4096` | 固定 loopback upstream（无论 host 如何，upstream 必须保持 loopback HTTP） |
 | `OC_SLIMAPI_MAX_MESSAGE_BYTES` | `33554432` | 单消息上限 |
 | `OC_SLIMAPI_SMOKE_SESSION_ID` | 无 | 启动字段漂移 smoke 的已知 sid |
-| `OC_SLIMAPI_SERVER_API_VERSION` | `2` | 服务端当前整数 API 版本 |
-| `OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS` | `2,2` | 接受的客户端版本闭区间 |
+| `OC_SLIMAPI_SERVER_API_VERSION` | `3` | 服务端当前整数 API 版本（v3-only 终态） |
+| `OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS` | `3,3` | 接受的客户端版本闭区间（v3-only） |
 | `OC_SLIMAPI_SKELETON_INLINE_OUTPUT_MAX_BYTES` | `4096` | 骨架投影单字段 inline 字节上限（超阈值则降级为引用占位） |
 | `OC_SLIMAPI_TRAFFIC_METRICS_ENABLED` | `1` | 双向字节账本总开关；`0` 时 traffic 账本快照（嵌入 `/slimapi/metrics` 响应的 `traffic` 块）与 ledger 全 no-op |
 | `OC_SLIMAPI_ACCESS_LOG_DIR` | `logs` | access log 目录（按天文件 `access-YYYY-MM-DD.jsonl`）；生产 systemd 覆盖为 `%S/oc-slimapi/logs` |

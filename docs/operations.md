@@ -2,7 +2,7 @@
 
 > 部署、服务管理、日志策略、排障。  
 > 面向 **oc-slimapi 操作者**（运行 sidecar 的人）与 **ocdroid 项目组**（理解客户端如何接入）。  
-> Wire 契约见 [`v2-contract.md`](specs/v2-contract.md)；发版见 [`release.md`](release.md)。
+> Wire 契约见 [`v3-contract.md`](specs/v3-contract.md)（v2 已于 3.0.0 退役，历史见 [`v2-contract.md`](specs/v2-contract.md)）；发版见 [`release.md`](release.md)。
 
 ---
 
@@ -383,9 +383,9 @@ ocdroid 客户端**不直接操作** sidecar 进程，只通过 stunnel mTLS 接
 | 经 sidecar 明文直连入口（Tailscale 等） | Tailscale 地址`:4097` → sidecar `0.0.0.0:4097`（依赖 Tailscale ACL / 防火墙；无 mTLS） |
 | 直连回退（不经 sidecar） | stunnel `:14096` → opencode `127.0.0.1:4096` |
 | 所有 `/slimapi/**` 请求必带 query | `?v=3`（无 `v`/`v=2`/不支持值 → `400 unsupported_version supported:[3]`；`X-Slimapi-Version` 头已删除不解读） |
-| 非 `/slimapi/**` | 透明反代 opencode，**不带**版本头 |
-| 健康自检（客户端侧） | `GET /slimapi/health` 读 `server.api_version` / `accepted_client_versions` 做运行时兼容判断 |
-| Wire 行为变更来源 | 本仓 [`CHANGELOG.md`](../CHANGELOG.md)（路径/头/错误码以本仓 + [`v2-contract.md`](specs/v2-contract.md) 为准） |
+| 非 `/slimapi/**` | **3.0.0 已关闭**——未收编路径 404 `thin_route_not_found`（2.x 为透明反代，历史行为见 CHANGELOG） |
+| 健康自检（客户端侧） | `GET /slimapi/health?v=3` 读 `server.api_version` / `accepted_client_versions` 做运行时兼容判断 |
+| Wire 行为变更来源 | 本仓 [`CHANGELOG.md`](../CHANGELOG.md)（路径/头/错误码以本仓 + [`v3-contract.md`](specs/v3-contract.md) 为准） |
 | 客户端配套改动清单 | [`CLIENT_CHANGES.md`](specs/CLIENT_CHANGES.md) |
 
 sidecar 进程的启停、日志、升级由 **服务端运维** 负责，ocdroid 侧无需介入；但理解拓扑有助于排障（例如 sidecar 重启时 SSE 会断、客户端应收 `resync` 重连）。
@@ -408,7 +408,8 @@ sidecar 进程的启停、日志、升级由 **服务端运维** 负责，ocdroi
 
 | 文件 | 用途 |
 |---|---|---|
-| [`v2-contract.md`](specs/v2-contract.md) | Wire 契约权威 |
+| [`v3-contract.md`](specs/v3-contract.md) | Wire 契约权威（v3-only 终态） |
+| [`v2-contract.md`](specs/v2-contract.md) | v2 契约（已于 3.0.0 退役，历史参考） |
 | [`release.md`](release.md) | 发版流程 |
 | [`../CHANGELOG.md`](../CHANGELOG.md) | 接口行为变更记录 |
 | [`develop.md`](develop.md) | 配置项速查 + 开发运行 |

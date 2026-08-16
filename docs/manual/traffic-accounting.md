@@ -166,8 +166,8 @@ curl -s "$BASE/slimapi/metrics?$V" | jq '
 | `client` | 客户端 app 名（来自 `X-Client-Name`，明文，**不 hash**） |
 | `clientVer` | 客户端版本（来自 `X-Client-Version`，明文，**不 hash**） |
 | `clientId` | 设备标识 hash（来自 `X-Client-Id`，默认 `sha256(raw)[:16]`；设 `OC_SLIMAPI_CLIENT_ID_SALT` 时为 `hmac_sha256(salt,raw)[:16]`） |
-| `wireVersion` | `"2"` \| `"3"` \| `null`——该请求生效的 wire 语义（`?v=3` → `"3"`；v2 管线（无 `v` 或 `?v=2`）→ `"2"`；被拒/豁免/非 `/slimapi` → `null`） |
-| `selectorResult` | `absent`（无 `v`）\| `v2`（`?v=2`）\| `v3`（`?v=3`）\| `rejected`（词法/不支持被 400）\| `exempt`（`GET /slimapi/versions`）\| `not_applicable`（catch-all 非 `/slimapi` 路由） |
+| `wireVersion` | `"2"` \| `"3"` \| `null`——该请求生效的 wire 语义（`?v=3` → `"3"`；**v2 管线已于 3.0.0 退役**——`"2"` 值及无 `v`/`?v=2` 语义为 2.x 并行期历史维度，3.0.0 起恒为 400（记 `rejected`）；被拒/豁免/非 `/slimapi` → `null`） |
+| `selectorResult` | `absent`（无 `v`）\| `v2`（`?v=2`）\| `v3`（`?v=3`）\| `rejected`（词法/不支持被 400）\| `exempt`（`GET /slimapi/versions`）\| `not_applicable`（catch-all 非 `/slimapi` 路由）。**3.0.0 终态：`absent`/`v2` 值的请求已不可达（一律 400 记 `rejected`）；枚举保留供历史日志（≤2.x 期）与 snapshot 矩阵维度对账** |
 | `directoryForm` | `query` \| `header` \| `both` \| `absent` \| `null`——directory 输入形态（仅 directory 消费集路由非 null：messages list/full、sessions 列表/status、todo/children/diff、agent/command、stream；其余含 catch-all = `null`） |
 | `recordType` | `request`（每 HTTP 请求一行）\| `sse_open` \| `sse_close`（SSE 建立断开标记行）。**消费口径：统计请求数/字节时必须过滤 `recordType=="request"`** |
 | `lifecycleId` | 进程内单调递增 int；同一条 SSE 连接的 `sse_open`/`sse_close` 行同值（配对键）。仅生命周期行有值，`request` 行为 `null`。`requestId` 在 SSE 重连时可复用，仅辅助关联，**配对以 `lifecycleId` 为准** |
@@ -358,8 +358,8 @@ jq -c '{ts, ratio: .ratios.messages.downOutOverUpIn}' /tmp/snap-all.jsonl
 }
 ```
 
-- **matrix** 维度 = 契约 v3 §9.2 的 `date × selectorResult × wireVersion × directoryForm × recordType × statusClass × bucket` 计数矩阵（内存视角无 date 维，跨日用 §9.4 末尾的离线聚合或按天 snapshot 帧对齐）；`statusClass` 形如 `"2xx"`，无 status 时 `"none"`。
-- **sseActive 语义**：`not_applicable` = catch-all 透传 SSE（`/event`、`/global/event`，不经省流面但计入观测）；`absent` = 无 `v` 参数的旧客户端 SSE。`rejected`/`exempt` 无 SSE 端点，恒不出现。
+- **matrix** 维度 = 契约 v3 §9.2 的 `date × selectorResult × wireVersion × directoryForm × recordType × statusClass × bucket` 计数矩阵（内存视角无 date 维，跨日用 §9.4 末尾的离线聚合或按天 snapshot 帧对齐）；`statusClass` 形如 `"2xx"`，无 status 时 `"none"`。**3.0.0 终态：`v2`/`absent` 维度值已不可达（无 `v`/`?v=2` 一律 400 记 `rejected`）——矩阵保留全枚举维度供 ≤2.x 历史帧对账。**
+- **sseActive 语义**：`not_applicable` = catch-all 透传 SSE（`/event`、`/global/event`，不经省流面但计入观测）；`absent` = 无 `v` 参数的旧客户端 SSE。`rejected`/`exempt` 无 SSE 端点，恒不出现。**3.0.0 终态：`v2`/`absent` 维度自然归零（旧客户端开流前即 400）；四维枚举保留供历史帧对账与退役判据（§9.3）核验。**
 - **离线对账**：跨日 carry-in 公式 `sseActive[D+1,k] = sseActive[D,k] + sse_open[D,k] − matched_sse_close[D,k]`（`sseActive[D,k]` 取 D 日首行时的窗口起点存量）。**matched/orphan 配对按 `lifecycleId`**（§11.8）：close 行的 `lifecycleId` 能配到先前未匹配 open（同 dim、跨日 carry）→ `matched_sse_close`（计入 close 当日，并从待配对集合移除）；配不到（open 早于数据窗口 / sidecar 重启后集合已空 / id 缺失）→ **孤儿 close**，只补记计数，**不冲减存量**（避免错误消耗他人活跃连接）。`traffic_snapshot.aggregate_v3_observability(records)` 提供该纯函数实现（输入按天 access log 解析出的记录列表，输出 `counts`/`countsByDate`/`sseActive`/`sseOpens`/`sseMatchedCloses`/`sseOrphanCloses`/`sseLive`），供运维脚本与测试对账复用。
 
 ---
