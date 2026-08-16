@@ -1,6 +1,6 @@
 # oc-slimapi v3 wire 契约（design-v3 rev11 — 终态）
 
-> 状态：**DRAFT rev11**（2026-08-16；rev6 终态重写 → 七评 9.1 → rev8 → 八评 9.4 → rev9 → 九评 9.4 → rev10 → 十评 9.4 → 本轮修复 carry-in 公式遗漏当日新开项；待十一评 ≥9.5 转正式）。
+> 状态：**正式——2.0.0 实施基线**（design-v3 rev11；2026-08-16 十一轮评审收敛 6.8→8.3→8.9→9.2→9.1→8.3→9.1→9.4→9.4→9.4→9.7 PASS，rev-sgpt 十一评）。
 > 方向决策（不可推翻）：单入口终态——`/slimapi/**` 提供完整功能（实测使用集：ocdroid StandardApi 全量端点），catch-all 3.0.0 关闭，全部自定义头退役。两步走（已定）：sidecar 2.0.0 → ocdroid 3.0.0（smoke 门控）→ sidecar 3.0.0。
 > v2 权威：`docs/specs/v2-contract.md`。条款标 **[冻结]** 或 **[计划]**。
 
