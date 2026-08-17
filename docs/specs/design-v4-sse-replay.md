@@ -14,6 +14,7 @@
 | 2026-08-17 rev-1 | 评审修复（rev-sgpt FAIL 后 R2）：全局流单序列（per-directory 域废除，全实例单连接策展流事实）；epoch 四类输入唯一语义（旧合法 epoch → resync{epoch_changed}；future/非法/跨端点 → 忽略重置）；错误体扁平化（仓库 CodedHTTPException 约定）；tombstone 序列语义（replay 复用既有 `message.removed` 帧形，seq 无空洞） |
 | 2026-08-17 rev-2 | 评审修复 R3：epoch 改**随机 boot nonce**（16 hex，非墙钟无序不比较——墙钟回拨/碰撞不可靠；判定 = epoch ≠ 当前 → 一律 resync{epoch_changed}，弃 future-epoch 区分）；ID 编入**域标签**（`g:<epoch>:<seq>` / `t:<sid>:<epoch>:<seq>`——无标签时跨端点域不可判定）；REPLAY-010 跨 epoch 字典序断言废除（nonce 无序，改为分段断言 + resync 界标） |
 | 2026-08-17 rev-3 | 评审修复 R4：§2.3 ID 语法与 §3.2 统一（域标签单一语法）；**上游断连恢复状态机补全**（两端点表行 + §3.5 触发条件冻结 + REPLAY-014——fanout resync{reconnect_no_replay}，epoch 不变 seq 不重置，禁 replay log 补上游缺口）；**Last-Event-ID 分类优先级冻结**（语法→域→epoch→seq 严格短路序 + REPLAY-015 组合输入）；search 规范化扩至 HTTP 降级路径（第四消费点，hash 输入 = trim 后转义前精确化） |
+| 2026-08-17 rev-4 | 评审修复 R5：**上游断连持久 barrier**（§3.4——每受影响域日志写 low-watermark，Last-Event-ID 早于水位 → resync{reconnect_no_replay}，防离线客户端跨缺口静默重放 + REPLAY-017）；**触发时点勘误**（首次确认 loss 即触发——EOF `global_hub.py:894-904`/异常 `:913-922` 为主，成功重连 `:847-863` 仅兜底，非"恢复成功才触发"）；REPLAY 重编号（心跳复归 014，新增 015/016/017，共 17 条）；REPLAY-016 旧 epoch 分支补 meta 恒首帧断言 |
 
 ---
 
@@ -105,7 +106,7 @@ data: {
 | 重连（格式非法 / 跨端点域） | CONNECTING → ESTABLISHED | 忽略该 ID（视为无 Last-Event-ID）→ `meta`（无 id）→ 新帧 | 非法/跨域无法解析 → 忽略重置，同 future 路径 |
 | 重连（窗口内缺 seq = gap，如日志逐出边缘） | CONNECTING → RESYNCED → ESTABLISHED | `meta`（无 id）→ `resync{reason:"replay_gap"}`（无 id）→ 新帧 | gap 无法以补帧缝合（缺公开发布记录）→ resync；客户端 resync 后**自行 HTTP 全量拉取**（snapshot 为客户端动作，服务端不发 snapshot 帧） |
 | 背压溢出（subscriber 队列满，帧被丢弃未送达） | ESTABLISHED →（客户端断连）→ 重连 | 溢出帧**已入重放日志**（§3.5，记录「已发布帧」）→ 重连后走补帧路径恢复 | 溢出丢帧正是重放日志的用途；不断连则客户端自按 ID 去重 |
-| **上游断连后恢复（rev-3 补）** | ESTABLISHED → RESYNCED → ESTABLISHED（存量连接，无重连） | `resync{reason:"reconnect_no_replay"}`（无 id，fanout 全部存量订阅者）→ 恢复后新帧（seq 继续） | **v3 现行为延续**（`global_hub.py:825` fanout `resync{reconnect_no_replay}`）；断连期间 sidecar 观察不到上游事件 → replay log **不含**缺口帧（日志只录已发布帧）→ 必须 resync 令客户端 HTTP 全量对齐；**epoch 不变**（sidecar 未重启，进程内日志仍有效）；seq 不重置（新帧继续单调；「上游侧缺口」不映射为「日志失效」） |
+| **上游断连后恢复（rev-3 补，rev-4 勘误触发时点）** | ESTABLISHED → RESYNCED → ESTABLISHED（存量连接，无重连） | `resync{reason:"reconnect_no_replay"}`（无 id，fanout 全部存量订阅者）→ 恢复后新帧（seq 继续） | **v3 现行为延续**（`global_hub.py:825` fanout 帧形锚点）；**触发时点 = 首次确认上游 loss 即触发**（EOF 路径 `global_hub.py:894-904` / 异常路径 `:913-922`，带 `_upstream_loss_notified` 防重；成功重连路径 `:847-863` 仅作未通知时兜底——rev-4 勘误：非"恢复成功才触发"）；断连期间 sidecar 观察不到上游事件 → replay log 不含缺口帧 + **日志已写 barrier（§3.4）** → 必须 resync 提示客户端 HTTP 全量对齐；恢复时该 sid 的 pending live 缓冲清空（重订阅重建）；**epoch 不变**（sidecar 未重启，日志仍有效）；seq 不重置（新帧继续单调） |
 | subscriber 溢出（新接入超限） | —（开流前） | 503 `{code:"subscriber_capacity_exceeded", limit, current}` + `Retry-After` | 同 v3 冻结行为（events.py:47-55），非重放场景 |
 
 #### token 流 `GET /slimapi/sessions/{sid}/stream?v=4`（tokens 恒 true）
@@ -115,7 +116,7 @@ data: {
 | 首连（无 Last-Event-ID） | CONNECTING → ESTABLISHED | `meta`（无 id，seqBase=当前）→ token 帧（seq 递增）→ heartbeat | 无重放 |
 | 重连（Last-Event-ID 在窗口内，epoch 匹配） | CONNECTING → REPLAYING → ESTABLISHED | `meta`（无 id）→ replay token 帧（seq = lastID+1 … 窗口尾）→ 新 token 帧 → heartbeat | 补帧；已撤销消息（tombstone）以既有 `message.removed` 帧形照常回放（带 `id:`，seq 连续）——见 §3.5 tombstone 裁决 |
 | 重连（旧 epoch / 过期 / gap） | CONNECTING → RESYNCED → ESTABLISHED | `meta` → `resync{reason:"epoch_changed"|"replay_expired"|"replay_gap"}` → 新 token 帧 | 同全局流语义（epoch_changed 仅限旧 epoch 场景） |
-| **上游断连后恢复（rev-3 补）** | ESTABLISHED → RESYNCED → ESTABLISHED（存量连接，无重连） | `resync{reason:"reconnect_no_replay"}`（无 id，fanout 至全部存量订阅者）→ 恢复后新 token 帧（seq 继续） | **v3 现行为延续**（`tokenstream/hub.py:1896-1900` 对每有订阅者的 sid fanout）；断连期间 sidecar 观察不到上游事件 → replay log 不含缺口帧 → **必须 resync 提示客户端 HTTP 全量对齐**；恢复时该 sid 的 pending live 缓冲清空（重订阅重建）；**epoch 不变**（sidecar 未重启，日志仍有效——resync 表「上游侧有缺口」非「日志失效」）；seq 不重置（新帧继续单调） |
+| **上游断连后恢复（rev-3 补）** | ESTABLISHED → RESYNCED → ESTABLISHED（存量连接，无重连） | `resync{reason:"reconnect_no_replay"}`（无 id，fanout 至全部存量订阅者）→ 恢复后新 token 帧（seq 继续） | **v3 现行为延续**（`tokenstream/hub.py:1896-1900` 对每有订阅者的 sid fanout）；断连期间 sidecar 观察不到上游事件 → replay log 不含缺口帧 + **日志已写 barrier（§3.4）** → **必须 resync** 提示客户端 HTTP 全量对齐；恢复时该 sid 的 pending live 缓冲清空（重订阅重建）；**epoch 不变**（sidecar 未重启，日志仍有效——resync 表「上游侧有缺口」非「日志失效」）；seq 不重置（新帧继续单调） |
 | `/stream` 上 tokens=1 语义 | CONNECTING | 恒 true（v3 冻结） | 不适用 400（400 仅限 `/events?tokens=1`，§2.1） |
 
 **通用不变量（两端点强制，测试断言点）**：①meta 恒首帧（v3 行 168 冻结延续）；②带 `id:` 的帧按 (epoch, seq) 严格单调不减；③无 `id:` 的帧（meta/resync/heartbeat）不参与序列；④replay 帧序列内不插入任何新帧。
@@ -162,6 +163,7 @@ id: t:<sid>:<epoch>:<seq>        # token 流 /sessions/{sid}/stream（t = token 
 | TTL | 15 min/帧 | 帧入日志时间 + TTL，到期逐出（滑窗） |
 
 - **覆盖策略**：环形缓冲，逐出最旧；任一维度触顶即逐出最旧帧，直至低于阈值。逐出后对应 seq 区间不可补 → 客户端 Last-Event-ID 落此区间 = 过期 → resync（2.4 表格）。
+- **上游断连 barrier（rev-4 冻结——防离线客户端跨缺口静默重放）**：sidecar 检测到上游 loss 时，除 fanout 存量订阅者外，在**每个受影响 ID 域的重放日志内写入不可跨越的持久 barrier**（记录断连时刻该域已发布 max seq = 水位；进程内存态，随日志生命周期）。**重放判定增补一条（优先级在 ④窗口判定内）**：Last-Event-ID 的 seq **早于本域最近 barrier 水位** → 一律 `resync{reason:"reconnect_no_replay"}`（无论帧是否仍在窗口内）——barrier 之前的帧与之后的新帧之间，sidecar 未观察到的上游事件存在缺口，**禁止跨 barrier 补帧**；离线客户端恢复在线后携带断连前 ID 重连，同样命中 barrier → resync 全量对齐。上游恢复后新帧继续单调（seq 不重置，barrier 不消耗 seq）；多轮断连 → 每轮各写一 barrier（水位单调递增，判定只看最近一个即可）。
 - **与现有组件边界（明确）**：
   - GlobalHub pending（250ms debounce）＝**发布前**的合并窗口（digest 合并节拍）——不属于重放日志，v4 不把 pending 当日志；
   - tombstone 队列（`TOKEN_REMOVED_MESSAGES` cap 1000 / TTL 24h，`config.py:72-73`）＝已撤销消息索引（`message.removed` tombstone，`tokenstream/hub.py:277`）——是**既有 token 域重放机制的配套索引**，与 v4 重放日志并存不混用：重放日志管「帧已公开发布 + seq 分配」，tombstone 管「哪些消息已撤销须以 `message.removed` 帧回放」（§3.5 tombstone 裁决）；
@@ -180,7 +182,7 @@ id: t:<sid>:<epoch>:<seq>        # token 流 /sessions/{sid}/stream（t = token 
 | Last-Event-ID future（同 epoch，seq > 当前已发布 max） | 无法确认存在过的帧 | 忽略 + 重置（按无 Last-Event-ID 处理），新帧继续；客户端按 (epoch,seq) 去重自担 |
 | 格式非法 / 跨端点域 | 无法解析或端点域不匹配 | 忽略 + 重置（同 future 路径） |
 | gap（窗口内缺 seq，非自然逐出的单点/区间缺失） | 窗口内 `lastID+1` 帧不存在或区间不连续 | `resync{reason:"replay_gap"}` + 新帧；**客户端 resync 后自行 HTTP 全量拉取（如 `/slimapi/sessions` 首屏 / token 域重拉消息投影）——snapshot 是客户端动作，服务端不发 snapshot 帧**（v2.2 行 153 "snapshot" 措辞注解为客户端全量获取行为） |
-| **上游断连后恢复**（sidecar↔`/global/event` 断开期间漏观察上游事件；v3 现行为延续 rev-3 冻结） | 非 Last-Event-ID 输入——sidecar 检测上游重连成功即触发 | `resync{reason:"reconnect_no_replay"}`（无 id，fanout 全部存量订阅者）→ 恢复后新帧；**epoch 不变、seq 不重置**；token 域另清空该 sid 的 pending live 缓冲（重订阅重建，`tokenstream/hub.py:1896-1900` v3 锚点）；客户端按 v3 语义 HTTP 全量对齐。**禁止**依赖 replay log 补上游断连缺口——日志只录「sidecar 已发布帧」，不含断连期间上游事件 |
+| **上游断连后恢复**（sidecar↔`/global/event` 断开期间漏观察上游事件；v3 现行为延续 rev-3 冻结、rev-4 勘误触发时点） | 非 Last-Event-ID 输入——**首次确认上游 loss 即触发**（EOF `global_hub.py:894-904` / 异常 `:913-922`，`_upstream_loss_notified` 防重；成功重连 `:847-863` 仅未通知时兜底） | `resync{reason:"reconnect_no_replay"}`（无 id，fanout 全部存量订阅者）→ 恢复后新帧；**epoch 不变、seq 不重置**；**同时在每受影响域日志写 barrier（§3.4——离线客户端后续重连按 barrier 判定 resync，防跨缺口静默重放）**；token 域另清空该 sid 的 pending live 缓冲（重订阅重建，`tokenstream/hub.py:1896-1900` v3 锚点）；客户端按 v3 语义 HTTP 全量对齐。**禁止**依赖 replay log 补上游断连缺口——日志只录「sidecar 已发布帧」，不含断连期间上游事件 |
 
 **tombstone 裁决（rev-1，REPLAY-012）**：token 流重放遇已撤销消息（`message.removed` tombstone）时，**照常消耗该 seq 并发送既有 `message.removed` 轻量撤销帧（保留 `id:`）**——复用既有 wire 帧形（`tokenstream/frames.py:137-151`：`event: message.removed` + `{"sessionID","messageID"}`），**ID 序列无空洞**；客户端收到撤销帧即丢弃该消息缓存。否决"跳过内容仅消耗 seq"：会造成 window 内单点 seq 缺口，客户端无法区分"受控空洞"与真实 gap（判定歧义），且与不变量②（(epoch,seq) 严格单调、无空洞的强形式）冲突。否决"跳过且 seq 留洞"：引入"客户端不得视为 gap"的新协议规则，弱化 gap 判定且与门槛④不变量相悖。
 
@@ -215,9 +217,10 @@ id: t:<sid>:<epoch>:<seq>        # token 流 /sessions/{sid}/stream（t = token 
 | REPLAY-011 双流 ID 域独立 | 同一 sid 同时开 `/events?v=4` 与 `/stream?v=4` | 两流各自发布事件 | `/events` 帧 id 按**全局单序列**递增；`/stream` 帧 id 按 **sid 域**递增；两域 seq 互不干扰（同一 sid 事件在两流各占自己计数器） | 单域单序列；跨流无 seq 竞争 |
 | REPLAY-012 token 重放含 tombstone | sid 内消息 M 被撤销（`message.removed` 入 `TOKEN_REMOVED_MESSAGES`） | 断连（seq=N，M 帧已发布）→ 重连 Last-Event-ID=N-1 | `meta` → replay 帧自 N 起；M 帧以 `message.removed` 轻量撤销帧回放（**保留 `id:`，seq 无空洞**）→ 新帧 | 已撤销消息以撤销帧回放（客户端丢弃缓存）；seq 仍连续（无 gap 判定） |
 | REPLAY-013 meta additive 不破坏 v3 | v3 客户端（无 v4 协商）正常连接 | 同域发布事件 | v3 帧形零变化（无 id:、无 capabilities 字段）；meta 仍为 `subscriberId`+`tokens` | 冻结回归：v3 契约 §7 行 167-168 逐条断言 |
-| REPLAY-014 上游断连恢复（rev-3 补） | 订阅者已 ESTABLISHED；sidecar↔上游 `/global/event` 断开数秒后恢复（断连期间上游有新事件） | 存量订阅连接不断开 | `resync{reason:"reconnect_no_replay"}`（无 id）fanout 到达全部存量订阅者 → 恢复后新帧（带 id，seq 继续单调，不重置）；epoch 不变 | resync 帧先于恢复后首个新业务帧；断连缺口**不**经 replay log 补（日志无此帧）；客户端随后 HTTP 全量对齐（断言发起）；token 域同场景另断言该 sid pending live 缓冲清空 |
-| REPLAY-015 组合输入分类优先级（rev-3 补） | `/events` 收到 `t:<other-sid>:<旧epoch>:5`（跨端点域 + 旧 epoch 组合）；对照 `/events` 收到 `g:<旧epoch>:5`（纯旧 epoch） | 两连接分别携带 | 前者 = 忽略重置（②端点域校验先命中短路，不走 epoch_changed）→ `meta` → 新帧；后者 = `resync{epoch_changed}` → 新帧 | 优先级冻结断言：语法→域→epoch→seq 严格短路序；组合输入不再触发 resync |
 | REPLAY-014 心跳无 ID | 长连接静默 15s | 观察心跳帧 | heartbeat 帧无 `id:` | 心跳不占序列、不入日志 |
+| REPLAY-015 上游断连恢复（在线订阅者，rev-3 补） | 订阅者已 ESTABLISHED；sidecar↔上游 `/global/event` 断开数秒后恢复（断连期间上游有新事件） | 存量订阅连接不断开 | `resync{reason:"reconnect_no_replay"}`（无 id）fanout 到达全部存量订阅者（**触发时点 = 首次确认 loss**，EOF/异常路径即发；恢复连接仅为未通知时兜底）→ 恢复后新帧（带 id，seq 继续单调，不重置）；epoch 不变 | resync 帧先于恢复后首个新业务帧；断连缺口**不**经 replay log 补（日志无此帧）；**barrier 已写入日志（断言日志状态）**；客户端随后 HTTP 全量对齐（断言发起）；token 域同场景另断言该 sid pending live 缓冲清空 |
+| REPLAY-016 组合输入分类优先级（rev-3 补） | `/events` 收到 `t:<other-sid>:<旧epoch>:5`（跨端点域 + 旧 epoch 组合）；对照 `/events` 收到 `g:<旧epoch>:5`（纯旧 epoch） | 两连接分别携带 | 前者 = 忽略重置（②端点域校验先命中短路，不走 epoch_changed）→ `meta` → 新帧；后者 = `meta` → `resync{epoch_changed}` → 新帧（**meta 恒首帧**，meta/resync 均无 id——不变量①） | 优先级冻结断言：语法→域→epoch→seq 严格短路序；组合输入不再触发 resync；旧 epoch 分支 meta 首帧在场 |
+| REPLAY-017 barrier 拦截离线客户端（rev-4 补） | 客户端收到 `g:E:100` 后断开（离线）；sidecar↔上游断连（日志写 barrier 水位=100）；恢复后发布 `g:E:101`、`g:E:102`（仍同 epoch 同窗口内） | 客户端携带 `Last-Event-ID: g:E:100` 重连 | `meta` → `resync{reason:"reconnect_no_replay"}`（无 id）→ 新帧 seq=103 起；**不得**补发 101/102（barrier 禁跨缺口补帧） | 离线客户端被 barrier 拦截 → resync 全量对齐（防静默漏事件）；窗口内连续帧不构成补帧依据（barrier 优先于窗口判定，§3.4） |
 
 ---
 
