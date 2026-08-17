@@ -3,7 +3,7 @@
 > 状态：**正式——2.0.0 实施基线，3.0.0（m3 分支）为 v3-only 终态实施**（design-v3 rev11；2026-08-16 十一轮评审收敛 6.8→8.3→8.9→9.2→9.1→8.3→9.1→9.4→9.4→9.4→9.7 PASS，rev-sgpt 十一评）。
 > 方向决策（不可推翻）：单入口终态——`/slimapi/**` 提供完整功能（实测使用集：ocdroid StandardApi 全量端点），catch-all 3.0.0 关闭，全部自定义头退役。两步走（已定）：sidecar 2.0.0 → ocdroid 3.0.0（smoke 门控）→ sidecar 3.0.0。
 > v2 历史契约（已于 3.0.0 退役）：`docs/specs/v2-contract.md`——本文件 §0 所继承的基线语义以其为准；**当前 wire 权威 = 本文件**（3.0.0 起仅 v3 语义可达）。条款标 **[冻结]** 或 **[计划]**。
-> 修订注记（2026-08-17，**4.0.0 包版本 MAJOR**；wire 版本**不变**，仍 v3、`?v=3` selector 不变）：expand 契约收编（设计权威 `docs/specs/design-expand.md` v5，rev-sgpt R4 APPROVED WITH CHANGES；实现已合入 969e9c6..ff71429，check.sh 全绿）。本次仅修订本文件不 bump wire——新增 §4a（消息投影缩减与 expandRefs）/§4b（expand 片段端点）；skeleton 投影缩减（减性）与 expand 片段端点（加性）均直接并入 v3 视图；§3 capabilities 增 `expand` 对象；§5 消费集纳入两 expand 路由；§6 注明 expand 无 ETag；§8 补 expand 错误码与路由内求值序；§10 读组计数 **7→8**（新增第 8 读组 `messages.expand`，raw 受控代理全节条款 carve-out）；§11 测试矩阵扩充。修订处标 **[4.0.0]**。
+> 修订注记（2026-08-17，**4.0.0 包版本 MAJOR**；wire 版本**不变**，仍 v3、`?v=3` selector 不变）：expand 契约收编（设计权威 `docs/specs/design-expand.md` v5，rev-sgpt R4 APPROVED WITH CHANGES；实现已合入 969e9c6..757d2d1，check.sh 全绿）。本次仅修订本文件不 bump wire——新增 §4a（消息投影缩减与 expandRefs）/§4b（expand 片段端点）；skeleton 投影缩减（减性）与 expand 片段端点（加性）均直接并入 v3 视图；§3 capabilities 增 `expand` 对象；§5 消费集纳入两 expand 路由；§6 注明 expand 无 ETag；§8 补 expand 错误码与路由内求值序；§10 读组计数 **7→8**（新增第 8 读组 `messages.expand`，raw 受控代理全节条款 carve-out）；§11 测试矩阵扩充。修订处标 **[4.0.0]**。
 
 ---
 
@@ -239,7 +239,7 @@ GET /slimapi/versions → 200
 6. 两 SSE 端点（v3 开流/**meta 首帧先于业务帧/heartbeat/resync 回放**/tokens 端点映射断言/lifecycle/`tokens=1` 组合/stream directory 守卫）；
 7. `/versions`（豁免/405/形状/readRoutes capability/未知字段容忍）；
 8. 观测字段（null/exempt/not_applicable/recordType/lifecycleId/**sseActive 四维 `{v2,v3,absent,not_applicable}`：无-v 旧客户端 SSE 归 absent 断言、跨日 carry-in 对账 `sseActive[D+1,k] = sseActive[D,k] + sse_open[D,k] − matched_sse_close[D,k]`（k=维度；§9.2 孤儿 close 校正适用；测试序列必须含"当日新开跨日未关"与"跨日后关闭"两种）、open/close 生命周期配对**）；
-9. **读路由 7 组回归**（每组：happy 透传逐字节/上游 4xx 透传/上游 5xx→503/响应超限 413/directory query 转发断言/幂等 GET ETag 往返（启用子集））；
+9. **既有 raw 读路由 7 组回归**（每组：happy 透传逐字节/上游 4xx 透传/上游 5xx→503/响应超限 413/directory query 转发断言/幂等 GET ETag 往返（启用子集））；
 10. **写路由 12 端点回归**（每端点：happy/4xx 透传/5xx→503/请求超限 413/directory 转发/PATCH 双 shape/fork messageID body 字段）；
 11. **catch-all raw-query 保序回归**（一切 query 含 `v`/`directory` 编码/顺序/重复项逐字透传——`proxy.py:182-203` 锁定，**无任何剥离**；携带 `?v=2/3` 断言同款）；
 12. 退役形态模拟（无 v/`v=2` → 400 `[3]`；头 → `directory_header_retired`；catch-all 404；**§8.3 优先级链逐级断言**）；
