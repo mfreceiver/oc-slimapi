@@ -97,8 +97,6 @@ class QpSweepShadow:
         timestamp = self._now() if now is None else now
         if directory in self._known_dirs:
             self._seen_at[directory] = timestamp
-            if self.running:
-                self._wake_event.set()
             return
         self._known_dirs.add(directory)
         self._seen_at[directory] = timestamp

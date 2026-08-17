@@ -473,3 +473,92 @@ async def test_relative_directory_frame_dropped_when_allowlist_set(
         assert hub.allowlist_dropped_events == 1
     finally:
         await _close_hub(hub)
+
+
+# --- rev-3: root-symlink retarget + identical-value re-apply must
+# re-resolve canonical roots (clear_allowlist_roots_cache is real) ------
+
+
+async def test_root_retarget_reapply_same_settings_value_revalidates(tmp_path):
+    """rev-3 path ①: the allowlist entry is a root symlink resolved to
+    old_root on first validate() (roots cached); the symlink is then
+    retargeted to new_root and the SAME allowlist value is re-applied via
+    a fresh Settings().validate() — the cached roots must be invalidated
+    (same value ⇒ same cache key, so only the explicit clear helps): the
+    old canonical root's subtree now 403s, the new root's passes."""
+    old_root = tmp_path / "old_root"
+    new_root = tmp_path / "new_root"
+    (old_root / "sub").mkdir(parents=True)
+    (new_root / "sub2").mkdir(parents=True)
+    link = tmp_path / "allowed_link"
+    os.symlink(old_root, link)
+    allowlist = [str(link)]  # the SAME value is reused after retarget
+
+    settings = _settings(directory_allowlist=allowlist)
+    settings.validate()  # config-determination point #1 → roots := old_root
+    app, _ = _build_file_app(settings, _file_ok)
+    async with _client(app) as client:
+        before = await client.get(
+            "/slimapi/file?v=3&path=foo&directory=" + str(old_root / "sub"),
+            headers={"Accept-Encoding": "identity"},
+        )
+    assert before.status_code == 200  # decision #1 populated the cache
+
+    link.unlink()
+    os.symlink(new_root, link)  # retarget the root symlink on disk
+
+    revalidated = _settings(directory_allowlist=allowlist)  # identical value
+    revalidated.validate()  # must clear cached roots
+    app2, seen2 = _build_file_app(revalidated, _file_ok)
+    async with _client(app2) as client:
+        after_old = await client.get(
+            "/slimapi/file?v=3&path=foo&directory=" + str(old_root / "sub"),
+            headers={"Accept-Encoding": "identity"},
+        )
+        after_new = await client.get(
+            "/slimapi/file?v=3&path=foo&directory=" + str(new_root / "sub2"),
+            headers={"Accept-Encoding": "identity"},
+        )
+    assert after_old.status_code == 403
+    assert after_old.json() == {"code": "directory_not_allowed"}
+    assert after_new.status_code == 200
+    assert len(seen2) == 1  # only the new-root request reached upstream
+
+
+async def test_root_retarget_runtime_hub_reapply_same_allowlist_value(tmp_path):
+    """rev-3 path ②: same retarget scenario, but the re-apply happens at
+    runtime via ``GlobalHub.set_directory_allowlist(same_value)`` — the
+    hub's frame filter must drop the old canonical root's digest (+count)
+    and pass the new root's."""
+    old_root = tmp_path / "old_root"
+    new_root = tmp_path / "new_root"
+    (old_root / "sub").mkdir(parents=True)
+    (new_root / "sub2").mkdir(parents=True)
+    link = tmp_path / "allowed_link"
+    os.symlink(old_root, link)
+    allowlist = [str(link)]
+
+    hub = GlobalHub(client=None, directory_allowlist=allowlist)
+    subscriber = Subscriber()
+    hub.subscribers.add(subscriber)
+    try:
+        hub.publish(_event(str(old_root / "sub")))
+        hub.flush()
+        assert subscriber.queue.qsize() == 1  # decision #1 cached old_root
+
+        link.unlink()
+        os.symlink(new_root, link)  # retarget
+        hub.set_directory_allowlist(allowlist)  # SAME value re-applied
+
+        # Step-wise assertions so the stale-cache outcome (old root still
+        # emitted) fails HERE, not via coincidentally-equal final counts.
+        hub.publish(_event(str(old_root / "sub")))
+        hub.flush()  # old canonical root → must be dropped + counted
+        assert subscriber.queue.qsize() == 1  # still only the pre-retarget frame
+        assert hub.allowlist_dropped_events == 1
+        hub.publish(_event(str(new_root / "sub2")))
+        hub.flush()  # new canonical root → passes
+        assert subscriber.queue.qsize() == 2
+        assert hub.allowlist_dropped_events == 1
+    finally:
+        await _close_hub(hub)

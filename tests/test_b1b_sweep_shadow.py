@@ -267,6 +267,60 @@ def test_async_scheduler_runs_each_directory_on_deadline_cadence():
         assert 0.8 * 0.2 <= interval <= 1.2 * 0.2 + 0.005
 
 
+def test_reobserving_known_directory_does_not_wake_scheduler():
+    async def scenario():
+        shadow = QpSweepShadow(
+            interval_seconds=0.5,
+            directories=["/known"],
+            jitter=lambda: 1.0,
+        )
+        original_run_once = shadow.run_once
+        calls = 0
+
+        def counted_run_once(*, now=None):
+            nonlocal calls
+            calls += 1
+            return original_run_once(now=now)
+
+        shadow.run_once = counted_run_once
+        shadow.start()
+        await asyncio.sleep(0.02)
+        assert calls == 1
+
+        for _ in range(3):
+            shadow.observe_directory("/known")
+        await asyncio.sleep(0.03)
+        assert calls == 1
+        await shadow.stop()
+
+    asyncio.run(scenario())
+
+
+def test_observing_new_directory_wakes_scheduler():
+    async def scenario():
+        shadow = QpSweepShadow(interval_seconds=10.0, jitter=lambda: 1.0)
+        original_run_once = shadow.run_once
+        calls = 0
+
+        def counted_run_once(*, now=None):
+            nonlocal calls
+            calls += 1
+            return original_run_once(now=now)
+
+        shadow.run_once = counted_run_once
+        shadow.start()
+        await asyncio.sleep(0.02)
+        assert calls == 0
+
+        shadow.observe_directory("/new")
+        await asyncio.sleep(0.02)
+        assert calls == 1
+        assert shadow.markers[-1]["directory"] == "/new"
+        await shadow.stop()
+
+    asyncio.run(scenario())
+
+
 def test_other_immediate_hub_event_does_not_update_qp_activity():
     hub = GlobalHub(None)
     hub.publish({"directory": "/repo", "payload": {"type": "server.connected", "properties": {}}})

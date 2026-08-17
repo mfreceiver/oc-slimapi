@@ -257,8 +257,11 @@ def clear_allowlist_roots_cache() -> None:
     Called from ``Settings.validate()`` and
     ``GlobalHub.set_directory_allowlist()`` so the next decision after a
     (re-)applied allowlist configuration re-resolves the roots on the
-    current filesystem.
+    current filesystem — including when the re-applied VALUE is identical
+    (a root symlink retargeted on disk must not keep authorising its old
+    canonical target).
     """
+    _ALLOWLIST_ROOTS_CACHE.clear()
 
 
 def allowlist_roots(allowlist: list[str]) -> tuple[str, ...]:
