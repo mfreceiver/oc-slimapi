@@ -3,7 +3,7 @@
 > **状态**：B0 批设计冻结版（2026-08-17）。v4 wire 契约以 `docs/specs/v4-contract.md` §4 为准（由编排者在 B0 批同步定稿）；本文档 = §3.1 数据源裁决的**工程化实现设计**（连接生命周期 / 所有权模型 / 路径解析 / 熔断重探 / 索引策略 / schema 门 / 降级矩阵 / SQL 语义冻结）+ B0-6(b)(c)(e) 三项硬门槛的实证记录。
 > **引用基准**：`docs/system-architecture-proposal-2026-08-17.md` v2.2 §3.1（行 46-149，本文档所有「行 n」均指该文件行号）；`docs/refactor-plans/slimapi-refactor-plan.md` §2.1 B0-5 / B0-6 表、§5.3（降级矩阵）。
 > **实现落地**：B3a 阶段 B（refactor-plan 行 236-241，B3a-B1 连接生命周期 + B3a-B2 投影 SQL 组装）；`src/oc_slimapi/dbaux/` 新建模块。
-> **上游源码核对对齐版本**：`opencode-src/current` → v1.18.16。
+> **上游源码核对对齐版本**：`opencode-src/current` → v1.18.18（warehouse package.json 直测；真库所有采样标注「2026-08-17，对齐 v1.18.18」）。
 > **实证脚本**：`scripts/eqp_matrix.py`（B0-6b，48 组合 EQP + 真库 P99）。
 
 ---
@@ -25,18 +25,25 @@
 | 146 | schema 兼容门（全投影列版） | §6 |
 | 147 | P99 < 20ms 性能护栏 | §2.7, §5.3 |
 
-### 0.2 待裁决清单（v2.2 与真库/上游源码的矛盾或缺口——记录不擅自决定）
+### 0.2 裁决记录（rev-1 结算：四项关闭转冻结/实证，两项保留为记录注）
 
-> 纪律（工单）：发现 v2.2 矛盾/缺口 → 记「待裁决」并汇报，不擅自决定。以下各项均不影响本文档其余部分落地（均以「对齐真库/上游事实」为默认假设并显式标注），但需编排者/owner 裁决后才能冻结进 v4-contract。
+> 纪律（工单）：发现 v2.2 矛盾/缺口 → 记「待裁决」并汇报。rev-1 评审实证后已结算：**R1/R2/R3/R6 关闭**（冻结或转为实证记录），仅留 R4/R5 两条非决策性记录注。
 
-| # | 待裁决项 | 矛盾/缺口 | 上游事实（file:line / 真库实测） | 本文档默认假设 |
-|---|---|---|---|---|
-| R1 | **project join 列** | v2.2 行 74 模板 `p.directory AS project_directory`，但真库 `project` 表**无 `directory` 列** | 真库 PRAGMA table_info(project)：`id, worktree, vcs, name, icon_url, icon_color, time_created, time_updated, time_initialized, sandboxes, commands, icon_url_override`（12 列，无 directory）；上游 upgrade 投影 = `{id, name, worktree}`（`packages/opencode/src/session/session.ts:582`） | 投影 join 列 = `p.id` + `p.worktree`；`project_directory` 字段名废弃（或改源为 `session.directory` 语义，待裁决） |
-| R2 | **tokens 列名** | v2.2 行 72 模板 `s.tokens_in, s.tokens_out` vs 真库列名 `tokens_input/tokens_output` | 真库 PRAGMA table_info(session) 实测；行 146 门为 `tokens_*` 通配 | SQL 模板与 schema 门均用真库列名 `tokens_input/tokens_output`（行 146 通配已覆盖） |
-| R3 | **channel 复刻规则缺口** | v2.2 行 98 只记「latest/beta/prod → opencode.db，否则 opencode-<channel>.db」，漏两条上游事实 | `database.ts:49-52`：`["latest","beta","prod"].includes(channel) \|\| OPENCODE_DISABLE_CHANNEL_DB ∈ {"1","true"} → opencode.db`；`installation/version.ts:7`：channel 是**编译期常量**（`declare global const OPENCODE_CHANNEL`），运行时无 env，默认 `"local"` | 完整复刻含 `OPENCODE_DISABLE_CHANNEL_DB` 分支（§3.3 伪代码）；sidecar 侧 OPENCODE_CHANNEL 取 env 或默认 `"local"` 近似（真实注入值不可知，见 §3.2 注） |
-| R4 | **path.ts 行号漂移** | v2.2 行 87 引 `path.ts:41-52`；对齐版（v1.18.16）`directoryColumn` 在 `packages/core/src/database/path.ts:43-59` | `database/path.ts:43-59`（v2.2 按 v1.18.18 引用，行号/路径微移） | 语义核对以 `database/path.ts:43-59` 为准（§9.4） |
-| R5 | **真库行数漂移** | v2.2 行 106 记「真库 384 行」 | 实测 2026-08-17：406 行（live 库） | 基线以实测为准：P50≈0.027ms / P99≈0.88ms（§5.2） |
-| R6 | **parent=only 谓词** | v2.2 行 56 定义 parent 四态但未冻结 SQL 谓词 | — | 设计冻结：`parent=only` → `s.parent_id IS NOT NULL`（非根会话；与 `parent=none → IS NULL` 互补；`parent=<sid>` → 等值）；降级矩阵中 only/<sid> 均 503（行 119） |
+**已关闭（rev-1 冻结/实证确认）**：
+
+| # | 裁决项 | rev-1 结论（冻结/关闭依据） |
+|---|---|---|
+| R1 | project join 列 | **关闭（实证）**：真库 `project` 表**含 `name`、无 `directory`**（直测 2026-08-17：12 列 = id/worktree/vcs/name/icon_url/icon_color/time_created/time_updated/time_initialized/sandboxes/commands/icon_url_override——评审记为 13 列为计数口径/live 差异，不影响门定义）；契约冻结投影链 = `project={id, name, worktree}`（上游 `session.ts:582` 同）。`p.directory` 模板废弃 |
+| R2 | tokens 列名 | **关闭（冻结）**：投影 SQL 与 schema 门用真库列名 `tokens_input/tokens_output`（行 146 `tokens_*` 通配覆盖）；模板内不出现 `tokens_in/out`（v2.2 行 72 笔误） |
+| R3 | channel 复刻 | **关闭（冻结为 fail-closed）**：因 channel 为编译期常量不可观测，**不做 channel 猜测**——§3 改单候选探测（唯一候选 → 采用 + warning；多候选/零候选 → 禁用辅助，reason=path_ambiguous\|not_found）。含 `OPENCODE_DISABLE_CHANNEL_DB` 分支复刻（§3.3） |
+| R6 | parent=only 谓词 | **关闭（冻结，真库实证）**：`parent=only` → `parent_id IS NOT NULL`。依据：真库 parent_id 分布 NULL 86 / NOT NULL 321 / **空串 0**（2026-08-17 直测）→ 无空串哨兵歧义；上游亦无指向空串 parent 的语义 |
+
+**保留记录注（非决策项）**：
+
+| # | 项 | 说明 |
+|---|---|---|
+| R4 | path.ts 行号/路径漂移 | v2.2 行 87 引 `path.ts:41-52`；v1.18.18 对齐版 `directoryColumn` 在 `packages/core/src/database/path.ts:43-59`——语义一致，引用以对齐全为准（§9.4） |
+| R5 | 真库行数漂移 | v2.2 行 106 记 384；实测持续漂移 406 → 407 → 408（live 库，归档操作中）——基线以实测为准（§5.2，2026-08-17 rev-1 复测 407/408） |
 
 ---
 
@@ -126,16 +133,16 @@
 
 ## 3. DB 路径解析（B0-6(c)，v2.2 行 98）
 
-### 3.1 解析优先级（冻结）
+### 3.1 解析优先级（冻结，rev-1 fail-closed 修订）
 
-1. **`OC_SLIMAPI_OPENCODE_DB` 显式配置（生产推荐，最高优先）**：sidecar 自有 env，明确指向后的路径不经过上游复刻逻辑；`":memory:"` → 禁用辅助（见下）；
-2. **默认复刻上游解析**（未配置时）：按 §3.3 伪代码逐条复刻 `database.ts:43-55`，输入 = 上游 env（`OPENCODE_DB`）+ 数据目录 + channel；
-3. `:memory:`（两条路径任一解析出）→ **禁用辅助**（sidecar 无法以只读复用上游内存库；行 98）。
-4. **启动 log 记录实际解析路径**（含来源：explicit env / OPENCODE_DB / channel 默认），便于运维核对（行 98「启动 log 实际解析路径」）。
+1. **`OC_SLIMAPI_OPENCODE_DB` 显式配置（生产推荐，最高优先）**：sidecar 自有 env；`":memory:"` → 禁用辅助；
+2. **`OPENCODE_DB` 上游 env（可观测、无歧义）**：按上游语义复刻——`:memory:` → 禁用；绝对路径 → 直接用；相对路径 → 挂数据目录（`database.ts:44-46`）；
+3. **channel 候选发现（不猜测，R3 冻结）**：上述两者均未配置时，枚举数据目录下 `opencode*.db` 候选：**恰一个 → 采用 + warning log**（注明「channel 未观测，单候选采用」）；**多候选并存 / 零候选 → 禁用辅助源**（fail-closed，`auxiliary.available=false`，reason=`path_ambiguous`|`not_found`）——不猜 channel、不猜默认库名（channel 为编译期常量不可观测，猜错 = 稳定选错文件永久降级，rev-1 否决猜测方案）；
+4. 启动 log 记录实际解析路径（含来源：explicit env / OPENCODE_DB / candidate-discovery），便于运维核对（行 98）。
 
 ### 3.2 上游解析核对（源码实证）
 
-`packages/core/src/database/database.ts:43-55`（v1.18.16 对齐版）：
+`packages/core/src/database/database.ts:43-55`（v1.18.18 对齐版，package.json 直测）：
 
 ```
 43  export function path() {
@@ -156,48 +163,53 @@
 配套事实：
 
 - **数据目录** `Global.Path.data` = `path.join(xdgData, "opencode")`（`packages/core/src/global.ts:10-11`），XDG 默认 → `~/.local/share/opencode`（真库实测即 `~/.local/share/opencode/opencode.db`，2026-08-17 5.6GB + `-wal` 19.9MB + `-shm` 32KB，行 18 实证同源）。
-- **`InstallationChannel`** 为**编译期常量**（`packages/core/src/installation/version.ts:1-7`：`declare global const OPENCODE_CHANNEL`，默认 `"local"`）——运行时无 env 注入；官方发布二进制 channel 由构建注入（典型 latest）。→ **sidecar 复刻注**：无法读取二进制内注入值，近似取 env `OPENCODE_CHANNEL`（若设）否则默认 `"local"`（→ `opencode-local.db`）；若真实部署为 latest → 解析为 `opencode.db`。**此近似为 R3 待裁决项，生产推荐路径 = 显式 `OC_SLIMAPI_OPENCODE_DB` 消除歧义。**
+- **`InstallationChannel`** 为**编译期常量**（`packages/core/src/installation/version.ts:1-7`：`declare global const OPENCODE_CHANNEL`，默认 `"local"`）——运行时无 env 注入；官方发布二进制 channel 由构建注入（典型 latest）。→ **sidecar 不可观测该注入值 → R3 冻结为候选发现（§3.1-3）：不做任何 channel 猜测**。
 
 ### 3.3 解析逻辑伪代码（定稿，直接落 B3a-B1 实现）
 
 ```
 def resolve_db_path() -> ResolvedPath | Disabled:
-    # 1. sidecar 显式配置（生产推荐）
+    # 1. sidecar 显式配置（生产推荐，R3 后最高优先）
     if OC_SLIMAPI_OPENCODE_DB is set:
         p = expanduser(OC_SLIMAPI_OPENCODE_DB)      # ~ 展开
         if p == ":memory:": return Disabled(reason="explicit-memory")
         return Resolved(path=normpath(p), source="OC_SLIMAPI_OPENCODE_DB")
-    # 2. 复刻上游 database.ts:43-55
     data_dir = XDG_DATA_HOME or "~/.local/share"  + "/opencode"   # global.ts:11 复刻
-    if OPENCODE_DB set:                             # 上游 env（flag.ts:47）
+    # 2. 上游 OPENCODE_DB env（flag.ts:47，可观测，无 channel 猜测）
+    if OPENCODE_DB set:
         raw = OPENCODE_DB
         if raw == ":memory:": return Disabled(reason="upstream-memory")   # 行 98
         if isabs(raw) or raw.startswith("~"):       # isAbsolute 复刻（POSIX 语义）
             return Resolved(path=normpath(expanduser(raw)), source="OPENCODE_DB")
         return Resolved(path=normpath(join(data_dir, raw)), source="OPENCODE_DB-relative")  # database.ts:46
-    channel = env("OPENCODE_CHANNEL") or "local"    # version.ts:7 近似（编译期常量不可读，R3）
-    if channel in {"latest","beta","prod"} or env("OPENCODE_DISABLE_CHANNEL_DB") in {"1","true"}:
-        return Resolved(path=normpath(join(data_dir, "opencode.db")), source="channel-default")   # database.ts:49-53
-    safe = re.sub(r"[^a-zA-Z0-9._-]", "-", channel)
-    return Resolved(path=normpath(join(data_dir, f"opencode-{safe}.db")), source=f"channel={channel}")
+    # 3. channel 候选发现（fail-closed，R3 冻结；含 OPENCODE_DISABLE_CHANNEL_DB 情形
+    #    由候选枚举自然覆盖——该开关只影响上游建库名，sidecar 按盘上文件事实判定）
+    candidates = sorted(glob(join(data_dir, "opencode*.db")))   # 含 opencode.db / opencode-local.db / opencode-<ch>.db
+    if len(candidates) == 1:
+        return Resolved(path=normpath(candidates[0]), source="candidate-discovery",
+                        warning="channel 未观测（编译期常量），单候选采用")
+    if len(candidates) > 1:
+        return Disabled(reason="path_ambiguous", detail=candidates)  # fail-closed
+    return Disabled(reason="not_found", detail=data_dir)
 ```
 
-要点：`~` 展开（显式配置路径）、相对/绝对规范化（`normpath`）、尾斜杠归一、空白 trim；解析结果（含 source）进启动 log（§1.4）。
+要点：`~` 展开（显式配置路径）、相对/绝对规范化（`normpath`）、尾斜杠归一、空白 trim；解析结果（含 source / reason / warning）进启动 log（§1.4）；`OPENCODE_DISABLE_CHANNEL_DB` / `OPENCODE_CHANNEL` 的枚举复刻见 §3.2 源码块（决策路径已由候选发现替代，不再作为侧car 猜测依据）。
 
-### 3.4 单元测试用例表（~10 case，B3a-B1 落地 `tests/test_db_path_resolution.py`）
+### 3.4 单元测试用例表（~11 case，B3a-B1 落地 `tests/test_db_path_resolution.py`）
 
 | # | case | 输入 | 期望 |
 |---|---|---|---|
-| 1 | 显式 env 优先 | `OC_SLIMAPI_OPENCODE_DB=/x/y.db` + `OPENCODE_DB=/z.db` | `/x/y.db`（source=explicit） |
-| 2 | OPENCODE_DB 继承 | 仅 `OPENCODE_DB=/z.db` | `/z.db`（source=OPENCODE_DB） |
-| 3 | channel latest/beta/prod 分库 | 仅 `OPENCODE_CHANNEL=latest`（无 env db） | `<data>/opencode.db` |
-| 4 | 非标准 channel 分库 | `OPENCODE_CHANNEL=nightly` | `<data>/opencode-nightly.db`；`OPENCODE_CHANNEL='a/b:c'` → `opencode-a-b-c.db`（`replace` 复刻） |
-| 5 | `:memory:` 禁用 | `OC_SLIMAPI_OPENCODE_DB=:memory:`（或 `OPENCODE_DB=:memory:`） | Disabled（不打开） |
-| 6 | 路径不存在 | 解析到不存在的目录 | 不报错（解析即值）；启动 ro 打开失败 → 禁用辅助（§1.4 路径，B3a-B1 集成断言） |
-| 7 | 相对/绝对规范化 | `OPENCODE_DB=rel/db.db` → `<data>/rel/db.db`；`OPENCODE_DB=./a.db` → `<data>/a.db`（join+normpath） | normpath 后无 `.`/`..` |
-| 8 | `~` 展开 | `OC_SLIMAPI_OPENCODE_DB=~/db.db` | `<home>/db.db` 绝对路径 |
-| 9 | 尾斜杠 / 空白 | `OC_SLIMAPI_OPENCODE_DB=/x/y/`（尾斜杠）或 `" /x/y.db "` | `normpath(/x/y)` + strip 后 `/x/y.db` |
-| 10 | 双 env 冲突 | `OC_SLIMAPI_OPENCODE_DB` 与 `OPENCODE_DB` 同时存在且不同 | 显式 env 胜出（case 1 语义）；优先级冻结不告警不合并 |
+| 1 | 显式 env 优先 | `OC_SLIMAPI_OPENCODE_DB=/x/y.db` + `OPENCODE_DB=/z.db` + data 目录多候选 | `/x/y.db`（source=explicit） |
+| 2 | OPENCODE_DB 继承（绝对） | 仅 `OPENCODE_DB=/z.db` | `/z.db`（source=OPENCODE_DB） |
+| 3 | OPENCODE_DB 继承（相对） | 仅 `OPENCODE_DB=rel/db.db` | `<data>/rel/db.db`（join+normpath，source=OPENCODE_DB-relative） |
+| 4 | 单候选发现（含 channel 名） | 无 env db，data 目录仅 `opencode.db`（或仅 `opencode-local.db`） | 采用该文件 + warning「channel 未观测，单候选采用」 |
+| 5 | 多候选 fail-closed | 无 env db，data 目录同时存在 `opencode.db` 与 `opencode-local.db` | Disabled(reason=`path_ambiguous`)，不猜测 |
+| 6 | 零候选 fail-closed | 无 env db，data 目录无任何 `opencode*.db` / 目录不存在 | Disabled(reason=`not_found`) |
+| 7 | `:memory:` 禁用 | `OC_SLIMAPI_OPENCODE_DB=:memory:`（或 `OPENCODE_DB=:memory:`） | Disabled（不打开） |
+| 8 | 相对/绝对规范化 | `OPENCODE_DB=./a.db` → `<data>/a.db`（join+normpath） | normpath 后无 `.`/`..` |
+| 9 | `~` 展开 | `OC_SLIMAPI_OPENCODE_DB=~/db.db` | `<home>/db.db` 绝对路径 |
+| 10 | 尾斜杠 / 空白 | `OC_SLIMAPI_OPENCODE_DB=/x/y/`（尾斜杠）或 `" /x/y.db "` | `normpath(/x/y)` + strip 后 `/x/y.db` |
+| 11 | 双 env 冲突 | `OC_SLIMAPI_OPENCODE_DB` 与 `OPENCODE_DB` 同时存在且不同 | 显式 env 胜出（case 1 语义）；优先级冻结不告警不合并 |
 
 **runtime 步骤**（进 B3a-B1 阻断测试，非 B0）：**冷启动**——启动 log 断言实际解析路径 + 辅助源状态；**运行中 inode swap**——替换 DB 文件（备份恢复/channel 切换模拟）后观察重开重探日志、期间查询不挂死（§4.1 场景）。
 
@@ -235,7 +247,7 @@ def resolve_db_path() -> ResolvedPath | Disabled:
 - **sidecar 永不写上游 DB（含 DDL）**（行 107）：D-ix 移出 sidecar（v2.1「sidecar 幂等建索引」撤回；AGENTS.md 措辞行 109 同步）。**索引 = 运维手册动作**：仅当生产 EQP + P99 数据证明必要时，运维显式执行（`docs/operations.md` 记录程序）；候选 = **sort-shaped 独立 `(time_updated DESC, id DESC)` 索引**（服务 keyset 排序，非 v2.1 filter-shaped 复合索引，行 108）；`CREATE INDEX IF NOT EXISTS` 不验证列定义 → 运维程序必须含 **`PRAGMA index_xinfo` 定义校验**（防同名异构误判，行 108）。
 - 排序正确性不依赖索引：`ORDER BY (time_updated DESC, id DESC)` 恒成立（行 104：keyset 排序正确性来自 SQL，索引仅性能）。
 
-### 5.2 B0-6(b) 实证数据（`scripts/eqp_matrix.py`，2026-08-17 实测）
+### 5.2 B0-6(b) 实证数据（`scripts/eqp_matrix.py`，2026-08-17 rev-1 实测，对齐 v1.18.18）
 
 **草稿库 48 组合全矩阵**（`--rows 1000 --limit 100`，SQL `LIMIT 101`；无任何用户索引，仅 PK autoindex）：
 
@@ -247,22 +259,22 @@ def resolve_db_path() -> ResolvedPath | Disabled:
 | planner：`SEARCH session USING <index>` | 0/48 |
 | planner：`USE TEMP B-TREE FOR ORDER BY` | **48/48**（无 `time_updated` 索引覆盖排序 → 排序由临时 b-tree 承担，与行 104 结论一致） |
 
-**真库采样**（`~/.local/share/opencode/opencode.db`，`file:...?mode=ro` + `query_only=ON` + `busy_timeout=5000`，48 组合 × 50 次 = 2400 样本，2026-08-17 live 库）：
+**真库采样**（`~/.local/share/opencode/opencode.db`，`file:...?mode=ro` + `query_only=ON` + `busy_timeout=5000`，48 组合 × 50 次 = 2400 样本；采样 2026-08-17 rev-1 复测，对齐 v1.18.18；投影 SQL 含契约冻结 `p.name`）：
 
 | 指标 | 实测 | 对照 |
 |---|---|---|
-| session 行数 | **406**（v2.2 行 106 记 384——R5 漂移，基线以实测为准）|
-| P50 | **0.027 ms** | 行 106「~0.015ms 温测」同量级（含 Python sqlite3 调用开销；0.015ms 为纯内核态估计） |
-| **P99** | **0.878 ms** | 幅距 **>20× 裕量**（护栏 20ms，行 106/147） |
-| mean / max | 0.135 ms / 2.30 ms | — |
+| session 行数 | **407**（复测窗口 408——live 库持续漂移，v2.2 行 106 记 384，R5 记录注）|
+| P50 | **0.0283 ms** | 行 106「~0.015ms 温测」同量级（含 Python sqlite3 调用开销） |
+| **P99** | **1.152 ms** | 幅距 **>17× 裕量**（护栏 20ms，行 106/147） |
+| mean / max | 0.149 ms / 2.01 ms | — |
 | planner：SCAN session | 24/48（parent=all / parent=only） |
 | planner：SEARCH session（命中上游自带索引） | 24/48（parent=none / parent=<sid>）——`parent_id IS NULL` 与 `parent_id = ?` 均命中 **`session_parent_idx`**（上游自身索引，非 sidecar 所建；真库 `PRAGMA index_list(session)` = workspace/parent/project 三索引 + PK autoindex，**无 time_updated 索引**） |
 | planner：`USE TEMP B-TREE FOR ORDER BY` | 48/48（无 time_updated 覆盖 → 排序恒由临时 b-tree 承担） |
-| schema 门（投影列 + project join 列） | **通过**（§6 核对记录） |
+| schema 门（投影列 + project join 列 id/name/worktree） | **通过**（§6 核对记录） |
 
 **结论（冻结）**：
 
-1. **无索引直跑成立**：406 行真库 P99 ≈ 0.9ms（最坏组合 ≈ 2.3ms），远低 20ms 护栏 → **首期无索引直跑**，DDL 程序保持运维态（行 106）；
+1. **无索引直跑成立**：~407 行真库 P99 ≈ 1.15ms（最坏组合 ≈ 2.0ms），远低 20ms 护栏 → **首期无索引直跑**，DDL 程序保持运维态（行 106）；
 2. **e2e 性能走势**：全表扫为 O(N)，行数增长（如 5k+）时 EQP 特征不变但延迟线性上升 → P99 < 20ms 熔断护栏（§2.7）兜底，超限自动降级 + 运维按 §5.1 建 sort-shaped 索引；
 3. 真库 EQP 特征与草稿库差异仅来自**上游自有索引**（session_parent_idx），非 sidecar 行为——sidecar 零索引假设与真实运行一致（只读复用上游既有索引）。
 
@@ -281,7 +293,7 @@ def resolve_db_path() -> ResolvedPath | Disabled:
 
 1. `session` 表存在，且**全部投影列**存在（缺任一 → 禁用辅助降级 HTTP）：
    `id, parent_id, project_id, time_archived, time_updated, directory, title, agent, model, version, summary_*（additions/deletions/files/diffs）, tokens_*（input/output/reasoning/cache_read/cache_write）, time_*（created/updated/compacting/archived）, revert, permission, metadata`（行 146 通配展开 = 真库实测列名，R2 待裁决项：模板用真库列名）；
-2. `project` 表存在且 join 列齐备：`id` + `worktree`（R1 待裁决：v2.2 行 74 的 `directory` 列真库不存在——门以实际投影读取的列为准）；
+2. `project` 表存在且 join 列齐备：`id` + `name` + `worktree`（**契约冻结 `project={id,name,worktree}`**；v2.2 行 74 的 `directory` 列真库不存在——已实证，R1 关闭；门以实际投影读取的列为准）；
 3. 门校验方式：`PRAGMA table_info(session)` / `PRAGMA table_info(project)` 只读比对（不做任何写入/DDL 尝试）。
 
 运行中错误分类触发重探（§4.2）；上游版本升级 schema 变更 → 等价性锚定测试矩阵覆盖（§10，行 148）。
@@ -305,15 +317,18 @@ def resolve_db_path() -> ResolvedPath | Disabled:
 | time_\* | `time_created/time_updated/time_compacting/time_archived` | ✓ |
 | revert / permission / metadata | `revert TEXT` / `permission TEXT` / `metadata TEXT` | ✓ |
 
-`project` 表（真库 12 列）join 列：
+`project` 表（真库 12 列，含 `name`、无 `directory`；2026-08-17 直测，对齐 v1.18.18）join 列：
 
 | join 列 | 真库列 | 状态 |
 |---|---|---|
 | id | `id TEXT PK` | ✓ |
+| name | `name TEXT` | ✓（契约冻结投影链含 name，上游 projective upgrade 同 `session.ts:582`） |
 | worktree | `worktree TEXT NOT NULL` | ✓ |
-| ~~directory~~（行 74 模板） | **不存在**（`worktree` 为目录投影字段） | **R1 待裁决** |
+| ~~directory~~（行 74 模板） | **不存在**（12 列 = id/worktree/vcs/name/icon_url/icon_color/time_created/time_updated/time_initialized/sandboxes/commands/icon_url_override） | 实证记录（R1 关闭） |
 
-**核对结论**：门在真库（v1.18.16 对齐）**通过**（eqp_matrix `--real-db` gate 输出 `gate_passes: True`；session 29 列 / project 12 列无缺失）；v2.2 行 74 模板的 `p.directory` 与真库冲突 → R1 待裁决，本文档 SQL 模板以 `p.worktree` 为准（§9、§5.2 已用）。
+**parent_id 分布（2026-08-17 rev-1 直测，R6 冻结依据）**：NULL **86** / NOT NULL **321** / 空串 **0**（合计 407 ≈ 现 407-408 live 行）→ `parent=only` = `parent_id IS NOT NULL` 无空串哨兵歧义。**LIKE/`=` 大小写实测**：`'Foo' LIKE 'foo'` = 1（ASCII 大小写**不敏感**）、`'Foo' = 'foo'` = 0（二进制**敏感**）→ §9.3 谓词必须回避 LIKE 通配规则（rev-1 冻结，Fix 3）。
+
+**核对结论**：门在真库（2026-08-17 直测，对齐 v1.18.18）**通过**（eqp_matrix `--real-db` gate 输出 `gate_passes: True`；session 29 列 / project join 三列 id+name+worktree 无缺失，`missing=[]`）；v2.2 行 74 模板的 `p.directory` 与真库冲突 → R1 关闭（实证记录），本文档 SQL 模板以 `p.id/p.name/p.worktree` 为准（§5.2、§9 已用）。
 
 ---
 
@@ -321,55 +336,62 @@ def resolve_db_path() -> ResolvedPath | Disabled:
 
 > 输入：refactor-plan §5.3 12 格行为表（4 需求行 × allowlist 2 态）+ B0-6(d) 口径（12 格 × DB 三态 × allowlist 两态 ≈ 72）。**本节 = 生成规则（formula），逐格语义由编排者同步进 v4-contract §4；本节冻结的是规则本身。**
 
-### 7.1 维度与符号
+### 7.1 维度与符号（rev-1 坐标系修正）
 
-- **需求态** `req` ∈ 12 格 = `archived(3) × parent(4)`（cursor/search 为额外轴，见下）：
+- **坐标系（rev-1 冻结）**：**72 格 = 行为等价类坐标系 `(req 12 × db 3 × al 2)`**；`cursor` 与 `search` **不进坐标系**——二者是**正交叠加轴**：任何格叠加 cursor/search 时行为按 §7.2 formula 对应行改写（cursor：db-avail → 仍 200 + keyset 下推；db-不可用 → 503；search：见下）。
+- **需求态** `req` ∈ 12 格 = `archived(3) × parent(4)`：
   - Class A（可等价表达组，**4 格**）：`archived ∈ {omit, all}(2) × parent ∈ {all, none}(2)`
-  - Class B（不可表达组，**8 格** = 12 − 4）：`archived=only × parent 任意`（4 格）∪ `parent ∈ {only, <sid>} × archived ∈ {omit, all}`（2×2=4 格）
-- **cursor** 为**正交硬闸**：`带 cursor（任何 req）→ 503`（行 120；上游单键 cursor 无法兑现 `(t,i)` keyset 指纹，session.ts:562 `lt(time_updated, cursor)` 实证）。
-- **search** 不影响需求分类（行 117：「search 任意」；DB 可用时入 SQL，降级时透传上游原生 `LIKE '%…%'`，session.ts:563）。
-- **DB 态** `db ∈ {avail, disabled, tripped}`：avail = 连接可用 + 门过 + 未熔断；disabled/tripped 对 **wire 行为同构**（都是「辅助源不可用」），仅恢复机制不同（§4.1/§4.2；行 97「禁用」、§2.7「熔断」）。
+  - Class B（不可表达组，**8 格** = 12 − 4）：`archived=only × parent 任意`（4 格）∪ `parent ∈ {only, <sid>} × archived ∈ {omit, all}`（2×2=4 格；`parent=only` 谓词冻结见 §6.2/R6）
+- **cursor** 正交轴：db-avail → 200（keyset 下推）；db-不可用 → **503**（行 120；上游单键 cursor 无法兑现 `(t,i)` keyset 指纹，session.ts:562 实证）。
+- **search** 正交轴（rev-1 收紧，Fix 2）：db-avail → 入 SQL（字面转义子串，§9.1）；db-不可用 → **search 含 `%`/`_`/`\` 任一字符 → 503**（不可等价——上游 `LIKE '%…%'` 无 ESCAPE，`%`/`_` 为通配（session.ts:563 实证），`\` 保守加宽，§9.1）；纯字面子串（无三字符）→ 透传上游等价 → 按 Class A/B 规则走。
+- **DB 态** `db ∈ {avail, disabled, tripped}`：avail = 连接可用 + 门过 + 未熔断；disabled/tripped 对 **wire 行为同构**（都是「辅助源不可用」），仅恢复机制不同（§4.1/§4.2；行 97「禁用」、§2.7「熔断」）——**同一坐标系内各占一半格数，行为一致**。
 - **allowlist 态** `al ∈ {empty, nonempty}`（S-B05 三态中「未配置机制」= empty：env 未配置 = 机制未启用、无过滤义务，§5.3 例外；非空 = 白名单过滤义务在身）。
 
 ### 7.2 生成规则（formula，冻结）
 
 ```
-result(req, db, al, cursor):
+result(req, db, al, cursor, search):
   if db == avail:
-      → 200，全过滤入 SQL 谓词（archived × parent × search × cursor × allowlist 子树谓词 + 指纹）
+      → 200，全过滤入 SQL 谓词（archived × parent × search(字面转义) × cursor(keyset)
+        × allowlist 子树谓词 + 指纹）
         （allowlist 维度不影响状态码，只影响 SQL 谓词与 cursor 指纹，行 78,85）
-  else:  # disabled | tripped —— 全降级 HTTP /experimental/session（行 113）
+  else:  # disabled | tripped —— wire 行为同构（§7.1 db 态），全降级 HTTP /experimental/session（行 113）
       if al == nonempty:
           → 503 auxiliary_unavailable（fail-closed，ora B-2 选②）
              ——不做「首 N 行后置过滤/内部循环翻页凑行」（真子集风险 + 撕裂单快照原子性，§5.3 论证 a/b/c）
-      else:  # al == empty → 按需求态分类
-          if cursor:                          → 503 auxiliary_unavailable（行 120）
-          if req ∈ Class A:                   → 200 + degraded:true
-              （parent=none → roots=true；parent=all → 不过滤；search 原生透传；
-                排序退化上游单键 time_updated（tie-break 弱）、complete 退 best-effort——degraded 披露，行 117）
-          if req ∈ Class B:                   → 503 auxiliary_unavailable（行 118-119)
+      elif has_wildcard(search):   # 含 %/_/\ 任一（§9.1 判定，rev-1 收紧）
+          → 503 auxiliary_unavailable（search 不可等价表达，与 Class B 同类）
+      elif cursor:                 → 503 auxiliary_unavailable（正交硬闸，行 120）
+      elif req ∈ Class A:          → 200 + degraded:true
+          （parent=none → roots=true；parent=all → 不过滤；search 纯字面透传；
+            排序退化上游单键 time_updated（tie-break 弱）、complete 退 best-effort——degraded 披露，行 117）
+      else:                        → 503 auxiliary_unavailable（Class B：archived=only / parent=only|<sid>，行 118-119）
 ```
 
-### 7.3 逐格语义（72 格展开，紧凑矩阵）
+### 7.3 逐格语义（72 格展开，紧凑矩阵）——cursor/search 缺席基线
 
-**DB 可用（24 格语义同构——allowlist 两态只换 SQL 谓词，不换状态码）**：
+**坐标系格子（`cursor 缺席` + `search 任意` 为基线；search 轴对基线的改写见下表注）**：
 
-| archived × parent（12） | allowlist 空 | allowlist 非空 |
+| 坐标系格（12 req × 3 db × 2 al = 72） | 格数 | 行为 |
 |---|---|---|
-| 全部 12 格（omit/only/all × all/none/only/\<sid\>） | 200，SQL 全过滤，`degraded` 缺席 | 200，SQL 全过滤 + `s.directory` allowlist 子树谓词（§9.3），cursor 指纹含 allowlist-rev（行 127,85） |
+| db=avail × al=empty：12 req | 12 | **全 200**，SQL 全过滤，`degraded` 缺席 |
+| db=avail × al=nonempty：12 req | 12 | **全 200**，SQL 全过滤 + allowlist 子树谓词（§9.3），cursor 指纹含 allowlist-rev；**allowlist 维度不影响状态码** |
+| db=disabled × al=empty | 12 | Class A 4 格 → **200 + `degraded:true`**（上游等价，行 117）；Class B 8 格 → **503**（行 118-119） |
+| db=tripped × al=empty | 12 | **同上（wire 行为同构）**：Class A 4 格 200+degraded；Class B 8 格 503 |
+| db=disabled × al=nonempty | 12 | **全 503 `auxiliary_unavailable`**（fail-closed，ora B-2 选②） |
+| db=tripped × al=nonempty | 12 | **全 503**（同上） |
 
-（带 cursor → 200 + keyset 下推；无 cursor → 首屏；状态码恒 200；此 24 格语义完全一致，diff 仅在 SQL 谓词。）
+**计数核对**：72 = 24（db-avail）+ 48（db-不可用 = disabled/tripped × al 两态 = 4 组 × 12 req）。db-不可用 × al-empty 24 格 = **Class A 8 格（4 req × 2 db 态）200+degraded + Class B 16 格（8 req × 2 db 态）503**；db-不可用 × al-nonempty 24 格全 503。
 
-**DB 禁用/熔断（48 格）**：
+**正交叠加轴**（不增加坐标系格数，改写部分格的行为）：
 
-| req 类 | allowlist 空（24 格） | allowlist 非空（24 格） |
+| 叠加轴 | db-avail | db-不可用 |
 |---|---|---|
-| Class A 4 格 × cursor 无（search 任意） | **200 + `degraded:true`**（上游等价，行 117） | **503 `auxiliary_unavailable`**（fail-closed） |
-| Class A 4 格 × cursor 有 | **503**（cursor 硬闸，行 120） | 503 |
-| Class B 8 格 × cursor 无 | **503**（行 118-119） | 503 |
-| Class B 8 格 × cursor 有 | 503 | 503 |
+| 叠加 `cursor`（任何 req） | 仍 200（keyset 下推，SQL 谓词 + 指纹） | → 503（硬闸，行 120） |
+| 叠加 `search 含 %/_/\` | 仍 200（字面转义后入 SQL，§9.1） | → 503（不可等价，rev-1 收紧）——Class A 格亦 503 |
+| 叠加 `search 纯字面` | 仍 200 | 不改变基线行为（透传等价：Class A → 200+degraded；Class B → 503） |
 
-（合计：allowlist 空 24 格 = 4×200+degraded + 20×503；allowlist 非空 24 格 = 全 503。总 72 格。）
+**测试落地口径（rev-1 冻结）**：72 等价类基线用例 + `cursor` 两态**正交参数化** = **144 参数化组合**（72 基线语义单表 + cursor 叠加断言；与 v4-contract §11.3 对齐由编排者执行）。
 
 ### 7.4 冻结语义
 
@@ -402,7 +424,7 @@ result(req, db, al, cursor):
 - **谓词**：`(:search IS NULL OR s.title LIKE :search ESCAPE '\')`；`:search` = `%` + 经过 **LIKE 字面转义**的用户子串 + `%`。
 - **字面转义（冻结）**：用户输入中的 `%`、`_`、`\` 在构造 pattern 时以 `\` 前缀转义（`\%%`、`\_`、`\\`）；`ESCAPE '\'` 使 `%`/`_` 不再具备通配语义——**search 语义 = 字面子串匹配**（行 57「标题子串」契约兑现）。
 - **游标指纹**：search 的**规范化形式**（trim + 上述转义后的串）hash（如 sha256，截断 8-16 hex）进 cursor 指纹 `f.search_hash`（行 127）；**同一输入两次执行 → hash 相同（规范化算法确定性 = 测试断言）**；指纹不匹配 → 400 `invalid_cursor`（行 129）。
-- 降级路径 = 透传上游原生 search（`session.ts:563` `like(title, '%…%')`——注意上游**不做**转义，`%`/`_` 在上游为通配：此为降级披露范围内的既定差异（需求文档行 57「降级透传上游」原样保留，不做等价化——记录为契约注记候选，由编排者确认是否入 v4-contract）。
+- 降级路径（rev-1 冻结，行 86 收紧）：DB 不可用（disabled/tripped）时——**search 含 `%`/`_`/`\` 任一字符 → 503 `auxiliary_unavailable`**：不可等价表达——上游降级透传为 `LIKE '%…%'` 且**无 ESCAPE**（session.ts:563 实证），`%`/`_` 在 SQLite LIKE 中为**通配符**，会放大行集（如 `search="100%"` 会匹配含 `100%` 之外的行），与 DB 侧字面转义子串行集不同 → 违反「过滤语义永不降级」（行 123）；`\` 在上游无 ESCAPE 声明时为字面（与 DB 侧字面一致，理论可等价）——纳入 503 为**保守加宽**（仅牺牲少数本可等价的反斜杠搜索，换取规则单一）；**判定函数 `has_wildcard(s) = any(c in s for c in '%_\\')` 为确定性函数（与 §9.1 游标指纹规范化共用同一判定 → 同输入两次执行结果一致，指纹 hash 确定性断言覆盖）**。**纯字面子串**（无 `%`/`_`/`\`）→ 透传上游等价（`%…%` 包裹下与字面子串匹配一致）→ 按 §7 Class A/B 规则走（Class A → 200+degraded（降级披露），Class B → 503）。
 
 ### 9.2 complete = LIMIT+1 同 snapshot（行 81, 137）
 
@@ -410,33 +432,48 @@ result(req, db, al, cursor):
 - 判定与列表在同**一只读事务快照**内（§1.2）——同一 snapshot 窗口（行 81 注记，rev-1 M9）。
 - 降级路径 = 上游 best-effort complete（`degraded` 披露，行 137）。
 
-### 9.3 allowlist 非空 → `s.directory` IN allowlist 子树谓词 + cursor 指纹（行 78, 85）
+### 9.3 allowlist 非空 → `s.directory` IN allowlist 子树谓词 + cursor 指纹（行 78, 85；rev-1 谓词冻结 Fix 3）
 
-- **子树谓词**（每 allowlist 项 `d`，resolve 规范化后）：`(s.directory = :d OR s.directory LIKE :d || '/%' ESCAPE '\')`，多项 OR 合并。
+- **子树谓词（冻结，弃 LIKE 改二进制前缀）**：每 allowlist 项 `d`（resolve 规范化后，absolute 非 realpath，同 §9.4 与上游存储语义）：
+
+```sql
+(s.directory = :d_raw
+ OR substr(s.directory, 1, :prefix_len) = :prefix)
+-- :prefix     = :d_raw || '/'       独立绑定参数（不做 LIKE 转义）
+-- :prefix_len = length(:d_raw) + 1
+-- substr 与 = 均为默认 BINARY 比较 → 大小写敏感、无 %/_ 通配语义
+```
+
+  多项 OR 合并（allowlist 并集）。
+- **弃 LIKE 依据（rev-1 实测，Fix 3）**：旧方案 `= :d OR LIKE :d||'/%' ESCAPE '\'` 三处缺陷——① SQLite 默认 LIKE 对 ASCII **大小写不敏感**（实测 `'Foo' LIKE 'foo'`=1）→ `/foo` 白名单会放行 `/Foo/child`（白名单语义泄漏）；改 `substr =`（默认 BINARY，实测 `'Foo' = 'foo'`=0）→ 全链大小写敏感；② allowlist 根 `/` 会生成 `//%` 前缀不匹配任何单斜杠路径；③ LIKE 转义参数（`%`/`_`/`\`）与 equality 分支复用冲突。`substr`+`=` 异质绑定参数三者全解。
+- **根目录特例（冻结）**：allowlist 项 = `/` → 独立分支 `substr(s.directory, 1, 1) = '/'`（匹配**所有非空绝对路径**；真库 2026-08-17 直测：407 行 directory 全部非空且以 `/` 开头）；`/` 不与 `//` 前缀规则混算（长度 1 特判，独立谓词）。
 - **边界语义（S-B08，冻结）**：
-  - `%`/`_`/`\` 字面转义（同 §9.1 规则应用于目录路径段文字）；
-  - **前缀边界**：`/foo` 的子树 = `/foo` 自身 + 所有 `d + '/%'` 后代；**不含** `/foobar`、`/foox/…`（同层异名前缀——`'/'` 后闭合语义，绝不用裸 `LIKE '/foo%'`）；
-  - **symlink**：与上游存储语义一致（`directoryColumn` 仅 `absolute()` 不做 realpath 解析，`database/path.ts:53-58`）→ sidecar 侧规范化同为「absolute 非 realpath」；过滤是**字符串前缀匹配于存储值**，不追踪 fs 实体（防 `..`/symlink 绕过由 allowlist 入口层 B4-4 负责，行 185）；
-  - **case 敏感性**：POSIX 下区分大小写（SQLite 默认二进制比较）；比较双方 = 存储值 vs 规范化后的 allowlist 项。
+  - **大小写敏感**：`=`/`substr` BINARY 比较（实测依据见上）；比较双方 = 存储值 vs 规范化后的 allowlist 项；
+  - **无通配语义**：`substr`/`=` 不解释 `%`/`_`/`\`——路径段含这些字符时**字面匹配**（如目录 `/a%20b/c` 在白名单 `/a` 子树内正常命中，`%` 不放大）；
+  - **前缀边界（子树闭合）**：`/foo` 的子树 = `/foo` 自身 + 所有 `d + '/'` 后代；**不含** `/foobar`、`/foox/…`（`'/'` 闭合语义：`:prefix = :d_raw || '/'`，绝不用裸前缀）；
+  - **symlink**：与上游存储语义一致（`directoryColumn` 仅 `absolute()` 不做 realpath 解析，`database/path.ts:53-58`）→ 过滤是**字符串前缀匹配于存储值**，不追踪 fs 实体（防 `..`/symlink 绕过由 allowlist 入口层 B4-4 负责，行 185）；
+  - **空 directory 行**：`substr('',…)` 与 `= :d_raw` 谓词对非空 `d_raw` 均不命中 → **允许其中任一（allowlist 非空）查询时天然排除**（legacy 空串行无目录归属，允许语义；既有行为不变）。
 - **cursor 指纹**：非空 allowlist 修订（集合变化）进指纹 `f.allowlist-rev`（行 127, 85）——中途变更 → 指纹不匹配 → 400 `invalid_cursor`（重开首屏，行为可预期）。
 - 空 allowlist（机制未启用）→ 无该谓词（零影响，启动零差异化）。
 
 ### 9.4 legacy 空 directory 规范化复刻（行 87；对齐源码 `database/path.ts:43-59`）
 
-- **上游事实**（v1.18.16 对齐版核对，R4 行号漂移注）：`directoryColumn` 的 `toDriver`/`fromDriver` = `input ? absolute(input) : input`（`database/path.ts:53-58`）——**legacy 会话持久化的空目录保留空串原值**（注释原文：*"Legacy sessions may persist an empty directory. Keep that existing value readable while normalizing and validating every real directory."*，`:43-44`）；非空值规范化（absolute，win32 平台转 storage 斜杠）。
+- **上游事实**（v1.18.18 对齐版核对，R4 行号漂移注）：`directoryColumn` 的 `toDriver`/`fromDriver` = `input ? absolute(input) : input`（`database/path.ts:53-58`）——**legacy 会话持久化的空目录保留空串原值**（注释原文：*"Legacy sessions may persist an empty directory. Keep that existing value readable while normalizing and validating every real directory."*，`:43-44`）；非空值规范化（absolute，win32 平台转 storage 斜杠）。
 - **DB 投影侧**：空串行在过滤谓词中按**字面空串**参与（`directory=''` 只匹配空串本身）；allowlist 不含空串目录（入口校验拒绝）→ 空 directory 行在 allowlist 非空查询中天然被排除（属允许语义——legacy 行无目录归属）。
 - **复刻必要性**（行 87 论证）：若 DB 侧把空串当「无目录」而非字面值，会与 HTTP 路径（上游 fromRow 同名语义）对同一行集**分叉** → 过滤 SQL 必须复刻「空串原样」语义。
 
-### 9.5 测试用例表（~12 参数化，B3a-B2 落地；断言 = 行集精确匹配 + 指纹 hash 确定性）
+### 9.5 测试用例表（~17 参数化，B3a-B2 落地；断言 = 行集精确匹配 + 指纹 hash 确定性）
 
 | # | 组 | case | 断言 |
 |---|---|---|---|
 | 1-4 | search 转义矩阵 | ① 普通子串匹配；② 含 `%` 的用户输入 → 字面命中仅含 `%` 的行（不放大为通配）；③ 含 `_` 输入 → 字面；④ 含 `\` 输入 → 字面 | 行集精确匹配（oracle 同 §9.1 转义规则） |
-| 5-7 | allowlist 前缀边界 | ⑤ `/foo` 匹配 `/foo` 与 `/foo/sub`，**不匹配** `/foobar`；⑥ `/foo/bar` 子树收窄（`/foo/bar/sub` 命中、`/foo/baz` 不含）；⑦ allowlist 多项（`/a`+`/b`）并集 | 行集精确匹配 |
+| 5-7 | allowlist 子树谓词（substr 二进制前缀，rev-1） | ⑤ `/foo` 匹配 `/foo` 与 `/foo/sub`，**不匹配** `/foobar`；⑥ `/foo/bar` 子树收窄（`/foo/bar/sub` 命中、`/foo/baz` 不含）；⑦ allowlist 多项（`/a`+`/b`）并集 | 行集精确匹配 |
 | 8-9 | complete 边界 | ⑧ 结果恰 `limit` 行 → complete:true；⑨ 结果 `limit+1` 行（有下一页）→ complete:false（LIMIT+1 判定） | complete 布尔精确 |
-| 10-11 | legacy 空 directory 分叉 | ⑩ 空 directory 行：allowlist 空 → 出现在结果（`directory=''` 字面参与）；⑪ allowlist 非空（不含空串）→ 空 directory 行被排除（允许语义）——与 HTTP 路径对同一行集不产生第二套行为 | 行集与「既定语义」一致 |
+| 10-11 | legacy 空 directory 分叉 | ⑩ 空 directory 行：allowlist 空 → 出现在结果（无谓词）；⑪ allowlist 非空（不含空串）→ 空 directory 行被排除（`substr('',…)` 与 `= :d_raw` 均不命中，允许语义）——与 HTTP 路径对同一行集不产生第二套行为 | 行集与「既定语义」一致 |
 | 12 | 键集下界 | ⑫ cursor 锚点后无更多行 → 返回 0 行 + complete:true（空窗口闭合） | 行集 + complete |
-| +2 | 指纹确定性 | 同 input 两次执行 cursor 指纹（search-hash / allowlist-rev）hash 相同；input 变化（search 或 allowlist）hash 变化 | hash 值相等/不等断言 |
+| 13-14 | search × DB 不可用（降级规则，rev-1 Fix 2） | ⑬ search 含 `%`（如 `100%`）× db 不可用 → **503 `auxiliary_unavailable`**（`has_wildcard` 判定）；⑭ search 纯字面 × db 不可用 Class A → **200 + `degraded:true`**（透传等价） | 状态码 + degraded 精确（oracle 同 §7.2 / §9.1） |
+| 15-17 | allowlist 二进制前缀边界（rev-1 Fix 3） | ⑮ 大小写：allowlist `/foo` 不匹配 `/Foo/child`（`substr`=` BINARY`；对照旧 LIKE 会误放行——实测 `'Foo' LIKE 'foo'`=1 / `'Foo' = 'foo'`=0）；⑯ 根 `/` 全匹配：allowlist `{/}` → 命中所**有非空绝对路径**（`substr(x,1,1)='/'`）；⑰ 路径段含 `%`/`_` 字面：allowlist `/a` 子树命中 `/a%20b/c` 且 `%` 不放大（无通配语义） | 行集精确匹配 |
+| +2 | 指纹确定性 | 同 input 两次执行 cursor 指纹（search-hash / allowlist-rev）hash 相同；input 变化（search 或 allowlist）hash 变化；`has_wildcard` 判定与指纹规范化共用同一确定性函数 | hash 值相等/不等断言 |
 
 ---
 
@@ -492,7 +529,7 @@ pytest.mark.parametrize 组合 = 版本 × {行集 / 字段语义 / 排序 / com
 | 维度 | 参数化取值 | 断言目标 |
 |---|---|---|
 | 行集 | ①全量（无 filter）②cursor 逐页翻取拼接 ≡ 一次全量 ③archived 过滤 ④parent 过滤 ⑤search 过滤 ⑥allowlist 子树 | 同一行集、同一行序（HTTP 投影） |
-| 字段语义 | 全投影列集合（v2.2 行 146：id/parent_id/project_id/time_archived/time_updated/directory/title/agent/model/version/summary_*/tokens_*/time_*/revert/permission/metadata + project join 列）逐字段等值 | 每行每字段 DB 值 ≡ HTTP 投影值 |
+| 字段语义 | 全投影列集合（v2.2 行 146：id/parent_id/project_id/time_archived/time_updated/directory/title/agent/model/version/summary_*/tokens_*/time_*/revert/permission/metadata + project join 列 **id/name/worktree**（行 74 模板 directory 已实证不存在，R1 关闭））逐字段等值 | 每行每字段 DB 值 ≡ HTTP 投影值 |
 | 排序 | `(time_updated DESC, id DESC)`；含同 time_updated tie 样本；升/降序对照 | 行序列全等（含 tie-break） |
 | complete | 窗口内 N 行 / N+1 行（LIMIT+1 判定两侧） | complete=true/false 一致（行 81/137） |
 

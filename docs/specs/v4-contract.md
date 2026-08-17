@@ -1,6 +1,6 @@
 # oc-slimapi v4 wire 契约（B0 起草稿 —— 随 4.0.0 定稿）
 
-> **状态**：**B0 规范先行批次起草稿（2026-08-17）**。wire 终态目标 = 4.0.0（`ACCEPTED_CLIENT_VERSIONS` (3,3)→(3,4)）；本文在 B0 批冻结全部可观察语义，实现随 B3a/B3b 分批落地（同属 4.0.0 一个 major）。S-B01 ②③④（§7 内标注）为**设计提案待 owner 终裁**——其余章节均为冻结语义。
+> **状态**：**B0 规范先行批次起草稿（2026-08-17，rev-1 评审修复后）**。wire 终态目标 = 4.0.0（`ACCEPTED_CLIENT_VERSIONS` (3,3)→(3,4)）；本文在 B0 批冻结全部可观察语义，实现随 B3a/B3b 分批落地（同属 4.0.0 一个 major）。S-B01 ②③④（§7 内标注）为**设计提案待 owner 终裁**；其余章节（含 DB 设计 R1/R2/R3/R6，已凭真库实证冻结——见 design-v4-dbaux §0.2）均为冻结语义。
 > **继承基线**：v3 契约（`docs/specs/v3-contract.md`）全量继承 + 本文件逐条差异覆盖——**凡未提及语义逐字沿用 v3**（投影、SSE 帧名帧形、资源上限、错误映射、gzip 族、指纹、catalog、token stream 帧形等）。v4 = v3 的**严格超集面**上的差异层：新增全局 sessions 面（DB 投影源）、SSE id:/重放、directory 于全局列表退役。
 > **裁决出处**：`docs/system-architecture-proposal-2026-08-17.md`（v2.2，权威基准，行号引用）；工程细化 `docs/refactor-plans/slimapi-refactor-plan.md`；设计文档 `design-v4-selector.md` / `design-v4-dbaux.md` / `design-v4-sse-replay.md` / `design-v4-qp-payload.md`。
 > **消费者**：ocdroid（B5a 探测 / B5b 适配）与 oc-webui 可**仅凭本文件**完成 v4 对接开发。
@@ -87,8 +87,8 @@ GET /slimapi/sessions?v=4
 | `directory`（任何形式） | 现状消费 | **400 `directory_retired_in_v4`**（§5） |
 | `search` / `limit` | 现状 | v4 语义（limit 上限 500） |
 
-- `parent=only` 谓词 = `parent_id IS NOT NULL`（v2.2 未冻结，B0 设计冻结——**待 owner 确认**，design-v4-dbaux §0.2 R6）。
-- **SessionSkeletonV4**：v3 `SESSION_KEYS` 投影（已含 directory）+ `project` 对象（`{id, name, worktree}` 上游 GlobalInfo.project 同构容忍，join 缺行 → null）+ v4-only 字段。列名以真库实证为准（`tokens_input/tokens_output`，v2.2 行 72 模板 `tokens_in/out` 为撰写笔误——design-v4-dbaux §0.2 R2，**待 owner 确认**）。
+- `parent=only` 谓词 = `parent_id IS NOT NULL`（v2.2 未冻结，B0 **实证冻结**：真库 parent_id NULL 86 / NOT NULL 321 / 空串 0——无空串哨兵歧义，design-v4-dbaux §0.2 R6）。
+- **SessionSkeletonV4**：v3 `SESSION_KEYS` 投影（已含 directory）+ `project` 对象（`{id, name, worktree}`——三列均已进 DB 投影 SELECT、schema 门与等价性 golden；join 缺行 → null）+ v4-only 字段。列名以真库实证为准（`tokens_input/tokens_output`，v2.2 行 72 模板 `tokens_in/out` 为撰写笔误——**B0 实证冻结**，design-v4-dbaux §0.2 R2）。
 - **排序冻结**：`(time_updated DESC, id DESC)` 复合排序（上游 session.ts:571-572 事实同构）。
 - **complete**：同查询 `LIMIT :limit+1` 窗口判定（同一只读 snapshot；返回 =limit+1 行 → `complete:false`）。
 - **零缓存**：一条 SQL 一次组装（v2.2 行 139）。
@@ -98,25 +98,29 @@ GET /slimapi/sessions?v=4
 维度：需求态 req（12 格 = archived×parent）× DB 态（avail/disabled/tripped）× allowlist 态（empty/nonempty）× cursor 轴（正交硬闸）。生成规则（design-v4-dbaux §7 同源）：
 
 ```
-result(req, db, al, cursor):
+result(req, db, al, cursor, search):
   db == avail            → 200；全过滤入 SQL 谓词（archived×parent×search×cursor
                             keyset×allowlist 子树谓词）；allowlist 态不影响状态码
   db ∈ {disabled,tripped}:            # 全降级上游 HTTP
     al == nonempty         → 503 auxiliary_unavailable（fail-closed，ora B-2 选②：
                               不做首N行后置过滤/循环翻页凑行——真子集风险+撕裂单快照）
     al == empty:
+      search 含通配字符    → 503 auxiliary_unavailable（%/_/\ 无法等价表达，过滤语义
+      (%/_/\\)               永不降级——上游原生 LIKE 通义 vs DB 字面转义）
       cursor               → 503 auxiliary_unavailable（上游单键 cursor 无法兑现
                               (t,i) keyset 指纹，行 120）
       req ∈ Class A        → 200 + degraded:true（archived∈{omit,all} × parent∈{all,none}；
-                              parent=none→roots=true 透传；search 原生透传）
+                              parent=none→roots=true 透传；search 纯字面子串透传等价）
       req ∈ Class B        → 503 auxiliary_unavailable（archived=only / parent=only|<sid>，
                               上游无法表达，行 118-119）
 ```
 
-- Class A = 4 格；Class B = 8 格；72 格 = (12 req × 3 db × 2 al)，其中 DB avail 24 格全 200（仅 SQL 谓词差异）；DB 不可用 × allowlist 空 24 格 = 4×200+degraded + 20×503；DB 不可用 × allowlist 非空 24 格 = 全 503。
+- **坐标系（冻结）**：72 格 = **行为等价类** (req 12 × db 3 × al 2)；**cursor 不进坐标系**，为正交叠加轴（任何格叠加 cursor：db-avail → 仍 200 keyset 下推；db-不可用 → 503）。测试落地 = 72 等价类 × cursor 2 态 = 144 case（§11.3）。
+- 逐格计数（cursor 缺席基线）：Class A = 4 req；Class B = 8 req。DB avail 24 格全 200（仅 SQL 谓词差异）；DB 不可用 × allowlist 空 24 格（4 req × 2 db 态 + 8 req × 2 db 态）= **8 格 200+degraded + 16 格 503**；DB 不可用 × allowlist 非空 24 格 = 全 503。
+- **search 等价性轴（冻结）**：DB 不可用时，search 含 `%`/`_`/`\` 任一字符 → **503**（上游原生通配语义无法等价表达——过滤语义永不降级，v2.2 行 57「降级透传上游」按此收窄）；纯字面子串 → 按 Class A/B 规则（上游 `LIKE '%…%'` 对无通配字符输入与字面子串等价）。
 - **`degraded:true` 语义冻结**（行 64/123）：只表数据源降级 + 排序/complete 强度弱化（排序退化上游单键 time_updated、tie-break 弱；complete 退 best-effort；cursor 翻页强度退化）；**过滤语义永不降级**——可等价表达 → 200+degraded，不可表达 → 503。allowlist 维度上「过滤语义」= 白名单 ⊆ 结果集（放行不失、禁止不漏）。
 - **503 统一附 `Retry-After: 30`**（秒，与熔断恢复探针同量级）；错误体**不泄露 DB 路径/schema 细节/白名单内容**（行 122；统一体见 §8）。
-- search 降级差异披露：上游原生 search 不做 `%`/`_` 转义（通配语义），DB 路径为字面子串——降级路径按上游原样透传（v2.2 行 57「降级透传上游」），此差异属 degraded 披露范围。
+- search 降级注记：上游原生 search 不做 `%`/`_` 转义（通配语义）——**v2.2 行 57「降级透传上游」按 search 等价性轴收窄**：仅纯字面子串（无 `%`/`_`/`\`）可透传（等价），含通配字符一律 503（过滤语义永不降级）。
 
 ### §4.3 错误族
 
@@ -141,8 +145,14 @@ v4 sessions **无 ETag/Vary/304**（v2.2 行 254 §6）；v3 全表面 ETag 原�
 
 ### §4.6 search / allowlist SQL 语义（B0-6e 冻结，design-v4-dbaux §9 同源）
 
-- search：`title LIKE :pattern ESCAPE '\'`，pattern = `%` + 用户串（`%`/`_`/`\` 以 `\` 前缀字面转义）+ `%`——**字面子串匹配**；规范化 hash 进指纹。
-- allowlist 子树谓词（非空时）：`(s.directory = :d OR s.directory LIKE :d||'/%' ESCAPE '\')` 多项 OR——`/foo` 匹配 `/foo` 与 `/foo/**`，**不含** `/foobar`（`'/'` 闭合边界，禁裸前缀 LIKE）；比较 = 存储值 vs 见范化（absolute 非 realpath，与上游 `directoryColumn` 一致）字符串前缀匹配，POSIX 大小写敏感。
+- search：DB 路径 `title LIKE :pattern ESCAPE '\'`，pattern = `%` + 用户串（`%`/`_`/`\` 以 `\` 前缀字面转义）+ `%`——**字面子串匹配**；规范化 hash 进指纹。**降级（DB 不可用）**：search 含 `%`/`_`/`\` 任一字符 → 503（不可等价表达，§4.2）；纯字面子串 → 上游透传等价（上游对无通配字符输入同字面子串）。
+- allowlist 子树谓词（非空时，**二进制前缀，弃 LIKE**——实测 SQLite LIKE 对 ASCII 大小写不敏感、`=` 二进制敏感，LIKE 通配规则不可用于安全边界）：
+  ```sql
+  (s.directory = :d_raw
+   OR substr(s.directory, 1, :prefix_len) = :prefix)
+  -- :prefix = :d_raw || '/'（独立绑定，不做 LIKE 转义）；:prefix_len = length(:d_raw)+1
+  ```
+  `/foo` 匹配 `/foo` 与 `/foo/**`，**不含** `/foobar`、**大小写敏感**（`/Foo` 不匹配）；**根目录特例**：allowlist 项 = `/` → 匹配所有非空绝对路径 directory（单独定义，不与 `//` 前缀混算）。比较 = 存储值 vs 规范化（absolute 非 realpath，与上游 `directoryColumn` 一致）。空 directory 行在 allowlist 非空查询中排除（§4.1 既有语义）。
 - legacy 空 directory：空串按字面空串参与谓词（复刻上游 `database/path.ts:43-59` 空"value 保留"语义）；allowlist 非空时空 directory 行天然排除。
 - `/slimapi/directories` 保持现形态（/experimental/session 发现 + allowlist 过滤叠加），**不**升 DB 投影（范围冻结，v2.2 行 145/183）。
 
@@ -175,7 +185,7 @@ v3 原样（§4.4 已含 v4 差异：v4 sessions 无 ETag）。
 |---|---|---|
 | ① | tokens=1 统一流 | **已裁决（owner，2026-08-17）**：v4 禁止复用——`/events?tokens=1` → **400**，token 流必须走独立 `/slimapi/sessions/{sid}/stream`。理由：单 Last-Event-ID 无法恢复双序列（meta-first 与重放顺序结构性矛盾：重连新 meta 分配新 seq 后发旧 replay 帧 = 线上 ID 倒退）；webui/ocdroid 本就分离两连接，成本最低 |
 | ② | meta 重连语义 | **设计提案待 owner 终裁**：meta 帧**不带 `id:`**（连接级协商帧，不参与序列）；epoch **不随重连更换**（仅进程重启换——重连同进程内历史帧与日志窗口仍有效，换 epoch 会浪费窗口内可补帧）；线序严格 = meta（无 ID）→ replay 帧 → 新帧，全程 `(epoch,seq)` 单调不减 |
-| ③ | token ID 作用域 | **设计提案待 owner 终裁**：**per-sid** 独立序列（token 流域键 = sid）；全局流 `/events` 对称采用 **per-directory** 域（域键 = directory）。否决全局序列（跨 sid 合法空洞污染 gap 判定）与每连接序列（重连后 Last-Event-ID 失效）；per-domain 域下 seq 空洞唯一来源 = 日志逐出 → gap 判定干净 |
+| ③ | token ID 作用域 | **设计提案待 owner 终裁**：**token 流 = per-sid** 独立序列（端点天然绑定 sid，域键 = sid）；**全局流 `/events` = 该全局输出流自身的单一序列**（全实例策展帧共序——`/events` 是单连接全实例流，无 directory 绑定，per-directory 域会产生跨 directory 重复 ID / 单连接 seq 不单调 / Last-Event-ID 无域信息不可恢复，不可实现）。否决全局跨端点统一序列（token 流独立端点独立域）与每连接序列（重连后 Last-Event-ID 失效）；单一/per-sid 域下 seq 空洞唯一来源 = 日志逐出 → gap 判定干净 |
 | ④ | 两端点逐帧状态机 | **设计提案待 owner 终裁**：CONNECTING → ESTABLISHED/REPLAYING/RESYNCED 转移逐帧表（8 场景 × 2 端点），4 条通用不变量：meta 恒首帧；带 `id:` 帧按 (epoch,seq) 严格单调不减；无 `id:` 帧（meta/resync/heartbeat）不参与序列；replay 序列内不插新帧 |
 
 （②③④完整论证与状态机表格见 `design-v4-sse-replay.md` §2/§3；本节为 wire 摘要。）
@@ -183,17 +193,17 @@ v3 原样（§4.4 已含 v4 差异：v4 sessions 无 ETag）。
 ### §7.1 id: 语法与序列（提案口径）
 
 - `id: <epoch>:<seq>`（冒号分隔，纯十进制）——epoch = 进程代（unixtime_ms，**重启必换**；不随 SSE 重连更换），seq = 单调递增。
-- **ID 域独立（per-domain）**：全局流 `/events` 域键 = directory；token 流 `/sessions/{sid}/stream` 域键 = sid。同 epoch 下两域 seq 空间不相交；跨域 `Last-Event-ID` 视为无效（忽略重置按首连处理）。
+- **ID 域独立**：全局流 `/events` = 全实例策展帧**单一序列**（一个 epoch 一个 seq 计数器）；token 流 = per-sid 独立序列（域键 = sid）。同 epoch 下两域 seq 空间不相交；跨端点 `Last-Event-ID` 视为无效（忽略重置按首连处理）。
 - 帧分类：业务帧 / digest 分配 id；meta / resync / heartbeat **无 id**（不参与序列）。
 - **ID 无倒退不变式**：任一连接上线后带 `id:` 帧严格单调不减（§7.0② 线序保障）。
 
 ### §7.2 重放语义（提案口径）
 
 - 有界重放日志（新组件，count/bytes/TTL 三维上限，环形覆盖）——现 GlobalHub pending（250ms debounce）与 tombstone 队列**不是** replay log；与既有 token 域重放队列（cap 1000/TTL 24h）并存不混用。
-- `Last-Event-ID` 重连：缺口在日志窗口内 → 补发 replay 帧；ID 过期（早于窗口）→ 发 resync 提示帧（客户端全量对齐）；future ID / epoch 不匹配 / 跨域 ID / 格式非法 → 忽略按首连处理。
-- gap 处理：能区分「消费者缺席 seq」（per-domain 域下合法空洞不存在跨域空洞）vs「日志逐出」（→ resync）；gap → resync+snapshot（v2.2 行 153）。逐出-发布并发的边界 gap 误判风险为实现期待验证项（design-v4-sse-replay.md §5 待裁决 5，可降级防御分支，不影响 wire 语义）。
+- `Last-Event-ID` 重连：缺口在日志窗口内 → 补发 replay 帧；ID 过期（早于窗口）→ 发 resync 提示帧（客户端全量对齐）；**epoch 归类（冻结，四类拆分）**：旧合法 epoch（格式合法、epoch < 当前，即进程重启）→ `resync{reason:"epoch_changed"}`；future（epoch > 当前 或 seq > 已发布 max）→ 忽略 + 重置（按首连）；格式非法 / 跨端点域 → 忽略 + 重置。
+- gap 处理：区分「日志逐出」（→ resync）vs 合法缺席（单一/per-sid 域下不存在跨域合法空洞）。**snapshot 不是服务端帧**——resync 后客户端自行 HTTP 全量对齐（全局域如 `/slimapi/sessions` 首屏、token 域重拉消息投影），服务端只发 meta → resync → 新帧。逐出-发布并发的边界 gap 误判风险为实现期待验证项（design-v4-sse-replay.md §5 待裁决 5，可降级防御分支，不影响 wire 语义）。
 - 背压：溢出帧**入**重放日志（日志记录「已发布帧」而非「已送达帧」）；订阅端溢出断连 → 重连走 Last-Event-ID 重放。
-- **resync 帧 reason 值域（v4 冻结，加性扩展）**：`epoch_changed` | `replay_expired` | `replay_gap` | `reconnect_no_replay`（既有）；token 流 tombstone 帧（消息已撤销）replay 时跳过不发。
+- **resync 帧 reason 值域（v4 冻结，加性扩展）**：`epoch_changed` | `replay_expired` | `replay_gap` | `reconnect_no_replay`（既有）；token 流 tombstone（消息已撤销）在 replay 时**照常消耗其 seq 并以 `message.removed` 轻量撤销帧回放**（既有帧形 `tokenstream/frames.py:137-151` = `event: message.removed` + `{sessionID, messageID}`；保留 `id:`，维持 ID 序列无空洞）。
 - meta 恒首帧（meta-first 不变）；v4 meta additive 扩展：capabilities 摘要 + epoch/seq 基线字段（v3 形状不动，B3b-4）。
 
 ### §7.3 tokens=1（已裁决终态）
@@ -273,9 +283,9 @@ v4 sessions 归入 sessions 桶既有记账；降级路径请求带 degraded 标
 |---|---|---|---|
 | 11.1 | 跨版本 | §2 状态表 × §8.3 真值表逐组合；v3 全回归逐字节不变 | B3a-A |
 | 11.2 | selector 分叉 | v4 sessions × directory 四形态 → 单一错误码；v4 非 sessions-list × directory → 正常消费 | B3a-A |
-| 11.3 | 降级矩阵 | **72 格逐格**（状态码/degraded/Retry-After/错误体负向断言：不含 DB 路径/schema 字样/白名单内容） | B3a-B4 |
+| 11.3 | 降级矩阵 | **72 等价类 × cursor 2 态 = 144 case 逐格**（状态码/degraded/Retry-After/错误体负向断言：不含 DB 路径/schema 字样/白名单内容）；search 等价轴（含通配字符 → 503）入格 | B3a-B4 |
 | 11.4 | cursor | 编解码/指纹矩阵（参数变更→400）/边界/畸形/确定性（同输入两次 hash 相同） | B3a-B3 |
-| 11.5 | SQL 语义 | search 转义矩阵 4 / allowlist 前缀边界 3 / complete 边界 2 / legacy 空 directory 2 / 键集下界 1 / 指纹确定性 2（~14 case） | B3a-B2 |
+| 11.5 | SQL 语义 | search 转义矩阵 4 + 降级等价轴 2（含通配字符×db不可用→503 / 纯子串×ClassA→200+degraded）/ allowlist 二进制前缀边界 3 + 3（大小写差异不匹配 / 根 `/` 全匹配 / 路径段含 `%`/`_` 字面）/ complete 边界 2 / legacy 空 directory 2 / 键集下界 1 / 指纹确定性 2（~19 case） | B3a-B2 |
 | 11.6 | DB 生命周期 | schema 门/熔断（P99 滑动窗+最小样本+warmup+hysteresis）/inode swap/路径解析 ~10 case/并发阻断（线程亲和 R4 断言：worker 外访问被 check_same_thread 拒绝=期望性质） | B3a-B1 |
 | 11.7 | WAL 陈旧读 | ro-vs-immutable 3 case（已进 CI：`tests/test_wal_staleness.py`） | **B0 已落地** |
 | 11.8 | 等价性锚定 | DB 投影 ≡ 权威源（真实 opencode 进程 / 版本标记 golden，S-B03 禁 mock 自证）× {行集/字段语义/排序/complete} | B3a-B2（设计定稿见 design-v4-dbaux §10 / design-v4-equivalence-anchor） |

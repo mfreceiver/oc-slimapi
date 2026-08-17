@@ -56,17 +56,17 @@ SESSION_PROJECTION_COLS = [
 ]
 # 注：v2.2 行 72 模板列名 tokens_in/tokens_out——真库实为 tokens_input/tokens_output（待裁决 5）；
 # summary_*/tokens_*/time_* 为通配展开后的真库列名（行 146）。
-PROJECT_JOIN_COLS = ["id", "worktree"]  # v2.2 行 74 project_directory 待裁决（真库无 directory 列）
+PROJECT_JOIN_COLS = ["id", "name", "worktree"]  # 契约冻结 project={id,name,worktree}；v2.2 行 74 project_directory 真库不存在（rev-1 实证）
 
 DEFAULT_REAL_DB = os.path.expanduser("~/.local/share/opencode/opencode.db")
 
-# 投影 SQL 模板（v2.2 行 70-82 工程化：真实列名 + join 列可配置）
+# 投影 SQL 模板（v2.2 行 70-82 工程化：真实列名 + join 列含契约冻结 project.name；rev-1 修订）
 SQL_TMPL = """
 SELECT s.id, s.parent_id, s.time_archived, s.time_updated, s.directory, s.title,
        s.agent, s.model, s.version, s.summary_diffs,
        s.tokens_input, s.tokens_output, s.time_created,
        s.revert, s.permission, s.metadata,
-       p.{project_alias} AS project_{project_alias}, p.worktree AS project_worktree
+       p.name AS project_name, p.worktree AS project_worktree
 FROM session s LEFT JOIN project p ON s.project_id = p.id
 WHERE {archived_pred} AND {parent_pred}
   AND (:search IS NULL OR s.title LIKE :search ESCAPE '\\')
@@ -131,9 +131,8 @@ def search_pattern(search_on: bool) -> Optional[str]:
 
 def build_sql(combo: Combo, join_col: str = "worktree") -> str:
     if join_col != "worktree":
-        raise ValueError(f"--join-col 仅支持 worktree（真库/上游 ProjectInfo 对齐，v2.2 行 74 待裁决），got {join_col!r}")
+        raise ValueError(f"--join-col 仅支持 worktree（真库/上游 ProjectInfo 对齐，v2.2 行 74 directory 列已实证不存在，rev-1 关闭），got {join_col!r}")
     return SQL_TMPL.format(
-        project_alias=join_col,
         archived_pred=archived_pred(combo),
         parent_pred=parent_pred(combo),
         cursor_pred=cursor_pred(combo),
@@ -174,6 +173,7 @@ SESSION_DDL_COLS = [
 
 PROJECT_DDL_COLS = [
     ("id", "TEXT PRIMARY KEY"),
+    ("name", "TEXT"),
     ("worktree", "TEXT NOT NULL"),
 ]
 
@@ -204,7 +204,7 @@ def build_draft_db(rows: int, seed: int) -> tuple[str, list[dict[str, Any]], dic
             "parent_id": parent_id,
             "directory": f"/work/d{i % 10}",
             "title": f"grp{i % 4}-{i:04d}",
-            "version": "1.18.16",
+            "version": "1.18.18",
             "summary_additions": i % 7,
             "summary_deletions": i % 3,
             "summary_files": i % 2,
@@ -224,7 +224,7 @@ def build_draft_db(rows: int, seed: int) -> tuple[str, list[dict[str, Any]], dic
             "tokens_cache_write": 0,
             "metadata": "{}",
         })
-    project_rows = [{"id": f"p{i:02d}", "worktree": f"/work/p{i}"} for i in range(38)]
+    project_rows = [{"id": f"p{i:02d}", "name": f"project-{i}", "worktree": f"/work/p{i}"} for i in range(38)]
 
     con = sqlite3.connect(db_path)
     try:
