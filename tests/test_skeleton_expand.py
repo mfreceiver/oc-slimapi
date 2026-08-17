@@ -69,8 +69,9 @@ def test_diffs_null_with_ref_and_other_summary_keys_preserved():
 
 
 def test_diffs_empty_or_null_no_message_ref():
-    # m1: only a NON-EMPTY LIST of diffs is ref-eligible — no None/[]/{}/""/False.
-    for diffs in (None, [], {}, "", False):
+    # m1: only a NON-EMPTY LIST of diffs is ref-eligible — nothing else, incl.
+    # the empty tuple () (isinstance list path, R2).
+    for diffs in (None, [], {}, "", False, ()):
         info = {"id": "m1", "summary": {"diffs": diffs, "files": 0}}
         out = _msg([], info=info)
         assert out["info"]["summary"]["diffs"] is None
@@ -378,6 +379,28 @@ def test_oversized_text_without_part_id_omits_but_no_ref():
 def test_message_without_id_omits_diffs_but_no_info_ref():
     """R1-M3: the ''unknown'' id fallback must never yield an info ref."""
     info = {"summary": {"diffs": [{"file": "a.ts"}]}}  # no "id"
+    out = _msg([], info=info)
+    assert out["info"]["summary"]["diffs"] is None
+    assert "expandRefs" not in out["info"]
+    assert out["parts"][0]["id"] == "thin_placeholder_unknown"
+
+
+def test_empty_string_part_id_text_omission_no_ref():
+    """R2: a falsy part id '' (not just missing) never yields a part-level
+    ref — the reduction still applies (text null + omitted)."""
+    big = "x" * (TEXT_INLINE_MAX_BYTES + 1)
+    part = {"id": "", "type": "text", "messageID": "m1", "text": big}
+    out = _msg([part])["parts"][0]
+    assert out["text"] is None
+    assert out["omitted"] == ["text"]
+    assert out["hasFull"] is True
+    assert "expandRefs" not in out
+
+
+def test_empty_string_message_id_diffs_omission_no_ref():
+    """R2: a falsy info id '' (not just missing) yields no info-level ref;
+    diffs is still projected null; placeholder falls back to 'unknown'."""
+    info = {"id": "", "summary": {"diffs": [{"file": "a.ts"}]}}
     out = _msg([], info=info)
     assert out["info"]["summary"]["diffs"] is None
     assert "expandRefs" not in out["info"]

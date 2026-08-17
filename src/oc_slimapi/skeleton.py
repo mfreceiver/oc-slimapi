@@ -492,12 +492,14 @@ def skeleton_part(part: dict[str, Any], *, budget: dict[str, int] | None = None,
     part_type = part.get("type")
     if part_type == "text":
         # §2.3: synthetic/ignored/time are /full-only — omitted, never refs.
-        # Only {id, type, text} (+ messageID/sessionID) are picked; n1: the
-        # threshold is measured on the ORIGINAL text before any copy is made.
-        copied = _pick(part, PART_IDS | {"text"})
+        # Only {id, type, text} (+ messageID/sessionID) are picked. n1: the
+        # threshold is evaluated on the ORIGINAL part BEFORE _pick — when text
+        # is oversized it is never deep-copied (no throwaway allocation).
+        exceeds_text = _utf8_bytes_exceeds(part.get("text"), TEXT_INLINE_MAX_BYTES)
+        copied = _pick(part, PART_IDS if exceeds_text else PART_IDS | {"text"})
         omitted = [key for key in part if key not in PART_IDS | {"text"}]
         refs: list[tuple[str, str]] = []
-        if _utf8_bytes_exceeds(part.get("text"), TEXT_INLINE_MAX_BYTES):
+        if exceeds_text:
             # §4.1: whole-field omission — text becomes null, never truncated.
             copied["text"] = None
             omitted.append("text")
@@ -507,10 +509,13 @@ def skeleton_part(part: dict[str, Any], *, budget: dict[str, int] | None = None,
                 refs.append(("part_text", copied["id"]))
         return _emit_expand_refs(_mark(copied, omitted), refs, sid)
     if part_type == "reasoning":
-        result = _pick(part, PART_IDS | {"text"})
+        # n1: threshold evaluated on the ORIGINAL text BEFORE _pick — an
+        # oversized text is never deep-copied.
+        exceeds_reasoning = _utf8_bytes_exceeds(part.get("text"), REASONING_INLINE_MAX_BYTES)
+        result = _pick(part, PART_IDS if exceeds_reasoning else PART_IDS | {"text"})
         omitted = [key for key in part if key not in PART_IDS | {"text"}]
         refs: list[tuple[str, str]] = []
-        if _utf8_bytes_exceeds(part.get("text"), REASONING_INLINE_MAX_BYTES):
+        if exceeds_reasoning:
             result["text"] = None
             omitted.append("text")
             if result.get("id"):
