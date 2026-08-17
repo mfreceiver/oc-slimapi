@@ -71,6 +71,12 @@ TOOL_METADATA_KEYS = {"sessionId", "sessionID", "description", "agent", "diffSta
 FILE_URL_LIMIT = 8 * 1024
 COMPACTION_PART_LIMIT = 64 * 1024
 
+# Expand design v5 §4.1: inline caps for text/reasoning, measured in UTF-8
+# encoded bytes. A part whose text exceeds the cap is projected as
+# ``text: null`` + an ``expandRefs`` entry — never partially truncated.
+TEXT_INLINE_MAX_BYTES = 2048
+REASONING_INLINE_MAX_BYTES = 2048
+
 
 # ---------------------------------------------------------------------------
 # Per-call skeleton limits (P1-3 config de-double-tracking).
@@ -144,6 +150,48 @@ def _mark(part: dict[str, Any], omitted: list[str]) -> dict[str, Any]:
     if omitted:
         part["hasFull"] = True
         part["omitted"] = sorted(set(omitted))
+    return part
+
+
+def _utf8_bytes_exceeds(text: Any, limit: int) -> bool:
+    """§4.1: threshold check measured in UTF-8 encoded bytes — multibyte
+    strings count by wire bytes, not character count. Non-str values never
+    exceed the limit."""
+    return isinstance(text, str) and len(text.encode("utf-8")) > limit
+
+
+def _expand_ref(category: str, message_id: str, part_id: str | None, sid: str) -> dict[str, Any]:
+    """Build one §5 expandRef entry (frozen schema).
+
+    Message-level href: ``/slimapi/messages/{sid}/expand/{category}/{mid}?v=3``
+    Part-level href:    ``/slimapi/messages/{sid}/expand/{category}/{mid}/{partID}?v=3``
+    ``directory`` is appended by the client (§5.2).
+    """
+    base = f"/slimapi/messages/{sid}/expand/{category}/{message_id}"
+    href = f"{base}/{part_id}?v=3" if part_id is not None else f"{base}?v=3"
+    ref = {"category": category, "messageID": message_id, "href": href}
+    if part_id is not None:
+        ref["partID"] = part_id
+    return ref
+
+
+def _emit_expand_refs(part: dict[str, Any], refs: list[tuple[str, str]], sid: str | None) -> dict[str, Any]:
+    """Attach deduped, deterministic ``expandRefs`` to a part (§5.2).
+
+    ``refs`` entries are ``(category, partID)`` pairs; each (category, partID)
+    appears at most once (dedup) and output is sorted by (category, partID).
+    Without ``sid`` no href can be built → refs are dropped (the reductions
+    themselves still apply). Parts without a ``messageID`` get no refs.
+    """
+    if not sid or not refs:
+        return part
+    message_id = part.get("messageID")
+    if not message_id:
+        return part
+    part["expandRefs"] = [
+        _expand_ref(category, message_id, part_id, sid)
+        for category, part_id in sorted(set(refs))
+    ]
     return part
 
 
@@ -267,9 +315,11 @@ def _maybe_inline_state_field(
         omitted.append(f"state.{key}")
 
 
-def _tool(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS) -> dict[str, Any]:
+def _tool(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS, sid: str | None = None) -> dict[str, Any]:
     result = _pick(part, TOOL_KEYS)
     omitted: list[str] = []
+    refs: list[tuple[str, str]] = []
+    part_id = part.get("id")
     state = part.get("state")
     if isinstance(state, dict):
         thin_state = _pick(state, {"status", "title", "time"})
@@ -281,6 +331,10 @@ def _tool(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits:
             omitted.extend(
                 f"state.input.{key}" for key in source_input if key not in TOOL_INPUT_KEYS
             )
+            if part_id and any(key not in TOOL_INPUT_KEYS for key in source_input):
+                # §5.3: multiple non-whitelist input keys collapse to ONE
+                # part_state_input_full ref (dedup by category+messageID+partID).
+                refs.append(("part_state_input_full", part_id))
         elif source_input is not None:
             omitted.append("state.input")
         source_metadata = state.get("metadata")
@@ -292,15 +346,26 @@ def _tool(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits:
                 f"state.metadata.{key}"
                 for key in source_metadata if key not in TOOL_METADATA_KEYS
             )
+            if part_id and any(key not in TOOL_METADATA_KEYS for key in source_metadata):
+                refs.append(("part_state_metadata_full", part_id))
         # Thresholded: inline small output/error (per-field + per-message caps),
         # omit large or budget-spent ones. A field is fully inlined or fully
         # omitted — never half-truncated.
         for key in SKELETON_INLINE_FIELDS:
+            value = state.get(key)
+            before = len(omitted)
             _maybe_inline_state_field(thin_state, state, key, omitted, budget, limits=limits)
+            if len(omitted) > before and value not in (None, "") and part_id:
+                refs.append((f"part_state_{key}", part_id))
         # Always-omit heavy nested fields (giant JSON / binary-ish payloads).
         for key in SKELETON_ALWAYS_OMIT_FIELDS:
             if key in state:
                 omitted.append(f"state.{key}")
+                # §5.3: attachments has an expand category — ref only when the
+                # value was non-null/non-empty at omission time. structured /
+                # result / raw are /full-only (§2.3) — no refs.
+                if key == "attachments" and state[key] not in (None, [], {}) and part_id:
+                    refs.append(("part_state_attachments", part_id))
         # Inject compact diffStats from upstream filediff (computed, injected
         # AFTER thresholding so it is never elligible for omission — the ~50 B
         # object is well below the per-field cap, and sits in TOOL_METADATA_KEYS
@@ -322,18 +387,25 @@ def _tool(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits:
     for key in part:
         if key not in TOOL_KEYS and key != "state":
             omitted.append(key)
-    return _mark(result, omitted)
+    return _emit_expand_refs(_mark(result, omitted), refs, sid)
 
 
-def _patch(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS) -> dict[str, Any]:
-    result = _pick(part, PART_IDS)
+def _patch(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS, sid: str | None = None) -> dict[str, Any]:
+    # §4.2 (P0): v1.18.16 PatchPart = {type, hash, files: string[]}. ``hash``
+    # was previously dropped into omitted — now preserved. ``files`` a plain
+    # string[] carries no per-file stat projection value → kept verbatim.
+    # Legacy dict-item files (pre-v1.18 shape) keep the old per-file pick.
+    result = _pick(part, PART_IDS | {"hash"})
     omitted: list[str] = []
     files = part.get("files")
     if isinstance(files, list):
-        result["files"] = [
-            _pick(item, {"path", "additions", "deletions", "status"})
-            for item in files if isinstance(item, dict)
-        ]
+        if files and all(isinstance(item, str) for item in files):
+            result["files"] = deepcopy(files)
+        else:
+            result["files"] = [
+                _pick(item, {"path", "additions", "deletions", "status"})
+                for item in files if isinstance(item, dict)
+            ]
     metadata = part.get("metadata")
     if isinstance(metadata, dict) and "path" in metadata:
         result["metadata"] = {"path": deepcopy(metadata["path"])}
@@ -373,48 +445,78 @@ def _patch(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits
                 thin_state["metadata"] = {}
             thin_state["metadata"]["diffStats"] = diffStats
     for key in part:
-        if key not in PART_IDS | {"files", "metadata", "state"}:
+        if key not in PART_IDS | {"files", "metadata", "state", "hash"}:
             omitted.append(key)
+    # §5.3: patch has no expand categories — files kept verbatim; any state
+    # omission on a patch part is /full-only (state categories are tool-only).
     return _mark(result, omitted)
 
 
-def _file(part: dict[str, Any]) -> dict[str, Any]:
+def _file(part: dict[str, Any], *, sid: str | None = None) -> dict[str, Any]:
     result = _pick(part, PART_IDS | {"filename", "mime"})
     omitted: list[str] = []
+    refs: list[tuple[str, str]] = []
+    part_id = part.get("id")
     url = part.get("url")
     if isinstance(url, str) and url.startswith(("http://", "https://")) and len(url) <= FILE_URL_LIMIT:
         result["url"] = url
     elif "url" in part:
         result["url"] = None
         omitted.append("url")
+        if url not in (None, "") and part_id:
+            refs.append(("part_url", part_id))
     if "source" in part:
         omitted.append("source")
+        if part.get("source") not in (None, {}, [], "") and part_id:
+            refs.append(("part_source", part_id))
     for key in part:
         if key not in PART_IDS | {"filename", "mime", "url", "source"}:
             omitted.append(key)
-    return _mark(result, omitted)
+    return _emit_expand_refs(_mark(result, omitted), refs, sid)
 
 
-def skeleton_part(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS) -> dict[str, Any]:
+def skeleton_part(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS, sid: str | None = None) -> dict[str, Any]:
     part_type = part.get("type")
     if part_type == "text":
-        return deepcopy(part)
+        copied = deepcopy(part)
+        if _utf8_bytes_exceeds(copied.get("text"), TEXT_INLINE_MAX_BYTES):
+            # §4.1: whole-field omission — text becomes null, never truncated.
+            copied["text"] = None
+            return _emit_expand_refs(
+                _mark(copied, ["text"]), [("part_text", copied.get("id"))], sid
+            )
+        return copied
     if part_type == "reasoning":
         result = _pick(part, PART_IDS | {"text"})
-        return _mark(result, [key for key in part if key not in PART_IDS | {"text"}])
+        omitted = [key for key in part if key not in PART_IDS | {"text"}]
+        refs: list[tuple[str, str]] = []
+        if _utf8_bytes_exceeds(part.get("text"), REASONING_INLINE_MAX_BYTES):
+            result["text"] = None
+            omitted.append("text")
+            refs.append(("part_reasoning", result.get("id")))
+        # reasoning metadata/time omissions are /full-only (§2.3) — no refs.
+        return _emit_expand_refs(_mark(result, omitted), refs, sid)
     if part_type == "tool":
-        return _tool(part, budget=budget, limits=limits)
+        return _tool(part, budget=budget, limits=limits, sid=sid)
     if part_type == "patch":
-        return _patch(part, budget=budget, limits=limits)
+        return _patch(part, budget=budget, limits=limits, sid=sid)
     if part_type == "file":
-        return _file(part)
+        return _file(part, sid=sid)
     if part_type in {"step-start", "step-finish"}:
-        return _mark(_pick(part, PART_IDS), [key for key in part if key not in PART_IDS])
+        result = _mark(_pick(part, PART_IDS), [key for key in part if key not in PART_IDS])
+        refs: list[tuple[str, str]] = []
+        # §5.3: snapshot omission maps to part_snapshot — only when the
+        # snapshot existed non-null/non-empty at omission time. reason/cost/
+        # tokens are /full-only (§2.3).
+        if part.get("snapshot") not in (None, "") and result.get("id"):
+            refs.append(("part_snapshot", result["id"]))
+        return _emit_expand_refs(result, refs, sid)
     if part_type == "compaction":
         copied = deepcopy(part)
         # Compaction is retained unless the single part violates its explicit cap.
         if len(orjson.dumps(copied)) <= COMPACTION_PART_LIMIT:
             return copied
+        # omitted ["*"] → /full-only (§2.3), no expandRefs.
         return _mark(_pick(part, PART_IDS), ["*"])
     return _mark(_pick(part, PART_IDS), [key for key in part if key not in PART_IDS] or ["*"])
 
@@ -423,6 +525,7 @@ def skeleton_message(
     message: dict[str, Any], *,
     limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS,
     fingerprint: bool = False,
+    sid: str | None = None,
 ) -> dict[str, Any]:
     # P1-29: normalise nested fields defensively. A malformed upstream message
     # where ``info`` is null or ``parts`` is a non-list (int/bool/string) would
@@ -433,6 +536,19 @@ def skeleton_message(
     if not isinstance(info, dict):
         info = {}
     result = {"info": deepcopy(info)}
+    message_id = result["info"].get("id", "unknown")
+    # §4.1: ``info.summary.diffs`` is ALWAYS projected as ``null`` (unconditional
+    # reduction); summary siblings are preserved. §5.2/§5.3: a message-level
+    # ``info_summary_diffs`` ref is generated iff diffs was non-null/non-empty
+    # at omission time (and a sid is available to build the href).
+    summary = result["info"].get("summary")
+    if isinstance(summary, dict) and "diffs" in summary:
+        orig_diffs = summary["diffs"]
+        summary["diffs"] = None
+        if sid and orig_diffs not in (None, [], {}, ""):
+            result["info"]["expandRefs"] = [
+                _expand_ref("info_summary_diffs", message_id, None, sid)
+            ]
     parts = message.get("parts") if isinstance(message, dict) else None
     if not isinstance(parts, list):
         parts = []
@@ -442,11 +558,10 @@ def skeleton_message(
     # cap. Created here (per-message) and threaded through skeleton_part.
     budget = {"used": 0}
     thin_parts = [
-        skeleton_part(part, budget=budget, limits=limits)
+        skeleton_part(part, budget=budget, limits=limits, sid=sid)
         for part in parts if isinstance(part, dict)
     ]
     if not any(_is_renderable(part) for part in thin_parts):
-        message_id = result["info"].get("id", "unknown")
         thin_parts.append({
             "id": f"thin_placeholder_{message_id}",
             "messageID": message_id,
@@ -471,9 +586,10 @@ def skeleton_messages(
     messages: list[dict[str, Any]], *,
     limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS,
     fingerprint: bool = False,
+    sid: str | None = None,
 ) -> list[dict[str, Any]]:
     return [
-        skeleton_message(message, limits=limits, fingerprint=fingerprint)
+        skeleton_message(message, limits=limits, fingerprint=fingerprint, sid=sid)
         for message in messages
     ]
 
@@ -534,7 +650,10 @@ def strip_diagnostics_message(message: dict[str, Any]) -> dict[str, Any]:
 def _is_renderable(part: dict[str, Any]) -> bool:
     part_type = part.get("type")
     if part_type in {"text", "reasoning"}:
-        return bool(part.get("text"))
+        # §4.3: a part whose text was reduced to null but carries expandRefs is
+        # still renderable — the client sees the part skeleton + an expand
+        # entry, not a whole-page placeholder.
+        return bool(part.get("text")) or bool(part.get("expandRefs"))
     if part_type == "tool":
         state = part.get("state") if isinstance(part.get("state"), dict) else {}
         return bool(part.get("tool") or state.get("title") or state.get("input"))
