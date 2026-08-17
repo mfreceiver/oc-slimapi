@@ -542,8 +542,12 @@ def skeleton_part(part: dict[str, Any], *, budget: dict[str, int] | None = None,
         # Compaction is retained unless the single part violates its explicit cap.
         if len(orjson.dumps(copied)) <= COMPACTION_PART_LIMIT:
             return copied
-        # omitted ["*"] → /full-only (§2.3), no expandRefs.
-        return _mark(_pick(part, PART_IDS), ["*"])
+        # §5.3: over-limit compaction → omitted ["*"] + a compaction_full ref —
+        # NOT /full-only (§2.3 exempts "compaction 超限" from the ["*"] row).
+        # Lane-A falsy-id guard: partID only when the part id is truthy;
+        # _emit_expand_refs suppresses without a messageID.
+        refs = [("compaction_full", part["id"])] if part.get("id") else []
+        return _emit_expand_refs(_mark(_pick(part, PART_IDS), ["*"]), refs, sid)
     return _mark(_pick(part, PART_IDS), [key for key in part if key not in PART_IDS] or ["*"])
 
 

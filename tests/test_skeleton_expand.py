@@ -277,12 +277,45 @@ def test_step_finish_reason_cost_tokens_no_snapshot_ref():
 # §5.2: compaction ["*"] → /full-only, no ref
 # ---------------------------------------------------------------------------
 
-def test_compaction_over_limit_star_no_ref():
+def test_compaction_over_limit_emits_compaction_full_ref():
+    """rev-sgpt M1 (§5.3 :268): over-limit compaction maps to compaction_full
+    — NOT /full-only (§2.3 :123 exempts 'compaction 超限' from the ['*'] row)."""
     big = {"id": "p1", "type": "compaction", "messageID": "m1", "auto": True,
            "overflow": "x" * (COMPACTION_PART_LIMIT + 1)}
     out = _msg([big])["parts"][0]
     assert out["omitted"] == ["*"]
+    assert out["hasFull"] is True
+    assert out["expandRefs"] == [{
+        "category": "compaction_full", "messageID": "m1", "partID": "p1",
+        "href": f"/slimapi/messages/{SID}/expand/compaction_full/m1/p1{V3}",
+    }]
+
+
+def test_compaction_under_limit_inline_no_ref():
+    """Over-limit aside, compaction is retained inline — no omit, no ref."""
+    small = {"id": "p1", "type": "compaction", "messageID": "m1",
+             "auto": True, "text": "ok"}
+    out = _msg([small])["parts"][0]
+    assert out["text"] == "ok"
+    assert "omitted" not in out
     assert "expandRefs" not in out
+
+
+def test_compaction_over_limit_missing_ids_no_ref():
+    """rev-sgpt M1 defense: reduction still applies (omitted ['*']) but a
+    falsy/missing part id or a missing part messageID never yields a ref
+    (Lane-A falsy-id semantics)."""
+    no_id = {"type": "compaction", "messageID": "m1",
+             "overflow": "x" * (COMPACTION_PART_LIMIT + 1)}
+    out = _msg([no_id])["parts"][0]
+    assert out["omitted"] == ["*"]
+    assert "expandRefs" not in out
+
+    no_mid = {"id": "p1", "type": "compaction",
+              "overflow": "x" * (COMPACTION_PART_LIMIT + 1)}
+    out2 = _msg([no_mid])["parts"][0]
+    assert out2["omitted"] == ["*"]
+    assert "expandRefs" not in out2
 
 
 # ---------------------------------------------------------------------------
