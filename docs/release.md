@@ -16,7 +16,7 @@
 | 质量门禁 | `./scripts/check.sh`（compile + unit） | `./scripts/check.sh`（`pytest tests/`） |
 | Changelog | 发版时从 conventional commits **生成**到 `APK/*.md`（无根 CHANGELOG） | **维护根目录 [`CHANGELOG.md`](../CHANGELOG.md)**（接口行为，给 ocdroid）；发版脚本要求目标版本节已存在 |
 | 对外发布 | 人工 `git push` + `upload-release.sh`（Gitea API 传 APK） | 人工 `git push origin main && git push origin vX.Y.Z`（可选：Gitea Release notes 贴 CHANGELOG 节） |
-| Wire 协议版本 | N/A（客户端） | **独立轨道**：`X-Slimapi-Version`（破坏性才 bump，见契约 §1） |
+| Wire 协议版本 | N/A（客户端） | **独立轨道**：`?v=` selector + `GET /slimapi/versions` 发现（破坏性才 bump，见契约 §1） |
 
 **保留的 ocdroid 纪律**：
 
@@ -39,12 +39,20 @@
 
 Tag 格式：**`v` + semver**（例：`v0.1.0`），与 ocdroid 一致。
 
-### 1.2 Wire API 版本（整数头）
+### 1.2 Wire API 版本（`?v=` selector + 发现端点）
 
-- 头名：`X-Slimapi-Version`
-- 当前接受区间：见 `src/oc_slimapi/versioning.py` 与 `docs/specs/v2-contract.md` §1。
+- 版本协商 = **`?v=` selector** + **`GET /slimapi/versions`** 发现端点；请求头通道已于 3.0.0 删除（出现不解读）。
+- 当前接受区间：见 `src/oc_slimapi/versioning.py`（`ACCEPTED_CLIENT_VERSIONS`）与 `docs/specs/v3-contract.md` §1/§2（权威契约）。
 - **仅破坏性**变更 bump；加性变更 **同版本**。
-- Bump 时必须同步：`versioning.py`、`docs/specs/v2-contract.md`、`CHANGELOG.md`（写明客户端必改点）。
+- Bump 时必须同步：`versioning.py`、`docs/specs/v3-contract.md`、`CHANGELOG.md`（写明客户端必改点）。
+
+### 1.3 双版本期（wire (3,4)）说明
+
+4.0.0（P3）起 sidecar 进入 wire **双版本期**（路线见 `docs/system-architecture-proposal-2026-08-17.md` §7）：
+
+- `GET /slimapi/versions` 报 `available: [3, 4]`、`current: 4`（v3/v4 并存，v3 降级隔离）。
+- **major 与 wire 协议版本绑定铁律不变**：wire `ACCEPTED_CLIENT_VERSIONS` bump 才发 major。
+- accepted-range 收窄 `(3,4) → (4,4)`（v3 退役）即下一次 major（5.0.0；对齐 v2→v3 退役先例）。
 
 ---
 
@@ -52,9 +60,18 @@ Tag 格式：**`v` + semver**（例：`v0.1.0`），与 ocdroid 一致。
 
 1. **行为变更**是否已写入 `CHANGELOG.md` 的 `[Unreleased]` 或目标版本节？  
    - 路径、状态码、头字段、SSE 帧、错误 `code`、gzip/SSE 行为、资源限制默认值。
-2. 若破坏性：契约 + `X-Slimapi-Version` 是否已按 §1.2 处理？
+2. 若破坏性：契约 + wire 版本协商（`src/oc_slimapi/versioning.py` / `docs/specs/v3-contract.md` §1/§2）是否已按 §1.2 处理？
 3. `main` 已包含全部要发的提交；本地 `./scripts/check.sh` 绿。
 4. （可选）对照 ocdroid `docs/slim-mode-api-routing.md`：客户端文档是否需同步（由 ocdroid 仓维护；本仓以 CHANGELOG 通知）。
+
+### 2.1 P3 major（4.0.0）前置 checklist（n5）
+
+给 **major（P3，4.0.0）** 的发布前置门槛（在 §2 通用清单之上追加；冻结点见 `docs/refactor-plans/slimapi-refactor-plan.md` §4.2）：
+
+- [ ] ocdroid **B5a 兼容版已发布**（capabilities["4"] 探测 + v3 回退）
+- [ ] webui **B5a 兼容版已发布**
+
+→ 消费者兼容版就绪后**方可执行 sidecar major**；B3a 不得早于消费者兼容版。
 
 ---
 
@@ -114,8 +131,8 @@ git push origin main && git push origin vX.Y.Z
    ```bash
    git pull
    .venv/bin/pip install -e '.[test]'   # 刷新 dist-info；否则 health.sidecar.version 仍报旧版
-   systemctl --user restart oc-slimapi
-    curl -s -H 'X-Slimapi-Version: 2' http://127.0.0.1:4097/slimapi/health
+systemctl --user restart oc-slimapi
+   curl -s 'http://127.0.0.1:4097/slimapi/health?v=3'
    # 期望 sidecar.version == X.Y.Z
    ```
    原因：`__version__` 读自已安装包的 dist-info（`importlib.metadata`），不是运行时读 `pyproject.toml`。详见 [`operations.md`](operations.md) §2 / §4。
@@ -174,7 +191,7 @@ git push origin main && git push origin vX.Y.Z
 | [`scripts/check.sh`](../scripts/check.sh) | 质量门禁 |
 | [`scripts/release.sh`](../scripts/release.sh) | 发版唯一入口 |
 | [`pyproject.toml`](../pyproject.toml) | 包版本号源 |
-| [`docs/specs/v2-contract.md`](specs/v2-contract.md) | Wire 契约 |
+| [`docs/specs/v3-contract.md`](specs/v3-contract.md) | Wire 契约（权威；v2-contract.md 为 ≤2.x 历史） |
 | `src/oc_slimapi/versioning.py` | Wire API 接受区间 |
 
 ---

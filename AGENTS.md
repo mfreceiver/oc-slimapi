@@ -17,7 +17,7 @@ ocdroid ──(stunnel mTLS 14096)──▶ opencode :4096   # 直连回退，�
                                                     # 目标态：ocdroid 完成 C1/C3 前置后此直连退役，仅服务匿名消费方（见 docs/specs/CLIENT_CHANGES.md「直连退役」）
 ```
 
-- **只**通过 HTTP 调 opencode **legacy** `/session/**`（及 `/global/event` 等），**不读** opencode SQLite。
+- **只**通过 HTTP 调 opencode **legacy** `/session/**`（及 `/global/event` 等），当前**不读** opencode SQLite（v4 起经只读投影源 `mode=ro` 读，**绝无写入**——写域约束见硬规则「SQLite 写域」）。
 - 为 ocdroid 提供：消息 skeleton 投影、策展 SSE（`session.digest` + q/p 直推 + `slimapi.meta` 首帧）、T3 资源限制、`/slimapi/**` v3-only 选择器（`?v=3`；catch-all 反代已于 3.0.0 关闭）。
 - **权威契约**：[`docs/specs/v3-contract.md`](docs/specs/v3-contract.md)（唯一 wire 基准，v3-only 终态；与 design / INTERFACE_MAP 冲突时以契约为准）。[`docs/specs/v2-contract.md`](docs/specs/v2-contract.md) 为 ≤2.x 历史契约（v2 语义已于 3.0.0 退役）。
 - **设计 / 接口追踪**：[`docs/specs/design-v2.md`](docs/specs/design-v2.md)、[`docs/specs/INTERFACE_MAP.md`](docs/specs/INTERFACE_MAP.md)。
@@ -36,7 +36,7 @@ ocdroid ──(stunnel mTLS 14096)──▶ opencode :4096   # 直连回退，�
 | **opencode 源码（在 ocdroid 内）** | `/home/mar/personal_projects/ocdroid/opencode-src/current` | 上游 server 源码快照，供对照 legacy 行为 |
 
 **opencode 源码目录（相对 ocdroid 根）**：`opencode-src/current/`（稳定符号链接 → 当前对齐版本的子目录）。  
-**当前对齐版本**：`opencode-src/current` → **v1.18.16**（完整 monorepo 树；非部分抽取）。后续定期更新时，仅 repoint `current` 符号链接即可，本仓文档路径不需改。`opencode-src/` 在 ocdroid `.gitignore` 中，符号链接不污染 ocdroid git。
+**当前对齐版本**：`opencode-src/current` → **v1.18.18**（完整 monorepo 树；非部分抽取）。后续定期更新时，仅 repoint `current` 符号链接即可，本仓文档路径不需改。`opencode-src/` 在 ocdroid `.gitignore` 中，符号链接不污染 ocdroid git。
 
 ### 上游对照常用路径（相对 `opencode-src/current/`）
 
@@ -72,6 +72,7 @@ ocdroid ──(stunnel mTLS 14096)──▶ opencode :4096   # 直连回退，�
 
 - **改动校验必做**：每次改 Python / 契约相关行为后，必须 `./scripts/check.sh` 通过才算改动完成（当前 = `pytest tests/`）。
 - **契约权威**：wire 行为以 `docs/specs/v3-contract.md` 为准；实现与契约冲突 → 先改实现或走正式契约修订（见 `docs/release.md`），**禁止**静默偏离契约。
+- **SQLite 写域**：禁止写入/修改上游 opencode SQLite 业务数据；sidecar 代码路径零 DDL/DML/PRAGMA 写；索引建立属显式运维动作（含定义校验），不在 sidecar 内。wire contract 只冻结可观察语义（参数/错误/降级/degraded），**不冻结 SQLite 实现手段**；实现边界进本文件 / 架构设计文档 / `docs/operations.md`。
 - **版本双轨**：
   - **包版本**（semver，git tag `vX.Y.Z` + `pyproject.toml`）：产品/发版版本。
   - **Wire API 版本**（整数，`versioning.py` 中 `ACCEPTED_CLIENT_VERSIONS`，当前 `[3,3]`）：协商经 `?v=` selector + `/slimapi/versions` 发现端点；`X-Slimapi-Version` 请求头已于 3.0.0 删除（出现不解读）。
@@ -113,6 +114,7 @@ ls ~/.local/state/oc-slimapi/logs/           # access-YYYY-MM-DD.jsonl(.gz) + tr
 | 文件 | 用途 |
 |---|---|
 | [`docs/specs/v3-contract.md`](docs/specs/v3-contract.md) | **Wire 契约权威**（v3-only 终态；`v2-contract.md` 为 ≤2.x 历史契约） |
+| [`docs/specs/v4-contract.md`](docs/specs/v4-contract.md) | v4 wire 契约（**B0 起草中**；随 4.0.0 定稿） |
 | [`docs/specs/design-v2.md`](docs/specs/design-v2.md) | 当前态设计（接口/骨架/部署） |
 | [`docs/specs/INTERFACE_MAP.md`](docs/specs/INTERFACE_MAP.md) | 端点级实现追踪 |
 | [`docs/specs/CLIENT_CHANGES.md`](docs/specs/CLIENT_CHANGES.md) | ocdroid 侧配套改动清单 |

@@ -118,7 +118,7 @@ MemoryMax=384M
 WantedBy=default.target
 ```
 
-> 这是 **user service** 模板（`systemctl --user`）：**不含** `ProtectSystem`/`ProtectHome` 等 sandbox 指令——它们需要 root（capability drop），user manager 无权设置。进程隔离靠 stunnel mTLS（:14097/:14096）+ Tailscale ACL（见 §10）。仓库内 `deploy/oc-slimapi.service` 是同结构模板（含注释），**以它为权威模板**（本节示例若与之冲突以 deploy 为准）。
+> 这是 **user service** 模板（`systemctl --user`）：**不含** `ProtectSystem`/`ProtectHome` 等 sandbox 指令——它们需要 root（capability drop），user manager 无权设置。进程隔离靠 stunnel mTLS（:14097/:14096）+ Tailscale ACL（见 §11）。仓库内 `deploy/oc-slimapi.service` 是同结构模板（含注释），**以它为权威模板**（本节示例若与之冲突以 deploy 为准）。
 
 调参（订阅上限、buffer 字节预算、transform 并发等）只需在 `[Service]` 加 `Environment=OC_SLIMAPI_*` 行，参见 [`develop.md`](develop.md) §配置。
 
@@ -373,7 +373,80 @@ curl -s 'http://127.0.0.1:4097/slimapi/ready?v=3'
 
 ---
 
-## 7. ocdroid 项目组须知（接入侧）
+## 7. v4 DB 辅助源运维（B0 预置，随 B3a 生效）
+
+> **B0 批预置文档**：本章为 v4（**4.0.0**，B3a 批次）DB 辅助投影源
+> （`/slimapi/sessions?v=4` 常态路径）的运维说明，**功能随 4.0.0 生效**；
+> 当前 3.x（v3-only 终态）sidecar 不读 SQLite，本章暂不适用（仅预案）。
+> 设计权威：`docs/system-architecture-proposal-2026-08-17.md` §3.1/§3.5；
+> wire 见 `docs/specs/v4-contract.md`（B0 起草中，随 4.0.0 定稿）；
+> **写域约束：sidecar 零 DDL/DML/PRAGMA 写**（见 `AGENTS.md` 硬规则「SQLite 写域」）。
+
+### 7.1 DB 路径解析
+
+DB 辅助源以 `mode=ro` 只读打开 opencode 的 SQLite。路径解析顺序（裁决行 98）：
+
+1. **`OC_SLIMAPI_OPENCODE_DB` 显式配置**（生产推荐）——直接使用。
+2. **`OPENCODE_DB` 继承**——复刻上游解析：`InstallationChannel` 分库
+   `latest`/`beta`/`prod` → `opencode.db`；其余 channel → `opencode-<channel>.db`。
+3. **`:memory:` 禁用辅助源**——内存库无文件可读，禁用辅助降级 HTTP。
+4. **启动 log 打实际解析路径**——运维确认到底在读哪个文件；备份恢复 /
+   channel 切换换 DB 文件后尤其重要（配合 7.3 的 inode 校验 / 重探观察）。
+
+### 7.2 索引运维程序（运维显式动作，sidecar 零写入）
+
+- **sidecar 永不写上游 DB（含 DDL）**；索引建立属**运维显式动作（含定义校验）**，
+  不在 sidecar 内（proposal 行 107-108）。
+- **触发条件**：仅当生产 EQP + P99 数据证明必要时由运维手动执行。当前设计为
+  **首期无索引直跑**：真库 384 行全表扫温测 ~0.015ms，`P99 < 20ms` 熔断护栏兜底
+  （超限 → 熔断降级 HTTP + 告警）。
+- **候选索引**：sort-shaped 独立 `(time_updated DESC, id DESC)` 索引
+  （服务 keyset 排序）；**不是** v2.1 拟议的复合索引（filter-shaped，EQP 实证
+  仅部分覆盖）。
+- **程序**（对生产库手动执行）：
+
+```sql
+CREATE INDEX IF NOT EXISTS idx_session_time_updated_id
+  ON session (time_updated DESC, id DESC);
+
+PRAGMA index_xinfo(idx_session_time_updated_id);  -- 定义校验（防同名异构误判）
+```
+
+> **为什么必须 `PRAGMA index_xinfo` 校验**：`CREATE INDEX IF NOT EXISTS`
+> 不验证列定义——同名索引存在但列/顺序异构时会**静默成功**；`index_xinfo`
+> 输出实际列序（`seqno`/`cid`/`name`/`desc`），运维对照 `<time_updated DESC,
+> id DESC>` 逐列核对，防同名异构误判。
+
+### 7.3 熔断排障
+
+DB 辅助源熔断策略（proposal 行 100/106；护栏 7）：
+
+- **P99 > 20ms 熔断**：查询延迟滑动窗口超限 → 熔断禁用。
+- **错误分类熔断**：`SQLITE_SCHEMA` / `no such table|column` / I/O /
+  WAL-SHM 不可达 → 熔断禁用辅助。
+- **恢复**：周期重探（成功 → 解除熔断；持续失败保持禁用）。
+- **inode/mtime 定期校验**：备份恢复 / channel 切换换 DB 文件 → sidecar 持旧
+  fd 读已删 inode → 校验发现 → 重开重探（挂熔断器周期）。
+- 熔断 = **全降级 HTTP `/experimental/session`**（v3 完全不受影响；v4 sessions
+  走降级矩阵，`degraded`/503 语义见 v4-contract §4）。
+- **观察**：`GET /slimapi/health` 的 `auxiliary: {available, mode}` 字段。
+
+### 7.4 runbook：升级 opencode 后第一步（n6）
+
+升级 opencode 后，**第一步观察** `/slimapi/health` 的
+`auxiliary.available` / `auxiliary.mode`：
+
+- **熔断（`available: false`）= 等价性失败的信号**——上游 schema 可能漂移；
+- 对照 `docs/refactor-plans/slimapi-refactor-plan.md` §6.2
+  （DB 投影源整体禁用开关）逐链排查：等价性锚定测试失败 → 禁用辅助 →
+  全降级 HTTP；
+- **确认根因前不要手动放开熔断**（等效性测试失败即禁用辅助是设计决策，
+  非临时故障）。
+- 当前 3.x 阶段 `auxiliary` 字段尚不存在（**4.0.0** B3a 起出现）。
+
+---
+
+## 8. ocdroid 项目组须知（接入侧）
 
 ocdroid 客户端**不直接操作** sidecar 进程，只通过 stunnel mTLS 接它。需要知道的：
 
@@ -392,7 +465,7 @@ sidecar 进程的启停、日志、升级由 **服务端运维** 负责，ocdroi
 
 ---
 
-## 8. 排障速查
+## 9. 排障速查
 
 | 症状 | 先查 |
 |---|---|
@@ -404,7 +477,7 @@ sidecar 进程的启停、日志、升级由 **服务端运维** 负责，ocdroi
 
 ---
 
-## 9. 相关文档
+## 10. 相关文档
 
 | 文件 | 用途 |
 |---|---|---|
@@ -416,7 +489,7 @@ sidecar 进程的启停、日志、升级由 **服务端运维** 负责，ocdroi
 | [`../AGENTS.md`](../AGENTS.md) | Agent 入口索引 |
 
 ---
-## 10. G-ACL 部署姿态与边界验证（0.0.0.0:4097 + 14097 mTLS 隧道）
+## 11. G-ACL 部署姿态与边界验证（0.0.0.0:4097 + 14097 mTLS 隧道）
 
 > **参照**：`docs/ocmar/reports/2026-07-21-g-acl-ops-evidence.md`（本日证据报告）  
 > **部署姿态**：用户最终接受 `0.0.0.0:4097` 明文监听 + `:14097` mTLS 隧道（stunnel `requireCert=yes verifyChain=yes`，复用既有证书）作为 steady-state。以下为 ops 维护的边界验证 runbook。
@@ -484,7 +557,7 @@ curl -s --cert client-cert.pem --key client-key.pem \
 
 ---
 
-## 11. actions 管理功能
+## 12. actions 管理功能
 
 > 本节记录 `/slimapi/actions` 的运维注意事项。功能详见 `docs/specs/v2-contract.md` §2「`/slimapi/actions` API」。
 

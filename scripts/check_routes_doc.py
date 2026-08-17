@@ -28,6 +28,9 @@ method 但漏更文档时 check.sh 失败。
    `EXPAND_CATEGORIES` / `12`——文档表行须携带 12 类目单一事实源引用
    （`traffic.py::EXPAND_CATEGORIES`）与类目计数，防类目表与契约/实现漂移。
 
+   B0（2026-08-17）：纯设计批，无新增 /slimapi 路由，SEMANTIC_CHECKS 白名单
+   未动（新增路由语义白名单属 B3a/B4 批）。
+
 **已知局限**：代码侧只扫 ``routes/*.py`` 里静态声明的 ``@router.<method>``。
 若某 ``/slimapi`` 路由在别处动态注册（``app.add_api_route`` 等），本脚本看不到。
 当前项目所有 ``/slimapi`` 路由都在 ``routes/*.py`` 静态声明，故无遗漏；改用
