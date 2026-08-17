@@ -113,6 +113,16 @@ _MAX_TRANSFORM_TOTAL_BYTES = 512 * 1024 * 1024  # 512 MiB
 _MAX_RAW_PLUS_TRANSFORM_TOTAL_BYTES = (
     _MAX_TRANSFORM_TOTAL_BYTES + 64 * 1024 * 1024
 )  # 576 MiB
+# Expand fragment cap (design-expand §3.2): the per-fragment serialised
+# response bound of the messages expand endpoints. Startup window is
+# [1 KiB, 32 MiB] — below 1 KiB even a small fragment could never be
+# serialised; above 32 MiB the expand worker's extra concurrent buffers
+# (raw full-message body + parsed object + serialised fragment bytes +
+# optional gzip bytes) risk OOM under MemoryMax. The window is deliberately
+# narrower than the plain response cap (256 MiB): expand output is a
+# single-field fragment, not a projection tree.
+_MIN_EXPAND_RESPONSE_BYTES = 1024              # 1 KiB
+_MAX_EXPAND_RESPONSE_BYTES = 32 * 1024 * 1024  # 32 MiB
 
 # Default values for the access-log dir / path fields (P1-34). These mirror
 # the hardcoded defaults in the dataclass field definitions below and are
@@ -179,6 +189,15 @@ class Settings:
     max_transforms: int = int(os.getenv("OC_SLIMAPI_MAX_TRANSFORMS", "1"))
     transform_wait_seconds: float = float(os.getenv("OC_SLIMAPI_TRANSFORM_WAIT_SECONDS", "2"))
     max_response_bytes: int = int(os.getenv("OC_SLIMAPI_MAX_RESPONSE_BYTES", str(64 * 1024 * 1024)))
+    # Expand per-fragment response cap (design-expand §3.2): bounds the
+    # serialised response of a single messages expand fragment. Independent
+    # of max_response_bytes — an expand worker holds the raw full-message
+    # bytes, the parsed object, the serialised fragment bytes AND optional
+    # gzip bytes simultaneously, so the aggregate memory envelope accounts
+    # the two caps via max() (see validate() P1-30 note).
+    max_expand_response_bytes: int = int(
+        os.getenv("OC_SLIMAPI_MAX_EXPAND_RESPONSE_BYTES", str(8 * 1024 * 1024))
+    )
     # Catalog TTL cache (traffic plan Batch 1 / A1): successful upstream
     # catalog bodies (/slimapi/agent, /slimapi/command) are cached for a TTL
     # window so repeat catalog GETs stop hitting upstream. Only successful
@@ -573,19 +592,40 @@ class Settings:
                 f"OC_SLIMAPI_MAX_RESPONSE_BYTES must be <= "
                 f"{_MAX_RESPONSE_BYTES_CAP // (1024 * 1024)} MiB"
             )
+        # Expand fragment cap (design-expand §3.2): must stay within
+        # [1 KiB, 32 MiB]. Below 1 KiB no fragment could ever be serialised
+        # (guaranteed 413); above 32 MiB the expand worker's extra concurrent
+        # buffers (raw full-message body + parsed object + serialised
+        # fragment + optional gzip) risk OOM under MemoryMax.
+        if not _MIN_EXPAND_RESPONSE_BYTES <= self.max_expand_response_bytes <= _MAX_EXPAND_RESPONSE_BYTES:
+            raise RuntimeError(
+                f"OC_SLIMAPI_MAX_EXPAND_RESPONSE_BYTES must be in "
+                f"[{_MIN_EXPAND_RESPONSE_BYTES // 1024} KiB, "
+                f"{_MAX_EXPAND_RESPONSE_BYTES // (1024 * 1024)} MiB]"
+            )
         # P1-30: RSS upper-bound sanity. The worst-case RSS for the transform
         # pool is approximately ``max_transforms × max_response_bytes`` (each
         # admitted transform buffers the upstream body + the projection tree
-        # + the serialised output simultaneously). A product exceeding this
-        # cap risks OOM under the systemd MemoryMax before the admission
-        # semaphore can protect the process. Default max_transforms=1 ×
-        # max_response_bytes=64 MiB = 64 MiB (well within budget). Operators
-        # who genuinely need more should raise both deliberately.
-        _transform_total_bytes = self.max_transforms * self.max_response_bytes
+        # + the serialised output simultaneously). R4-M3 (design-expand
+        # §3.2): the expand worker additionally holds the raw full-message
+        # bytes, the parsed object, the serialised fragment bytes AND optional
+        # gzip bytes concurrently, so the envelope is accounted via the max of
+        # the two caps — an expand cap above the plain response cap must not
+        # be underestimated. A product exceeding this cap risks OOM under the
+        # systemd MemoryMax before the admission semaphore can protect the
+        # process. Default max_transforms=1 × max(64 MiB, 8 MiB) = 64 MiB
+        # (well within budget). Operators who genuinely need more should
+        # raise both deliberately.
+        _transform_total_bytes = (
+            self.max_transforms
+            * max(self.max_response_bytes, self.max_expand_response_bytes)
+        )
         if _transform_total_bytes > _MAX_TRANSFORM_TOTAL_BYTES:
             raise RuntimeError(
                 f"OC_SLIMAPI_MAX_TRANSFORMS ({self.max_transforms}) × "
-                f"OC_SLIMAPI_MAX_RESPONSE_BYTES ({self.max_response_bytes}) "
+                f"max(OC_SLIMAPI_MAX_RESPONSE_BYTES ({self.max_response_bytes}), "
+                f"OC_SLIMAPI_MAX_EXPAND_RESPONSE_BYTES "
+                f"({self.max_expand_response_bytes})) "
                 f"= {_transform_total_bytes} bytes exceeds "
                 f"{_MAX_TRANSFORM_TOTAL_BYTES // (1024 * 1024)} MiB — risk of "
                 f"OOM under MemoryMax (reduce one or both). See transform.py "
@@ -614,7 +654,9 @@ class Settings:
             raise RuntimeError(
                 f"OC_SLIMAPI_RAW_FETCH_MAX_BYTES ({self.raw_fetch_max_bytes}) "
                 f"+ OC_SLIMAPI_MAX_TRANSFORMS ({self.max_transforms}) × "
-                f"OC_SLIMAPI_MAX_RESPONSE_BYTES ({self.max_response_bytes}) "
+                f"max(OC_SLIMAPI_MAX_RESPONSE_BYTES ({self.max_response_bytes}), "
+                f"OC_SLIMAPI_MAX_EXPAND_RESPONSE_BYTES "
+                f"({self.max_expand_response_bytes})) "
                 f"= {_raw_plus_transform} bytes exceeds "
                 f"{_MAX_RAW_PLUS_TRANSFORM_TOTAL_BYTES // (1024 * 1024)} MiB "
                 f"— raw-fetch and transform budgets peak concurrently; "

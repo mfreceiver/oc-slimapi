@@ -58,7 +58,14 @@ from typing import Any, Awaitable, Callable
 from ..access_log import get_access_logger, hash_client_id, write_access_log
 from ..logging_config import get_logger
 from ..selector import DIRECTORY_FORM_STATE_KEY, SELECTOR_STATE_KEY
-from ..traffic import SSE_BUCKETS, _read_state_int, _UP_IN_KEY, _UP_OUT_KEY, bucketize
+from ..traffic import (
+    SSE_BUCKETS,
+    _UP_IN_KEY,
+    _UP_OUT_KEY,
+    _read_state_int,
+    bucketize,
+    expand_category_from_path,
+)
 from .request_id import REQUEST_ID_KEY
 
 logger = get_logger("middleware.traffic_accounting")
@@ -367,6 +374,17 @@ def _record(
             directory_form=directory_form,
             record_type="request",
         )
+        # design-expand §11 P4: expand requests additionally counted per
+        # category|status with wire downOut bytes (additive cross-cut; the
+        # bucket/requests above already cover the HTTP dimension). Path-hidden
+        # — the expand routes need no ledger knowledge.
+        expand_category = expand_category_from_path(path)
+        if expand_category is not None:
+            ledger.record_expand(
+                category=expand_category,
+                status=status,
+                resp_bytes=resp_for_ledger,
+            )
         # Upstream bytes for SSE buckets come from record_sse_upstream in the
         # hub — ignore the stash so the single shared /global/event
         # connection is attributed exactly once.

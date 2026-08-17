@@ -27,12 +27,31 @@ from __future__ import annotations
 from fastapi import APIRouter, Request
 
 from .. import __version__
+from ..config import settings
 from ..gzip_util import json_response
 
 router = APIRouter(prefix="/slimapi", tags=["versions"])
 
 CURRENT_VERSION = 3
 AVAILABLE_VERSIONS: list[int] = [3]
+
+# Expand capability (design-expand §6): the 12 frozen categories in §2.2
+# table order (verbatim — consumers may assume this ordering), advertised so
+# ocdroid can discover which fragments exist without probing per message.
+EXPAND_CATEGORIES: list[str] = [
+    "info_summary_diffs",
+    "part_text",
+    "part_reasoning",
+    "part_state_output",
+    "part_state_error",
+    "part_state_input_full",
+    "part_state_metadata_full",
+    "part_state_attachments",
+    "part_url",
+    "part_source",
+    "part_snapshot",
+    "compaction_full",
+]
 
 # Capability map keyed by version STRING (contract §3 shape, verbatim).
 CAPABILITIES: dict[str, dict] = {
@@ -56,11 +75,24 @@ CAPABILITIES: dict[str, dict] = {
 
 @router.get("/versions")
 async def versions(request: Request):
+    # capabilities["3"] carries the expand capability (design-expand §6):
+    # the frozen §2.2 categories plus ``fragmentMaxBytes`` read live from
+    # Settings at request time, so the advertisement always matches the
+    # effective per-fragment response cap of the running process.
+    capabilities = {
+        "3": {
+            **CAPABILITIES["3"],
+            "expand": {
+                "categories": EXPAND_CATEGORIES,
+                "fragmentMaxBytes": settings.max_expand_response_bytes,
+            },
+        },
+    }
     return json_response(
         {
             "current": CURRENT_VERSION,
             "available": AVAILABLE_VERSIONS,
-            "capabilities": CAPABILITIES,
+            "capabilities": capabilities,
             "sidecarVersion": __version__,
         },
         headers={"Cache-Control": "no-store"},

@@ -103,6 +103,16 @@ class TestBucketize:
         # prefix-tolerant (consistent with siblings)
         assert bucketize("GET", "/slimapi/questions/x") == "questions"
 
+    def test_messages_expand_bucket(self):
+        """Expand endpoints (design-expand §2.1 / §8 read group 8
+        "messages.expand") bucket separately from skeleton messages, both
+        path forms (/{mid} and /{mid}/{partID})."""
+        assert bucketize("GET", "/slimapi/messages/ses_x/expand/part_text/msg_x") == "messages.expand"
+        assert bucketize("GET", "/slimapi/messages/ses_x/expand/part_text/msg_x/prt_y") == "messages.expand"
+        # plain messages paths keep the generic bucket
+        assert bucketize("GET", "/slimapi/messages/ses_x") == "messages"
+        assert bucketize("GET", "/slimapi/messages") == "messages"
+
     def test_session_root_is_sessions(self):
         assert bucketize("GET", "/slimapi/sessions") == "sessions"
 

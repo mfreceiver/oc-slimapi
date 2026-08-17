@@ -69,6 +69,13 @@ def bucketize(method: str, path: str) -> str:
             return "token_stream_sse"
         if path == "/slimapi/events" or path.startswith("/slimapi/events/"):
             return "events_sse"
+        # Messages expand endpoints (design-expand §2.1 / §8 read group 8
+        # "messages.expand"): /slimapi/messages/{sid}/expand/{category}/... get
+        # their own bucket so per-fragment traffic (and error surface) stays
+        # visible in /slimapi/metrics.traffic separate from the skeleton
+        # projections (same per-endpoint precedent as command/agent).
+        if _expand_tail(path) is not None:
+            return "messages.expand"
         if path.startswith("/slimapi/messages"):
             return "messages"
         # Catalog skeleton routes (additive). Distinct buckets so each
@@ -130,6 +137,49 @@ def bucketize(method: str, path: str) -> str:
         return "other"
     # Anything else is the catch-all reverse proxy.
     return "passthrough"
+
+
+# Messages expand path segment (design-expand §2.1): the expand endpoints live
+# at ``/slimapi/messages/{sid}/expand/{category}/{mid}[/{partID}]``. The
+# segment-check helpers below share one source of truth for bucketizing AND
+# per-category accounting, so a path can never be counted under a different
+# category than the bucket it landed in.
+_EXPAND_SEGMENT = "expand/"
+
+
+def _expand_tail(path: str) -> str | None:
+    """Return the substring after the ``expand/`` segment of a messages
+    expand path, or ``None`` when the path is not an expand request.
+
+    Segment-strict: ``{sid}`` must be a single path segment immediately
+    followed by ``expand/`` — a stray ``expand/`` later in the path (or a
+    bare ``/slimapi/messages/{sid}/expand`` with no category) does not match.
+    """
+    prefix = "/slimapi/messages/"
+    if not path.startswith(prefix):
+        return None
+    rest = path[len(prefix):]
+    slash = rest.find("/")
+    if slash < 0:
+        return None
+    after_sid = rest[slash + 1:]
+    if not after_sid.startswith(_EXPAND_SEGMENT):
+        return None
+    return after_sid[len(_EXPAND_SEGMENT):]
+
+
+def expand_category_from_path(path: str) -> str | None:
+    """Extract the expand ``category`` path segment (design-expand §2.1/§2.2),
+    or ``None`` when the path is not an expand request.
+
+    Used by the traffic middleware to attribute expand requests to the
+    ``category|status`` counter (design-expand §11 P4 observability).
+    """
+    tail = _expand_tail(path)
+    if tail is None:
+        return None
+    category, _, _ = tail.partition("/")
+    return category or None
 
 
 # Per-request upstream-byte stash keys (stored under ``scope["state"]`` by
@@ -217,6 +267,7 @@ class TrafficLedger:
         "_latencies",   # bucket -> deque[float] (bounded duration_ms samples)
         "_v3_matrix",   # flat "selectorResult|wireVersion|directoryForm|recordType|statusClass|bucket" -> count (v3 §9.2)
         "_v3_sse",      # sseActive dim -> {opens, closes, active, orphanCloses} (v3 §9.2)
+        "_expand",      # "category|status" -> {requests, bytes} (design-expand §11 P4)
     )
 
     def __init__(self, *, enabled: bool = True) -> None:
@@ -227,6 +278,7 @@ class TrafficLedger:
         self._latencies: dict[str, deque] = {}
         self._v3_matrix: dict[str, int] = {}
         self._v3_sse: dict[str, dict[str, int]] = {}
+        self._expand: dict[str, dict[str, int]] = {}
 
     @property
     def enabled(self) -> bool:
@@ -415,6 +467,35 @@ class TrafficLedger:
                     entry["orphanCloses"] += 1
 
 
+    # ---- expand per-category observability (design-expand §11 P4) ----
+
+    def record_expand(
+        self,
+        *,
+        category: str,
+        status: int,
+        resp_bytes: int,
+    ) -> None:
+        """Count one expand request by ``category`` and ``status``.
+
+        ``resp_bytes`` is the downstream response body length (same口径 as
+        ``downOut``). Key = ``category|status`` — the flat-key style mirrors
+        the v3 matrix (``record_selector_request``) and is what the
+        rate-limit / cache evaluation (design-expand §11 follow-up) needs to
+        split expand traffic per category without re-parsing access logs.
+
+        Additive cross-cut: the request is ALSO counted in its HTTP bucket
+        (``messages.expand``) by :meth:`record_downstream`; this counter is a
+        separate dimension, not a replacement.
+        """
+        if not self._enabled:
+            return
+        key = f"{category}|{status}"
+        with self._lock:
+            entry = self._expand.setdefault(key, {"requests": 0, "bytes": 0})
+            entry["requests"] += 1
+            entry["bytes"] += max(0, resp_bytes)
+
     # ---- snapshot for /slimapi/metrics ----
 
     def snapshot(self) -> dict:
@@ -538,5 +619,10 @@ class TrafficLedger:
                     "sseActive": {
                         dim: entry["active"] for dim, entry in self._v3_sse.items()
                     },
+                },
+                # design-expand §11 P4: expand requests counted per
+                # ``category|status`` with downstream response bytes.
+                "expand": {
+                    key: dict(entry) for key, entry in self._expand.items()
                 },
             }
