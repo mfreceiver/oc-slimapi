@@ -57,6 +57,7 @@ from oc_slimapi.errors import register_error_handlers
 from oc_slimapi.proxy import install_proxy
 from oc_slimapi.routes import messages
 from oc_slimapi.selector import SlimapiSelectorMiddleware
+from oc_slimapi.traffic import EXPAND_CATEGORIES as TRAFFIC_CATEGORIES
 from oc_slimapi.transform import TransformConfig, TransformPool
 
 HDR = {"X-Slimapi-Version": "2"}
@@ -65,12 +66,17 @@ V3 = "?v=3"
 DIRECTORY_HEADER = "X-Opencode-Directory"
 
 # §2.2 table order — part of the wire contract (validCategories replay).
-VALID_CATEGORIES = [
-    "info_summary_diffs", "part_text", "part_reasoning",
-    "part_state_output", "part_state_error", "part_state_input_full",
-    "part_state_metadata_full", "part_state_attachments", "part_url",
-    "part_source", "part_snapshot", "compaction_full",
-]
+# Derived from the SINGLE SOURCE OF TRUTH (oc_slimapi.traffic) so this module
+# can never drift from the route/capabilities whitelist (rev-gpt R1 M1).
+VALID_CATEGORIES = list(TRAFFIC_CATEGORIES)
+
+
+def test_route_category_whitelist_matches_traffic_source_of_truth():
+    """The route's accepted category set is the traffic constant itself —
+    a private copy in messages.py would drift from the capabilities
+    advertisement and the ledger whitelist (rev-gpt R1 M1)."""
+    assert messages._EXPAND_CATEGORIES_SET == frozenset(TRAFFIC_CATEGORIES)
+    assert messages._EXPAND_CATEGORIES == TRAFFIC_CATEGORIES  # same table order
 
 
 def _settings(**overrides) -> Settings:
@@ -534,9 +540,10 @@ async def test_step_finish_snapshot_200(upstream_factory):
 # 4) Extractor positives — 12 categories
 # ---------------------------------------------------------------------------
 
-async def _expand_part(client, category: str, part_id: str):
+async def _expand_part(client, category: str, part_id: str, *, mid: str = "m1"):
     return await client.get(
-        f"/slimapi/messages/s1/expand/{category}/m1/{part_id}", headers=HDR)
+        f"/slimapi/messages/s1/expand/{category}/{mid}/{part_id}",
+        headers=HDR)
 
 
 async def test_extract_info_summary_diffs(upstream_factory):
@@ -698,12 +705,14 @@ async def test_nested_type_mismatch_502(upstream_factory, category, part_id, par
     {"info": {"id": "m1"}, "parts": "scalar"},
     {"info": {"id": "m1"}, "parts": 7},
     {"info": {"id": "m1"}, "parts": [{"type": "text"}]},
+    {"info": {"id": "m1"}, "parts": [{"id": "", "type": "text"}]},
     {"info": {"id": "m1"}, "parts": [1, 2]},
     {"info": {"id": "m1"}, "parts": [{"id": "p", "type": "text"},
                                      {"id": "p", "type": "text"}]},
 ], ids=[
     "parts-null", "parts-scalar-str", "parts-scalar-int",
-    "element-without-id", "non-object-element", "duplicate-partid",
+    "element-without-id", "element-empty-id", "non-object-element",
+    "duplicate-partid",
 ])
 async def test_malformed_parts_502(upstream_factory, malformed):
     """Parsed-but-structurally-malformed parts → 502 (distinct from the
@@ -859,6 +868,39 @@ async def test_singleflight_same_message_one_get(upstream_factory, cat2, pid2):
     assert calls[0] == 1
 
 
+async def test_singleflight_joins_while_in_flight(upstream_factory):
+    """M2-proof: with a SLOW upstream GET, the second concurrent expand
+    genuinely joins the first while it is in flight (not merely coalescing
+    on the completion grace after serialised pool admission). Both requests
+    succeed and upstream served the message exactly once."""
+    calls = [0]
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls[0] += 1
+        started.set()
+        await release.wait()  # park the LEADER's GET until both requestors are in
+        return httpx.Response(200, content=orjson.dumps(FULL_MESSAGE),
+                              headers={"Content-Type": "application/json"})
+
+    async with _test_client(
+        upstream_factory, handler,
+        max_transforms=4,  # enough slots that admission never serialises us
+    ) as client:
+        t1 = asyncio.create_task(
+            _expand_part(client, "part_text", "p_text"))
+        await started.wait()          # leader's GET is genuinely in flight
+        t2 = asyncio.create_task(
+            _expand_part(client, "part_reasoning", "p_reason"))
+        await asyncio.sleep(0.05)     # let the second requestor reach the join
+        release.set()                 # unblock the leader
+        r1, r2 = await asyncio.gather(t1, t2)
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+    assert calls[0] == 1  # the in-flight join, not two serialised GETs
+
+
 async def test_singleflight_expand_and_full_share(upstream_factory):
     """An expand and a concurrent direct /full for the same mid coalesce
     (the L2-CD-1 key is (pool, sid, mid, directory)) → 1 GET."""
@@ -925,7 +967,13 @@ async def test_singleflight_different_messages_no_merge(upstream_factory):
 
 async def test_singleflight_grace_expiry_new_get(upstream_factory):
     """After the 1s grace window, a sequential expand re-fetches (the grace
-    is a dedup artefact, not a cache)."""
+    is a dedup artefact, not a cache).
+
+    Uses a mid unique to this test: the module-level ``fulls`` registry keys
+    on ``(id(pool), sid, mid, directory)``, and pytest reuses freed pool
+    object addresses across apps — a shared mid would let a previous test's
+    still-warm grace entry coalesce this test's first GET (a test-isolation
+    artefact, not production behaviour)."""
     calls = [0]
     async def handler(request: httpx.Request) -> httpx.Response:
         calls[0] += 1
@@ -933,10 +981,10 @@ async def test_singleflight_grace_expiry_new_get(upstream_factory):
                               headers={"Content-Type": "application/json"})
 
     async with _test_client(upstream_factory, handler) as client:
-        r1 = await _expand_part(client, "part_text", "p_text")
+        r1 = await _expand_part(client, "part_text", "p_text", mid="m_grace_1")
         assert r1.status_code == 200
         await asyncio.sleep(1.1)  # _RESULT_GRACE_SECONDS == 1.0
-        r2 = await _expand_part(client, "part_text", "p_text")
+        r2 = await _expand_part(client, "part_text", "p_text", mid="m_grace_1")
     assert r2.status_code == 200
     assert calls[0] == 2
 
@@ -1145,6 +1193,53 @@ async def test_merged_intersection_single_slot_single_fetch(upstream_factory):
         r = await _merged_get(client, "/slimapi/messages/s1?mode=merged")
     assert r.status_code == 200
     assert calls == ["/session/s1/message/m_x"]  # exactly one fetch
+
+
+async def test_merged_mixed_page_e2e_placeholder_first(upstream_factory):
+    """M3 e2e: a page carrying BOTH a placeholder message AND a ref message
+    exercises the full R3-B pipeline — placeholder claims its slot first,
+    the ref candidate fills the remaining slot, page order is preserved
+    (created ASC), and the ref message's diffs stay null + info.expandRefs.
+    NOTE: a real intersection (placeholder marker AND part-level expandRefs
+    on the SAME message) is unreachable from genuine upstream — the skeleton
+    makes any expandRefs-bearing part renderable, so such a message is never
+    a placeholder (§4.3 renderability). The intersection DEDUP itself is
+    covered by the pure-function assertion above; this test locks the
+    mixed-page ordering/budget semantics end-to-end."""
+    ph = {"info": {"id": "m_ph", "role": "user",
+                   "time": {"created": 1, "updated": 1}},
+          "parts": [{"id": "p_empty", "type": "text", "messageID": "m_ph",
+                     "text": ""}]}
+    ref = {"info": {"id": "m_ref", "role": "assistant",
+                    "time": {"created": 2, "updated": 2},
+                    "summary": {"diffs": [{"file": "b.ts", "additions": 2}]}},
+           "parts": [{"id": "p_long", "type": "reasoning", "messageID": "m_ref",
+                      "text": "r" * 3000}]}  # > 2048 threshold → reasoning ref
+    fulls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session/s1/message":
+            return _list_response([ph, ref])
+        mid = request.url.path.rsplit("/", 1)[-1]
+        fulls.append(mid)
+        return _single_full(mid)
+
+    async with _test_client(
+        upstream_factory, handler, merged_max_fulls_per_page=2,
+    ) as client:
+        r = await _merged_get(client, "/slimapi/messages/s1?mode=merged")
+    assert r.status_code == 200
+    # both slots claimed: placeholder + ref, page order (1 < 2)
+    assert fulls == ["m_ph", "m_ref"]
+    items = _json(r)["items"]
+    assert [i["info"]["id"] for i in items] == ["m_ph", "m_ref"]
+    # placeholder spliced from full
+    assert items[0]["parts"] == orjson.loads(_single_full("m_ph").content)["parts"]
+    # ref spliced too (its slot came after the placeholder)
+    assert items[1]["parts"] == orjson.loads(_single_full("m_ref").content)["parts"]
+    # diffs stay null + message-level expandRefs preserved for the ref message
+    assert items[1]["info"]["summary"]["diffs"] is None
+    assert items[1]["info"]["expandRefs"][0]["category"] == "info_summary_diffs"
 
 
 # ---------------------------------------------------------------------------

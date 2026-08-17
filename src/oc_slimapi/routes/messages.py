@@ -1216,23 +1216,15 @@ async def message(
 # want; the contract wire shape is 400 invalid_expand_category.
 # ---------------------------------------------------------------------------
 
-# §2.2 — the 12 frozen categories, TABLE ORDER (order is part of the wire
-# contract: validCategories / expectedTypes lists are emitted in this order).
-_EXPAND_CATEGORIES: tuple[str, ...] = (
-    "info_summary_diffs",
-    "part_text",
-    "part_reasoning",
-    "part_state_output",
-    "part_state_error",
-    "part_state_input_full",
-    "part_state_metadata_full",
-    "part_state_attachments",
-    "part_url",
-    "part_source",
-    "part_snapshot",
-    "compaction_full",
-)
-_EXPAND_CATEGORIES_SET = frozenset(_EXPAND_CATEGORIES)
+# §2.2 — the 12 frozen categories. SINGLE SOURCE OF TRUTH is
+# ``oc_slimapi.traffic.EXPAND_CATEGORIES`` (design-expand §2.2 table order —
+# order is part of the wire contract: validCategories / expectedTypes lists
+# are emitted in this order). The versions route and the traffic accounting
+# whitelist import the same constant; the route must never hold a private
+# copy or category additions/removals would drift between the wire
+# advertisement, the ledger and the endpoint (rev-gpt R1 M1).
+from ..traffic import EXPAND_CATEGORIES as _EXPAND_CATEGORIES
+from ..traffic import EXPAND_CATEGORIES_SET as _EXPAND_CATEGORIES_SET
 
 # §2.2 level split: only ``info_summary_diffs`` is message-level.
 _EXPAND_MESSAGE_LEVEL_CATEGORIES = frozenset({"info_summary_diffs"})
@@ -1275,8 +1267,11 @@ def _expand_locate_part(message: dict, part_id: str) -> dict:
         if not isinstance(item, dict):
             _expand_shape_error()
         pid = item.get("id")
-        if not isinstance(pid, str):
-            _expand_shape_error()  # part without usable id — cannot match
+        if not isinstance(pid, str) or not pid:
+            # part without a usable id (missing / non-string / empty string,
+            # rev-gpt R1 m1) — cannot match, same 502 as the other unusable
+            # id forms (matches lane A's falsy-id skeleton guard semantics).
+            _expand_shape_error()
         if pid in seen:
             _expand_shape_error()  # duplicate partID
         seen.add(pid)
