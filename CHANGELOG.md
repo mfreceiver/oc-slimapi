@@ -26,6 +26,35 @@ ocdroid 对接时：
 
 ---
 
+## [4.0.0] - 2026-08-17 — expand 片段端点 + skeleton 投影缩减（包版本 MAJOR；wire 版本**不变**，仍 v3——缩减按 owner 决策收进 v3 视图，无 `?v=4`，ocdroid 同步发版承接）
+
+> 设计稿：`docs/specs/design-expand.md`（v5，rev-sgpt R4 APPROVED WITH CHANGES 已采纳）。**ocdroid 必改点**：渲染 skeleton 列表时按 `omitted`/`hasFull`/`expandRefs` 处理被折叠字段，按需经 expand 端点拉取；`text` 整字段折叠为 `null`（从不半截断），超大内容改走 `part_text`/`part_reasoning` 拉取。
+
+### Changed（wire 行为变更：skeleton 投影缩减——wire 仍 v3，无新 selector）
+
+- **`GET /slimapi/messages/{sid}` 与 merged 模式的 skeleton 投影收紧**（design-expand §2）：
+  - `text`/`reasoning` part：UTF-8 字节 **>2048** → `text: null` + `omitted:["text"]` + `hasFull:true` + `expandRefs:[{category:"part_text"|"part_reasoning",…}]`（**整字段折叠，从不半截断**；≤2048 原样内联）。
+  - `text` 的 `synthetic`/`ignored`/`time` 与 `reasoning` 的 metadata/time：**/full-only**——skeleton 中 `omitted`（无 refs；`/full` 照旧全量）。
+  - `file` part：`url` 为空/缺 → `url:null`+omitted；非空折叠 → ref `part_url`；`source` 折叠 → ref `part_source`。
+  - `step-start`/`step-finish`：`snapshot` 折叠 → ref `part_snapshot`（仅折叠时刻非空才 ref）；`reason`/`cost`/`tokens` /full-only。
+  - `tool` state：`input`/`metadata`/`attachments` 折叠 → refs `part_state_input_full`/`part_state_metadata_full`/`part_state_attachments`（缺失 vs 显式 null 均折叠不 ref）。
+  - `info.summary.diffs`：skeleton 恒 `null` + 消息级 `info.expandRefs[0].category="info_summary_diffs"`（非空 list 才 ref；`/full` 照旧全量）。
+  - **`expandRefs` 为 sidecar 拥有键**：上游同名 junk 一律剥离/确定性替换，永不透传、不进 `omitted`。
+  - 无可用 id 的 part/message：缩减照常应用但不生成（不可用的）refs。
+  - `?mode=merged` 扩展：placeholder 优先填槽，剩余槽位由页内 part 级 `expandRefs` 候选填充（消息级 diffs ref **不参与**候选）；页序保持、预算耗尽单项降级保持折叠（不 500 整页）。
+- **对账语义**：expand 返回**当前态**字段值（非快照）；part 已删 → 404（`reason:"part_missing"`），类型已变 → 400——客户端据此刷新 skeleton。
+
+### Added（加性 wire：expand 片段端点 + 配置/能力/记账）
+
+- **2 个 GET 端点**（design-expand §2.2/§3）：`GET /slimapi/messages/{sid}/expand/{category}/{mid}`（message-level，仅 `info_summary_diffs`）与 `GET /slimapi/messages/{sid}/expand/{category}/{mid}/{partID}`（part-level，11 类目）。12 类目白名单单一事实源 = `traffic.py::EXPAND_CATEGORIES`（表序冻结）。
+- **响应 envelope**：`{category, messageID, data}`（part 级多 `partID`）+ `Cache-Control:no-store` + gzip+`Vary`；缺失字段 vs 显式 null → 200 + `data` 键 `null`。
+- **求值序冻结**（§3.1）：白名单 400 → level 400 → 池 admission 503（**先于** part 级错误）→ 共享 single-flight GET（与 `/full`/merged 同键去重）→ 源 cap 413（先于解码）→ decode 503 → 定位 502/404 → 类型 400 → 提取 → 片段 cap 413（gzip 前）。错误码仅 `expand_target_not_found`（附 `reason`）/`expand_category_mismatch` 两命名 + `invalid_expand_category`/`expand_source_too_large`/`expand_fragment_too_large`/`upstream_invalid_shape`/`transform_busy`/`upstream_unavailable`。
+- **配置**：`OC_SLIMAPI_MAX_EXPAND_RESPONSE_BYTES`（默认 8388608=8 MiB，1 KiB–32 MiB 含边界校验，非法值启动即 RuntimeError 命名变量）；转换池聚合 envelope 上限自动取 `max(max_response_bytes, max_expand_response_bytes)×max_transforms`。
+- **能力广告**：`GET /slimapi/versions` → `capabilities["3"]["expand"] = {validCategories:[12 项表序], fragmentMaxBytes:<live>}`。
+- **流量记账**：ledger/snapshot/metrics 新增 `expand` 块（按 category×status 聚合）；伪造/非法 category 折叠进固定 `invalid` 桶（防基数 DoS）；`traffic-snapshot-YYYY-MM-DD.jsonl` 持久化含 expand。
+
+---
+
 ## [2.0.0] - 2026-08-16 — v3 wire 全表面（M1 中间版：版本选择器 + envelope + directory query + ETag 域隔离 + SSE meta + 读 11 路由 + 写 12 端点收编；全部加性，v2 逐字节不变）；未 bump `X-Slimapi-Version`，仍 2
 
 ### Added（加性 wire：v3 Batch C2——写路径 12 端点收编；未 bump `X-Slimapi-Version`，仍 2）
