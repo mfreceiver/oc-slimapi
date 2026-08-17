@@ -35,6 +35,12 @@ async def metrics(request: Request):
     traffic_ledger = getattr(request.app.state, "traffic_ledger", None)
     if traffic_ledger is not None:
         hubs_snapshot["traffic"] = traffic_ledger.snapshot()
+    # B1b stage 1 is shadow-only: no HTTP sweep is issued, but the scheduler's
+    # bounded counters are observable here when production lifespan wires it.
+    # Disabled/test apps intentionally omit the additive block.
+    qp_sweep = getattr(request.app.state, "qp_sweep", None)
+    if qp_sweep is not None and getattr(qp_sweep, "enabled", True):
+        hubs_snapshot["sweep"] = qp_sweep.metrics()
     return json_response(
         hubs_snapshot,
         accept_encoding=request.headers.get("accept-encoding"),

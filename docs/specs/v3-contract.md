@@ -199,9 +199,9 @@ GET /slimapi/versions → 200
 
 ## §10 路由收编全集 [冻结]（读 **9** 组 + 写 **17** 端点；ocdroid StandardApi 全量 + 实测基线；**读组计数 7→8 [3.1.0]、8→9 + 写 12→17 [3.3.0] B4 加性**）
 
-**设计原则**：受控代理——sidecar 不改写成功语义，叠加保护 + 审计 + `?v=`/`?directory=` 消费。路径 = legacy 路径加 `/slimapi` 前缀。**错误两级制（冻结）**：成功（2xx）状态码+body 逐字透传；**4xx 状态码+body 逐字透传**（客户端校验错误原样到达）；**上游 5xx/网络错误 → 503 `upstream_unavailable`**（显式例外，与既有读路由一致——legacy 直连会收到上游原始 5xx 码，此为已知迁移点）。**admission（冻结）**：请求超限 → 413（既有 `max_request_bytes` 语义）；响应超限 → 413 `response_too_large`（既有读路由 code 复用）；**纯 raw 受控代理不占 transform 池**（无投影变换，仅流式透传+上限检查，不产生 `transform_busy`）。**3.1.0 carve-out [冻结]**：本节"纯 raw 受控代理不占 transform 池 / 成功 2xx 状态码+body 逐字透传 / 错误两级制"条款**对第 8 读组 `messages.expand`（§4b 两路由）不适用**——该组为**转换端点**：变换成功 body（§4b.4）、生成自有错误码（§4b.3，非逐字透传）、占用 transform pool（池满 503 `transform_busy` + `Retry-After`）；其余 7 组（含其 4xx 逐字透传与不占池条款）**完全不变**。
+**设计原则**：受控代理——sidecar 不改写成功语义，叠加保护 + 审计 + `?v=`/`?directory=` 消费。路径 = legacy 路径加 `/slimapi` 前缀。**错误两级制（冻结）**：成功（2xx）状态码+body 逐字透传；**4xx 状态码+body 逐字透传**（客户端校验错误原样到达）；**上游 5xx/网络错误 → 503 `upstream_unavailable`**（显式例外，与既有读路由一致——legacy 直连会收到上游原始 5xx 码，此为已知迁移点）。**admission（冻结）**：请求超限 → 413（既有 `max_request_bytes` 语义）；响应超限 → 413 `response_too_large`（既有读路由 code 复用）；**纯 raw 受控代理不占 transform 池**（无投影变换，仅流式透传+上限检查，不产生 `transform_busy`）。**3.1.0 carve-out [冻结]**：本节"纯 raw 受控代理不占 transform 池 / 成功 2xx 状态码+body 逐字透传 / 错误两级制"条款**对第 8 读组 `messages.expand`（§4b 两路由）不适用**——该组为**转换端点**：变换成功 body（§4b.4）、生成自有错误码（§4b.3，非逐字透传）、占用 transform pool（池满 503 `transform_busy` + `Retry-After`）；其余组（含其 4xx 逐字透传与不占池条款）**完全不变**（[3.3.0] 起读组增至 9，`messages.expand` 保留历史"第 8 读组"身份，`session.context` 为第 9 组、属受控代理、不触发本 carve-out）。
 
-### 10.a 读路由（8 组：既有 7 组 2.0.0 交付 + `messages.expand` 3.1.0 交付 [3.1.0]）
+### 10.a 读路由（9 组：既有 7 组 2.0.0 交付 + `messages.expand` 3.1.0 交付 + `session.context` 3.3.0 交付 [3.3.0]）
 
 | 组 | v3 路由 | 上游 legacy | 方法 | directory | ETag |
 |---|---|---|---|---|---|

@@ -435,9 +435,18 @@ async def lifespan(app: FastAPI):
         stack.push_async_callback(_close_hubs)
         if settings.qp_sweep_enabled:
             global_hub = app.state.hubs.get_global()
+
+            def _qp_sweep_directory_source():
+                # ``pending`` is only a short-lived flush buffer.  Include the
+                # q/p route tracker here as well; QpSweepShadow also ingests
+                # these keys into its monotonic known-directory set.
+                return tuple(global_hub.pending.values()) + tuple(
+                    global_hub.qp_last_activity
+                )
+
             app.state.qp_sweep = QpSweepShadow(
                 activity=global_hub.qp_last_activity,
-                directory_source=lambda: global_hub.pending.values(),
+                directory_source=_qp_sweep_directory_source,
                 interval_seconds=settings.qp_sweep_interval_seconds,
                 daily_budget=settings.qp_sweep_daily_budget,
             )

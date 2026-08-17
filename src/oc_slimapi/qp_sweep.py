@@ -11,13 +11,21 @@ from __future__ import annotations
 import asyncio
 import random
 import time
+from collections import deque
 from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from typing import Any
 
 
 class QpSweepShadow:
-    """Round-robin, budgeted, dry-run q/p sweep scheduler."""
+    """Budgeted, dry-run q/p sweep scheduler.
+
+    Scheduling is per directory rather than per global round: each directory
+    has its own ``next_run`` deadline and receives an independently jittered
+    interval after every evaluation.  The scheduler loop only provides a
+    short polling tick; it never makes the directory count part of a
+    directory's cadence.
+    """
 
     ESTIMATED_DIRECTORY_BYTES = 2 * 1024
 
@@ -30,31 +38,38 @@ class QpSweepShadow:
         interval_seconds: float = 1800.0,
         daily_budget: int = 100,
         enabled: bool = True,
-        batch_size: int = 1,
         now: Callable[[], float] = time.time,
         jitter: Callable[[], float] | None = None,
+        tick_seconds: float | None = None,
     ) -> None:
         if interval_seconds <= 0:
             raise ValueError("interval_seconds must be > 0")
         if daily_budget < 0:
             raise ValueError("daily_budget must be >= 0")
-        if batch_size <= 0:
-            raise ValueError("batch_size must be > 0")
+        if tick_seconds is not None and tick_seconds <= 0:
+            raise ValueError("tick_seconds must be > 0")
         self._activity = activity if activity is not None else {}
-        self._known: dict[str, None] = {}
+        # Monotonic within the process: a directory remains eligible for
+        # evaluation even after a transient source (for example, the hub's
+        # pending map) becomes empty.
+        self._known_dirs: set[str] = set()
         self._seen_at: dict[str, float] = {}
+        self._next_run: dict[str, float] = {}
         self._directory_source = directory_source
         self.interval_seconds = interval_seconds
         self.daily_budget = daily_budget
         self.enabled = enabled
-        self.batch_size = batch_size
         self._now = now
         self.jitter = jitter or (lambda: random.uniform(0.8, 1.2))
-        self._cursor = 0
+        self.tick_seconds = (
+            min(interval_seconds / 4.0, 30.0)
+            if tick_seconds is None
+            else tick_seconds
+        )
         self._budget_day: str | None = None
         self._budget_used = 0
         self._task: asyncio.Task[None] | None = None
-        self.markers: list[dict[str, Any]] = []
+        self.markers: deque[dict[str, Any]] = deque(maxlen=256)
         self._triggers_total = 0
         self._cold_hits = 0
         self._skips = 0
@@ -78,9 +93,14 @@ class QpSweepShadow:
     def observe_directory(self, directory: str, *, now: float | None = None) -> None:
         if not isinstance(directory, str) or not directory:
             return
-        if directory not in self._known:
-            self._known[directory] = None
-            self._seen_at[directory] = self._now() if now is None else now
+        if directory in self._known_dirs:
+            return
+        timestamp = self._now() if now is None else now
+        self._known_dirs.add(directory)
+        self._seen_at[directory] = timestamp
+        # New directories are evaluated on the next scheduler scan (or the
+        # next explicit run_once call), then move onto their normal cadence.
+        self._next_run[directory] = timestamp
 
     def record_activity(self, directory: str, *, now: float | None = None) -> None:
         if not isinstance(directory, str) or not directory:
@@ -120,18 +140,13 @@ class QpSweepShadow:
             self._budget_day = day
             self._budget_used = 0
 
-    def _batch(self) -> list[str]:
-        directories = list(self._known)
-        if not directories:
-            return []
-        if self._cursor >= len(directories):
-            self._cursor = 0
-        batch = [
-            directories[(self._cursor + offset) % len(directories)]
-            for offset in range(min(self.batch_size, len(directories)))
+    def _due_directories(self, timestamp: float) -> list[str]:
+        due = [
+            directory
+            for directory in sorted(self._known_dirs)
+            if self._next_run.get(directory, timestamp) <= timestamp
         ]
-        self._cursor = (self._cursor + len(batch)) % len(directories)
-        return batch
+        return due
 
     def run_once(self, *, now: float | None = None) -> list[dict[str, Any]]:
         """Run one shadow round and return the markers emitted by that round."""
@@ -139,7 +154,7 @@ class QpSweepShadow:
         self._ingest_directory_source()
         self._reset_budget_if_needed(timestamp)
         emitted: list[dict[str, Any]] = []
-        for directory in self._batch():
+        for directory in self._due_directories(timestamp):
             self._triggers_total += 1
             last_activity = self._activity.get(directory, self._seen_at.get(directory, timestamp))
             elapsed = max(0.0, timestamp - last_activity)
@@ -165,11 +180,14 @@ class QpSweepShadow:
             }
             self.markers.append(marker)
             emitted.append(marker)
+            # Every evaluation gets a fresh independent jitter sample,
+            # including skips and budget-exhausted decisions.
+            self._next_run[directory] = timestamp + self.next_delay()
         return emitted
 
     async def _run(self) -> None:
         while True:
-            await asyncio.sleep(self.next_delay())
+            await asyncio.sleep(self.tick_seconds)
             self.run_once()
 
     def start(self) -> asyncio.Task[None] | None:
@@ -196,6 +214,7 @@ class QpSweepShadow:
             "skips": self._skips,
             "budget_exhausted": self._budget_exhausted,
             "est_bytes_total": self._est_bytes_total,
+            "known_directories": len(self._known_dirs),
         }
 
     def snapshot(self) -> dict[str, Any]:

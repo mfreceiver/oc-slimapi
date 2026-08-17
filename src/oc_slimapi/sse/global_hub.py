@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import time
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Callable
@@ -20,8 +19,8 @@ import orjson
 from ..config import (
     TOKEN_REMOVED_MESSAGES_MAX,
     TOKEN_REMOVED_MESSAGES_TTL_MS,
+    directory_allowed,
 )
-from ..directory import normalize_directory
 from ..logging_config import get_logger
 from .hub_types import (
     ABORT_NAME,
@@ -471,14 +470,12 @@ class GlobalHub:
         allowlist = self.directory_allowlist
         if not allowlist:
             return True
-        if not isinstance(directory, str) or not directory:
-            return False
-        target = os.path.normpath(normalize_directory(directory))
-        for entry in allowlist:
-            root = os.path.normpath(normalize_directory(entry))
-            if target == root or root == os.sep or target.startswith(root + os.sep):
-                return True
-        return False
+        # rev-sgpt MAJOR-1: canonical (realpath) matching via the shared
+        # config helper — a symlinked directory that lexically sits inside
+        # an allowed root but resolves outside is dropped (and counted)
+        # here. Non-str / empty directories fall through to the helper's
+        # fail-closed False (frame dropped + counted, as before).
+        return directory_allowed(allowlist, directory)
 
     def _emit_directory_frame(self, frame: bytes, directory: Any) -> None:
         if not self._directory_allowed(directory):

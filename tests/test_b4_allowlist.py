@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 
 import httpx
 import orjson
@@ -10,7 +11,7 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport
 
-from oc_slimapi.config import Settings
+from oc_slimapi.config import Settings, directory_allowed
 from oc_slimapi.app import _log_directory_allowlist
 from oc_slimapi.errors import register_error_handlers
 from oc_slimapi.routes import health, read_groups
@@ -240,3 +241,108 @@ def test_empty_allowlist_startup_warning(caplog):
         _log_directory_allowlist(settings)
     assert "directory allowlist enabled but empty" in caplog.text
     assert "/slimapi/file/** will 403" in caplog.text
+
+
+# --- rev-sgpt MAJOR-1: symlink bypass (canonical realpath matching) ---------
+
+
+async def test_symlink_escape_is_rejected_by_file_routes(tmp_path):
+    """Lexically-inside symlink that resolves outside → 403 (realpath)."""
+    allowed_root = tmp_path / "allowed_root"
+    outside = tmp_path / "outside"
+    allowed_root.mkdir()
+    outside.mkdir()
+    os.symlink(outside, allowed_root / "link")
+    app, seen = _build_file_app(
+        _settings(directory_allowlist=[str(allowed_root)]), _file_ok
+    )
+    async with _client(app) as client:
+        response = await client.get(
+            "/slimapi/file?v=3&path=foo&directory=" + str(allowed_root / "link"),
+            headers={"Accept-Encoding": "identity"},
+        )
+    assert response.status_code == 403
+    assert response.json() == {"code": "directory_not_allowed"}
+    assert str(outside) not in response.text
+    assert not seen
+
+
+async def test_symlink_chain_within_subtree_is_allowed(tmp_path):
+    """link → link2 → real, all resolving inside the allowed root → 200."""
+    allowed_root = tmp_path / "allowed_root"
+    real_dir = allowed_root / "real"
+    allowed_root.mkdir()
+    real_dir.mkdir()
+    os.symlink(real_dir, allowed_root / "link2")
+    os.symlink(allowed_root / "link2", allowed_root / "link")
+    app, seen = _build_file_app(
+        _settings(directory_allowlist=[str(allowed_root)]), _file_ok
+    )
+    async with _client(app) as client:
+        response = await client.get(
+            "/slimapi/file?v=3&path=foo&directory=" + str(allowed_root / "link"),
+            headers={"Accept-Encoding": "identity"},
+        )
+    assert response.status_code == 200
+    assert response.content == b'{"sentinel":"byte-identical"}'
+    assert len(seen) == 1
+
+
+async def test_nonexistent_candidate_falls_back_to_lexical_subtree(tmp_path):
+    """No symlinks to resolve: non-strict realpath keeps the missing tail
+    verbatim, so the decision degrades to the lexical subtree match."""
+    allowed_root = tmp_path / "allowed_root"
+    allowed_root.mkdir()
+    app, seen = _build_file_app(
+        _settings(directory_allowlist=[str(allowed_root)]), _file_ok
+    )
+    async with _client(app) as client:
+        inside = await client.get(
+            "/slimapi/file?v=3&path=foo&directory="
+            + str(allowed_root / "no" / "such" / "dir"),
+            headers={"Accept-Encoding": "identity"},
+        )
+        outside = await client.get(
+            "/slimapi/file?v=3&path=foo&directory="
+            + str(tmp_path / "elsewhere" / "missing"),
+            headers={"Accept-Encoding": "identity"},
+        )
+    assert inside.status_code == 200
+    assert outside.status_code == 403
+    assert outside.json() == {"code": "directory_not_allowed"}
+    assert len(seen) == 1
+
+
+async def test_symlink_escape_digest_frame_dropped_and_counted(tmp_path):
+    """SSE filter: digest whose directory symlink-escapes the root is
+    dropped + counted (same canonical decision as the /file routes)."""
+    allowed_root = tmp_path / "allowed_root"
+    outside = tmp_path / "outside"
+    allowed_root.mkdir()
+    outside.mkdir()
+    os.symlink(outside, allowed_root / "link")
+    hub = GlobalHub(client=None, directory_allowlist=[str(allowed_root)])
+    subscriber = Subscriber()
+    hub.subscribers.add(subscriber)
+    try:
+        hub.publish(_event(str(allowed_root / "link")))
+        hub.flush()
+        assert subscriber.queue.qsize() == 0
+        assert hub.allowlist_dropped_events == 1
+    finally:
+        await _close_hub(hub)
+
+
+def test_directory_allowed_repeated_decisions_are_stable(tmp_path):
+    """Cache correctness: identical inputs keep yielding identical
+    verdicts across repeated resolutions (deny AND allow paths)."""
+    allowed_root = tmp_path / "allowed_root"
+    outside = tmp_path / "outside"
+    allowed_root.mkdir()
+    outside.mkdir()
+    os.symlink(outside, allowed_root / "link")
+    allowlist = [str(allowed_root)]
+    assert [directory_allowed(allowlist, str(allowed_root / "link"))
+            for _ in range(3)] == [False, False, False]
+    assert [directory_allowed(allowlist, str(allowed_root / "sub"))
+            for _ in range(3)] == [True, True, True]

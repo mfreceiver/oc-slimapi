@@ -39,11 +39,11 @@ is whitelisted through the exact same ``skeleton_session`` used by
 
 from __future__ import annotations
 
-import os
 import orjson
 from fastapi import APIRouter, Request
 
-from ..directory import normalize_directory, validate_directory
+from ..config import directory_allowed
+from ..directory import validate_directory
 from ..errors import CodedHTTPException
 from ..selector import (
     DIRECTORY_QUERY_PARAM,
@@ -86,20 +86,13 @@ def _project_session(raw: bytes) -> bytes:
     return orjson.dumps(skeleton_session(session))
 
 
-def _directory_allowed(allowlist: list[str], directory: str | None) -> bool:
-    if directory is None:
-        return False
-    target = os.path.normpath(normalize_directory(directory))
-    for entry in allowlist:
-        root = os.path.normpath(normalize_directory(entry))
-        if target == root or root == os.sep or target.startswith(root + os.sep):
-            return True
-    return False
-
-
 def _enforce_file_allowlist(request: Request, directory: str | None) -> None:
     allowlist = request.app.state.config.directory_allowlist
-    if allowlist is not None and not _directory_allowed(allowlist, directory):
+    # rev-sgpt MAJOR-1: canonical (realpath) subtree match via the shared
+    # config helper — a symlinked directory that lexically sits inside an
+    # allowed root but resolves outside is rejected with the same uniform
+    # 403 (no existence leak).
+    if allowlist is not None and not directory_allowed(allowlist, directory):
         raise CodedHTTPException(403, code="directory_not_allowed")
 
 

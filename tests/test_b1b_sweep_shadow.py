@@ -8,8 +8,10 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from fastapi import FastAPI
 
 from oc_slimapi.qp_sweep import QpSweepShadow
+from oc_slimapi.routes import metrics
 from oc_slimapi.sse.global_hub import GlobalHub
 from oc_slimapi.traffic import bucketize
 
@@ -27,8 +29,8 @@ def test_shadow_touch_never_calls_upstream_transport():
         daily_budget=2,
         now=lambda: 10.0,
         directories=["/cold"],
+        jitter=lambda: 1.0,
     )
-    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     shadow.run_once(now=10.2)
     shadow.run_once(now=10.3)
     assert calls == 0
@@ -62,21 +64,30 @@ def test_jitter_is_bounded_to_twenty_percent():
     assert all(8.0 <= value <= 12.0 for value in values)
 
 
-def test_round_robin_processes_only_a_small_batch_each_round():
+def test_each_known_directory_has_an_independent_cadence():
     shadow = QpSweepShadow(
         interval_seconds=1.0,
         daily_budget=10,
         directories=["/a", "/b", "/c"],
-        batch_size=1,
         now=lambda: 100.0,
+        jitter=lambda: 1.0,
     )
-    assert [m["directory"] for m in shadow.run_once(now=104.0)] == ["/a"]
-    assert [m["directory"] for m in shadow.run_once(now=104.0)] == ["/b"]
-    assert [m["directory"] for m in shadow.run_once(now=104.0)] == ["/c"]
+    assert len(shadow.run_once(now=100.0)) == 3
+    assert shadow.run_once(now=100.99) == []
+    for timestamp in (101.0, 102.0):
+        markers = shadow.run_once(now=timestamp)
+        assert {marker["directory"] for marker in markers} == {"/a", "/b", "/c"}
+    for directory in ("/a", "/b", "/c"):
+        times = [
+            marker["ts"]
+            for marker in shadow.markers
+            if marker["directory"] == directory
+        ]
+        assert times == [100.0, 101.0, 102.0]
 
 
 def test_activity_within_interval_skips_touch():
-    shadow = QpSweepShadow(interval_seconds=1.0, directories=["/d"])
+    shadow = QpSweepShadow(interval_seconds=1.0, directories=["/d"], now=lambda: 0.0)
     shadow.record_activity("/d", now=10.0)
     marker = shadow.run_once(now=10.9)[0]
     assert marker["decision"] == "skip"
@@ -84,7 +95,7 @@ def test_activity_within_interval_skips_touch():
 
 
 def test_three_intervals_without_activity_are_cold():
-    shadow = QpSweepShadow(interval_seconds=1.0, directories=["/d"])
+    shadow = QpSweepShadow(interval_seconds=1.0, directories=["/d"], now=lambda: 0.0)
     shadow.record_activity("/d", now=10.0)
     marker = shadow.run_once(now=13.0)[0]
     assert marker["decision"] == "cold"
@@ -92,28 +103,44 @@ def test_three_intervals_without_activity_are_cold():
 
 
 def test_activity_recovery_exits_cold_set():
-    shadow = QpSweepShadow(interval_seconds=1.0, directories=["/d"])
+    shadow = QpSweepShadow(
+        interval_seconds=1.0,
+        directories=["/d"],
+        now=lambda: 0.0,
+        jitter=lambda: 1.0,
+    )
     shadow.record_activity("/d", now=10.0)
     assert shadow.run_once(now=13.0)[0]["decision"] == "cold"
     shadow.record_activity("/d", now=13.1)
-    assert shadow.run_once(now=13.9)[0]["decision"] == "skip"
+    assert shadow.run_once(now=14.0)[0]["decision"] == "skip"
 
 
 def test_daily_budget_marks_later_cold_touches_exhausted():
-    shadow = QpSweepShadow(interval_seconds=1.0, daily_budget=2, directories=["/a", "/b", "/c"])
+    shadow = QpSweepShadow(
+        interval_seconds=1.0,
+        daily_budget=2,
+        directories=["/a", "/b", "/c"],
+        now=lambda: 0.0,
+    )
     for directory in ("/a", "/b", "/c"):
         shadow.record_activity(directory, now=0.0)
-    decisions = [m["decision"] for m in shadow.run_once(now=3.0) + shadow.run_once(now=3.0) + shadow.run_once(now=3.0)]
+    decisions = [m["decision"] for m in shadow.run_once(now=3.0)]
     assert decisions == ["cold", "cold", "budget_exhausted"]
     assert shadow.snapshot()["budget_exhausted"] == 1
 
 
 def test_budget_resets_at_utc_day_boundary():
     day = datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp()
-    shadow = QpSweepShadow(interval_seconds=1.0, daily_budget=1, directories=["/d"])
+    shadow = QpSweepShadow(
+        interval_seconds=1.0,
+        daily_budget=1,
+        directories=["/d"],
+        now=lambda: day,
+        jitter=lambda: 1.0,
+    )
     shadow.record_activity("/d", now=day)
     assert shadow.run_once(now=day + 3.0)[0]["decision"] == "cold"
-    assert shadow.run_once(now=day + 3.0)[0]["decision"] == "budget_exhausted"
+    assert shadow.run_once(now=day + 4.0)[0]["decision"] == "budget_exhausted"
     assert shadow.run_once(now=day + 86400.0 + 3.0)[0]["decision"] == "cold"
 
 
@@ -145,12 +172,12 @@ def test_request_activity_updates_shared_activity_tracker():
 
 def test_external_global_hub_activity_becomes_a_known_directory():
     activity = {"/repo": 10.0}
-    shadow = QpSweepShadow(activity=activity, interval_seconds=1.0)
+    shadow = QpSweepShadow(activity=activity, interval_seconds=1.0, now=lambda: 10.0)
     assert shadow.run_once(now=10.9)[0]["decision"] == "skip"
 
 
 def test_markers_and_counters_have_observable_shape():
-    shadow = QpSweepShadow(interval_seconds=1.0, directories=["/d"])
+    shadow = QpSweepShadow(interval_seconds=1.0, directories=["/d"], now=lambda: 0.0)
     shadow.record_activity("/d", now=0.0)
     shadow.run_once(now=3.0)
     snapshot = shadow.snapshot()
@@ -166,6 +193,7 @@ def test_metrics_shape_can_be_exposed_as_sweep_block():
         "skips": 0,
         "budget_exhausted": 0,
         "est_bytes_total": 0,
+        "known_directories": 1,
     }
 
 
@@ -175,9 +203,75 @@ def test_shadow_marker_path_has_sweep_traffic_bucket():
 
 def test_known_digest_directory_source_is_included():
     pending = {"sid": SimpleNamespace(directory="/digest")}
-    shadow = QpSweepShadow(interval_seconds=1.0, directory_source=lambda: pending.values())
+    shadow = QpSweepShadow(
+        interval_seconds=1.0,
+        directory_source=lambda: pending.values(),
+        now=lambda: 0.0,
+    )
     shadow.run_once(now=3.0)
     assert shadow.markers[0]["directory"] == "/digest"
+
+
+def test_empty_directory_source_does_not_forget_a_known_directory():
+    source = iter([[SimpleNamespace(directory="/retained")], []])
+    shadow = QpSweepShadow(
+        interval_seconds=1.0,
+        directory_source=lambda: next(source),
+        now=lambda: 0.0,
+        jitter=lambda: 1.0,
+    )
+    shadow.run_once(now=0.0)
+    assert shadow.run_once(now=1.0)[0]["directory"] == "/retained"
+    assert shadow.snapshot()["known_directories"] == 1
+
+
+def test_multi_directory_budget_is_reachable_on_one_due_scan():
+    shadow = QpSweepShadow(
+        interval_seconds=1.0,
+        daily_budget=2,
+        directories=["/a", "/b", "/c"],
+        now=lambda: 0.0,
+        jitter=lambda: 1.0,
+    )
+    shadow.run_once(now=0.0)
+    markers = shadow.run_once(now=3.0)
+    assert [marker["decision"] for marker in markers] == ["cold", "cold", "budget_exhausted"]
+    assert shadow.metrics()["budget_exhausted"] == 1
+
+
+def test_metrics_endpoint_exposes_production_sweep_block():
+    app = FastAPI()
+    shadow = QpSweepShadow(interval_seconds=1.0, directories=["/d"], now=lambda: 0.0)
+    app.state.hubs = SimpleNamespace(
+        snapshot_metrics=lambda: {"sse": {}, "skeleton": {}, "batch": None},
+    )
+    app.state.qp_sweep = shadow
+    app.include_router(metrics.router)
+
+    async def request_metrics():
+        transport = httpx.ASGITransport(app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            return await client.get("/slimapi/metrics")
+
+    response = asyncio.run(request_metrics())
+    assert response.status_code == 200
+    sweep = response.json()["sweep"]
+    assert set(sweep) == {
+        "triggers_total",
+        "cold_hits",
+        "skips",
+        "budget_exhausted",
+        "est_bytes_total",
+        "known_directories",
+    }
+
+
+def test_markers_are_bounded_ring_buffer():
+    shadow = QpSweepShadow(interval_seconds=1.0, now=lambda: 0.0)
+    for index in range(300):
+        shadow.observe_directory(f"/d{index}", now=0.0)
+        shadow.run_once(now=0.0)
+    assert len(shadow.markers) == 256
 
 
 def test_disabled_shadow_does_not_start_task():
