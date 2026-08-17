@@ -167,6 +167,14 @@ class DigestFields:
     # already-stamped digest (contract §3.y.5, V10).
     turn_incarnation: int | None = None
     turn: int | None = None
+    # B1a: minimal ``changed`` semantics — a digest frame appearing means
+    # that sid changed, so every digest frame carries ``changed: [<this
+    # frame's sid>]``. The array shape ``[sid…]`` is kept for future
+    # aggregation. ZERO new sidecar state: the value is constructed at flush
+    # time from the frame's own sid (never accumulated/tracked here), so the
+    # default stays None and ``to_payload`` omits the key for any digest
+    # caller that does not opt in.
+    changed: list[str] | None = None
 
     def to_payload(self, session_id: str) -> dict[str, Any]:
         payload: dict[str, Any] = {"sessionID": session_id}
@@ -193,6 +201,10 @@ class DigestFields:
         if self.turn_incarnation is not None and self.turn is not None:
             payload["turnIncarnation"] = self.turn_incarnation
             payload["turn"] = self.turn
+        # B1a: minimal changed — conditionally included exactly like every
+        # other optional digest field (non-None → present).
+        if self.changed is not None:
+            payload["changed"] = self.changed
         return payload
 
 

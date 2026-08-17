@@ -156,6 +156,8 @@ async def test_digest_merges_status_and_message_into_one_frame(fresh_hub):
         "status": "busy",
         "messageID": "msg_1",
         "updatedAt": data["updatedAt"],
+        # B1a: every digest frame carries changed: [<this frame's sid>].
+        "changed": ["s1"],
     }
 
 
@@ -1430,10 +1432,11 @@ async def test_digest_fields_converged(fresh_hub):
         directory="/proj", status="busy", message_id="msg_1",
         updated_at=1700000000000, archived=1700000001000,
         deleted=True, last_error="boom",
+        changed=["s1"],  # B1a: non-None → conditionally included
     )
     unit_payload = full.to_payload("s1")
     # Every field that is set must appear; None/default fields are omitted.
-    for key in ("directory", "status", "messageID", "updatedAt", "archived", "deleted", "lastError"):
+    for key in ("directory", "status", "messageID", "updatedAt", "archived", "deleted", "lastError", "changed"):
         assert key in unit_payload, f"expected {key} in to_payload output"
     assert "contentRevisions" not in unit_payload
     assert "childrenVersion" not in unit_payload
@@ -1459,7 +1462,7 @@ async def test_digest_fields_converged(fresh_hub):
     payload = digests[0]
 
     allowed = {"sessionID", "directory", "status", "messageID",
-               "updatedAt", "archived", "deleted", "lastError"}
+               "updatedAt", "archived", "deleted", "lastError", "changed"}
     assert set(payload) <= allowed, f"Unexpected keys: {set(payload) - allowed}"
     assert "contentRevisions" not in payload
     assert "childrenVersion" not in payload

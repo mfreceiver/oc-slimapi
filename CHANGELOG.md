@@ -26,6 +26,26 @@ ocdroid 对接时：
 
 ---
 
+## [3.3.0] - 2026-08-17 — digest changed + B4 能力路由 + directory allowlist（包版本 minor；wire 版本**不变**，仍 v3——全部加性，ocdroid 零必改点）
+
+> P1 批次（B1a + B1b 阶段1 + B2 + B4）。依据 `docs/system-architecture-proposal-2026-08-17.md` v2.2 与 B0 设计文档。**ocdroid 必改点：无**——所有变更均为加性（新可忽略字段/新路由/可选部署机制）。
+
+### Added（加性 wire 变更——wire 仍 v3）
+
+- **digest 帧 `changed` 字段（B1a，契约 §7.2 修订）**：SSE `session.digest` 帧增可忽略字段 `changed: [sid…]`。**最小语义**：digest 为 per-sid 逐帧产出，**帧出现即该 sid changed**，每帧 `changed` 恒为单元素 `[本帧 sessionID]`（数组形状为未来聚合预留，勿假设多元素）；sidecar 零新增状态。旧客户端忽略未知字段零必改点；消费端可从「整表重拉」升级为「定向精拉」。仅 digest 帧携带——q/p IMMEDIATE 直推帧、resync、heartbeat、`slimapi.meta` 帧形零变化。
+- **B4 能力缺口路由（契约 §10.a 第 9 读组 + §10.b #13-17，上游 v2 session 组 `/api/session/**`）**：
+  - `POST /slimapi/session/{sid}/agent`（body `{"agent":"<id>"}` 透传，成功 204）——运行中切换 agent；
+  - `POST /slimapi/session/{sid}/model`（body `{"model":"<provider/model>"}` 透传，成功 204）——运行中切换 model；
+  - `GET /slimapi/session/{sid}/context`（token 用量感知，200 `{"data":[…]}` 逐字无投影）；
+  - `POST /slimapi/session/{sid}/revert/stage|clear|commit`（三段式预览-确认回滚；stage body `{"messageID":…,"files"?:bool}` 透传成功 200 `{"data":…}` 逐字；clear/commit 无 payload 成功 204）——与既有单步 `POST /slimapi/session/{sid}/revert` **加性并存**，互不替代。
+  - 统一行为：错误两级制（上游 4xx 状态+body 逐字、5xx/网络→503 `upstream_unavailable`）、请求超限 413、body+content-type 透传、`Cache-Control:no-store`；**directory 不消费**——`?directory=` 宽容剥离不转发不报错（上游 sessionLocationMiddleware 按 sid 自路由）。traffic bucket：5 POST→`write_session`、GET context→`session_context`。
+- **directory allowlist fail-closed（B4-4，契约 §5.7a，部署配置面）**：新 env `OC_SLIMAPI_DIRECTORY_ALLOWLIST` 三态——**未配置**（缺省）= 机制禁用，现状逐字节零变化；**显式空串** = `/slimapi/file/**` 三端点全部 403 `{"code":"directory_not_allowed"}`（不泄露目录存在性）+ 启动 warning；**非空**（冒号分隔路径清单）= `/slimapi/file/**` 仅白名单目录子树放行（normpath 归一防 `..`/尾斜杠绕过）+ GlobalHub SSE 帧过滤（digest 与 q/p IMMEDIATE 帧中 directory 非白名单/无法判定 → 丢弃+计数，放行帧字节不变）。`/slimapi/health` features 增 `"allowlist":{"enabled":<bool>[,"droppedEvents":<int>]}`（只报布值不泄露清单）。**启用属部署事项，客户端无必改点**。
+- **B1b 阶段1：q/p sweep shadow 观测（内部机制，wire 无新路由）**：30min±jitter 纯模拟调度（cold-set 判定 + 日预算闸），**零真实 sweep 上游请求**（shadow 零逃逸）；traffic/access log 观测 `bucket=sweep` 可区分。为 3.3.0 后维护观测期（B1b 阶段2）提供数据。
+
+### Verified（B2 兼容性验证，[3.2.0] 行为断言矩阵锁定）
+
+- **`TextPart.text` 全量内联复核通过（零缺陷）**：skeleton 与 merged 路径均无阈值分支、无 `truncated` 字段（代码层 grep 负向断言，契约 §4a 注记：merged「400 码点截断」设计已废止，`truncated` 不入契约）；折叠 omitted+expandRefs 规则不变；两模式裁剪原则（正文永不截取 / 折叠内容模式 1-2）断言入测试矩阵（契约 §11.16）。
+
 ## [3.2.0] - 2026-08-17 — text 正文永远全量内联（包版本 minor；wire 版本**不变**，仍 v3——放宽性投影变更，ocdroid 零必改点）
 
 > 背景：3.1.0 的 text 折叠 × 客户端未适配曾致折叠消息渲染空壳（联查实锤 msg_00e76e3fe，text=1245 字符/2054 UTF-8 字节，超阈仅 6 字节）。owner 决策 2026-08-17：**对话正文是 chat 核心浏览内容，无论其正文多少都需要呈现和查看，不应当缩减**。**ocdroid 必改点：无**——全量内联是 3.1.x 折叠形态的超集；已按 3.1.0 容忍/展开适配的客户端双形态（3.1.x / 3.2.0）均正常。

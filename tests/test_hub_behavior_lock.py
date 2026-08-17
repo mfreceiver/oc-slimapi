@@ -222,6 +222,8 @@ class TestDigestAccumulation:
             "status": "busy",
             "messageID": "msg_1",
             "updatedAt": digests[0]["updatedAt"],
+            # B1a additive: every digest frame carries changed: [<sid>].
+            "changed": ["s1"],
         }
 
     async def test_two_separate_windows_produce_two_digests(self, pair):

@@ -16,6 +16,7 @@
    - **ocdroid 3.0.0** = 全量切 v3 + smoke 证据回收（双方 9.5 门控）。
    - **sidecar 3.0.0** = 删 v2 管线/全部自定义头/catch-all 关闭。前置 = ocdroid 3.0.0 已发 + §9.3 判据满足。
 4. **3.1.0 修订（2026-08-17；包版本 minor（major 与 wire 协议版本绑定，wire 仍 v3 未 bump，不发 major）、wire 仍 v3；[冻结]）**：skeleton 投影缩减（§4a）与 expand 片段端点（§4b）并入 v3 视图——§0.1「凡未提及语义逐字沿用 v2」对被 §4a/§4b 覆盖的投影/错误/上限语义**由本节覆盖优先**；**§10 读组计数 7→8**（历史"两步走"块内"读 7 组"保持 2.0.0 交付口径不变，计数修订以本条目与 §10 标题为准）。
+5. **3.3.0 修订（2026-08-17；包版本 minor、wire 仍 v3（纯加性，无 selector 变化）；[冻结]）**：①§7 digest 帧 `changed` 字段（B1a，最小语义）；②§4a TextPart.text 全量内联 [3.2.0] 行为的 B2 兼容性注记与两模式裁剪断言矩阵；③§10.a 第 9 读组 `session.context` + §10.b 写 12→17 端点（agent/model/revert 三段式，B4）；④§3a health `features.allowlist` + §5.7a directory allowlist fail-closed 语义（B4-4，env 三态：未配置=现状零变化——故 allowlist 属**部署配置面**，不开启即无任何 wire 变化）。
 
 ## §1 头退役范围（按方向拆分）[冻结]
 
@@ -69,6 +70,7 @@ GET /slimapi/versions → 200
 - **`schema.version` 双视图冻结**：与 `server.api_version` 同源同值（`health.py:37` 现状）——v2 视图 = 2、v3 视图 = 3，禁止 3/2 组合。`schema.clientMin/clientMax` 同步 accepted range。
 - `/slimapi/ready`：无 contract 标识字段（部署探针，`health.py:71-104` 现状）；`schema` 节三字段同源规则同上。
 - health/ready 属 `/slimapi` 表面：v2 语义请求照旧要求 `X-Slimapi-Version`；v3 免。`/slimapi/versions` 是唯一豁免端点。
+- **`features.allowlist`（[3.3.0] 加性，B4-4）**：`/slimapi/health` features 块增 `"allowlist": {"enabled": <bool>}`（enabled = `OC_SLIMAPI_DIRECTORY_ALLOWLIST` 已配置，§5.7a）；hub registry 可达时附 `"droppedEvents": <int>`（SSE 帧丢弃计数，§5.7a.3）。**只报布值不泄露清单内容**。未配置 env → `enabled:false`，无 droppedEvents 键语义变化（§5.7a.1 现状零变化）。`/slimapi/ready` 不加。
 
 ## §4 envelope [冻结]（仅 messages/sessions 列表；status 不 envelope 化）
 
@@ -83,7 +85,7 @@ GET /slimapi/versions → 200
 
 1. **阈值与省略规则**：
    - `info.summary.diffs`：**总是省略** → `null` + 消息级 `info.expandRefs`（`category:"info_summary_diffs"`）；summary 其余 key 保留；仅省略时刻非 null/非空 list 才生成 ref。
-   - `TextPart.text`：**[3.2.0] 起永远全量内联，不折叠、无阈值**（owner 决策 2026-08-17：对话正文是 chat 核心浏览内容，无论字节数一律呈现；≤3.1.x 曾按 >2048 折叠为 `part_text`）。
+   - `TextPart.text`：**[3.2.0] 起永远全量内联，不折叠、无阈值**（owner 决策 2026-08-17：对话正文是 chat 核心浏览内容，无论字节数一律呈现；≤3.1.x 曾按 >2048 折叠为 `part_text`）。**[3.3.0] B2 兼容性注记 [冻结]**：skeleton 与 merged 两模式经断言测试矩阵锁定全量内联（src 投影层零 text 截断分支、零 `truncated` 语义残留、零 400 码点截断——B2 设计稿的「merged 400 码点截断」已废止，`truncated` 字段不入契约；两模式裁剪原则 = 正文永不截取，折叠内容按 omitted+expandRefs 模式 1 / 缩略信息模式 2）。`ReasoningPart.text` 折叠与 expand 12 类目端点（含 `part_text` 留存服务 3.1.x 历史响应）均不变。
    - `ReasoningPart.text`：UTF-8 编码字节 > **2048** → 整字段 `null` + `omitted:["text"]` + `hasFull:true` + part 级 `expandRefs`（`part_reasoning`）；≤ 2048 原样内联（规则不变）。
    - `ToolPart.state.output/error`：现状阈值（4 KB/字段、16 KB/消息）不变，省略时新增 `expandRefs`（`part_state_output` / `part_state_error`）。
    - `tool state.input`/`metadata`/`attachments`（`object|null` / `object|null` / `object[]|null`）、`file.url`/`source`、`step-start`/`step-finish` 的 `snapshot`、compaction 整体超限：按 §4b.2 映射生成 `expandRefs`。
@@ -155,6 +157,13 @@ GET /slimapi/versions → 200
 6. **stream 例外（v2 守卫逐字继承 + v3 多值前置新增）**：v2 单值行为 = **query-only directory 接受**（no-op，不报错）；仅 query 与头**同时存在且归一化后不同值** → 400 `directory_not_allowed`（`token_stream.py:51-69` 实际语义，rev6 表述有误以此为准）。v3 新增仅一条前置：`?directory=` **多值异值** → 400 `invalid_directory_selector`（消费集统一规则）；单值化后按上述 v2 规则判定。
 7. **3.0.0 终态**：消费集内 directory 头出现 → 400 `directory_header_retired`。
 
+### §5.7a directory allowlist fail-closed [冻结]（[3.3.0] 加性，B4-4；部署配置面——env 不开启即无任何行为变化）
+
+1. **env 三态语义（S-B05）**：`OC_SLIMAPI_DIRECTORY_ALLOWLIST`——**未配置**（键缺失）= 机制禁用，一切端点/SSE 行为**现状零变化**（本节其余条款全部不生效）；**显式空串** = 机制启用、清单为空 → `/slimapi/file/**` 三端点全部 **403** + 启动 warning 日志，其余端点（含 SSE）不限制；**非空**（冒号分隔路径清单）= `/slimapi/file/**` 仅白名单目录**子树**放行 + GlobalHub SSE 帧过滤（§5.7a.3）。条目经 `normalize_directory()` + `normpath` 归一（防 `..`/冗余段/尾斜杠绕过）；空白/无效条目 → 启动拒绝。**启用 allowlist 属部署事项**（B4-4b：客户端无必改点——未配置即现状）。
+2. **`/slimapi/file/**` 403 语义**：目标 directory（消费解析结果）不在白名单子树，或无法判定（缺 directory）→ **fail-closed 403** `{"code":"directory_not_allowed"}`（统一错误体；**不泄露目录存在性**——不含清单内容、不区分"存在但禁"与"不存在"）。子树匹配 = 相等或 `startswith(条目 + "/")`（字符串前缀陷阱防护：`/abc` 不命中 `/ab`）。其余端点**不 gate**（本批范围；全局面过滤为 v4 §3.5 后续批次）。
+3. **SSE 帧过滤（仅非空清单）**：digest 帧（per-sid，含 §7.2 `changed`）与 IMMEDIATE q/p 直推帧——帧 directory 不在白名单子树，或帧无 directory/无法判定 → **丢弃该帧 + dropped 计数**（放行帧字节形状零变化）。显式空清单 → SSE **不过滤**（空=不限制，仅 `/file/**` 403）。计数经 `/slimapi/health` `features.allowlist.droppedEvents` 暴露（§3a）。
+4. **health 广播**：§3a `features.allowlist`——只报 `enabled` 布值（+可达时 droppedEvents 计数），**不泄露清单内容**（消费方可区分"空因过滤 vs 空因无会话"靠 enabled 布值，非清单）。
+
 ## §6 ETag / Vary / 304 [冻结]
 
 1. **validator 域隔离**：`representation_version` 输入含 wire 版本标记——v2/v3 validator 互不匹配。
@@ -162,11 +171,12 @@ GET /slimapi/versions → 200
 3. ETag/`If-None-Match`/`*`/judge 三态沿用 v2；envelope 路由 canonical 输入 = envelope body。**收编路由 ETag = §10.a 全集**（file/vcs/find/providers/session 单查/active/global health 七组全部 GET）；§10.b 写路由不启用。上游自身 ETag 头不透传（sidecar 生成域，§6.1 隔离）。**expand 两路由（§4b）不在 ETag 全集 [3.1.0]**——成功恒 200、无 304/`If-None-Match` 判定；其响应头冻结（`Cache-Control: no-store`、`Vary: Accept-Encoding`、无 ETag、无自定义辅助头）见 §4b.1。
 4. **v3 304 头集合**：仅 `ETag` + `Vary` + `Cache-Control: no-store`；不复制 `X-Next-Cursor`/`X-Complete`。
 
-## §7 SSE [冻结]
+## §7 SSE [冻结]（[3.3.0] 修订 digest `changed` 字段）
 
 1. 两端点（`events`、`/stream`）接受 `?v=3`；帧名/帧形/`Last-Event-ID`/resync/heartbeat 零变化。`?v=3&tokens=1` 合法；`?v=3&directory=` 按 §5.6。
-2. **meta 帧（v3）**：v3 SSE 不产出 `X-Slimapi-Subscriber-ID`（v2 照旧）。开流**首帧**元事件：`event: slimapi.meta\ndata: {"subscriberId": "<id>", "tokens": <bool>}\n\n`——早于任何业务帧、heartbeat、**及 Last-Event-ID resync 回放**。**`tokens` 取值冻结**：`/events` = `tokens=1` 时 `true` 否则 `false`；`/stream` 恒 `true`。SSE 流不做 content-encoding（帧字节原样）。客户端从 meta 取 id（无重连 API，观测/对账用途——ocdroid 已回执确认无需求）。
-3. 选择器畸形/不支持 → 开流前 400 普通 JSON。
+2. **digest 帧 `changed` 字段（[3.3.0] 加性修订 [冻结]，B1a）**：`session.digest` 帧 data 增可忽略字段 `changed: [sid…]`。**最小语义（裁决冻结）**：digest 为 per-sid 逐帧产出，**帧出现即该 sid changed**，每帧 `changed` 恒为单元素数组 `[本帧 sessionID]`；数组形状为未来聚合预留，客户端消费按「帧到 = 该 sid 变更」处理即可，不应对数组多元素做任何假设。**sidecar 零新增状态**（无 changed 跟踪缓存）。旧客户端忽略未知字段，零必改点；消费端可从整表重拉升级为定向精拉。仅 digest 帧携带；q/p IMMEDIATE 直推帧、`resync` 帧、heartbeat 帧、`slimapi.meta` 帧均不含此字段（帧形零变化）。
+3. **meta 帧（v3）**：v3 SSE 不产出 `X-Slimapi-Subscriber-ID`（v2 照旧）。开流**首帧**元事件：`event: slimapi.meta\ndata: {"subscriberId": "<id>", "tokens": <bool>}\n\n`——早于任何业务帧、heartbeat、**及 Last-Event-ID resync 回放**。**`tokens` 取值冻结**：`/events` = `tokens=1` 时 `true` 否则 `false`；`/stream` 恒 `true`。SSE 流不做 content-encoding（帧字节原样）。客户端从 meta 取 id（无重连 API，观测/对账用途——ocdroid 已回执确认无需求）。
+4. 选择器畸形/不支持 → 开流前 400 普通 JSON。
 
 ## §8 错误体与 catch-all 终局 [冻结]
 
@@ -187,7 +197,7 @@ GET /slimapi/versions → 200
    - ④ **`selectorResult == "not_applicable"`（catch-all/passthrough）**：每日 `sseActive(not_applicable) == 0` **且**窗口内该维度 `sse_open` 为 0 **且**其成功 REST 为 0——全部流量已收敛 `/slimapi`；
    - ⑤ webui 生产流量全 `v=3`；⑥ ocdroid 组书面确认。
 
-## §10 路由收编全集 [冻结]（读 **8** 组 + 写 12 端点；ocdroid StandardApi 全量 + 实测基线；**读组计数 7→8 修订 [3.1.0]**）
+## §10 路由收编全集 [冻结]（读 **9** 组 + 写 **17** 端点；ocdroid StandardApi 全量 + 实测基线；**读组计数 7→8 [3.1.0]、8→9 + 写 12→17 [3.3.0] B4 加性**）
 
 **设计原则**：受控代理——sidecar 不改写成功语义，叠加保护 + 审计 + `?v=`/`?directory=` 消费。路径 = legacy 路径加 `/slimapi` 前缀。**错误两级制（冻结）**：成功（2xx）状态码+body 逐字透传；**4xx 状态码+body 逐字透传**（客户端校验错误原样到达）；**上游 5xx/网络错误 → 503 `upstream_unavailable`**（显式例外，与既有读路由一致——legacy 直连会收到上游原始 5xx 码，此为已知迁移点）。**admission（冻结）**：请求超限 → 413（既有 `max_request_bytes` 语义）；响应超限 → 413 `response_too_large`（既有读路由 code 复用）；**纯 raw 受控代理不占 transform 池**（无投影变换，仅流式透传+上限检查，不产生 `transform_busy`）。**3.1.0 carve-out [冻结]**：本节"纯 raw 受控代理不占 transform 池 / 成功 2xx 状态码+body 逐字透传 / 错误两级制"条款**对第 8 读组 `messages.expand`（§4b 两路由）不适用**——该组为**转换端点**：变换成功 body（§4b.4）、生成自有错误码（§4b.3，非逐字透传）、占用 transform pool（池满 503 `transform_busy` + `Retry-After`）；其余 7 组（含其 4xx 逐字透传与不占池条款）**完全不变**。
 
@@ -203,6 +213,7 @@ GET /slimapi/versions → 200
 | active | `/slimapi/api/session/active` | `/api/session/active` | GET | 不消费 | **启用** |
 | global health | `/slimapi/global/health` | `/global/health` | GET | 不消费 | **启用** |
 | **messages.expand** | **`GET /slimapi/messages/{sid}/expand/{category}/{mid}`、`GET /slimapi/messages/{sid}/expand/{category}/{mid}/{partID}`**（§4b；**转换端点**，**非 raw 受控代理**） | `/session/{sid}/message/{mid}`（singleflight 共享 GET） | GET | 消费（§5.3） | **不启用**（恒 200） |
+| **session.context** | **`GET /slimapi/session/{sid}/context`**（[3.3.0] B4 加性） | `/api/session/{sid}/context`（**v2 session 组**，`protocol/groups/session.ts:292-305`） | GET | **不消费**（v2 sessionLocationMiddleware 按 sid 自路由；`?directory=` 宽容剥离不转发不报错） | **启用**（受控代理管线缺省） |
 
 （既有 thin：sessions/messages/status/todo/children/diff/permission/question/agent/command 不重复列。）
 
@@ -210,7 +221,7 @@ GET /slimapi/versions → 200
 
 **错误 body 读取的资源上限 [冻结]**：错误两级制的"4xx status+body 逐字透传"以 body 可安全读入为前提——错误路径 body 读取同样受 response cap（`max_response_bytes`）保护；超限时无法逐字透传，降级为 503 `upstream_unavailable`（资源保护优先于逐字义务）。**投影路由（session 单查）的投影执行域**：仅当上游响应为 2xx 且 body 为合法 JSON object 时投影；其余一切状态（含 204 空 body、3xx 非 JSON）逐字透传不投影。投影属转换工作，须按 admission 冻结条款经转换池 offload 执行（事件循环不承载 JSON 解析/序列化）。
 
-### 10.b 写路由（12 端点，2.0.0 交付；**directory 列 = 全部消费**——上游 `groups/session.ts:203-397`、`groups/question.ts:32-48` 均声明 `WorkspaceRoutingQuery`）
+### 10.b 写路由（12 端点 2.0.0 交付 + **5 端点 [3.3.0] B4 加性**（#13-17，共 17）；**directory 列 = #1-12 全部消费**——上游 `groups/session.ts:203-397`、`groups/question.ts:32-48` 均声明 `WorkspaceRoutingQuery`；**#13-17 不消费**——v2 session 组经 sessionLocationMiddleware 按 sid 自路由，`?directory=` 宽容剥离不转发不报错）
 
 | # | v3 路由 | 上游 | 方法 | 备注 |
 |---|---|---|---|---|
@@ -226,6 +237,11 @@ GET /slimapi/versions → 200
 | 10 | `/slimapi/question/{requestId}/reply` | 同名 | POST | replyQuestion |
 | 11 | `/slimapi/question/{requestId}/reject` | 同名 | POST | rejectQuestion |
 | 12 | `/slimapi/session/{id}/command` | `/session/{id}/command` | POST | CommandPayload 透传 |
+| 13 | `/slimapi/session/{id}/agent` | `/api/session/{id}/agent`（**v2 session 组**，`protocol/groups/session.ts:173-188`） | POST | switchAgent；body `{"agent":"<id>"}` 透传；成功 **204** 无体（错误两级制照旧：上游 404 逐字、5xx/网络→503） |
+| 14 | `/slimapi/session/{id}/model` | `/api/session/{id}/model`（`:189-204`） | POST | switchModel；body `{"model":"<provider/model>"}` 透传；成功 204 |
+| 15 | `/slimapi/session/{id}/revert/stage` | `/api/session/{id}/revert/stage`（`:256-271`） | POST | revert 三段式之 stage；body `{"messageID":…,"files"?:bool}` 透传；成功 **200** `{"data":…}` 逐字（无投影）；与既有单步 #8 `/revert` **加性并存**，互不替代 |
+| 16 | `/slimapi/session/{id}/revert/clear` | `/api/session/{id}/revert/clear`（`:272-280`） | POST | 无 payload；成功 204 |
+| 17 | `/slimapi/session/{id}/revert/commit` | `/api/session/{id}/revert/commit`（`:281-291`） | POST | 无 payload；成功 204 |
 
 **统一行为**（依据上游快照 **opencode v1.18.16**（`opencode-src/current`，后续 repoint 时本节逐条复核））：请求 body（含 content-type）透传；上游**响应头透传集合冻结** = `Content-Type`、`Location`（上游 3xx 重定向：状态码 + body 均逐字透传，sidecar 不跟随不重写）、`Retry-After`、上游 `X-Request-ID`/`Last-Request-ID` 追踪头；其余上游自定义头不透传。**content-coding 规则**：上游 `Content-Encoding` 不透传——上游响应经解码后取实体字节（httpx 自动解码，与既有读路由一致），admission 按实体字节计，sidecar 按自身 gzip 族重新编码并生成自己的 `Content-Encoding`/`ETag`（"body 逐字透传"均指实体字节）。**ETag 冻结子集**：§10.a 全部 GET 路由启用（含 file/content——大正文 304 收益最大；受既有 gzip 受益门与 validator 规则约束）；§10.b 写路由不启用。错误两级制与 admission 冻结条款适用全集。
 
@@ -246,6 +262,10 @@ GET /slimapi/versions → 200
 12. 退役形态模拟（无 v/`v=2` → 400 `[3]`；头 → `directory_header_retired`；catch-all 404；**§8.3 优先级链逐级断言**）；
 13. 存量回归：旧 ocdroid 形态（无 v + header=2）逐字节不变。
 14. **expand 回归矩阵（[3.1.0]，design-expand §12 全集）**：selector/directory（缺 v / v=2 / 畸形 → 400 先于路由内错误；expand 消费 directory）；求值序全链（池满 503 先于 part 404；源超限 413 先于解码；sid 404 → `session_not_found`；超限且畸形 body → 413；错误码 JSON 精确断言——无独立 `part_missing`/`category_mismatch` 码）；级别匹配（消息级带 partID → 400；partID 未命中 → 404 + `reason:"part_missing"`；patch part 请求 state 类 → 400；step-finish 请求 `part_snapshot` → 200）；extractor（12 category 各正反例 + 类型错配矩阵；解码失败/顶层非 dict → 503 与解析成功后结构畸形 → 502 显式区分；缺失 vs 显式 null 双断言 → 200 + data 键 null；metadata 无 diagnostics 泄露；compaction_full 剥离 expandRefs）；双上限边界（源 1 字节 / 片段 8 MiB 两侧）；singleflight（同消息同/异 category 并发 1 次上游 GET、expand 与 /full 共享、1s grace 后重取）；skeleton/引用（阈值两侧、引用排序去重、可渲染、diffs 恒 null + ref、patch files verbatim）；merged（placeholder-first、预算外保留 null+refs、diffs 永不 batch 还原、交集去重）；配置（cap 超界 startup 拒绝、aggregate 信封超限拒绝）；capabilities 广告形状；check_routes_doc 语义关键词检查通过（12 category 数量一致）。
+15. **[3.3.0] B1a digest `changed`**：flush_sid 即时路径与批量 flush 逐帧路径均携带 `changed:[本帧sid]`；帧间列表对象非共享（零新增状态）；IMMEDIATE q/p 直推帧 / resync 帧 / heartbeat 帧 / `slimapi.meta` 帧零变化（无 changed）；sticky lastError merge 与 changed 共存。
+16. **[3.3.0] B2 兼容断言**：skeleton 与 merged 路径 `TextPart.text` 全量内联（任意字节原样、无阈值分支、无 `truncated` 字段）；折叠 omitted+expandRefs 规则不变；`truncated` 不入契约（grep 负向断言，作用域=代码层）。
+17. **[3.3.0] B4 新路由回归**（§10.a 第 9 组 + §10.b #13-17）：六端点 happy 逐字（agent/model/clear/commit 204、stage/context 200）；上游 4xx 逐字 / 5xx+网络→503 / 请求超限 413；body+content-type 透传；`?directory=` 宽容剥离不转发（上游 URL/头零 directory 痕迹）且无效值不 400；三段式与既有单步 `/revert` 并存各自命中；traffic bucket（5 POST→`write_session`、GET context→`session_context`）。
+18. **[3.3.0] B4-4 allowlist 三态矩阵**（§5.7a）：未配置=现状逐字节零变化（/file happy、SSE 帧照常、health enabled:false）；显式空=/file 三端点 403 统一错误体（directory 有值/None 双断言、无清单泄露）+启动 warning、SSE 不过滤；非空=子树放行（相等/startswith+"/"，前缀陷阱 `/abc`↔`/ab`）+白名单外 403、SSE digest 与 IMMEDIATE 帧非白名单/无 directory 丢弃+droppedEvents 计数、白名单内帧字节不变（含 changed 共存）；env 解析（冒号分隔、normalize、空白条目 startup 拒绝）。
 
 ## §12 里程碑 [计划]
 

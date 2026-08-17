@@ -1,4 +1,6 @@
-"""v3-contract §10.b — the 12 annexed WRITE endpoints (Batch C2).
+"""v3-contract §10.b — the 12 annexed WRITE endpoints (Batch C2), plus the
+5..6 B4 additions (#13-#17: agent / model / revert three-step — non-consuming
+directory, see the B4 section note below).
 
 Every endpoint is a **controlled write proxy**: the sidecar never rewrites
 success semantics, only adding protection (request/response caps), audit
@@ -25,6 +27,12 @@ opencode v1.18.16 — ``groups/session.ts:203-397``, ``groups/question.ts:32-48`
   forwarded as the ``X-Opencode-Directory`` header; v2 → the header is the
   channel (bound + validated); v2 ``?directory=`` values are validated then
   forwarded verbatim (not consumed);
+* the B4 additions (#13-#17) are **exceptions to directory consumption**:
+  their upstream v2 session group resolves location per-sid via
+  sessionLocationMiddleware and does NOT participate in directory routing —
+  client ``?directory=`` is tolerated and dropped (never forwarded upstream,
+  never an error), matching the questions/permissions non-consuming set
+  semantics;
 * **response status verbatim** — 2xx (incl. 201/202/204) AND 3xx (status +
   body + ``Location`` untouched; never followed — the upstream client has
   ``follow_redirects=False``) AND 4xx (client validation errors arrive
@@ -52,7 +60,11 @@ from starlette.responses import Response
 
 from ..directory import validate_directory
 from ..gzip_util import compress_if_beneficial, error_response
-from ..selector import resolve_route_directory
+from ..selector import (
+    DIRECTORY_QUERY_PARAM,
+    _strip_query_keys,
+    resolve_route_directory,
+)
 from ..traffic import stash_up_in, stash_up_out
 from ..transform import read_with_cap
 from ..turn_registry import extract_sid_from_path, is_turn_bumping_path
@@ -299,3 +311,100 @@ async def session_command(request: Request, session_id: str) -> Response:
     return await _write_passthrough(
         request, method="POST",
         upstream_path=f"/session/{session_id}/command")
+
+
+# ---------------------------------------------------------------------------
+# B4 六条加性端点（wire contract v3 → v4 B0 起草段；上游锚点
+# opencode v1.18.18 ``packages/protocol/src/groups/session.ts:173-305``，
+# v2 ``/api/session/...`` 前缀，非 legacy ``/session/...``）。
+#
+# 与既有 #1-#12 的关键差异：**directory 列 = 不消费**。上游 v2 session 组
+# 经 sessionLocationMiddleware 按 sid 从 DB 解析 location，不消费 directory；
+# 客户端带 ``?directory=`` 时宽容忽略（不转发上游、不报错），同
+# questions/permissions 非消费集语义（_DIRECTORY_CONSUMING_PATTERNS 未收录
+# 这些路径 → 无校验/无 stash → _resolve 返回 None，X-Opencode-Directory 头
+# 自然不加）。selector 只 strip ``v``（宽容路由不碰 directory），故需在端点
+# 内显式剥掉 query 里的 directory 键，上游 URL 不携带任何 directory 痕迹。
+# ---------------------------------------------------------------------------
+
+
+def _strip_directory_query(request: Request) -> None:
+    """B4 非消费集目录宽容：剥掉 ``scope['query_string']`` 中的 ``directory``。
+
+    与 selector 自身消费集的剥离同源（:meth:`_strip_query_keys` 字节保真，
+    & 分段扫描，不解析引号/编码）——B4 路由不在消费集，selector 不会代剥，
+    这里在进入上游管线前就地处理，使上游请求 URL 无 directory 痕迹。
+    """
+    request.scope["query_string"] = _strip_query_keys(
+        request.scope.get("query_string", b"") or b"",
+        frozenset({DIRECTORY_QUERY_PARAM}),
+    )
+
+
+@router.post("/session/{session_id}/agent")
+async def session_agent(request: Request, session_id: str) -> Response:
+    """#13 agent（B4）— POST，body ``{"agent":"<id>"}`` 透传 → 上游 204。
+
+    Upstream: opencode v1.18.18 ``protocol/groups/session.ts:173``-305
+    (v2 session group, ``/api/session/{sid}/agent``)。directory 不消费 —
+    ``?directory=`` 宽容忽略、不转发。
+    """
+    _strip_directory_query(request)
+    return await _write_passthrough(
+        request, method="POST",
+        upstream_path=f"/api/session/{session_id}/agent")
+
+
+@router.post("/session/{session_id}/model")
+async def session_model(request: Request, session_id: str) -> Response:
+    """#14 model（B4）— POST，body ``{"model":"<provider/model>"}`` 透传 →
+    上游 204。
+
+    Upstream: opencode v1.18.18 ``protocol/groups/session.ts`` (v2 session
+    group, ``/api/session/{sid}/model``)。directory 不消费（同上）。
+    """
+    _strip_directory_query(request)
+    return await _write_passthrough(
+        request, method="POST",
+        upstream_path=f"/api/session/{session_id}/model")
+
+
+@router.post("/session/{session_id}/revert/stage")
+async def revert_stage(request: Request, session_id: str) -> Response:
+    """#15 revert/stage（B4，三段式第 1 段）— POST，body
+    ``{"messageID":"…","files"?:bool}`` 透传 → 上游 200 ``{data:…}``。
+
+    Upstream: opencode v1.18.18 ``protocol/groups/session.ts`` (v2 session
+    group, ``/api/session/{sid}/revert/stage``)。目录不消费（同上）；
+    与既有单步 ``POST /session/{sid}/revert``（#8）路径不同不互截。
+    """
+    _strip_directory_query(request)
+    return await _write_passthrough(
+        request, method="POST",
+        upstream_path=f"/api/session/{session_id}/revert/stage")
+
+
+@router.post("/session/{session_id}/revert/clear")
+async def revert_clear(request: Request, session_id: str) -> Response:
+    """#16 revert/clear（B4，三段式第 2 段）— POST，无 payload → 上游 204。
+
+    Upstream: opencode v1.18.18 ``protocol/groups/session.ts`` (v2 session
+    group, ``/api/session/{sid}/revert/clear``)。目录不消费（同上）。
+    """
+    _strip_directory_query(request)
+    return await _write_passthrough(
+        request, method="POST",
+        upstream_path=f"/api/session/{session_id}/revert/clear")
+
+
+@router.post("/session/{session_id}/revert/commit")
+async def revert_commit(request: Request, session_id: str) -> Response:
+    """#17 revert/commit（B4，三段式第 3 段）— POST，无 payload → 上游 204。
+
+    Upstream: opencode v1.18.18 ``protocol/groups/session.ts`` (v2 session
+    group, ``/api/session/{sid}/revert/commit``)。目录不消费（同上）。
+    """
+    _strip_directory_query(request)
+    return await _write_passthrough(
+        request, method="POST",
+        upstream_path=f"/api/session/{session_id}/revert/commit")

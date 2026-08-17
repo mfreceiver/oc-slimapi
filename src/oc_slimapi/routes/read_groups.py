@@ -39,11 +39,17 @@ is whitelisted through the exact same ``skeleton_session`` used by
 
 from __future__ import annotations
 
+import os
 import orjson
 from fastapi import APIRouter, Request
 
-from ..directory import validate_directory
-from ..selector import resolve_route_directory
+from ..directory import normalize_directory, validate_directory
+from ..errors import CodedHTTPException
+from ..selector import (
+    DIRECTORY_QUERY_PARAM,
+    _strip_query_keys,
+    resolve_route_directory,
+)
 from ..skeleton import skeleton_session
 from ._read_passthrough import read_passthrough_get
 
@@ -80,6 +86,23 @@ def _project_session(raw: bytes) -> bytes:
     return orjson.dumps(skeleton_session(session))
 
 
+def _directory_allowed(allowlist: list[str], directory: str | None) -> bool:
+    if directory is None:
+        return False
+    target = os.path.normpath(normalize_directory(directory))
+    for entry in allowlist:
+        root = os.path.normpath(normalize_directory(entry))
+        if target == root or root == os.sep or target.startswith(root + os.sep):
+            return True
+    return False
+
+
+def _enforce_file_allowlist(request: Request, directory: str | None) -> None:
+    allowlist = request.app.state.config.directory_allowlist
+    if allowlist is not None and not _directory_allowed(allowlist, directory):
+        raise CodedHTTPException(403, code="directory_not_allowed")
+
+
 # --- file group (FileQuery: workspace routing + path) ----------------------
 
 
@@ -92,9 +115,11 @@ async def file_list(request: Request, path: str,
     forwarded verbatim — ``path`` travels in the URL bytes, unknown
     params/repeats/encodings included. The declaration keeps the 422 on a
     missing ``path``."""
+    resolved = _resolve(request, directory)
+    _enforce_file_allowlist(request, resolved)
     return await read_passthrough_get(
         request, upstream_path="/file",
-        directory=_resolve(request, directory),
+        directory=resolved,
     )
 
 
@@ -102,18 +127,22 @@ async def file_list(request: Request, path: str,
 async def file_content(request: Request, path: str,
                        directory: str | None = None):
     """Upstream ``GET /file/content`` — ``LegacyContent`` (text|binary)."""
+    resolved = _resolve(request, directory)
+    _enforce_file_allowlist(request, resolved)
     return await read_passthrough_get(
         request, upstream_path="/file/content",
-        directory=_resolve(request, directory),
+        directory=resolved,
     )
 
 
 @router.get("/file/status")
 async def file_status(request: Request, directory: str | None = None):
     """Upstream ``GET /file/status`` — ``LegacyStatus[]``."""
+    resolved = _resolve(request, directory)
+    _enforce_file_allowlist(request, resolved)
     return await read_passthrough_get(
         request, upstream_path="/file/status",
-        directory=_resolve(request, directory),
+        directory=resolved,
     )
 
 
@@ -218,4 +247,38 @@ async def global_health(request: Request):
     """Upstream ``GET /global/health`` — ``{healthy, version}`` verbatim."""
     return await read_passthrough_get(
         request, upstream_path="/global/health",
+    )
+
+
+# --- B4: session context (v2 /api/session/{sid}/context, directory N/A) ----
+
+
+def _strip_directory_query(request: Request) -> None:
+    """B4 non-consuming directory tolerance: drop ``directory`` from the raw
+    query bytes before the upstream URL is built.
+
+    The v2 session group resolves location per-sid via
+    sessionLocationMiddleware (``protocol/groups/session.ts:173-305``) — it
+    does NOT participate in directory routing. The client's ``?directory=``
+    is ignored (never forwarded upstream, never an error) — same semantics
+    as the questions/permissions non-consuming set. The selector leaves
+    tolerant routes' ``directory`` in ``scope["query_string"]``, so this
+    route strips it here (same byte-preserving scan as the selector)."""
+    request.scope["query_string"] = _strip_query_keys(
+        request.scope.get("query_string", b"") or b"",
+        frozenset({DIRECTORY_QUERY_PARAM}),
+    )
+
+
+@router.get("/session/{sid}/context")
+async def session_context(request: Request, sid: str):
+    """Upstream ``GET /api/session/{sid}/context`` — ``{data: [...]}``
+    verbatim (no projection).
+
+    B4 annex (v2 session group, ``protocol/groups/session.ts``). Directory
+    is NOT consumed: ``?directory=`` is tolerated and dropped (not forwarded,
+    not an error)."""
+    _strip_directory_query(request)
+    return await read_passthrough_get(
+        request, upstream_path=f"/api/session/{sid}/context",
     )

@@ -72,6 +72,18 @@ async def health(request: Request):
     rev = request.app.state.deployment_revision
     if rev is not None:
         resp["server"]["deploymentRevision"] = rev
+    allowlist_feature = {
+        "enabled": request.app.state.config.directory_allowlist is not None,
+    }
+    hubs = getattr(request.app.state, "hubs", None)
+    if hubs is not None:
+        try:
+            hub = hubs.get_global()
+        except Exception:
+            hub = None
+        if hub is not None:
+            allowlist_feature["droppedEvents"] = hub.allowlist_dropped_events
+    resp["features"]["allowlist"] = allowlist_feature
     return json_response(resp, accept_encoding=request.headers.get("accept-encoding"))
 
 

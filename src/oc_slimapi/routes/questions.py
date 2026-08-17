@@ -215,6 +215,9 @@ async def questions(request: Request):
 
     # (Step 2 — directory derivation — happened inside the discovery block
     # above: `directories` is a caller-owned list of strings.)
+    shadow = getattr(request.app.state, "qp_sweep", None)
+    if shadow is not None:
+        shadow.record_request_activity(directories)
 
     # ------------------------------------------------------------------
     # Step 3: sliding-window fan-out with per-dir byte cap, aggregate byte

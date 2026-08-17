@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import time
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -19,6 +21,7 @@ from ..config import (
     TOKEN_REMOVED_MESSAGES_MAX,
     TOKEN_REMOVED_MESSAGES_TTL_MS,
 )
+from ..directory import normalize_directory
 from ..logging_config import get_logger
 from .hub_types import (
     ABORT_NAME,
@@ -65,6 +68,7 @@ class GlobalHub:
         max_frame_bytes: int = DEFAULT_SSE_MAX_FRAME_BYTES,
         traffic_ledger: "TrafficLedger | None" = None,
         turn_registry: "TurnRegistry | None" = None,
+        directory_allowlist: list[str] | None = None,
     ):
         self.client = client
         self.subscribers: set[Subscriber] = set()
@@ -72,6 +76,7 @@ class GlobalHub:
         self.buffer_bytes = buffer_bytes
         self.max_frame_bytes = max_frame_bytes
         self._traffic_ledger = traffic_ledger
+        self.directory_allowlist = directory_allowlist
         # Turn token fence (S9 ingest-time snapshot stamp). Injected from
         # app.py via set_turn_registry(); ``None`` → no stamping (fields
         # omitted from every digest, ocdroid degrades).
@@ -82,6 +87,9 @@ class GlobalHub:
         self.stop_task: asyncio.Task | None = None
         self.ever_connected = False
         self.pending: dict[str, DigestFields] = {}
+        # B1b stage 1: shared, in-memory q/p activity source for the shadow
+        # scheduler. This is observation only; it does not alter frames.
+        self.qp_last_activity: dict[str, float] = {}
         # Token-stream accumulator (design-token-stream.md). Injected from
         # app.py via set_token_hub().
         # When None, message.part.delta/updated fall through to the
@@ -118,6 +126,7 @@ class GlobalHub:
         self.upstream_events_total = 0
         self.emitted_frames_total = 0
         self.reconnects_total = 0
+        self.allowlist_dropped_events = 0
         # rev-ogpt MAJOR 3 + MAJOR 4 (3rd-round terminal audit): bounded
         # gate of retired (sessionID, messageID) tuples. Populated by
         # ``message.removed``; checked by ``message.part.updated`` to
@@ -389,11 +398,11 @@ class GlobalHub:
         # Merge sticky lastError only when entry did not set/clear it this window.
         if fields.last_error is _UNSET and session_id in self.sticky_last_error:
             fields.last_error = self.sticky_last_error[session_id]
+        # B1a: minimal changed — frame appearance == this sid changed.
+        # Constructed from the frame's own sid at flush time (zero new state).
+        fields.changed = [session_id]
         frame = sse_frame(fields.to_payload(session_id), event="session.digest")
-        for subscriber in tuple(self.subscribers):
-            subscriber.put(frame)
-        if self.subscribers:
-            self.emitted_frames_total += len(self.subscribers)
+        self._emit_directory_frame(frame, fields.directory)
 
     def flush(self) -> None:
         """Flush every pending digest (debounce loop).
@@ -416,11 +425,12 @@ class GlobalHub:
             # Merge sticky lastError only when entry did not set/clear it this window.
             if fields.last_error is _UNSET and session_id in self.sticky_last_error:
                 fields.last_error = self.sticky_last_error[session_id]
+            # B1a: minimal changed — per-frame, from this entry's own sid.
+            # Batch flush stays per-entry/per-sid (one frame, one sid, one
+            # changed); no aggregation state is introduced.
+            fields.changed = [session_id]
             frame = sse_frame(fields.to_payload(session_id), event="session.digest")
-            for subscriber in tuple(self.subscribers):
-                subscriber.put(frame)
-            if self.subscribers:
-                self.emitted_frames_total += len(self.subscribers)
+            self._emit_directory_frame(frame, fields.directory)
 
     async def heartbeat_loop(self) -> None:
         while True:
@@ -452,6 +462,32 @@ class GlobalHub:
         detached (tests, shutdown).
         """
         self._turn_registry = registry
+
+    def set_directory_allowlist(self, allowlist: list[str] | None) -> None:
+        """Set the process-wide SSE directory filter (None disables it)."""
+        self.directory_allowlist = allowlist
+
+    def _directory_allowed(self, directory: Any) -> bool:
+        allowlist = self.directory_allowlist
+        if not allowlist:
+            return True
+        if not isinstance(directory, str) or not directory:
+            return False
+        target = os.path.normpath(normalize_directory(directory))
+        for entry in allowlist:
+            root = os.path.normpath(normalize_directory(entry))
+            if target == root or root == os.sep or target.startswith(root + os.sep):
+                return True
+        return False
+
+    def _emit_directory_frame(self, frame: bytes, directory: Any) -> None:
+        if not self._directory_allowed(directory):
+            self.allowlist_dropped_events += 1
+            return
+        for subscriber in tuple(self.subscribers):
+            subscriber.put(frame)
+        if self.subscribers:
+            self.emitted_frames_total += len(self.subscribers)
 
     def _prune_retired_messages(self, now_ms: int) -> None:
         """rev-ogpt MAJOR 4 (3rd-round terminal audit): enforce FIFO cap +
@@ -523,15 +559,19 @@ class GlobalHub:
 
         # Blocking signals: forward raw, no debounce.
         if event_type in IMMEDIATE:
+            if (
+                isinstance(event_type, str)
+                and (event_type.startswith("question.") or event_type.startswith("permission."))
+                and isinstance(directory, str)
+                and directory
+            ):
+                self.qp_last_activity[directory] = time.time()
             frame = sse_frame({
                 "directory": directory,
                 "type": event_type,
                 "properties": props,
             })
-            for subscriber in tuple(self.subscribers):
-                subscriber.put(frame)
-            if self.subscribers:
-                self.emitted_frames_total += len(self.subscribers)
+            self._emit_directory_frame(frame, directory)
             return
 
         # Session/message events: accumulate into pending digest.
@@ -689,10 +729,7 @@ class GlobalHub:
                 if directory:
                     frame_payload["directory"] = directory
                 frame = sse_frame(frame_payload, event="session.error")
-                for subscriber in tuple(self.subscribers):
-                    subscriber.put(frame)
-                if self.subscribers:
-                    self.emitted_frames_total += len(self.subscribers)
+                self._emit_directory_frame(frame, directory)
             return
 
         # Token-stream ingest (design-token-stream.md §5.3): route the

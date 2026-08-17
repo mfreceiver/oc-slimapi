@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from .directory import normalize_directory
 from .versioning import ACCEPTED_CLIENT_VERSIONS, SERVER_API_VERSION
 
 
@@ -194,6 +195,22 @@ def _int_env(name: str, default: int) -> int:
         raise RuntimeError(f"{name} must be an integer") from exc
 
 
+def _directory_allowlist_env() -> list[str] | None:
+    """Parse the allowlist without collapsing its three env states."""
+    raw = os.getenv("OC_SLIMAPI_DIRECTORY_ALLOWLIST")
+    if raw is None:
+        return None
+    if raw == "":
+        return []
+    entries: list[str] = []
+    for item in raw.split(":"):
+        if not item.strip():
+            entries.append("")
+        else:
+            entries.append(os.path.normpath(normalize_directory(item)))
+    return entries
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     host: str = os.getenv("OC_SLIMAPI_HOST", "127.0.0.1")
@@ -331,6 +348,7 @@ class Settings:
     shell_deny_list_enabled: bool = os.getenv("OC_SLIMAPI_SHELL_DENY_LIST_ENABLED", "1").lower() in (
         "1", "true", "yes", "on",
     )
+    directory_allowlist: list[str] | None = field(default_factory=_directory_allowlist_env)
 
     # S-C/S-E deployment revision (env-or-file, best-effort, no validate needed).
     deployment_revision: str | None = os.getenv("OC_SLIMAPI_DEPLOYMENT_REVISION")
@@ -452,6 +470,17 @@ class Settings:
     permissions_max_aggregate_bytes: int = int(
         os.getenv("OC_SLIMAPI_PERMISSIONS_MAX_AGGREGATE_BYTES", str(16 * 1024 * 1024))
     )
+    # B1b stage 1: q/p sweep is a production-safe shadow scheduler. It only
+    # records hypothetical touches; it never owns or calls an upstream client.
+    qp_sweep_enabled: bool = os.getenv(
+        "OC_SLIMAPI_QP_SWEEP_ENABLED", "true"
+    ).lower() in ("1", "true", "yes", "on")
+    qp_sweep_interval_seconds: float = float(
+        os.getenv("OC_SLIMAPI_QP_SWEEP_INTERVAL_SECONDS", "1800.0")
+    )
+    qp_sweep_daily_budget: int = int(
+        os.getenv("OC_SLIMAPI_QP_SWEEP_DAILY_BUDGET", "100")
+    )
     merged_fanout: int = int(
         os.getenv("OC_SLIMAPI_MERGED_FANOUT", "8")
     )
@@ -535,6 +564,20 @@ class Settings:
         return self.access_log_dir, False
 
     def validate(self) -> None:
+        if self.directory_allowlist is not None:
+            for entry in self.directory_allowlist:
+                if (
+                    not isinstance(entry, str)
+                    or not entry.strip()
+                    or not os.path.isabs(entry)
+                    or "\0" in entry
+                    or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in entry)
+                    or len(entry) > 4096
+                ):
+                    raise RuntimeError(
+                        "OC_SLIMAPI_DIRECTORY_ALLOWLIST entries must be non-empty "
+                        "absolute directories with no control characters"
+                    )
         # Bind host: loopback is the safe default; ``0.0.0.0`` is allowed as a
         # plaintext direct-entry surface (port 4097) for ops scenarios such as
         # reaching the sidecar over a Tailscale address without terminating
@@ -857,6 +900,12 @@ class Settings:
             raise RuntimeError(
                 "OC_SLIMAPI_PERMISSIONS_MAX_AGGREGATE_BYTES must be <= 128 MiB"
             )
+        if self.qp_sweep_interval_seconds <= 0:
+            raise RuntimeError(
+                "OC_SLIMAPI_QP_SWEEP_INTERVAL_SECONDS must be > 0"
+            )
+        if self.qp_sweep_daily_budget < 0:
+            raise RuntimeError("OC_SLIMAPI_QP_SWEEP_DAILY_BUDGET must be >= 0")
         if not 1 <= self.merged_fanout <= 16:
             raise RuntimeError(
                 "OC_SLIMAPI_MERGED_FANOUT must be in [1, 16]"

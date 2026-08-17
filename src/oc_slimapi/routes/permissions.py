@@ -231,6 +231,9 @@ async def permissions(request: Request):
     # (Step 2 — directory derivation — happened inside the discovery block
     # above: `directories` is a caller-owned list of strings; mirrors
     # questions.py's _directories_from_sessions semantics exactly.)
+    shadow = getattr(request.app.state, "qp_sweep", None)
+    if shadow is not None:
+        shadow.record_request_activity(directories)
 
     # ------------------------------------------------------------------
     # Step 3: sliding-window fan-out with per-dir byte cap, aggregate byte

@@ -25,6 +25,7 @@ from .logging_config import get_logger, setup_logging
 from .middleware.request_id import RequestIdMiddleware
 from .middleware.traffic_accounting import TrafficAccountingMiddleware
 from .proxy import install_proxy
+from .qp_sweep import QpSweepShadow
 from .routes import actions, agent, children, command, directories, events, health, messages, metrics, permissions, questions, read_groups, sessions, todo, token_stream, versions, write_groups
 from .routes import diff as diff_routes
 from .selector import SlimapiSelectorMiddleware
@@ -99,6 +100,18 @@ def _log_maint_task_exception(task: asyncio.Task) -> None:
         )
 
 
+def _log_directory_allowlist(settings) -> None:
+    if settings.directory_allowlist == []:
+        get_logger("app").warning(
+            "directory allowlist enabled but empty; /slimapi/file/** will 403"
+        )
+    elif settings.directory_allowlist is not None:
+        get_logger("app").info(
+            "directory allowlist enabled with %d entries",
+            len(settings.directory_allowlist),
+        )
+
+
 async def smoke(app: FastAPI) -> None:
     """Validate the upstream message-list schema and record a diagnostic status.
 
@@ -168,6 +181,7 @@ async def lifespan(app: FastAPI):
     setup_logging()
     settings.validate()
     app.state.config = settings
+    _log_directory_allowlist(settings)
     # Structured access log (DailyAccessHandler on the oc_slimapi.access
     # logger). Files are named access-YYYY-MM-DD.jsonl under ``access_log_dir``,
     # rotated by calendar day; startup compresses history and a background loop
@@ -409,6 +423,9 @@ async def lifespan(app: FastAPI):
             max_frame_bytes=settings.sse_max_frame_bytes,
             traffic_ledger=app.state.traffic_ledger,
         )
+        app.state.hubs.get_global().set_directory_allowlist(
+            settings.directory_allowlist
+        )
 
         async def _close_hubs():
             try:
@@ -416,6 +433,28 @@ async def lifespan(app: FastAPI):
             except Exception as exc:
                 get_logger("app").warning("hubs.close failed", exc_info=exc)
         stack.push_async_callback(_close_hubs)
+        if settings.qp_sweep_enabled:
+            global_hub = app.state.hubs.get_global()
+            app.state.qp_sweep = QpSweepShadow(
+                activity=global_hub.qp_last_activity,
+                directory_source=lambda: global_hub.pending.values(),
+                interval_seconds=settings.qp_sweep_interval_seconds,
+                daily_budget=settings.qp_sweep_daily_budget,
+            )
+            app.state.qp_sweep.start()
+
+            async def _stop_qp_sweep():
+                await app.state.qp_sweep.stop()
+
+            stack.push_async_callback(_stop_qp_sweep)
+            get_logger("app").info(
+                "qp sweep shadow enabled (interval=%ss, budget=%s/day); "
+                "zero real upstream requests",
+                settings.qp_sweep_interval_seconds,
+                settings.qp_sweep_daily_budget,
+            )
+        else:
+            app.state.qp_sweep = None
         # Token-stream accumulator (design-token-stream.md §5.3). Constructed
         # unconditionally so publish() can route message.part.delta/updated
         # into it the moment the first upstream event arrives; subscriber /

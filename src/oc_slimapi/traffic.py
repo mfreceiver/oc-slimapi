@@ -104,6 +104,10 @@ def bucketize(method: str, path: str) -> str:
             return "health"
         if path == "/slimapi/metrics" or path.startswith("/slimapi/metrics/"):
             return "metrics"
+        # Stage-1 q/p sweep markers are shadow observations, not HTTP routes;
+        # keep a reserved path shape bucketable for future ledger integrations.
+        if path == "/slimapi/_shadow/sweep" or path.startswith("/slimapi/_shadow/sweep/"):
+            return "sweep"
         # Token-stream SSE lives under /slimapi/sessions/{sid}/stream — must be
         # tested BEFORE the generic /slimapi/sessions prefix below.
         if path.startswith("/slimapi/sessions/") and path.endswith("/stream"):
@@ -167,6 +171,14 @@ def bucketize(method: str, path: str) -> str:
             # 405 (routes registered for POST only) and must not count as
             # write traffic; it falls through to the generic buckets.
             return "write_question"
+        # B4: GET /slimapi/session/{sid}/context — the v2 session group's
+        # context endpoint (sessionContext). Its own bucket so context-read
+        # traffic stays visible separately from the session_single projection
+        # (same per-endpoint precedent as command/agent). Must fire BEFORE
+        # the generic session_single branch below; the method-aware
+        # write_session branch above already owns non-GET /session/**.
+        if path.startswith("/slimapi/session/") and path.endswith("/context"):
+            return "session_context"
         # /slimapi/session/{sid} (session single — NOT the plural sessions
         # surface above) and the two tolerant global reads.
         if path.startswith("/slimapi/session/"):
