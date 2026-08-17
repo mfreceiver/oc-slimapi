@@ -19,6 +19,7 @@ import orjson
 from ..config import (
     TOKEN_REMOVED_MESSAGES_MAX,
     TOKEN_REMOVED_MESSAGES_TTL_MS,
+    clear_allowlist_roots_cache,
     directory_allowed,
 )
 from ..logging_config import get_logger
@@ -89,6 +90,9 @@ class GlobalHub:
         # B1b stage 1: shared, in-memory q/p activity source for the shadow
         # scheduler. This is observation only; it does not alter frames.
         self.qp_last_activity: dict[str, float] = {}
+        # B1b stage 1: optional synchronous directory observer. ``None`` is
+        # the normal zero-cost path for hubs without the shadow scheduler.
+        self._directory_observer: Callable[[str], None] | None = None
         # Token-stream accumulator (design-token-stream.md). Injected from
         # app.py via set_token_hub().
         # When None, message.part.delta/updated fall through to the
@@ -401,6 +405,7 @@ class GlobalHub:
         # Constructed from the frame's own sid at flush time (zero new state).
         fields.changed = [session_id]
         frame = sse_frame(fields.to_payload(session_id), event="session.digest")
+        self._observe_directory(fields.directory)
         self._emit_directory_frame(frame, fields.directory)
 
     def flush(self) -> None:
@@ -429,6 +434,7 @@ class GlobalHub:
             # changed); no aggregation state is introduced.
             fields.changed = [session_id]
             frame = sse_frame(fields.to_payload(session_id), event="session.digest")
+            self._observe_directory(fields.directory)
             self._emit_directory_frame(frame, fields.directory)
 
     async def heartbeat_loop(self) -> None:
@@ -450,6 +456,22 @@ class GlobalHub:
         """
         self._token_hub = token_hub
 
+    def set_directory_observer(
+        self, observer: Callable[[str], None] | None
+    ) -> None:
+        """Wire an optional best-effort observer for ingested directories."""
+        self._directory_observer = observer
+
+    def _observe_directory(self, directory: Any) -> None:
+        observer = self._directory_observer
+        if observer is None or not isinstance(directory, str) or not directory:
+            return
+        try:
+            observer(directory)
+        except Exception:
+            # Observability must never alter the hub's ingest/fan-out path.
+            logger.debug("directory observer failed", exc_info=True)
+
     def set_turn_registry(self, registry: "TurnRegistry | None") -> None:
         """Wire the :class:`TurnRegistry` so publish() can stamp
         ``turnIncarnation`` / ``turn`` onto ``session.digest`` entries.
@@ -465,16 +487,21 @@ class GlobalHub:
     def set_directory_allowlist(self, allowlist: list[str] | None) -> None:
         """Set the process-wide SSE directory filter (None disables it)."""
         self.directory_allowlist = allowlist
+        # rev-2 sub-1: config-change signal — every (re-)applied allowlist
+        # re-resolves the canonical roots, so a root retargeted on disk
+        # takes effect on the next config change (documented ops semantic).
+        clear_allowlist_roots_cache()
 
     def _directory_allowed(self, directory: Any) -> bool:
         allowlist = self.directory_allowlist
         if not allowlist:
             return True
-        # rev-sgpt MAJOR-1: canonical (realpath) matching via the shared
-        # config helper — a symlinked directory that lexically sits inside
-        # an allowed root but resolves outside is dropped (and counted)
-        # here. Non-str / empty directories fall through to the helper's
-        # fail-closed False (frame dropped + counted, as before).
+        # rev-2 closure: cached canonical ROOTS (config-time resolution)
+        # vs REALTIME candidate canonicalisation (never cached — a symlink
+        # created/retargeted after a previous verdict cannot ride a stale
+        # result). Relative candidates fail closed (authorisation object
+        # must equal access object). Non-str / empty directories also fall
+        # through to fail-closed False (frame dropped + counted, as before).
         return directory_allowed(allowlist, directory)
 
     def _emit_directory_frame(self, frame: bytes, directory: Any) -> None:
@@ -548,6 +575,7 @@ class GlobalHub:
         # early-returns below still represent real traffic the GlobalBus saw.
         self.upstream_events_total += 1
         directory = global_event.get("directory")
+        self._observe_directory(directory)
         payload = global_event.get("payload")
         if not isinstance(payload, dict):
             return

@@ -157,6 +157,116 @@ def test_non_qp_hub_event_does_not_update_qp_activity():
     assert "/repo" not in hub.qp_last_activity
 
 
+def test_hub_observer_retains_non_qp_directory_after_pending_flush():
+    shadow = QpSweepShadow(
+        interval_seconds=1.0,
+        now=lambda: 100.0,
+        jitter=lambda: 1.0,
+    )
+    hub = GlobalHub(None)
+    hub.set_directory_observer(shadow.observe_directory)
+
+    hub.publish(
+        {
+            "directory": "/repo",
+            "payload": {
+                "type": "session.updated",
+                "properties": {"sessionID": "sid"},
+            },
+        }
+    )
+    assert hub.pending
+    hub.flush()
+    assert not hub.pending
+
+    shadow.run_once(now=103.0)
+    assert shadow.metrics()["known_directories"] == 1
+    assert shadow.markers[-1]["directory"] == "/repo"
+
+
+def test_hub_directory_observer_exception_does_not_break_publish():
+    hub = GlobalHub(None)
+
+    def broken_observer(directory: str) -> None:
+        raise RuntimeError(f"observer failed for {directory}")
+
+    hub.set_directory_observer(broken_observer)
+    hub.publish(
+        {
+            "directory": "/repo",
+            "payload": {
+                "type": "session.updated",
+                "properties": {"sessionID": "sid"},
+            },
+        }
+    )
+    assert "sid" in hub.pending
+
+
+def test_missing_directory_is_not_sent_to_hub_observer():
+    observed: list[str] = []
+    hub = GlobalHub(None)
+    hub.set_directory_observer(observed.append)
+
+    for directory in (None, ""):
+        hub.publish(
+            {
+                "directory": directory,
+                "payload": {
+                    "type": "session.updated",
+                    "properties": {"sessionID": "sid"},
+                },
+            }
+        )
+
+    assert observed == []
+
+
+def test_stale_directories_are_evicted_and_reobserved():
+    shadow = QpSweepShadow(
+        interval_seconds=1.0,
+        eviction_after_seconds=10.0,
+        now=lambda: 0.0,
+        jitter=lambda: 1.0,
+        directories=["/old"],
+    )
+    shadow.run_once(now=0.0)
+    assert shadow.metrics()["known_directories"] == 1
+
+    shadow.run_once(now=11.0)
+    assert shadow.metrics()["known_directories"] == 0
+
+    shadow.observe_directory("/old", now=11.0)
+    assert shadow.metrics()["known_directories"] == 1
+
+
+def test_async_scheduler_runs_each_directory_on_deadline_cadence():
+    async def scenario():
+        shadow = QpSweepShadow(
+            interval_seconds=0.2,
+            daily_budget=20,
+            directories=["/a", "/b", "/c"],
+            jitter=lambda: 1.2,
+        )
+        shadow.start()
+        await asyncio.sleep(0.34)
+        await shadow.stop()
+        return {
+            directory: [
+                marker["ts"]
+                for marker in shadow.markers
+                if marker["directory"] == directory
+            ]
+            for directory in ("/a", "/b", "/c")
+        }
+
+    times = asyncio.run(scenario())
+    for directory_times in times.values():
+        assert len(directory_times) >= 2
+        interval = directory_times[1] - directory_times[0]
+        assert 0.8 * 0.2 <= interval <= 1.2 * 0.2 + 0.005
+
+
 def test_other_immediate_hub_event_does_not_update_qp_activity():
     hub = GlobalHub(None)
     hub.publish({"directory": "/repo", "payload": {"type": "server.connected", "properties": {}}})

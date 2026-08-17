@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
@@ -214,83 +213,138 @@ def _directory_allowlist_env() -> list[str] | None:
 
 
 # ---------------------------------------------------------------------------
-# Directory-allowlist canonical matching (rev-sgpt MAJOR-1).
+# Directory-allowlist canonical matching (rev-sgpt MAJOR-1 → rev-2 closure).
 #
 # The allowlist decision MUST NOT be a purely lexical prefix comparison: a
 # candidate like ``/allowed/link`` (symlink → /outside) sits inside the
 # allowed subtree *lexically* but escapes it on the real filesystem. Both
 # decision points (routes/read_groups.py 403 gate, sse/global_hub.py SSE
-# frame filter) canonicalise candidate AND allowlist entries through
+# frame filter) therefore canonicalise BOTH sides through
 # ``os.path.realpath`` (non-strict: symlinks in the existing prefix are
 # resolved; a non-existent tail is preserved verbatim) before the
-# boundary-aligned prefix match below.
+# boundary-aligned prefix match.
+#
+# rev-2 split of resolution duties:
+#   * CANDIDATE directories are resolved in REALTIME on every decision and
+#     are NEVER cached (sub-1). A cached candidate verdict could be pinned
+#     before a symlink was created / retargeted and then ridden after the
+#     filesystem changed.
+#   * ALLOWLIST ROOTS are resolved once per config determination and cached
+#     BY VALUE (sub-1 allows this). Config-determination points —
+#     ``Settings.validate()`` and ``GlobalHub.set_directory_allowlist()``
+#     — call :func:`clear_allowlist_roots_cache` so re-applying the config
+#     re-resolves. OPS SEMANTIC: a root that is itself retargeted on disk
+#     after being resolved does NOT affect candidate checks until the
+#     allowlist config is re-applied or the process restarts — deliberate
+#     ops semantics (whoever controls the allowlist config controls which
+#     roots are authorised).
+#   * RELATIVE candidates are never authorised under a set allowlist
+#     (sub-2): ``realpath`` would resolve them against the SIDECAR's CWD
+#     while the upstream executes against its own CWD — authorisation
+#     object ≠ access object.
 # ---------------------------------------------------------------------------
 
-# FIFO/LRU cap on the realpath resolution cache. Keys are normalised
-# directory strings arriving from client / upstream input, so the key space
-# is not naturally bounded — the cap bounds memory in exchange for an
-# occasional re-resolution after eviction (decisions are unaffected, only
-# the syscall repeats). Mirrors the bounded-OrderedDict pattern used across
-# the hubs (see TOKEN_DISABLED_MAX / _LAST_UPDATED_AT_BY_SID_MAX).
-_REALPATH_CACHE_MAX = 4096
-_REALPATH_CACHE: OrderedDict[str, str] = OrderedDict()
+# rev-2 sub-1: canonical roots keyed by the allowlist VALUE (tuple form).
+# The key space is the set of distinct allowlist values ever active in the
+# process (handful at most) — no eviction needed, and a config change
+# clears it wholesale.
+_ALLOWLIST_ROOTS_CACHE: dict[tuple[str, ...], tuple[str, ...]] = {}
 
 
-def canonical_directory(path: str) -> str:
-    """Resolve ``path`` through ``os.path.realpath`` with a bounded cache.
+def clear_allowlist_roots_cache() -> None:
+    """Config-change signal (rev-2 sub-1): drop cached canonical roots.
 
-    Non-strict semantics: symlink components that exist are resolved; a
-    missing tail is kept verbatim (so not-yet-created directories still
-    match lexically — required by the B4-4 lexical-subtree tests). Raises
-    OSError / ValueError only on genuine resolution failures (e.g.
-    embedded NUL); callers treat that as fail-closed. LRU-refresh on hit
-    keeps the hot keys (allowlist roots, common workspace dirs) resident.
+    Called from ``Settings.validate()`` and
+    ``GlobalHub.set_directory_allowlist()`` so the next decision after a
+    (re-)applied allowlist configuration re-resolves the roots on the
+    current filesystem.
     """
-    cached = _REALPATH_CACHE.get(path)
+
+
+def allowlist_roots(allowlist: list[str]) -> tuple[str, ...]:
+    """Canonical (realpath) form of every allowlist entry, cached by value.
+
+    Roots are resolved once per distinct allowlist value (see the module
+    block above). An entry whose resolution genuinely fails (OSError /
+    ValueError — e.g. embedded NUL) is skipped: fail-closed, an entry
+    that cannot be resolved authorises nothing. Non-existent entries are
+    fine — non-strict realpath keeps the missing tail verbatim.
+    """
+    key = tuple(allowlist)
+    cached = _ALLOWLIST_ROOTS_CACHE.get(key)
     if cached is not None:
-        _REALPATH_CACHE.move_to_end(path)
         return cached
-    resolved = os.path.realpath(path)
-    _REALPATH_CACHE[path] = resolved
-    while len(_REALPATH_CACHE) > _REALPATH_CACHE_MAX:
-        _REALPATH_CACHE.popitem(last=False)
+    roots: list[str] = []
+    for entry in allowlist:
+        try:
+            roots.append(
+                os.path.realpath(os.path.normpath(normalize_directory(entry)))
+            )
+        except (OSError, ValueError):
+            continue
+    resolved = tuple(roots)
+    _ALLOWLIST_ROOTS_CACHE[key] = resolved
     return resolved
 
 
-def directory_allowed(allowlist: list[str], directory: Any) -> bool:
-    """Canonical (realpath) allowlist subtree match — rev-sgpt MAJOR-1.
+def candidate_canonical(directory: Any) -> str | None:
+    """Realtime canonical resolution of a candidate — NEVER cached (rev-2 sub-1).
 
-    Both the candidate and every allowlist entry are canonicalised through
-    :func:`canonical_directory` BEFORE the prefix comparison, so a symlink
-    pointing outside the allowed subtree is rejected even when its lexical
-    path is inside it.
+    Every decision re-runs ``os.path.realpath`` so no verdict can ride a
+    stale cache entry: a candidate first judged before a symlink was
+    created (or before a symlink was retargeted) re-resolves on every
+    check.
 
-    Boundary alignment: allowed iff ``candidate == root``, ``root == "/"``,
-    or ``candidate`` starts with ``root + "/"`` (the ``/abc`` vs ``/ab``
-    prefix trap stays rejected).
+    Returns ``None`` — callers fail closed (403 / frame dropped) — when
+    the candidate:
+
+    * is not a non-empty ``str``;
+    * is RELATIVE (rev-2 sub-2): realpath would resolve it against the
+      sidecar CWD while the upstream executes against its own CWD;
+    * genuinely fails to resolve (OSError / ValueError).
+    """
+    if not isinstance(directory, str) or not directory:
+        return None
+    normalized = os.path.normpath(normalize_directory(directory))
+    if not os.path.isabs(normalized):
+        return None
+    try:
+        return os.path.realpath(normalized)
+    except (OSError, ValueError):
+        return None
+
+
+def match_allowlist(roots: tuple[str, ...], canonical: str | None) -> bool:
+    """Boundary-aligned canonical prefix match (rev-2 sub-1 form).
+
+    ``canonical`` is the candidate's realtime canonical form (from
+    :func:`candidate_canonical`; ``None`` → not allowed). Allowed iff
+    ``canonical == root``, ``root == "/"``, or ``canonical`` starts with
+    ``root + "/"`` (the ``/abc`` vs ``/ab`` prefix trap stays rejected).
 
     Case sensitivity: comparison is by POSIX path bytes (Linux deployment
     environment); case-insensitive filesystems are deliberately NOT
     handled.
-
-    Fail-closed: a candidate or entry that cannot be resolved at all
-    (OSError / ValueError from realpath, e.g. embedded NUL) is not
-    allowed. The three-state gating (None = no filtering, [] = reject-all
-    at the /file routes / no-filter at the SSE hub) stays with the
-    callers — this helper only answers "is ``directory`` inside
-    ``allowlist``".
     """
-    if not isinstance(directory, str) or not directory:
+    if canonical is None:
         return False
-    try:
-        target = canonical_directory(os.path.normpath(normalize_directory(directory)))
-        for entry in allowlist:
-            root = canonical_directory(os.path.normpath(normalize_directory(entry)))
-            if target == root or root == os.sep or target.startswith(root + os.sep):
-                return True
-        return False
-    except (OSError, ValueError):
-        return False
+    for root in roots:
+        if canonical == root or root == os.sep or canonical.startswith(root + os.sep):
+            return True
+    return False
+
+
+def directory_allowed(allowlist: list[str], directory: Any) -> bool:
+    """Canonical subtree match: cached roots vs realtime candidate.
+
+    Convenience wrapper chaining :func:`allowlist_roots` (config-time
+    resolution, cached by value) with :func:`candidate_canonical`
+    (realtime, never cached). The three-state gating (None = no
+    filtering, [] = reject-all at the /file routes / no-filter at the SSE
+    hub) stays with the callers — this helper only answers "is
+    ``directory`` inside ``allowlist``".
+    """
+    return match_allowlist(allowlist_roots(allowlist), candidate_canonical(directory))
 
 
 @dataclass(frozen=True, slots=True)
@@ -660,15 +714,16 @@ class Settings:
                         "OC_SLIMAPI_DIRECTORY_ALLOWLIST entries must be non-empty "
                         "absolute directories with no control characters"
                     )
-            # rev-sgpt MAJOR-1: fail-closed startup check — every allowlist
-            # entry must be canonically resolvable (realpath). Entries may
-            # legitimately not exist yet (non-strict realpath keeps the
-            # missing tail verbatim); only genuine resolution failures
-            # (OSError / ValueError) reject startup. Also warms the shared
-            # realpath cache with the hot allowlist roots.
+            # rev-2 sub-1: config-determination point — resolve roots once
+            # here and drop any stale cached roots. Fail-closed startup
+            # check: every allowlist entry must be canonically resolvable
+            # (realpath). Entries may legitimately not exist yet (non-strict
+            # realpath keeps the missing tail verbatim); only genuine
+            # resolution failures (OSError / ValueError) reject startup.
+            clear_allowlist_roots_cache()
             for entry in self.directory_allowlist:
                 try:
-                    canonical_directory(os.path.normpath(normalize_directory(entry)))
+                    os.path.realpath(os.path.normpath(normalize_directory(entry)))
                 except (OSError, ValueError) as exc:
                     raise RuntimeError(
                         "OC_SLIMAPI_DIRECTORY_ALLOWLIST entries must be "

@@ -17,14 +17,18 @@ from datetime import datetime, timezone
 from typing import Any
 
 
+_EVICTION_AFTER = 30 * 86400.0
+_MAX_SLEEP_SECONDS = 30.0
+
+
 class QpSweepShadow:
     """Budgeted, dry-run q/p sweep scheduler.
 
     Scheduling is per directory rather than per global round: each directory
     has its own ``next_run`` deadline and receives an independently jittered
-    interval after every evaluation.  The scheduler loop only provides a
-    short polling tick; it never makes the directory count part of a
-    directory's cadence.
+    interval after every evaluation.  The scheduler sleeps until the nearest
+    deadline, with a short wake cap for newly observed directories; it never
+    makes the directory count part of a directory's cadence.
     """
 
     ESTIMATED_DIRECTORY_BYTES = 2 * 1024
@@ -40,14 +44,14 @@ class QpSweepShadow:
         enabled: bool = True,
         now: Callable[[], float] = time.time,
         jitter: Callable[[], float] | None = None,
-        tick_seconds: float | None = None,
+        eviction_after_seconds: float = _EVICTION_AFTER,
     ) -> None:
         if interval_seconds <= 0:
             raise ValueError("interval_seconds must be > 0")
         if daily_budget < 0:
             raise ValueError("daily_budget must be >= 0")
-        if tick_seconds is not None and tick_seconds <= 0:
-            raise ValueError("tick_seconds must be > 0")
+        if eviction_after_seconds <= 0:
+            raise ValueError("eviction_after_seconds must be > 0")
         self._activity = activity if activity is not None else {}
         # Monotonic within the process: a directory remains eligible for
         # evaluation even after a transient source (for example, the hub's
@@ -57,18 +61,15 @@ class QpSweepShadow:
         self._next_run: dict[str, float] = {}
         self._directory_source = directory_source
         self.interval_seconds = interval_seconds
+        self.eviction_after_seconds = eviction_after_seconds
         self.daily_budget = daily_budget
         self.enabled = enabled
         self._now = now
         self.jitter = jitter or (lambda: random.uniform(0.8, 1.2))
-        self.tick_seconds = (
-            min(interval_seconds / 4.0, 30.0)
-            if tick_seconds is None
-            else tick_seconds
-        )
         self._budget_day: str | None = None
         self._budget_used = 0
         self._task: asyncio.Task[None] | None = None
+        self._wake_event = asyncio.Event()
         self.markers: deque[dict[str, Any]] = deque(maxlen=256)
         self._triggers_total = 0
         self._cold_hits = 0
@@ -93,14 +94,19 @@ class QpSweepShadow:
     def observe_directory(self, directory: str, *, now: float | None = None) -> None:
         if not isinstance(directory, str) or not directory:
             return
-        if directory in self._known_dirs:
-            return
         timestamp = self._now() if now is None else now
+        if directory in self._known_dirs:
+            self._seen_at[directory] = timestamp
+            if self.running:
+                self._wake_event.set()
+            return
         self._known_dirs.add(directory)
         self._seen_at[directory] = timestamp
         # New directories are evaluated on the next scheduler scan (or the
         # next explicit run_once call), then move onto their normal cadence.
         self._next_run[directory] = timestamp
+        if self.running:
+            self._wake_event.set()
 
     def record_activity(self, directory: str, *, now: float | None = None) -> None:
         if not isinstance(directory, str) or not directory:
@@ -148,10 +154,29 @@ class QpSweepShadow:
         ]
         return due
 
+    def _evict_stale_directories(self, timestamp: float) -> None:
+        stale = [
+            directory
+            for directory, seen_at in self._seen_at.items()
+            if timestamp - seen_at >= self.eviction_after_seconds
+        ]
+        for directory in stale:
+            self._known_dirs.discard(directory)
+            self._seen_at.pop(directory, None)
+            self._next_run.pop(directory, None)
+
+    def _next_sleep(self, timestamp: float) -> float:
+        self._evict_stale_directories(timestamp)
+        if not self._next_run:
+            return min(self.interval_seconds, _MAX_SLEEP_SECONDS)
+        deadline = min(self._next_run.values())
+        return min(max(0.0, deadline - timestamp), _MAX_SLEEP_SECONDS)
+
     def run_once(self, *, now: float | None = None) -> list[dict[str, Any]]:
         """Run one shadow round and return the markers emitted by that round."""
         timestamp = self._now() if now is None else now
         self._ingest_directory_source()
+        self._evict_stale_directories(timestamp)
         self._reset_budget_if_needed(timestamp)
         emitted: list[dict[str, Any]] = []
         for directory in self._due_directories(timestamp):
@@ -187,7 +212,13 @@ class QpSweepShadow:
 
     async def _run(self) -> None:
         while True:
-            await asyncio.sleep(self.tick_seconds)
+            delay = self._next_sleep(self._now())
+            if delay > 0:
+                self._wake_event.clear()
+                try:
+                    await asyncio.wait_for(self._wake_event.wait(), timeout=delay)
+                except asyncio.TimeoutError:
+                    pass
             self.run_once()
 
     def start(self) -> asyncio.Task[None] | None:

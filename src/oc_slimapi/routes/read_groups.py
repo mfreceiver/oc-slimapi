@@ -42,7 +42,7 @@ from __future__ import annotations
 import orjson
 from fastapi import APIRouter, Request
 
-from ..config import directory_allowed
+from ..config import allowlist_roots, candidate_canonical, match_allowlist
 from ..directory import validate_directory
 from ..errors import CodedHTTPException
 from ..selector import (
@@ -86,14 +86,27 @@ def _project_session(raw: bytes) -> bytes:
     return orjson.dumps(skeleton_session(session))
 
 
-def _enforce_file_allowlist(request: Request, directory: str | None) -> None:
+def _authorized_file_directory(request: Request, directory: str | None) -> str | None:
+    """403 gate returning the directory to forward upstream (rev-2 closure).
+
+    * allowlist ``None`` → ungated: the original ``directory`` is returned
+      verbatim (zero behaviour change).
+    * allowlist set → the candidate is canonicalised in REALTIME (never
+      cached — rev-2 sub-1), relative candidates fail closed with the
+      uniform 403 ``directory_not_allowed`` (sub-2; no existence leak),
+      and on a pass the CANONICAL (realpath) form is returned so the
+      forwarded ``X-Opencode-Directory`` binds the upstream access to the
+      exact object the authorization decision was made on (sub-3) — a
+      symlink swapped between check and upstream resolution cannot
+      retarget the lookup.
+    """
     allowlist = request.app.state.config.directory_allowlist
-    # rev-sgpt MAJOR-1: canonical (realpath) subtree match via the shared
-    # config helper — a symlinked directory that lexically sits inside an
-    # allowed root but resolves outside is rejected with the same uniform
-    # 403 (no existence leak).
-    if allowlist is not None and not directory_allowed(allowlist, directory):
+    if allowlist is None:
+        return directory
+    canonical = candidate_canonical(directory)
+    if not match_allowlist(allowlist_roots(allowlist), canonical):
         raise CodedHTTPException(403, code="directory_not_allowed")
+    return canonical
 
 
 # --- file group (FileQuery: workspace routing + path) ----------------------
@@ -109,10 +122,10 @@ async def file_list(request: Request, path: str,
     params/repeats/encodings included. The declaration keeps the 422 on a
     missing ``path``."""
     resolved = _resolve(request, directory)
-    _enforce_file_allowlist(request, resolved)
+    forward_directory = _authorized_file_directory(request, resolved)
     return await read_passthrough_get(
         request, upstream_path="/file",
-        directory=resolved,
+        directory=forward_directory,
     )
 
 
@@ -121,10 +134,10 @@ async def file_content(request: Request, path: str,
                        directory: str | None = None):
     """Upstream ``GET /file/content`` — ``LegacyContent`` (text|binary)."""
     resolved = _resolve(request, directory)
-    _enforce_file_allowlist(request, resolved)
+    forward_directory = _authorized_file_directory(request, resolved)
     return await read_passthrough_get(
         request, upstream_path="/file/content",
-        directory=resolved,
+        directory=forward_directory,
     )
 
 
@@ -132,10 +145,10 @@ async def file_content(request: Request, path: str,
 async def file_status(request: Request, directory: str | None = None):
     """Upstream ``GET /file/status`` — ``LegacyStatus[]``."""
     resolved = _resolve(request, directory)
-    _enforce_file_allowlist(request, resolved)
+    forward_directory = _authorized_file_directory(request, resolved)
     return await read_passthrough_get(
         request, upstream_path="/file/status",
-        directory=resolved,
+        directory=forward_directory,
     )
 
 

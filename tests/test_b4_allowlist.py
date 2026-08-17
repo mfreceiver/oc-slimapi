@@ -346,3 +346,130 @@ def test_directory_allowed_repeated_decisions_are_stable(tmp_path):
             for _ in range(3)] == [False, False, False]
     assert [directory_allowed(allowlist, str(allowed_root / "sub"))
             for _ in range(3)] == [True, True, True]
+
+
+# --- rev-2 closure: realtime candidate resolution / relative / canonical
+# forward (sub-1 / sub-2 / sub-3) -------------------------------------------
+
+
+async def test_candidate_created_as_escape_symlink_after_first_check(tmp_path):
+    """rev-2 scenario 1 (sub-1): the candidate is judged nonexistent first
+    (lexical subtree pass), then created as an escaping symlink — the
+    second judgement must re-resolve in realtime and 403. No candidate
+    realpath caching exists, so no stale verdict can be ridden."""
+    allowed_root = tmp_path / "allowed_root"
+    outside = tmp_path / "outside"
+    allowed_root.mkdir()
+    outside.mkdir()
+    future = allowed_root / "future"  # does not exist yet
+    app, seen = _build_file_app(
+        _settings(directory_allowlist=[str(allowed_root)]), _file_ok
+    )
+    url = "/slimapi/file?v=3&path=foo&directory=" + str(future)
+    async with _client(app) as client:
+        first = await client.get(url, headers={"Accept-Encoding": "identity"})
+        os.symlink(outside, future)  # becomes a symlink escaping the root
+        second = await client.get(url, headers={"Accept-Encoding": "identity"})
+    assert first.status_code == 200
+    assert second.status_code == 403
+    assert second.json() == {"code": "directory_not_allowed"}
+    assert len(seen) == 1  # only the first (legitimately allowed) call
+
+
+async def test_symlink_retarget_after_first_check_is_rejected(tmp_path):
+    """rev-2 scenario 2 (sub-1): link first points INSIDE the allowed root
+    (pass), then is retargeted outside at runtime — realtime candidate
+    resolution must reject the second request."""
+    allowed_root = tmp_path / "allowed_root"
+    real_dir = allowed_root / "real"
+    outside = tmp_path / "outside"
+    allowed_root.mkdir()
+    real_dir.mkdir()
+    outside.mkdir()
+    link = allowed_root / "link"
+    os.symlink(real_dir, link)
+    app, seen = _build_file_app(
+        _settings(directory_allowlist=[str(allowed_root)]), _file_ok
+    )
+    url = "/slimapi/file?v=3&path=foo&directory=" + str(link)
+    async with _client(app) as client:
+        first = await client.get(url, headers={"Accept-Encoding": "identity"})
+        link.unlink()
+        os.symlink(outside, link)
+        second = await client.get(url, headers={"Accept-Encoding": "identity"})
+    assert first.status_code == 200
+    assert second.status_code == 403
+    assert second.json() == {"code": "directory_not_allowed"}
+    assert len(seen) == 1
+
+
+async def test_relative_directory_rejected_even_when_cwd_inside_allowed_root(
+    tmp_path, monkeypatch
+):
+    """rev-2 scenario 3 (sub-2): with the sidecar CWD inside the allowed
+    root, a relative directory would realpath-resolve into the subtree —
+    it must still fail closed with the uniform 403 (the upstream executes
+    against its own CWD, so a relative authorisation object is never
+    valid)."""
+    allowed_root = tmp_path / "allowed_root"
+    allowed_root.mkdir()
+    monkeypatch.chdir(allowed_root)
+    app, seen = _build_file_app(
+        _settings(directory_allowlist=[str(allowed_root)]), _file_ok
+    )
+    async with _client(app) as client:
+        response = await client.get(
+            "/slimapi/file?v=3&path=foo&directory=sessions/sub",
+            headers={"Accept-Encoding": "identity"},
+        )
+    assert response.status_code == 403
+    assert response.json() == {"code": "directory_not_allowed"}
+    assert not seen
+
+
+async def test_forwarded_directory_header_is_canonical_after_symlink_pass(
+    tmp_path,
+):
+    """rev-2 scenario 4 (sub-3): after a passing check the upstream request
+    must carry the CANONICAL directory (realpath result) in
+    ``X-Opencode-Directory`` — not the original symlink path — binding the
+    access to the object the authorization decision was made on."""
+    allowed_root = tmp_path / "allowed_root"
+    real_dir = allowed_root / "real"
+    allowed_root.mkdir()
+    real_dir.mkdir()
+    os.symlink(real_dir, allowed_root / "link")
+    app, seen = _build_file_app(
+        _settings(directory_allowlist=[str(allowed_root)]), _file_ok
+    )
+    async with _client(app) as client:
+        response = await client.get(
+            "/slimapi/file?v=3&path=foo&directory=" + str(allowed_root / "link"),
+            headers={"Accept-Encoding": "identity"},
+        )
+    assert response.status_code == 200
+    assert len(seen) == 1
+    forwarded = seen[0].headers["x-opencode-directory"]
+    assert forwarded == str(real_dir)
+    assert forwarded != str(allowed_root / "link")
+
+
+async def test_relative_directory_frame_dropped_when_allowlist_set(
+    tmp_path, monkeypatch
+):
+    """sub-2 at the SSE layer: a relative-directory frame is dropped +
+    counted under a set allowlist (same fail-closed semantics as the
+    routes), even when the sidecar CWD sits inside the allowed root."""
+    allowed_root = tmp_path / "allowed_root"
+    allowed_root.mkdir()
+    monkeypatch.chdir(allowed_root)
+    hub = GlobalHub(client=None, directory_allowlist=[str(allowed_root)])
+    subscriber = Subscriber()
+    hub.subscribers.add(subscriber)
+    try:
+        hub.publish(_event("sessions/sub"))
+        hub.flush()
+        assert subscriber.queue.qsize() == 0
+        assert hub.allowlist_dropped_events == 1
+    finally:
+        await _close_hub(hub)
