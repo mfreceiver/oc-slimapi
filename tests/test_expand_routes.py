@@ -45,6 +45,7 @@ observable.
 from __future__ import annotations
 
 import asyncio
+import copy
 from contextlib import asynccontextmanager
 
 import httpx
@@ -614,6 +615,17 @@ async def test_extract_part_state_attachments(upstream_factory):
     assert _json(r)["data"] == {"attachments": [{"path": "/tmp/a"}]}
 
 
+async def test_extract_part_state_attachments_empty_object_element(upstream_factory):
+    """rev-sgpt M2 positive: an attachments array whose elements are objects
+    passes even when the objects are empty (object[] allows any object)."""
+    message = _wrap([{"id": "p", "type": "tool", "messageID": "m1",
+                      "state": {"attachments": [{}]}}])
+    async with _test_client(upstream_factory, _message_handler(message)) as client:
+        r = await _expand_part(client, "part_state_attachments", "p")
+    assert r.status_code == 200
+    assert _json(r)["data"] == {"attachments": [{}]}
+
+
 async def test_extract_part_url(upstream_factory):
     async with _test_client(upstream_factory, _message_handler(FULL_MESSAGE)) as client:
         r = await _expand_part(client, "part_url", "p_file")
@@ -665,6 +677,10 @@ def _wrap(parts: list) -> dict:
     # attachments non-array
     ("part_state_attachments", "p", [{"id": "p", "type": "tool", "messageID": "m1",
                                       "state": {"attachments": {}}}]),
+    # attachments array with non-object elements (rev-sgpt M2: the frozen
+    # schema is object[] — every element must be an object)
+    ("part_state_attachments", "p", [{"id": "p", "type": "tool", "messageID": "m1",
+                                      "state": {"attachments": ["bad", 123]}}]),
     # metadata non-object
     ("part_state_metadata_full", "p", [{"id": "p", "type": "tool", "messageID": "m1",
                                         "state": {"metadata": "x"}}]),
@@ -1295,12 +1311,24 @@ async def test_merged_step_only_message_same_message_intersection(upstream_facto
 # ---------------------------------------------------------------------------
 
 async def test_full_route_byte_identical_after_wiring(upstream_factory):
-    """The sid wiring must not perturb direct /full output: two identical
-    requests return byte-identical bodies."""
+    """/full/{mid} output equals the upstream body modulo the LSP
+    ``state.metadata.diagnostics`` scrub — the sid wiring must not perturb
+    direct /full (rev-sgpt m2: byte-locks the projection itself, not just
+    request determinism)."""
+    expected = copy.deepcopy(FULL_MESSAGE)
+    for part in expected["parts"]:
+        state = part.get("state")
+        if isinstance(state, dict):
+            metadata = state.get("metadata")
+            if isinstance(metadata, dict):
+                metadata.pop("diagnostics", None)
+    expected_bytes = orjson.dumps(expected)
+
     async with _test_client(upstream_factory, _message_handler(FULL_MESSAGE)) as client:
         r1 = await client.get("/slimapi/messages/s1/full/m1", headers=HDR)
         r2 = await client.get("/slimapi/messages/s1/full/m1", headers=HDR)
     assert r1.status_code == 200
     assert r2.status_code == 200
+    assert r1.content == expected_bytes  # upstream body minus diagnostics
     assert r1.content == r2.content
     assert _json(r1)["info"]["id"] == "m1"

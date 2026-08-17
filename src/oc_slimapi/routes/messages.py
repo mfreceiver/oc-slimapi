@@ -1380,7 +1380,10 @@ def _extract_part_state_metadata_full(_message: dict, part: dict) -> dict:
 
 
 def _extract_part_state_attachments(_message: dict, part: dict) -> dict:
-    """state.attachments → {attachments: object[]|null}; non-array → 502."""
+    """state.attachments → {attachments: object[]|null}; non-array or a
+    non-object element → 502 (design-expand §3.3 frozen schema: the array
+    shape is object[] — each element must be an object, element-level
+    validation mirrors the other nested-type checks, rev-sgpt M2)."""
     state = _expand_state(part)
     if state is None:
         return {"attachments": None}
@@ -1389,6 +1392,8 @@ def _extract_part_state_attachments(_message: dict, part: dict) -> dict:
         return {"attachments": None}
     if not isinstance(value, list):
         _expand_shape_error()
+    if not all(isinstance(item, dict) for item in value):
+        _expand_shape_error()  # every element must be an object
     return {"attachments": value}
 
 
