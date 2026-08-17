@@ -1065,8 +1065,8 @@ async def test_merged_placeholder_first_ref_never_displaces(upstream_factory):
                      "text": ""}]}
     ref = {"info": {"id": "m_ref", "role": "assistant",
                     "time": {"created": 2, "updated": 2}},
-           "parts": [{"id": "p_long", "type": "text", "messageID": "m_ref",
-                      "text": "x" * 3000}]}  # > 2048 threshold → text:null + expandRefs
+           "parts": [{"id": "p_long", "type": "reasoning", "messageID": "m_ref",
+                      "text": "x" * 3000}]}  # > 2048 → text:null + part_reasoning ref
     fulls: list[str] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -1091,7 +1091,7 @@ async def test_merged_placeholder_first_ref_never_displaces(upstream_factory):
     ref_out = items[1]
     ref_part = ref_out["parts"][0]
     assert ref_part["text"] is None
-    assert ref_part["expandRefs"][0]["category"] == "part_text"
+    assert ref_part["expandRefs"][0]["category"] == "part_reasoning"
 
 
 async def test_merged_long_text_restored_in_budget(upstream_factory):
@@ -1103,7 +1103,7 @@ async def test_merged_long_text_restored_in_budget(upstream_factory):
                      "text": ""}]}
     ref = {"info": {"id": "m_ref", "role": "assistant",
                     "time": {"created": 2, "updated": 2}},
-           "parts": [{"id": "p_long", "type": "text", "messageID": "m_ref",
+           "parts": [{"id": "p_long", "type": "reasoning", "messageID": "m_ref",
                       "text": "x" * 3000}]}
     fulls: list[str] = []
 
@@ -1134,7 +1134,7 @@ async def test_merged_over_budget_keeps_skeleton(upstream_factory):
                      "text": ""}]}
     ref = {"info": {"id": "m_ref", "role": "assistant",
                     "time": {"created": 2, "updated": 2}},
-           "parts": [{"id": "p_long", "type": "text", "messageID": "m_ref",
+           "parts": [{"id": "p_long", "type": "reasoning", "messageID": "m_ref",
                       "text": "y" * 3000}]}
     fulls: list[str] = []
 
@@ -1156,7 +1156,7 @@ async def test_merged_over_budget_keeps_skeleton(upstream_factory):
     assert len(fulls) <= 2
     ref_out = items[1]
     assert ref_out["parts"][0]["text"] is None
-    assert ref_out["parts"][0]["expandRefs"][0]["category"] == "part_text"
+    assert ref_out["parts"][0]["expandRefs"][0]["category"] == "part_reasoning"
 
 
 async def test_merged_diffs_stay_null_with_expand_refs(upstream_factory):

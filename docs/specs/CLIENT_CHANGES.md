@@ -6,6 +6,10 @@
 
 # ocdroid 客户端改动清单（仅文档，不修改 ocdroid）
 
+## text 正文永远全量内联（3.2.0 — 包版本 minor，wire 仍 v3，2026-08-17）
+
+> **放宽性变更，客户端零必改**：sidecar skeleton 投影中 `TextPart.text` 不再有任何字节阈值——**无论 UTF-8 字节数多少一律原样内联**，不再出现 `text:null + omitted + hasFull + part_text ref` 形态的 text part（3.1.x 曾按 >2048 折叠）。`ReasoningPart.text`（>2048 折叠为 `part_reasoning`）与其余折叠类目（tool state 5 类、`part_url`/`part_source`/`part_snapshot`/`info_summary_diffs`/`compaction_full`）**全部维持 3.1.0 规则不变**。expand 12 类目端点全部保留（`part_text` 端点留存，服务历史缓存响应与降级场景）。对已按 3.1.0 容忍/展开适配的客户端：全量内联是折叠的超集，双形态（3.1.x / 3.2.0）均正常。skeleton 字节变化 → `contentFingerprint`/ETag 自动失效旧缓存。
+
 ## expand 片段端点与 skeleton 投影缩减（3.1.0 — 包版本 minor（major 与 wire 协议版本绑定，wire 仍 v3 未 bump，不发 major）；wire 仍 v3，2026-08-17）
 
 > **减性 + 加性并存**：wire 版本**不变**（仍 v3、`?v=3` selector 不变）——skeleton 投影缩减（**减性**）按 owner 决策直接在 v3 视图内生效，expand 片段端点（**加性**）配套补齐。设计稿 `docs/specs/design-expand.md` v5；**权威 wire 见 `docs/specs/v3-contract.md` §4a/§4b**。**部署顺序（关键）**：ocdroid 先发容忍版 → sidecar 3.1.0 后装（见下兼容矩阵）。
@@ -14,7 +18,7 @@
 
 - **哪些字段会变 `null`（+ `omitted` + `hasFull` + `expandRefs`）**：
   - `info.summary.diffs` → **恒 `null`** + 消息级 `info.expandRefs[0].category="info_summary_diffs"`（非空 list 才 ref；`/full/{mid}` 照旧全量，语义不变）。
-  - `text`/`reasoning` part：UTF-8 编码字节 **>2048** → 整字段 `null` + `omitted:["text"]` + `hasFull:true` + part 级 `expandRefs`（`part_text`/`part_reasoning`）——**整字段折叠，从不半截断**；≤2048 原样内联。
+  - `text`/`reasoning` part：UTF-8 编码字节 **>2048** → 整字段 `null` + `omitted:["text"]` + `hasFull:true` + part 级 `expandRefs`（`part_text`/`part_reasoning`）——**整字段折叠，从不半截断**；≤2048 原样内联。（**[3.2.0] 起本条的 text 部分已废止**——`TextPart.text` 永远内联；reasoning 部分仍有效。）
   - `tool` state：`input`（`object|null`）/`metadata`（`object|null`）/`attachments`（`object[]|null`）折叠 → refs `part_state_input_full`/`part_state_metadata_full`/`part_state_attachments`；`output`/`error` 按现状 4 KB 阈值省略并补 refs。
   - `file` `url`/`source`、`step-start`/`step-finish` `snapshot` 折叠 → refs `part_url`/`part_source`/`part_snapshot`。
   - `patch` part：`files` 为 `string[]` **原样保留 verbatim**（P0 修复），永不折叠、无 ref。

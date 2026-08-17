@@ -77,13 +77,14 @@ GET /slimapi/versions → 200
 3. **`GET /slimapi/sessions/status`（v=3）**：不 envelope 化（map，无分页头）；v3 差异仅 §5。
 4. 边界：错误响应不 envelope；304 无 body（§6.4）；`?v=3` 与其他 query 任意组合。
 
-## §4a 消息投影缩减与 expandRefs [冻结]（[3.1.0]；设计权威 `docs/specs/design-expand.md` §4/§5）
+## §4a 消息投影缩减与 expandRefs [冻结]（[3.1.0]；[3.2.0] 修订 `TextPart.text` 规则；设计权威 `docs/specs/design-expand.md` §4/§5）
 
 **范围**：`GET /slimapi/messages/{sid}`（缺省 skeleton 与 `mode=merged`）默认投影的缩减语义。原则：skeleton 内字段**整字段保留或整字段省略，不做部分截断**；多字节按 UTF-8 编码字节计数。省略字段（除 §2.3 /full-only 清单）必携带 `expandRefs`。
 
 1. **阈值与省略规则**：
    - `info.summary.diffs`：**总是省略** → `null` + 消息级 `info.expandRefs`（`category:"info_summary_diffs"`）；summary 其余 key 保留；仅省略时刻非 null/非空 list 才生成 ref。
-   - `TextPart.text` / `ReasoningPart.text`：UTF-8 编码字节 > **2048** → 整字段 `null` + `omitted:["text"]` + `hasFull:true` + part 级 `expandRefs`（`part_text` / `part_reasoning`）；≤ 2048 原样内联。
+   - `TextPart.text`：**[3.2.0] 起永远全量内联，不折叠、无阈值**（owner 决策 2026-08-17：对话正文是 chat 核心浏览内容，无论字节数一律呈现；≤3.1.x 曾按 >2048 折叠为 `part_text`）。
+   - `ReasoningPart.text`：UTF-8 编码字节 > **2048** → 整字段 `null` + `omitted:["text"]` + `hasFull:true` + part 级 `expandRefs`（`part_reasoning`）；≤ 2048 原样内联（规则不变）。
    - `ToolPart.state.output/error`：现状阈值（4 KB/字段、16 KB/消息）不变，省略时新增 `expandRefs`（`part_state_output` / `part_state_error`）。
    - `tool state.input`/`metadata`/`attachments`（`object|null` / `object|null` / `object[]|null`）、`file.url`/`source`、`step-start`/`step-finish` 的 `snapshot`、compaction 整体超限：按 §4b.2 映射生成 `expandRefs`。
    - **/full-only**（省略但不生成 refs，显式穷举，design-expand §2.3）：`state.structured/result/raw`、tool input 非白名单单个 key、step-finish `reason/cost/tokens`、reasoning `metadata/time`、text `synthetic/ignored/time`、未知上游字段、`omitted:["*"]`（compaction 超限除外）、`thin_placeholder` 的 `omitted:["parts"]`。
@@ -101,7 +102,7 @@ GET /slimapi/versions → 200
    | category | 级别 | 适用 part 类型 | 返回 `data` |
    |---|---|---|---|
    | `info_summary_diffs` | 消息级 | — | `{diffs: <FileDiff[]> \| null}`（`info.summary.diffs`） |
-   | `part_text` | part | text | `{text: string \| null}`（`part.text`） |
+   | `part_text` | part | text | `{text: string \| null}`（`part.text`）。**[3.2.0] 起 skeleton 不再产生 `part_text` ref**（text 永远内联）；端点保留，服务 3.1.x 时代历史响应与降级场景 |
    | `part_reasoning` | part | reasoning | `{text: string \| null}`（`part.text`） |
    | `part_state_output` | part | tool | `{output: string \| null}`（`state.output`） |
    | `part_state_error` | part | tool | `{error: string \| null}`（`state.error`） |

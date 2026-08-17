@@ -191,8 +191,8 @@ in-flight 合并 + 1 秒成功结果 grace，非缓存（singleflight.py:15-23, 
 | 字段 | 规则 | 阈值 |
 |---|---|---|
 | `info.summary.diffs` | **总是省略** → `null` + 消息级 expandRefs；summary 其余 key 保留 | 无条件 |
-| `TextPart.text` | UTF-8 编码字节 > 阈值 → 省略为 `null` + expandRefs；否则完整保留 | `text_inline_max_bytes=2048` |
-| `ReasoningPart.text` | 同上 | `reasoning_inline_max_bytes=2048` |
+| `TextPart.text` | ~~UTF-8 编码字节 > 阈值 → 省略为 `null` + expandRefs；否则完整保留~~ **[3.2.0] 已废止：永远全量内联，不折叠**（owner 决策 2026-08-17，对话正文不缩减；wire 见 v3-contract.md §4a.1） | ~~`text_inline_max_bytes=2048`~~ 无 |
+| `ReasoningPart.text` | 同上（>阈值省略为 `null` + expandRefs）——**仍有效** | `reasoning_inline_max_bytes=2048` |
 | `ToolPart.state.output/error` | 现状不变（4 KB/字段、16 KB/消息），省略时新增 expandRefs | 现状 |
 | 其余（tool input/metadata/attachments、file url/source、snapshot、compaction） | 现状投影不变，按 §5.3 映射生成 expandRefs | 现状 |
 

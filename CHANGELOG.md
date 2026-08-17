@@ -26,6 +26,18 @@ ocdroid 对接时：
 
 ---
 
+## [3.2.0] - 2026-08-17 — text 正文永远全量内联（包版本 minor；wire 版本**不变**，仍 v3——放宽性投影变更，ocdroid 零必改点）
+
+> 背景：3.1.0 的 text 折叠 × 客户端未适配曾致折叠消息渲染空壳（联查实锤 msg_00e76e3fe，text=1245 字符/2054 UTF-8 字节，超阈仅 6 字节）。owner 决策 2026-08-17：**对话正文是 chat 核心浏览内容，无论其正文多少都需要呈现和查看，不应当缩减**。**ocdroid 必改点：无**——全量内联是 3.1.x 折叠形态的超集；已按 3.1.0 容忍/展开适配的客户端双形态（3.1.x / 3.2.0）均正常。
+
+### Changed（wire 行为变更：skeleton 投影放宽——wire 仍 v3，无新 selector）
+
+- **`GET /slimapi/messages/{sid}` 与 merged 模式 skeleton 投影**：`TextPart.text` **永远全量内联**——彻底移除 >2048 UTF-8 字节折叠路径，不再产生 `text:null + omitted + hasFull + part_text ref` 形态的 text part（任意字节数原样内联，含无 part id / 空 part id）。
+- **不变项（显式列举）**：`ReasoningPart.text`（>2048 折叠为 `part_reasoning`）维持 3.1.0 规则；tool state 5 类、`part_url`/`part_source`/`part_snapshot`/`info_summary_diffs`/`compaction_full` 折叠规则全部不变；expand 12 类目端点**全部保留**（`part_text` 端点留存，服务 3.1.x 时代历史响应与降级场景）。
+- **缓存**：skeleton 字节变化 → `contentFingerprint` 与列表 ETag 自动失效旧缓存（内容哈希语义，无需客户端动作）。
+
+---
+
 ## [3.1.0] - 2026-08-17 — expand 片段端点 + skeleton 投影缩减（包版本 minor（major 与 wire 协议版本绑定，wire 仍 v3 未 bump，不发 major）；wire 版本**不变**，仍 v3——缩减按 owner 决策收进 v3 视图，无 `?v=4`，ocdroid 同步发版承接）
 
 > 设计稿：`docs/specs/design-expand.md`（v5，rev-sgpt R4 APPROVED WITH CHANGES 已采纳）。**ocdroid 必改点**：渲染 skeleton 列表时按 `omitted`/`hasFull`/`expandRefs` 处理被折叠字段，按需经 expand 端点拉取；`text` 整字段折叠为 `null`（从不半截断），超大内容改走 `part_text`/`part_reasoning` 拉取。

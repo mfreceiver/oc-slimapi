@@ -7,7 +7,6 @@ from oc_slimapi.config import settings as _skel_config
 from oc_slimapi.skeleton import (
     PLACEHOLDER_TEXT,
     REASONING_INLINE_MAX_BYTES,
-    TEXT_INLINE_MAX_BYTES,
     _compute_diffstats,
     _compute_diffstats_from_files,
     _field_byte_size,
@@ -39,16 +38,12 @@ def test_skeleton_preserves_message_and_part_order_and_text_verbatim():
     assert [item["info"]["id"] for item in result] == [
         item["info"]["id"] for item in source
     ]
-    # expand §4.1: text > 2 KiB UTF-8 bytes is projected as text:null +
-    # expandRefs. Only inline (≤ threshold) text parts are compared verbatim.
+    # [3.2.0] TextPart.text is always inlined verbatim — no size threshold.
     result_text = [
         part for part in parts(result, "text")
-        if not part["id"].startswith("thin_placeholder_") and part.get("text") is not None
+        if not part["id"].startswith("thin_placeholder_")
     ]
-    source_text = [
-        part for part in parts(source, "text")
-        if len(part["text"].encode("utf-8")) <= TEXT_INLINE_MAX_BYTES
-    ]
+    source_text = [part for part in parts(source, "text")]
     assert [part["id"] for part in result_text] == [
         part["id"] for part in source_text
     ]

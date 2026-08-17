@@ -71,9 +71,13 @@ TOOL_METADATA_KEYS = {"sessionId", "sessionID", "description", "agent", "diffSta
 FILE_URL_LIMIT = 8 * 1024
 COMPACTION_PART_LIMIT = 64 * 1024
 
-# Expand design v5 §4.1: inline caps for text/reasoning, measured in UTF-8
-# encoded bytes. A part whose text exceeds the cap is projected as
-# ``text: null`` + an ``expandRefs`` entry — never partially truncated.
+# Expand design v5 §4.1: inline caps, measured in UTF-8 encoded bytes. A
+# reasoning part whose text exceeds the cap is projected as ``text: null`` +
+# an ``expandRefs`` entry — never partially truncated.
+# [3.2.0] TextPart.text is no longer capped (always inlined verbatim);
+# TEXT_INLINE_MAX_BYTES stays as the historical 3.1.x contract value — kept
+# for expand-endpoint documentation and as the test baseline for building
+# over-cap samples.
 TEXT_INLINE_MAX_BYTES = 2048
 REASONING_INLINE_MAX_BYTES = 2048
 
@@ -491,23 +495,15 @@ def skeleton_part(part: dict[str, Any], *, budget: dict[str, int] | None = None,
     part = {key: value for key, value in part.items() if key != "expandRefs"}
     part_type = part.get("type")
     if part_type == "text":
-        # §2.3: synthetic/ignored/time are /full-only — omitted, never refs.
-        # Only {id, type, text} (+ messageID/sessionID) are picked. n1: the
-        # threshold is evaluated on the ORIGINAL part BEFORE _pick — when text
-        # is oversized it is never deep-copied (no throwaway allocation).
-        exceeds_text = _utf8_bytes_exceeds(part.get("text"), TEXT_INLINE_MAX_BYTES)
-        copied = _pick(part, PART_IDS if exceeds_text else PART_IDS | {"text"})
+        # [3.2.0] TextPart.text is ALWAYS inlined verbatim, regardless of
+        # size — the conversation body is the primary browsing surface and is
+        # never reduced (owner decision 2026-08-17). The part_text expand
+        # category is no longer produced by this projection (the endpoint
+        # stays for historical 3.1.x responses). §2.3 still holds:
+        # synthetic/ignored/time are /full-only — omitted, never refs.
+        copied = _pick(part, PART_IDS | {"text"})
         omitted = [key for key in part if key not in PART_IDS | {"text"}]
-        refs: list[tuple[str, str]] = []
-        if exceeds_text:
-            # §4.1: whole-field omission — text becomes null, never truncated.
-            copied["text"] = None
-            omitted.append("text")
-            # M3: a part-level ref requires a non-empty part id — without one
-            # the reduction still applies but no (unusable) ref is emitted.
-            if copied.get("id"):
-                refs.append(("part_text", copied["id"]))
-        return _emit_expand_refs(_mark(copied, omitted), refs, sid)
+        return _emit_expand_refs(_mark(copied, omitted), [], sid)
     if part_type == "reasoning":
         # n1: threshold evaluated on the ORIGINAL text BEFORE _pick — an
         # oversized text is never deep-copied.
