@@ -6,9 +6,9 @@
 
 # ocdroid 客户端改动清单（仅文档，不修改 ocdroid）
 
-## expand 片段端点与 skeleton 投影缩减（4.0.0 — 包版本 MAJOR；wire 仍 v3，2026-08-17）
+## expand 片段端点与 skeleton 投影缩减（3.1.0 — 包版本 minor（major 与 wire 协议版本绑定，wire 仍 v3 未 bump，不发 major）；wire 仍 v3，2026-08-17）
 
-> **减性 + 加性并存**：wire 版本**不变**（仍 v3、`?v=3` selector 不变）——skeleton 投影缩减（**减性**）按 owner 决策直接在 v3 视图内生效，expand 片段端点（**加性**）配套补齐。设计稿 `docs/specs/design-expand.md` v5；**权威 wire 见 `docs/specs/v3-contract.md` §4a/§4b**。**部署顺序（关键）**：ocdroid 先发容忍版 → sidecar 4.0.0 后装（见下兼容矩阵）。
+> **减性 + 加性并存**：wire 版本**不变**（仍 v3、`?v=3` selector 不变）——skeleton 投影缩减（**减性**）按 owner 决策直接在 v3 视图内生效，expand 片段端点（**加性**）配套补齐。设计稿 `docs/specs/design-expand.md` v5；**权威 wire 见 `docs/specs/v3-contract.md` §4a/§4b**。**部署顺序（关键）**：ocdroid 先发容忍版 → sidecar 3.1.0 后装（见下兼容矩阵）。
 
 ### 投影变更影响（新 sidecar 下 `/slimapi/messages/{sid}` 的 skeleton）
 
@@ -31,9 +31,9 @@
 ### 部署顺序与兼容矩阵（2×2）
 
 1. **ocdroid 先发**容忍版：对旧 sidecar 零改动（现状全文渲染）；对新 sidecar 的折叠字段按 `expandRefs` 展开或显示"查看全文"（`/full` 不变）。
-2. **sidecar 4.0.0 后装**：`?v=3` selector 不变、wire 不 bump；唯一消费方已具备容忍/渲染能力。
+2. **sidecar 3.1.0 后装**：`?v=3` selector 不变、wire 不 bump；唯一消费方已具备容忍/渲染能力。
 
-| 客户端 \ sidecar | 旧 sidecar | 新 sidecar（4.0.0+） |
+| 客户端 \ sidecar | 旧 sidecar | 新 sidecar（3.1.0+） |
 |---|---|---|
 | **旧客户端** | 基线：现状全文渲染（不受影响） | **已知减性影响（owner 接受）**：长 text/reasoning 显示为空 + "查看全文"仍可用（`/full` 不变）；diffs 缺失不影响列表基础功能 |
 | **新客户端** | 无 `expandRefs`/expand 路由 → 现状全文渲染；expand 请求 404 → 回退 `/full` | 完整 expand 体验 |

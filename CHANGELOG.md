@@ -26,7 +26,7 @@ ocdroid 对接时：
 
 ---
 
-## [4.0.0] - 2026-08-17 — expand 片段端点 + skeleton 投影缩减（包版本 MAJOR；wire 版本**不变**，仍 v3——缩减按 owner 决策收进 v3 视图，无 `?v=4`，ocdroid 同步发版承接）
+## [3.1.0] - 2026-08-17 — expand 片段端点 + skeleton 投影缩减（包版本 minor（major 与 wire 协议版本绑定，wire 仍 v3 未 bump，不发 major）；wire 版本**不变**，仍 v3——缩减按 owner 决策收进 v3 视图，无 `?v=4`，ocdroid 同步发版承接）
 
 > 设计稿：`docs/specs/design-expand.md`（v5，rev-sgpt R4 APPROVED WITH CHANGES 已采纳）。**ocdroid 必改点**：渲染 skeleton 列表时按 `omitted`/`hasFull`/`expandRefs` 处理被折叠字段，按需经 expand 端点拉取；`text` 整字段折叠为 `null`（从不半截断），超大内容改走 `part_text`/`part_reasoning` 拉取。
 

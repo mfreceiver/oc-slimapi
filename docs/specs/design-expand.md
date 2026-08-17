@@ -67,7 +67,7 @@
 
 - **决策**：`summary.diffs` 置 null、`text`/`reasoning` 超 2 KB 省略，在 **wire v3 内直接缩减默认投影**。不引入 opt-in mode、不升 wire 版本。
 - **理由**：ocdroid 是 `/slimapi/messages` 唯一消费方，同机部署、同运营者、可控发版窗口。缩减字段均有 expand 补齐通道，`/full` 语义不变。
-- **义务**：规范性内容并入 `v3-contract.md`（文档修订注记，wire selector 不变）；`CHANGELOG.md` ⚠️；包版本 **major**（semver/wire 双轨，AGENTS.md:75-77）；`CLIENT_CHANGES.md`；部署时序 §10。
+- **义务**：规范性内容并入 `v3-contract.md`（文档修订注记，wire selector 不变）；`CHANGELOG.md` ⚠️；包版本 minor（owner 2026-08-17 决策：major 与 wire 协议版本绑定，wire 未 bump 不发 major）；`CLIENT_CHANGES.md`；部署时序 §10。
 
 ### 1.3 目标
 
@@ -330,7 +330,7 @@ sidecar 专属键 **`expandRefs`**：
 **时序（同运营者、同机、两仓可控）**：
 
 1. **ocdroid 先发**：容忍旧 sidecar——无 `expandRefs` 按现状渲染全文；expand 404 → 回退 /full；
-2. **sidecar 后发（包版本 major；wire 仍 v=3）**：缩减生效，唯一消费方已具备渲染能力；
+2. **sidecar 后发（包版本 minor；wire 仍 v=3）**：缩减生效，唯一消费方已具备渲染能力；
 3. 窗口期任意组合无功能性破坏（减性影响 owner 接受）。
 
 | 客户端 \ sidecar | 旧 sidecar | 新 sidecar |
@@ -377,7 +377,7 @@ sidecar 专属键 **`expandRefs`**：
 2. **独立端点而非 /full?fields=** — /full 保持"完整消息"语义（测试锁定）；
 3. **服务端生成引用** — 投影代码知道省略了什么；
 4. **显式 mid/partID** — 上游 API 必需 messageID，利于日志/对账；
-5. **wire v3 内缩减（owner 决策）** — 唯一消费方可控发版；规范性内容并入契约本体（含 §10 carve-out）；包版本 major；客户端先行（§10）；
+5. **wire v3 内缩减（owner 决策）** — 唯一消费方可控发版；规范性内容并入契约本体（含 §10 carve-out）；包版本 minor；客户端先行（§10）；
 6. **整字段省略而非截断** — 延续 skeleton 原则；
 7. **2 KB 阈值** — 实测分布下保留多数内联、砍掉长尾；
 8. **patch files 原样保留 + 存量 bug 修复** — `string[]` 无省流价值；
