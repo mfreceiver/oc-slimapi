@@ -141,11 +141,11 @@ v4 sessions **无 ETag/Vary/304**（v2.2 行 254 §6）；v3 全表面 ETag 原�
 - 承诺：确定性排序（§4.1 冻结）；**不承诺**并发更新零重复零遗漏（跨边界重见为预期行为，契约明示）。
 - 指纹不匹配当前请求参数 → 400 `invalid_cursor`（提示重开首屏）。
 - keyset 下推 SQL（`(time_updated, id) < (t, i)` 复合谓词）；降级路径遇 cursor 一律 503（§4.2）。
-- search-hash = search 规范化形式（trim+LIKE 转义后）的稳定 hash；allowlist-rev = 非空 allowlist 集合修订版本——**同一输入两次执行 hash 相同**（确定性断言，§11.6）。
+- search-hash = hash(normalized_search)（**normalized_search = trim(raw) 为四个消费点的唯一输入源**：SQL pattern 构造 / has_wildcard 判定 / 指纹 hash / **HTTP 降级上游 query**——降级路径同样传 normalized，禁 DB 查 trim 值而上游收 raw；hash 输入 = trim 后、LIKE 转义**前**的串，sha256 截断 8-16 hex）；allowlist-rev = 非空 allowlist 集合修订版本——**同一输入两次执行 hash 相同**（确定性断言，§11.6）。
 
 ### §4.6 search / allowlist SQL 语义（B0-6e 冻结，design-v4-dbaux §9 同源）
 
-- search：DB 路径 `title LIKE :pattern ESCAPE '\'`，pattern = `%` + 用户串（`%`/`_`/`\` 以 `\` 前缀字面转义）+ `%`——**字面子串匹配**；规范化 hash 进指纹。**降级（DB 不可用）**：search 含 `%`/`_`/`\` 任一字符 → 503（不可等价表达，§4.2）；纯字面子串 → 上游透传等价（上游对无通配字符输入同字面子串）。
+- search：输入先规范化 `normalized_search = trim(raw)`（唯一输入源，§4.5）；DB 路径 `title LIKE :pattern ESCAPE '\'`，pattern = `%` + LIKE 字面转义（normalized_search）+ `%`——**字面子串匹配**；规范化 hash 进指纹。**降级（DB 不可用）**：has_wildcard(normalized_search) 含 `%`/`_`/`\` 任一字符 → 503（不可等价表达，§4.2）；纯字面子串 → 上游透传等价（**传 normalized_search**，上游对无通配字符输入同字面子串）。
 - allowlist 子树谓词（非空时，**二进制前缀，弃 LIKE**——实测 SQLite LIKE 对 ASCII 大小写不敏感、`=` 二进制敏感，LIKE 通配规则不可用于安全边界）：
   ```sql
   (s.directory = :d_raw
@@ -201,6 +201,8 @@ v3 原样（§4.4 已含 v4 差异：v4 sessions 无 ETag）。
 
 - 有界重放日志（新组件，count/bytes/TTL 三维上限，环形覆盖）——现 GlobalHub pending（250ms debounce）与 tombstone 队列**不是** replay log；与既有 token 域重放队列（cap 1000/TTL 24h）并存不混用。
 - `Last-Event-ID` 重连：缺口在日志窗口内 → 补发 replay 帧；ID 过期（早于窗口）→ 发 resync 提示帧（客户端全量对齐）；**epoch 归类（冻结，四类拆分）**：旧 epoch（格式合法、epoch ≠ 当前——随机 nonce 无序不比较大小，即进程重启前世界）→ `resync{reason:"epoch_changed"}`；future（同 epoch 且 seq > 已发布 max）→ 忽略 + 重置（按首连）；格式非法 / 跨端点域 / 跨 sid 域 → 忽略 + 重置。
+- **Last-Event-ID 分类优先级（冻结，严格短路序）**：①完整语法校验（域标签 + epoch 16hex + seq 十进制）→ ②端点标签与路径 sid 校验（`g:` 只属 `/events`；`t:` 只属 `/stream` 且 sid 匹配路径）→ ③epoch 比对（仅对通过 ② 的正确域 ID）→ ④seq/窗口比对（仅同 epoch）。组合输入按最先命中者短路（如 `t:<sid>:<旧epoch>:5` 到 `/events` = 跨端点域 → 忽略重置，不触发 epoch_changed）。
+- **上游断连恢复（触发条件冻结）**：sidecar↔上游 `/global/event` 断开期间 sidecar 观察不到上游事件（replay log 不含缺口帧——日志只录 sidecar 已发布帧）→ 恢复时对全部存量订阅者 fanout `resync{reason:"reconnect_no_replay"}`（无 id）→ 恢复后新帧（seq 继续单调不重置；**epoch 不变**——sidecar 未重启）；token 域另清空该 sid pending live 缓冲（v3 现行为延续，`tokenstream/hub.py:1896-1900` / `global_hub.py:825` 锚点）；客户端按 v3 语义 HTTP 全量对齐。
 - gap 处理：区分「日志逐出」（→ resync）vs 合法缺席（单一/per-sid 域下不存在跨域合法空洞）。**snapshot 不是服务端帧**——resync 后客户端自行 HTTP 全量对齐（全局域如 `/slimapi/sessions` 首屏、token 域重拉消息投影），服务端只发 meta → resync → 新帧。逐出-发布并发的边界 gap 误判风险为实现期待验证项（design-v4-sse-replay.md §5 待裁决 5，可降级防御分支，不影响 wire 语义）。
 - 背压：溢出帧**入**重放日志（日志记录「已发布帧」而非「已送达帧」）；订阅端溢出断连 → 重连走 Last-Event-ID 重放。
 - **resync 帧 reason 值域（v4 冻结，加性扩展）**：`epoch_changed` | `replay_expired` | `replay_gap` | `reconnect_no_replay`（既有）；token 流 tombstone（消息已撤销）在 replay 时**照常消耗其 seq 并以 `message.removed` 轻量撤销帧回放**（既有帧形 `tokenstream/frames.py:137-151` = `event: message.removed` + `{sessionID, messageID}`；保留 `id:`，维持 ID 序列无空洞）。
@@ -290,7 +292,7 @@ v4 sessions 归入 sessions 桶既有记账；降级路径请求带 degraded 标
 | 11.7 | WAL 陈旧读 | ro-vs-immutable 3 case（已进 CI：`tests/test_wal_staleness.py`） | **B0 已落地** |
 | 11.8 | 等价性锚定 | DB 投影 ≡ 权威源（真实 opencode 进程 / 版本标记 golden，S-B03 禁 mock 自证）× {行集/字段语义/排序/complete} | B3a-B2（设计定稿见 design-v4-dbaux §10 / design-v4-equivalence-anchor） |
 | 11.9 | EQP 全矩阵 | 48 组合 planner 特征断言（SCAN/SEARCH、TEMP B-TREE、行数；非全文案） | B3a-B2（脚本 `scripts/eqp_matrix.py` **B0 已落地**） |
-| 11.10 | SSE 重放 | 重放/缺口/过期/重启 epoch/背压/重连/tokens=1 400/ID 无倒退断言（协议矩阵用例表见 design-v4-sse-replay.md） | B3b |
+| 11.10 | SSE 重放 | 重放/缺口/过期/重启 epoch/背压/重连/tokens=1 400/ID 无倒退断言/**上游断连恢复/组合输入优先级**（协议矩阵用例表 15 条 REPLAY 见 design-v4-sse-replay.md §4） | B3b |
 | 11.11 | DB schema 变更兼容 / 运行中迁移 | 上游升版列变更 → 门失败降级；运行中 inode swap | B3a-B1/B6 |
 | 11.12 | 冷启动 | P99 warmup 豁免；首查延迟 | B3a-B1 |
 

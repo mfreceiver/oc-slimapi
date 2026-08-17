@@ -254,7 +254,7 @@ v2.2 行 270：*"wire v4 第二刀：SSE id:/重放日志 + q/p 帧补全（若�
 
 | 任务 | 改动文件/模块 | 实现要点 | 验收标准 | 测试 |
 |---|---|---|---|---|
-| B3b-1 有界环形重放日志 | 新 `src/oc_slimapi/sse/replay_log.py` + `config.py`（上限参数段）+ `app.py`（装配段） | v4 新有状态组件（行 213 "+1"）：count/bytes/TTL 上限；进程 epoch + 单调 seq；全局流与 token 流**独立 ID 域**（行 153）；帧 ID 分配（业务帧/digest/meta 有；heartbeat 无）；与既有 tombstone 队列并存不混用（B0-3 设计落地） | 日志上限（count/bytes/TTL）生效；ID 单调 | 上限边界；epoch 重启；独立域隔离 |
+| B3b-1 有界环形重放日志 | 新 `src/oc_slimapi/sse/replay_log.py` + `config.py`（上限参数段）+ `app.py`（装配段） | v4 新有状态组件（行 213 "+1"）：count/bytes/TTL 上限；进程 epoch（随机 boot nonce）+ 单调 seq；全局流与 token 流**独立 ID 域**（域标签编入 ID，行 153）；帧 ID 分配（**业务帧/digest 有；meta/resync/heartbeat 无**——B0 rev-1 冻结，重连 meta 分配新 seq 会与 replay 旧 seq 倒退）；与既有 tombstone 队列并存不混用（B0-3 设计落地） | 日志上限（count/bytes/TTL）生效；ID 单调 | 上限边界；epoch 重启；独立域隔离 |
 | B3b-2 SSE id:/重放 | `src/oc_slimapi/routes/events.py`、`routes/token_stream.py`、`sse/global_hub.py`（产出路径） | **前提**：S-B01 ②③④ owner 终裁（B0 提案已上报）；①已裁（tokens=1 v4 = 400）。v4 端点发 `id:`（域标签语法 `g:<epoch>:<seq>` / `t:<sid>:<epoch>:<seq>`，epoch = 随机 boot nonce 非墙钟——B0 rev-2 冻结，见 design-v4-sse-replay §3）；`Last-Event-ID` 触发重放；expired/future/旧 epoch/gap 处理（**旧 epoch → resync{epoch_changed}；gap → 服务端仅发 meta→resync→新帧，snapshot 是客户端 HTTP 动作非服务端帧**）；**tokens=1 复用流已裁决 = v4 一律 400 `tokens_stream_retired_in_v4`**（§8.2，非二选一）；与 meta-first（meta 仍首帧）/背压/上游重连的顺序（行 153）；**v3 SSE 帧名帧形零变化**（行 153 冻结） | 重放协议全矩阵绿（14 条 REPLAY 用例）；ID 无倒退断言（同 epoch 同域内）；v3 SSE 零回归 | 重放矩阵：正常/缺口/过期/旧 epoch/future/非法/跨域/背压/重连；gap → resync 断言（+客户端 HTTP 全量对齐另行断言）；tokens=1 → 400 断言（B0-6f grep + REPLAY-009）；ID 单调（REPLAY-010/011，域标签隔离） |
 | B3b-3 q/p 帧补全 | `src/oc_slimapi/sse/global_hub.py`（q/p 直推路径）+ `v4-contract.md` §7 | **仅当 B0-4 核对结论 = 缺字段**（行 164, 270 "若需"）：question.asked / permission.asked 帧补全 properties 为完整对象（v4-only） | 补全后 `qpImmediateFull` 语义成立 | 帧补全用例（对照上游 schema） |
 | B3b-4 meta v4 扩展 | `src/oc_slimapi/routes/events.py`、`routes/token_stream.py` | `slimapi.meta` v4 additive 扩展：capabilities 摘要 + epoch/seq 基线字段（行 154）；v3 形状不动 | v3 meta 帧零变化；v4 扩展字段出现 | meta 双版本断言 |
@@ -502,7 +502,7 @@ v2.2 行 96-97, 100 定义的禁用链（**运维无需改代码**）：
 
 ---
 
-## 8. 开放问题（R2 重组：3 项待裁决 + 9 项已裁决/就地解决存档）
+## 8. 开放问题（R2 重组：3 项待裁决 + 12 项已裁决/就地解决存档——B0 批新增 3 项 owner 裁决存档）
 
 > 2026-08-17 核准（fixer-glm）：原 10 项经 v2.2 / v3-contract / src 事实核对重组——7 项可凭既有权威文本就地解决（§8.2 存档），3 项确需 owner / 三方评审裁决，另核准新发现 1 项契约冲突（最高优先级）。
 > **2026-08-17 R2（fixer-ds，双评审收敛）**：① §8.1 问题 1（B2×[3.2.0] 冲突）**已由 owner 裁决关闭**（TextPart.text 永不截取全量内联，400 码点废止）→ 移入 §8.2 存档；② §8.1 问题 4（sweep 组件账目）**随 v2.2 §5 修订闭合**（15→17 phase-aware，sweep 调度器 + DB-aux 生命周期独立计账）→ 移入 §8.2 存档，B6-3 按其复核；③ **新增问题 5（SSE 协议裁决门槛，S-B01，rev-sgpt 阻断）**——§8.1 待裁决项净剩 3 项。
@@ -518,7 +518,7 @@ v2.2 行 96-97, 100 定义的禁用链（**运维无需改代码**）：
    - ④ **两端点逐帧状态机**（**B0-3 设计提案待 owner 终裁**，同上）：`/events` 与 `/sessions/{sid}/stream` 各自的 replay / snapshot / resync 完整帧序列表（含 epoch 切换、背压、subscriber 溢出）。
    - 裁决输入 = B0-3 设计文档逐项方案+论证；冻结 gate = 四项终裁记录进 v4-contract §7 定稿（①已完成，②③④随 B0 汇报上报）。
 
-### 8.2 已就地解决 / 已裁决（9 项存档——凭既有权威文本解决，结论已写回对应批次）
+### 8.2 已就地解决 / 已裁决（12 项存档——9 项凭既有权威文本解决 + 3 项 B0 批 owner 裁决，结论已写回对应批次）
 
 | 原问题 | 就地结论 | 依据 | 写回落点 |
 |---|---|---|---|

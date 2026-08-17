@@ -421,10 +421,10 @@ result(req, db, al, cursor, search):
 
 ### 9.1 search = `LIKE ? ESCAPE '\'` + 规范化 hash 进 cursor 指纹（行 86）
 
-- **规范化同源（rev-2 冻结）**：`normalized_search = trim(raw)` 为**唯一输入源**——SQL pattern 构造、`has_wildcard` 判定、cursor 指纹 hash **三者全部读取 normalized_search**（禁一处用 raw 一处用 trim——否则 `" foo "` 与 `"foo"` 两请求同 hash，后续页在错误过滤上下文续走）。指纹 = normalized_search 经转义后的串 hash（sha256 截断 8-16 hex）。
+- **规范化同源（rev-2 冻结，rev-3 扩至降级路径）**：`normalized_search = trim(raw)` 为**唯一输入源**，共**四个消费点**全部读取该值——①SQL pattern 构造、②`has_wildcard` 判定、③cursor 指纹 hash、④**HTTP 降级上游 query 参数**（禁 DB 路径查 `"foo"` 而降级路径把 raw `" foo "` 传上游——两路径行集分叉）。**指纹 hash 输入 = normalized_search 本身（trim 后、LIKE 转义前的串）**——转义只发生在 SQL pattern 构造内部，不改变 hash 输入（rev-3 精确化：hash(ntrim) 而非 hash(escaped)，同一输入两请求 hash 必相同）。
 - **谓词**：`(:search IS NULL OR s.title LIKE :search ESCAPE '\')`；`:search` = `%` + LIKE 字面转义（normalized_search）+ `%`。
 - **字面转义（冻结）**：用户输入中的 `%`、`_`、`\` 在构造 pattern 时以 `\` 前缀转义（`\%%`、`\_`、`\\`）；`ESCAPE '\'` 使 `%`/`_` 不再具备通配语义——**search 语义 = 字面子串匹配**（行 57「标题子串」契约兑现）。
-- **游标指纹**：search 的规范化形式（normalized_search = trim(raw)，§「规范化同源」）hash 进 cursor 指纹 `f.search_hash`（行 127）；**同一输入两次执行 → hash 相同（规范化算法确定性 = 测试断言）**；指纹不匹配 → 400 `invalid_cursor`（行 129）。
+- **游标指纹**：hash(normalized_search)（§「规范化同源」——输入 = trim 后转义前的串，sha256 截断 8-16 hex）进 cursor 指纹 `f.search_hash`（行 127）；**同一输入两次执行 → hash 相同（规范化算法确定性 = 测试断言）**；指纹不匹配 → 400 `invalid_cursor`（行 129）。
 - 降级路径（rev-1 冻结，行 86 收紧）：DB 不可用（disabled/tripped）时——**search 含 `%`/`_`/`\` 任一字符 → 503 `auxiliary_unavailable`**：不可等价表达——上游降级透传为 `LIKE '%…%'` 且**无 ESCAPE**（session.ts:563 实证），`%`/`_` 在 SQLite LIKE 中为**通配符**，会放大行集（如 `search="100%"` 会匹配含 `100%` 之外的行），与 DB 侧字面转义子串行集不同 → 违反「过滤语义永不降级」（行 123）；`\` 在上游无 ESCAPE 声明时为字面（与 DB 侧字面一致，理论可等价）——纳入 503 为**保守加宽**（仅牺牲少数本可等价的反斜杠搜索，换取规则单一）；**判定函数 `has_wildcard(s) = any(c in s for c in '%_\\')` 为确定性函数（与 §9.1 游标指纹规范化共用同一判定 → 同输入两次执行结果一致，指纹 hash 确定性断言覆盖）**。**纯字面子串**（无 `%`/`_`/`\`）→ 透传上游等价（`%…%` 包裹下与字面子串匹配一致）→ 按 §7 Class A/B 规则走（Class A → 200+degraded（降级披露），Class B → 503）。
 
 ### 9.2 complete = LIMIT+1 同 snapshot（行 81, 137）
@@ -450,7 +450,7 @@ result(req, db, al, cursor, search):
 - **根目录特例（冻结）**：allowlist 项 = `/` → 独立分支 `substr(s.directory, 1, 1) = '/'`（匹配**所有非空绝对路径**；真库 2026-08-17 直测：407 行 directory 全部非空且以 `/` 开头）；`/` 不与 `//` 前缀规则混算（长度 1 特判，独立谓词）。
 - **边界语义（S-B08，冻结）**：
   - **大小写敏感**：`=`/`substr` BINARY 比较（实测依据见上）；比较双方 = 存储值 vs 规范化后的 allowlist 项；
-  - **无通配语义**：`substr`/`=` 不解释 `%`/`_`/`\`——路径段含这些字符时**字面匹配**（如目录 `/a%20b/c` 在白名单 `/a` 子树内正常命中，`%` 不放大）；
+  - **无通配语义**：`substr`/`=` 不解释 `%`/`_`/`\`——路径段含这些字符时**字面匹配**（如目录 `/a/%20b/c`、`/a/dir_%_x` 在白名单 `/a` 子树内正常命中，`%`/`_` 不放大；反之 `/a%20b/c` 是 `/a` 的**同层异名目录**——同 `/foobar` 边界，**不在** `/a` 子树，rev-3 勘误）；
   - **前缀边界（子树闭合）**：`/foo` 的子树 = `/foo` 自身 + 所有 `d + '/'` 后代；**不含** `/foobar`、`/foox/…`（`'/'` 闭合语义：`:prefix = :d_raw || '/'`，绝不用裸前缀）；
   - **symlink**：与上游存储语义一致（`directoryColumn` 仅 `absolute()` 不做 realpath 解析，`database/path.ts:53-58`）→ 过滤是**字符串前缀匹配于存储值**，不追踪 fs 实体（防 `..`/symlink 绕过由 allowlist 入口层 B4-4 负责，行 185）；
   - **空 directory 行**：`substr('',…)` 与 `= :d_raw` 谓词对非空 `d_raw` 均不命中 → **允许其中任一（allowlist 非空）查询时天然排除**（legacy 空串行无目录归属，允许语义；既有行为不变）。
