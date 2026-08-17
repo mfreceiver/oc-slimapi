@@ -181,7 +181,8 @@ def _emit_expand_refs(part: dict[str, Any], refs: list[tuple[str, str]], sid: st
     ``refs`` entries are ``(category, partID)`` pairs; each (category, partID)
     appears at most once (dedup) and output is sorted by (category, partID).
     Without ``sid`` no href can be built → refs are dropped (the reductions
-    themselves still apply). Parts without a ``messageID`` get no refs.
+    themselves still apply). Parts without a ``messageID`` — or refs whose
+    partID is falsy (missing/empty, M3) — get no part-level refs.
     """
     if not sid or not refs:
         return part
@@ -190,7 +191,7 @@ def _emit_expand_refs(part: dict[str, Any], refs: list[tuple[str, str]], sid: st
         return part
     part["expandRefs"] = [
         _expand_ref(category, message_id, part_id, sid)
-        for category, part_id in sorted(set(refs))
+        for category, part_id in sorted({(c, p) for c, p in refs if p})
     ]
     return part
 
@@ -266,16 +267,23 @@ def _compute_diffstats_from_files(files: list[dict[str, Any]] | Any) -> dict[str
     array (as used by patch parts and multi-file apply_patch). Each file item
     must be a dict with ``additions`` / ``deletions`` (schema ``NonNegativeInt``).
 
-    Returns ``None`` when input is not a non-empty list of dicts.
+    Returns ``None`` when input is not a non-empty list containing at least one
+    dict item — a pure ``string[]`` (the v1.18.16 PatchPart ``files`` shape)
+    carries no per-file stat data and must NOT yield a fabricated
+    ``{additions: 0, deletions: 0, files: N}`` (rev-gpt R1-M1).
     """
     if not isinstance(files, list) or not files:
         return None
     total_additions = 0
     total_deletions = 0
+    has_dict_item = False
     for item in files:
         if isinstance(item, dict):
+            has_dict_item = True
             total_additions += int(item.get("additions", 0) or 0)
             total_deletions += int(item.get("deletions", 0) or 0)
+    if not has_dict_item:
+        return None
     return {
         "additions": total_additions,
         "deletions": total_deletions,
@@ -476,16 +484,28 @@ def _file(part: dict[str, Any], *, sid: str | None = None) -> dict[str, Any]:
 
 
 def skeleton_part(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS, sid: str | None = None) -> dict[str, Any]:
+    # §5: ``expandRefs`` is a sidecar-OWNED key — a foreign value from upstream
+    # is dropped before any projection. It must never leak into the output, into
+    # ``omitted``/``hasFull``, or survive a whole-part deepcopy (compaction);
+    # the sidecar replaces it deterministically when it generates refs (m2).
+    part = {key: value for key, value in part.items() if key != "expandRefs"}
     part_type = part.get("type")
     if part_type == "text":
-        copied = deepcopy(part)
-        if _utf8_bytes_exceeds(copied.get("text"), TEXT_INLINE_MAX_BYTES):
+        # §2.3: synthetic/ignored/time are /full-only — omitted, never refs.
+        # Only {id, type, text} (+ messageID/sessionID) are picked; n1: the
+        # threshold is measured on the ORIGINAL text before any copy is made.
+        copied = _pick(part, PART_IDS | {"text"})
+        omitted = [key for key in part if key not in PART_IDS | {"text"}]
+        refs: list[tuple[str, str]] = []
+        if _utf8_bytes_exceeds(part.get("text"), TEXT_INLINE_MAX_BYTES):
             # §4.1: whole-field omission — text becomes null, never truncated.
             copied["text"] = None
-            return _emit_expand_refs(
-                _mark(copied, ["text"]), [("part_text", copied.get("id"))], sid
-            )
-        return copied
+            omitted.append("text")
+            # M3: a part-level ref requires a non-empty part id — without one
+            # the reduction still applies but no (unusable) ref is emitted.
+            if copied.get("id"):
+                refs.append(("part_text", copied["id"]))
+        return _emit_expand_refs(_mark(copied, omitted), refs, sid)
     if part_type == "reasoning":
         result = _pick(part, PART_IDS | {"text"})
         omitted = [key for key in part if key not in PART_IDS | {"text"}]
@@ -493,7 +513,8 @@ def skeleton_part(part: dict[str, Any], *, budget: dict[str, int] | None = None,
         if _utf8_bytes_exceeds(part.get("text"), REASONING_INLINE_MAX_BYTES):
             result["text"] = None
             omitted.append("text")
-            refs.append(("part_reasoning", result.get("id")))
+            if result.get("id"):
+                refs.append(("part_reasoning", result["id"]))
         # reasoning metadata/time omissions are /full-only (§2.3) — no refs.
         return _emit_expand_refs(_mark(result, omitted), refs, sid)
     if part_type == "tool":
@@ -536,16 +557,23 @@ def skeleton_message(
     if not isinstance(info, dict):
         info = {}
     result = {"info": deepcopy(info)}
-    message_id = result["info"].get("id", "unknown")
+    # §5: ``expandRefs`` is a sidecar-OWNED key — a foreign value in the
+    # upstream info is dropped; the sidecar replaces it deterministically when
+    # it generates refs (m2).
+    result["info"].pop("expandRefs", None)
+    info_id = result["info"].get("id")
+    message_id = info_id if info_id else "unknown"
     # §4.1: ``info.summary.diffs`` is ALWAYS projected as ``null`` (unconditional
     # reduction); summary siblings are preserved. §5.2/§5.3: a message-level
-    # ``info_summary_diffs`` ref is generated iff diffs was non-null/non-empty
-    # at omission time (and a sid is available to build the href).
+    # ``info_summary_diffs`` ref is generated iff diffs was a NON-EMPTY LIST at
+    # omission time (m1: type-aware — ``""`` / ``False`` / ``{}`` don't count)
+    # AND a real message id exists (M3: the ``unknown`` fallback must not yield
+    # an unusable ref).
     summary = result["info"].get("summary")
     if isinstance(summary, dict) and "diffs" in summary:
         orig_diffs = summary["diffs"]
         summary["diffs"] = None
-        if sid and orig_diffs not in (None, [], {}, ""):
+        if sid and info_id and isinstance(orig_diffs, list) and orig_diffs:
             result["info"]["expandRefs"] = [
                 _expand_ref("info_summary_diffs", message_id, None, sid)
             ]

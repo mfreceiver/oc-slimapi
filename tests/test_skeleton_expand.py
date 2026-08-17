@@ -69,7 +69,8 @@ def test_diffs_null_with_ref_and_other_summary_keys_preserved():
 
 
 def test_diffs_empty_or_null_no_message_ref():
-    for diffs in (None, [], {}, ""):
+    # m1: only a NON-EMPTY LIST of diffs is ref-eligible — no None/[]/{}/""/False.
+    for diffs in (None, [], {}, "", False):
         info = {"id": "m1", "summary": {"diffs": diffs, "files": 0}}
         out = _msg([], info=info)
         assert out["info"]["summary"]["diffs"] is None
@@ -126,14 +127,17 @@ def test_text_threshold_counts_utf8_bytes_not_chars():
     assert out2["text"] == small
 
 
-def test_text_extra_fields_preserved_no_refs():
+def test_text_synthetic_ignored_time_omitted_full_only_no_refs():
+    """rev-gpt R1-M2: synthetic/ignored/time are §2.3 /full-only — omitted,
+    never inlined, never refs; the projection keeps only {id, type, text}."""
     part = _text_part("short", pid="p1")
     part.update({"synthetic": True, "ignored": False, "time": {"start": 1}})
     out = _msg([part])["parts"][0]
     assert out["text"] == "short"
-    assert out["synthetic"] is True
-    assert out["ignored"] is False
-    assert "expandRefs" not in out  # §2.3: synthetic/ignored/time are /full-only
+    assert {"synthetic", "ignored", "time"}.isdisjoint(out)
+    assert out["omitted"] == ["ignored", "synthetic", "time"]  # sorted(set)
+    assert out["hasFull"] is True
+    assert "expandRefs" not in out  # §2.3: /full-only, no refs
 
 
 def test_reasoning_threshold_and_ref_metadata_time_full_only():
@@ -338,3 +342,144 @@ def test_no_sid_reductions_apply_but_refs_suppressed():
     assert "expandRefs" not in out["info"]
     assert out["parts"][0]["text"] is None
     assert "expandRefs" not in out["parts"][0]
+
+
+# ---------------------------------------------------------------------------
+# rev-gpt R1 review fixes (string[] diffStats / text field omission / ID
+# guards / type-aware diffs / expandRefs key ownership)
+# ---------------------------------------------------------------------------
+
+def test_patch_string_array_no_fabricated_diffstats():
+    """R1-M1: a pure string[] files carries no per-file stat data — deriving
+    diffStats would fabricate {0,0,N}. Not injected; state not created."""
+    src = {"id": "p1", "type": "patch", "messageID": "m1", "hash": "h",
+           "files": ["src/a.ts", "src/b.ts"]}
+    out = skeleton_messages([{"info": {"id": "m1"}, "parts": [src]}])[0]["parts"][0]
+
+    assert out["files"] == ["src/a.ts", "src/b.ts"]
+    assert out["hash"] == "h"
+    assert "state" not in out          # no fabricated state.metadata.diffStats
+    assert "diffStats" not in out
+    assert "omitted" not in out
+
+
+def test_oversized_text_without_part_id_omits_but_no_ref():
+    """R1-M3: a part-level ref requires a non-empty part id — without one the
+    reduction applies but no unusable part-level ref is emitted."""
+    big = "x" * (TEXT_INLINE_MAX_BYTES + 1)
+    part = {"type": "text", "messageID": "m1", "text": big}  # no "id"
+    out = _msg([part])["parts"][0]
+    assert out["text"] is None
+    assert out["hasFull"] is True
+    assert out["omitted"] == ["text"]
+    assert "expandRefs" not in out
+
+
+def test_message_without_id_omits_diffs_but_no_info_ref():
+    """R1-M3: the ''unknown'' id fallback must never yield an info ref."""
+    info = {"summary": {"diffs": [{"file": "a.ts"}]}}  # no "id"
+    out = _msg([], info=info)
+    assert out["info"]["summary"]["diffs"] is None
+    assert "expandRefs" not in out["info"]
+    assert out["parts"][0]["id"] == "thin_placeholder_unknown"
+
+
+def test_upstream_info_expand_refs_junk_replaced_or_removed():
+    """R1-m2: expandRefs is sidecar-owned — upstream junk is replaced when the
+    sidecar generates a ref and dropped when it generates none."""
+    info = {"id": "m1", "expandRefs": [{"category": "bogus"}],
+            "summary": {"diffs": [{"file": "a.ts"}]}}
+    out = _msg([], info=info)
+    assert out["info"]["expandRefs"] == [{
+        "category": "info_summary_diffs", "messageID": "m1",
+        "href": f"/slimapi/messages/{SID}/expand/info_summary_diffs/m1{V3}",
+    }]
+
+    info2 = {"id": "m1", "expandRefs": [{"category": "bogus"}],
+             "summary": {"diffs": []}}
+    out2 = _msg([], info=info2)
+    assert "expandRefs" not in out2["info"]
+
+
+def test_upstream_part_expand_refs_junk_stripped():
+    """R1-m2: junk expandRefs never survives on parts — not in output, not in
+    omitted/hasFull, not through the compaction whole-part deepcopy."""
+    state = {"status": "completed", "input": {"command": "ls"},
+             "output": "o" * 5000}
+    part = {"id": "p1", "type": "tool", "messageID": "m1", "tool": "bash",
+            "expandRefs": [{"category": "bogus"}], "state": state}
+    out = _msg([part])["parts"][0]
+    assert [r["category"] for r in out["expandRefs"]] == ["part_state_output"]
+
+    part2 = {"id": "p1", "type": "tool", "messageID": "m1", "tool": "bash",
+             "expandRefs": [{"category": "bogus"}],
+             "state": {"status": "completed", "title": "t"}}
+    out2 = _msg([part2])["parts"][0]
+    assert "expandRefs" not in out2
+    assert "expandRefs" not in out2.get("omitted", [])
+
+    small = {"id": "p1", "type": "compaction", "messageID": "m1",
+             "expandRefs": [{"category": "bogus"}], "auto": True, "text": "ok"}
+    out3 = _msg([small])["parts"][0]
+    assert out3["type"] == "compaction" and out3["text"] == "ok"
+    assert "expandRefs" not in out3
+
+
+def test_text_threshold_contract_literal_2048():
+    """R1: pin the contract value itself (no implementation-constant import):
+    2048 bytes inline, 2049 -> null + ref."""
+    out = _msg([_text_part("a" * 2048)])["parts"][0]
+    assert out["text"] == "a" * 2048
+    assert "expandRefs" not in out
+
+    out2 = _msg([_text_part("a" * 2049)])["parts"][0]
+    assert out2["text"] is None
+    assert out2["hasFull"] is True
+    assert out2["expandRefs"][0]["category"] == "part_text"
+
+
+def test_reasoning_threshold_contract_literal_2048():
+    out = _msg([_reasoning_part("a" * 2048)])["parts"][0]
+    assert out["text"] == "a" * 2048
+    assert "expandRefs" not in out
+
+    out2 = _msg([_reasoning_part("a" * 2049)])["parts"][0]
+    assert out2["text"] is None
+    assert out2["hasFull"] is True
+    assert out2["expandRefs"][0]["category"] == "part_reasoning"
+
+
+def test_projection_does_not_mutate_or_alias_source():
+    """Deepcopy isolation: mutating the projected result never affects the
+    original input message tree."""
+    src_summary = {"diffs": [{"file": "a.ts", "additions": 3}], "files": 1}
+    src_part = {"id": "p1", "type": "tool", "messageID": "m1", "tool": "bash",
+                "state": {"status": "completed",
+                          "input": {"command": "ls", "arg": "-la"},
+                          "output": "small"}}
+    source = [{"info": {"id": "m1", "summary": src_summary}, "parts": [src_part]}]
+    out = skeleton_messages(source, sid=SID)[0]
+
+    # mutate the projection deeply
+    out["info"]["summary"]["files"] = 999
+    out["info"]["summary"]["diffs"] = "mutated"
+    out["parts"][0]["state"]["input"]["command"] = "mutated"
+    out["parts"][0]["state"]["output"] = "mutated"
+
+    assert source[0]["info"]["summary"]["diffs"] == [{"file": "a.ts", "additions": 3}]
+    assert source[0]["info"]["summary"]["files"] == 1
+    assert source[0]["parts"][0]["state"]["input"]["command"] == "ls"
+    assert source[0]["parts"][0]["state"]["output"] == "small"
+
+
+def test_source_summary_diffs_untouched_by_projection():
+    """Nested source values stay in place: the projected diffs is null, the
+    original summary object (and its diffs list) is byte-for-byte intact."""
+    src_summary = {"diffs": [{"file": "a.ts", "additions": 3}], "files": 1}
+    source = [{"info": {"id": "m1", "summary": src_summary}, "parts": []}]
+    out = skeleton_messages(source, sid=SID)[0]
+
+    assert out["info"]["summary"]["diffs"] is None
+    assert source[0]["info"]["summary"] is src_summary
+    assert source[0]["info"]["summary"]["diffs"] == [{"file": "a.ts", "additions": 3}]
+    assert source[0]["info"]["summary"]["files"] == 1
