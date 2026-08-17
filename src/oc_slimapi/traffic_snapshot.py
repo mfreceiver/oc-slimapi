@@ -418,6 +418,13 @@ class TrafficSnapshotter:
             # names and order unchanged.
             "v3": snap.get(
                 "v3", {"matrix": {}, "sseLifecycle": {}, "sseActive": {}}),
+            # design-expand §11 P4: per-category|status expand counters ride
+            # along with the same-source snapshot — the daily JSONL is the
+            # ONLY ≥RETAIN_DAYS carrier of the /slimapi/metrics.traffic
+            # shape, so dropping this block would strand the expand
+            # observability (rate-limit / cache evaluation inputs). Additive
+            # tail: legacy field names and order unchanged.
+            "expand": snap.get("expand", {}),
         }
 
         # Derive the daily path from the SAME `now` so the ts field and the

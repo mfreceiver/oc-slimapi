@@ -39,6 +39,47 @@ from typing import Any, Final
 # Keeps /slimapi/metrics snapshot percentile cost bounded.
 _LATENCY_SAMPLES: Final[int] = 1024
 
+# Expand fragment categories (design-expand §2.2 frozen table, verbatim order).
+# SINGLE SOURCE OF TRUTH for both the wire advertisement
+# (routes/versions.py capabilities["3"]["expand"], §6) and the per-category
+# accounting whitelist below — the versions route imports this constant
+# (traffic.py has no imports back into routes/, so no cycle). The whitelist
+# bounds the ledger's ``_expand`` key space: only these categories may open
+# new keys, everything else collapses into the fixed ``invalid`` bucket
+# (rev-gpt R1 M2 — arbitrary path segments must not grow memory unboundedly).
+EXPAND_CATEGORIES: list[str] = [
+    "info_summary_diffs",
+    "part_text",
+    "part_reasoning",
+    "part_state_output",
+    "part_state_error",
+    "part_state_input_full",
+    "part_state_metadata_full",
+    "part_state_attachments",
+    "part_url",
+    "part_source",
+    "part_snapshot",
+    "compaction_full",
+]
+EXPAND_CATEGORIES_SET: Final[frozenset[str]] = frozenset(EXPAND_CATEGORIES)
+# Fixed sink for any request path whose category segment is not in the
+# whitelist (forged / malformed categories, empty segments) — keeps the
+# ``_expand`` dict size bounded by (12 categories + 1) × observed statuses.
+_EXPAND_INVALID_CATEGORY: Final[str] = "invalid"
+
+
+def _normalize_expand_category(category: str) -> str:
+    """Collapse a raw path category onto the §2.2 whitelist.
+
+    Whitelisted categories round-trip unchanged; anything else (forged or
+    malformed segments, including empty ones) counts under the fixed
+    ``invalid`` key so an attacker rotating arbitrary category segments
+    cannot grow the ledger's ``_expand`` dict without bound.
+    """
+    if category in EXPAND_CATEGORIES_SET:
+        return category
+    return _EXPAND_INVALID_CATEGORY
+
 
 # Logical bucket names. The SSE buckets are owned by ``record_sse_*``; the
 # middleware passes ``resp_bytes=0`` to ``record_downstream`` for them so their
@@ -151,17 +192,18 @@ def _expand_tail(path: str) -> str | None:
     """Return the substring after the ``expand/`` segment of a messages
     expand path, or ``None`` when the path is not an expand request.
 
-    Segment-strict: ``{sid}`` must be a single path segment immediately
-    followed by ``expand/`` — a stray ``expand/`` later in the path (or a
-    bare ``/slimapi/messages/{sid}/expand`` with no category) does not match.
+    Segment-strict: ``{sid}`` must be a single NON-EMPTY path segment
+    immediately followed by ``expand/`` — a stray ``expand/`` later in the
+    path, a bare ``/slimapi/messages/{sid}/expand`` with no category, or an
+    empty sid segment (``/slimapi/messages//expand/...``) does not match.
     """
     prefix = "/slimapi/messages/"
     if not path.startswith(prefix):
         return None
     rest = path[len(prefix):]
     slash = rest.find("/")
-    if slash < 0:
-        return None
+    if slash <= 0:
+        return None  # missing sid segment, or empty sid segment
     after_sid = rest[slash + 1:]
     if not after_sid.startswith(_EXPAND_SEGMENT):
         return None
@@ -169,17 +211,21 @@ def _expand_tail(path: str) -> str | None:
 
 
 def expand_category_from_path(path: str) -> str | None:
-    """Extract the expand ``category`` path segment (design-expand §2.1/§2.2),
-    or ``None`` when the path is not an expand request.
+    """Extract the raw expand ``category`` path segment (design-expand
+    §2.1/§2.2), or ``None`` when the path is not an expand request.
 
-    Used by the traffic middleware to attribute expand requests to the
-    ``category|status`` counter (design-expand §11 P4 observability).
+    The raw segment is NOT whitelisted here — it may be an empty string
+    (``/expand/{mid}``) or a forged value; :func:`_normalize_expand_category`
+    (inside :meth:`TrafficLedger.record_expand`) collapses those onto the
+    bounded ``invalid`` key. Returning ``None`` only for non-expand paths
+    keeps "is this an expand request" (bucket/middleware) separate from
+    "which category does it count under" (normalization).
     """
     tail = _expand_tail(path)
     if tail is None:
         return None
     category, _, _ = tail.partition("/")
-    return category or None
+    return category
 
 
 # Per-request upstream-byte stash keys (stored under ``scope["state"]`` by
@@ -479,10 +525,17 @@ class TrafficLedger:
         """Count one expand request by ``category`` and ``status``.
 
         ``resp_bytes`` is the downstream response body length (same口径 as
-        ``downOut``). Key = ``category|status`` — the flat-key style mirrors
-        the v3 matrix (``record_selector_request``) and is what the
-        rate-limit / cache evaluation (design-expand §11 follow-up) needs to
-        split expand traffic per category without re-parsing access logs.
+        ``downOut``). Key = ``normalized_category|status`` where
+        ``normalized_category`` is the §2.2 whitelist membership via
+        :func:`_normalize_expand_category` — categories outside the 12
+        (forged or empty segments) always collapse onto the fixed
+        ``invalid`` key (rev-gpt R1 M2): the ``_expand`` dict stays bounded
+        by (12 + 1) categories × observed statuses regardless of the request
+        path, so an attacker rotating arbitrary category segments cannot grow
+        sidecar memory. The flat-key style mirrors the v3 matrix
+        (``record_selector_request``) and is what the rate-limit / cache
+        evaluation (design-expand §11 follow-up) needs to split expand
+        traffic per category without re-parsing access logs.
 
         Additive cross-cut: the request is ALSO counted in its HTTP bucket
         (``messages.expand``) by :meth:`record_downstream`; this counter is a
@@ -490,7 +543,7 @@ class TrafficLedger:
         """
         if not self._enabled:
             return
-        key = f"{category}|{status}"
+        key = f"{_normalize_expand_category(category)}|{status}"
         with self._lock:
             entry = self._expand.setdefault(key, {"requests": 0, "bytes": 0})
             entry["requests"] += 1

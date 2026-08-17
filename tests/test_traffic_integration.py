@@ -165,14 +165,17 @@ async def test_metrics_with_ledger_surfaces_traffic_block(upstream_factory):
         # The traffic block is additive on top of the existing shape.
         # v3 Batch A (§9.2): the additive "v3" observability section (matrix +
         # sseLifecycle + sseActive) now rides along.
+        # design-expand §11 P4: the additive "expand" per-category|status
+        # counter section rides along too (empty until an expand request).
         assert "traffic" in data
         traffic = data["traffic"]
-        assert set(traffic) == {"enabled", "buckets", "totals", "ratios", "v3"}
+        assert set(traffic) == {"enabled", "buckets", "totals", "ratios", "v3", "expand"}
         assert traffic["enabled"] is True
         # No requests recorded yet → empty buckets / ratios, zero totals.
         assert traffic["buckets"] == {}
         assert traffic["ratios"] == {}
         assert traffic["v3"] == {"matrix": {}, "sseLifecycle": {}, "sseActive": {}}
+        assert traffic["expand"] == {}
         assert traffic["totals"] == {
             "requests": 0, "downIn": 0, "downOut": 0, "upIn": 0, "upOut": 0,
         }

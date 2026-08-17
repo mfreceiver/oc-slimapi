@@ -177,6 +177,23 @@ def _opt_int_env(name: str) -> int | None:
     return int(value) if value and value.strip() else None
 
 
+def _int_env(name: str, default: int) -> int:
+    """Parse an int env knob, raising a NAMED RuntimeError on malformed input.
+
+    Mirrors the ``_version_range`` diagnostic pattern (a bare ``ValueError``
+    at import time would not name the offending variable). Used by the
+    expand fragment cap so ``OC_SLIMAPI_MAX_EXPAND_RESPONSE_BYTES=abc``
+    fails startup with an actionable message (rev-gpt R1 m1).
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     host: str = os.getenv("OC_SLIMAPI_HOST", "127.0.0.1")
@@ -195,8 +212,8 @@ class Settings:
     # bytes, the parsed object, the serialised fragment bytes AND optional
     # gzip bytes simultaneously, so the aggregate memory envelope accounts
     # the two caps via max() (see validate() P1-30 note).
-    max_expand_response_bytes: int = int(
-        os.getenv("OC_SLIMAPI_MAX_EXPAND_RESPONSE_BYTES", str(8 * 1024 * 1024))
+    max_expand_response_bytes: int = _int_env(
+        "OC_SLIMAPI_MAX_EXPAND_RESPONSE_BYTES", 8 * 1024 * 1024
     )
     # Catalog TTL cache (traffic plan Batch 1 / A1): successful upstream
     # catalog bodies (/slimapi/agent, /slimapi/command) are cached for a TTL
@@ -604,14 +621,13 @@ class Settings:
                 f"{_MAX_EXPAND_RESPONSE_BYTES // (1024 * 1024)} MiB]"
             )
         # P1-30: RSS upper-bound sanity. The worst-case RSS for the transform
-        # pool is approximately ``max_transforms × max_response_bytes`` (each
-        # admitted transform buffers the upstream body + the projection tree
-        # + the serialised output simultaneously). R4-M3 (design-expand
-        # §3.2): the expand worker additionally holds the raw full-message
-        # bytes, the parsed object, the serialised fragment bytes AND optional
-        # gzip bytes concurrently, so the envelope is accounted via the max of
-        # the two caps — an expand cap above the plain response cap must not
-        # be underestimated. A product exceeding this cap risks OOM under the
+        # pool is approximately ``max_transforms × max(response_bytes,
+        # expand_response_bytes)`` — the envelope is accounted via the max of
+        # the two caps because R4-M3 (design-expand §3.2) expand workers
+        # additionally hold the raw full-message bytes, the parsed object,
+        # the serialised fragment bytes AND optional gzip bytes concurrently,
+        # so an expand cap above the plain response cap must not be
+        # underestimated. A product exceeding this cap risks OOM under the
         # systemd MemoryMax before the admission semaphore can protect the
         # process. Default max_transforms=1 × max(64 MiB, 8 MiB) = 64 MiB
         # (well within budget). Operators who genuinely need more should

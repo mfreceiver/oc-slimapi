@@ -1135,3 +1135,65 @@ class TestV3NodeInFrames:
         for line in lines:
             assert line["v3"] == {
                 "matrix": {}, "sseLifecycle": {}, "sseActive": {}}
+
+
+# ---------------------------------------------------------------------------
+# design-expand §11 P4: the expand block rides along in persisted rows
+# ---------------------------------------------------------------------------
+
+
+class TestExpandBlockPersisted:
+    """The daily JSONL must carry the per-category|status expand counters so
+    the cross-restart observation chain does not lose expand metrics
+    (rev-gpt R1 M1 — previously only buckets/totals/ratios/v3 were copied)."""
+
+    async def test_expand_counters_persisted_in_rows(self, tmp_path: Path) -> None:
+        path = str(tmp_path / "snap.jsonl")
+        ledger = _make_ledger_with_data()
+        ledger.record_expand(category="part_text", status=200, resp_bytes=250)
+        ledger.record_expand(category="part_text", status=200, resp_bytes=300)
+        ledger.record_expand(category="forged_cat", status=404, resp_bytes=0)
+        snap = TrafficSnapshotter(ledger=ledger, interval_s=300, path=path)
+        await snap.start()
+        await snap.stop()
+
+        lines = _read_lines(path)
+        assert lines
+        for line in lines:
+            # Whitelisted category accumulates; forged collapses to invalid.
+            assert line["expand"] == {
+                "part_text|200": {"requests": 2, "bytes": 550},
+                "invalid|404": {"requests": 1, "bytes": 0},
+            }
+
+    async def test_expand_node_additive_tail_after_v3(self, tmp_path: Path) -> None:
+        """Additive tail: the legacy 10-field prefix keeps its exact order;
+        ``expand`` rides as key #11 (consumers of old shapes unaffected)."""
+        path = str(tmp_path / "snap.jsonl")
+        ledger = TrafficLedger(enabled=True)
+        ledger.record_expand(category="compaction_full", status=200, resp_bytes=7)
+        snap = TrafficSnapshotter(ledger=ledger, interval_s=300, path=path)
+        await snap.start()
+        await snap.stop()
+
+        lines = _read_lines(path)
+        assert lines
+        keys = list(lines[0].keys())
+        assert keys[:10] == ["ts", "bootTs", "runId", "uptimeS", "pid",
+                             "enabled", "buckets", "totals", "ratios", "v3"]
+        assert keys[10] == "expand"
+
+    async def test_expand_node_empty_for_fresh_ledger(self, tmp_path: Path) -> None:
+        """No expand traffic yet → the node still exists (empty, not absent),
+        mirroring the v3 node's always-present contract."""
+        path = str(tmp_path / "snap.jsonl")
+        snap = TrafficSnapshotter(
+            ledger=TrafficLedger(enabled=True),
+            interval_s=300, path=path)
+        await snap.start()
+        await snap.stop()
+
+        lines = _read_lines(path)
+        assert lines
+        for line in lines:
+            assert line["expand"] == {}

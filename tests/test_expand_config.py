@@ -23,6 +23,7 @@ from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 from httpx import ASGITransport
 
+from oc_slimapi import config as config_module
 from oc_slimapi.config import Settings
 from oc_slimapi.errors import register_error_handlers
 from oc_slimapi.middleware.traffic_accounting import TrafficAccountingMiddleware
@@ -127,6 +128,18 @@ def test_validate_accepts_expand_cap_below_or_equal_response_cap():
     1 × max(64 MiB, 8 MiB) = 64 MiB (well within budget)."""
     _base().validate()
     _base(max_expand_response_bytes=2 * 1024 * 1024).validate()
+
+
+def test_env_non_integer_expand_cap_is_named_runtime_error(monkeypatch):
+    """m1 (rev-gpt R1): a malformed OC_SLIMAPI_MAX_EXPAND_RESPONSE_BYTES must
+    fail startup with a RuntimeError NAMING the variable — not a bare
+    ValueError at import time (mirrors the _version_range pattern)."""
+    monkeypatch.setenv("OC_SLIMAPI_MAX_EXPAND_RESPONSE_BYTES", "abc")
+    with pytest.raises(
+        RuntimeError,
+        match=r"OC_SLIMAPI_MAX_EXPAND_RESPONSE_BYTES must be an integer",
+    ):
+        config_module._int_env("OC_SLIMAPI_MAX_EXPAND_RESPONSE_BYTES", 8 * 1024 * 1024)
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +254,95 @@ def test_expand_category_from_path_extracts_segment():
     assert expand_category_from_path("/slimapi/messages") is None
     assert expand_category_from_path("/slimapi/messages/ses_x/expand") is None  # no category segment
     assert expand_category_from_path("/slimapi/other") is None
+
+
+# ---------------------------------------------------------------------------
+# 5b. Whitelist cardinality bound (rev-gpt R1 M2) — forged / malformed
+# categories collapse onto the fixed ``invalid`` key (bounded memory).
+# ---------------------------------------------------------------------------
+
+def test_expand_counter_forged_and_empty_categories_collapse_to_invalid():
+    """Any category outside the 12-item §2.2 whitelist — forged segments AND
+    empty segments — counts under the fixed ``invalid`` key instead of
+    opening a per-value key."""
+    ledger = TrafficLedger()
+    ledger.record_expand(category="aaaaaa", status=200, resp_bytes=10)
+    ledger.record_expand(category="", status=200, resp_bytes=20)
+    ledger.record_expand(category="part_text", status=200, resp_bytes=30)
+    snap = ledger.snapshot()
+    assert snap["expand"] == {
+        "invalid|200": {"requests": 2, "bytes": 30},
+        "part_text|200": {"requests": 1, "bytes": 30},
+    }
+
+
+def test_expand_counter_forged_category_cardinality_bounded():
+    """100 distinct attacker-chosen category segments → ONE invalid key, so
+    the ``_expand`` dict cannot grow with the request path (DoS bound:
+    ≤ 12 whitelisted + 1 invalid categories)."""
+    ledger = TrafficLedger()
+    for i in range(100):
+        ledger.record_expand(category=f"forged{i:03d}", status=404, resp_bytes=0)
+    snap = ledger.snapshot()
+    assert set(snap["expand"].keys()) == {"invalid|404"}
+    assert snap["expand"]["invalid|404"]["requests"] == 100
+    assert len(snap["expand"]) <= 13
+
+
+def test_empty_sid_segment_is_not_expand():
+    """/slimapi/messages//expand/... has an EMPTY session segment — malformed,
+    so it must NOT classify as an expand request (bucket stays plain
+    messages, category extractor returns None)."""
+    path = "/slimapi/messages//expand/part_text/mid"
+    assert expand_category_from_path(path) is None
+    assert bucketize("GET", path) == "messages"
+
+
+async def test_middleware_forged_category_counts_as_invalid():
+    """A 404 on an attacker-rotatable category segment must land in the fixed
+    ``invalid`` counter (bucket messages.expand), never open a per-category
+    key — the middleware records AFTER routing, including 404s."""
+    ledger = TrafficLedger()
+
+    def routes(app: FastAPI) -> None:
+        pass  # expand routes are a parallel lane — every expand path 404s
+
+    app = _middleware_app(ledger=ledger, configure_routes=routes)
+    async with httpx.AsyncClient(
+        transport=ASGITransport(app), base_url="http://test"
+    ) as client:
+        r = await client.get("/slimapi/messages/ses_x/expand/aaaaaa/msg_x")
+
+    assert r.status_code == 404
+    snap = ledger.snapshot()
+    assert snap["buckets"]["messages.expand"]["requests"] == 1
+    assert set(snap["expand"].keys()) == {"invalid|404"}
+
+
+async def test_middleware_empty_category_segment_counts_as_invalid():
+    """Empty category segment (/expand//msg_x) still classifies as an expand
+    request (path shape) but counts under ``invalid`` — defined accounting
+    for otherwise-undefined malformed forms (rev-gpt R1 m2)."""
+    ledger = TrafficLedger()
+
+    def routes(app: FastAPI) -> None:
+        pass
+
+    app = _middleware_app(ledger=ledger, configure_routes=routes)
+    async with httpx.AsyncClient(
+        transport=ASGITransport(app), base_url="http://test"
+    ) as client:
+        r = await client.get("/slimapi/messages/ses_x/expand//msg_x")
+
+    assert r.status_code == 404
+    snap = ledger.snapshot()
+    assert snapshot_bucket_requests(snap, "messages.expand") == 1
+    assert set(snap["expand"].keys()) == {"invalid|404"}
+
+
+def snapshot_bucket_requests(snap: dict, bucket: str) -> int:
+    """Local helper: requests count for a bucket (avoids KeyError churn)."""
+    return snap["buckets"].get(bucket, {}).get("requests", 0)
 
 
 # ---------------------------------------------------------------------------
