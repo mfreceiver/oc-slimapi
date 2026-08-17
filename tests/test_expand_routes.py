@@ -199,6 +199,29 @@ def _json(response: httpx.Response) -> dict:
     return orjson.loads(response.content)
 
 
+@pytest.fixture(autouse=True)
+def _cleanup_global_singleflight():
+    """Isolate the module-level singleflight registry between tests.
+
+    ``oc_slimapi.sse.singleflight.fulls`` is a MODULE-level registry whose
+    keys are ``(id(pool), sid, mid, directory)``. Each test builds a fresh
+    TransformPool, but pytest reuses freed pool object addresses — a later
+    test's pool can collide on ``id()`` with an earlier test's pool, so an
+    earlier test's still-warm result (completion grace is 1 second) would
+    be JOINED by the later test instead of triggering a fresh upstream GET.
+    Enjoying a body that belongs to a DIFFERENT test (e.g. a malformed /
+    missing-part body from an extractor test) surfaces as intermittent
+    spurious 404/502 revelations across runs. ``shutdown()`` clears every
+    retained entry (and cancels its expiry timers) while leaving the
+    registry fully usable for the next test — so each test starts with an
+    empty, id-free registry. Test-only cleanup; production has a single
+    long-lived pool per process and never benefits from (or is harmed by)
+    re-seeding this per-test.
+    """
+    yield
+    messages.fulls.shutdown()
+
+
 # ---------------------------------------------------------------------------
 # 1) Selector / directory (SlimapiSelectorMiddleware + ?v=3)
 # ---------------------------------------------------------------------------
