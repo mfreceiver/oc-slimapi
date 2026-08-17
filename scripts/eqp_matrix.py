@@ -521,7 +521,7 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=0, help="rng seed（预留）")
     ap.add_argument("--keep", action="store_true", help="保留临时草稿库（调试）")
     ap.add_argument("--join-col", default="worktree",
-                    help="project join 列（待裁决：v2.2 行 74 project_directory vs 真库 worktree；默认 worktree）")
+                    help="project join 列（B0 已实证冻结 worktree：真库 project 无 directory 列；name/worktree 均已进 SELECT 与 schema 门）")
     ap.add_argument("--real-db", nargs="?", const=DEFAULT_REAL_DB, default=None,
                     metavar="PATH", help="真库 mode=ro 采样模式（可选；默认路径 ~/.local/share/opencode/opencode.db）")
     ap.add_argument("--reps", type=int, default=30, help="真库模式每组合采样次数（warmup 3）")

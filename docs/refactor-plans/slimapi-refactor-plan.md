@@ -95,15 +95,15 @@ v2.2 行 264 原文：*"规范先行 + 设计实证：v4-contract delta 全章�
 #### B0-3 SSE 重放协议设计（v2.2 行 264 + 行 153）
 
 - **改动文件**：`docs/specs/design-v4-sse-replay.md`（新）
-- **实现要点**（行 153 全部要点展开）：进程 epoch + 单调 seq；ID 作用域（全局流 vs token 流**独立**）；帧 ID 分配（业务帧/digest/meta 有；heartbeat 无）；有界重放日志（count/bytes/TTL）；expired/future/gap 处理（gap → resync+snapshot）；与 meta-first / 背压 / 上游重连的顺序。**明确**：现 GlobalHub pending（250ms debounce）与 tombstone 队列**不是** replay log——v4 新建有界环形日志组件（行 153）；与既有 token 域重放队列（`TOKEN_REMOVED_MESSAGES` cap 1000 / TTL 24h，config.py:72-73）**并存不混用**。**设计必答题**：背压溢出帧是否入重放日志；断连后 gap 由重放日志补还是 resync 全量——属本协议设计要素（行 153 已列「与背压的顺序」），随设计文档 rev gate 把关。
+- **实现要点**（行 153 全部要点展开）：进程 epoch（**随机 boot nonce**，B0 rev-2 冻结）+ 单调 seq；ID 作用域（全局流 vs token 流**独立**，域标签编入 ID——`g:`/`t:<sid>:`）；帧 ID 分配（业务帧/digest 有；**meta/heartbeat 无**——B0 rev-1 冻结）；有界重放日志（count/bytes/TTL）；expired/future/旧 epoch/gap 处理（**gap → resync，snapshot = 客户端 HTTP 动作非服务端帧**——B0 rev-1 冻结）；与 meta-first / 背压 / 上游重连的顺序。**明确**：现 GlobalHub pending（250ms debounce）与 tombstone 队列**不是** replay log——v4 新建有界环形日志组件（行 153）；与既有 token 域重放队列（`TOKEN_REMOVED_MESSAGES` cap 1000 / TTL 24h，config.py:72-73）**并存不混用**。**设计必答题**：背压溢出帧是否入重放日志；断连后 gap 由重放日志补还是 resync 全量——属本协议设计要素（行 153 已列「与背压的顺序」），随设计文档 rev gate 把关。（B0 终态见 `docs/specs/design-v4-sse-replay.md`）
 - **⚠ 协议裁决门槛（S-B01，B0 出门 gate——§8.1 问题 5 四项，未收敛则 B0 不出门、`sseReplay:true` 不得进 v4 capability）**，本设计文档**必须先回答**下述四项才能成文 §7：
-  1. **tokens=1 统一流**（`/events?tokens=1` 同连接复用全局 digest 帧 + token 帧）：二选一裁决——①单 Last-Event-ID 复合 cursor（全局+token 双序列编码，如 `g<epoch>-<seq>;t<epoch>-<seq>`）；②**v4 禁止复用**（tokens=1 请求在 v4 返回 400，token 流必须走独立 `/sessions/{sid}/stream`）。现状 `/events` 复用全局/token 帧 + 单 Last-Event-ID **无法**恢复双序列（S-B01 论证：meta-first 与重放顺序矛盾——重连新 meta 分配新 seq 后再发旧 replay 帧 = 线上 ID 倒退）；
+  1. **tokens=1 统一流**（`/events?tokens=1` 同连接复用全局 digest 帧 + token 帧）：二选一裁决——①单 Last-Event-ID 复合 cursor（全局+token 双序列编码，如 `g<epoch>-<seq>;t<epoch>-<seq>`）；②**v4 禁止复用**（tokens=1 请求在 v4 返回 400，token 流必须走独立 `/sessions/{sid}/stream`）。现状 `/events` 复用全局/token 帧 + 单 Last-Event-ID **无法**恢复双序列（S-B01 论证：meta-first 与重放顺序矛盾——重连新 meta 分配新 seq 后再发旧 replay 帧 = 线上 ID 倒退）。**→ 已裁决 = 选②（owner，2026-08-17，见 §8.2）**；
   2. **meta 重连语义**：重连后 meta 帧是否带 `id:`、epoch 是否更换、线序定义（meta → replay 帧 → 新帧的严格顺序 = 无 ID 倒退）；
   3. **token ID 作用域**：全局序列 / per-sid / 每连接——全局序列会因其他 sid 消费 seq 出现合法空洞，**gap 不能当丢帧**（gap 判定须区分「消费者缺席 seq」vs「日志逐出」）；
   4. **两端点状态机逐帧序列表**：`/events` 与 `/sessions/{sid}/stream` 各自的 replay / snapshot / resync 帧序列（含 epoch 切换、背压溢出、subscriber 溢出重连场景）。
 - **能力键时序（n1）**：`sseReplay` / `qpImmediateFull` capability 与实现**同批启用**——B3a 的 `capabilities["4"]` **不**含此二键；随 B3b 实现落地同期广告（§2.7 B3b-5、§4.1）。
 - **验收标准**：协议含可落地的帧形/ID 语法 + 上述四项裁决记录（每项含选定方案与理由）；v4-contract §7 有对应章节；`sseReplay` 键语义冻结与 §4.1 时序表一致
-- **测试**：协议矩阵用例表（重放/缺口/过期/重启/背压/**tokens=1 双序列**/ID 无倒退断言），落地于 B3b
+- **测试**：协议矩阵用例表（重放/缺口/过期/重启 epoch/背压/**tokens=1 → 400**（已裁决）/ID 无倒退断言，14 条 REPLAY 用例见 design-v4-sse-replay §4），落地于 B3b
 
 #### B0-4 q/p 载荷核对（v2.2 行 164 "载荷直投评估前置（B1b 先行）"）
 
@@ -255,7 +255,7 @@ v2.2 行 270：*"wire v4 第二刀：SSE id:/重放日志 + q/p 帧补全（若�
 | 任务 | 改动文件/模块 | 实现要点 | 验收标准 | 测试 |
 |---|---|---|---|---|
 | B3b-1 有界环形重放日志 | 新 `src/oc_slimapi/sse/replay_log.py` + `config.py`（上限参数段）+ `app.py`（装配段） | v4 新有状态组件（行 213 "+1"）：count/bytes/TTL 上限；进程 epoch + 单调 seq；全局流与 token 流**独立 ID 域**（行 153）；帧 ID 分配（业务帧/digest/meta 有；heartbeat 无）；与既有 tombstone 队列并存不混用（B0-3 设计落地） | 日志上限（count/bytes/TTL）生效；ID 单调 | 上限边界；epoch 重启；独立域隔离 |
-| B3b-2 SSE id:/重放 | `src/oc_slimapi/routes/events.py`、`routes/token_stream.py`、`sse/global_hub.py`（产出路径） | **前提**：§8.1 问题 5 四项协议裁决已收敛（S-B01，B0 出门 gate）；v4 端点发 `id:`；`Last-Event-ID` 触发重放；expired/future/gap 处理（gap → resync+snapshot）；与 meta-first（meta 仍首帧）/**背压**/上游重连的顺序（行 153）；**tokens=1 复用流按 §8.1 问题 5 裁决执行（复合 cursor 或 v4 禁止复用）**；**v3 SSE 帧名帧形零变化**（行 153 冻结） | 重放协议全矩阵绿；ID 无倒退断言；v3 SSE 零回归 | 重放矩阵：正常/缺口/过期/未来/背压/重连；gap → resync 断言；tokens=1 双序列；ID 单调无倒退（S-B01 状态机逐帧序列表） |
+| B3b-2 SSE id:/重放 | `src/oc_slimapi/routes/events.py`、`routes/token_stream.py`、`sse/global_hub.py`（产出路径） | **前提**：S-B01 ②③④ owner 终裁（B0 提案已上报）；①已裁（tokens=1 v4 = 400）。v4 端点发 `id:`（域标签语法 `g:<epoch>:<seq>` / `t:<sid>:<epoch>:<seq>`，epoch = 随机 boot nonce 非墙钟——B0 rev-2 冻结，见 design-v4-sse-replay §3）；`Last-Event-ID` 触发重放；expired/future/旧 epoch/gap 处理（**旧 epoch → resync{epoch_changed}；gap → 服务端仅发 meta→resync→新帧，snapshot 是客户端 HTTP 动作非服务端帧**）；**tokens=1 复用流已裁决 = v4 一律 400 `tokens_stream_retired_in_v4`**（§8.2，非二选一）；与 meta-first（meta 仍首帧）/背压/上游重连的顺序（行 153）；**v3 SSE 帧名帧形零变化**（行 153 冻结） | 重放协议全矩阵绿（14 条 REPLAY 用例）；ID 无倒退断言（同 epoch 同域内）；v3 SSE 零回归 | 重放矩阵：正常/缺口/过期/旧 epoch/future/非法/跨域/背压/重连；gap → resync 断言（+客户端 HTTP 全量对齐另行断言）；tokens=1 → 400 断言（B0-6f grep + REPLAY-009）；ID 单调（REPLAY-010/011，域标签隔离） |
 | B3b-3 q/p 帧补全 | `src/oc_slimapi/sse/global_hub.py`（q/p 直推路径）+ `v4-contract.md` §7 | **仅当 B0-4 核对结论 = 缺字段**（行 164, 270 "若需"）：question.asked / permission.asked 帧补全 properties 为完整对象（v4-only） | 补全后 `qpImmediateFull` 语义成立 | 帧补全用例（对照上游 schema） |
 | B3b-4 meta v4 扩展 | `src/oc_slimapi/routes/events.py`、`routes/token_stream.py` | `slimapi.meta` v4 additive 扩展：capabilities 摘要 + epoch/seq 基线字段（行 154）；v3 形状不动 | v3 meta 帧零变化；v4 扩展字段出现 | meta 双版本断言 |
 | B3b-5 契约/观测/能力广告同步 | `v4-contract.md` §7/§9、`INTERFACE_MAP.md`、`CHANGELOG.md`（4.0.0 节）、`routes/versions.py` | replay hit/miss/gap 观测（行 254 §9）；**能力键广告（n1）**：本批实现落地时 `capabilities["4"]` 追加 `sseReplay`（+`qpImmediateFull`：若 B0-4 核对=已完整则现状已成立，随本批与 sseReplay 同批广告；若需补全则由 B3b-3 完成后再广告）——**与实现同批启用，绝不提前广告** | 契约与实现一致；能力键仅在实现落地后出现 | check.sh + versions 双视图能力键断言（B3a 时期缺席 → B3b 时期出现） |
@@ -410,7 +410,7 @@ P4  v3 流量归零判据（access log + SSE active，行 248）→ sidecar 5.0.
   - B2：兼容验证断言（merged 正文与缺省 skeleton 同源、无 `truncated` 泄漏）**~6 case**
   - B4：新路由（context/agent/model/revert）+ allowlist 三态矩阵（未配置/显式空/非空）**~30 case**
   - B3a：selector 双版本全矩阵 + 跨版本错误优先级真值表 + config 迁移 + DB 投影源全测试面（schema 门/熔断含最小样本与 hysteresis/并发模型/inode/路径解析/降级矩阵逐格/EQP/等价性锚定/cursor/roots-422）**~120 case**
-  - B3b：重放协议全矩阵（gap/过期/背压/重启 epoch/重连/tokens=1 双序列/ID 无倒退）**~20 case**
+  - B3b：重放协议全矩阵（gap/过期/背压/重启 epoch/重连/tokens=1 → 400/ID 无倒退）**~20 case**
   - B6：合并后回归 + 退役相关测试更新（净变化保守为 0 附近）
 - **净变化**：v4 测试面新增（预计净增 ~180-200 参数化 case）> sticky/fan-out 高频面删除（行 216 "不承诺具体数，实测复核"）
 

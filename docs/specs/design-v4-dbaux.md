@@ -292,7 +292,7 @@ def resolve_db_path() -> ResolvedPath | Disabled:
 启动探测（§1.4）+ 错误重探（§4.2）共用：
 
 1. `session` 表存在，且**全部投影列**存在（缺任一 → 禁用辅助降级 HTTP）：
-   `id, parent_id, project_id, time_archived, time_updated, directory, title, agent, model, version, summary_*（additions/deletions/files/diffs）, tokens_*（input/output/reasoning/cache_read/cache_write）, time_*（created/updated/compacting/archived）, revert, permission, metadata`（行 146 通配展开 = 真库实测列名，R2 待裁决项：模板用真库列名）；
+   `id, parent_id, project_id, time_archived, time_updated, directory, title, agent, model, version, summary_*（additions/deletions/files/diffs）, tokens_*（input/output/reasoning/cache_read/cache_write）, time_*（created/updated/compacting/archived）, revert, permission, metadata`（行 146 通配展开 = 真库实测列名；R2 已实证关闭：模板 tokens_in/out 为撰写笔误，以真库列名 tokens_input/output 为准）；
 2. `project` 表存在且 join 列齐备：`id` + `name` + `worktree`（**契约冻结 `project={id,name,worktree}`**；v2.2 行 74 的 `directory` 列真库不存在——已实证，R1 关闭；门以实际投影读取的列为准）；
 3. 门校验方式：`PRAGMA table_info(session)` / `PRAGMA table_info(project)` 只读比对（不做任何写入/DDL 尝试）。
 
@@ -313,7 +313,7 @@ def resolve_db_path() -> ResolvedPath | Disabled:
 | title | `title TEXT NOT NULL` | ✓ |
 | agent / model / version | `agent TEXT` / `model TEXT` / `version TEXT NOT NULL` | ✓ |
 | summary_\* | `summary_additions/summary_deletions/summary_files/summary_diffs`（INTEGER×3 + TEXT） | ✓ |
-| tokens_\*（行 72 模板 tokens_in/out → R2） | `tokens_input/tokens_output/tokens_reasoning/tokens_cache_read/tokens_cache_write`（INTEGER NOT NULL） | ✓（列名待裁决 R2） |
+| tokens_\*（行 72 模板 tokens_in/out；R2 已实证关闭） | `tokens_input/tokens_output/tokens_reasoning/tokens_cache_read/tokens_cache_write`（INTEGER NOT NULL） | ✓（真库列名实证冻结） |
 | time_\* | `time_created/time_updated/time_compacting/time_archived` | ✓ |
 | revert / permission / metadata | `revert TEXT` / `permission TEXT` / `metadata TEXT` | ✓ |
 
@@ -421,9 +421,10 @@ result(req, db, al, cursor, search):
 
 ### 9.1 search = `LIKE ? ESCAPE '\'` + 规范化 hash 进 cursor 指纹（行 86）
 
-- **谓词**：`(:search IS NULL OR s.title LIKE :search ESCAPE '\')`；`:search` = `%` + 经过 **LIKE 字面转义**的用户子串 + `%`。
+- **规范化同源（rev-2 冻结）**：`normalized_search = trim(raw)` 为**唯一输入源**——SQL pattern 构造、`has_wildcard` 判定、cursor 指纹 hash **三者全部读取 normalized_search**（禁一处用 raw 一处用 trim——否则 `" foo "` 与 `"foo"` 两请求同 hash，后续页在错误过滤上下文续走）。指纹 = normalized_search 经转义后的串 hash（sha256 截断 8-16 hex）。
+- **谓词**：`(:search IS NULL OR s.title LIKE :search ESCAPE '\')`；`:search` = `%` + LIKE 字面转义（normalized_search）+ `%`。
 - **字面转义（冻结）**：用户输入中的 `%`、`_`、`\` 在构造 pattern 时以 `\` 前缀转义（`\%%`、`\_`、`\\`）；`ESCAPE '\'` 使 `%`/`_` 不再具备通配语义——**search 语义 = 字面子串匹配**（行 57「标题子串」契约兑现）。
-- **游标指纹**：search 的**规范化形式**（trim + 上述转义后的串）hash（如 sha256，截断 8-16 hex）进 cursor 指纹 `f.search_hash`（行 127）；**同一输入两次执行 → hash 相同（规范化算法确定性 = 测试断言）**；指纹不匹配 → 400 `invalid_cursor`（行 129）。
+- **游标指纹**：search 的规范化形式（normalized_search = trim(raw)，§「规范化同源」）hash 进 cursor 指纹 `f.search_hash`（行 127）；**同一输入两次执行 → hash 相同（规范化算法确定性 = 测试断言）**；指纹不匹配 → 400 `invalid_cursor`（行 129）。
 - 降级路径（rev-1 冻结，行 86 收紧）：DB 不可用（disabled/tripped）时——**search 含 `%`/`_`/`\` 任一字符 → 503 `auxiliary_unavailable`**：不可等价表达——上游降级透传为 `LIKE '%…%'` 且**无 ESCAPE**（session.ts:563 实证），`%`/`_` 在 SQLite LIKE 中为**通配符**，会放大行集（如 `search="100%"` 会匹配含 `100%` 之外的行），与 DB 侧字面转义子串行集不同 → 违反「过滤语义永不降级」（行 123）；`\` 在上游无 ESCAPE 声明时为字面（与 DB 侧字面一致，理论可等价）——纳入 503 为**保守加宽**（仅牺牲少数本可等价的反斜杠搜索，换取规则单一）；**判定函数 `has_wildcard(s) = any(c in s for c in '%_\\')` 为确定性函数（与 §9.1 游标指纹规范化共用同一判定 → 同输入两次执行结果一致，指纹 hash 确定性断言覆盖）**。**纯字面子串**（无 `%`/`_`/`\`）→ 透传上游等价（`%…%` 包裹下与字面子串匹配一致）→ 按 §7 Class A/B 规则走（Class A → 200+degraded（降级披露），Class B → 503）。
 
 ### 9.2 complete = LIMIT+1 同 snapshot（行 81, 137）
@@ -462,7 +463,7 @@ result(req, db, al, cursor, search):
 - **DB 投影侧**：空串行在过滤谓词中按**字面空串**参与（`directory=''` 只匹配空串本身）；allowlist 不含空串目录（入口校验拒绝）→ 空 directory 行在 allowlist 非空查询中天然被排除（属允许语义——legacy 行无目录归属）。
 - **复刻必要性**（行 87 论证）：若 DB 侧把空串当「无目录」而非字面值，会与 HTTP 路径（上游 fromRow 同名语义）对同一行集**分叉** → 过滤 SQL 必须复刻「空串原样」语义。
 
-### 9.5 测试用例表（~17 参数化，B3a-B2 落地；断言 = 行集精确匹配 + 指纹 hash 确定性）
+### 9.5 测试用例表（17 行集/状态 case + 2 指纹 case ≈ 19 参数化，B3a-B2 落地；断言 = 行集精确匹配 + 指纹 hash 确定性）
 
 | # | 组 | case | 断言 |
 |---|---|---|---|
@@ -472,7 +473,7 @@ result(req, db, al, cursor, search):
 | 10-11 | legacy 空 directory 分叉 | ⑩ 空 directory 行：allowlist 空 → 出现在结果（无谓词）；⑪ allowlist 非空（不含空串）→ 空 directory 行被排除（`substr('',…)` 与 `= :d_raw` 均不命中，允许语义）——与 HTTP 路径对同一行集不产生第二套行为 | 行集与「既定语义」一致 |
 | 12 | 键集下界 | ⑫ cursor 锚点后无更多行 → 返回 0 行 + complete:true（空窗口闭合） | 行集 + complete |
 | 13-14 | search × DB 不可用（降级规则，rev-1 Fix 2） | ⑬ search 含 `%`（如 `100%`）× db 不可用 → **503 `auxiliary_unavailable`**（`has_wildcard` 判定）；⑭ search 纯字面 × db 不可用 Class A → **200 + `degraded:true`**（透传等价） | 状态码 + degraded 精确（oracle 同 §7.2 / §9.1） |
-| 15-17 | allowlist 二进制前缀边界（rev-1 Fix 3） | ⑮ 大小写：allowlist `/foo` 不匹配 `/Foo/child`（`substr`=` BINARY`；对照旧 LIKE 会误放行——实测 `'Foo' LIKE 'foo'`=1 / `'Foo' = 'foo'`=0）；⑯ 根 `/` 全匹配：allowlist `{/}` → 命中所**有非空绝对路径**（`substr(x,1,1)='/'`）；⑰ 路径段含 `%`/`_` 字面：allowlist `/a` 子树命中 `/a%20b/c` 且 `%` 不放大（无通配语义） | 行集精确匹配 |
+| 15-17 | allowlist 二进制前缀边界（rev-1 Fix 3） | ⑮ 大小写：allowlist `/foo` 不匹配 `/Foo/child`（`substr`=` BINARY`；对照旧 LIKE 会误放行——实测 `'Foo' LIKE 'foo'`=1 / `'Foo' = 'foo'`=0）；⑯ 根 `/` 全匹配：allowlist `{/}` → 命中所**有非空绝对路径**（`substr(x,1,1)='/'`）；⑰ 路径段含 `%`/`_` 字面：allowlist `/a` 子树命中 `/a/%20b/c` 与 `/a/dir_%_x`（`%`/`_` 字面不放大）；**同前缀异名不命中**：`/a%20b/c`（`/a` 的同层异名目录，同 `/foobar` 边界）**不在** `/a` 子树 | 行集精确匹配 |
 | +2 | 指纹确定性 | 同 input 两次执行 cursor 指纹（search-hash / allowlist-rev）hash 相同；input 变化（search 或 allowlist）hash 变化；`has_wildcard` 判定与指纹规范化共用同一确定性函数 | hash 值相等/不等断言 |
 
 ---

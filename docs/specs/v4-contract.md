@@ -192,15 +192,15 @@ v3 原样（§4.4 已含 v4 差异：v4 sessions 无 ETag）。
 
 ### §7.1 id: 语法与序列（提案口径）
 
-- `id: <epoch>:<seq>`（冒号分隔，纯十进制）——epoch = 进程代（unixtime_ms，**重启必换**；不随 SSE 重连更换），seq = 单调递增。
-- **ID 域独立**：全局流 `/events` = 全实例策展帧**单一序列**（一个 epoch 一个 seq 计数器）；token 流 = per-sid 独立序列（域键 = sid）。同 epoch 下两域 seq 空间不相交；跨端点 `Last-Event-ID` 视为无效（忽略重置按首连处理）。
+- ID 语法（域标签编入，冻结）：`id: g:<epoch>:<seq>`（全局流 `/events`）；`id: t:<sid>:<epoch>:<seq>`（token 流 `/sessions/{sid}/stream`）。epoch = 进程代（**随机 boot nonce 16 hex，非墙钟、无序、不比较大小**——墙钟可回拨/碰撞；**重启必换**、不随 SSE 重连更换），seq = 单调递增。
+- **ID 域独立 + 机械判定**：全局流 = 全实例策展帧**单一序列**；token 流 = per-sid 独立序列（域键 = sid 编入 ID）。服务端按域标签判定：前缀非 `g`/`t` → 格式非法；`g:` 到 `/stream` 或 `t:` 到 `/events` → 跨端点域；`t:<sid>` 与路径 sid 不符 → 跨 sid 域——三者一律忽略 + 重置（按首连；跨域混用属客户端协议违约，不报错不 resync）。
 - 帧分类：业务帧 / digest 分配 id；meta / resync / heartbeat **无 id**（不参与序列）。
 - **ID 无倒退不变式**：任一连接上线后带 `id:` 帧严格单调不减（§7.0② 线序保障）。
 
 ### §7.2 重放语义（提案口径）
 
 - 有界重放日志（新组件，count/bytes/TTL 三维上限，环形覆盖）——现 GlobalHub pending（250ms debounce）与 tombstone 队列**不是** replay log；与既有 token 域重放队列（cap 1000/TTL 24h）并存不混用。
-- `Last-Event-ID` 重连：缺口在日志窗口内 → 补发 replay 帧；ID 过期（早于窗口）→ 发 resync 提示帧（客户端全量对齐）；**epoch 归类（冻结，四类拆分）**：旧合法 epoch（格式合法、epoch < 当前，即进程重启）→ `resync{reason:"epoch_changed"}`；future（epoch > 当前 或 seq > 已发布 max）→ 忽略 + 重置（按首连）；格式非法 / 跨端点域 → 忽略 + 重置。
+- `Last-Event-ID` 重连：缺口在日志窗口内 → 补发 replay 帧；ID 过期（早于窗口）→ 发 resync 提示帧（客户端全量对齐）；**epoch 归类（冻结，四类拆分）**：旧 epoch（格式合法、epoch ≠ 当前——随机 nonce 无序不比较大小，即进程重启前世界）→ `resync{reason:"epoch_changed"}`；future（同 epoch 且 seq > 已发布 max）→ 忽略 + 重置（按首连）；格式非法 / 跨端点域 / 跨 sid 域 → 忽略 + 重置。
 - gap 处理：区分「日志逐出」（→ resync）vs 合法缺席（单一/per-sid 域下不存在跨域合法空洞）。**snapshot 不是服务端帧**——resync 后客户端自行 HTTP 全量对齐（全局域如 `/slimapi/sessions` 首屏、token 域重拉消息投影），服务端只发 meta → resync → 新帧。逐出-发布并发的边界 gap 误判风险为实现期待验证项（design-v4-sse-replay.md §5 待裁决 5，可降级防御分支，不影响 wire 语义）。
 - 背压：溢出帧**入**重放日志（日志记录「已发布帧」而非「已送达帧」）；订阅端溢出断连 → 重连走 Last-Event-ID 重放。
 - **resync 帧 reason 值域（v4 冻结，加性扩展）**：`epoch_changed` | `replay_expired` | `replay_gap` | `reconnect_no_replay`（既有）；token 流 tombstone（消息已撤销）在 replay 时**照常消耗其 seq 并以 `message.removed` 轻量撤销帧回放**（既有帧形 `tokenstream/frames.py:137-151` = `event: message.removed` + `{sessionID, messageID}`；保留 `id:`，维持 ID 序列无空洞）。
