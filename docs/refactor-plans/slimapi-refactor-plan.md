@@ -153,7 +153,7 @@ v2.2 行 152：*"digest 帧增强（v3 安全加性，B1a）：`session.digest` 
 
 | 任务 | 改动文件/模块 | 实现要点 | 验收标准 | 测试 |
 |---|---|---|---|---|
-| B1a-1 changed 字段实现 | `src/oc_slimapi/sse/hub_types.py`（DigestFields 区域，行 134-196）、`src/oc_slimapi/sse/global_hub.py`（publish/flush 路径） | DigestFields 增 `changed` 字段；flush 时聚合本窗口内发生变化的 sid 列表进帧载荷（**触发语义**见 §8.1 问题 2——核准补充事实：digest 帧为 per-sid 逐帧产出（sse/global_hub.py:392,419），changed 聚合口径待 owner 裁决；最小语义 = 与帧字段一致的 sid 集） | 帧形加字段且**仅此一项**（v2.2 行 152 "仅此一项新增"）；v3 旧客户端忽略（契约既有"消费方必须忽略未知字段"） | digest 帧 changed 出现/缺席断言；SSE 帧形回归（v3 §11.6 测试面扩展） |
+| B1a-1 changed 字段实现 | `src/oc_slimapi/sse/hub_types.py`（DigestFields 区域，行 134-196）、`src/oc_slimapi/sse/global_hub.py`（publish/flush 路径） | DigestFields 增 `changed` 字段；flush 时聚合本窗口内发生变化的 sid 列表进帧载荷（**触发语义已裁决**（owner，2026-08-17，§8.2）= 最小语义 `changed:[本帧sid]`——digest 为 per-sid 逐帧产出（sse/global_hub.py:392,419），帧出现即 changed；形状保留列表为未来聚合留形） | 帧形加字段且**仅此一项**（v2.2 行 152 "仅此一项新增"）；v3 旧客户端忽略（契约既有"消费方必须忽略未知字段"） | digest 帧 changed 出现/缺席断言；SSE 帧形回归（v3 §11.6 测试面扩展） |
 | B1a-2 契约修订 | `docs/specs/v3-contract.md` §7 | 帧形加字段的正式修订 + 旧客户端兼容说明（v2.2 行 152） | §7 修订完成；`[冻结]` 标注 | — |
 | B1a-3 CHANGELOG | `CHANGELOG.md`（3.3.0 节） | 行为描述：digest changed 字段（供 ocdroid 定向精拉） | 3.3.0 节条目齐（release.md §3.2 前置） | — |
 
@@ -255,7 +255,7 @@ v2.2 行 270：*"wire v4 第二刀：SSE id:/重放日志 + q/p 帧补全（若�
 | 任务 | 改动文件/模块 | 实现要点 | 验收标准 | 测试 |
 |---|---|---|---|---|
 | B3b-1 有界环形重放日志 | 新 `src/oc_slimapi/sse/replay_log.py` + `config.py`（上限参数段）+ `app.py`（装配段） | v4 新有状态组件（行 213 "+1"）：count/bytes/TTL 上限；进程 epoch（随机 boot nonce）+ 单调 seq；全局流与 token 流**独立 ID 域**（域标签编入 ID，行 153）；帧 ID 分配（**业务帧/digest 有；meta/resync/heartbeat 无**——B0 rev-1 冻结，重连 meta 分配新 seq 会与 replay 旧 seq 倒退）；与既有 tombstone 队列并存不混用（B0-3 设计落地） | 日志上限（count/bytes/TTL）生效；ID 单调 | 上限边界；epoch 重启；独立域隔离 |
-| B3b-2 SSE id:/重放 | `src/oc_slimapi/routes/events.py`、`routes/token_stream.py`、`sse/global_hub.py`（产出路径） | **前提**：S-B01 ②③④ owner 终裁（B0 提案已上报）；①已裁（tokens=1 v4 = 400）。v4 端点发 `id:`（域标签语法 `g:<epoch>:<seq>` / `t:<sid>:<epoch>:<seq>`，epoch = 随机 boot nonce 非墙钟——B0 rev-2 冻结，见 design-v4-sse-replay §3）；`Last-Event-ID` 触发重放；expired/future/旧 epoch/gap 处理（**旧 epoch → resync{epoch_changed}；gap → 服务端仅发 meta→resync→新帧，snapshot 是客户端 HTTP 动作非服务端帧**）；**tokens=1 复用流已裁决 = v4 一律 400 `tokens_stream_retired_in_v4`**（§8.2，非二选一）；与 meta-first（meta 仍首帧）/背压/上游重连的顺序（行 153）；**v3 SSE 帧名帧形零变化**（行 153 冻结） | 重放协议全矩阵绿（18 条 REPLAY 用例）；ID 无倒退断言（同 epoch 同域内）；v3 SSE 零回归 | 重放矩阵：正常/缺口/过期/旧 epoch/future/非法/跨域/背压/重连/barrier 边界三连+token 离线拦截；gap → resync 断言（+客户端 HTTP 全量对齐另行断言）；tokens=1 → 400 断言（B0-6f grep + REPLAY-009）；ID 单调（REPLAY-010/011，域标签隔离） |
+| B3b-2 SSE id:/重放 | `src/oc_slimapi/routes/events.py`、`routes/token_stream.py`、`sse/global_hub.py`（产出路径） | **前提已满足**：S-B01 四项全部 owner 终裁（2026-08-17，§8.2——②③④按 design-v4-sse-replay §2.2-2.4 提案原文冻结；①tokens=1 v4 = 400）。v4 端点发 `id:`（域标签语法 `g:<epoch>:<seq>` / `t:<sid>:<epoch>:<seq>`，epoch = 随机 boot nonce 非墙钟——B0 rev-2 冻结，见 design-v4-sse-replay §3）；`Last-Event-ID` 触发重放；expired/future/旧 epoch/gap 处理（**旧 epoch → resync{epoch_changed}；gap → 服务端仅发 meta→resync→新帧，snapshot 是客户端 HTTP 动作非服务端帧**）；**tokens=1 复用流已裁决 = v4 一律 400 `tokens_stream_retired_in_v4`**（§8.2，非二选一）；与 meta-first（meta 仍首帧）/背压/上游重连的顺序（行 153）；**v3 SSE 帧名帧形零变化**（行 153 冻结） | 重放协议全矩阵绿（18 条 REPLAY 用例）；ID 无倒退断言（同 epoch 同域内）；v3 SSE 零回归 | 重放矩阵：正常/缺口/过期/旧 epoch/future/非法/跨域/背压/重连/barrier 边界三连+token 离线拦截；gap → resync 断言（+客户端 HTTP 全量对齐另行断言）；tokens=1 → 400 断言（B0-6f grep + REPLAY-009）；ID 单调（REPLAY-010/011，域标签隔离） |
 | B3b-3 q/p 帧补全 | `src/oc_slimapi/sse/global_hub.py`（q/p 直推路径）+ `v4-contract.md` §7 | **仅当 B0-4 核对结论 = 缺字段**（行 164, 270 "若需"）：question.asked / permission.asked 帧补全 properties 为完整对象（v4-only） | 补全后 `qpImmediateFull` 语义成立 | 帧补全用例（对照上游 schema） |
 | B3b-4 meta v4 扩展 | `src/oc_slimapi/routes/events.py`、`routes/token_stream.py` | `slimapi.meta` v4 additive 扩展：capabilities 摘要 + epoch/seq 基线字段（行 154）；v3 形状不动 | v3 meta 帧零变化；v4 扩展字段出现 | meta 双版本断言 |
 | B3b-5 契约/观测/能力广告同步 | `v4-contract.md` §7/§9、`INTERFACE_MAP.md`、`CHANGELOG.md`（4.0.0 节）、`routes/versions.py` | replay hit/miss/gap 观测（行 254 §9）；**能力键广告（n1）**：本批实现落地时 `capabilities["4"]` 追加 `sseReplay`（+`qpImmediateFull`：若 B0-4 核对=已完整则现状已成立，随本批与 sseReplay 同批广告；若需补全则由 B3b-3 完成后再广告）——**与实现同批启用，绝不提前广告** | 契约与实现一致；能力键仅在实现落地后出现 | check.sh + versions 双视图能力键断言（B3a 时期缺席 → B3b 时期出现） |
@@ -507,18 +507,13 @@ v2.2 行 96-97, 100 定义的禁用链（**运维无需改代码**）：
 > 2026-08-17 核准（fixer-glm）：原 10 项经 v2.2 / v3-contract / src 事实核对重组——7 项可凭既有权威文本就地解决（§8.2 存档），3 项确需 owner / 三方评审裁决，另核准新发现 1 项契约冲突（最高优先级）。
 > **2026-08-17 R2（fixer-ds，双评审收敛）**：① §8.1 问题 1（B2×[3.2.0] 冲突）**已由 owner 裁决关闭**（TextPart.text 永不截取全量内联，400 码点废止）→ 移入 §8.2 存档；② §8.1 问题 4（sweep 组件账目）**随 v2.2 §5 修订闭合**（15→17 phase-aware，sweep 调度器 + DB-aux 生命周期独立计账）→ 移入 §8.2 存档，B6-3 按其复核；③ **新增问题 5（SSE 协议裁决门槛，S-B01，rev-sgpt 阻断）**——§8.1 待裁决项净剩 3 项。
 
-### 8.1 待 owner 裁决（B0 后净剩 1 项：S-B01 ②③④ 待终裁）
+### 8.1 待 owner 裁决（B0 后净剩 0 项）
 
-> **2026-08-17 B0 批写回（omni-orch 会话三项 owner 裁决落定）**：原问题 2（changed 触发语义）、原问题 3（B1b exit 口径）**已裁决关闭**移入 §8.2 存档；S-B01 **①已裁决关闭**（v4 禁止复用），②③④由 B0-3 设计文档（`docs/specs/design-v4-sse-replay.md`）产出裁决方案，随 B0 汇报上报 omni-orch 升 owner 定夺后方可冻结进 v4-contract §7——**B0 出门 gate 仍要求四项全部收敛记录**（①终裁 + ②③④提案在案）。
+> **2026-08-17 B0 批写回（omni-orch 会话三项 owner 裁决落定）**：原问题 2（changed 触发语义）、原问题 3（B1b exit 口径）**已裁决关闭**移入 §8.2 存档。
+>
+> **2026-08-17 B0 收尾（omni-orch 终裁通知）**：**S-B01 四项全部 owner 终裁（2026-08-17）**——①v4 禁止复用（tokens=1 → 400）；②③④按 `docs/specs/design-v4-sse-replay.md` §2.2-2.4 提案原文全部通过冻结（含上游断连 barrier 机制、REPLAY-001~018、resync reason 值域 `epoch_changed`/`replay_expired`/`replay_gap`/`reconnect_no_replay`）。原问题 5（SSE 协议裁决门槛）关闭移入 §8.2 存档；B0 出门 gate 四项收敛记录齐备。**§8.1 待裁决清单清空**。
 
-1. **SSE 协议裁决门槛（S-B01，rev-sgpt 阻断）**：SSE id:/重放的四个协议前提彼此耦合且 v2.2 行 153 未定稿，**不收敛则 B0 不出门、`sseReplay:true` 不得进 v4 capability**（n1 联动）：
-   - ① **tokens=1 统一流——已裁决关闭（owner，2026-08-17）**：**v4 禁止复用**——`/events?tokens=1` 请求在 v4 返回 400，token 流必须走独立 `/sessions/{sid}/stream`。理由：单 Last-Event-ID 无法恢复双序列（meta-first 与重放顺序结构性矛盾：重连新 meta 分配新 seq 后发旧 replay 帧 = 线上 ID 倒退）；webui/ocdroid 本就分离两连接，成本最低。已写入 v4-contract §7.0/§7.3 与 design-v4-sse-replay.md（[已裁决]）。
-   - ② **meta 重连语义**（**B0-3 设计提案待 owner 终裁**，方案+论证见 `docs/specs/design-v4-sse-replay.md`）：重连 meta 是否带 `id:`、epoch 更换规则、严格线序定义（meta → replay → 新帧的无倒退顺序）；
-   - ③ **token ID 作用域**（**B0-3 设计提案待 owner 终裁**，同上）：全局 / per-sid / 每连接——全局序列因其他 sid 消费 seq 产生合法空洞，**gap 不能当丢帧**（须区分「消费者缺席 seq」vs「日志逐出」）；
-   - ④ **两端点逐帧状态机**（**B0-3 设计提案待 owner 终裁**，同上）：`/events` 与 `/sessions/{sid}/stream` 各自的 replay / snapshot / resync 完整帧序列表（含 epoch 切换、背压、subscriber 溢出）。
-   - 裁决输入 = B0-3 设计文档逐项方案+论证；冻结 gate = 四项终裁记录进 v4-contract §7 定稿（①已完成，②③④随 B0 汇报上报）。
-
-### 8.2 已就地解决 / 已裁决（12 项存档——9 项凭既有权威文本解决 + 3 项 B0 批 owner 裁决，结论已写回对应批次）
+### 8.2 已就地解决 / 已裁决（13 项存档——9 项凭既有权威文本解决 + 4 项 B0 批 owner 裁决，结论已写回对应批次）
 
 | 原问题 | 就地结论 | 依据 | 写回落点 |
 |---|---|---|---|
@@ -526,6 +521,7 @@ v2.2 行 96-97, 100 定义的禁用链（**运维无需改代码**）：
 | **（B0）S-B01 ①：tokens=1 统一流** | **已裁决关闭**（owner，2026-08-17 omni-orch 会话）：**v4 禁止复用**——`/events?tokens=1` 请求在 v4 返回 400，token 流必须走独立 `/sessions/{sid}/stream`。理由：单 Last-Event-ID 无法恢复双序列（meta-first 与重放顺序结构性矛盾：重连新 meta 分配新 seq 后发旧 replay 帧 = 线上 ID 倒退）；webui/ocdroid 本就分离两连接，成本最低 | owner 裁决（B0 工单 PRE 记录）+ v2.2 行 153 | B0-3 / B3b-2 / v4-contract §7.0/§7.3 / design-v4-sse-replay.md |
 | **（B0）原 §8.1 问题 2：B1a digest `changed` 触发语义** | **已裁决关闭**（owner，2026-08-17 omni-orch 会话）：**最小语义**——`changed:[本帧sid]`（digest 为 per-sid 逐帧产出，帧出现即 changed，覆盖全部触发 digest 的事件：message.*/status/archived/deleted/updatedAt）；形状保留 `[sid…]` 列表为未来聚合留形；sidecar 零新增状态 | owner 裁决（B0 工单 PRE 记录）+ sse/global_hub.py:392,419 事实 | B1a-1 / v3-contract §7 修订 |
 | **（B0）原 §8.1 问题 3：B1b 阶段 2 exit criteria 口径** | **已裁决关闭**（owner，2026-08-17 omni-orch 会话）：**B1b-5 现稿确认**——稳态窗连续 7 日；公式 = 真实 sweep 请求 + 事件驱动 + 客户端 q/p 相关请求合计 < 阶段 1 同期（7 日）实际基线（shadow 模拟计数不入基线）；载体 = traffic snapshot（保留期配置 >7 天）为主、access log（RETAIN_DAYS=3）短窗辅助；cold-set 长尾可达性作并列判据 | owner 裁决（B0 工单 PRE 记录）+ 本方案 §2.3 B1b-5 现稿 | B1b-5 / §6.1 回退 |
+| **（B0）S-B01 ②③④：meta 重连语义 / token ID 作用域 / 逐帧状态机（原 §8.1 问题 5）** | **已裁决关闭**（owner 终裁通知，2026-08-17 omni-orch）：**按 B0-3 设计提案全部通过**——② 重连 meta 不带 `id:`、epoch 仅进程重启更换、线序 meta→replay→新帧单调；③ token 流 per-sid 序列 + 全局流单序列，ID 语法 `g:<epoch>:<seq>` / `t:<sid>:<epoch>:<seq>`；④ 两端点状态机逐帧序列表（含上游断连 barrier 机制、四条通用不变量、REPLAY-001~018）。resync reason 值域冻结 = `epoch_changed`/`replay_expired`/`replay_gap`/`reconnect_no_replay`。S-B01 四项全部收敛，B0 出门 gate 满足 | owner 终裁（2026-08-17 omni-orch 通知）+ B0 rev-6 PASS-with-notes + design-v4-sse-replay §2.2-2.4 提案原文（冻结基线） | v4-contract §7（收敛冻结记录）/ design-v4-sse-replay §2/§5 / B3b-2 |
 | （R2）**问题 4：sweep 组件账目口径** | **随 v2.2 §5 修订闭合**：账目 15→**17 phase-aware**（P1 16 = 15+sweep 调度器 → P3 18 = +DB-aux 生命周期 + replay log → B6 后 17 = −singleflight 合并）——sweep 调度器与 DB-aux 生命周期**独立计账**已由 v2.2 裁决；B6-3 按此复核 | v2.2 §5（m00488 修订）+ 本方案 §2.8 B6-3 | B6-3 / §7 |
 | 2（SERVER_API_VERSION 双视图） | `server.api_version`（与 `schema.version` 同源同值）**按请求 wireVersion 取视图值：v3 视图=3、v4 视图=4，禁止错配组合**；实现由单一常量改为视图映射 + **env `OC_SLIMAPI_SERVER_API_VERSION` 双版本期废弃（R2 S-B04 增补）** | v3-contract §3a 冻结先例（v2/v3 期 v2 视图=2 / v3 视图=3、同源同值、禁止 3/2 组合；health.py:37 现状）+ v2.2 行 254 §3「双视图」 | B3a-A1 |
 | 3（revert 三段式并存） | 三段式 = **加性新路由**；既有单步 `POST /slimapi/session/{id}/revert`（v3 §10.b #8）保持不动；上游三段式端点/payload 形状 = B4 实现前置核对（非裁决项） | v2.2 §3.4「B4 加性，v=3 即可用」+ 本方案 P1 零 breaking | B4-3 |
@@ -537,4 +533,4 @@ v2.2 行 96-97, 100 定义的禁用链（**运维无需改代码**）：
 
 ---
 
-*（完）本方案为 oc-slimapi 侧工程执行细化；技术裁决全部引用 v2.2 行号，未新增决策（2026-08-17 核准修订与 R2 双评审修复除外，见头注）。§8.1 现仅剩 S-B01 ②③④（SSE meta 重连语义 / token ID 作用域 / 逐帧状态机——①tokens=1 与 changed / B1b exit 口径已裁决关闭移入 §8.2）：B0-3 已产出设计提案（`docs/specs/design-v4-sse-replay.md` §2），随 B0 汇报上报 owner 终裁后冻结进 v4-contract §7；§8.2 十二项已凭既有权威文本或 owner 裁决就绪并写回对应批次。*
+*（完）本方案为 oc-slimapi 侧工程执行细化；技术裁决全部引用 v2.2 行号，未新增决策（2026-08-17 核准修订与 R2 双评审修复除外，见头注）。§8.1 待裁决清单**已清空**（S-B01 四项全部 owner 终裁，2026-08-17：①tokens=1 禁止复用 + ②③④按 design-v4-sse-replay §2.2-2.4 提案原文冻结）；§8.2 十三项已凭既有权威文本或 owner 裁决就绪并写回对应批次。*

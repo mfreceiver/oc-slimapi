@@ -16,6 +16,7 @@
 | 2026-08-17 rev-3 | 评审修复 R4：§2.3 ID 语法与 §3.2 统一（域标签单一语法）；**上游断连恢复状态机补全**（两端点表行 + §3.5 触发条件冻结 + REPLAY-014——fanout resync{reconnect_no_replay}，epoch 不变 seq 不重置，禁 replay log 补上游缺口）；**Last-Event-ID 分类优先级冻结**（语法→域→epoch→seq 严格短路序 + REPLAY-015 组合输入）；search 规范化扩至 HTTP 降级路径（第四消费点，hash 输入 = trim 后转义前精确化） |
 | 2026-08-17 rev-4 | 评审修复 R5：**上游断连持久 barrier**（§3.4——每受影响域日志写 low-watermark，Last-Event-ID 不晚于水位即拦截（本行原文"早于"，边界经 rev-5 勘误为 **≤**）→ resync{reconnect_no_replay}，防离线客户端跨缺口静默重放 + REPLAY-017）；**触发时点勘误**（首次确认 loss 即触发——EOF `global_hub.py:894-904`/异常 `:913-922` 为主，成功重连 `:847-863` 仅兜底，非"恢复成功才触发"）；REPLAY 重编号（心跳复归 014，新增 015/016/017，共 17 条）；REPLAY-016 旧 epoch 分支补 meta 恒首帧断言 |
 | 2026-08-17 rev-5 | 评审修复 R6：**barrier 边界 off-by-one 勘误**（判定 = seq **≤** 水位一律拦截——水位本身对应的帧亦发布于缺口前，客户端不知情；REPLAY-017 边界三连断言：水位-1/水位/水位+1）；**写入范围冻结**（全局域 + 当前 epoch 内全部已创建 per-sid 域，不限在线订阅者 + REPLAY-018 token 离线变体）；**保留生命周期冻结**（不受 count/bytes/TTL 逐出；仅窗口下界严格越过后可删；域回收保留失效水位/fail-safe resync；进程重启归 epoch_changed）；措辞定位 = S-B01④提案内冻结口径（随④待 owner 终裁）；REPLAY 计数 17→18 |
+| 2026-08-17 owner 终裁 | **S-B01 四项全部裁决（omni-orch 通知）**：②meta 重连语义、③token ID 作用域（per-sid + 全局流单序列）、④两端点状态机逐帧序列表（含上游断连 barrier、四条通用不变量、REPLAY-001~018）**按本稿 §2.2-2.4 提案原文全部通过冻结**；resync reason 值域冻结 = `epoch_changed`/`replay_expired`/`replay_gap`/`reconnect_no_replay`；v4-contract §7 收敛冻结记录已同步 |
 
 ---
 
@@ -38,7 +39,7 @@
 
 ## 2. S-B01 协议裁决门槛（B0 出门 gate）
 
-> 来源：refactor-plan §8.1 问题 5，四项裁决未收敛则 B0 不出门、`sseReplay:true` 不得进 v4 capability。①为已裁决项；②③④为本稿设计提案，**待 owner 裁决**。
+> 来源：refactor-plan §8.1 问题 5，四项裁决未收敛则 B0 不出门、`sseReplay:true` 不得进 v4 capability。**S-B01 四项已全部 owner 终裁（2026-08-17）**：①tokens=1 禁止复用（400）；②③④按本稿 §2.2-2.4 提案原文冻结。
 
 ### 2.1 ① tokens=1 统一流 —— [已裁决，owner 2026-08-17]
 
@@ -52,7 +53,7 @@
 
 **落地**：v4 路由层 `events.py` 对 `tokens == "1"` 直接 400 `tokens_stream_retired_in_v4`（v3 行为在 v3 契约冻结，v4 才拦截）；`INTERFACE_MAP` 同步记录。
 
-### 2.2 ② meta 重连语义 —— [设计提案，待 owner 裁决]
+### 2.2 ② meta 重连语义 —— [已裁决，owner 2026-08-17]
 
 **提案：重连后 meta 帧不带 `id:`；epoch 不随 SSE 重连更换；线序 = meta（无 ID）→ replay 帧（seq 严格递增）→ 新帧（seq 继续）。**
 
@@ -75,7 +76,7 @@ data: {
 }
 ```
 
-### 2.3 ③ token ID 作用域 —— [设计提案，待 owner 裁决]
+### 2.3 ③ token ID 作用域 —— [已裁决，owner 2026-08-17]
 
 **提案：token 流 per-sid 序列（每 sid 独立计数）；全局流 `/events` = 该全局输出流自身的单一序列（一个 epoch 一个 seq 计数器，全实例所有策展帧共序）。**
 
@@ -91,7 +92,7 @@ data: {
 
 **ID 语法（冻结，与 §3.2 同一）**：`id: g:<epoch>:<seq>`（全局流）；`id: t:<sid>:<epoch>:<seq>`（token 流）——域标签 + epoch（16 hex 随机 boot nonce）+ seq（纯十进制）。全局流与 token 流独立 ID 域：全局流 = `(epoch, 全实例单序列 seq)`；token 流 = `(epoch, per-sid seq)`。客户端不得跨流混用 `Last-Event-ID`（域标签使跨端点/跨 sid 混用可机械判定，§3.2）。
 
-### 2.4 ④ 两端点状态机逐帧序列表 —— [设计提案，待 owner 裁决]
+### 2.4 ④ 两端点状态机逐帧序列表 —— [已裁决，owner 2026-08-17]
 
 **状态机：`CONNECTING → ESTABLISHED → (RECONNECT → REPLAYING → ESTABLISHED)`；resync 为终止性转移（进入 `RESYNCED` 全量路径）。**
 
@@ -164,7 +165,7 @@ id: t:<sid>:<epoch>:<seq>        # token 流 /sessions/{sid}/stream（t = token 
 | TTL | 15 min/帧 | 帧入日志时间 + TTL，到期逐出（滑窗） |
 
 - **覆盖策略**：环形缓冲，逐出最旧；任一维度触顶即逐出最旧帧，直至低于阈值。逐出后对应 seq 区间不可补 → 客户端 Last-Event-ID 落此区间 = 过期 → resync（2.4 表格）。
-- **上游断连 barrier（S-B01④提案内冻结口径，随④一并待 owner 终裁；low-watermark 数据结构为实现细节）**：sidecar 检测到上游 loss 时，除 fanout 存量订阅者外，写入不可跨越的 barrier（low-watermark = 断连时刻该域已发布 max seq；进程内存**日志元数据，非帧**）。**写入范围（受影响域全集）**：全局域 + 当前 epoch 内已创建的**全部** per-sid 域——**不限于断连时有在线订阅者的 sid**（离线 token 客户端同样须被拦截）。**重放判定增补一条（优先级在 ④窗口判定内）**：Last-Event-ID 的 seq **≤ 本域最近 barrier 水位** → 一律 `resync{reason:"reconnect_no_replay"}`——水位本身对应的帧亦发布于缺口之前，持有该 ID 的客户端不知情，**等于水位同样拦截**（不得补发 barrier 后窗口内帧）；seq **> 水位** → 正常走窗口/过期/gap 判定。barrier 前后之间存在 sidecar 未观察到的上游事件缺口，**禁止跨 barrier 补帧**（窗口内连续不构成补帧依据）。**保留生命周期（不作为普通帧逐出）**：barrier 不受 count/bytes/TTL 三维逐出；仅当日志窗口下界已**严格越过** barrier 水位（此后所有 seq ≤ barrier 的 cursor 必被 `replay_expired` 拦截，barrier 判定冗余）方可删除；per-sid 域对象因零订阅者回收时，须**保留失效水位**（或使同 epoch 旧 cursor fail-safe 进 resync——**不得**视作普通首连/空日志放行）；进程重启 = epoch 更换，旧 epoch cursor 由 `epoch_changed` 拦截（barrier 随进程消亡无影响）。上游恢复后新帧继续单调（seq 不重置，barrier 不消耗 seq）；多轮断连 → 每轮各写一 barrier（水位单调递增，判定只看最近一个即可）。
+- **上游断连 barrier（S-B01④已裁决冻结，owner 2026-08-17；low-watermark 数据结构为实现细节）**：sidecar 检测到上游 loss 时，除 fanout 存量订阅者外，写入不可跨越的 barrier（low-watermark = 断连时刻该域已发布 max seq；进程内存**日志元数据，非帧**）。**写入范围（受影响域全集）**：全局域 + 当前 epoch 内已创建的**全部** per-sid 域——**不限于断连时有在线订阅者的 sid**（离线 token 客户端同样须被拦截）。**重放判定增补一条（优先级在 ④窗口判定内）**：Last-Event-ID 的 seq **≤ 本域最近 barrier 水位** → 一律 `resync{reason:"reconnect_no_replay"}`——水位本身对应的帧亦发布于缺口之前，持有该 ID 的客户端不知情，**等于水位同样拦截**（不得补发 barrier 后窗口内帧）；seq **> 水位** → 正常走窗口/过期/gap 判定。barrier 前后之间存在 sidecar 未观察到的上游事件缺口，**禁止跨 barrier 补帧**（窗口内连续不构成补帧依据）。**保留生命周期（不作为普通帧逐出）**：barrier 不受 count/bytes/TTL 三维逐出；仅当日志窗口下界已**严格越过** barrier 水位（此后所有 seq ≤ barrier 的 cursor 必被 `replay_expired` 拦截，barrier 判定冗余）方可删除；per-sid 域对象因零订阅者回收时，须**保留失效水位**（或使同 epoch 旧 cursor fail-safe 进 resync——**不得**视作普通首连/空日志放行）；进程重启 = epoch 更换，旧 epoch cursor 由 `epoch_changed` 拦截（barrier 随进程消亡无影响）。上游恢复后新帧继续单调（seq 不重置，barrier 不消耗 seq）；多轮断连 → 每轮各写一 barrier（水位单调递增，判定只看最近一个即可）。
 - **与现有组件边界（明确）**：
   - GlobalHub pending（250ms debounce）＝**发布前**的合并窗口（digest 合并节拍）——不属于重放日志，v4 不把 pending 当日志；
   - tombstone 队列（`TOKEN_REMOVED_MESSAGES` cap 1000 / TTL 24h，`config.py:72-73`）＝已撤销消息索引（`message.removed` tombstone，`tokenstream/hub.py:277`）——是**既有 token 域重放机制的配套索引**，与 v4 重放日志并存不混用：重放日志管「帧已公开发布 + seq 分配」，tombstone 管「哪些消息已撤销须以 `message.removed` 帧回放」（§3.5 tombstone 裁决）；
@@ -230,9 +231,9 @@ id: t:<sid>:<epoch>:<seq>        # token 流 /sessions/{sid}/stream（t = token 
 
 | 编号 | 事项 | 状态 |
 |---|---|---|
-| 1 | S-B01 ② meta 重连语义（2.2 提案） | 待 owner 裁决 |
-| 2 | S-B01 ③ token ID 作用域 = per-sid + 全局流单序列（2.3 提案，rev-1 修订） | 待 owner 裁决 |
-| 3 | S-B01 ④ 两端点状态机逐帧序列表（2.4 提案，含通用不变量；rev-1 统一 epoch 四类输入语义） | 待 owner 裁决 |
+| 1 | S-B01 ② meta 重连语义（2.2 提案） | **已裁决（owner，2026-08-17，按 §2.2 提案原文冻结）** |
+| 2 | S-B01 ③ token ID 作用域 = per-sid + 全局流单序列（2.3 提案，rev-1 修订） | **已裁决（owner，2026-08-17，按 §2.3 提案原文冻结）** |
+| 3 | S-B01 ④ 两端点状态机逐帧序列表（2.4 提案，含通用不变量；rev-1 统一 epoch 四类输入语义） | **已裁决（owner，2026-08-17，按 §2.4 提案原文冻结——含上游断连 barrier 机制与 REPLAY-001~018）** |
 | 4 | 重放日志三维默认上限（count 2048/域、bytes 64MiB、TTL 15min）与覆盖策略 | 设计提案值，可随实现调参（不进 wire） |
 | 5 | 日志窗口内 gap 语义（REPLAY-006）在真实的「逐出-补帧」并发边界是否可能出现误判 | 实现期验证，若发现不可达可降级为防御分支（不违背 wire 语义） |
 
