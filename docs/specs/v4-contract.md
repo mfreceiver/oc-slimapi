@@ -202,7 +202,7 @@ v3 原样（§4.4 已含 v4 差异：v4 sessions 无 ETag）。
 - 有界重放日志（新组件，count/bytes/TTL 三维上限，环形覆盖）——现 GlobalHub pending（250ms debounce）与 tombstone 队列**不是** replay log；与既有 token 域重放队列（cap 1000/TTL 24h）并存不混用。
 - `Last-Event-ID` 重连：缺口在日志窗口内 → 补发 replay 帧；ID 过期（早于窗口）→ 发 resync 提示帧（客户端全量对齐）；**epoch 归类（冻结，四类拆分）**：旧 epoch（格式合法、epoch ≠ 当前——随机 nonce 无序不比较大小，即进程重启前世界）→ `resync{reason:"epoch_changed"}`；future（同 epoch 且 seq > 已发布 max）→ 忽略 + 重置（按首连）；格式非法 / 跨端点域 / 跨 sid 域 → 忽略 + 重置。
 - **Last-Event-ID 分类优先级（冻结，严格短路序）**：①完整语法校验（域标签 + epoch 16hex + seq 十进制）→ ②端点标签与路径 sid 校验（`g:` 只属 `/events`；`t:` 只属 `/stream` 且 sid 匹配路径）→ ③epoch 比对（仅对通过 ② 的正确域 ID）→ ④seq/窗口比对（仅同 epoch）。组合输入按最先命中者短路（如 `t:<sid>:<旧epoch>:5` 到 `/events` = 跨端点域 → 忽略重置，不触发 epoch_changed）。
-- **上游断连恢复（触发条件冻结）**：**首次确认上游 loss 即触发**（EOF/异常路径为主，`_upstream_loss_notified` 防重；成功重连仅作未通知时兜底——v3 现行为延续，`global_hub.py:894-904/913-922/847-863`）→ 对全部存量订阅者 fanout `resync{reason:"reconnect_no_replay"}`（无 id）→ 恢复后新帧（seq 继续单调不重置；**epoch 不变**）；token 域另清空该 sid pending live 缓冲（`tokenstream/hub.py:1896-1900` 锚点）。**持久 barrier（v4 冻结）**：上游 loss 时在每个受影响 ID 域重放日志写 low-watermark barrier——后续任何 `Last-Event-ID` seq 早于 barrier 水位的重连（含断连期间离线的客户端）一律 `resync{reconnect_no_replay}`，**禁止跨 barrier 补帧**（barrier 前后之间存在 sidecar 未观察到的上游事件缺口，窗口内连续不构成补帧依据）；客户端 HTTP 全量对齐。
+- **上游断连恢复（触发条件冻结）**：**首次确认上游 loss 即触发**（EOF/异常路径为主，`_upstream_loss_notified` 防重；成功重连仅作未通知时兜底——v3 现行为延续，`global_hub.py:894-904/913-922/847-863`）→ 对全部存量订阅者 fanout `resync{reason:"reconnect_no_replay"}`（无 id）→ 恢复后新帧（seq 继续单调不重置；**epoch 不变**）；token 域另清空该 sid pending live 缓冲（`tokenstream/hub.py:1896-1900` 锚点）。**持久 barrier（S-B01④提案内冻结口径，随④待 owner 终裁）**：上游 loss 时写 low-watermark barrier（水位 = 该域已发布 max seq）——**写入范围 = 全局域 + 当前 epoch 内全部已创建 per-sid 域（不限在线订阅者）**；后续任何 `Last-Event-ID` seq **≤** barrier 水位的重连（含断连期间离线的客户端）一律 `resync{reconnect_no_replay}`（水位本身对应的帧亦发布于缺口前），seq > 水位 → 正常窗口判定；**禁止跨 barrier 补帧**（barrier 前后存在 sidecar 未观察到的上游事件缺口，窗口内连续不构成补帧依据）。barrier 不受 count/bytes/TTL 逐出（仅窗口下界严格越过后可删；域回收保留失效水位或 fail-safe resync；进程重启归 `epoch_changed` 拦截）；客户端 HTTP 全量对齐。
 - gap 处理：区分「日志逐出」（→ resync）vs 合法缺席（单一/per-sid 域下不存在跨域合法空洞）。**snapshot 不是服务端帧**——resync 后客户端自行 HTTP 全量对齐（全局域如 `/slimapi/sessions` 首屏、token 域重拉消息投影），服务端只发 meta → resync → 新帧。逐出-发布并发的边界 gap 误判风险为实现期待验证项（design-v4-sse-replay.md §5 待裁决 5，可降级防御分支，不影响 wire 语义）。
 - 背压：溢出帧**入**重放日志（日志记录「已发布帧」而非「已送达帧」）；订阅端溢出断连 → 重连走 Last-Event-ID 重放。
 - **resync 帧 reason 值域（v4 冻结，加性扩展）**：`epoch_changed` | `replay_expired` | `replay_gap` | `reconnect_no_replay`（既有）；token 流 tombstone（消息已撤销）在 replay 时**照常消耗其 seq 并以 `message.removed` 轻量撤销帧回放**（既有帧形 `tokenstream/frames.py:137-151` = `event: message.removed` + `{sessionID, messageID}`；保留 `id:`，维持 ID 序列无空洞）。
@@ -292,7 +292,7 @@ v4 sessions 归入 sessions 桶既有记账；降级路径请求带 degraded 标
 | 11.7 | WAL 陈旧读 | ro-vs-immutable 3 case（已进 CI：`tests/test_wal_staleness.py`） | **B0 已落地** |
 | 11.8 | 等价性锚定 | DB 投影 ≡ 权威源（真实 opencode 进程 / 版本标记 golden，S-B03 禁 mock 自证）× {行集/字段语义/排序/complete} | B3a-B2（设计定稿见 design-v4-dbaux §10 / design-v4-equivalence-anchor） |
 | 11.9 | EQP 全矩阵 | 48 组合 planner 特征断言（SCAN/SEARCH、TEMP B-TREE、行数；非全文案） | B3a-B2（脚本 `scripts/eqp_matrix.py` **B0 已落地**） |
-| 11.10 | SSE 重放 | 重放/缺口/过期/重启 epoch/背压/重连/tokens=1 400/ID 无倒退断言/**上游断连 barrier/组合输入优先级**（协议矩阵用例表 17 条 REPLAY 见 design-v4-sse-replay.md §4） | B3b |
+| 11.10 | SSE 重放 | 重放/缺口/过期/重启 epoch/背压/重连/tokens=1 400/ID 无倒退断言/**上游断连 barrier（边界三连+token 离线变体）/组合输入优先级**（协议矩阵用例表 18 条 REPLAY 见 design-v4-sse-replay.md §4） | B3b |
 | 11.11 | DB schema 变更兼容 / 运行中迁移 | 上游升版列变更 → 门失败降级；运行中 inode swap | B3a-B1/B6 |
 | 11.12 | 冷启动 | P99 warmup 豁免；首查延迟 | B3a-B1 |
 
