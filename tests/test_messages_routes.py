@@ -310,11 +310,12 @@ async def test_health_stays_responsive_during_slow_transform(app_and_client, mon
     original_pack = msgs_mod._project_list_sorted_and_pack
     slow_packs_started = asyncio.Event()
 
-    def slow_pack(body, *, accept_encoding, limits):
+    def slow_pack(body, *, accept_encoding, limits, sid=None):
         # Signal that the worker has picked up the job, then park it.
         slow_packs_started.set()
         time.sleep(0.5)
-        return original_pack(body, accept_encoding=accept_encoding, limits=limits)
+        return original_pack(
+            body, accept_encoding=accept_encoding, limits=limits, sid=sid)
 
     monkeypatch.setattr(msgs_mod, "_project_list_sorted_and_pack", slow_pack)
 

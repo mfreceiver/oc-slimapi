@@ -118,6 +118,12 @@ _DIRECTORY_CONSUMING_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     for p in (
         r"^/slimapi/messages/[^/]+$",
         r"^/slimapi/messages/[^/]+/full/[^/]+$",
+        # Expand fragments (design-expand.md §5): message-level
+        # ``/expand/{category}/{mid}`` and part-level
+        # ``/expand/{category}/{mid}/{partID}`` — both directory-consuming
+        # (the upstream full-message GET forwards the directory).
+        r"^/slimapi/messages/[^/]+/expand/[^/]+/[^/]+$",
+        r"^/slimapi/messages/[^/]+/expand/[^/]+/[^/]+/[^/]+$",
         r"^/slimapi/sessions$",
         r"^/slimapi/sessions/status$",
         r"^/slimapi/sessions/[^/]+/todo$",

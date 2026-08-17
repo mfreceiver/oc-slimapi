@@ -72,7 +72,7 @@ def _created_sort_key(msg: dict) -> int:
 
 
 def _parse_sort_project(
-    body: bytes, *, limits: SkeletonLimits,
+    body: bytes, *, limits: SkeletonLimits, sid: str | None = None,
 ) -> list[dict]:
     """Worker entry: parse + sort by ``info.time.created`` ASC + skeleton
     project (no serialization).
@@ -80,6 +80,10 @@ def _parse_sort_project(
     Shared by the default pack worker (:func:`_project_list_sorted_and_pack`)
     and the L2-CD-2 merged path, which needs the projected dicts (to detect
     placeholder messages and later splice inlined fulls) before packing.
+
+    ``sid`` is threaded through to ``skeleton_messages`` so the projection
+    emits ``expandRefs`` (design-expand §5.2) — without it, lane A's refs
+    never reach the wire and the merged ref candidate set is empty.
 
     Batch 4 / B3: the fingerprint switch rides on ``limits.fingerprint``
     (built by the route from config) so this worker's signature is
@@ -97,11 +101,12 @@ def _parse_sort_project(
         # route maps to 503.
         raise ValueError("upstream message body is not a list of message dicts")
     parsed.sort(key=_created_sort_key)
-    return skeleton_messages(parsed, limits=limits)
+    return skeleton_messages(parsed, limits=limits, sid=sid)
 
 
 def _project_list_sorted_and_pack(
     body: bytes, *, accept_encoding: str | None, limits: SkeletonLimits,
+    sid: str | None = None,
 ) -> bytes:
     """Worker entry: parse + sort + project + serialize to identity bytes.
 
@@ -122,7 +127,7 @@ def _project_list_sorted_and_pack(
     ``accept_encoding`` is retained in the signature for call-site symmetry
     (and existing slow-pack monkeypatches); the route owns coding choice.
     """
-    projected = _parse_sort_project(body, limits=limits)
+    projected = _parse_sort_project(body, limits=limits, sid=sid)
     return orjson.dumps(projected)
 
 
@@ -383,6 +388,65 @@ def _placeholder_pairs(projected: list[dict]) -> list[tuple[int, str]]:
     return pairs
 
 
+def _expand_ref_pairs(projected: list[dict]) -> list[tuple[int, str]]:
+    """(index, mid) of every projected message carrying a part-level
+    ``expandRefs`` key — the design-expand §4.3 ref candidate set.
+
+    Only PART-level keys count. Message-level ``info.expandRefs`` (the
+    ``info.summary.diffs`` reference) NEVER enters the candidate set: diffs
+    average ~105 KB and would exhaust the merged budget instantly, and the
+    list view does not need them (§4.3.1). The check is a plain dict-key
+    presence test — no skeleton import (lane A owns skeleton.py's expandRefs
+    emission; the key's exact location in the projected part is all we need).
+    """
+    pairs: list[tuple[int, str]] = []
+    for index, message in enumerate(projected):
+        if not isinstance(message, dict):
+            continue
+        parts = message.get("parts")
+        if not isinstance(parts, list):
+            continue
+        if not any(
+            isinstance(p, dict) and "expandRefs" in p for p in parts
+        ):
+            continue
+        info = message.get("info")
+        mid = info.get("id") if isinstance(info, dict) else None
+        if isinstance(mid, str) and mid:
+            pairs.append((index, mid))
+    return pairs
+
+
+def _merged_candidate_pairs(
+    projected: list[dict], config,
+) -> list[tuple[int, str]]:
+    """Merged candidate list — design-expand §4.3 (R3-B model).
+
+    Placeholder-first: the skeleton collapse placeholders form the HIGH
+    priority queue and claim the page/full budget exactly as before
+    (``merged_max_fulls_per_page`` slots, page order — the current /full
+    behavior, unchanged). Ref candidates (messages whose ANY part carries a
+    part-level ``expandRefs``) fill only the REMAINING slots, page order,
+    best-effort — they never displace a placeholder.
+
+    Intersection dedup (R4-min1): a message belonging to both classes is
+    counted once. The placeholder identity wins (dedup by mid, reserved for
+    the placeholder queue) — it occupies exactly ONE slot and triggers only
+    ONE full fetch, which the renderability of either class would produce
+    (§4.3.1). ``info.expandRefs`` (the diffs reference) never contributes
+    candidates — see ``_expand_ref_pairs``.
+    """
+    page_cap = config.merged_max_fulls_per_page
+    placeholder_pairs = _placeholder_pairs(projected)[:page_cap]
+    placeholder_mids = {mid for _, mid in placeholder_pairs}
+    ref_pairs = [
+        (index, mid) for index, mid in _expand_ref_pairs(projected)
+        if mid not in placeholder_mids  # intersection → placeholder identity
+    ]
+    remaining_slots = max(0, page_cap - len(placeholder_pairs))
+    return placeholder_pairs + ref_pairs[:remaining_slots]
+
+
 async def _dedicated_full_get(
     request: Request, sid: str, mid: str, directory: str | None, cap: int,
 ) -> bytes | None:
@@ -548,7 +612,7 @@ async def _merge_fulls(
     ONE final offload (splice + serialize + gzip) instead of N serial
     transforms.
     """
-    pairs = _placeholder_pairs(projected)[: config.merged_max_fulls_per_page]
+    pairs = _merged_candidate_pairs(projected, config)
     semaphore = asyncio.Semaphore(config.merged_fanout)
     remaining = [config.merged_max_bytes]  # mutable cell shared by the tasks
 
@@ -761,12 +825,13 @@ async def _messages_via_lease(
                     if merged_mode:
                         projected = await pool.offload(
                             _parse_sort_project, body, limits=limits,
+                            sid=sid,
                         )
                     else:
                         identity = await pool.offload(
                             _project_list_sorted_and_pack, body,
                             accept_encoding=accept_encoding,
-                            limits=limits,
+                            limits=limits, sid=sid,
                         )
                 except (orjson.JSONDecodeError, ValueError, TypeError, AttributeError) as exc:
                     raise_upstream_unavailable(exc)
@@ -947,6 +1012,7 @@ async def messages(
                                 message_bytes=config.skeleton_inline_output_max_message_bytes,
                                 fingerprint=config.message_fingerprint_enabled,
                             ),
+                            sid=sid,
                         )
                     else:
                         identity = await pool.offload(
@@ -957,6 +1023,7 @@ async def messages(
                                 message_bytes=config.skeleton_inline_output_max_message_bytes,
                                 fingerprint=config.message_fingerprint_enabled,
                             ),
+                            sid=sid,
                         )
                 except (orjson.JSONDecodeError, ValueError, TypeError, AttributeError) as exc:
                     raise_upstream_unavailable(exc)
@@ -1135,3 +1202,397 @@ async def message(
         )
     except TransformBusy:
         return _busy_response(accept_encoding)
+
+
+# ---------------------------------------------------------------------------
+# design-expand §2.2 — expand fragment endpoints.
+#
+# On-demand part/message expansion of a single upstream message body, served
+# from the SAME single-flight full fetch as /full/{mid} (the key embeds
+# (pool, sid, mid, directory)), so an expand request and a concurrent /full
+# for the same message share ONE upstream GET (§3.5). The category is a
+# plain str path param validated against a manual whitelist — a FastAPI Enum
+# path param would surface as a raw 422, which the v3 contract does not
+# want; the contract wire shape is 400 invalid_expand_category.
+# ---------------------------------------------------------------------------
+
+# §2.2 — the 12 frozen categories, TABLE ORDER (order is part of the wire
+# contract: validCategories / expectedTypes lists are emitted in this order).
+_EXPAND_CATEGORIES: tuple[str, ...] = (
+    "info_summary_diffs",
+    "part_text",
+    "part_reasoning",
+    "part_state_output",
+    "part_state_error",
+    "part_state_input_full",
+    "part_state_metadata_full",
+    "part_state_attachments",
+    "part_url",
+    "part_source",
+    "part_snapshot",
+    "compaction_full",
+)
+_EXPAND_CATEGORIES_SET = frozenset(_EXPAND_CATEGORIES)
+
+# §2.2 level split: only ``info_summary_diffs`` is message-level.
+_EXPAND_MESSAGE_LEVEL_CATEGORIES = frozenset({"info_summary_diffs"})
+
+# §2.2 — applicable message-part types per part-level category.
+_EXPAND_APPLICABLE_TYPES: dict[str, tuple[str, ...]] = {
+    "part_text": ("text",),
+    "part_reasoning": ("reasoning",),
+    "part_state_output": ("tool",),
+    "part_state_error": ("tool",),
+    "part_state_input_full": ("tool",),
+    "part_state_metadata_full": ("tool",),
+    "part_state_attachments": ("tool",),
+    "part_url": ("file",),
+    "part_source": ("file",),
+    "part_snapshot": ("step-start", "step-finish"),
+    "compaction_full": ("compaction",),
+}
+
+
+def _expand_shape_error() -> None:
+    """§3.3 — parsed-but-malformed upstream body → 502 upstream_invalid_shape."""
+    raise CodedHTTPException(502, code="upstream_invalid_shape")
+
+
+def _expand_locate_part(message: dict, part_id: str) -> dict:
+    """§3.1 step 5 — locate ``part_id`` in the parsed message parts.
+
+    parts missing / null / scalar / non-object element / duplicate partID →
+    502 upstream_invalid_shape (parsed yet structurally malformed); a well
+    formed list simply not containing ``part_id`` → 404 the contract's
+    expand_target_not_found (reason: part_missing).
+    """
+    parts = message.get("parts")
+    if not isinstance(parts, list):
+        _expand_shape_error()
+    found = None
+    seen: set[str] = set()
+    for item in parts:
+        if not isinstance(item, dict):
+            _expand_shape_error()
+        pid = item.get("id")
+        if not isinstance(pid, str):
+            _expand_shape_error()  # part without usable id — cannot match
+        if pid in seen:
+            _expand_shape_error()  # duplicate partID
+        seen.add(pid)
+        if pid == part_id:
+            found = item
+    if found is None:
+        raise CodedHTTPException(
+            404, code="expand_target_not_found", reason="part_missing",
+        )
+    return found
+
+
+def _expand_str_field(obj: dict, field: str) -> str | None:
+    """§3.3 nested-type rule for string fields: missing/null → null key;
+    present but non-string → 502 upstream_invalid_shape."""
+    value = obj.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        _expand_shape_error()
+    return value
+
+
+def _extract_info_summary_diffs(message: dict, _part: dict | None) -> dict:
+    """info.summary.diffs → {diffs: FileDiff[]|null} (§2.2, message-level)."""
+    info = message.get("info")
+    if info is None:
+        return {"diffs": None}
+    if not isinstance(info, dict):
+        _expand_shape_error()
+    summary = info.get("summary")
+    if summary is None:
+        return {"diffs": None}
+    if not isinstance(summary, dict):
+        _expand_shape_error()
+    diffs = summary.get("diffs")
+    if diffs is None:
+        return {"diffs": None}
+    if not isinstance(diffs, list) or not all(
+        isinstance(d, dict) for d in diffs
+    ):
+        _expand_shape_error()
+    return {"diffs": diffs}
+
+
+def _extract_part_text(_message: dict, part: dict) -> dict:
+    """part.text → {text: string|null} (text parts)."""
+    return {"text": _expand_str_field(part, "text")}
+
+
+def _extract_part_reasoning(_message: dict, part: dict) -> dict:
+    """part.text → {text: string|null} (reasoning parts)."""
+    return {"text": _expand_str_field(part, "text")}
+
+
+def _expand_state(part: dict) -> dict | None:
+    """Tool state accessor — state missing/null → None (null data key);
+    present but not an object → 502 (state 标量, §3.3)."""
+    state = part.get("state")
+    if state is None:
+        return None
+    if not isinstance(state, dict):
+        _expand_shape_error()
+    return state
+
+
+def _extract_part_state_output(_message: dict, part: dict) -> dict:
+    """state.output → {output: string|null} (tool, ToolStateCompleted)."""
+    state = _expand_state(part)
+    return {"output": _expand_str_field(state, "output") if state else None}
+
+
+def _extract_part_state_error(_message: dict, part: dict) -> dict:
+    """state.error → {error: string|null} (tool, ToolStateError)."""
+    state = _expand_state(part)
+    return {"error": _expand_str_field(state, "error") if state else None}
+
+
+def _extract_part_state_input_full(_message: dict, part: dict) -> dict:
+    """state.input → {input: object|null}; input non-object → 502 (§3.3)."""
+    state = _expand_state(part)
+    if state is None:
+        return {"input": None}
+    value = state.get("input")
+    if value is None:
+        return {"input": None}
+    if not isinstance(value, dict):
+        _expand_shape_error()
+    return {"input": value}
+
+
+def _extract_part_state_metadata_full(_message: dict, part: dict) -> dict:
+    """state.metadata → {metadata: object|null}, with the never-consumed LSP
+    ``diagnostics`` map dropped (same strip as /full §2.1 / P3)."""
+    state = _expand_state(part)
+    if state is None:
+        return {"metadata": None}
+    value = state.get("metadata")
+    if value is None:
+        return {"metadata": None}
+    if not isinstance(value, dict):
+        _expand_shape_error()
+    return {"metadata": {
+        key: item for key, item in value.items() if key != "diagnostics"
+    }}
+
+
+def _extract_part_state_attachments(_message: dict, part: dict) -> dict:
+    """state.attachments → {attachments: object[]|null}; non-array → 502."""
+    state = _expand_state(part)
+    if state is None:
+        return {"attachments": None}
+    value = state.get("attachments")
+    if value is None:
+        return {"attachments": None}
+    if not isinstance(value, list):
+        _expand_shape_error()
+    return {"attachments": value}
+
+
+def _extract_part_url(_message: dict, part: dict) -> dict:
+    """part.url → {url: string|null} (file parts)."""
+    return {"url": _expand_str_field(part, "url")}
+
+
+def _extract_part_source(_message: dict, part: dict) -> dict:
+    """part.source → {source: object|null}; non-object → 502."""
+    source = part.get("source")
+    if source is None:
+        return {"source": None}
+    if not isinstance(source, dict):
+        _expand_shape_error()
+    return {"source": source}
+
+
+def _extract_part_snapshot(_message: dict, part: dict) -> dict:
+    """part.snapshot → {snapshot: string|null} (step-start/step-finish)."""
+    return {"snapshot": _expand_str_field(part, "snapshot")}
+
+
+def _extract_compaction_full(_message: dict, part: dict) -> dict:
+    """The COMPLETE compaction part, minus the sidecar-injected
+    ``expandRefs`` key (§2.2 / §3.3 — whitelist-built, never blacklist)."""
+    return {key: value for key, value in part.items() if key != "expandRefs"}
+
+
+_EXPAND_EXTRACTORS = {
+    "info_summary_diffs": _extract_info_summary_diffs,
+    "part_text": _extract_part_text,
+    "part_reasoning": _extract_part_reasoning,
+    "part_state_output": _extract_part_state_output,
+    "part_state_error": _extract_part_state_error,
+    "part_state_input_full": _extract_part_state_input_full,
+    "part_state_metadata_full": _extract_part_state_metadata_full,
+    "part_state_attachments": _extract_part_state_attachments,
+    "part_url": _extract_part_url,
+    "part_source": _extract_part_source,
+    "part_snapshot": _extract_part_snapshot,
+    "compaction_full": _extract_compaction_full,
+}
+
+
+def _expand_fragment_worker(
+    body: bytes, *, category: str, mid: str, part_id: str | None,
+    limit: int, accept_encoding: str | None,
+) -> tuple[bytes, dict[str, str]]:
+    """§3.1 steps 4d-7 + §3.2/§6 — parse, locate, extract, serialize, gzip.
+
+    Runs off-thread under pool admission (mirrors /full). Decode failure or
+    top-level non-dict → propagates ValueError/JSONDecodeError which the
+    route maps to 503 upstream_unavailable; parsed-but-malformed structures
+    raise CodedHTTPException 502/404/400/413 lines directly.
+    """
+    try:
+        message = orjson.loads(body)
+    except orjson.JSONDecodeError as exc:
+        raise ValueError("expand source body is not JSON") from exc
+    if not isinstance(message, dict):
+        raise ValueError("expand source body is not a dict")
+    part: dict | None = None
+    if part_id is not None:
+        part = _expand_locate_part(message, part_id)
+        # §3.1 step 6 — type fitness for the requested category.
+        applicable = _EXPAND_APPLICABLE_TYPES[category]
+        if part.get("type") not in applicable:
+            raise CodedHTTPException(
+                400, code="expand_category_mismatch",
+                expectedTypes=list(applicable),
+            )
+    data = _EXPAND_EXTRACTORS[category](message, part)
+    envelope: dict = {
+        "category": category,
+        "messageID": mid,
+        "data": data,
+    }
+    if part_id is not None:
+        envelope["partID"] = part_id
+    identity = orjson.dumps(envelope)
+    # §3.2 — fragment byte cap on the serialized identity (before gzip).
+    if len(identity) > limit:
+        raise CodedHTTPException(
+            413, code="expand_fragment_too_large", limitBytes=limit,
+        )
+    return compress_if_beneficial(identity, accept_encoding)
+
+
+async def _expand_fragment(
+    request: Request, sid: str, category: str, mid: str,
+    part_id: str | None, directory: str | None,
+) -> Response:
+    """Shared implementation for the two expand routes (§3.1 strict order)."""
+    accept_encoding = request.headers.get("accept-encoding")
+
+    # §3.1 step 1 — category whitelist (plain str, never FastAPI Enum).
+    if category not in _EXPAND_CATEGORIES_SET:
+        return error_response(
+            "invalid_expand_category", 400,
+            validCategories=list(_EXPAND_CATEGORIES),
+            accept_encoding=accept_encoding,
+        )
+
+    # §3.1 step 2 — level match: message-level category without partID,
+    # part-level category with a partID, or level/category mismatch.
+    if category in _EXPAND_MESSAGE_LEVEL_CATEGORIES:
+        if part_id is not None:
+            return error_response(
+                "expand_category_mismatch", 400,
+                expectedLevel="message",
+                accept_encoding=accept_encoding,
+            )
+    elif part_id is None:
+        return error_response(
+            "expand_category_mismatch", 400,
+            expectedLevel="part",
+            accept_encoding=accept_encoding,
+        )
+
+    directory = await _resolve_messages_directory(request, directory)
+    config = request.app.state.config
+    pool = request.app.state.transforms
+    # §3.2 — fragment cap; lane C adds the real config value, keep the
+    # fallback until integration (config.py is out of this lane's write set).
+    fragment_limit = getattr(
+        config, "max_expand_response_bytes", 8 * 1024 * 1024,
+    )
+    try:
+        # §3.1 step 3 — transform pool admission (mirrors /full absorb loop:
+        # pool-full 503 transform_busy precedes every part-level 40x).
+        deadline = time.monotonic() + config.transform_absorb_budget_seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TransformBusy()
+            try:
+                await pool.acquire(min(config.transform_wait_seconds, remaining))
+            except TransformBusy:
+                continue  # narrow the next attempt to the remaining budget
+            break
+        try:
+            # §3.1 step 4 — shared single-flight upstream GET ((pool, sid,
+            # mid, directory) key — dedupes with concurrent /full).
+            body = await _fetch_full_shared(request, pool, sid, mid, directory)
+            if body is None:
+                # §3.1 4c — source body over max_message_bytes: 413 BEFORE
+                # any JSON decode (oversize + malformed body still 413, the
+                # cap-read ran first — R4-M1).
+                return error_response(
+                    "expand_source_too_large", 413,
+                    limitBytes=config.max_message_bytes,
+                    accept_encoding=accept_encoding,
+                )
+            # §3.1 4d-7 — decode/locate/extract/serialize/gzip off-thread.
+            try:
+                encoded, extra = await pool.offload(
+                    _expand_fragment_worker, body,
+                    category=category, mid=mid, part_id=part_id,
+                    limit=fragment_limit, accept_encoding=accept_encoding,
+                )
+            except (orjson.JSONDecodeError, ValueError) as exc:
+                # §3.1 4d — decode failure / top-level non-dict → 503.
+                raise_upstream_unavailable(exc)
+        finally:
+            pool.release()
+        return Response(
+            encoded, status_code=200, media_type="application/json",
+            headers={"Cache-Control": "no-store", **extra},
+        )
+    except TransformBusy:
+        return _busy_response(accept_encoding)
+
+
+@router.get("/expand/{category}/{mid}")
+async def expand_message_fragment(
+    request: Request, sid: str, category: str, mid: str,
+    directory: str | None = None,
+):
+    """design-expand §2 — message-level expand fragment.
+
+    Only ``info_summary_diffs`` is message-level; every other category needs
+    a partID and 400s here (expand_category_mismatch, expectedLevel=part).
+    """
+    return await _expand_fragment(
+        request, sid, category, mid, None, directory,
+    )
+
+
+@router.get("/expand/{category}/{mid}/{partID}")
+async def expand_part_fragment(
+    request: Request, sid: str, category: str, mid: str, partID: str,
+    directory: str | None = None,
+):
+    """design-expand §2 — part-level expand fragment.
+
+    ``info_summary_diffs`` with a partID 400s (expand_category_mismatch,
+    expectedLevel=message); unknown partIDs → 404 expand_target_not_found.
+    """
+    return await _expand_fragment(
+        request, sid, category, mid, partID, directory,
+    )
