@@ -1242,6 +1242,54 @@ async def test_merged_mixed_page_e2e_placeholder_first(upstream_factory):
     assert items[1]["info"]["expandRefs"][0]["category"] == "info_summary_diffs"
 
 
+async def test_merged_step_only_message_same_message_intersection(upstream_factory):
+    """R2 e2e regression: a message that is BOTH a placeholder AND a
+    part-level expandRefs carrier IS constructible from real upstream —
+    step-start/step-finish parts emit part_snapshot refs (skeleton.py
+    :531-539) yet are NOT renderable (skeleton.py _is_renderable :683-697
+    only recognises text/reasoning/tool/patch/file). A step-only message
+    therefore projects to: step part + part_snapshot expandRefs AND the
+    thin_placeholder marker. The merged route must dedupe it into ONE full
+    slot (intersection rule §4.3.1), splice the restored parts, and emit a
+    clean wire body with no null leakage."""
+    step = {"info": {"id": "m_dual", "role": "assistant",
+                     "time": {"created": 3, "updated": 3}},
+            "parts": [{"id": "p_step", "type": "step-start",
+                       "messageID": "m_dual",
+                       "snapshot": "SNAPSHOT-v1", "reason": "start"}]}
+    fulls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session/s1/message":
+            return _list_response([step])
+        mid = request.url.path.rsplit("/", 1)[-1]
+        fulls.append(mid)
+        return _single_full(mid)
+
+    async with _test_client(upstream_factory, handler) as client:
+        r = await _merged_get(client, "/slimapi/messages/s1?mode=merged")
+    assert r.status_code == 200
+    # intersection dedupe: ONE slot, ONE fetch for the dual-identity message
+    assert fulls == ["m_dual"]
+    items = _json(r)["items"]
+    assert [i["info"]["id"] for i in items] == ["m_dual"]  # page order intact
+    item = items[0]
+    # placeholder identity spliced: full parts replace the thin skeleton
+    exp_parts = orjson.loads(_single_full("m_dual").content)["parts"]
+    assert item["parts"] == exp_parts
+    # no null/placeholder leakage: the restored parts have no
+    # thin_placeholder marker and no expandRefs
+    assert not any(
+        str(p.get("id", "")).startswith("thin_placeholder_")
+        for p in item["parts"]
+    )
+    assert all("expandRefs" not in p for p in item["parts"])
+    # the spliced text part carries its real content (no folded null)
+    text_part = next(p for p in item["parts"]
+                     if p.get("type") == "text")
+    assert text_part["text"] == "full text content"
+
+
 # ---------------------------------------------------------------------------
 # 8) /full/{mid} byte-identical regression
 # ---------------------------------------------------------------------------
