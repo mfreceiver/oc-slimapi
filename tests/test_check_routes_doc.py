@@ -144,6 +144,62 @@ def test_validate_semantic_missing_keyword_reported(crd, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# expand 路由语义门禁（design-expand §8/§12：12 category 数量一致 +
+# EXPAND_CATEGORIES 单一事实源引用）
+# ---------------------------------------------------------------------------
+
+
+def test_validate_expand_row_with_markers_passes(crd):
+    """An expand route doc row carrying the full semantic markers (expand
+    semantics + ``traffic.py::EXPAND_CATEGORIES`` source-of-truth reference
+    + 12-category count) passes — positive case."""
+    routes = [("GET", "/slimapi/messages/{sid}/expand/{category}/{mid}", "messages.py")]
+    doc = (
+        "| **GET `/slimapi/messages/{sid}/expand/{category}/{mid}`**<br>"
+        "12 类目，`traffic.py::EXPAND_CATEGORIES` 单一事实源，expand 语义 | y |"
+    )
+    missing, mismatches, semantic = crd.validate(routes, doc)
+    assert missing == []
+    assert mismatches == []
+    assert semantic == []
+
+
+def test_validate_expand_row_without_source_of_truth_fails(crd):
+    """Stripping the ``EXPAND_CATEGORIES`` source-of-truth reference and the
+    12-category count from an expand doc row must be flagged. The path itself
+    still contains ``expand``, so the reported missing keywords are the two
+    drift guards (design-expand §12 gate: 12 category count consistent)."""
+    routes = [("GET", "/slimapi/messages/{sid}/expand/{category}/{mid}", "messages.py")]
+    doc = (
+        "| **GET `/slimapi/messages/{sid}/expand/{category}/{mid}`**<br>"
+        "row without source-of-truth reference or category count | y |"
+    )
+    missing, mismatches, semantic = crd.validate(routes, doc)
+    assert missing == []
+    assert mismatches == []
+    assert len(semantic) == 1
+    assert semantic[0][0] == "/slimapi/messages/{sid}/expand/{category}/{mid}"
+    assert semantic[0][1] == ["EXPAND_CATEGORIES", "12"]
+
+
+def test_validate_part_level_expand_row_without_markers_fails(crd):
+    """Part-level expand route is gated the same way."""
+    routes = [
+        ("GET", "/slimapi/messages/{sid}/expand/{category}/{mid}/{partID}", "messages.py"),
+    ]
+    doc = (
+        "| **GET `/slimapi/messages/{sid}/expand/{category}/{mid}/{partID}`**<br>"
+        "bare description with no category-table markers | y |"
+    )
+    missing, mismatches, semantic = crd.validate(routes, doc)
+    assert missing == []
+    assert mismatches == []
+    assert len(semantic) == 1
+    assert semantic[0][0] == "/slimapi/messages/{sid}/expand/{category}/{mid}/{partID}"
+    assert semantic[0][1] == ["EXPAND_CATEGORIES", "12"]
+
+
+# ---------------------------------------------------------------------------
 # AST collect_routes — api_route / options support
 # ---------------------------------------------------------------------------
 

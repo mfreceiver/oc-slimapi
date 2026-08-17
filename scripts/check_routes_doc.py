@@ -23,7 +23,10 @@ method 但漏更文档时 check.sh 失败。
    关键错误码关键词（`session_not_found` / `upstream_http_` / `upstream_unavailable`
    / `transform_busy` 等）。防 P1-2 那类"路由存在但错误映射描述与实现/契约矛盾"
    的语义漂移——存在性门禁检不出。白名单刻意保守：只覆盖有明确错误码契约的
-   核心读路由；新增路由如需语义校验，往 `SEMANTIC_CHECKS` 加条目即可。
+   核心读路由；新增路由如需语义校验，往 `SEMANTIC_CHECKS` 加条目即可。**expand
+   两路由（2026-08-17 [4.0.0]；design-expand §8/§12 门禁）**：关键词 = `expand` /
+   `EXPAND_CATEGORIES` / `12`——文档表行须携带 12 类目单一事实源引用
+   （`traffic.py::EXPAND_CATEGORIES`）与类目计数，防类目表与契约/实现漂移。
 
 **已知局限**：代码侧只扫 ``routes/*.py`` 里静态声明的 ``@router.<method>``。
 若某 ``/slimapi`` 路由在别处动态注册（``app.add_api_route`` 等），本脚本看不到。
@@ -59,6 +62,9 @@ _DOC_METHOD_PATH_RE = re.compile(
 # 故 `upstream_http_` 覆盖 `upstream_http_N`）。仅对有明确错误码契约的核心
 # 读路由启用；未列入的路由只走存在性 + method 校验。每条都已对照当前
 # INTERFACE_MAP 核实通过。
+# expand 两路由（[4.0.0]，design-expand §8/§12）：行内须含 `expand` 语义、
+# 12 类目单一事实源引用 `EXPAND_CATEGORIES` 与类目计数 `12`——防类目表
+# 与契约/实现漂移（路径本身恒含 `expand`，实际守卫为后两者）。
 SEMANTIC_CHECKS: dict[str, list[str]] = {
     "/slimapi/sessions": ["upstream_http_", "upstream_unavailable"],
     "/slimapi/messages/{sid}": [
@@ -66,6 +72,12 @@ SEMANTIC_CHECKS: dict[str, list[str]] = {
     ],
     "/slimapi/messages/{sid}/full/{mid}": [
         "session_not_found", "upstream_http_", "upstream_unavailable", "transform_busy",
+    ],
+    "/slimapi/messages/{sid}/expand/{category}/{mid}": [
+        "expand", "EXPAND_CATEGORIES", "12",
+    ],
+    "/slimapi/messages/{sid}/expand/{category}/{mid}/{partID}": [
+        "expand", "EXPAND_CATEGORIES", "12",
     ],
     "/slimapi/command": ["upstream_http_", "upstream_unavailable", "transform_busy"],
     "/slimapi/agent": ["upstream_http_", "upstream_unavailable", "transform_busy"],

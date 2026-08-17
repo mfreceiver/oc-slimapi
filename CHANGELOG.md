@@ -50,7 +50,7 @@ ocdroid 对接时：
 - **响应 envelope**：`{category, messageID, data}`（part 级多 `partID`）+ `Cache-Control:no-store` + gzip+`Vary`；缺失字段 vs 显式 null → 200 + `data` 键 `null`。
 - **求值序冻结**（§3.1）：白名单 400 → level 400 → 池 admission 503（**先于** part 级错误）→ 共享 single-flight GET（与 `/full`/merged 同键去重）→ 源 cap 413（先于解码）→ decode 503 → 定位 502/404 → 类型 400 → 提取 → 片段 cap 413（gzip 前）。错误码仅 `expand_target_not_found`（附 `reason`）/`expand_category_mismatch` 两命名 + `invalid_expand_category`/`expand_source_too_large`/`expand_fragment_too_large`/`upstream_invalid_shape`/`transform_busy`/`upstream_unavailable`。
 - **配置**：`OC_SLIMAPI_MAX_EXPAND_RESPONSE_BYTES`（默认 8388608=8 MiB，1 KiB–32 MiB 含边界校验，非法值启动即 RuntimeError 命名变量）；转换池聚合 envelope 上限自动取 `max(max_response_bytes, max_expand_response_bytes)×max_transforms`。
-- **能力广告**：`GET /slimapi/versions` → `capabilities["3"]["expand"] = {validCategories:[12 项表序], fragmentMaxBytes:<live>}`。
+- **能力广告**：`GET /slimapi/versions` → `capabilities["3"]["expand"] = {categories:[12 项表序], fragmentMaxBytes:<live>}`。
 - **流量记账**：ledger/snapshot/metrics 新增 `expand` 块（按 category×status 聚合）；伪造/非法 category 折叠进固定 `invalid` 桶（防基数 DoS）；`traffic-snapshot-YYYY-MM-DD.jsonl` 持久化含 expand。
 
 ---

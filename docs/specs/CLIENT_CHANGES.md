@@ -6,6 +6,44 @@
 
 # ocdroid 客户端改动清单（仅文档，不修改 ocdroid）
 
+## expand 片段端点与 skeleton 投影缩减（4.0.0 — 包版本 MAJOR；wire 仍 v3，2026-08-17）
+
+> **减性 + 加性并存**：wire 版本**不变**（仍 v3、`?v=3` selector 不变）——skeleton 投影缩减（**减性**）按 owner 决策直接在 v3 视图内生效，expand 片段端点（**加性**）配套补齐。设计稿 `docs/specs/design-expand.md` v5；**权威 wire 见 `docs/specs/v3-contract.md` §4a/§4b**。**部署顺序（关键）**：ocdroid 先发容忍版 → sidecar 4.0.0 后装（见下兼容矩阵）。
+
+### 投影变更影响（新 sidecar 下 `/slimapi/messages/{sid}` 的 skeleton）
+
+- **哪些字段会变 `null`（+ `omitted` + `hasFull` + `expandRefs`）**：
+  - `info.summary.diffs` → **恒 `null`** + 消息级 `info.expandRefs[0].category="info_summary_diffs"`（非空 list 才 ref；`/full/{mid}` 照旧全量，语义不变）。
+  - `text`/`reasoning` part：UTF-8 编码字节 **>2048** → 整字段 `null` + `omitted:["text"]` + `hasFull:true` + part 级 `expandRefs`（`part_text`/`part_reasoning`）——**整字段折叠，从不半截断**；≤2048 原样内联。
+  - `tool` state：`input`（`object|null`）/`metadata`（`object|null`）/`attachments`（`object[]|null`）折叠 → refs `part_state_input_full`/`part_state_metadata_full`/`part_state_attachments`；`output`/`error` 按现状 4 KB 阈值省略并补 refs。
+  - `file` `url`/`source`、`step-start`/`step-finish` `snapshot` 折叠 → refs `part_url`/`part_source`/`part_snapshot`。
+  - `patch` part：`files` 为 `string[]` **原样保留 verbatim**（P0 修复），永不折叠、无 ref。
+- **`expandRefs` 如何消费**：每个 ref = `{category, messageID, partID?, href}`；`href` 已含 `?v=3`（`/slimapi/messages/{sid}/expand/...`），directory 由客户端按需追加。**列表滚动场景零散片段用 expand 单字段拉取**（`data.<key>` 可能为 `null`——缺失与显式 null 等价）；**详情页直接 `/full/{mid}`**（单消息展开 ≥4 片段累计已接近一次 /full，不划算）。
+- **renderability 不受影响**：`text:null` 但带 `expandRefs` 的 part 仍计为**可渲染**（part 骨架 + 展开入口，不是整页 placeholder）；消息级 diffs 省略不参与可渲染判定。既有 `hasFull`/`omitted` 处理逻辑继续沿用，只是现多了 `expandRefs` 数组可读。
+
+### expand 端点用法
+
+- **发现（经 capabilities）**：`GET /slimapi/versions` → `capabilities["3"]["expand"] = {categories: [12 项], fragmentMaxBytes: <live，默认 8388608>}`。**该 key 存在 = sidecar 支持 expand**（勿用 `sidecarVersion` 字符串比较）；缺 key / 旧 sidecar（无路由）→ 404 `thin_route_not_found` → 现状渲染 + 回退（见下）。
+- **调用**：`GET /slimapi/messages/{sid}/expand/{category}/{mid}?v=3`（消息级，仅 `info_summary_diffs`）与 `GET /slimapi/messages/{sid}/expand/{category}/{mid}/{partID}?v=3`（part 级）；`directory` 语义与 messages 路由一致。200 envelope：`{category, messageID, data}`（part 级多 `partID`）+ `Cache-Control: no-store` + 无 ETag（恒 200）+ gzip 按协商。
+- **错误处理**：`404 expand_target_not_found`（附 `reason:"part_missing"`）→ 目标 part/字段已删 → 刷新 skeleton；`400 expand_category_mismatch`（附 `expectedLevel`/`expectedTypes`）→ part 类型已变 → 刷新 skeleton；`413 expand_source_too_large`/`expand_fragment_too_large` → 内容超单片段上限 → 改走 `/full/{mid}`；`503 transform_busy`（+`Retry-After`）→ 沿用既有重试范式；`503 upstream_unavailable` / `502 upstream_http_N` / `404 session_not_found` → 与 messages 路由同语义处理（circuit breaker / 移除会话）。**回退规则**：**仅** 404 `thin_route_not_found`（旧 sidecar 无 expand 路由）→ 回退 `/full`；其余错误走重试/刷新，**绝不**静默降级。
+- **merged 模式行为**：`?mode=merged` 现为 **placeholder-first + best-effort**——占位消息优先还原（行为与现状完全一致，不被 ref 候选挤占）；剩余预算按页面顺序 best-effort 还原 part 级 ref 候选；`info.summary.diffs` 在 merged 输出**恒为 null + expandRefs**（永不批量还原）；预算外/失败的消息保留 `text: null + expandRefs`——客户端保留展开入口兜底即合规（这**是特性而非缺陷**）。
+
+### 部署顺序与兼容矩阵（2×2）
+
+1. **ocdroid 先发**容忍版：对旧 sidecar 零改动（现状全文渲染）；对新 sidecar 的折叠字段按 `expandRefs` 展开或显示"查看全文"（`/full` 不变）。
+2. **sidecar 4.0.0 后装**：`?v=3` selector 不变、wire 不 bump；唯一消费方已具备容忍/渲染能力。
+
+| 客户端 \ sidecar | 旧 sidecar | 新 sidecar（4.0.0+） |
+|---|---|---|
+| **旧客户端** | 基线：现状全文渲染（不受影响） | **已知减性影响（owner 接受）**：长 text/reasoning 显示为空 + "查看全文"仍可用（`/full` 不变）；diffs 缺失不影响列表基础功能 |
+| **新客户端** | 无 `expandRefs`/expand 路由 → 现状全文渲染；expand 请求 404 → 回退 `/full` | 完整 expand 体验 |
+
+### 回退路径
+
+- 无 `expandRefs` 字段（旧 sidecar / 开关关闭）→ 按现状渲染全文（字段本就在 skeleton 内或走 `/full`）。
+- expand 请求 404 `thin_route_not_found`（旧 sidecar 无此路由）→ 回退 `/full/{mid}` 整条拉取。
+- **不降级触发条件**：除 404 `thin_route_not_found` 外（503/413/timeout/版本错误/鉴权错误）一律重试/刷新——走 `/full` 会让流量翻倍 + 掩盖问题（沿用全局 fallback 规则）。
+
 ## 模型
 
 - `Part` 增加 `hasFull: Boolean? = null`、`omitted: List<String>? = null`。
