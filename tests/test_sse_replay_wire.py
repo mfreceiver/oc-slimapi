@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from types import SimpleNamespace
 
 import httpx
@@ -238,7 +239,7 @@ class _FakeHubs:
     def __init__(self) -> None:
         self.sub = _FakeSubscriber()
 
-    def subscribe(self) -> _FakeSubscriber:
+    def subscribe(self, wire_v4: bool = False) -> _FakeSubscriber:
         return self.sub
 
     def unsubscribe(self, subscriber) -> None:
@@ -249,7 +250,7 @@ class _FakeTokenRegistry:
     def __init__(self) -> None:
         self.sub = _FakeSubscriber("tok_test")
 
-    def subscribe(self, sid: str) -> _FakeSubscriber:
+    def subscribe(self, sid: str, wire_v4: bool = False) -> _FakeSubscriber:
         return self.sub
 
     def unsubscribe(self, subscriber) -> None:
@@ -298,8 +299,8 @@ class _ScriptedHubRegistry(HubRegistry):
     def push_script(self, script) -> None:
         self._scripts.append(script)
 
-    def subscribe(self):
-        sub = super().subscribe()
+    def subscribe(self, wire_v4: bool = False):
+        sub = super().subscribe(wire_v4=wire_v4)
         if self._scripts:
             script = self._scripts.pop(0)
             hub = self.get_global()
@@ -327,8 +328,8 @@ class _ScriptedTokenRegistry(TokenStreamRegistry):
     def push_script(self, script) -> None:
         self._scripts.append(script)
 
-    def subscribe(self, sid: str):
-        sub = super().subscribe(sid)
+    def subscribe(self, sid: str, wire_v4: bool = False):
+        sub = super().subscribe(sid, wire_v4=wire_v4)
         if self._scripts:
             script = self._scripts.pop(0)
             asyncio.get_running_loop().create_task(self._guard(script, sub, sid))
@@ -564,11 +565,12 @@ async def test_emit_directory_frame_v3_subscriber_gets_raw_bytes():
 async def test_emit_directory_frame_v4_subscriber_gets_id_stamped():
     log = ReplayLog(epoch=EPOCH)
     hub = GlobalHub(None, replay_log=log)
-    sub = hub.subscribe()
+    # v4 admission path (rev-gate BLOCKER-1): welcome suppressed at the
+    # source — the first queued item is already the stamped business frame.
+    sub = hub.subscribe(welcome=False)
     sub.wire_v4 = True
     try:
         hub.publish(_q_event(1))
-        sub.queue.get_nowait()  # welcome
         item = sub.queue.get_nowait()
         assert item == sse_id_line(GLOBAL_DOMAIN, EPOCH, 1) + _q_frame(1)
         assert log.last_seq(GLOBAL_DOMAIN) == 1
@@ -792,15 +794,15 @@ async def test_v4_events_first_connect_meta_seqbase_and_order(stack: _RealStack)
     assert data0["epoch"] == EPOCH
     assert data0["seqBase"] == 5
 
-    # welcome frame is connection-scoped — no id, before business frames
-    assert frames[1][0] == "server.connected"
-    assert frames[1][1] is None
-    # the new business frame: id g:<epoch>:6 (data-only q/p frame)
-    assert frames[2][0] is None
-    assert frames[2][2]["type"] == "question.asked"
-    assert frames[2][1] == f"g:{EPOCH}:6"
-    # NO resync on a first connect
+    # rev-gate BLOCKER-1 / cond 5: server.connected is SUPPRESSED on v4 —
+    # the first frame after meta is the stamped business frame directly
+    # (data-only q/p frame: no event name, id + data).
+    assert frames[1][0] is None
+    assert frames[1][2]["type"] == "question.asked"
+    assert frames[1][1] == f"g:{EPOCH}:6"
+    # NO resync on a first connect, NO server.connected anywhere
     assert all(e != "resync" for e, _, _ in frames)
+    assert all(e != "server.connected" for e, _, _ in frames)
 
 
 async def test_v4_events_window_replay_strictly_before_new_frames(stack: _RealStack):
@@ -826,10 +828,9 @@ async def test_v4_events_window_replay_strictly_before_new_frames(stack: _RealSt
         "properties": {"questionID": "q5", "title": "t5"},
     }
     assert frames[2][2]["properties"]["questionID"] == "q6"
-    # welcome AFTER the replay block, then the live frame 7
-    assert frames[3][0] == "server.connected"
-    assert frames[3][1] is None
-    assert frames[4][1] == f"g:{EPOCH}:7"
+    # live frame 7 DIRECTLY after the replay block (no welcome on v4)
+    assert frames[3][1] == f"g:{EPOCH}:7"
+    assert all(f[0] != "server.connected" for f in frames)
     # strictly increasing id seq across the whole connection
     id_frames = [f for f in frames if f[1] is not None]
     seqs = [_seq_of(f[1]) for f in id_frames]
@@ -846,7 +847,9 @@ async def test_v4_events_replay_up_to_date_no_frames_no_resync(stack: _RealStack
     assert response.status_code == 200
     frames = list(_frames(body))
     assert frames[0][0] == "slimapi.meta"
-    assert frames[1][0] == "server.connected"  # no replay frames, no resync
+    # up-to-date cursor: no replay frames, no resync — and no welcome on
+    # v4, so meta is the ONLY frame on the wire.
+    assert len(frames) == 1
     assert all(e != "resync" for e, _, _ in frames)
 
 
@@ -864,7 +867,8 @@ async def test_v4_events_old_epoch_resync_epoch_changed(stack: _RealStack):
     assert frames[0][0] == "slimapi.meta"
     assert frames[1] == ("resync", None, {"reason": "epoch_changed"})
     assert frames[1][1] is None  # resync never carries an id
-    assert frames[2][0] == "server.connected"
+    # no welcome on v4 — resync is the last frame
+    assert len(frames) == 2
 
 
 async def test_v4_events_expired_window_resync_no_snapshot():
@@ -913,7 +917,8 @@ async def test_v4_events_ignore_reset_inputs(stack: _RealStack, cursor):
     assert response.status_code == 200
     frames = list(_frames(body))
     assert frames[0][0] == "slimapi.meta"
-    assert frames[1][0] == "server.connected"
+    # ignore+reset = first-connect semantics; no welcome on v4 → meta only
+    assert len(frames) == 1
     assert all(e != "resync" for e, _, _ in frames)
     assert [f for f in frames if f[1] is not None] == []
 
@@ -1175,41 +1180,63 @@ async def test_v4_stream_first_connect_meta_and_live_delta():
         assert data0["capabilities"] == {"sseReplay": True}
         assert data0["epoch"] == EPOCH
 
-        assert frames[1][0] == "server.connected"  # handshake, no id
-        assert frames[1][1] is None
-        assert frames[2][0] == "message.part.delta"
-        assert frames[2][1] == f"t:{SID}:{EPOCH}:1"
+        assert frames[1][0] == "message.part.delta"
+        assert frames[1][1] == f"t:{SID}:{EPOCH}:1"
+        # rev-gate BLOCKER-1: NO server.connected handshake frame on v4 —
+        # the stamped delta is the first frame after meta; no snapshot.
+        assert all(f[0] != "server.connected" for f in frames)
+        assert all(f[0] != "message.part.snapshot" for f in frames)
     finally:
         await s.close()
 
 
 async def test_v4_stream_tombstone_replay_with_id():
-    """REPLAY-012 (wire): the reconnect replays the tombstone frame with
-    its id, hole-free after the delta."""
+    """REPLAY-012 (rev-gate rewrite): FULL frame sequence — meta → replay
+    delta(1) + tombstone(2, WITH id) → live delta(3). The tombstone
+    appears EXACTLY ONCE on the whole stream (the v3 handshake pre-fill
+    would have double-sent it un-id'd) and no server.connected / snapshot
+    frame is ever sent on v4."""
     s = _RealStack()
     try:
-        # pre-flow: delta seq 1, tombstone seq 2 (no subscribers needed)
+        # pre-flow: delta seq 1, tombstone seq 2 (published, zero subs)
         s.token_hub.on_part_updated(_text_start(SID, "m1", "p1"))
         s.token_hub.on_part_delta(_delta(SID, "m1", "p1", "x"))
         s.token_hub.flush()
         s.token_hub.on_message_removed(SID, "m1")
 
-        s.token_registry.push_script(_stop_token_stream)
+        # reconnect script: publish one MORE live delta (seq 3) then STOP
+        async def script(sub, sid):
+            s.token_hub.on_part_updated(_text_start(sid, "m2", "p1"))
+            s.token_hub.on_part_delta(_delta(sid, "m2", "p1", "y"))
+            s.token_hub.flush()
+            sub.put(TOKEN_STOP)
+
+        s.token_registry.push_script(script)
         response, body = await _read(
             s.app, f"/slimapi/sessions/{SID}/stream?v=4",
             headers={"Last-Event-ID": f"t:{SID}:{EPOCH}:0"},
         )
         assert response.status_code == 200
         frames = list(_frames(body))
-        assert frames[0][0] == "slimapi.meta"
-        # replay block: delta(1) + tombstone(2), both id-stamped
-        assert frames[1][0] == "message.part.delta"
-        assert frames[1][1] == f"t:{SID}:{EPOCH}:1"
-        assert frames[2][0] == "message.removed"
-        assert frames[2][1] == f"t:{SID}:{EPOCH}:2"
-        assert frames[2][2] == {"sessionID": SID, "messageID": "m1"}
-        # replay precedes the handshake welcome
-        assert frames[3][0] == "server.connected"
+
+        # complete sequence, nothing skipped
+        assert [f[0] for f in frames] == [
+            "slimapi.meta",
+            "message.part.delta",   # replay 1 (m1/p1 "x")
+            "message.removed",      # replay 2 (tombstone, id'd)
+            "message.part.delta",   # live 3 (m2/p1 "y")
+        ]
+        assert [f[1] for f in frames[1:]] == [
+            f"t:{SID}:{EPOCH}:1", f"t:{SID}:{EPOCH}:2", f"t:{SID}:{EPOCH}:3",
+        ]
+        # the removed message appears EXACTLY once, WITH its id
+        removed = [f for f in frames if f[0] == "message.removed"]
+        assert len(removed) == 1
+        assert removed[0][2] == {"sessionID": SID, "messageID": "m1"}
+        assert removed[0][1] == f"t:{SID}:{EPOCH}:2"
+        # no un-id'd control frames beyond the frozen set; no snapshots
+        assert all(f[0] != "server.connected" for f in frames)
+        assert all(f[0] != "message.part.snapshot" for f in frames)
     finally:
         await s.close()
 
@@ -1235,13 +1262,16 @@ async def test_v4_stream_cross_sid_cross_endpoint_and_epoch(cursor, expect):
         frames = list(_frames(body))
         assert frames[0][0] == "slimapi.meta"
         if expect == "reset":
-            assert frames[1][0] == "server.connected"
+            # ignore+reset = first-connect semantics; no welcome on v4 →
+            # meta is the only frame (no resync, no replay).
+            assert len(frames) == 1
             assert all(e != "resync" for e, _, _ in frames)
         else:
             assert frames[1] == (
                 "resync", None,
                 {"reason": "epoch_changed", "sessionID": SID},
             )
+            assert len(frames) == 2  # no welcome after the resync on v4
     finally:
         await s.close()
 
@@ -1287,6 +1317,219 @@ async def test_v4_stream_expired_window_resync():
             "resync", None,
             {"reason": "replay_expired", "sessionID": SID},
         )
+    finally:
+        await s.close()
+
+
+# ===========================================================================
+# §4b — rev-gate BLOCKER-1: v4 握手旁路修复的 wire 证据
+# ===========================================================================
+
+_CONTROL_EVENTS = frozenset({"slimapi.meta", "resync", "server.heartbeat"})
+_GLOBAL_ID_RE = re.compile(rf"^g:{EPOCH}:(\d+)$")
+_TOKEN_ID_RE = re.compile(rf"^t:{re.escape(SID)}:{EPOCH}:(\d+)$")
+
+
+def _assert_v4_id_invariant(frames, domain, *, sid=SID):
+    """通用 invariant（评委通过条件 4）：除裁决控制帧（meta/resync/
+    heartbeat）外，v4 流上全部业务/token 帧必须携带正确域的 id 且 seq
+    严格递增；控制帧必须无 id。"""
+    pattern = _GLOBAL_ID_RE if domain == GLOBAL_DOMAIN else _TOKEN_ID_RE
+    prev = 0
+    for event, frame_id, _data in frames:
+        if event in _CONTROL_EVENTS:
+            assert frame_id is None, (event, frame_id)
+            continue
+        assert frame_id is not None, (event, frame_id)
+        match = pattern.match(frame_id)
+        assert match, (frame_id, domain)
+        seq = int(match.group(1))
+        assert seq > prev, (frame_id, prev)
+        prev = seq
+
+
+async def test_v4_stream_live_part_first_connect_no_snapshot():
+    """live part 三态之一（首连）：v4 不预发 message.part.snapshot，也
+    不预发首连前的历史帧——meta 之后直接是 live delta（带 id）。"""
+    s = _RealStack()
+    try:
+        # part 处于 live 状态且已发布过一帧（seq 1，客户端未连）
+        s.token_hub.on_part_updated(_text_start(SID, "m1", "p1"))
+        s.token_hub.on_part_delta(_delta(SID, "m1", "p1", "x"))
+        s.token_hub.flush()
+
+        async def script(sub, sid):
+            s.token_hub.on_part_delta(_delta(sid, "m1", "p1", "y"))
+            s.token_hub.flush()
+            sub.put(TOKEN_STOP)
+
+        s.token_registry.push_script(script)
+        response, body = await _read(s.app, f"/slimapi/sessions/{SID}/stream?v=4")
+        assert response.status_code == 200
+        frames = list(_frames(body))
+        # 首连 = meta + live：无 cursor 不重放（seq 1 不出现），无 snapshot
+        assert [f[0] for f in frames] == ["slimapi.meta", "message.part.delta"]
+        assert frames[1][1] == f"t:{SID}:{EPOCH}:2"
+        assert all(f[0] != "message.part.snapshot" for f in frames)
+        assert all(f[0] != "server.connected" for f in frames)
+        _assert_v4_id_invariant(frames, token_domain(SID))
+    finally:
+        await s.close()
+
+
+async def test_v4_stream_live_part_window_replay_no_snapshot():
+    """live part 三态之二（窗口 replay）：带 cursor 重连只从日志带 id
+    回放，绝不以服务端 snapshot 帧对齐 live part 状态。"""
+    s = _RealStack()
+    try:
+        s.token_hub.on_part_updated(_text_start(SID, "m1", "p1"))
+        s.token_hub.on_part_delta(_delta(SID, "m1", "p1", "x"))
+        s.token_hub.flush()  # seq 1
+
+        async def script(sub, sid):
+            s.token_hub.on_part_delta(_delta(sid, "m1", "p1", "y"))
+            s.token_hub.flush()
+            sub.put(TOKEN_STOP)
+
+        s.token_registry.push_script(script)
+        _, body = await _read(
+            s.app, f"/slimapi/sessions/{SID}/stream?v=4",
+            headers={"Last-Event-ID": f"t:{SID}:{EPOCH}:0"},
+        )
+        frames = list(_frames(body))
+        # replay(seq 1) + live(seq 2)，全部带 id，无任何 snapshot/welcome
+        assert [f[0] for f in frames] == [
+            "slimapi.meta", "message.part.delta", "message.part.delta",
+        ]
+        assert [f[1] for f in frames[1:]] == [
+            f"t:{SID}:{EPOCH}:1", f"t:{SID}:{EPOCH}:2",
+        ]
+        assert all(f[0] != "message.part.snapshot" for f in frames)
+        assert all(f[0] != "server.connected" for f in frames)
+        _assert_v4_id_invariant(frames, token_domain(SID))
+    finally:
+        await s.close()
+
+
+async def test_v4_stream_live_part_resync_no_snapshot():
+    """live part 三态之三（resync）：窗口过期 → resync 帧后 live 帧继续，
+    仍无服务端 snapshot（协议：resync 后客户端走 HTTP 全量对齐）。"""
+    log = ReplayLog(epoch=EPOCH, ttl_s=0.05, clock=lambda: 1000.0)
+    s = _RealStack(log=log)
+    try:
+        s.token_hub.on_part_updated(_text_start(SID, "m1", "p1"))
+        s.token_hub.on_part_delta(_delta(SID, "m1", "p1", "x"))
+        s.token_hub.flush()  # seq 1 @1000.0
+        s.log._clock = lambda: 2000.0  # 越过 TTL
+
+        async def script(sub, sid):
+            s.token_hub.on_part_delta(_delta(sid, "m1", "p1", "y"))
+            s.token_hub.flush()
+            sub.put(TOKEN_STOP)
+
+        s.token_registry.push_script(script)
+        _, body = await _read(
+            s.app, f"/slimapi/sessions/{SID}/stream?v=4",
+            headers={"Last-Event-ID": f"t:{SID}:{EPOCH}:0"},
+        )
+        frames = list(_frames(body))
+        assert frames[0][0] == "slimapi.meta"
+        assert frames[1] == (
+            "resync", None,
+            {"reason": "replay_expired", "sessionID": SID},
+        )
+        # resync 后 live 帧继续带 id 下发
+        assert frames[2][0] == "message.part.delta"
+        assert frames[2][1] == f"t:{SID}:{EPOCH}:2"
+        assert all(f[0] != "message.part.snapshot" for f in frames)
+        _assert_v4_id_invariant(frames, token_domain(SID))
+    finally:
+        await s.close()
+
+
+async def test_v4_id_invariant_global_events_stream():
+    """通用 invariant（条件 4）在 /events v4 全帧遍历上成立：含
+    replay + live 混合、无事件名 IMMEDIATE 帧。"""
+    log = ReplayLog(epoch=EPOCH)
+    s = _RealStack(log=log)
+    try:
+        s.publish(_q_event(1), _q_event(2))  # 离线发布
+        s.hubs.push_script(_script_publish_global(_q_event(3)))
+        _, body = await _read(
+            s.app, "/slimapi/events?v=4",
+            headers={"Last-Event-ID": f"g:{EPOCH}:0"},
+        )
+        frames = list(_frames(body))
+        _assert_v4_id_invariant(frames, GLOBAL_DOMAIN)
+        # replay 1,2 + live 3 全部带 id（IMMEDIATE 帧无 event 名 → 业务帧）
+        assert [f[1] for f in frames[1:]] == [
+            f"g:{EPOCH}:{n}" for n in (1, 2, 3)
+        ]
+    finally:
+        await s.close()
+
+
+async def test_v4_no_old_tombstone_prefill_on_first_connect():
+    """评委通过条件 1（v4 不预发旧 handshake tombstone）：历史
+    message.removed 只进 ReplayLog；v4 首连（无 cursor）绝不重放它。"""
+    s = _RealStack()
+    try:
+        # 历史流量：delta + tombstone（无订阅者时发布）
+        s.token_hub.on_part_updated(_text_start(SID, "m1", "p1"))
+        s.token_hub.on_part_delta(_delta(SID, "m1", "p1", "x"))
+        s.token_hub.flush()
+        s.token_hub.on_message_removed(SID, "m1")
+        assert s.log.domain_frame_count(token_domain(SID)) == 2
+
+        # v4 首连：只有 meta + live delta（新 part）——旧 tombstone 不发
+        async def script(sub, sid):
+            s.token_hub.on_part_updated(_text_start(sid, "m2", "p1"))
+            s.token_hub.on_part_delta(_delta(sid, "m2", "p1", "y"))
+            s.token_hub.flush()
+            sub.put(TOKEN_STOP)
+
+        s.token_registry.push_script(script)
+        response, body = await _read(s.app, f"/slimapi/sessions/{SID}/stream?v=4")
+        assert response.status_code == 200
+        frames = list(_frames(body))
+        assert [f[0] for f in frames] == ["slimapi.meta", "message.part.delta"]
+        assert all(f[0] != "message.removed" for f in frames)
+        assert all(f[0] != "message.part.snapshot" for f in frames)
+        assert all(f[0] != "server.connected" for f in frames)
+    finally:
+        await s.close()
+
+
+async def test_v3_stream_handshake_prefill_unchanged():
+    """v3 握手路径逐字节不变（条件 8 的 real-stack 面）：server.connected
+    预填 + live part snapshot 预填照旧存在（v4 抑制不外溢）。"""
+    s = _RealStack()
+    try:
+        # part live 状态 + 历史 tombstone 都在
+        s.token_hub.on_part_updated(_text_start(SID, "m1", "p1"))
+        s.token_hub.on_part_delta(_delta(SID, "m1", "p1", "x"))
+        s.token_hub.flush()
+        s.token_hub.on_message_removed(SID, "m2")
+
+        s.token_registry.push_script(_stop_token_stream)
+        response, body = await _read(s.app, f"/slimapi/sessions/{SID}/stream?v=3")
+        assert response.status_code == 200
+        frames = list(_frames(body))
+        assert frames[0][0] == "slimapi.meta"
+        assert set(frames[0][2].keys()) == {"subscriberId", "tokens"}
+        names = [f[0] for f in frames]
+        # v3 handshake 预填序列完整保留：connected → tombstone(m2) →
+        # snapshot(m1 live part, done=false)
+        assert names[1] == "server.connected"
+        assert names[2] == "message.removed"
+        assert "message.part.snapshot" in names
+        removed = [f for f in frames if f[0] == "message.removed"]
+        assert len(removed) == 1
+        assert removed[0][2] == {"sessionID": SID, "messageID": "m2"}
+        snapshot = [f for f in frames if f[0] == "message.part.snapshot"]
+        assert snapshot and snapshot[0][2]["done"] is False
+        for block in _blocks(body):
+            assert not block.startswith(b"id:")
     finally:
         await s.close()
 

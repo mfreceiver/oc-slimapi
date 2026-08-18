@@ -37,6 +37,7 @@ GlobalHub / TokenStreamHub).
 
 from __future__ import annotations
 
+import math
 import re
 import secrets
 import time
@@ -277,8 +278,15 @@ class ReplayLog:
             raise ValueError("max_count must be >= 1")
         if max_bytes < 1:
             raise ValueError("max_bytes must be >= 1")
-        if ttl_s <= 0:
-            raise ValueError("ttl_s must be > 0")
+        if ttl_s <= 0 or not math.isfinite(ttl_s):
+            # rev-gate MAJOR-1: ``nan``/``inf`` must NOT slip through —
+            # ``nan <= 0`` is False (bypasses the plain check) and makes
+            # ``age > ttl_s`` constantly False, silently disabling TTL
+            # eviction forever. Fail closed on every non-finite value.
+            raise ValueError(
+                "ttl_s must be a finite number > 0 "
+                f"(got {ttl_s!r})"
+            )
         self.epoch = epoch
         self.max_count = max_count
         self.max_bytes = max_bytes

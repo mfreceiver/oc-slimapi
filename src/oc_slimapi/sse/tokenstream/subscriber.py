@@ -601,8 +601,16 @@ class TokenStreamRegistry:
         if self.hub_registry is not None:
             self.hub_registry.maybe_arm_grace_if_idle()
 
-    def subscribe(self, sid: str) -> TokenSubscriber:
+    def subscribe(self, sid: str, wire_v4: bool = False) -> TokenSubscriber:
         """Admit one token subscriber for ``sid`` under the cap + handshake.
+
+        ``wire_v4`` (rev-gate BLOCKER-1): the subscription process must
+        know the wire version BEFORE the handshake pre-fill runs — it is
+        threaded into the subscriber (``sub.wire_v4``) up front so every
+        frame the sub can possibly receive (handshake or live fanout) is
+        stamped consistently, and into :meth:`attach_subscriber`, whose
+        v4 branch runs the no-prefill handshake (no ``server.connected``,
+        no historical tombstones, no live-part snapshot pre-fill).
 
         Order (all synchronous, no ``await`` → no interleaving with another
         coroutine):
@@ -654,6 +662,10 @@ class TokenStreamRegistry:
             buffer_bytes=self.buffer_bytes,
             max_frame_bytes=self.max_frame_bytes,
         )
+        # rev-gate BLOCKER-1: stamp the wire version BEFORE any delivery
+        # path can see the sub (handshake pre-fill inside attach, live
+        # fanout after) — the fanout choke points stamp iff ``wire_v4``.
+        sub.wire_v4 = wire_v4
         # INV-3 (P1-20): wrap the ENTIRE side-effectful section so any
         # exception (not just sub.closed) triggers symmetric rollback.
         # CancelledError is re-raised untouched (not swallowed by the
@@ -666,9 +678,10 @@ class TokenStreamRegistry:
                 hub.ensure_upstream()
             # Token flush loop (idempotent start; first-attach lifecycle).
             self.token_hub.start()
-            # §5.5 handshake (server.connected first, then flush_sid →
-            # snapshot → enter fanout).
-            self.token_hub.attach_subscriber(sid, sub)
+            # §5.5 handshake (v3: server.connected first, then flush_sid →
+            # snapshot → enter fanout; v4: no-prefill — straight into the
+            # fanout, replay/HTTP own history + anchors).
+            self.token_hub.attach_subscriber(sid, sub, wire_v4=wire_v4)
         except asyncio.CancelledError:
             raise
         except Exception:

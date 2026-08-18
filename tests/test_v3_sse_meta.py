@@ -96,7 +96,7 @@ class _FakeHubs:
     def __init__(self) -> None:
         self.sub = _FakeSubscriber()
 
-    def subscribe(self) -> _FakeSubscriber:
+    def subscribe(self, wire_v4: bool = False) -> _FakeSubscriber:
         return self.sub
 
     def unsubscribe(self, subscriber) -> None:
@@ -107,7 +107,7 @@ class _FakeTokenRegistry:
     def __init__(self) -> None:
         self.sub = _FakeSubscriber("tok_test")
 
-    def subscribe(self, sid: str) -> _FakeSubscriber:
+    def subscribe(self, sid: str, wire_v4: bool = False) -> _FakeSubscriber:
         return self.sub
 
     def unsubscribe(self, subscriber) -> None:

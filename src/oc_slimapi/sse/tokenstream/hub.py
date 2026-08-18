@@ -1143,8 +1143,34 @@ class TokenStreamHub:
     # ------------------------------------------------------------------
     # Subscribe fanout bookkeeping (§5.5 handshake, §5.7 stream-perspective)
     # ------------------------------------------------------------------
-    def attach_subscriber(self, sid: str, sub: Any) -> None:
+    def attach_subscriber(self, sid: str, sub: Any, wire_v4: bool = False) -> None:
         """Stage D's ``TokenSubscriber`` calls this on HTTP connect.
+
+        **v4 fork (rev-gate BLOCKER-1, first)**: ``wire_v4=True`` runs the
+        NO-prefill handshake — the connection joins the fanout directly:
+
+        * ``server.connected`` is **suppressed** — it is not in the frozen
+          no-``id:`` control-frame set (meta/resync/heartbeat only), and a
+          connection-local frame must not bypass the ReplayLog;
+        * historical ``_removed_messages`` tombstones are **not pre-filled**
+          — reconnecting clients get them from the ReplayLog WITH their
+          ``id:`` exactly once (REPLAY-012; the v3 pre-fill would
+          double-send alongside the log replay);
+        * live-part ``message.part.snapshot`` pre-fill is **suppressed** —
+          the v4 protocol NEVER sends server-originated snapshot frames
+          (state alignment after resync is a client HTTP full fetch);
+        * no handshake frames are appended to the ReplayLog either —
+          connection-private frames must not advance the shared per-sid
+          sequence (would pollute other subscribers and future replays).
+
+        Residual ``_pending`` for this sid is left to the regular flush
+        loop: the sub is already in ``_subs_by_sid``, so the next flush
+        publishes those frames through the normal logged+stamped path —
+        nothing is missed and nothing is double-delivered.
+
+        The v3 path below is **byte-identical unchanged** (rev-gate
+        condition 8: the frozen handshake order server.connected →
+        tombstones → flush_sid → live snapshot → fanout).
 
         Implements the §5.5 handshake (C2 no-double-count) in strict order
         with NO await window between steps — flush_loop cannot interleave
@@ -1195,6 +1221,17 @@ class TokenStreamHub:
         # initial pre-fill always lands. Lane 3's TokenSubscriber owns
         # the begin/end API (``_in_handshake`` flag); we just bracket
         # the pre-fill with it.
+        if wire_v4:
+            # v4: NO prefill at all (see docstring). No handshake-mode
+            # bracket either — there is nothing to overflow-guard. The
+            # closed check mirrors the v3 exit: a sub that arrived closed
+            # (prior disconnect / oversized frame) never enters fanout,
+            # and TokenStreamRegistry.subscribe's post-attach check
+            # rolls the flush-loop/grace side effects back symmetrically.
+            if sub.closed:
+                return
+            self._subs_by_sid.setdefault(sid, set()).add(sub)
+            return
         sub.begin_handshake()
         try:
             # 1. server.connected first.
@@ -1371,6 +1408,21 @@ class TokenStreamHub:
         accept the truncated frame because it carries a strictly greater
         revision than the previous delivery.
         """
+        if getattr(sub, "wire_v4", False):
+            # rev-gate BLOCKER-1 principle: v4 subscribers never receive
+            # the per-sub snapshot/truncated DIRECT emits — they bypass
+            # the ReplayLog (no ``id:``, no seq). An oversized part still
+            # goes through :meth:`_truncate_part_for_all`, whose fanout
+            # publishes the truncated frame through the LOGGED path
+            # (id-stamped business frame) and drops the part — memory
+            # bounding identical to v3; only the un-logged direct
+            # delivery is suppressed. The size probe omits the revision
+            # field, so the v3/v4 truncate boundary can differ by the
+            # revision's digit width (~10 bytes) — internal-only.
+            probe = _snapshot_frame(key, text, done)
+            if len(probe) > self._max_frame_bytes:
+                self._truncate_part_for_all(key, done)
+            return
         rev = self._next_part_revision(key)
         frame = _snapshot_frame(
             key, text, done, part_revision=rev,
@@ -1420,6 +1472,15 @@ class TokenStreamHub:
         (one count per subscriber, unlike ``_truncate_part_for_all`` which
         counts once per part drop).
         """
+        if getattr(sub, "wire_v4", False):
+            # rev-gate BLOCKER-1 principle: v4 subscribers never receive
+            # the per-sub direct snapshot/truncated emits (they bypass
+            # the ReplayLog — no ``id:``, no seq). The nodrop path is
+            # pure delivery (no state transition), so suppressing it for
+            # v4 loses nothing protocol-visible: the v4 client keeps its
+            # own accumulated text (every delta was delivered stamped)
+            # and re-anchors via HTTP after any resync.
+            return
         rev = self._next_part_revision(key)
         frame = _snapshot_frame(
             key, text, done, part_revision=rev,

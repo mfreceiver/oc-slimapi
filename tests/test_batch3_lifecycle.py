@@ -594,7 +594,7 @@ class TestInv3SubscribeRollback:
         monkeypatch.setattr("oc_slimapi.sse.registry.GRACE_SECONDS", 0.0)
         reg, th, hubs = self._build_registry()
         try:
-            def raising_attach(sid, sub):
+            def raising_attach(sid, sub, wire_v4=False):
                 raise RuntimeError("attach boom")
 
             th.attach_subscriber = raising_attach  # type: ignore[assignment]
@@ -621,7 +621,7 @@ class TestInv3SubscribeRollback:
         but the code is NOT a capacity error — the exception propagates as-is."""
         reg, th, hubs = self._build_registry()
         try:
-            def raising_attach(sid, sub):
+            def raising_attach(sid, sub, wire_v4=False):
                 raise RuntimeError("attach boom")
 
             th.attach_subscriber = raising_attach  # type: ignore[assignment]
@@ -641,7 +641,7 @@ class TestInv3SubscribeRollback:
         except Exception."""
         reg, th, hubs = self._build_registry()
         try:
-            def cancelling_attach(sid, sub):
+            def cancelling_attach(sid, sub, wire_v4=False):
                 raise asyncio.CancelledError()
 
             th.attach_subscriber = cancelling_attach  # type: ignore[assignment]
@@ -678,11 +678,11 @@ class TestInv3SubscribeRollback:
             calls = {"n": 0}
             real_attach = th.attach_subscriber
 
-            def fail_once(sid, sub):
+            def fail_once(sid, sub, wire_v4=False):
                 calls["n"] += 1
                 if calls["n"] == 1:
                     raise RuntimeError("first attach boom")
-                real_attach(sid, sub)
+                real_attach(sid, sub, wire_v4=wire_v4)
 
             th.attach_subscriber = fail_once  # type: ignore[assignment]
 

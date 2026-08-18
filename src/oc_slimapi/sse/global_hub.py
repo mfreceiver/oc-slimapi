@@ -325,14 +325,21 @@ class GlobalHub:
                 self._spawn_group()
         return _on_done
 
-    def subscribe(self) -> Subscriber:
+    def subscribe(self, welcome: bool = True) -> Subscriber:
+        """Admit a subscriber; ``welcome=False`` skips the connection-local
+        ``server.connected`` frame (rev-gate BLOCKER-1 / condition 5: on v4
+        the frame is suppressed — it is not in the frozen no-``id:`` control
+        set (meta/resync/heartbeat) and connection-local frames must not
+        bypass the replay log. v3 callers keep the default ``True`` —
+        byte-identical unchanged)."""
         subscriber = Subscriber(
             queue_items=self.queue_items,
             buffer_bytes=self.buffer_bytes,
             max_frame_bytes=self.max_frame_bytes,
         )
         # Welcome frame first so the client sees it before any digest/heartbeat.
-        subscriber.put(sse_frame({}, event="server.connected"))
+        if welcome:
+            subscriber.put(sse_frame({}, event="server.connected"))
         self.subscribers.add(subscriber)
         self.ensure_upstream()
         logger.info("sse subscriber attach", extra={"subscriber_id": subscriber.id})

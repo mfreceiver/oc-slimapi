@@ -124,7 +124,12 @@ async def events(request: Request, tokens: str | None = None):
         replay_plan = ReplayResync(RESYNC_RECONNECT_NO_REPLAY)
 
     try:
-        subscriber = request.app.state.hubs.subscribe()
+        # rev-gate BLOCKER-1 / condition 5: the wire version flows INTO
+        # the subscription — v4 suppresses the connection-local
+        # ``server.connected`` welcome frame (outside the frozen no-id
+        # control set; must not bypass the replay log) and is stamped on
+        # the subscriber so fanout frames carry ``id:`` from the start.
+        subscriber = request.app.state.hubs.subscribe(wire_v4=v4)
     except SubscriberCapacityError as exc:
         return json_response(
             {"code": exc.code, "limit": exc.limit, "current": exc.current},
@@ -132,12 +137,6 @@ async def events(request: Request, tokens: str | None = None):
             headers={"Retry-After": "5"},
             accept_encoding=request.headers.get("accept-encoding"),
         )
-
-    if v4:
-        # Sync, no await between subscribe() and here — the welcome frame is
-        # already in the queue (connection-scoped, id-less by design) and no
-        # fanout frame can slip in un-stamped.
-        subscriber.wire_v4 = True
 
     subscriber_id = subscriber.id
     # The meta payload is frozen HERE (handler time) for v4: ``seqBase``

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -1117,8 +1118,15 @@ class Settings:
             raise RuntimeError("OC_SLIMAPI_REPLAY_COUNT must be >= 1")
         if self.replay_max_bytes_kb < 1:
             raise RuntimeError("OC_SLIMAPI_REPLAY_BYTES_KB must be >= 1")
-        if self.replay_ttl_s <= 0:
-            raise RuntimeError("OC_SLIMAPI_REPLAY_TTL_S must be > 0")
+        if not (math.isfinite(self.replay_ttl_s) and self.replay_ttl_s > 0):
+            # rev-gate MAJOR-1: ``float("nan")``/``float("inf")`` env values
+            # bypass a plain ``<= 0`` check (``nan <= 0`` is False); ``nan``
+            # would additionally make the log's ``age > ttl_s`` constantly
+            # False — TTL eviction silently disabled forever. Fail closed.
+            raise RuntimeError(
+                "OC_SLIMAPI_REPLAY_TTL_S must be a finite number > 0 "
+                f"(got {self.replay_ttl_s!r})"
+            )
         if self.qp_sweep_daily_budget < 0:
             raise RuntimeError("OC_SLIMAPI_QP_SWEEP_DAILY_BUDGET must be >= 0")
         if not 1 <= self.merged_fanout <= 16:

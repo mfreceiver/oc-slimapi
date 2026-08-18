@@ -330,7 +330,7 @@ class _MockHubs:
     def get_global(self) -> GlobalHub:
         return self._hub
 
-    def subscribe(self) -> Subscriber:
+    def subscribe(self, wire_v4: bool = False) -> Subscriber:
         # Direct delegation: this mock bypasses admission control so the
         # events-route tests can exercise the SSE generator without a
         # fully-configured registry.

@@ -739,7 +739,7 @@ class _ClosingTokenHub:
     def stop(self) -> None:
         self.stop_calls += 1
 
-    def attach_subscriber(self, sid: str, sub) -> None:
+    def attach_subscriber(self, sid: str, sub, wire_v4: bool = False) -> None:
         # MAJOR 4 trigger: simulate the sub being closed during / after
         # the handshake pre-fill (defensive guard). attach_subscriber in
         # hub.py checks sub.closed and bails without entering fanout.
@@ -842,7 +842,7 @@ class TestRegistryAttachFailure:
             def start(self) -> None: pass
             def stop(self) -> None: pass
 
-            def attach_subscriber(self, sid: str, sub) -> None:
+            def attach_subscriber(self, sid: str, sub, wire_v4: bool = False) -> None:
                 self._calls += 1
                 if self._calls == 1:
                     sub.closed = True  # first attach fails

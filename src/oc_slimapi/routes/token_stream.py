@@ -164,7 +164,12 @@ async def token_stream(request: Request, sid: str, directory: str | None = None)
         replay_plan = ReplayResync(RESYNC_RECONNECT_NO_REPLAY)
 
     try:
-        subscriber = registry.subscribe(sid)
+        # rev-gate BLOCKER-1: the wire version flows INTO the subscription
+        # (before the handshake pre-fill runs) — v4 attaches with the
+        # no-prefill handshake (no server.connected / historical
+        # tombstones / live-part snapshot) and every later fanout frame
+        # is id-stamped from the start.
+        subscriber = registry.subscribe(sid, wire_v4=v4)
     except TokenSubscriberCapacityError as exc:
         body = {"code": exc.code, "limit": exc.limit, "current": exc.current}
         if exc.buffer_bytes is not None:
@@ -175,12 +180,6 @@ async def token_stream(request: Request, sid: str, directory: str | None = None)
             headers={"Retry-After": "5"},
             accept_encoding=request.headers.get("accept-encoding"),
         )
-
-    if v4:
-        # Sync, no await between subscribe() and here — the handshake frames
-        # enqueued by attach_subscriber are connection-scoped (id-less by
-        # design) and no live-fanout frame can slip in un-stamped.
-        subscriber.wire_v4 = True
 
     subscriber_id = subscriber.id
     # The meta payload is frozen HERE (handler time) for v4: ``seqBase``

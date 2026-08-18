@@ -184,8 +184,16 @@ class HubRegistry:
             return
         self._removal_task = asyncio.create_task(self._remove_hub_after_grace(hub))
 
-    def subscribe(self) -> Subscriber:
+    def subscribe(self, wire_v4: bool = False) -> Subscriber:
         """Admit a new subscriber under T3 caps, then start / reuse the hub.
+
+        ``wire_v4`` (rev-gate BLOCKER-1 / condition 5): suppresses the
+        connection-local ``server.connected`` welcome frame (v4-only —
+        the frame is outside the frozen no-``id:`` control set and must
+        not bypass the replay log) and stamps ``subscriber.wire_v4`` so
+        the fanout choke point id-stamps business frames for this
+        connection. v3 callers keep the default ``False`` — the welcome
+        frame and raw frame bytes are byte-identical unchanged.
 
         Capacity check + ``subscribers.add`` happen with no ``await`` between
         them (contract §6 admission critical section). On overflow raises
@@ -215,7 +223,8 @@ class HubRegistry:
                 limit=self.max_total_subscribers,
                 current=self.total_subscribers,
             )
-        subscriber = hub.subscribe()
+        subscriber = hub.subscribe(welcome=not wire_v4)
+        subscriber.wire_v4 = wire_v4
         self.total_subscribers += 1
         # ---- end critical section ----
         return subscriber

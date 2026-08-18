@@ -571,8 +571,8 @@ class TestTokenStreamRegistryAdmission:
             th = app.state.token_hub
             original_attach = th.attach_subscriber
 
-            def closing_attach(sid, sub):
-                original_attach(sid, sub)
+            def closing_attach(sid, sub, wire_v4=False):
+                original_attach(sid, sub, wire_v4=wire_v4)
                 sub.closed = True  # simulate post-attach defensive close
 
             th.attach_subscriber = closing_attach  # type: ignore[method-assign]
@@ -608,8 +608,8 @@ class TestTokenStreamRegistryAdmission:
             hubs = app.state.hubs
             original_attach = th.attach_subscriber
 
-            def closing_attach(sid, sub):
-                original_attach(sid, sub)
+            def closing_attach(sid, sub, wire_v4=False):
+                original_attach(sid, sub, wire_v4=wire_v4)
                 sub.closed = True
 
             th.attach_subscriber = closing_attach  # type: ignore[method-assign]
@@ -664,8 +664,8 @@ class TestTokenStreamRegistryAdmission:
                 assert th._flush_task is not None
                 original_attach = th.attach_subscriber
 
-                def closing_attach(sid, sub):
-                    original_attach(sid, sub)
+                def closing_attach(sid, sub, wire_v4=False):
+                    original_attach(sid, sub, wire_v4=wire_v4)
                     sub.closed = True
 
                 th.attach_subscriber = closing_attach  # type: ignore[method-assign]

@@ -626,6 +626,45 @@ def test_config_replay_fail_closed_validation(field, value):
 
 
 # ---------------------------------------------------------------------------
+# rev-gate MAJOR-1: 非有限 TTL（nan/inf）必须两层 fail-closed
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("ttl", [float("nan"), float("inf"), float("-inf")])
+def test_replay_log_ctor_rejects_non_finite_ttl(ttl):
+    with pytest.raises(ValueError, match="finite"):
+        ReplayLog(epoch="0" * 16, ttl_s=ttl)
+
+
+@pytest.mark.parametrize("ttl", [float("nan"), float("inf"), float("-inf")])
+def test_settings_validation_rejects_non_finite_ttl(ttl):
+    from oc_slimapi.config import Settings
+
+    s = Settings(
+        host="127.0.0.1", port=4097, upstream="http://127.0.0.1:4096",
+        replay_ttl_s=ttl,
+    )
+    with pytest.raises(RuntimeError, match="OC_SLIMAPI_REPLAY_TTL_S"):
+        s.validate()
+
+
+@pytest.mark.parametrize("raw", ["nan", "inf", "-inf", "+inf"])
+def test_settings_env_non_finite_ttl_fails_closed(monkeypatch, raw):
+    """env 注入的非有限 TTL（含 nan 使 age>ttl 恒 False 从而静默禁用
+    TTL 的攻击面）必须在 validate() 处 RuntimeError。"""
+    import oc_slimapi.config as config_mod
+
+    monkeypatch.setenv("OC_SLIMAPI_REPLAY_TTL_S", raw)
+    reloaded = importlib.reload(config_mod)
+    s = reloaded.Settings(
+        host="127.0.0.1", port=4097, upstream="http://127.0.0.1:4096",
+    )
+    with pytest.raises(RuntimeError, match="OC_SLIMAPI_REPLAY_TTL_S"):
+        s.validate()
+    monkeypatch.delenv("OC_SLIMAPI_REPLAY_TTL_S")
+    importlib.reload(config_mod)
+
+
+# ---------------------------------------------------------------------------
 # app 装配（app.state 键约定：replay_epoch / replay_log — B3b-2 接口）
 # ---------------------------------------------------------------------------
 

@@ -278,7 +278,7 @@ class _FakeHubs:
     def __init__(self) -> None:
         self.sub = _FakeSubscriber()
 
-    def subscribe(self) -> _FakeSubscriber:
+    def subscribe(self, wire_v4: bool = False) -> _FakeSubscriber:
         return self.sub
 
     def unsubscribe(self, subscriber) -> None:
