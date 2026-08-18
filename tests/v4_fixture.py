@@ -466,6 +466,141 @@ def load_golden() -> dict[str, Any]:
     return document
 
 
+# ---------------------------------------------------------------------------
+# 真实上游 golden（rev gate BLOCKER-1：权威源①真进程 HTTP handler 生成）
+# ---------------------------------------------------------------------------
+
+REAL_UPSTREAM_BINARY = "/home/mar/.opencode/bin/opencode"
+REAL_UPSTREAM_VERSION = "1.18.18"
+REAL_GOLDEN_GENERATOR = f"real-upstream-http-{REAL_UPSTREAM_VERSION}"
+REAL_GOLDEN_PATH = GOLDEN_DIR / f"sessions-global-real-{ALIGNED_VERSION}.json"
+
+# 服务端赋值字段：真实实例自定 id / 时间戳 / 目录为绝对路径 / project 解析
+# （这些字段跨环境不可复现——日常 CI 对它们降级为「存在性 + 排序一致性」，
+# 其余字段仍全量比对；EQ-007 真实运行时全字段含时间戳精确比对）。
+REAL_SERVER_ASSIGNED_FIELDS = [
+    "id",
+    "time_created",
+    "time_updated",
+    "directory",
+    "project_id",
+    "project",
+]
+
+REAL_GOLDEN_HINT = (
+    "OC_SLIMAPI_EQ_WRITE_REAL_GOLDEN=1 .venv/bin/python -m pytest "
+    "tests/test_equivalence_anchor.py -k eq007_real_golden "
+    "（需真实 opencode 1.18.18 发布二进制）"
+)
+
+
+def build_real_golden_document(
+    sessions: Sequence[dict[str, Any]],
+    injected: Sequence[dict[str, Any]],
+    *,
+    opencode_version: str,
+    generated_at: str,
+) -> dict[str, Any]:
+    """真实 handler golden（GET /experimental/session?archived=true 全量）。
+
+    ``sessions``：真实 HTTP GlobalInfo 经比较层归一的记录（time_updated
+    DESC, id DESC 序——上游 listGlobal 冻结排序）。
+
+    ``injected``：注入清单 ``{fixture_id, real_id, fixture_directory,
+    real_directory}``——fixture 语义 ↔ 真实值的桥（CI 降级校验用它做
+    非 server-assigned 字段的全量比对 + parent 链接一致性）。
+    """
+    manifest = dataset_manifest()
+    return {
+        "version": ALIGNED_VERSION,
+        "generator": REAL_GOLDEN_GENERATOR,
+        "generated_at": generated_at,
+        "opencode_version": opencode_version,
+        "dataset_digest": manifest["digest"],
+        "dataset_manifest": manifest,
+        "server_assigned_fields": list(REAL_SERVER_ASSIGNED_FIELDS),
+        "regenerate_hint": REAL_GOLDEN_HINT,
+        "injected_sessions": list(injected),
+        "response_fingerprint": response_fingerprint(sessions),
+        "query": {
+            "endpoint": "GET /experimental/session?archived=true&limit=1000",
+            "sort": "time_updated DESC, id DESC",
+        },
+        "sessions": list(sessions),
+    }
+
+
+def validate_real_golden_ci(document: dict[str, Any]) -> list[str]:
+    """日常 CI（无真进程）对真实 golden 的**降级**校验；返回问题清单。
+
+    降级规则（任务点 5）：server-assigned 字段 → 存在性 + 排序一致性；
+    其余字段（title / archived 置性 / parent 链接 / tokens 零值族）→ 经
+    injected 清单桥接 fixture 语义后全量比对。
+    """
+    problems: list[str] = []
+    if document.get("version") != ALIGNED_VERSION:
+        problems.append(f"version mismatch: {document.get('version')!r}")
+    if document.get("generator") != REAL_GOLDEN_GENERATOR:
+        problems.append(f"generator mismatch: {document.get('generator')!r}")
+    if document.get("opencode_version") != REAL_UPSTREAM_VERSION:
+        problems.append(
+            f"opencode_version mismatch: {document.get('opencode_version')!r}"
+        )
+    if document.get("dataset_digest") != dataset_manifest()["digest"]:
+        problems.append("dataset_digest mismatch（数据集与 golden 漂移，需再生成）")
+    if not document.get("regenerate_hint"):
+        problems.append("regenerate_hint missing")
+    if document.get("server_assigned_fields") != REAL_SERVER_ASSIGNED_FIELDS:
+        problems.append("server_assigned_fields 声明漂移")
+    injected = document.get("injected_sessions") or []
+    sessions = document.get("sessions") or []
+    if not injected or not sessions:
+        problems.append("injected_sessions / sessions 空")
+        return problems
+    if len(sessions) != len(injected):
+        problems.append(
+            f"sessions({len(sessions)}) != injected({len(injected)}) 行数漂移"
+        )
+    fixture_by_id = {row["id"]: row for row in DATASET}
+    injected_by_fixture = {e["fixture_id"]: e for e in injected}
+    if set(injected_by_fixture) != {
+        row["id"] for row in DATASET if row.get("directory")
+    }:
+        problems.append("injected 清单与可注入 fixture 行集不一致")
+    real_to_fixture = {e["real_id"]: e["fixture_id"] for e in injected}
+    if len(real_to_fixture) != len(injected):
+        problems.append("real_id 重复")
+    # 排序一致性：time_updated (, id) DESC 单调不增
+    keys = [(s.get("time_updated"), s.get("id")) for s in sessions]
+    if any(a is None or b is None for a, b in keys):
+        problems.append("server-assigned 字段缺失（time_updated / id 存在性）")
+    elif keys != sorted(keys, reverse=True):
+        problems.append("sessions 序违反 time_updated DESC, id DESC")
+    for entry in sessions:
+        rid = entry.get("id")
+        fid = real_to_fixture.get(rid)
+        if fid is None:
+            problems.append(f"未知 real_id {rid!r}")
+            continue
+        row = fixture_by_id[fid]
+        # 非 server-assigned：全量比对（title / archived 置性 / parent 链接）
+        if entry.get("title") != row.get("title"):
+            problems.append(f"{fid}: title 全量比对失败")
+        arch_golden = entry.get("time_archived")
+        if (arch_golden is not None) != (row.get("time_archived") is not None):
+            problems.append(f"{fid}: archived 置性不一致")
+        if (arch_golden is not None) and arch_golden != row.get("time_archived"):
+            problems.append(f"{fid}: time_archived 值不一致")
+        parent = entry.get("parent_id")
+        if (parent is not None) != (row.get("parent_id") is not None):
+            problems.append(f"{fid}: parent 链接置性不一致")
+        if parent is not None and real_to_fixture.get(parent) != row.get("parent_id"):
+            problems.append(f"{fid}: parent 链接映射不一致")
+        if entry.get("directory") != injected_by_fixture[fid]["real_directory"]:
+            problems.append(f"{fid}: directory 与注入清单不一致")
+    return problems
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if "--write-golden" in argv:

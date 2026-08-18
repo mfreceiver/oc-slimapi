@@ -643,13 +643,20 @@ async def test_v4_degraded_items_projection_shape():
 
 
 class _BusyAux:
-    """db 可用面 + query 抛 busy（lifecycle busy 分类原样上抛的路由可见形态）。"""
+    """db 可用面 + query 抛 busy（lifecycle busy 分类原样上抛的路由可见形态）。
+
+    rev gate MINOR-1：存下**参数化的**异常实例并原样抛出——三个参数化
+    case 各自真正执行（此前的硬编码使参数未用、断言面退化）。
+    """
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
 
     def status(self) -> DbAuxStatus:
         return DbAuxStatus(available=True, mode="db", reason=None)
 
     async def query(self, sql, params=()):  # pragma: no cover - raise only
-        raise sqlite3.OperationalError("database is locked")
+        raise self._exc
 
 
 @pytest.mark.parametrize(
@@ -661,7 +668,7 @@ class _BusyAux:
     ],
 )
 async def test_busy_sqlite_error_maps_to_503_without_leak(exc):
-    app, seen = _build_app(_BusyAux())
+    app, seen = _build_app(_BusyAux(exc))
     async with _client(app) as client:
         resp = await client.get("/slimapi/sessions",
                                 params={"v": "4"}, headers=IDENTITY)

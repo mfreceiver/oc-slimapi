@@ -565,3 +565,146 @@ async def test_snapshotter_carries_v4(tmp_path):
     line = json.loads(files[0].read_text().strip())
     assert line["v4"]["degradedMatrix"][HTTP_KEY] == 1
     assert line["v4"]["degradedMatrix"][FAIL_KEY] == 1
+
+
+# ---------------------------------------------------------------------------
+# rev gate MINOR-3：真实写入端到端（**不装 _MarkerSimulatorMiddleware**）
+#
+# 标记由真实 routes/sessions.py `_sessions_v4` 写入（R1 已合入），经真实
+# SlimapiSelectorMiddleware + TrafficAccountingMiddleware 全链——验证「写入
+# 键名/值域」与「消费侧」在无模拟层时同键同值。外加：非 fail-closed 的
+# v4 sessions 5xx（TransformBusy transform_busy 503）**不计** degraded503。
+# ---------------------------------------------------------------------------
+
+
+def _build_real_app(
+    aux,
+    *,
+    logger: logging.Logger,
+    ledger: TrafficLedger | None = None,
+    settings: Settings | None = None,
+):
+    """生产栈序（无 marker 模拟层）：Traffic → Selector → 路由。"""
+    app = FastAPI()
+    app.state.config = settings or _settings()
+    app.state.upstream = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200, content=HTTP_SESSIONS_BODY,
+                headers={"Content-Type": "application/json"},
+            )
+        ),
+        base_url=app.state.config.upstream,
+    )
+    app.state.schema_degraded = False
+    app.state.deployment_revision = None
+    app.state.dbaux = aux
+    app.state.transforms = TransformPool(TransformConfig(
+        max_transforms=app.state.config.max_transforms,
+        transform_wait_seconds=app.state.config.transform_wait_seconds,
+        max_response_bytes=app.state.config.max_response_bytes,
+    ))
+    if ledger is not None:
+        app.state.traffic_ledger = ledger
+    app.add_middleware(SlimapiSelectorMiddleware)
+    app.add_middleware(TrafficAccountingMiddleware, logger=logger)
+    for router in (health.router, sessions.router):
+        app.include_router(router)
+    register_error_handlers(app)
+    install_proxy(app)
+    return app
+
+
+async def test_real_writer_db_200(tmp_path, capture_logger):
+    """真实路由 DB 200 → source=db（全链无模拟层）。"""
+    aux = await _real_aux(tmp_path)
+    ledger = TrafficLedger()
+    app = _build_real_app(aux, logger=capture_logger, ledger=ledger)
+    try:
+        async with _client(app) as client:
+            resp = await client.get("/slimapi/sessions",
+                                    params={"v": "4"}, headers=IDENTITY)
+        assert resp.status_code == 200
+        assert "degraded" not in resp.json()
+    finally:
+        await aux.stop()
+    row = _rows(capture_logger)[-1]
+    assert row["sessionsSource"] == "db"
+    assert "degraded503" not in row
+    assert "v4" not in ledger.snapshot()
+    assert _counters(app) == {"degraded_200": 0, "fail_closed_503": 0}
+
+
+async def test_real_writer_http_degraded_200(capture_logger):
+    """真实路由 Class A 降级 200 → source=http。"""
+    ledger = TrafficLedger()
+    app = _build_real_app(_StubAux("disabled"), logger=capture_logger,
+                          ledger=ledger)
+    async with _client(app) as client:
+        resp = await client.get("/slimapi/sessions",
+                                params={"v": "4"}, headers=IDENTITY)
+    assert resp.status_code == 200
+    assert resp.json()["degraded"] is True
+    row = _rows(capture_logger)[-1]
+    assert row["sessionsSource"] == "http"
+    assert "degraded503" not in row
+    assert ledger.snapshot()["v4"]["degradedMatrix"].get(HTTP_KEY) == 1
+    assert _counters(app) == {"degraded_200": 1, "fail_closed_503": 0}
+
+
+async def test_real_writer_fail_closed_503(capture_logger):
+    """真实路由 503 fail-closed → degraded503=True。"""
+    ledger = TrafficLedger()
+    app = _build_real_app(_StubAux("disabled"), logger=capture_logger,
+                          ledger=ledger)
+    async with _client(app) as client:
+        resp = await client.get(
+            "/slimapi/sessions",
+            params={"v": "4", "parent": "only"}, headers=IDENTITY)
+    assert resp.status_code == 503
+    row = _rows(capture_logger)[-1]
+    assert row["degraded503"] is True
+    assert "sessionsSource" not in row
+    assert ledger.snapshot()["v4"]["degradedMatrix"].get(FAIL_KEY) == 1
+    assert _counters(app) == {"degraded_200": 0, "fail_closed_503": 1}
+
+
+async def test_real_writer_v3_path_markers_absent(capture_logger):
+    """真实 v3 路径两字段恒缺席（回归锚）。"""
+    app = _build_real_app(_StubAux("disabled"), logger=capture_logger)
+    async with _client(app) as client:
+        resp = await client.get("/slimapi/sessions",
+                                params={"v": "3"}, headers=IDENTITY)
+    assert resp.status_code == 200
+    row = _rows(capture_logger)[-1]
+    assert row["wireVersion"] == "3"
+    assert "sessionsSource" not in row
+    assert "degraded503" not in row
+    assert _counters(app) == {"degraded_200": 0, "fail_closed_503": 0}
+
+
+async def test_real_transform_busy_503_not_degraded(capture_logger):
+    """非 fail-closed 的 v4 sessions 5xx（TransformBusy transform_busy）
+    **不计** degraded503：transform 拥塞是资源面而非 DB 降级面——计进去
+    会污染「DB 辅助不可用」语义（R1 决策锚）。"""
+    ledger = TrafficLedger()
+    app = _build_real_app(
+        _StubAux("disabled"), logger=capture_logger, ledger=ledger,
+        settings=_settings(transform_wait_seconds=0.05),
+    )
+    pool = app.state.transforms
+    await pool.acquire()  # 占满 admission（max_transforms=1）
+    try:
+        async with _client(app) as client:
+            resp = await client.get("/slimapi/sessions",
+                                    params={"v": "4"}, headers=IDENTITY)
+    finally:
+        pool.release()
+    assert resp.status_code == 503
+    assert resp.json()["code"] == "transform_busy"
+    row = _rows(capture_logger)[-1]
+    assert row["status"] == 503
+    assert "degraded503" not in row
+    assert "sessionsSource" not in row
+    assert "v4" not in ledger.snapshot()
+    assert _counters(app) == {"degraded_200": 0, "fail_closed_503": 0}

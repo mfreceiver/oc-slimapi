@@ -219,7 +219,11 @@ async def test_v3_sessions_key_order_nondeterminism_recorded():
     live_items = orjson.loads(live_resp.content)["items"]
     # 语义等价恒成立；键序可能不同（记录性断言，不构成回归门槛）
     assert [sorted(i) for i in pinned_items] == [sorted(i) for i in live_items]
-    same_order = pinned_items == live_items
+    # rev gate MINOR-2：dict == 忽略键序（恒真断言）——改为比较键**序列**
+    # （序列化字节等价：orjson 序列化按插入序输出键）。
+    pinned_key_seq = [list(i.keys()) for i in pinned_items]
+    live_key_seq = [list(i.keys()) for i in live_items]
+    same_order = pinned_key_seq == live_key_seq
     print(f"v3 sessions item key order identical across seeds: {same_order}")
 
 
