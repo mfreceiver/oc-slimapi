@@ -68,8 +68,13 @@ PROJECT_ALIASED_COLUMNS: tuple[str, ...] = (
 # 查询结果行 → dict 的键序（与 SELECT 列序严格一致）
 ROW_KEYS: tuple[str, ...] = SESSION_PROJECTION_COLUMNS + ("p_id", "p_name", "p_worktree")
 
-# §8 JSON 列（真库 TEXT 存 JSON；解析失败 → 跳行 + warning）
-JSON_COLUMNS: tuple[str, ...] = ("summary_diffs", "revert", "permission", "metadata")
+# §8 JSON 文本列（真库 drizzle json 列族）：rows_to_records 解析为对象；
+# 解析失败 → 跳行 + warning。rev gate R5 BLOCKER-1：**model 是 json 列**
+# （上游 fromRow session.ts:86-95 直接 row.model.id——实证对象形态），漏掉
+# 会让 v4 wire 输出 JSON 字符串而非对象（skeleton 直出 row["model"]）。
+JSON_COLUMNS: tuple[str, ...] = (
+    "summary_diffs", "revert", "permission", "metadata", "model",
+)
 
 ARCHIVED_STATES: tuple[str, ...] = ("omit", "only", "all")
 # parent 保留态；其余非空字符串按 <sid> 字面处理（上游 sid 为 ses_* 格式，

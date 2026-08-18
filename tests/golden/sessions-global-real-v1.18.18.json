@@ -1,13 +1,13 @@
 {
   "version": "v1.18.18",
   "generator": "real-upstream-http-1.18.18",
-  "generated_at": "2026-08-18T04:47:15+00:00",
+  "generated_at": "2026-08-18T05:11:54+00:00",
   "opencode_version": "1.18.18",
-  "dataset_digest": "c7b87f0f653b1694",
+  "dataset_digest": "0a98f151671b36ed",
   "dataset_manifest": {
-    "sessions": 23,
+    "sessions": 24,
     "projects": 2,
-    "digest": "c7b87f0f653b1694"
+    "digest": "0a98f151671b36ed"
   },
   "server_assigned_fields": [
     "id",
@@ -35,9 +35,9 @@
   "injected_sessions": [
     {
       "fixture_id": "ses_root_1",
-      "real_id": "ses_fecce1003ffe6pQH4aN8kU9bdl",
+      "real_id": "ses_fecb77f20ffeVoGMIs2I1NTWY6",
       "fixture_directory": "/foo",
-      "real_directory": "/tmp/eq007-home-_wult88v/ws/foo",
+      "real_directory": "/tmp/eq007-home-5ndymjd7/ws/foo",
       "agent": "agent-even",
       "model": [
         "fixture-model",
@@ -48,9 +48,9 @@
     },
     {
       "fixture_id": "ses_root_2",
-      "real_id": "ses_fecce0fa5ffeZYv7BaEpmbZLe4",
+      "real_id": "ses_fecb77ecaffeQSTqG5mJvbMn3I",
       "fixture_directory": "/foobar",
-      "real_directory": "/tmp/eq007-home-_wult88v/ws/foobar",
+      "real_directory": "/tmp/eq007-home-5ndymjd7/ws/foobar",
       "agent": "agent-odd",
       "model": [
         "fixture-model",
@@ -61,9 +61,9 @@
     },
     {
       "fixture_id": "ses_archived_child",
-      "real_id": "ses_fecce0f80ffeJdwrr74ERLIZF0",
+      "real_id": "ses_fecb77ea2ffeiKqbn4r5Zs6lV6",
       "fixture_directory": "/foo/sub",
-      "real_directory": "/tmp/eq007-home-_wult88v/ws/foo/sub",
+      "real_directory": "/tmp/eq007-home-5ndymjd7/ws/foo/sub",
       "agent": "agent-even",
       "model": [
         "fixture-model",
@@ -74,9 +74,9 @@
     },
     {
       "fixture_id": "ses_root_3",
-      "real_id": "ses_fecce0f5effeN66FEhQ18nWMGx",
+      "real_id": "ses_fecb77e83ffeNrGg7ZJSuuexby",
       "fixture_directory": "/a",
-      "real_directory": "/tmp/eq007-home-_wult88v/ws/a",
+      "real_directory": "/tmp/eq007-home-5ndymjd7/ws/a",
       "agent": "agent-odd",
       "model": [
         "fixture-model",
@@ -93,9 +93,9 @@
     },
     {
       "fixture_id": "ses_a_pct",
-      "real_id": "ses_fecce0f27ffe3Fgi4dVnv09iSF",
+      "real_id": "ses_fecb77e61fferxAkJW9bXtzwgw",
       "fixture_directory": "/a/%20b/c",
-      "real_directory": "/tmp/eq007-home-_wult88v/ws/a/ b/c",
+      "real_directory": "/tmp/eq007-home-5ndymjd7/ws/a/ b/c",
       "agent": "agent-even",
       "model": [
         "fixture-model",
@@ -106,9 +106,9 @@
     },
     {
       "fixture_id": "ses_a_us",
-      "real_id": "ses_fecce0ef6ffe3d0d2n4sYcYua2",
+      "real_id": "ses_fecb77e3dffe30zl8Fx4K6Kid9",
       "fixture_directory": "/a/dir_%_x",
-      "real_directory": "/tmp/eq007-home-_wult88v/ws/a/dir_%_x",
+      "real_directory": "/tmp/eq007-home-5ndymjd7/ws/a/dir_%_x",
       "agent": "agent-odd",
       "model": [
         "fixture-model",
@@ -130,9 +130,9 @@
     },
     {
       "fixture_id": "ses_same_level",
-      "real_id": "ses_fecce0ed3ffevvJSW0tH2xtAUd",
+      "real_id": "ses_fecb77e1effeFlavdQdhWrX7jL",
       "fixture_directory": "/a%20b/c",
-      "real_directory": "/tmp/eq007-home-_wult88v/ws/a b/c",
+      "real_directory": "/tmp/eq007-home-5ndymjd7/ws/a b/c",
       "agent": "agent-even",
       "model": [
         "fixture-model",
@@ -143,9 +143,9 @@
     },
     {
       "fixture_id": "ses_case",
-      "real_id": "ses_fecce0eb4ffeJYdyTly6Pd1AAu",
+      "real_id": "ses_fecb77df7ffeuPOwxf39pFO85g",
       "fixture_directory": "/Foo/child",
-      "real_directory": "/tmp/eq007-home-_wult88v/ws/Foo/child",
+      "real_directory": "/tmp/eq007-home-5ndymjd7/ws/Foo/child",
       "agent": "agent-odd",
       "model": [
         "fixture-model",
@@ -156,9 +156,9 @@
     },
     {
       "fixture_id": "ses_tie_a",
-      "real_id": "ses_fecce0e8bffeSC5ql0jllM3Xnz",
+      "real_id": "ses_fecb77dd5ffe6Oh9cIn3TNE8ke",
       "fixture_directory": "/b",
-      "real_directory": "/tmp/eq007-home-_wult88v/ws/b",
+      "real_directory": "/tmp/eq007-home-5ndymjd7/ws/b",
       "agent": "agent-even",
       "model": [
         "fixture-model",
@@ -169,9 +169,9 @@
     },
     {
       "fixture_id": "ses_tie_b",
-      "real_id": "ses_fecce0e65ffeqCLr8XRbN5qkIR",
+      "real_id": "ses_fecb77dafffeq8AJJfieaKtG15",
       "fixture_directory": "/b/sub",
-      "real_directory": "/tmp/eq007-home-_wult88v/ws/b/sub",
+      "real_directory": "/tmp/eq007-home-5ndymjd7/ws/b/sub",
       "agent": "agent-odd",
       "model": [
         "fixture-model",
@@ -182,9 +182,9 @@
     },
     {
       "fixture_id": "ses_host_style",
-      "real_id": "ses_fecce0e40ffeXY6SYjXcCFXVvL",
+      "real_id": "ses_fecb77d8bffeKNaXdKh3bnAg6n",
       "fixture_directory": "/srv/mar@host-1/proj",
-      "real_directory": "/tmp/eq007-home-_wult88v/ws/srv/mar@host-1/proj",
+      "real_directory": "/tmp/eq007-home-5ndymjd7/ws/srv/mar@host-1/proj",
       "agent": "agent-even",
       "model": [
         "fixture-model",
@@ -201,9 +201,9 @@
     },
     {
       "fixture_id": "ses_time_zero",
-      "real_id": "ses_fecce0e2cffe4QSvcd7FhnwfkQ",
+      "real_id": "ses_fecb77d7bffeLo1z7bUOdvsoMi",
       "fixture_directory": "/foo",
-      "real_directory": "/tmp/eq007-home-_wult88v/ws/foo",
+      "real_directory": "/tmp/eq007-home-5ndymjd7/ws/foo",
       "agent": "agent-odd",
       "model": [
         "fixture-model",
@@ -214,9 +214,9 @@
     },
     {
       "fixture_id": "ses_time_now",
-      "real_id": "ses_fecce0e05ffe6qnRhW8gU9zauy",
+      "real_id": "ses_fecb77d65ffeQMpJoe0MWHxGg2",
       "fixture_directory": "/b/late",
-      "real_directory": "/tmp/eq007-home-_wult88v/ws/b/late",
+      "real_directory": "/tmp/eq007-home-5ndymjd7/ws/b/late",
       "agent": "agent-even",
       "model": [
         "fixture-model",
@@ -238,9 +238,9 @@
     },
     {
       "fixture_id": "ses_tie_c",
-      "real_id": "ses_fecce0df1ffeJmEvISxQ9AGRys",
+      "real_id": "ses_fecb77d5affeY1ik56JMM98tcK",
       "fixture_directory": "/foo",
-      "real_directory": "/tmp/eq007-home-_wult88v/ws/foo",
+      "real_directory": "/tmp/eq007-home-5ndymjd7/ws/foo",
       "agent": "agent-odd",
       "model": [
         "fixture-model",
@@ -251,9 +251,9 @@
     },
     {
       "fixture_id": "ses_orphan_proj",
-      "real_id": "ses_fecce0de5ffei0T3xM8ry8Jfq2",
+      "real_id": "ses_fecb77d49ffebAJ6j4zGuEf0xJ",
       "fixture_directory": "/foo",
-      "real_directory": "/tmp/eq007-home-_wult88v/ws/foo",
+      "real_directory": "/tmp/eq007-home-5ndymjd7/ws/foo",
       "agent": "agent-even",
       "model": [
         "fixture-model",
@@ -264,9 +264,9 @@
     },
     {
       "fixture_id": "ses_bad_json",
-      "real_id": "ses_fecce0dd1ffe7Eax0jdbpB6YCn",
+      "real_id": "ses_fecb77d39ffePkKVgXtpbYKHXe",
       "fixture_directory": "/foo",
-      "real_directory": "/tmp/eq007-home-_wult88v/ws/foo",
+      "real_directory": "/tmp/eq007-home-5ndymjd7/ws/foo",
       "agent": "agent-odd",
       "model": [
         "fixture-model",
@@ -276,10 +276,10 @@
       "permission": null
     },
     {
-      "fixture_id": "ses_revert_full",
-      "real_id": "ses_fecce0dc3ffezA71Vkmd3z9GzC",
-      "fixture_directory": "/a",
-      "real_directory": "/tmp/eq007-home-_wult88v/ws/a",
+      "fixture_id": "ses_bad_model",
+      "real_id": "ses_fecb77d2affeM4Pd7j3IcE5Lto",
+      "fixture_directory": "/foo",
+      "real_directory": "/tmp/eq007-home-5ndymjd7/ws/foo",
       "agent": "agent-even",
       "model": [
         "fixture-model",
@@ -289,10 +289,10 @@
       "permission": null
     },
     {
-      "fixture_id": "ses_search_decoy",
-      "real_id": "ses_fecce0daeffe15TpJQspWNjV1X",
-      "fixture_directory": "/b",
-      "real_directory": "/tmp/eq007-home-_wult88v/ws/b",
+      "fixture_id": "ses_revert_full",
+      "real_id": "ses_fecb77d17ffefB9JNV2cwjTgGn",
+      "fixture_directory": "/a",
+      "real_directory": "/tmp/eq007-home-5ndymjd7/ws/a",
       "agent": "agent-odd",
       "model": [
         "fixture-model",
@@ -308,10 +308,10 @@
       ]
     },
     {
-      "fixture_id": "ses_case_fold",
-      "real_id": "ses_fecce0da3ffeN1eua0IR6VEfN6",
+      "fixture_id": "ses_search_decoy",
+      "real_id": "ses_fecb77d05ffeq7UHqam5nDIDAt",
       "fixture_directory": "/b",
-      "real_directory": "/tmp/eq007-home-_wult88v/ws/b",
+      "real_directory": "/tmp/eq007-home-5ndymjd7/ws/b",
       "agent": "agent-even",
       "model": [
         "fixture-model",
@@ -321,10 +321,10 @@
       "permission": null
     },
     {
-      "fixture_id": "ses_child_a",
-      "real_id": "ses_fecce0d91ffeoXIWACipTMAfxC",
-      "fixture_directory": "/foo/sub",
-      "real_directory": "/tmp/eq007-home-_wult88v/ws/foo/sub",
+      "fixture_id": "ses_case_fold",
+      "real_id": "ses_fecb77ceeffeQYAxbn4xfLHzrX",
+      "fixture_directory": "/b",
+      "real_directory": "/tmp/eq007-home-5ndymjd7/ws/b",
       "agent": "agent-odd",
       "model": [
         "fixture-model",
@@ -345,10 +345,10 @@
       ]
     },
     {
-      "fixture_id": "ses_child_b",
-      "real_id": "ses_fecce0d6dffeYElSLAmV0dTmm1",
-      "fixture_directory": "/foo/bar/deep",
-      "real_directory": "/tmp/eq007-home-_wult88v/ws/foo/bar/deep",
+      "fixture_id": "ses_child_a",
+      "real_id": "ses_fecb77ce2ffedZbLV3gla03thk",
+      "fixture_directory": "/foo/sub",
+      "real_directory": "/tmp/eq007-home-5ndymjd7/ws/foo/sub",
       "agent": "agent-even",
       "model": [
         "fixture-model",
@@ -358,10 +358,10 @@
       "permission": null
     },
     {
-      "fixture_id": "ses_child_c",
-      "real_id": "ses_fecce0d4dffe6Ccx1mDOeR0GbL",
-      "fixture_directory": "/foo/baz",
-      "real_directory": "/tmp/eq007-home-_wult88v/ws/foo/baz",
+      "fixture_id": "ses_child_b",
+      "real_id": "ses_fecb77cbdffe248wk5x7lk7y3Y",
+      "fixture_directory": "/foo/bar/deep",
+      "real_directory": "/tmp/eq007-home-5ndymjd7/ws/foo/bar/deep",
       "agent": "agent-odd",
       "model": [
         "fixture-model",
@@ -369,22 +369,36 @@
         null
       ],
       "permission": null
+    },
+    {
+      "fixture_id": "ses_child_c",
+      "real_id": "ses_fecb77c9affer8VrCwLepg6g4r",
+      "fixture_directory": "/foo/baz",
+      "real_directory": "/tmp/eq007-home-5ndymjd7/ws/foo/baz",
+      "agent": "agent-even",
+      "model": [
+        "fixture-model",
+        "prov-a",
+        null
+      ],
+      "permission": null
     }
   ],
-  "response_fingerprint": "70739767254816d2",
+  "response_fingerprint": "7691fff75350860d",
   "query": {
     "endpoint": "GET /experimental/session?archived=true&limit=1000",
     "sort": "time_updated DESC, id DESC"
   },
   "sessions": [
     {
-      "id": "ses_fecce0d4dffe6Ccx1mDOeR0GbL",
-      "parent_id": "ses_fecce1003ffe6pQH4aN8kU9bdl",
-      "directory": "/tmp/eq007-home-_wult88v/ws/foo/baz",
+      "id": "ses_fecb77c9affer8VrCwLepg6g4r",
+      "parent_id": "ses_fecb77f20ffeVoGMIs2I1NTWY6",
+      "project_id": "global",
+      "directory": "/tmp/eq007-home-5ndymjd7/ws/foo/baz",
       "title": "back\\slash title",
       "version": "1.18.18",
-      "time_created": 1787028435634,
-      "time_updated": 1787028435634,
+      "time_created": 1787029914469,
+      "time_updated": 1787029914469,
       "time_archived": null,
       "time_compacting": null,
       "tokens": [
@@ -402,10 +416,10 @@
       "metadata": {
         "origin": "fixture"
       },
-      "agent": "agent-odd",
+      "agent": "agent-even",
       "model": [
         "fixture-model",
-        "prov-b",
+        "prov-a",
         null
       ],
       "summary": [
@@ -422,13 +436,14 @@
       "permission": null
     },
     {
-      "id": "ses_fecce0d6dffeYElSLAmV0dTmm1",
-      "parent_id": "ses_fecce1003ffe6pQH4aN8kU9bdl",
-      "directory": "/tmp/eq007-home-_wult88v/ws/foo/bar/deep",
+      "id": "ses_fecb77cbdffe248wk5x7lk7y3Y",
+      "parent_id": "ses_fecb77f20ffeVoGMIs2I1NTWY6",
+      "project_id": "global",
+      "directory": "/tmp/eq007-home-5ndymjd7/ws/foo/bar/deep",
       "title": "under_score path",
       "version": "1.18.18",
-      "time_created": 1787028435602,
-      "time_updated": 1787028435602,
+      "time_created": 1787029914434,
+      "time_updated": 1787029914434,
       "time_archived": null,
       "time_compacting": null,
       "tokens": [
@@ -446,10 +461,10 @@
       "metadata": {
         "origin": "fixture"
       },
-      "agent": "agent-even",
+      "agent": "agent-odd",
       "model": [
         "fixture-model",
-        "prov-a",
+        "prov-b",
         null
       ],
       "summary": [
@@ -466,13 +481,14 @@
       "permission": null
     },
     {
-      "id": "ses_fecce0d91ffeoXIWACipTMAfxC",
-      "parent_id": "ses_fecce1003ffe6pQH4aN8kU9bdl",
-      "directory": "/tmp/eq007-home-_wult88v/ws/foo/sub",
+      "id": "ses_fecb77ce2ffedZbLV3gla03thk",
+      "parent_id": "ses_fecb77f20ffeVoGMIs2I1NTWY6",
+      "project_id": "global",
+      "directory": "/tmp/eq007-home-5ndymjd7/ws/foo/sub",
       "title": "fix the 100% bug",
       "version": "1.18.18",
-      "time_created": 1787028435566,
-      "time_updated": 1787028435566,
+      "time_created": 1787029914397,
+      "time_updated": 1787029914397,
       "time_archived": null,
       "time_compacting": null,
       "tokens": [
@@ -490,6 +506,51 @@
       "metadata": {
         "origin": "fixture"
       },
+      "agent": "agent-even",
+      "model": [
+        "fixture-model",
+        "prov-a",
+        null
+      ],
+      "summary": [
+        0,
+        2,
+        1,
+        {
+          "files": 1,
+          "additions": 2,
+          "deletions": 3
+        }
+      ],
+      "revert": null,
+      "permission": null
+    },
+    {
+      "id": "ses_fecb77ceeffeQYAxbn4xfLHzrX",
+      "parent_id": null,
+      "project_id": "global",
+      "directory": "/tmp/eq007-home-5ndymjd7/ws/b",
+      "title": "PLAIN TITLE UPPER",
+      "version": "1.18.18",
+      "time_created": 1787029914385,
+      "time_updated": 1787029914385,
+      "time_archived": null,
+      "time_compacting": null,
+      "tokens": [
+        506,
+        456,
+        10,
+        3,
+        15
+      ],
+      "project": [
+        "global",
+        null,
+        "/"
+      ],
+      "metadata": {
+        "origin": "fixture"
+      },
       "agent": "agent-odd",
       "model": [
         "fixture-model",
@@ -498,8 +559,8 @@
       ],
       "summary": [
         0,
-        2,
         1,
+        0,
         {
           "files": 1,
           "additions": 2,
@@ -521,57 +582,14 @@
       ]
     },
     {
-      "id": "ses_fecce0da3ffeN1eua0IR6VEfN6",
+      "id": "ses_fecb77d05ffeq7UHqam5nDIDAt",
       "parent_id": null,
-      "directory": "/tmp/eq007-home-_wult88v/ws/b",
-      "title": "PLAIN TITLE UPPER",
-      "version": "1.18.18",
-      "time_created": 1787028435548,
-      "time_updated": 1787028435548,
-      "time_archived": null,
-      "time_compacting": null,
-      "tokens": [
-        506,
-        456,
-        10,
-        3,
-        15
-      ],
-      "project": [
-        "global",
-        null,
-        "/"
-      ],
-      "metadata": {
-        "origin": "fixture"
-      },
-      "agent": "agent-even",
-      "model": [
-        "fixture-model",
-        "prov-a",
-        null
-      ],
-      "summary": [
-        0,
-        1,
-        0,
-        {
-          "files": 1,
-          "additions": 2,
-          "deletions": 3
-        }
-      ],
-      "revert": null,
-      "permission": null
-    },
-    {
-      "id": "ses_fecce0daeffe15TpJQspWNjV1X",
-      "parent_id": null,
-      "directory": "/tmp/eq007-home-_wult88v/ws/b",
+      "project_id": "global",
+      "directory": "/tmp/eq007-home-5ndymjd7/ws/b",
       "title": "1004 percent four",
       "version": "1.18.18",
-      "time_created": 1787028435537,
-      "time_updated": 1787028435537,
+      "time_created": 1787029914363,
+      "time_updated": 1787029914363,
       "time_archived": null,
       "time_compacting": null,
       "tokens": [
@@ -589,10 +607,10 @@
       "metadata": {
         "origin": "fixture"
       },
-      "agent": "agent-odd",
+      "agent": "agent-even",
       "model": [
         "fixture-model",
-        "prov-b",
+        "prov-a",
         null
       ],
       "summary": [
@@ -606,22 +624,17 @@
         }
       ],
       "revert": null,
-      "permission": [
-        [
-          "bash",
-          "rm*",
-          "deny"
-        ]
-      ]
+      "permission": null
     },
     {
-      "id": "ses_fecce0dc3ffezA71Vkmd3z9GzC",
-      "parent_id": "ses_fecce0f5effeN66FEhQ18nWMGx",
-      "directory": "/tmp/eq007-home-_wult88v/ws/a",
+      "id": "ses_fecb77d17ffefB9JNV2cwjTgGn",
+      "parent_id": "ses_fecb77e83ffeNrGg7ZJSuuexby",
+      "project_id": "global",
+      "directory": "/tmp/eq007-home-5ndymjd7/ws/a",
       "title": "with revert data",
       "version": "1.18.18",
-      "time_created": 1787028435516,
-      "time_updated": 1787028435516,
+      "time_created": 1787029914344,
+      "time_updated": 1787029914344,
       "time_archived": null,
       "time_compacting": null,
       "tokens": [
@@ -639,10 +652,10 @@
       "metadata": {
         "k": "v"
       },
-      "agent": "agent-even",
+      "agent": "agent-odd",
       "model": [
         "fixture-model",
-        "prov-a",
+        "prov-b",
         null
       ],
       "summary": [
@@ -661,16 +674,68 @@
         null,
         null
       ],
+      "permission": [
+        [
+          "bash",
+          "rm*",
+          "deny"
+        ]
+      ]
+    },
+    {
+      "id": "ses_fecb77d2affeM4Pd7j3IcE5Lto",
+      "parent_id": null,
+      "project_id": "global",
+      "directory": "/tmp/eq007-home-5ndymjd7/ws/foo",
+      "title": "broken model json row",
+      "version": "1.18.18",
+      "time_created": 1787029914325,
+      "time_updated": 1787029914325,
+      "time_archived": null,
+      "time_compacting": null,
+      "tokens": [
+        349,
+        299,
+        7,
+        2,
+        11
+      ],
+      "project": [
+        "global",
+        null,
+        "/"
+      ],
+      "metadata": {
+        "origin": "fixture"
+      },
+      "agent": "agent-even",
+      "model": [
+        "fixture-model",
+        "prov-a",
+        null
+      ],
+      "summary": [
+        4,
+        0,
+        1,
+        {
+          "files": 1,
+          "additions": 2,
+          "deletions": 3
+        }
+      ],
+      "revert": null,
       "permission": null
     },
     {
-      "id": "ses_fecce0dd1ffe7Eax0jdbpB6YCn",
+      "id": "ses_fecb77d39ffePkKVgXtpbYKHXe",
       "parent_id": null,
-      "directory": "/tmp/eq007-home-_wult88v/ws/foo",
+      "project_id": "global",
+      "directory": "/tmp/eq007-home-5ndymjd7/ws/foo",
       "title": "broken json row",
       "version": "1.18.18",
-      "time_created": 1787028435502,
-      "time_updated": 1787028435502,
+      "time_created": 1787029914310,
+      "time_updated": 1787029914310,
       "time_archived": null,
       "time_compacting": null,
       "tokens": [
@@ -704,13 +769,14 @@
       "permission": null
     },
     {
-      "id": "ses_fecce0de5ffei0T3xM8ry8Jfq2",
+      "id": "ses_fecb77d49ffebAJ6j4zGuEf0xJ",
       "parent_id": null,
-      "directory": "/tmp/eq007-home-_wult88v/ws/foo",
+      "project_id": "global",
+      "directory": "/tmp/eq007-home-5ndymjd7/ws/foo",
       "title": "join miss project",
       "version": "1.18.18",
-      "time_created": 1787028435482,
-      "time_updated": 1787028435482,
+      "time_created": 1787029914294,
+      "time_updated": 1787029914294,
       "time_archived": null,
       "time_compacting": null,
       "tokens": [
@@ -748,13 +814,14 @@
       "permission": null
     },
     {
-      "id": "ses_fecce0df1ffeJmEvISxQ9AGRys",
-      "parent_id": "ses_fecce1003ffe6pQH4aN8kU9bdl",
-      "directory": "/tmp/eq007-home-_wult88v/ws/foo",
+      "id": "ses_fecb77d5affeY1ik56JMM98tcK",
+      "parent_id": "ses_fecb77f20ffeVoGMIs2I1NTWY6",
+      "project_id": "global",
+      "directory": "/tmp/eq007-home-5ndymjd7/ws/foo",
       "title": "tie c",
       "version": "1.18.18",
-      "time_created": 1787028435470,
-      "time_updated": 1787028435470,
+      "time_created": 1787029914277,
+      "time_updated": 1787029914277,
       "time_archived": null,
       "time_compacting": null,
       "tokens": [
@@ -792,13 +859,14 @@
       "permission": null
     },
     {
-      "id": "ses_fecce0e05ffe6qnRhW8gU9zauy",
-      "parent_id": "ses_fecce0fa5ffeZYv7BaEpmbZLe4",
-      "directory": "/tmp/eq007-home-_wult88v/ws/b/late",
+      "id": "ses_fecb77d65ffeQMpJoe0MWHxGg2",
+      "parent_id": "ses_fecb77ecaffeQSTqG5mJvbMn3I",
+      "project_id": "global",
+      "directory": "/tmp/eq007-home-5ndymjd7/ws/b/late",
       "title": "now-ish late session",
       "version": "1.18.18",
-      "time_created": 1787028435450,
-      "time_updated": 1787028435450,
+      "time_created": 1787029914266,
+      "time_updated": 1787029914266,
       "time_archived": null,
       "time_compacting": null,
       "tokens": [
@@ -847,13 +915,14 @@
       ]
     },
     {
-      "id": "ses_fecce0e2cffe4QSvcd7FhnwfkQ",
+      "id": "ses_fecb77d7bffeLo1z7bUOdvsoMi",
       "parent_id": null,
-      "directory": "/tmp/eq007-home-_wult88v/ws/foo",
+      "project_id": "global",
+      "directory": "/tmp/eq007-home-5ndymjd7/ws/foo",
       "title": "oldest epoch zero",
       "version": "1.18.18",
-      "time_created": 1787028435411,
-      "time_updated": 1787028435411,
+      "time_created": 1787029914244,
+      "time_updated": 1787029914244,
       "time_archived": null,
       "time_compacting": null,
       "tokens": [
@@ -891,13 +960,14 @@
       "permission": null
     },
     {
-      "id": "ses_fecce0e40ffeXY6SYjXcCFXVvL",
+      "id": "ses_fecb77d8bffeKNaXdKh3bnAg6n",
       "parent_id": null,
-      "directory": "/tmp/eq007-home-_wult88v/ws/srv/mar@host-1/proj",
+      "project_id": "global",
+      "directory": "/tmp/eq007-home-5ndymjd7/ws/srv/mar@host-1/proj",
       "title": "owner host dir",
       "version": "1.18.18",
-      "time_created": 1787028435391,
-      "time_updated": 1787028435391,
+      "time_created": 1787029914228,
+      "time_updated": 1787029914228,
       "time_archived": null,
       "time_compacting": null,
       "tokens": [
@@ -941,13 +1011,14 @@
       ]
     },
     {
-      "id": "ses_fecce0e65ffeqCLr8XRbN5qkIR",
+      "id": "ses_fecb77dafffeq8AJJfieaKtG15",
       "parent_id": null,
-      "directory": "/tmp/eq007-home-_wult88v/ws/b/sub",
+      "project_id": "global",
+      "directory": "/tmp/eq007-home-5ndymjd7/ws/b/sub",
       "title": "tie b",
       "version": "1.18.18",
-      "time_created": 1787028435354,
-      "time_updated": 1787028435354,
+      "time_created": 1787029914192,
+      "time_updated": 1787029914192,
       "time_archived": 9100,
       "time_compacting": null,
       "tokens": [
@@ -985,13 +1056,14 @@
       "permission": null
     },
     {
-      "id": "ses_fecce0e8bffeSC5ql0jllM3Xnz",
+      "id": "ses_fecb77dd5ffe6Oh9cIn3TNE8ke",
       "parent_id": null,
-      "directory": "/tmp/eq007-home-_wult88v/ws/b",
+      "project_id": "global",
+      "directory": "/tmp/eq007-home-5ndymjd7/ws/b",
       "title": "tie a",
       "version": "1.18.18",
-      "time_created": 1787028435316,
-      "time_updated": 1787028435316,
+      "time_created": 1787029914155,
+      "time_updated": 1787029914155,
       "time_archived": null,
       "time_compacting": null,
       "tokens": [
@@ -1029,13 +1101,14 @@
       "permission": null
     },
     {
-      "id": "ses_fecce0eb4ffeJYdyTly6Pd1AAu",
+      "id": "ses_fecb77df7ffeuPOwxf39pFO85g",
       "parent_id": null,
-      "directory": "/tmp/eq007-home-_wult88v/ws/Foo/child",
+      "project_id": "global",
+      "directory": "/tmp/eq007-home-5ndymjd7/ws/Foo/child",
       "title": "case mismatch dir",
       "version": "1.18.18",
-      "time_created": 1787028435275,
-      "time_updated": 1787028435275,
+      "time_created": 1787029914120,
+      "time_updated": 1787029914120,
       "time_archived": null,
       "time_compacting": null,
       "tokens": [
@@ -1073,13 +1146,14 @@
       "permission": null
     },
     {
-      "id": "ses_fecce0ed3ffevvJSW0tH2xtAUd",
+      "id": "ses_fecb77e1effeFlavdQdhWrX7jL",
       "parent_id": null,
-      "directory": "/tmp/eq007-home-_wult88v/ws/a b/c",
+      "project_id": "global",
+      "directory": "/tmp/eq007-home-5ndymjd7/ws/a b/c",
       "title": "same level name",
       "version": "1.18.18",
-      "time_created": 1787028435244,
-      "time_updated": 1787028435244,
+      "time_created": 1787029914081,
+      "time_updated": 1787029914081,
       "time_archived": null,
       "time_compacting": null,
       "tokens": [
@@ -1117,13 +1191,14 @@
       "permission": null
     },
     {
-      "id": "ses_fecce0ef6ffe3d0d2n4sYcYua2",
-      "parent_id": "ses_fecce0f5effeN66FEhQ18nWMGx",
-      "directory": "/tmp/eq007-home-_wult88v/ws/a/dir_%_x",
+      "id": "ses_fecb77e3dffe30zl8Fx4K6Kid9",
+      "parent_id": "ses_fecb77e83ffeNrGg7ZJSuuexby",
+      "project_id": "global",
+      "directory": "/tmp/eq007-home-5ndymjd7/ws/a/dir_%_x",
       "title": "an underscore dir",
       "version": "1.18.18",
-      "time_created": 1787028435209,
-      "time_updated": 1787028435209,
+      "time_created": 1787029914050,
+      "time_updated": 1787029914050,
       "time_archived": 8900,
       "time_compacting": null,
       "tokens": [
@@ -1172,13 +1247,14 @@
       ]
     },
     {
-      "id": "ses_fecce0f27ffe3Fgi4dVnv09iSF",
-      "parent_id": "ses_fecce0f5effeN66FEhQ18nWMGx",
-      "directory": "/tmp/eq007-home-_wult88v/ws/a/ b/c",
+      "id": "ses_fecb77e61fferxAkJW9bXtzwgw",
+      "parent_id": "ses_fecb77e83ffeNrGg7ZJSuuexby",
+      "project_id": "global",
+      "directory": "/tmp/eq007-home-5ndymjd7/ws/a/ b/c",
       "title": "a percent dir session",
       "version": "1.18.18",
-      "time_created": 1787028435160,
-      "time_updated": 1787028435160,
+      "time_created": 1787029914014,
+      "time_updated": 1787029914014,
       "time_archived": null,
       "time_compacting": null,
       "tokens": [
@@ -1216,13 +1292,14 @@
       "permission": null
     },
     {
-      "id": "ses_fecce0f5effeN66FEhQ18nWMGx",
+      "id": "ses_fecb77e83ffeNrGg7ZJSuuexby",
       "parent_id": null,
-      "directory": "/tmp/eq007-home-_wult88v/ws/a",
+      "project_id": "global",
+      "directory": "/tmp/eq007-home-5ndymjd7/ws/a",
       "title": "grp1 alpha work",
       "version": "1.18.18",
-      "time_created": 1787028435105,
-      "time_updated": 1787028435105,
+      "time_created": 1787029913980,
+      "time_updated": 1787029913980,
       "time_archived": null,
       "time_compacting": 1234,
       "tokens": [
@@ -1266,13 +1343,14 @@
       ]
     },
     {
-      "id": "ses_fecce0f80ffeJdwrr74ERLIZF0",
-      "parent_id": "ses_fecce0fa5ffeZYv7BaEpmbZLe4",
-      "directory": "/tmp/eq007-home-_wult88v/ws/foo/sub",
+      "id": "ses_fecb77ea2ffeiKqbn4r5Zs6lV6",
+      "parent_id": "ses_fecb77ecaffeQSTqG5mJvbMn3I",
+      "project_id": "global",
+      "directory": "/tmp/eq007-home-5ndymjd7/ws/foo/sub",
       "title": "archived child",
       "version": "1.18.18",
-      "time_created": 1787028435071,
-      "time_updated": 1787028435071,
+      "time_created": 1787029913949,
+      "time_updated": 1787029913949,
       "time_archived": 8500,
       "time_compacting": null,
       "tokens": [
@@ -1310,13 +1388,14 @@
       "permission": null
     },
     {
-      "id": "ses_fecce0fa5ffeZYv7BaEpmbZLe4",
+      "id": "ses_fecb77ecaffeQSTqG5mJvbMn3I",
       "parent_id": null,
-      "directory": "/tmp/eq007-home-_wult88v/ws/foobar",
+      "project_id": "global",
+      "directory": "/tmp/eq007-home-5ndymjd7/ws/foobar",
       "title": "plain title too",
       "version": "1.18.18",
-      "time_created": 1787028435035,
-      "time_updated": 1787028435035,
+      "time_created": 1787029913909,
+      "time_updated": 1787029913909,
       "time_archived": 7900,
       "time_compacting": null,
       "tokens": [
@@ -1354,13 +1433,14 @@
       "permission": null
     },
     {
-      "id": "ses_fecce1003ffe6pQH4aN8kU9bdl",
+      "id": "ses_fecb77f20ffeVoGMIs2I1NTWY6",
       "parent_id": null,
-      "directory": "/tmp/eq007-home-_wult88v/ws/foo",
+      "project_id": "global",
+      "directory": "/tmp/eq007-home-5ndymjd7/ws/foo",
       "title": "root one plain",
       "version": "1.18.18",
-      "time_created": 1787028434940,
-      "time_updated": 1787028434940,
+      "time_created": 1787029913823,
+      "time_updated": 1787029913823,
       "time_archived": null,
       "time_compacting": null,
       "tokens": [

@@ -111,7 +111,7 @@ async def test_eq002_cursor_paging_concat_equals_full(tmp_path):
         full, complete = mirror_page(**FULL)
         assert complete is True
         assert seen == full  # 拼接（含字段）与全量严格相等
-        assert len(seen) == len(full) == 22  # 23 原始 − 1 坏 JSON 行
+        assert len(seen) == len(full) == 22  # 24 原始 − 2 坏 JSON 行
     finally:
         await source.stop()
 
@@ -216,8 +216,10 @@ async def test_eq006_field_by_field_optional_columns(tmp_path):
             row = dataset_by_id[sid]
             for key in ROW_KEYS[:-3]:  # session 24 列逐字段
                 expected_value = row[key]
-                if key in ("summary_diffs", "revert", "permission", "metadata"):
+                if key in ("summary_diffs", "revert", "permission", "metadata",
+                           "model"):
                     # JSON 列：DB 侧返回解析后对象，数据集是原始字符串
+                    # （R5 BLOCKER-1：model 同为 json 列族）
                     expected_value = (
                         __import__("json").loads(expected_value)
                         if isinstance(expected_value, str) else expected_value
@@ -233,6 +235,10 @@ async def test_eq006_field_by_field_optional_columns(tmp_path):
         assert by_id["ses_revert_full"]["metadata"] == {"k": "v"}
         assert by_id["ses_root_3"]["time_compacting"] == 1234
         assert by_id["ses_root_1"]["time_compacting"] is None
+        # R5 BLOCKER-1：model 解析为对象（非 JSON 字符串）
+        assert isinstance(by_id["ses_root_1"]["model"], dict)
+        assert by_id["ses_root_1"]["model"]["id"] == "model-ses_root_1"
+        assert isinstance(by_id["ses_root_1"]["model"]["providerID"], str)
         # project join：对象 vs null（§8）
         assert by_id["ses_root_1"]["p_id"] == "prj_alpha"
         assert by_id["ses_root_1"]["p_name"] == "alpha"
@@ -240,11 +246,15 @@ async def test_eq006_field_by_field_optional_columns(tmp_path):
         assert by_id["ses_orphan_proj"]["p_id"] is None
         assert by_id["ses_orphan_proj"]["p_name"] is None
         assert by_id["ses_orphan_proj"]["p_worktree"] is None
+        # R5 MAJOR-1：project_id 与 project **两字段独立性**——orphan 行
+        # project_id 非空 + join null 同现。
+        assert by_id["ses_orphan_proj"]["project_id"] == "prj_missing"
         # 极端时间戳透传（毫秒整数）
         assert by_id["ses_time_zero"]["time_updated"] == 0
         assert by_id["ses_time_now"]["time_updated"] > 1_787_000_000_000
-        # 坏 JSON 行被组装容忍跳过
+        # 坏 JSON 行被组装容忍跳过（summary_diffs 坏 + model 坏两维）
         assert "ses_bad_json" not in by_id
+        assert "ses_bad_model" not in by_id
     finally:
         await source.stop()
 
@@ -561,6 +571,10 @@ def _norm_upstream(info: dict) -> dict:
     在完整 Info.fields 上，session.ts fromRow:59-115——这些字段 HTTP
     可观察）。置性镜像 fromRow：summary 三列全 null → undefined；
     revert JSON 非空才暴露。
+
+    rev gate R5 MAJOR-1：``project_id``（= wire ``projectID``）**独立**
+    进比较形状——与 project join 三元组分立（orphan 维度：project_id
+    非空 + project=null 同现）。
     """
     t = info.get("time") or {}
     tokens = info.get("tokens") or {}
@@ -573,6 +587,7 @@ def _norm_upstream(info: dict) -> dict:
     return {
         "id": info.get("id"),
         "parent_id": info.get("parentID"),
+        "project_id": info.get("projectID"),
         "directory": info.get("directory"),
         "title": info.get("title"),
         "version": info.get("version"),
@@ -610,12 +625,15 @@ def _norm_upstream(info: dict) -> dict:
 def _norm_db(record: dict) -> dict:
     """fetch_sessions_page 记录（DB 列名）→ 同一比较形状。
 
-    model 列不在生产 JSON 解析集（rows_to_records 只解析 summary_diffs/
-    revert/permission/metadata）——此处按 JSON 字符串 parse；置性镜像
-    上游 fromRow（三列全 null → summary None）。
+    R5 BLOCKER-1：model 已是生产 JSON 解析集成员（rows_to_records 解析
+    summary_diffs/revert/permission/metadata/**model**）——本函数**零补偿
+    直读**（此前的 ``json.loads`` 测试侧补偿掩盖了产品缺陷，已删除；
+    生产输出字符串会在恒等式直接失败）。置性镜像上游 fromRow（三列全
+    null → summary None）。
+
+    R5 MAJOR-1：``project_id`` 独立进形状（= wire ``projectID``）。
     """
-    model_raw = record.get("model")
-    model = json.loads(model_raw) if isinstance(model_raw, str) else model_raw
+    model = record.get("model")
     revert = record.get("revert")
     permission = record.get("permission")
     summary_absent = (
@@ -626,6 +644,7 @@ def _norm_db(record: dict) -> dict:
     return {
         "id": record["id"],
         "parent_id": record["parent_id"],
+        "project_id": record["project_id"],
         "directory": record["directory"],
         "title": record["title"],
         "version": record["version"],
@@ -1101,13 +1120,26 @@ _TAMPER_CASES = {
     "summary": lambda doc: doc["sessions"][0].update(
         summary=[7, 7, 7, None]),
     "agent": lambda doc: doc["sessions"][0].update(agent="tampered"),
+    "model": lambda doc: doc["sessions"][0].update(
+        model=["tampered-model", "prov-x", None]),
     "permission": lambda doc: doc["sessions"][0].update(
         permission=[["x", "y", "allow"]]),
     "fingerprint": lambda doc: doc.update(response_fingerprint="0" * 16),
     "generated_at": lambda doc: doc.pop("generated_at"),
+    "generated_at_not_iso": lambda doc: doc.update(
+        generated_at="2026-08-18TnotTiso"),  # 含 "T" 伪 ISO——fromisoformat 拒
     "query_sort": lambda doc: doc["query"].update(sort="tampered"),
     "injected_empty": lambda doc: doc.update(injected_sessions=[]),
     "dataset_digest": lambda doc: doc.update(dataset_digest="0" * 16),
+    # R5 BLOCKER-2：provenance 严格化新增面
+    "manifest_sessions": lambda doc: doc["dataset_manifest"].update(
+        sessions=999),
+    "manifest_projects": lambda doc: doc["dataset_manifest"].update(
+        projects=999),
+    "enrichment_tamper": lambda doc: doc.update(enrichment="tampered-note"),
+    "hint_wrong": lambda doc: doc.update(regenerate_hint="wrong-but-nonempty"),
+    "key_extra": lambda doc: doc.update(unexpected_top_key=1),
+    "key_drop": lambda doc: doc.pop("server_assigned_fields"),
 }
 
 
@@ -1315,12 +1347,10 @@ async def test_eq007_bad_json_probe_upstream_behavior(real_upstream):
         )
         conn.commit()
         conn.close()
-    # 实证断言：二选一（任何其他状态 = 上游行为超出已知面，需上报）
-    assert status in (200, 500), f"未预期的上游行为：{status} {snippet}"
-    if status == 500:
-        print(f"[EQ-007 实证] 上游坏 JSON → 500（整列表失败）：{snippet}")
-    else:
-        print("[EQ-007 实证] 上游坏 JSON → 200（列表仍可用）")
+    # R5 MINOR-1：实证冻结——v1.18.18 上游坏 JSON → 500 整列表失败
+    # （该版本无行级容忍；上游行为若漂移到其他状态码 = 语义变化，需上报）。
+    assert status == 500, f"未预期的上游行为：{status} {snippet}"
+    print(f"[EQ-007 实证] 上游坏 JSON → 500（整列表失败）：{snippet}")
 
 
 async def test_eq007_real_tie_break_and_upstream_cursor_boundary(real_upstream):

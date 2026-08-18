@@ -113,7 +113,8 @@ def test_allowlist_multi_union(tmp_path):
 
 async def test_complete_at_exact_limit(tmp_path):
     # 经 B1 query() 通道端到端：LIMIT+1 同窗口 complete 判定
-    # 数据集 23 原始行（含 1 行 JSON 坏行）→ limit=23 恰好全窗 → True
+    # 数据集 24 原始行（含 2 行 JSON 坏行：summary_diffs + model）→
+    # limit=24 恰好全窗 → True（R5：model 坏行同计入保守窗口）
     from oc_slimapi.dbaux import DbAuxiliarySource, fetch_sessions_page
     from oc_slimapi.dbaux.path_resolution import ResolvedPath
 
@@ -121,14 +122,16 @@ async def test_complete_at_exact_limit(tmp_path):
     src = DbAuxiliarySource(ResolvedPath(path=str(db), source="explicit-env"))
     await src.start()
     try:
-        page = await fetch_sessions_page(src, archived="all", parent="all", limit=23)
+        page = await fetch_sessions_page(src, archived="all", parent="all", limit=24)
         assert page.complete is True  # ⑧ 恰好 limit → true
-        assert len(page.records) == 22  # 23 原始 − 1 坏 JSON 行
+        assert len(page.records) == 22  # 24 原始 − 2 坏 JSON 行
         page2 = await fetch_sessions_page(src, archived="all", parent="all", limit=22)
         assert page2.complete is False  # ⑨ limit+1 行命中 → false（坏行保守计入）
-        assert len(page2.records) == 21
+        # 窗口 = 原始前 22 行（含两坏行 t=8700/8200，尾部 2 行出局）
+        # → 可见 = 22 − 2 坏行 = 20
+        assert len(page2.records) == 20
         # 同 limit 镜像一致性（含 complete）
-        for limit in (23, 22, 5, 1):
+        for limit in (24, 22, 5, 1):
             got = await fetch_sessions_page(src, archived="all", parent="all", limit=limit)
             exp_records, exp_complete = mirror_page(archived="all", parent="all", limit=limit)
             assert got.complete is exp_complete
@@ -148,13 +151,16 @@ def _fetch_limit(db_path, limit):
 
 
 def test_complete_boundary_via_raw_window(tmp_path):
-    # 不经 source 的同窗口判定等价检查：LIMIT+1 行判定与镜像一致
+    # 不经 source 的同窗口判定等价检查：LIMIT+1 行判定与镜像一致。
+    # R5：顶窗含 bad_model 行（t=8700）——原始 4 行窗可见 3（§8 跳行）；
+    # complete 由**原始**窗口判定（24 > 3 → False），与镜像同口径。
     db = build_fixture_db(tmp_path / "s.db")
-    expected, complete = mirror_page(**{**ALL, "limit": 3})
+    expected4, _ = mirror_page(**{**ALL, "limit": 4})  # limit+1 窗的可见面
+    _, complete3 = mirror_page(**{**ALL, "limit": 3})
     got3 = _fetch_limit(db, 3)
-    assert len(got3) == 4  # 原始窗口 = limit+1（complete:false 的来源）
-    assert [r["id"] for r in got3[:3]] == [r["id"] for r in expected]
-    assert complete is False  # 23 > 3 → false
+    assert len(got3) == 3  # 原始窗口 4（limit+1）− 1 坏 model 行
+    assert [r["id"] for r in got3] == [r["id"] for r in expected4]
+    assert complete3 is False  # 24 > 3 → false
 
 
 # --- ⑩-⑪ legacy 空 directory（§9.5 ⑩-⑪） -------------------------------

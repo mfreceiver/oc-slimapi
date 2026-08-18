@@ -25,6 +25,18 @@ SEED = 0
 def draft():
     eqp = load_eqp_matrix()
     db_path, session_rows, meta = eqp.build_draft_db(rows=ROWS, seed=SEED)
+    # R5 BLOCKER-1 连带：model 现为生产 JSON 解析列（真库 drizzle json
+    # 列）；B0 草稿库写纯文本 "model-x" 会让 rows_to_records 按 §8 全跳。
+    # scripts/eqp_matrix.py B0 冻结不改——测试侧归一为合法 JSON 文本。
+    con = sqlite3.connect(str(db_path))
+    try:
+        con.execute(
+            "UPDATE session SET model = "
+            "'{\"id\":\"' || model || '\",\"providerID\":\"prov-draft\"}'"
+        )
+        con.commit()
+    finally:
+        con.close()
     yield eqp, db_path, session_rows, meta
     eqp.cleanup_draft(db_path, keep=False)
 

@@ -600,10 +600,81 @@ async def test_v4_project_object_and_null(tmp_path):
         assert items["ses_root_1"]["project"] == {
             "id": "prj_alpha", "name": "alpha", "worktree": "/wt/alpha"}
         assert items["ses_orphan_proj"]["project"] is None
+        # R5 MAJOR-1：project_id 与 project 两字段**独立**——orphan 行
+        # projectID 非空 + project=null 同现（不从 join 反推）。
+        assert items["ses_orphan_proj"]["projectID"] == "prj_missing"
         assert items["ses_revert_full"]["revert"] == {
             "messageID": "msg_9", "partID": "prt_9"}
     finally:
         await aux.stop()
+
+
+async def test_v4_model_object_on_wire_bad_model_row_skipped(
+    tmp_path, caplog
+):
+    """rev gate R5 BLOCKER-1 路由级断言：model 在 v4 wire 上是**对象**。
+
+    - 每行 model 均为 dict（``isinstance(model, str)`` 绝不成立），id /
+      providerID 值正确（= fixture model JSON 解析值）；
+    - 坏 model JSON 行（ses_bad_model）按 §8 跳行 + warning——不出现在
+      items，其余行正常。
+    """
+    import logging
+
+    aux = await _real_aux(tmp_path)
+    app, _ = _build_app(aux)
+    try:
+        with caplog.at_level(logging.WARNING):
+            async with _client(app) as client:
+                resp = await client.get("/slimapi/sessions",
+                                        params={"v": "4", "archived": "all"},
+                                        headers=IDENTITY)
+        assert resp.status_code == 200
+        items = {i["id"]: i for i in resp.json()["items"]}
+        dataset_by_id = {r["id"]: r for r in DATASET}
+        assert "ses_bad_model" not in items
+        assert "ses_bad_json" not in items
+        assert len(items) == 22  # 24 原始 − 2 坏 JSON 行
+        for sid, item in items.items():
+            model = item["model"]
+            assert not isinstance(model, str), (
+                f"{sid}: model 是字符串（JSON 解析缺失回归）"
+            )
+            assert isinstance(model, dict), sid
+            expected = orjson.loads(dataset_by_id[sid]["model"])
+            assert model == expected, sid
+            assert "id" in model and "providerID" in model
+        # §8 跳行 warning（含 sid）
+        assert any("ses_bad_model" in r.getMessage() for r in caplog.records), (
+            "坏 model 行跳行未记 warning"
+        )
+    finally:
+        await aux.stop()
+
+
+async def test_v3_model_object_passthrough_from_upstream():
+    """rev gate R5 BLOCKER-1 第 6 条：v3 不受影响——v3 model 来自上游
+    HTTP（已是对象），skeleton 透传对象而非字符串。"""
+    upstream_session = {
+        "id": "h1", "title": "up one", "directory": "/any",
+        "model": {"id": "m-up", "providerID": "prov-up"},
+        "time": {"created": 1, "updated": 2},
+    }
+
+    def handler(request):
+        return httpx.Response(
+            200, content=orjson.dumps([upstream_session]),
+            headers={"Content-Type": "application/json"},
+        )
+
+    app, _ = _build_app(_StubAux("disabled"), handler=handler)
+    async with _client(app) as client:
+        resp = await client.get("/slimapi/sessions",
+                                params={"v": "3"}, headers=IDENTITY)
+    assert resp.status_code == 200
+    items = resp.json()["items"]
+    assert items[0]["model"] == {"id": "m-up", "providerID": "prov-up"}
+    assert isinstance(items[0]["model"], dict)
 
 
 async def test_v4_degraded_upstream_param_mapping():

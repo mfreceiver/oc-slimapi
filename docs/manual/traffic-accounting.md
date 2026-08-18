@@ -171,6 +171,8 @@ curl -s "$BASE/slimapi/metrics?$V" | jq '
 | `directoryForm` | `query` \| `header` \| `both` \| `absent` \| `null`——directory 输入形态（仅 directory 消费集路由非 null：messages list/full、sessions 列表/status、todo/children/diff、agent/command、stream；其余含 catch-all = `null`） |
 | `recordType` | `request`（每 HTTP 请求一行）\| `sse_open` \| `sse_close`（SSE 建立断开标记行）。**消费口径：统计请求数/字节时必须过滤 `recordType=="request"`** |
 | `lifecycleId` | 进程内单调递增 int；同一条 SSE 连接的 `sse_open`/`sse_close` 行同值（配对键）。仅生命周期行有值，`request` 行为 `null`。`requestId` 在 SSE 重连时可复用，仅辅助关联，**配对以 `lifecycleId` 为准** |
+| `sessionsSource` | `"db"` \| `"http"` \| 缺席——v4 `GET /slimapi/sessions` 数据面来源（4.0.0 加性稀疏字段：DB 投影源成功→`"db"`；降级矩阵 Class A HTTP 降级 200→`"http"`；v3 路径/其他路由/被拒请求**字段缺席**=否定语义，不写 `null`）。配套聚合：ledger 矩阵键 `degraded\|<kind>\|<statusClass>\|<bucket>`（kind=`http`/`fail_closed`）、`/slimapi/metrics` `sessionsDegraded` 块（`degraded_200`/`fail_closed_503` 按响应逐次计数）、snapshot `v4.degradedMatrix` |
+| `degraded503` | `true` \| 缺席——v4 sessions fail-closed 503（`auxiliary_unavailable` 族）标记（4.0.0 加性稀疏字段；**仅 503 降级写 `true`，永不写 `false`**；TransformBusy 拥塞 503 不属降级语义，不置位；v3/其他路由缺席）。与 `sessionsSource` 互斥使用：503 时两者同现（`"http"`+`true`） |
 
 ### 5.1 SSE 生命周期行（2026-08-16 加性）
 

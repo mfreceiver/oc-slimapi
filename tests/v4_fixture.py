@@ -18,6 +18,7 @@ import importlib.util
 import json
 import sqlite3
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -25,7 +26,9 @@ from typing import Any, Iterable, Sequence
 # 常量不构成 oracle 依赖（依赖的是行为镜像，不是常量）。
 from oc_slimapi.dbaux import ROW_KEYS
 
-JSON_COLS = ("summary_diffs", "revert", "permission", "metadata")
+# 镜像侧 JSON 解析集——与生产 JSON_COLUMNS 对齐（R5 BLOCKER-1：model 是
+# 真库 json 列，镜像容忍语义必须同步覆盖，否则 oracle 与生产漂移）。
+JSON_COLS = ("summary_diffs", "revert", "permission", "metadata", "model")
 
 ALIGNED_VERSION = "v1.18.18"  # AGENTS.md：opencode-src/current 对齐版本
 GOLDEN_GENERATOR = "mirror-oracle-v1"
@@ -78,10 +81,16 @@ def _row(
     permission: str | None = None,
     metadata: str | None = '{"origin":"fixture"}',
     agent: str = "agent-x",
-    model: str = "model-y",
+    model: str | None = None,
 ) -> dict[str, Any]:
     # 确定性派生（hash() 跨进程随机化，不可用于 golden 数据集）
     n = int(hashlib.sha256(sid.encode("utf-8")).hexdigest()[:8], 16) % 500
+    if model is None:
+        # R5 BLOCKER-1：model 列 = 真库形态 JSON 文本（drizzle json 列，
+        # fromRow 对象语义）；按 sid 派生保证行间互异。
+        model = json.dumps({
+            "id": f"model-{sid}", "providerID": f"prov-{n % 3}",
+        })
     return {
         "id": sid,
         "project_id": project_id,
@@ -161,6 +170,9 @@ DATASET: list[dict[str, Any]] = [
     _row("ses_bad_json", "prj_alpha", None, "/foo",
          "broken json row", 3200, 8200,
          summary_diffs="not-json{"),                           # 解析失败 → 跳行
+    _row("ses_bad_model", "prj_beta", None, "/foo",
+         "broken model json row", 3250, 8700,
+         model="not-json-model{"),  # R5 BLOCKER-1：model json 解析失败 → §8 跳行
     _row("ses_revert_full", "prj_beta", "ses_root_3", "/a",
          "with revert data", 3300, 8300,
          revert='{"messageID":"msg_9","partID":"prt_9"}',
@@ -565,6 +577,16 @@ def _canonical(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
+# R5 BLOCKER-2：真实 golden 顶层 provenance 键集**冻结**——生成器增删键 →
+# 校验失败（防止生成器悄悄扩面/缩面绕过校验链）。
+REAL_GOLDEN_TOP_LEVEL_KEYS = frozenset({
+    "version", "generator", "generated_at", "opencode_version",
+    "dataset_digest", "dataset_manifest", "server_assigned_fields",
+    "sql_enriched_fields", "enrichment", "regenerate_hint",
+    "injected_sessions", "response_fingerprint", "query", "sessions",
+})
+
+
 def _expected_enriched(row: dict[str, Any]) -> dict[str, Any]:
     """fixture 行 → SQL 富化写入真库的期望值（含替代值）。
 
@@ -623,6 +645,10 @@ def validate_real_golden_ci(document: dict[str, Any]) -> list[str]:
       派生值）；agent/model/permission（= 注入清单条目记录的 API 注入值）。
     """
     problems: list[str] = []
+    # R5 BLOCKER-2：顶层 provenance 键集冻结（增删键 → 失败）
+    key_drift = set(document) ^ set(REAL_GOLDEN_TOP_LEVEL_KEYS)
+    if key_drift:
+        problems.append(f"顶层键集漂移：{sorted(key_drift)}")
     if document.get("version") != ALIGNED_VERSION:
         problems.append(f"version mismatch: {document.get('version')!r}")
     if document.get("generator") != REAL_GOLDEN_GENERATOR:
@@ -634,18 +660,33 @@ def validate_real_golden_ci(document: dict[str, Any]) -> list[str]:
     manifest = dataset_manifest()
     if document.get("dataset_digest") != manifest["digest"]:
         problems.append("dataset_digest mismatch（数据集与 golden 漂移，需再生成）")
-    stored_manifest = document.get("dataset_manifest") or {}
-    if stored_manifest.get("digest") != manifest["digest"]:
-        problems.append("dataset_manifest 摘要与 dataset_digest 不一致")
+    # R5 BLOCKER-2：dataset_manifest **全字典相等**（不只 digest——
+    # sessions/projects 计数篡改必须检出）。
+    if document.get("dataset_manifest") != manifest:
+        problems.append(
+            f"dataset_manifest 全字典不等：file={document.get('dataset_manifest')!r}"
+        )
+    # R5 BLOCKER-2：generated_at 必须是**带时区的 ISO 时间戳**
+    # （fromisoformat 解析 + tzinfo 非空——拒 "T" 字样伪 ISO 串）。
     generated_at = document.get("generated_at")
-    if not isinstance(generated_at, str) or "T" not in generated_at:
-        problems.append(f"generated_at 缺失或非 ISO 形状: {generated_at!r}")
+    parsed_at = None
+    if isinstance(generated_at, str):
+        try:
+            parsed_at = datetime.fromisoformat(generated_at)
+        except ValueError:
+            parsed_at = None
+    if parsed_at is None or parsed_at.tzinfo is None:
+        problems.append(f"generated_at 缺失或非带时区 ISO: {generated_at!r}")
     if document.get("query") != REAL_GOLDEN_QUERY:
         problems.append(f"query 漂移: {document.get('query')!r}")
     if document.get("sql_enriched_fields") != SQL_ENRICHED_FIELDS:
         problems.append("sql_enriched_fields 声明漂移")
-    if not document.get("regenerate_hint"):
-        problems.append("regenerate_hint missing")
+    # R5 BLOCKER-2：hint / enrichment 与生成器常量对账相等（非空即可的
+    # 弱校验改为字面冻结——篡改可检出）。
+    if document.get("regenerate_hint") != REAL_GOLDEN_HINT:
+        problems.append("regenerate_hint 与 REAL_GOLDEN_HINT 常量不等")
+    if document.get("enrichment") != REAL_ENRICHMENT_NOTE:
+        problems.append("enrichment 与 REAL_ENRICHMENT_NOTE 常量不等")
     if document.get("server_assigned_fields") != REAL_SERVER_ASSIGNED_FIELDS:
         problems.append("server_assigned_fields 声明漂移")
     sessions = document.get("sessions") or []
@@ -741,12 +782,14 @@ def build_db_from_real_golden(
     session_rows: list[dict[str, Any]] = []
     for s in document["sessions"]:
         project = s.get("project")
-        project_id = None
         if project is not None:
-            project_id = project[0]
-            project_rows[project_id] = {
+            project_rows[project[0]] = {
                 "id": project[0], "name": project[1], "worktree": project[2],
             }
+        # R5 MAJOR-1：project_id **独立字段恢复** FK——不从 project 三元组
+        # 反推（两字段语义独立：project_id 非空 + project=null 同现 =
+        # orphan 维度；golden 每行独立保存该字段）。
+        project_id = s.get("project_id")
         tokens = s.get("tokens") or (None,) * 5
         summary = s.get("summary")
         if summary is None:
