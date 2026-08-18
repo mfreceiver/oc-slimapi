@@ -15,13 +15,13 @@ from .. import etag as etag_mod
 from ..envelope import messages_envelope_bytes
 from ..gzip_util import compress_if_beneficial, error_response
 from ..selector import resolve_route_directory, wire_view_from_scope
+from ..singleflight import full_fetch_key, fulls
 from ..skeleton import (
     SkeletonLimits,
     recompute_fingerprint,
     skeleton_messages,
     strip_diagnostics_message,
 )
-from ..sse.singleflight import full_fetch_key, fulls
 from ..transform import (
     TransformBusy,
     read_with_cap,

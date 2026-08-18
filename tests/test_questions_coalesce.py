@@ -28,7 +28,7 @@ from fastapi import FastAPI
 
 from oc_slimapi.config import Settings
 from oc_slimapi.errors import register_error_handlers
-from oc_slimapi.leased_singleflight import LeasedSingleFlight
+from oc_slimapi.singleflight import LeasedSingleFlight
 from oc_slimapi.proxy import install_proxy
 from oc_slimapi.routes import permissions, questions
 from oc_slimapi.transform import TransformConfig, TransformPool

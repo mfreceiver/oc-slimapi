@@ -15,7 +15,7 @@ import asyncio
 
 import pytest
 
-from oc_slimapi.leased_singleflight import LeasedSingleFlight
+from oc_slimapi.singleflight import LeasedSingleFlight
 
 RESERVE = 60
 

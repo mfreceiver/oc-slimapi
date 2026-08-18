@@ -39,7 +39,7 @@ from oc_slimapi.config import Settings
 from oc_slimapi.errors import register_error_handlers
 from oc_slimapi.proxy import install_proxy
 from oc_slimapi.routes import messages
-from oc_slimapi.sse import singleflight as sf_mod
+from oc_slimapi import singleflight as sf_mod
 from oc_slimapi.transform import TransformConfig, TransformPool
 
 HDR = {"X-Slimapi-Version": "2"}

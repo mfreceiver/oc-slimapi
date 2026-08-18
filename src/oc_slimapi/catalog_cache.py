@@ -15,7 +15,7 @@ Design contract (plan §Task 1.1):
   entries first. A body larger than ``max_entry_bytes`` bypasses the cache
   (served as-is, never accounted).
 * Refresh stampede protection: concurrent refreshes of the same key
-  coalesce through a plain :class:`~oc_slimapi.sse.singleflight.SingleFlight`
+  coalesce through a plain :class:`~oc_slimapi.singleflight.SingleFlight`
   held by this cache (leader fetch + 1s grace window for stragglers).
   Eviction runs at the serial point (no ``await`` between insert and evict).
 * ``shutdown()`` mirrors CD-1 semantics: clears entries and shuts the
@@ -29,7 +29,7 @@ from typing import Awaitable, Callable, Hashable
 
 import orjson
 
-from .sse.singleflight import SingleFlight
+from .singleflight import SingleFlight
 
 FactoryT = Callable[[], Awaitable[bytes | None]]
 

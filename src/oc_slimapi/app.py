@@ -18,7 +18,6 @@ from .access_log import (
 )
 from .actions import load_registry as actions_load_registry
 from .catalog_cache import CatalogCache
-from .leased_singleflight import LeasedSingleFlight
 from .config import settings
 from .dbaux import DbAuxiliarySource, resolve_db_path
 from .errors import register_error_handlers
@@ -30,10 +29,10 @@ from .qp_sweep import QpSweepShadow
 from .routes import actions, agent, children, command, directories, events, health, messages, metrics, permissions, questions, read_groups, sessions, todo, token_stream, versions, write_groups
 from .routes import diff as diff_routes
 from .selector import SlimapiSelectorMiddleware
+from .singleflight import LeasedSingleFlight, fulls
 from .sse.hub import HubRegistry
 from .sse.replay_log import ReplayLog, new_epoch
 from .sse.replay_wire import replay_sweep_loop
-from .sse.singleflight import fulls
 from .sse.token_hub import TokenStreamHub, TokenStreamRegistry
 from .sse.tokenstream.hub import apply_debug_budget_overrides
 from .traffic import TrafficLedger

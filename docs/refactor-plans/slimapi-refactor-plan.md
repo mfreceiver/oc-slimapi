@@ -1,5 +1,7 @@
 # oc-slimapi 侧改造方案：v4 全局门面工程执行计划（slimapi-refactor-plan）
 
+> **owner 终态裁决 2026-08-18**：协议封顶 4 系，(3,4) 永久双版本，5.0.0/B6-2/v2 退役取消。
+>
 > **性质**：本文档是 `docs/system-architecture-proposal-2026-08-17.md`（下称 **v2.2**）在 oc-slimapi 侧的**工程执行细化**。所有技术裁决**引用 v2.2 原文（行号）**，本方案不新增决策。发现 v2.2 内部矛盾或缺口 → 见 **§8 开放问题**，不擅自决定。
 > **依据基线**：v2.2（310 行）+ `docs/slimapi-complexity-map-2026-08-17.md`（15 有状态组件基线）+ `docs/specs/v3-contract.md`（现契约）+ `AGENTS.md` + `docs/release.md` + src/ 代码事实。
 > **写域纪律**：本文档为唯一可写文件；**禁止修改任何 src/、tests/、既有 docs/**（AGENTS.md / release.md / operations.md / v3-contract.md 仅作为本方案中"待修订"任务的目标被引用，修订动作在对应批次执行期按本方案 §2.1 B0-6f 落地）。

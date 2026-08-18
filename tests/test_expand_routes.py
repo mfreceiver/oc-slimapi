@@ -203,7 +203,7 @@ def _json(response: httpx.Response) -> dict:
 def _cleanup_global_singleflight():
     """Isolate the module-level singleflight registry between tests.
 
-    ``oc_slimapi.sse.singleflight.fulls`` is a MODULE-level registry whose
+    ``oc_slimapi.singleflight.fulls`` is a MODULE-level registry whose
     keys are ``(id(pool), sid, mid, directory)``. Each test builds a fresh
     TransformPool, but pytest reuses freed pool object addresses — a later
     test's pool can collide on ``id()`` with an earlier test's pool, so an
@@ -1022,7 +1022,7 @@ async def test_singleflight_grace_expiry_new_get(upstream_factory):
     async with _test_client(upstream_factory, handler) as client:
         r1 = await _expand_part(client, "part_text", "p_text", mid="m_grace_1")
         assert r1.status_code == 200
-        await asyncio.sleep(1.1)  # _RESULT_GRACE_SECONDS == 1.0
+        await asyncio.sleep(1.1)  # _DEFAULT_RESULT_GRACE_SECONDS == 1.0
         r2 = await _expand_part(client, "part_text", "p_text", mid="m_grace_1")
     assert r2.status_code == 200
     assert calls[0] == 2

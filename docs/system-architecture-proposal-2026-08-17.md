@@ -1,5 +1,7 @@
 # oc-slimapi 体系架构重塑方案（2026-08-17，v2.2 修订版）
 
+> **owner 终态裁决 2026-08-18**：协议封顶 4 系，(3,4) 永久双版本，5.0.0/B6-2/v2 退役取消。
+>
 > **v2.2 修订**：并入三方 R2 复审（oracle APPROVE WITH CONCERNS / rev-sgpt REJECTED / deepest SOUND WITH GAPS）全部发现。核心修正：① DB 辅助连接策略反转——`mode=ro` 主路径（WAL-aware），`immutable=1` **完全弃用**（live WAL 下静默陈旧读，三方独立实证）；② 数据源模型裁决——DB = v4 sessions **投影源**（非"过滤辅助"），HTTP = schema 权威 + 降级路径；③ 降级矩阵冻结——HTTP fallback 仅服务可等价表达的过滤组合，其余显式 503，禁止 `degraded:true` 掩盖语义削弱；④ D-ix 移出 sidecar（永不写上游 DB，索引 = 运维动作）；⑤ q/p 60s 定时兜底废除（285× 流量放大实证）→ resync 驱动 + 低频 jitter sweep；⑥ B5 拆 B5a/B5b、B3 拆 B3a/B3b；⑦ 组件账目 15→15 修正。
 > **v2 修订**（历史）：并入三方 R1 评审全部发现——status 矛盾消除、`slimapi.meta` 事实纠正（已实现）、SSE id: 移 v4-only、q/p「删除」改「降频」、双版本 selector 前置 B0、发版路线对齐 release.sh、/global/event 事件源实证纠正。
 > 证据链：`slimapi-complexity-map-2026-08-17.md` + `ocdroid-needs-audit-2026-08-17.md` + `upstream-global-model-2026-08-17.md`（其 /global/event 论断已被实证推翻，见 §1.1）+ `native-web-benchmark-2026-08-17.md` + `webui-needs-audit-2026-08-17.md` + 三方 R2 评审（WAL 陈旧读草稿库复现 / EQP 索引矩阵 / 降级语义审查，2026-08-17）

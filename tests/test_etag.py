@@ -28,7 +28,7 @@ from oc_slimapi import etag as etag_mod
 from oc_slimapi.envelope import messages_envelope_bytes
 from oc_slimapi.config import Settings
 from oc_slimapi.errors import register_error_handlers
-from oc_slimapi.leased_singleflight import LeasedSingleFlight
+from oc_slimapi.singleflight import LeasedSingleFlight
 from oc_slimapi.catalog_cache import CatalogCache
 from oc_slimapi.proxy import install_proxy
 from oc_slimapi.routes import (

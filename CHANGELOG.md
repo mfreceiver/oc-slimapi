@@ -26,6 +26,17 @@ ocdroid 对接时：
 
 ---
 
+## [4.1.0] - 2026-08-18 — B6-1 singleflight 双实现合并（包版本 minor；wire 版本**不变**，仍 (3,4)——纯内部重构，ocdroid 零感知）
+
+> PHASE-5 终态批次 B6-1。**ocdroid 必改点：无**——无任何 wire 行为变化（v3/v4 响应逐字节不变）。
+
+### Changed（内部重构，wire 零变化）
+
+- **SingleFlight 双实现合并为单一实现**：`leased_singleflight.py`（LeasedSingleFlight，439 行）与 `sse/singleflight.py`（SingleFlight，329 行）合并为新单一模块 `src/oc_slimapi/singleflight.py`（统一 SingleFlight 类，plain/leased 双 profile，别名 `LeasedSingleFlight` 保留）；两旧文件删除，全仓 import 迁移。两调用方（/full+expand+catalog 的 plain profile；列表路由 coalesce 的 leased profile）行为逐项等价：并发去重、预算 admission/bypass、lease exactly-once 释放、grace 超时、三分支取消、关停收敛语义均由既有测试锁定，全量回归通过（2976）。
+- **组件账目同步（计账修正 17→16，singleflight 合并 −1）**：owner 终态裁决 2026-08-18——协议封顶 4 系，(3,4) 永久双版本，5.0.0 与 B6-2（sticky/三形状退役）取消。与 v2.2 §5 原账目差异说明：v2.2 phase-aware 预测「P3=18 → B6 后 17」为计划口径（含 B6 全量前提）；实际按 4.0.0 组件清点为 17，B6-1 合并后 16。B6-3 全面复核随 owner 裁决取消，账目以本节为准。
+
+---
+
 ## [4.0.0] - 2026-08-18 — wire 双版本 (3,4)：?v=4 sessions 全局面（DB 投影 + 降级矩阵）+ versions/health 双视图（包版本 major；wire 版本 3 → **(3,4) 双版本窗口**）
 
 > P3 批次（B3a：阶段 A selector 双版本 + B1 dbaux 连接生命周期 + B2 投影 SQL + B3 cursor + B4 路由分叉降级 + B5 观测 + B6 契约同步；B3b：SSE `id:`/重放 + q/p 载荷核对 + 能力键广告）。依据 `docs/specs/v4-contract.md`（**4.0.0 实施基线，B3a+B3b 已落地**）与 B0 设计文档（design-v4-selector / design-v4-dbaux / design-v4-sse-replay / design-v4-qp-payload）。**ocdroid 必改点：仅当采用 `?v=4`**——不升级的消费者继续走 `?v=3`，全部 v3 语义**逐字节不变**（既有测试零改动前提下的回归基线）。§7（SSE id:/重放、q/p 载荷）**已随 B3b 批落地**，条目见下文。
