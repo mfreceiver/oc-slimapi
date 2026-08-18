@@ -66,6 +66,7 @@ from oc_slimapi.sse.replay_log import (
     token_domain,
 )
 from oc_slimapi.sse.replay_wire import (
+    V4_RESYNC_REASONS,
     classify_reconnect,
     frame_with_id,
     meta_v4_extension,
@@ -378,19 +379,30 @@ async def _stop_token_stream(sub, sid=None) -> None:
 class _RealStack:
     """Real hub/token/replay stack wired onto a FastAPI app."""
 
-    def __init__(self, *, log: ReplayLog | None = None, **registry_kwargs) -> None:
+    def __init__(
+        self,
+        *,
+        log: ReplayLog | None = None,
+        token_queue_items: int | None = None,
+        **registry_kwargs,
+    ) -> None:
         self.log = log if log is not None else ReplayLog(epoch=EPOCH)
         self.hubs = _ScriptedHubRegistry(**registry_kwargs)
         self.hubs.set_replay_log(self.log)
         self.token_hub = TokenStreamHub(replay_log=self.log)
         self.hubs.set_token_hub(self.token_hub)
+        token_kwargs: dict = {
+            "max_subscribers": 64,
+            "queue_items": (
+                64 if token_queue_items is None else token_queue_items
+            ),
+            "buffer_bytes": 512 * 1024,
+            "max_frame_bytes": DEFAULT_TOKEN_MAX_FRAME_BYTES,
+        }
         self.token_registry = _ScriptedTokenRegistry(
             self.token_hub,
             self.hubs,
-            max_subscribers=64,
-            queue_items=64,
-            buffer_bytes=512 * 1024,
-            max_frame_bytes=DEFAULT_TOKEN_MAX_FRAME_BYTES,
+            **token_kwargs,
         )
         self.app = FastAPI(title="sse-replay-wire-real")
         self.app.add_middleware(SlimapiSelectorMiddleware)
@@ -803,7 +815,9 @@ async def test_token_heartbeat_and_resync_not_logged():
         th.on_part_delta(_delta(SID, "m1", "p1", "x"))
         th.flush()  # seq 1
         th._fanout_heartbeat()
-        th._fanout_resync(SID, "token_memory_limit")
+        # R3: a FROZEN reason is still delivered (un-id'd) on v4 — e.g.
+        # the reconnect_no_replay fanout from on_upstream_reconnect().
+        th._fanout_resync(SID, "reconnect_no_replay")
         assert log.last_seq(token_domain(SID)) == 1
         assert log.domain_frame_count(token_domain(SID)) == 1
         # the fanned heartbeat/resync frames carry no id even for v4
@@ -814,7 +828,7 @@ async def test_token_heartbeat_and_resync_not_logged():
             except Exception:
                 break
         ctrl = [f for f in drained if b"server.heartbeat" in f or b"resync" in f]
-        assert ctrl
+        assert len(ctrl) == 2
         assert all(not f.startswith(b"id:") for f in ctrl)
     finally:
         th.detach_subscriber(SID, sub)
@@ -994,16 +1008,15 @@ async def test_v4_events_g_label_old_epoch_still_epoch_changed(stack: _RealStack
 
 
 async def test_v4_events_backpressure_overflow_recovery():
-    """REPLAY-007: overflowed frames live in the log — the reconnecting
-    client replays them with ids."""
+    """REPLAY-007 + rev-gate R3: overflow terminates the v4 connection with
+    NO resync frame (subscriber_backpressure is outside the frozen v4
+    reason domain — the disconnect itself is the observable signal); the
+    reconnecting client replays the overflowed frames from the log."""
     log = ReplayLog(epoch=EPOCH)
-    # queue_items=2: the overflow branch enqueues resync+STOP after
-    # clearing the queue — a maxsize of 1 would drop STOP (pre-existing
-    # put_nowait behaviour, harmless at the production default of 256).
     s = _RealStack(log=log, queue_items=2, buffer_bytes=1024 * 1024)
     try:
-        # first connection: 3 quick publishes overflow the 1-slot queue →
-        # forced disconnect with the backpressure resync.
+        # first connection: 3 quick publishes overflow the 2-slot queue →
+        # forced disconnect. v4: STOP only, no backpressure resync.
         async def script1(hub, sub):
             hub.publish(_q_event(1))
             hub.publish(_q_event(2))
@@ -1014,15 +1027,15 @@ async def test_v4_events_backpressure_overflow_recovery():
         assert response.status_code == 200
         frames = list(_frames(body))
         _assert_v4_no_forbidden_frames(frames)
-        backpressure = [
-            d for e, i, d in frames
-            if e == "resync" and d.get("reason") == "subscriber_backpressure"
-        ]
-        assert backpressure, frames
-        # the log retained every published frame regardless of delivery
+        # R3: NO resync frame on the v4 wire at all — and no delivered
+        # business frames either (the overflow clears the queue).
+        assert all(e != "resync" for e, _, _ in frames), frames
+        assert frames == [("slimapi.meta", None, frames[0][2])]
+        # ... but the log retained every published frame regardless of
+        # delivery (published-not-delivered semantics).
         assert log.last_seq(GLOBAL_DOMAIN) == 3
 
-        # reconnect from seq 1 → replay 2,3
+        # reconnect from seq 1 → replay 2,3 (the overflowed frames)
         s.hubs.push_script(_script_publish_global())
         response, body = await _read(
             s.app, "/slimapi/events?v=4",
@@ -1512,6 +1525,294 @@ async def test_v4_stream_expired_window_resync():
 
 
 # ===========================================================================
+# §4b — rev-gate R3: the five non-frozen-reason paths. Each test triggers
+# the path FOR REAL on the wire and asserts: (a) the v4 wire carries NO
+# out-of-domain resync frame (allowlist = production V4_RESYNC_REASONS),
+# (b) the v4 connection is TERMINATED (finite body — the disconnect is
+# the observable signal), and (c) a v3 connection facing the same trigger
+# still receives the legacy resync frame, byte-shape unchanged.
+# ===========================================================================
+
+
+async def test_r3_global_backpressure_v4_terminates_v3_resyncs():
+    """Path ① — global stream overflow (hub_types.Subscriber.put).
+
+    v4: STOP only (REPLAY-007 rev-gate semantics — no
+    subscriber_backpressure frame outside the frozen domain).
+    v3: the frozen ``resync{subscriber_backpressure}`` + STOP pair."""
+    log = ReplayLog(epoch=EPOCH)
+    s = _RealStack(log=log, queue_items=2, buffer_bytes=1024 * 1024)
+    try:
+        # v4 leg: 3 publishes overflow the 2-slot queue.
+        async def v4_script(hub, sub):
+            hub.publish(_q_event(1))
+            hub.publish(_q_event(2))
+            hub.publish(_q_event(3))
+
+        s.hubs.push_script(v4_script)
+        _, body = await _read(s.app, "/slimapi/events?v=4")
+        frames = list(_frames(body))
+        _assert_v4_no_forbidden_frames(frames)
+        # terminated with NOTHING delivered past meta (queue was cleared)
+        assert frames == [("slimapi.meta", None, frames[0][2])]
+
+        # v3 leg: same trigger on the same stack → legacy resync emitted.
+        async def v3_script(hub, sub):
+            hub.publish(_q_event(4))
+            hub.publish(_q_event(5))
+            hub.publish(_q_event(6))
+
+        s.hubs.push_script(v3_script)
+        _, body = await _read(s.app, "/slimapi/events?v=3")
+        v3_frames = list(_frames(body))
+        resyncs = [f for f in v3_frames if f[0] == "resync"]
+        assert len(resyncs) == 1
+        assert resyncs[0][2] == {"reason": "subscriber_backpressure"}
+        for block in _blocks(body):
+            assert not block.startswith(b"id:")
+    finally:
+        await s.close()
+
+
+async def test_r3_token_backpressure_v4_terminates_v3_resyncs():
+    """Path ② — token stream overflow (TokenSubscriber.put).
+
+    queue_items=2: the first delta lands in the queue, the second
+    overflows. (maxsize=1 would drop the v3 STOP — the overflow branch
+    seals resync+STOP as TWO terminal puts, a latent pre-existing
+    behaviour at degenerate maxsize; production default is 64.) The
+    overflow branch clears the runtime queue (the frozen disconnect
+    idiom, REPLAY-007 precedent) — so even the first delta is dropped
+    from the wire and lives ONLY in the ReplayLog.
+    v4: STOP only. v3: ``resync{subscriber_backpressure, sessionID}``."""
+    log = ReplayLog(epoch=EPOCH)
+    s = _RealStack(log=log, token_queue_items=2)
+    sid2 = "s2"  # v3 leg runs on a fresh domain (v4 leg left m1 pending)
+    try:
+        async def v4_script(sub, sid):
+            s.token_hub.on_part_updated(_text_start(sid, "m1", "p1"))
+            s.token_hub.on_part_delta(_delta(sid, "m1", "p1", "a"))
+            s.token_hub.flush()  # seq 1 logged; fills a queue slot
+            s.token_hub.on_part_delta(_delta(sid, "m1", "p1", "b"))
+            s.token_hub.flush()  # overflow → v4 termination (queue wiped)
+            s.token_hub.on_part_delta(_delta(sid, "m1", "p1", "c"))
+            s.token_hub.flush()  # seq 2 logged (sub closed — not delivered)
+            sub.put(TOKEN_STOP)  # safety STOP (dropped — sub is closed)
+
+        s.token_registry.push_script(v4_script)
+        _, body = await _read(s.app, f"/slimapi/sessions/{SID}/stream?v=4")
+        frames = list(_frames(body))
+        _assert_v4_no_forbidden_frames(frames)
+        # termination wiped the undelivered deltas: meta only, finite
+        # body, NO resync frame anywhere on the wire — but the log
+        # retained ALL published deltas (published-not-delivered).
+        assert frames == [("slimapi.meta", None, frames[0][2])]
+        assert log.last_seq(token_domain(SID)) == 3
+
+        async def v3_script(sub, sid):
+            s.token_hub.on_part_updated(_text_start(sid, "m1", "p1"))
+            s.token_hub.on_part_delta(_delta(sid, "m1", "p1", "a"))
+            s.token_hub.flush()
+            s.token_hub.on_part_delta(_delta(sid, "m1", "p1", "b"))
+            s.token_hub.flush()
+            s.token_hub.on_part_delta(_delta(sid, "m1", "p1", "c"))
+            s.token_hub.flush()  # overflow → legacy resync + STOP
+            sub.put(TOKEN_STOP)
+
+        s.token_registry.push_script(v3_script)
+        _, body = await _read(s.app, f"/slimapi/sessions/{sid2}/stream?v=3")
+        v3_frames = list(_frames(body))
+        resyncs = [f for f in v3_frames if f[0] == "resync"]
+        assert len(resyncs) == 1
+        assert resyncs[0][2] == {
+            "reason": "subscriber_backpressure", "sessionID": sid2,
+        }
+        for block in _blocks(body):
+            assert not block.startswith(b"id:")
+    finally:
+        await s.close()
+
+
+async def test_r3_token_memory_eviction_v4_terminates_v3_resyncs(monkeypatch):
+    """Path ③ — LivePart LRU eviction (_reserve → _evict_part_for_memory →
+    _fanout_resync{token_memory_limit}).
+
+    TOKEN_LIVEPARTS_MAX_BYTES=1: part A (1 byte) is resident; part B's
+    delta cannot fit → A is evicted → the sid's subscribers get the
+    resync. v4: terminated (STOP only). v3: legacy
+    ``resync{token_memory_limit, sessionID}``."""
+    monkeypatch.setattr(tokenstream_hub_module, "TOKEN_LIVEPARTS_MAX_BYTES", 1)
+    log = ReplayLog(epoch=EPOCH)
+    s = _RealStack(log=log)
+    sid2 = "s2"
+    try:
+        # v4 leg.
+        async def v4_script(sub, sid):
+            s.token_hub.on_part_updated(_text_start(sid, "mA", "p1"))
+            s.token_hub.on_part_delta(_delta(sid, "mA", "p1", "a"))
+            s.token_hub.flush()  # seq 1 delivered; live gauge = 1 byte
+            # part B cannot fit under the 1-byte cap → A evicted →
+            # _fanout_resync(sid, token_memory_limit) → v4 terminate.
+            s.token_hub.on_part_updated(_text_start(sid, "mB", "p1"))
+            s.token_hub.on_part_delta(_delta(sid, "mB", "p1", "b"))
+            s.token_hub.flush()
+            sub.put(TOKEN_STOP)
+
+        s.token_registry.push_script(v4_script)
+        _, body = await _read(s.app, f"/slimapi/sessions/{SID}/stream?v=4")
+        frames = list(_frames(body))
+        _assert_v4_no_forbidden_frames(frames)
+        # terminate() clears the runtime queue (existing disconnect
+        # idiom): the undelivered delta is dropped from the wire; meta
+        # only, finite body, no resync.
+        assert frames == [("slimapi.meta", None, frames[0][2])]
+        # both deltas survive in the log for replay (the evicted part's
+        # and the post-eviction one — published-not-delivered).
+        assert log.last_seq(token_domain(SID)) == 2
+
+        # v3 leg on a fresh sid (same monkeypatched cap).
+        async def v3_script(sub, sid):
+            s.token_hub.on_part_updated(_text_start(sid, "mA", "p1"))
+            s.token_hub.on_part_delta(_delta(sid, "mA", "p1", "a"))
+            s.token_hub.flush()
+            s.token_hub.on_part_updated(_text_start(sid, "mB", "p1"))
+            s.token_hub.on_part_delta(_delta(sid, "mB", "p1", "b"))
+            s.token_hub.flush()
+            sub.put(TOKEN_STOP)
+
+        s.token_registry.push_script(v3_script)
+        _, body = await _read(s.app, f"/slimapi/sessions/{sid2}/stream?v=3")
+        v3_frames = list(_frames(body))
+        resyncs = [
+            f for f in v3_frames
+            if f[0] == "resync" and f[2].get("reason") == "token_memory_limit"
+        ]
+        assert len(resyncs) == 1
+        assert resyncs[0][2]["sessionID"] == sid2
+        for block in _blocks(body):
+            assert not block.startswith(b"id:")
+    finally:
+        await s.close()
+
+
+async def test_r3_session_idle_v4_terminates_v3_resyncs():
+    """Path ④ — session.status idle (on_session_status → pending resync
+    batch → _fanout_resync{session_idle}).
+
+    v4: terminated (STOP only). v3: ``resync{session_idle, sessionID}``."""
+    log = ReplayLog(epoch=EPOCH)
+    s = _RealStack(log=log)
+    sid2 = "s2"
+    try:
+        async def v4_script(sub, sid):
+            s.token_hub.on_part_updated(_text_start(sid, "m1", "p1"))
+            s.token_hub.on_part_delta(_delta(sid, "m1", "p1", "a"))
+            s.token_hub.flush()  # seq 1 delivered
+            # upstream says the session went idle → pending resync →
+            # flush() drains it → _fanout_resync(session_idle) → v4 stop.
+            s.token_hub.on_session_status(sid, "idle")
+            s.token_hub.flush()
+            sub.put(TOKEN_STOP)
+
+        s.token_registry.push_script(v4_script)
+        _, body = await _read(s.app, f"/slimapi/sessions/{SID}/stream?v=4")
+        frames = list(_frames(body))
+        _assert_v4_no_forbidden_frames(frames)
+        # terminate() wipes the undelivered delta (existing disconnect
+        # idiom): meta only, finite body, no resync on the v4 wire.
+        assert frames == [("slimapi.meta", None, frames[0][2])]
+
+        # recovery leg (the R3-blessed path): the client reconnects with
+        # cursor 0 → ReplayLog replays the terminated frame, id'd.
+        s.token_registry.push_script(_stop_token_stream)
+        _, body = await _read(
+            s.app, f"/slimapi/sessions/{SID}/stream?v=4",
+            headers={"Last-Event-ID": f"t:{SID}:{EPOCH}:0"},
+        )
+        frames = list(_frames(body))
+        _assert_v4_no_forbidden_frames(frames)
+        assert [f[0] for f in frames] == [
+            "slimapi.meta", "message.part.delta",
+        ]
+        assert frames[1][1] == f"t:{SID}:{EPOCH}:1"
+
+        # v3 leg: same trigger on a fresh sid → legacy resync delivered.
+        async def v3_script(sub, sid):
+            s.token_hub.on_part_updated(_text_start(sid, "m1", "p1"))
+            s.token_hub.on_part_delta(_delta(sid, "m1", "p1", "a"))
+            s.token_hub.flush()
+            s.token_hub.on_session_status(sid, "idle")
+            s.token_hub.flush()
+            sub.put(TOKEN_STOP)
+
+        s.token_registry.push_script(v3_script)
+        _, body = await _read(s.app, f"/slimapi/sessions/{sid2}/stream?v=3")
+        v3_frames = list(_frames(body))
+        resyncs = [
+            f for f in v3_frames
+            if f[0] == "resync" and f[2].get("reason") == "session_idle"
+        ]
+        assert len(resyncs) == 1
+        assert resyncs[0][2]["sessionID"] == sid2
+        for block in _blocks(body):
+            assert not block.startswith(b"id:")
+    finally:
+        await s.close()
+
+
+async def test_r3_session_deleted_v4_terminates_v3_resyncs():
+    """Path ⑤ — session.deleted (on_session_deleted → terminate).
+
+    v4: STOP only — the deletion semantics reach the client via the
+    GLOBAL session.digest control plane, never via a token-stream resync.
+    v3: ``resync{session_deleted, sessionID}`` → STOP (INV-4 pair)."""
+    log = ReplayLog(epoch=EPOCH)
+    s = _RealStack(log=log)
+    sid2 = "s2"  # v3 leg MUST use another sid: on_session_deleted arms
+    # the deleted-sid gate (late part events for the sid are dropped).
+    try:
+        async def v4_script(sub, sid):
+            s.token_hub.on_part_updated(_text_start(sid, "m1", "p1"))
+            s.token_hub.on_part_delta(_delta(sid, "m1", "p1", "a"))
+            s.token_hub.flush()  # seq 1 delivered
+            s.token_hub.on_session_deleted(sid)  # terminate({session_deleted})
+            sub.put(TOKEN_STOP)
+
+        s.token_registry.push_script(v4_script)
+        _, body = await _read(s.app, f"/slimapi/sessions/{SID}/stream?v=4")
+        frames = list(_frames(body))
+        _assert_v4_no_forbidden_frames(frames)
+        # terminate() wipes the undelivered delta (existing disconnect
+        # idiom): meta only, finite body, no resync on the v4 wire.
+        assert frames == [("slimapi.meta", None, frames[0][2])]
+        # the deletion's token-stream state is gone, but the frame lives
+        # on in the log (deletion semantics reach clients via the global
+        # session.digest control plane, not this stream).
+        assert log.last_seq(token_domain(SID)) == 1
+
+        async def v3_script(sub, sid):
+            s.token_hub.on_part_updated(_text_start(sid, "m1", "p1"))
+            s.token_hub.on_part_delta(_delta(sid, "m1", "p1", "a"))
+            s.token_hub.flush()
+            s.token_hub.on_session_deleted(sid)
+            sub.put(TOKEN_STOP)
+
+        s.token_registry.push_script(v3_script)
+        _, body = await _read(s.app, f"/slimapi/sessions/{sid2}/stream?v=3")
+        v3_frames = list(_frames(body))
+        resyncs = [
+            f for f in v3_frames
+            if f[0] == "resync" and f[2].get("reason") == "session_deleted"
+        ]
+        assert len(resyncs) == 1
+        assert resyncs[0][2]["sessionID"] == sid2
+        for block in _blocks(body):
+            assert not block.startswith(b"id:")
+    finally:
+        await s.close()
+
+
+# ===========================================================================
 # §4b — rev-gate BLOCKER-1: v4 握手旁路修复的 wire 证据
 # ===========================================================================
 
@@ -1526,10 +1827,16 @@ _TOKEN_ID_RE = re.compile(rf"^t:{re.escape(SID)}:{EPOCH}:(\d+)$")
 
 
 def _assert_v4_no_forbidden_frames(frames):
-    """禁止事件集断言：v4 全流遍历永不出现 server.connected 或
-    message.part.snapshot（任何变体：done/truncated/handshake）。"""
+    """禁止事件集 + 冻结 reason 值域断言（rev-gate R2+R3 BLOCKER-1）：
+    v4 全流遍历永不出现 server.connected 或 message.part.snapshot
+    （任何变体：done/truncated/handshake）；且每个出现的 resync 帧的
+    data.reason ∈ 生产侧 V4_RESYNC_REASONS（import 自 replay_wire——
+    与五条路径的 v4 分支共用同一常量，非测试私有副本）。"""
     for event, frame_id, _data in frames:
         assert event not in _FORBIDDEN_V4_EVENTS, (event, frame_id, _data)
+        if event == "resync":
+            reason = _data.get("reason")
+            assert reason in V4_RESYNC_REASONS, (reason, frame_id, _data)
 
 
 def _assert_v4_id_invariant(frames, domain, *, sid=SID):
@@ -1765,6 +2072,7 @@ async def test_barrier_boundary_triple_wire():
                 headers={"Last-Event-ID": f"g:{EPOCH}:{cursor_seq}"},
             )
             frames = list(_frames(body))
+            _assert_v4_no_forbidden_frames(frames)
             resyncs = [d for e, i, d in frames if e == "resync"]
             if expect_resync:
                 assert resyncs == [{"reason": "reconnect_no_replay"}], (
@@ -1809,6 +2117,7 @@ async def test_offline_token_domain_barrier_and_recycle_retention():
             headers={"Last-Event-ID": f"t:{SID}:{EPOCH}:0"},
         )
         frames = list(_frames(body))
+        _assert_v4_no_forbidden_frames(frames)
         resyncs = [d for e, i, d in frames if e == "resync"]
         assert resyncs == [{"reason": "reconnect_no_replay", "sessionID": SID}]
 

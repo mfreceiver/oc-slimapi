@@ -22,6 +22,8 @@ import orjson
 
 from oc_slimapi.logging_config import get_logger
 
+from .replay_wire import V4_RESYNC_REASONS
+
 logger = get_logger(__name__)
 
 
@@ -305,7 +307,18 @@ class Subscriber:
         self._clear_queue()
         logger.warning("sse subscriber forced disconnect (backpressure)",
                       extra={"subscriber_id": self.id})
-        resync = sse_frame({"reason": "subscriber_backpressure"}, event="resync")
+        # rev-gate R3 BLOCKER-1: ``subscriber_backpressure`` is NOT in the
+        # frozen v4 reason domain (V4_RESYNC_REASONS) — a v4 wire never
+        # carries it. v4 termination = STOP only (the disconnect itself is
+        # the observable signal; recovery = Last-Event-ID reconnect +
+        # ReplayLog replay per REPLAY-007). v3 keeps the frozen
+        # resync + STOP pair, byte-identical.
+        reason = "subscriber_backpressure"
+        if self.wire_v4 and reason not in V4_RESYNC_REASONS:
+            with contextlib.suppress(asyncio.QueueFull):
+                self.queue.put_nowait(STOP)
+            return False
+        resync = sse_frame({"reason": reason}, event="resync")
         with contextlib.suppress(asyncio.QueueFull):
             self.queue.put_nowait(resync)
             self.queue.put_nowait(STOP)

@@ -35,13 +35,21 @@ import asyncio
 import re
 from typing import TYPE_CHECKING, Any
 
-from .replay_log import GLOBAL_DOMAIN, ReplayOutcome
+from .replay_log import (
+    GLOBAL_DOMAIN,
+    ReplayOutcome,
+    RESYNC_EPOCH_CHANGED,
+    RESYNC_REPLAY_EXPIRED,
+    RESYNC_REPLAY_GAP,
+    RESYNC_RECONNECT_NO_REPLAY,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - import-time only
     from .replay_log import ReplayLog
 
 __all__ = [
     "META_CAPABILITY_KEYS",
+    "V4_RESYNC_REASONS",
     "classify_reconnect",
     "frame_with_id",
     "meta_v4_extension",
@@ -49,6 +57,24 @@ __all__ = [
     "replay_sweep_loop",
     "sse_id_line",
 ]
+
+# rev-gate R3 BLOCKER-1: the frozen v4 ``resync.reason`` value domain
+# (v4-contract §7.2 / design §4) — EXACTLY these four values may appear in
+# a ``resync`` frame on a v4 wire. Every other legacy v3 reason
+# (subscriber_backpressure / token_memory_limit / session_idle /
+# session_deleted …) takes the v4 termination route instead: the server
+# ends the connection (STOP) WITHOUT emitting an out-of-domain resync
+# frame — the disconnect itself is the observable signal, and the client's
+# recovery path is Last-Event-ID reconnect → ReplayLog replay (in window)
+# or a frozen-reason resync (out of window) → HTTP alignment. This is the
+# PRODUCTION allowlist (not a test-only oracle): the subscriber/hub v4
+# branches below key off it, and the wire tests import the same constant.
+V4_RESYNC_REASONS = frozenset({
+    RESYNC_EPOCH_CHANGED,
+    RESYNC_REPLAY_EXPIRED,
+    RESYNC_REPLAY_GAP,
+    RESYNC_RECONNECT_NO_REPLAY,
+})
 
 # §7.1 syntax: epoch = exactly 16 lowercase hex chars; seq = decimal digits
 # (leading zeros tolerated — the value domain is the integer, the ID is a

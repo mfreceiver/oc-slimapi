@@ -88,7 +88,7 @@ from ..replay_log import (
     ReplayLog,
     token_domain,
 )
-from ..replay_wire import sse_id_line
+from ..replay_wire import V4_RESYNC_REASONS, sse_id_line
 from .frames import (
     STOP,
     _connected_frame,
@@ -1442,12 +1442,30 @@ class TokenStreamHub:
         self._metrics.flushed_frames_total += delivered
 
     def _fanout_resync(self, sid: str, reason: str) -> None:
-        """Fan ``resync{reason, sessionID}`` to every subscriber of sid."""
+        """Fan ``resync{reason, sessionID}`` to every subscriber of sid.
+
+        rev-gate R3 BLOCKER-1: the frozen v4 reason domain is EXACTLY
+        :data:`V4_RESYNC_REASONS` (epoch_changed / replay_expired /
+        replay_gap / reconnect_no_replay). A v4 subscriber facing a
+        NON-frozen reason (``token_memory_limit`` via
+        :meth:`_evict_part_for_memory`, ``session_idle`` via the pending
+        session-resync batch) is TERMINATED instead —
+        :meth:`TokenSubscriber.terminate` suppresses the out-of-domain
+        frame on v4 wires (STOP only; the disconnect is the observable
+        signal, recovery = Last-Event-ID reconnect → ReplayLog replay or
+        a frozen-reason resync). v3 subscribers keep the frozen
+        ``resync{reason}`` frame, byte-identical.
+        """
         subs = self._subs_by_sid.get(sid)
         if not subs:
             return
-        frame = _resync_frame(sid, reason)
+        frame: bytes | None = None
         for sub in tuple(subs):
+            if getattr(sub, "wire_v4", False) and reason not in V4_RESYNC_REASONS:
+                sub.terminate(reason)
+                continue
+            if frame is None:
+                frame = _resync_frame(sid, reason)
             sub.put(frame)
 
     def _fanout_heartbeat(self) -> None:

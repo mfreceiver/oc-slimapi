@@ -17,6 +17,7 @@ from ...config import (
     TOKEN_HANDSHAKE_ITEMS,
 )
 from .frames import STOP, _resync_frame
+from ..replay_wire import V4_RESYNC_REASONS
 from .models import _TokenMetrics
 
 if TYPE_CHECKING:
@@ -439,7 +440,17 @@ class TokenSubscriber:
         self.forced_disconnects += 1
         self.metrics.dropped_frames_total += 1
         self.queue.clear_runtime()
-        resync = _resync_frame(self.session_id, "subscriber_backpressure")
+        # rev-gate R3 BLOCKER-1: ``subscriber_backpressure`` is NOT in the
+        # frozen v4 reason domain (V4_RESYNC_REASONS) — a v4 wire never
+        # carries it. v4 termination = STOP only (the disconnect is the
+        # observable signal; recovery = Last-Event-ID reconnect +
+        # ReplayLog replay). v3 keeps the frozen resync + STOP pair,
+        # byte-identical.
+        reason = "subscriber_backpressure"
+        if self.wire_v4 and reason not in V4_RESYNC_REASONS:
+            self.queue.put_runtime_terminal(STOP)
+            return False
+        resync = _resync_frame(self.session_id, reason)
         # Terminal pair: put WITHOUT bumping runtime_bytes (these are the
         # disconnect marker, not backlog — see put_runtime_terminal).
         self.queue.put_runtime_terminal(resync)
@@ -458,6 +469,15 @@ class TokenSubscriber:
         ended) then STOP (so the generator breaks → finally →
         unsubscribe releases the slot / stops flush / arms grace).
 
+        rev-gate R3 BLOCKER-1: on a v4 wire the resync frame is emitted
+        ONLY when ``reason`` is inside the frozen four-value domain
+        (:data:`V4_RESYNC_REASONS`); otherwise the termination is silent
+        (STOP only — the disconnect is the observable signal; e.g.
+        ``session_deleted`` is expressed to v4 clients via the global
+        session.digest control plane, and idle/memory pressure recover
+        via Last-Event-ID reconnect). v3 keeps the frozen
+        resync{reason} → STOP pair, byte-identical.
+
         Does NOT detach from the hub's fanout — :meth:`on_session_deleted`
         relies on the sub still being in ``_subs_by_sid`` so the
         generator's finally → :meth:`TokenStreamRegistry.unsubscribe`
@@ -466,9 +486,10 @@ class TokenSubscriber:
         """
         self.closed = True
         self.queue.clear_runtime()
-        self.queue.put_runtime_terminal(
-            _resync_frame(self.session_id, reason)
-        )
+        if not self.wire_v4 or reason in V4_RESYNC_REASONS:
+            self.queue.put_runtime_terminal(
+                _resync_frame(self.session_id, reason)
+            )
         self.queue.put_runtime_terminal(STOP)
 
     def ack(self, frame: Any) -> None:
