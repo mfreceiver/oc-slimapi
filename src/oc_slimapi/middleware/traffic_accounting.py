@@ -64,7 +64,10 @@ from ..traffic import (
     _UP_OUT_KEY,
     _read_state_int,
     bucketize,
+    ensure_sessions_degraded_counters,
     expand_category_from_path,
+    read_degraded_503,
+    read_sessions_source,
 )
 from .request_id import REQUEST_ID_KEY
 
@@ -283,6 +286,12 @@ def _record(
     selector_result = sel_info.get("result")
     wire_version = sel_info.get("wire")
     directory_form = sel_state.get(DIRECTORY_FORM_STATE_KEY)
+    # v4 sessions degraded markers (§9.1/§9.2, BLOCKER-4): stashed by the
+    # ``_sessions_v4`` route handler into the shared scope state during the
+    # request; read here (validated) at request end. Absent on v3 paths /
+    # other routes / non-degraded responses.
+    sessions_source = read_sessions_source(scope)
+    degraded_503 = read_degraded_503(scope)
     # Access log: always (when the logger is enabled). For SSE buckets we log
     # the wire-level down_out so an operator sees the real connection payload.
     try:
@@ -328,73 +337,99 @@ def _record(
             directory_form=directory_form,
             record_type="request",
             lifecycle_id=None,
+            sessions_source=sessions_source,
+            degraded_503=degraded_503,
         )
     except Exception as exc:
         logger.warning("write_access_log failed", exc_info=exc)
 
     ledger = _ledger_from_scope(scope)
-    if ledger is None:
-        return
-    try:
-        # SSE buckets: pass resp_bytes=0 only for genuine SSE streams
-        # (200 + text/event-stream), where record_sse_downstream owns downOut.
-        # Non-stream error responses on SSE paths (400/503) are counted
-        # normally so the ledger does not lose those bytes.
-        #
-        # Invariant / double-count guard: this zeroing DEPENDS on every real
-        # SSE response carrying ``content-type: text/event-stream``. Both SSE
-        # generators (``routes/events.py`` and ``routes/token_stream.py``)
-        # set ``media_type="text/event-stream"`` on their StreamingResponse,
-        # so the wire downOut is owned by ``record_sse_downstream`` here. If
-        # a future SSE variant forgot that header, this branch would fall
-        # through to ``resp_for_ledger = down_out`` (counting wire bytes)
-        # AND the generator's per-frame ``record_sse_downstream`` would
-        # ALSO add bytes → silent double-count of downOut for that bucket.
-        is_real_sse_stream = (
-            is_sse
-            and status == 200
-            and content_type is not None
-            and "text/event-stream" in content_type
-        )
-        resp_for_ledger = 0 if is_real_sse_stream else down_out
-        ledger.record_downstream(
-            bucket=bucket,
-            method=method,
-            status=status,
-            req_bytes=down_in,
-            resp_bytes=resp_for_ledger,
-            duration_ms=duration_ms,
-        )
-        # v3 §9.2 matrix (best-effort, additive): one request row per request.
-        ledger.record_selector_request(
-            bucket=bucket,
-            status=status,
-            selector_result=selector_result,
-            wire_version=wire_version,
-            directory_form=directory_form,
-            record_type="request",
-        )
-        # design-expand §11 P4: expand requests additionally counted per
-        # category|status with wire downOut bytes (additive cross-cut; the
-        # bucket/requests above already cover the HTTP dimension). Path-hidden
-        # — the expand routes need no ledger knowledge.
-        expand_category = expand_category_from_path(path)
-        if expand_category is not None:
-            ledger.record_expand(
-                category=expand_category,
-                status=status,
-                resp_bytes=resp_for_ledger,
+    if ledger is not None:
+        try:
+            # SSE buckets: pass resp_bytes=0 only for genuine SSE streams
+            # (200 + text/event-stream), where record_sse_downstream owns downOut.
+            # Non-stream error responses on SSE paths (400/503) are counted
+            # normally so the ledger does not lose those bytes.
+            #
+            # Invariant / double-count guard: this zeroing DEPENDS on every real
+            # SSE response carrying ``content-type: text/event-stream``. Both SSE
+            # generators (``routes/events.py`` and ``routes/token_stream.py``)
+            # set ``media_type="text/event-stream"`` on their StreamingResponse,
+            # so the wire downOut is owned by ``record_sse_downstream`` here. If
+            # a future SSE variant forgot that header, this branch would fall
+            # through to ``resp_for_ledger = down_out`` (counting wire bytes)
+            # AND the generator's per-frame ``record_sse_downstream`` would
+            # ALSO add bytes → silent double-count of downOut for that bucket.
+            is_real_sse_stream = (
+                is_sse
+                and status == 200
+                and content_type is not None
+                and "text/event-stream" in content_type
             )
-        # Upstream bytes for SSE buckets come from record_sse_upstream in the
-        # hub — ignore the stash so the single shared /global/event
-        # connection is attributed exactly once.
-        if not is_sse and (up_in > 0 or up_out > 0):
-            ledger.record_upstream(
+            resp_for_ledger = 0 if is_real_sse_stream else down_out
+            ledger.record_downstream(
                 bucket=bucket,
                 method=method,
                 status=status,
-                req_bytes=up_out,
-                resp_bytes=up_in,
+                req_bytes=down_in,
+                resp_bytes=resp_for_ledger,
+                duration_ms=duration_ms,
             )
+            # v3 §9.2 matrix (best-effort, additive): one request row per request.
+            ledger.record_selector_request(
+                bucket=bucket,
+                status=status,
+                selector_result=selector_result,
+                wire_version=wire_version,
+                directory_form=directory_form,
+                record_type="request",
+            )
+            # design-expand §11 P4: expand requests additionally counted per
+            # category|status with wire downOut bytes (additive cross-cut; the
+            # bucket/requests above already cover the HTTP dimension). Path-hidden
+            # — the expand routes need no ledger knowledge.
+            expand_category = expand_category_from_path(path)
+            if expand_category is not None:
+                ledger.record_expand(
+                    category=expand_category,
+                    status=status,
+                    resp_bytes=resp_for_ledger,
+                )
+            # v4 §9.2 degraded matrix (BLOCKER-4): per-response counts — the
+            # status gate mirrors the marker semantics (source=http only on the
+            # Class A degraded 200; the 503 marker only on fail-closed 5xx).
+            if sessions_source == "http" and 200 <= status < 300:
+                ledger.record_sessions_degraded(kind="http", bucket=bucket, status=status)
+            if degraded_503 and 500 <= status < 600:
+                ledger.record_sessions_degraded(
+                    kind="fail_closed", bucket=bucket, status=status
+                )
+            # Upstream bytes for SSE buckets come from record_sse_upstream in the
+            # hub — ignore the stash so the single shared /global/event
+            # connection is attributed exactly once.
+            if not is_sse and (up_in > 0 or up_out > 0):
+                ledger.record_upstream(
+                    bucket=bucket,
+                    method=method,
+                    status=status,
+                    req_bytes=up_out,
+                    resp_bytes=up_in,
+                )
+        except Exception as exc:
+            logger.warning("record_upstream failed", exc_info=exc)
+
+    # Per-response degraded counters on app.state (BLOCKER-4): deliberately
+    # OUTSIDE the ledger try above and independent of ledger availability —
+    # degraded observability does not ride the traffic-metrics switch. Lazy
+    # init keeps app.py untouched (the middleware owns creation).
+    try:
+        app = scope.get("app")
+        state = getattr(app, "state", None)
+        if state is not None:
+            counters = ensure_sessions_degraded_counters(state)
+            if sessions_source == "http" and 200 <= status < 300:
+                counters.record_degraded_200()
+            elif degraded_503 and 500 <= status < 600:
+                counters.record_fail_closed_503()
     except Exception as exc:
-        logger.warning("record_upstream failed", exc_info=exc)
+        logger.warning("sessions degraded counters update failed", exc_info=exc)

@@ -374,17 +374,46 @@ def mirror_page(
 # golden 文档（权威源②的 fixture 驱动降级版——任务预声明偏离）
 # ---------------------------------------------------------------------------
 
+def response_fingerprint(records: Sequence[dict[str, Any]]) -> str:
+    """响应指纹：golden 载荷 canonical JSON 的 sha256[:16]。
+
+    独立于 dataset digest——数据集不变但投影管线（列集/键序）漂移时，
+    响应指纹变化而数据集指纹不变，二者交叉定位漂移层。
+    """
+    canonical = json.dumps(
+        records, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
 def build_golden_document() -> dict[str, Any]:
-    """golden = 镜像 oracle 全量投影（生成器标识 + 指纹 + manifest 头）。"""
+    """golden = 镜像 oracle 全量投影（生成器标识 + 指纹 + manifest 头）。
+
+    头部（rev gate 增强后）：
+
+    - ``version`` / ``generator`` / ``fingerprint`` / ``dataset_manifest``：
+      既有四键（生成器 + 数据集身份）；
+    - ``dataset_digest``：数据集摘要顶层便捷键（= manifest.digest）；
+    - ``response_fingerprint``：**载荷**身份（投影输出字节身份，锚定
+      「同一数据集 + 同一投影管线」的响应可复现性）；
+    - ``upstream_locked``：生成时锁定的上游对齐版本（真进程权威源①
+      不可用时，标明 golden 的上游语义基线）；
+    - ``regenerate_hint``：再生成指引（design §10.6）。
+    """
     records, complete = mirror_page(
         archived="all", parent="all", limit=len(DATASET) + 10
     )
     assert complete, "golden 全量窗口必须 complete"
+    manifest = dataset_manifest()
     return {
         "version": ALIGNED_VERSION,
         "generator": GOLDEN_GENERATOR,
         "fingerprint": dataset_fingerprint(),
-        "dataset_manifest": dataset_manifest(),
+        "dataset_manifest": manifest,
+        "dataset_digest": manifest["digest"],
+        "response_fingerprint": response_fingerprint(records),
+        "upstream_locked": ALIGNED_VERSION,
+        "regenerate_hint": ".venv/bin/python tests/v4_fixture.py --write-golden",
         "query": {
             "archived": "all",
             "parent": "all",
@@ -411,11 +440,22 @@ def validate_golden(document: dict[str, Any]) -> tuple[bool, str]:
             f"dataset={dataset_fingerprint()!r} — 数据集与 golden 漂移；"
             f"再生成：.venv/bin/python tests/v4_fixture.py --write-golden"
         )
+    # rev gate 增强：头部声明键逐项校验（缺一即失效——强制再生成）。
+    if document.get("dataset_digest") != dataset_manifest()["digest"]:
+        return False, "golden dataset_digest mismatch or missing"
+    if document.get("upstream_locked") != ALIGNED_VERSION:
+        return False, (
+            f"golden upstream_locked mismatch: file={document.get('upstream_locked')!r}"
+        )
+    if not document.get("regenerate_hint"):
+        return False, "golden regenerate_hint missing"
     expected_records, _ = mirror_page(
         archived="all", parent="all", limit=len(DATASET) + 10
     )
     if document.get("sessions") != expected_records:
         return False, "golden sessions payload mismatch (mirror oracle drift)"
+    if document.get("response_fingerprint") != response_fingerprint(expected_records):
+        return False, "golden response_fingerprint mismatch (payload identity drift)"
     return True, ""
 
 

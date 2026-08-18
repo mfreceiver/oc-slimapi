@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sqlite3
+
 import httpx
 import orjson
 from fastapi import APIRouter, Query, Request
@@ -298,6 +300,17 @@ def _aux_unavailable() -> CodedHTTPException:
     )
 
 
+def _fail_closed_503(request: Request) -> CodedHTTPException:
+    """503 fail-closed 统一出口（rev gate：R2 观测泳道接口约定）。
+
+    写 ``request.state.slimapi_degraded_503 = True``——R2 在 access log /
+    snapshot / metrics 消费；Class A 降级 200 不置位（那是
+    ``slimapi_sessions_source="http"`` 的辖区）。v3 路径两字段恒缺席。
+    """
+    request.state.slimapi_degraded_503 = True
+    return _aux_unavailable()
+
+
 def _http_session_to_v4(item: dict) -> dict:
     """Upstream ``/session`` JSON (SessionInfo camelCase) → SessionSkeletonV4.
 
@@ -423,14 +436,22 @@ async def _sessions_v4(
             )
         except AuxiliaryUnavailableError:
             pass  # raced into unavailable between status and query → degrade
+        except sqlite3.Error:
+            # rev gate BLOCKER-1：busy 族及其他查询期 sqlite 异常（lifecycle
+            # busy 分类原样上抛、不禁用连接）在路由边界统一转
+            # auxiliary_unavailable 语义 → 503 fail-closed；不泄露 SQLite
+            # 细节（§4.2），延迟已由 lifecycle 计入熔断器画像。
+            raise _fail_closed_503(request) from None
         else:
             items = project_rows_to_v4_skeletons(page.records)
+            # BLOCKER-3：nextCursor 用**原始窗口锚点**（坏行不丢锚点——
+            # items 可为空仍可前进；仅在 complete:false 且锚点存在时编码）。
             next_cursor = None
-            if not page.complete and items:
-                last = page.records[-1]
+            if not page.complete and page.anchor is not None:
                 next_cursor = encode_cursor(
-                    last["time_updated"], last["id"], fingerprint,
+                    page.anchor[0], page.anchor[1], fingerprint,
                 )
+            request.state.slimapi_sessions_source = "db"
             return _v4_json_response(
                 sessions_envelope_v4(items, next_cursor, page.complete),
                 request,
@@ -438,18 +459,18 @@ async def _sessions_v4(
     # DB unavailable (or raced) → §4.2 degradation formula
     if allowlist:
         # fail-closed：白名单 ⊆ 结果集不可由上游保证（ora B-2 选②）
-        raise _aux_unavailable()
+        raise _fail_closed_503(request)
     if has_wildcard(normalized):
         # %/_/\ 无法等价表达——过滤语义永不降级（§4.6 收窄）
-        raise _aux_unavailable()
+        raise _fail_closed_503(request)
     if cursor_payload is not None:
         # 上游单键 cursor 无法兑现 (t,i) keyset 指纹
-        raise _aux_unavailable()
+        raise _fail_closed_503(request)
     class_a = (
         archived_state in ("omit", "all") and parent_state in ("all", "none")
     )
     if not class_a:
-        raise _aux_unavailable()
+        raise _fail_closed_503(request)
 
     # ---- Class A 200 + degraded:true（HTTP 降级，v3 调用形态复制） -----
     params: dict[str, object] = {"limit": limit}
@@ -499,6 +520,8 @@ async def _sessions_v4(
     # complete best-effort（§4.2 degraded 语义：上游无 LIMIT+1 窗口）；
     # nextCursor 恒 null——降级页无法用 (t,i) keyset 续读（cursor → 503）。
     complete = len(items) < limit
+    # R2 观测接口（rev gate）：降级 200 标记数据面来源。
+    request.state.slimapi_sessions_source = "http"
     return _v4_json_response(
         sessions_envelope_v4(items, None, complete, degraded=True),
         request,

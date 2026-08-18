@@ -7,6 +7,10 @@
     "projects": 2,
     "digest": "c7b87f0f653b1694"
   },
+  "dataset_digest": "c7b87f0f653b1694",
+  "response_fingerprint": "9e5ef5c083086924",
+  "upstream_locked": "v1.18.18",
+  "regenerate_hint": ".venv/bin/python tests/v4_fixture.py --write-golden",
   "query": {
     "archived": "all",
     "parent": "all",

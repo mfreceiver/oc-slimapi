@@ -520,15 +520,27 @@ class DbAuxiliarySource:
 
     def _open_and_gate_sync(self) -> None:
         """worker 内：关旧（若有）→ 开新 → 门。失败抛（旧已关，状态由
-        调用方置禁用）。"""
+        调用方置禁用）。
+
+        rev gate MAJOR-1：局部所有权纪律——连接在门**全部成功**前只归
+        本栈帧所有；门查询自身抛异常（非「缺列」结论——如 PRAGMA 被锁/
+        IO 错）时 finally 关闭局部连接，绝不泄漏给进程 fd 表。只有门过
+        后才转移 ``self._conn`` 并推进 generation。
+        """
         self._close_conn()
         conn = self._open_conn()
-        missing = schema_gate_missing(conn)
-        if missing:
-            conn.close()
-            raise sqlite3.OperationalError(
-                f"schema gate failed, missing columns: {missing}"
-            )
+        try:
+            missing = schema_gate_missing(conn)
+            if missing:
+                raise sqlite3.OperationalError(
+                    f"schema gate failed, missing columns: {missing}"
+                )
+        except BaseException:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+            raise
         self._conn = conn
         self._generation += 1
         marker = stat_inode_marker(self._resolution.path)  # type: ignore[union-attr]

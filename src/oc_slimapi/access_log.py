@@ -286,6 +286,8 @@ def write_access_log(
     directory_form: str | None = None,
     record_type: str = "request",
     lifecycle_id: int | None = None,
+    sessions_source: str | None = None,
+    degraded_503: bool = False,
 ) -> None:
     """Emit one JSON-lines access record.
 
@@ -312,6 +314,19 @@ def write_access_log(
       "sse_open"/"sse_close" rows come from :func:`write_sse_lifecycle_log`.
     * ``lifecycleId``: null on request rows; the process-monotonic pairing id
       on SSE lifecycle rows.
+
+    v4 sessions degraded observability (v4-contract §9.1/§9.2, rev-gate
+    BLOCKER-4) — SPARSE tail fields, same style as ``cache`` (only routes
+    with the semantics carry them; every other row keeps its exact key set,
+    and old rows/consumers simply never see them):
+
+    * ``sessionsSource``: "db" | "http" — written only when the
+      ``_sessions_v4`` handler stashed the source marker (DB 200 → "db";
+      Class A degraded 200 → "http"). Absent on v3 paths, other routes, and
+      503 fail-closed responses (no body served from either source).
+    * ``degraded503``: ``true`` — written only on fail-closed degraded 503
+      responses. Never ``false``: absence IS the negative, keeping rows
+      sparse (jq: ``select(.degraded503 == true)``).
     """
     if logger.disabled:
         return
@@ -339,6 +354,13 @@ def write_access_log(
     record["directoryForm"] = directory_form
     record["recordType"] = record_type
     record["lifecycleId"] = lifecycle_id
+    # v4 sessions degraded markers — sparse (cache-style): only sessions v4
+    # responses carry them. Defensive value check: only the frozen value set
+    # reaches the row even if a garbage state value slipped in.
+    if sessions_source in ("db", "http"):
+        record["sessionsSource"] = sessions_source
+    if degraded_503:
+        record["degraded503"] = True
     logger.info(json.dumps(record, separators=(",", ":")))
 
 

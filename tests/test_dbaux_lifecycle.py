@@ -175,6 +175,95 @@ async def test_open_failure_disables_not_crashes(tmp_path: Path):
         await src.stop()
 
 
+# ---------------------------------------------------------------------------
+# rev gate MAJOR-1：门查询抛异常 → 局部连接关闭，不泄漏 fd
+# ---------------------------------------------------------------------------
+
+
+class _ConnSpy:
+    """包装 sqlite3.connect：记录创建的连接与其存活状态。"""
+
+    def __init__(self, real) -> None:
+        self._real = real
+        self.created: list[sqlite3.Connection] = []
+
+    def __call__(self, *a, **kw):
+        conn = self._real(*a, **kw)
+        self.created.append(conn)
+        return conn
+
+    @property
+    def open_count(self) -> int:
+        return sum(1 for c in self.created if not _conn_is_closed(c))
+
+
+def _conn_is_closed(conn) -> bool:
+    # sqlite3.Connection 无公开 closed 属性；用 total_changes 探活（readonly
+    # 连接上合法且常量；已关闭连接抛 ProgrammingError）。
+    try:
+        conn.total_changes
+        return False
+    except sqlite3.ProgrammingError:
+        return True
+
+
+async def test_gate_exception_closes_local_connection(tmp_path: Path, monkeypatch):
+    """门 PRAGMA 查询抛异常（非「缺列」结论）→ 连接必须被关闭（MAJOR-1）。"""
+    import oc_slimapi.dbaux.lifecycle as lifecycle_mod
+
+    p = tmp_path / "opencode.db"
+    _create_db(p)
+
+    spy = _ConnSpy(lifecycle_mod.sqlite3.connect)
+    monkeypatch.setattr(lifecycle_mod.sqlite3, "connect", spy)
+
+    def _boom(conn):
+        raise RuntimeError("gate query exploded")
+
+    monkeypatch.setattr(lifecycle_mod, "schema_gate_missing", _boom)
+
+    src = DbAuxiliarySource(_resolved(p))
+    st = await src.start()
+    try:
+        assert not st.available
+        # RuntimeError 属 classify "other" → open_failed；sqlite 族门异常
+        # → gate_failed。泄漏断言与 reason 分类正交。
+        assert st.reason in ("gate_failed", "open_failed")
+        # 门抛异常路径：打开过的连接必须全部关闭（局部所有权 finally 纪律）。
+        assert len(spy.created) >= 1
+        assert spy.open_count == 0, f"leaked {spy.open_count} connection(s)"
+    finally:
+        await src.stop()
+
+
+async def test_repeated_gate_failures_no_fd_accumulation(tmp_path: Path, monkeypatch):
+    """连续多次 reprobe 均在门处抛异常 → 每次都关闭，无 fd 泄漏累积。"""
+    import oc_slimapi.dbaux.lifecycle as lifecycle_mod
+
+    p = tmp_path / "opencode.db"
+    _create_db(p)
+
+    spy = _ConnSpy(lifecycle_mod.sqlite3.connect)
+    monkeypatch.setattr(lifecycle_mod.sqlite3, "connect", spy)
+
+    def _boom(conn):
+        raise RuntimeError("gate boom")
+
+    monkeypatch.setattr(lifecycle_mod, "schema_gate_missing", _boom)
+
+    src = DbAuxiliarySource(_resolved(p))
+    st = await src.start()
+    try:
+        assert not st.available
+        for _ in range(5):
+            await src.reprobe()
+            assert spy.open_count == 0
+        assert len(spy.created) >= 6  # start + 每 reprobe 各开过一次
+    finally:
+        await src.stop()
+    assert spy.open_count == 0
+
+
 async def test_disabled_resolution_stays_disabled(tmp_path):
     from oc_slimapi.dbaux import DisabledResolution
 

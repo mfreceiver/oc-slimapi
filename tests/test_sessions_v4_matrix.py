@@ -1,13 +1,23 @@
-"""v4 sessions 降级矩阵全量测试（B3a-B4；v4-contract §4.2 / §11.3）。
+"""v4 sessions 降级矩阵全量测试（B3a-B4 + rev gate R1；v4-contract §4.2 / §11.3）。
 
-72 等价类（req 12 = archived×parent × db 3 × al 2）基线 + cursor 正交
-×2 + search 轴 + 优先级真值表 + v3 回归面。db 态注入：avail = fixture
-DB 上的真实 ``DbAuxiliarySource``；disabled/tripped = ``_StubAux``
-（status 不可用 + query 抛 ``AuxiliaryUnavailableError``——真实状态机的
-路由可见面）。行集 oracle = ``v4_fixture.mirror_page``（S-B03 镜像）。
+- **144 等价类**（rev gate MAJOR-2：req 12 = archived×parent × db 3 ×
+  al 2 × cursor {absent, present}）——期望值来自**独立手推判定函数**
+  ``_expect_v4_outcome``（§4.2 formula 逐条手写，不调用生产降级逻辑、
+  不复制其分支实现）；行集 oracle = ``v4_fixture.mirror_page``（S-B03
+  镜像）。
+- db 态注入：avail = fixture DB 上的真实 ``DbAuxiliarySource``；
+  disabled/tripped = ``_StubAux``；busy = ``_BusyAux``（rev gate
+  BLOCKER-1：查询期 sqlite 异常 → 503 不泄 SQLite 细节）。
+- rev gate BLOCKER-3：坏行窗口锚点（items=[] 仍可 cursor 前进）。
+- rev gate R2 接口：``request.state`` 降级标记（source=db/http、
+  degraded_503）断言。
 """
 
 from __future__ import annotations
+
+import base64
+import json
+import sqlite3
 
 import httpx
 import orjson
@@ -16,6 +26,7 @@ from fastapi import FastAPI
 
 from oc_slimapi.config import Settings
 from oc_slimapi.dbaux import AuxiliaryUnavailableError, DbAuxiliarySource
+from oc_slimapi.dbaux.cursor import allowlist_rev, encode_cursor
 from oc_slimapi.dbaux.lifecycle import DbAuxStatus
 from oc_slimapi.dbaux.path_resolution import ResolvedPath
 from oc_slimapi.errors import register_error_handlers
@@ -24,7 +35,7 @@ from oc_slimapi.routes import health, sessions, versions
 from oc_slimapi.selector import SlimapiSelectorMiddleware
 from oc_slimapi.transform import TransformConfig, TransformPool
 
-from v4_fixture import build_fixture_db, mirror_page
+from v4_fixture import DATASET, FIXED_NOW_MS, build_fixture_db, mirror_page
 
 IDENTITY = {"Accept-Encoding": "identity"}
 V3 = {"v": "3"}
@@ -126,27 +137,61 @@ REQ_CASES = [
 ]
 DB_STATES = ("avail", "disabled", "tripped")
 AL_STATES = ("unset", "nonempty")
+CURSOR_STATES = ("absent", "present")
 
 MATRIX_IDS = [
-    f"{arch}-{parent}-{db}-{al}"
+    f"{arch}-{parent}-{db}-{al}-{cur}"
     for arch, parent in REQ_CASES
     for db in DB_STATES
     for al in AL_STATES
+    for cur in CURSOR_STATES
 ]
 
 
-def _is_class_a(archived: str, parent: str) -> bool:
-    return archived in ("omit", "all") and parent in ("all", "none")
+def _mint_valid_cursor(arch: str, parent: str, al_entries: tuple[str, ...]) -> str:
+    """铸合法 cursor（wire 输入构造——用编码器，而非期望判定）。"""
+    return encode_cursor(8000, "ses_tie_c", {
+        "archived": arch, "parent": parent,
+        "search_hash": "",  # 矩阵 search 轴缺席
+        "allowlist_rev": allowlist_rev(al_entries) if al_entries else "",
+    })
+
+
+def _expect_v4_outcome(
+    arch: str, parent: str, db_state: str, al_state: str, cursor_state: str,
+) -> str:
+    """**独立期望判定**（rev gate MAJOR-2；S-B03 纪律）。
+
+    §4.2 formula 手推真值表（本函数独立于 ``routes/sessions.py`` 的降级
+    实现逐条重写，二者零共享代码；漂移时测试红即定位分歧）：
+
+    1. db 可用 → 200 DB 投影（全过滤 SQL，cursor 为 keyset 同窗）；
+    2. db 不可用：
+       a. allowlist 非空 → 503（白名单子集性不可由上游保证）；
+       b. cursor 在场 → 503（上游无 (t,i) keyset 等价物）；
+       c. Class A（archived∈{omit,all} × parent∈{all,none}）→
+          200 HTTP 降级 + degraded:true；
+       d. 其余（Class B）→ 503。
+    """
+    if db_state == "avail":
+        return "db_200"
+    if al_state == "nonempty":
+        return "s503"
+    if cursor_state == "present":
+        return "s503"
+    if arch in ("omit", "all") and parent in ("all", "none"):
+        return "http_200_degraded"
+    return "s503"
 
 
 # ---------------------------------------------------------------------------
-# §11.3 72 等价类基线（cursor 缺席）
+# §11.3 144 等价类（MAJOR-2：cursor 状态轴入矩阵，逐格独立期望）
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("matrix_id", MATRIX_IDS)
-async def test_matrix_72_baseline(tmp_path_factory, matrix_id):
-    arch, parent, db_state, al_state = matrix_id.rsplit("-", 3)
+async def test_matrix_144_degradation_cells(tmp_path_factory, matrix_id):
+    arch, parent, db_state, al_state, cursor_state = matrix_id.rsplit("-", 4)
     aux = await _aux_for(db_state, tmp_path_factory)
     settings = _settings(
         directory_allowlist=None if al_state == "unset" else list(AL_NONEMPTY),
@@ -155,28 +200,31 @@ async def test_matrix_72_baseline(tmp_path_factory, matrix_id):
     try:
         async with _client(app) as client:
             params = {"v": "4", "archived": arch, "parent": parent}
+            al_entries = () if al_state == "unset" else AL_NONEMPTY
+            if cursor_state == "present":
+                params["cursor"] = _mint_valid_cursor(arch, parent, al_entries)
             resp = await client.get("/slimapi/sessions",
                                     params=params, headers=IDENTITY)
-        al_entries = () if al_state == "unset" else AL_NONEMPTY
-        if db_state == "avail":
+        expected = _expect_v4_outcome(arch, parent, db_state, al_state,
+                                      cursor_state)
+        if expected == "db_200":
             assert resp.status_code == 200, resp.text
             body = resp.json()
             assert "degraded" not in body
-            expected, _ = mirror_page(archived=arch, parent=parent,
-                                      allowlist=al_entries, limit=100)
+            cursor_arg = (8000, "ses_tie_c") if cursor_state == "present" else None
+            exp_records, _ = mirror_page(
+                archived=arch, parent=parent, allowlist=al_entries,
+                cursor=cursor_arg, limit=100)
             assert [item["id"] for item in body["items"]] == \
-                [r["id"] for r in expected]
-        elif al_state == "nonempty":
-            assert resp.status_code == 503
-            _assert_aux_unavailable(resp)
-        elif _is_class_a(arch, parent):
+                [r["id"] for r in exp_records]
+        elif expected == "http_200_degraded":
             assert resp.status_code == 200, resp.text
             body = resp.json()
             assert body.get("degraded") is True
             assert [item["id"] for item in body["items"]] == ["h1", "h2"]
             assert seen, "degraded path must hit upstream"
-        else:
-            assert resp.status_code == 503
+        else:  # s503
+            assert resp.status_code == 503, resp.text
             _assert_aux_unavailable(resp)
     finally:
         if isinstance(aux, DbAuxiliarySource):
@@ -587,3 +635,267 @@ async def test_v4_degraded_items_projection_shape():
     assert item["tokens_input"] == 9 and item["tokens_output"] == 8
     assert item["tokens_cache_read"] == 1 and item["tokens_cache_write"] == 2
     assert item["time"] == {"created": 1, "updated": 2}
+
+
+# ---------------------------------------------------------------------------
+# rev gate BLOCKER-1：busy 族 sqlite 异常 → 路由边界 503（不泄 SQLite 细节）
+# ---------------------------------------------------------------------------
+
+
+class _BusyAux:
+    """db 可用面 + query 抛 busy（lifecycle busy 分类原样上抛的路由可见形态）。"""
+
+    def status(self) -> DbAuxStatus:
+        return DbAuxStatus(available=True, mode="db", reason=None)
+
+    async def query(self, sql, params=()):  # pragma: no cover - raise only
+        raise sqlite3.OperationalError("database is locked")
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        sqlite3.OperationalError("database is locked"),
+        sqlite3.OperationalError("database table is locked"),
+        sqlite3.DatabaseError("file is not a database"),
+    ],
+)
+async def test_busy_sqlite_error_maps_to_503_without_leak(exc):
+    app, seen = _build_app(_BusyAux())
+    async with _client(app) as client:
+        resp = await client.get("/slimapi/sessions",
+                                params={"v": "4"}, headers=IDENTITY)
+    assert resp.status_code == 503
+    assert resp.headers.get("Retry-After") == "30"
+    body = resp.json()
+    assert body["code"] == "auxiliary_unavailable"
+    text = resp.text.lower()
+    for leak in ("sqlite", "locked", "database error", "operationalerror",
+                 "not a database"):
+        assert leak not in text, leak
+    assert not seen
+
+
+# ---------------------------------------------------------------------------
+# rev gate BLOCKER-2：空 i cursor 优先级（400 先于 503）
+# ---------------------------------------------------------------------------
+
+
+def _raw_cursor(doc: dict) -> str:
+    blob = json.dumps(doc).encode("utf-8")
+    return base64.urlsafe_b64encode(blob).decode("ascii").rstrip("=")
+
+
+async def test_empty_anchor_cursor_400_beats_db_unavailable():
+    # 结构合法 + 指纹合法，仅 i=""：解码层拒绝 → 400（先于 503）
+    app, seen = _build_app(_StubAux("disabled"))
+    async with _client(app) as client:
+        resp = await client.get("/slimapi/sessions", params={
+            "v": "4",
+            "cursor": _raw_cursor({
+                "t": 8000, "i": "",
+                "f": {"archived": "omit", "parent": "all",
+                      "search_hash": "", "allowlist_rev": ""},
+            }),
+        }, headers=IDENTITY)
+    assert resp.status_code == 400
+    assert resp.json()["code"] == "invalid_cursor"
+    assert not seen
+
+
+async def test_empty_anchor_cursor_400_db_avail_too(tmp_path):
+    aux = await _real_aux(tmp_path)
+    app, _ = _build_app(aux)
+    try:
+        async with _client(app) as client:
+            resp = await client.get("/slimapi/sessions", params={
+                "v": "4",
+                "cursor": _raw_cursor({
+                    "t": 8000, "i": "",
+                    "f": {"archived": "omit", "parent": "all",
+                          "search_hash": "", "allowlist_rev": ""},
+                }),
+            }, headers=IDENTITY)
+        assert resp.status_code == 400
+        assert resp.json()["code"] == "invalid_cursor"
+    finally:
+        await aux.stop()
+
+
+# ---------------------------------------------------------------------------
+# rev gate BLOCKER-3：坏行窗口锚点（items 可空仍可前进）
+# ---------------------------------------------------------------------------
+
+
+def _rows_with_bad_head(bad_count: int) -> list[dict]:
+    """在数据集顶部插入 bad_count 行坏 JSON（time_updated 递减占据窗口头）。
+
+    坏行时间戳必须高于 ``FIXED_NOW_MS``（数据集最大合法时间），否则
+    排不到窗口头。
+    """
+    base = dict(DATASET[0])
+    rows: list[dict] = []
+    for k in range(bad_count):
+        row = dict(base)
+        row.update(
+            id=f"zz_bad_{k:02d}",
+            title=f"broken {k}",
+            time_created=FIXED_NOW_MS + 10_000 + k,
+            time_updated=_BAD_BASE - k,
+            summary_diffs="not-json{",
+        )
+        rows.append(row)
+    return rows + list(DATASET)
+
+
+_BAD_BASE = FIXED_NOW_MS + 100_000  # 坏行时间基线（高于数据集全部合法行）
+
+
+async def _start_aux_on_rows(tmp_path, rows):
+    db = build_fixture_db(tmp_path / "bad.db", session_rows=rows)
+    source = DbAuxiliarySource(ResolvedPath(path=str(db), source="explicit-env"))
+    status = await source.start()
+    assert status.available
+    return source
+
+
+async def test_all_bad_window_items_empty_but_cursor_advances(tmp_path):
+    """整窗口全坏 JSON → items=[] + nextCursor 非空 + complete:false。"""
+    rows = _rows_with_bad_head(3)
+    aux = await _start_aux_on_rows(tmp_path, rows)
+    app, _ = _build_app(aux)
+    try:
+        async with _client(app) as client:
+            resp = await client.get("/slimapi/sessions", params={
+                "v": "4", "limit": "3"}, headers=IDENTITY)
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["items"] == []
+        assert body["complete"] is False
+        assert body["nextCursor"], "坏行不丢锚点——必须可前进"
+        # 下一页到达合法行（期望 = 镜像 oracle 同 cursor 同窗）
+        anchor = (_BAD_BASE - 2, "zz_bad_02")
+        async with _client(app) as client:
+            nxt = await client.get("/slimapi/sessions", params={
+                "v": "4", "limit": "3", "cursor": body["nextCursor"],
+            }, headers=IDENTITY)
+        assert nxt.status_code == 200
+        nxt_body = nxt.json()
+        expected, _ = mirror_page(archived="omit", parent="all", limit=3,
+                                  cursor=anchor, session_rows=rows)
+        assert [i["id"] for i in nxt_body["items"]] == [r["id"] for r in expected]
+    finally:
+        await aux.stop()
+
+
+async def test_multi_page_bad_rows_reach_legal_and_complete(tmp_path):
+    """连续多页坏行最终到达合法行 / complete:true；拼接 ≡ 镜像全量。"""
+    rows = _rows_with_bad_head(5)
+    aux = await _start_aux_on_rows(tmp_path, rows)
+    app, _ = _build_app(aux)
+    try:
+        ids: list[str] = []
+        cursor: str | None = None
+        for _ in range(30):  # 上限防死循环（卡死回归即红）
+            async with _client(app) as client:
+                params = {"v": "4", "limit": "2"}
+                if cursor:
+                    params["cursor"] = cursor
+                resp = await client.get("/slimapi/sessions", params=params,
+                                        headers=IDENTITY)
+            assert resp.status_code == 200
+            body = resp.json()
+            ids.extend(i["id"] for i in body["items"])
+            cursor = body["nextCursor"]
+            if body["complete"]:
+                break
+        else:
+            pytest.fail("分页未收敛（BLOCKER-3 回归：卡死在坏行窗口）")
+        expected, _ = mirror_page(archived="omit", parent="all", limit=100,
+                                  session_rows=rows)
+        assert ids == [r["id"] for r in expected]
+    finally:
+        await aux.stop()
+
+
+async def test_first_window_no_visible_items_still_cursored(tmp_path):
+    """首窗口可见 items 为空（limit=1 且顶行坏）仍产出 nextCursor。"""
+    aux = await _start_aux_on_rows(tmp_path, _rows_with_bad_head(1))
+    app, _ = _build_app(aux)
+    try:
+        async with _client(app) as client:
+            resp = await client.get("/slimapi/sessions", params={
+                "v": "4", "limit": "1"}, headers=IDENTITY)
+        body = resp.json()
+        assert body["items"] == []
+        assert body["nextCursor"] is not None
+    finally:
+        await aux.stop()
+
+
+# ---------------------------------------------------------------------------
+# rev gate R2 观测接口：request.state 降级标记
+# ---------------------------------------------------------------------------
+
+
+def _state_capturing(app, sink: list[dict]):
+    """外层 ASGI 包装：请求完成后快照 scope["state"]（标记写入可见）。"""
+    async def wrapped(scope, receive, send):
+        await app(scope, receive, send)
+        if scope["type"] == "http":
+            sink.append(dict(scope.get("state") or {}))
+    return wrapped
+
+
+async def test_marker_db_200_source_db(tmp_path):
+    aux = await _real_aux(tmp_path)
+    app, _ = _build_app(aux)
+    sink: list[dict] = []
+    try:
+        async with _client(_state_capturing(app, sink)) as client:
+            resp = await client.get("/slimapi/sessions",
+                                    params={"v": "4"}, headers=IDENTITY)
+        assert resp.status_code == 200
+        state = sink[-1]
+        assert state.get("slimapi_sessions_source") == "db"
+        assert "slimapi_degraded_503" not in state
+    finally:
+        await aux.stop()
+
+
+async def test_marker_class_a_http_source():
+    app, _ = _build_app(_StubAux("disabled"))
+    sink: list[dict] = []
+    async with _client(_state_capturing(app, sink)) as client:
+        resp = await client.get("/slimapi/sessions",
+                                params={"v": "4"}, headers=IDENTITY)
+    assert resp.status_code == 200
+    assert resp.json()["degraded"] is True
+    state = sink[-1]
+    assert state.get("slimapi_sessions_source") == "http"
+    assert "slimapi_degraded_503" not in state
+
+
+async def test_marker_503_degraded_flag():
+    # Class B（archived=only）× db 不可用 → 503 fail-closed 标记
+    app, _ = _build_app(_StubAux("circuit_open"))
+    sink: list[dict] = []
+    async with _client(_state_capturing(app, sink)) as client:
+        resp = await client.get("/slimapi/sessions", params={
+            "v": "4", "archived": "only"}, headers=IDENTITY)
+    assert resp.status_code == 503
+    state = sink[-1]
+    assert state.get("slimapi_degraded_503") is True
+    assert "slimapi_sessions_source" not in state
+
+
+async def test_marker_v3_path_fields_absent():
+    app, _ = _build_app(_StubAux("disabled"))
+    sink: list[dict] = []
+    async with _client(_state_capturing(app, sink)) as client:
+        resp = await client.get("/slimapi/sessions",
+                                params={"v": "3"}, headers=IDENTITY)
+    assert resp.status_code == 200
+    state = sink[-1]
+    assert "slimapi_sessions_source" not in state
+    assert "slimapi_degraded_503" not in state

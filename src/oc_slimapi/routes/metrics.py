@@ -12,6 +12,7 @@ The version selector (``?v=3`` terminal) already covers every
 from fastapi import APIRouter, Request
 
 from ..gzip_util import json_response
+from ..traffic import SESSIONS_DEGRADED_STATE_ATTR
 
 router = APIRouter(prefix="/slimapi", tags=["metrics"])
 
@@ -66,6 +67,21 @@ async def metrics(request: Request):
             "breaker_open": breaker["open"],
             "counters": snap["counters"],
         }
+    # v4 sessions degraded per-response counters (v4-contract §9.1, rev-gate
+    # BLOCKER-4): distinct from the dbaux state-machine event counters above
+    # — one disable/trip can serve any number of degraded responses, so the
+    # operator-facing truth is counted per response by the traffic
+    # middleware. Zero-knowledge additive: the block appears only once the
+    # middleware has mounted the counters on app.state (any first request
+    # through the stack does); absent on a freshly-booted app, matching the
+    # dbaux/traffic/sweep convention. The metrics handler runs before the
+    # middleware records the current request, so a first-ever GET /slimapi
+    # metrics sees the pre-mount state (no block) — stable either way.
+    degraded_counters = getattr(
+        request.app.state, SESSIONS_DEGRADED_STATE_ATTR, None
+    )
+    if degraded_counters is not None:
+        hubs_snapshot["sessionsDegraded"] = degraded_counters.snapshot()
     return json_response(
         hubs_snapshot,
         accept_encoding=request.headers.get("accept-encoding"),

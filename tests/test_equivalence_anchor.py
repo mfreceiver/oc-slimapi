@@ -305,17 +305,27 @@ def test_golden_in_repo_file_is_current():
     assert ok, reason
 
 
-# --- EQ-007 真实进程（skip-if-no-server 框架；发布门完整版） --------------
+# --- EQ-007 真实进程：数据集注入全量对照框架（发布门；CI 无 bun 跳过） ------
 
-_EQ_UPSTREAM = os.environ.get("OC_SLIMAPI_EQ_UPSTREAM")
+_EQ_UPSTREAM = os.environ.get("OC_SLIMAPI_EQ_UPSTREAM", "").rstrip("/")
+_EQ_DB = os.environ.get("OC_SLIMAPI_EQ_DB", "").strip()
+_EQ_SKIP_REASON = (
+    "需上游进程（bun 构建），本机不可用——设 OC_SLIMAPI_EQ_UPSTREAM="
+    "<base_url> 启用（可选 OC_SLIMAPI_EQ_DB=<进程 SQLite 路径> 走发布门"
+    " DB 投影对照）"
+)
+
+# 可注入子集：上游 Location.Ref 的 directory 是 AbsolutePath——空串
+# （legacy 空 directory 维度）不可注入，该维度由 golden/EQ-001..006 锚定。
+_EQ_INJECTABLE = [row for row in DATASET if row.get("directory")]
+_EQ_INJECTABLE_IDS = {row["id"] for row in _EQ_INJECTABLE}
 
 
 def _real_server_available() -> tuple[bool, str]:
     if not _EQ_UPSTREAM:
-        return False, "OC_SLIMAPI_EQ_UPSTREAM 未设置（真实进程框架未启用）"
+        return False, _EQ_SKIP_REASON
     try:
-        response = httpx.get(f"{_EQ_UPSTREAM}/experimental/session?limit=1",
-                             timeout=1.0)
+        response = httpx.get(f"{_EQ_UPSTREAM}/session?limit=1", timeout=2.0)
     except httpx.HTTPError as exc:
         return False, f"上游不可达：{exc}"
     if response.status_code != 200:
@@ -323,25 +333,159 @@ def _real_server_available() -> tuple[bool, str]:
     return True, ""
 
 
-@pytest.mark.skipif(not _EQ_UPSTREAM, reason="OC_SLIMAPI_EQ_UPSTREAM 未设置")
-def test_eq007_real_process_framework():
-    """真实 opencode 进程对照（发布门）。
+def _eq_inject_dataset(client: httpx.Client) -> None:
+    """经上游 API 注入 fixture 数据集（幂等：已存在则跳过创建）。
 
-    CI 框架版：进程可达时校验 schema 权威面（/experimental/session 200 +
-    行字段存在性）。**数据集注入的行集全量对照**属发布门完整版（拉起
-    opencode + 指向 fixture DB），超出 CI 范围——框架就位，发布时补全。
+    - ``POST /session``：``{id, location: {directory}}``（v1.18.18
+      CreateInput 尊重 passthrough id）；
+    - ``PATCH /session/:id``：``{title}`` 与 ``{time: {archived}}``。
+    - parent_id 上游 create 不收——父子维度对照属 golden/EQ-003 面。
+    """
+    for row in _EQ_INJECTABLE:
+        response = client.post(
+            "/session",
+            json={"id": row["id"],
+                  "location": {"directory": row["directory"]}},
+        )
+        if response.status_code >= 400:
+            # 幂等：已存在（重复运行）→ get 验证；真失败 → 断言失败。
+            probe = client.get(f"/session/{row['id']}")
+            assert probe.status_code == 200, (
+                f"注入 {row['id']} 失败：create={response.status_code} "
+                f"{response.text[:200]}; get={probe.status_code}"
+            )
+    for row in _EQ_INJECTABLE:
+        if row.get("title"):
+            response = client.patch(
+                f"/session/{row['id']}", json={"title": row["title"]})
+            assert response.status_code < 400, (
+                f"title 注入失败 {row['id']}：{response.status_code} "
+                f"{response.text[:200]}"
+            )
+        if row.get("time_archived") is not None:
+            response = client.patch(
+                f"/session/{row['id']}",
+                json={"time": {"archived": row["time_archived"]}})
+            assert response.status_code < 400, (
+                f"archived 注入失败 {row['id']}：{response.status_code} "
+                f"{response.text[:200]}"
+            )
+
+
+def _eq_upstream_sessions(client: httpx.Client) -> list[dict]:
+    """上游全量列表中属于注入集的行（上游 list 不过滤 archived——
+    v1.18.18 session.ts list() 无 time_archived 谓词）。"""
+    response = client.get("/session", params={"limit": 1000})
+    assert response.status_code == 200, response.text[:200]
+    payload = response.json()
+    assert isinstance(payload, list)
+    return [s for s in payload if s.get("id") in _EQ_INJECTABLE_IDS]
+
+
+def _eq_v4_order(items: list[dict]) -> list[dict]:
+    """本测试内独立重写的 v4 冻结排序（不 import 生产/镜像任何排序）：
+    ``(time.updated, id)`` DESC。"""
+    return sorted(
+        items,
+        key=lambda s: (s["time"]["updated"], s["id"]),
+        reverse=True,
+    )
+
+
+@pytest.mark.skipif(not _EQ_UPSTREAM, reason=_EQ_SKIP_REASON)
+def test_eq007_real_process_dataset_equivalence():
+    """真实 opencode 进程 × 数据集注入全量对照（发布门，rev gate 升级版）。
+
+    对照面（三轴 + 可选第四轴）：
+
+    1. **行集**：注入集 id ⇔ 上游返回 id 逐一双射；
+    2. **逐字段**：id / directory / title / time.archived 置性一致；
+    3. **排序/分页**：以**上游真实数据**（time.updated 取自上游响应）过
+       本文件独立重写的 (time_updated, id) DESC 比较器——窗口切分自洽
+       （每窗与锚点 keyset 关系成立），并验证上游自身返回序与其
+       (time_created, id) DESC 实现一致（交叉校验读到的数据是活的）；
+    4.（可选，发布门完整对照）``OC_SLIMAPI_EQ_DB`` 指向该进程的 SQLite
+       时：sidecar ``fetch_sessions_page`` 直读该库 → 行集/序与上游响应
+       全量对照（archived=omit 面）。
     """
     available, reason = _real_server_available()
     if not available:
         pytest.skip(reason)
-    response = httpx.get(f"{_EQ_UPSTREAM}/experimental/session?limit=5",
-                         timeout=2.0)
-    assert response.status_code == 200
-    payload = response.json()
-    items = payload if isinstance(payload, list) else payload.get("sessions", [])
-    assert isinstance(items, list)
-    for item in items:
-        assert "id" in item and "title" in item
+    with httpx.Client(base_url=_EQ_UPSTREAM, timeout=15.0) as client:
+        _eq_inject_dataset(client)
+        upstream_rows = _eq_upstream_sessions(client)
+
+    # 1) 行集双射
+    got_ids = {s["id"] for s in upstream_rows}
+    assert got_ids == _EQ_INJECTABLE_IDS, (
+        f"行集漂移：缺失 {sorted(_EQ_INJECTABLE_IDS - got_ids)} / "
+        f"多出 {sorted(got_ids - _EQ_INJECTABLE_IDS)}"
+    )
+
+    # 2) 逐字段（title / directory / archived 置性）
+    by_id = {s["id"]: s for s in upstream_rows}
+    for row in _EQ_INJECTABLE:
+        item = by_id[row["id"]]
+        assert item.get("directory") == row["directory"], row["id"]
+        if row.get("title"):
+            assert item.get("title") == row["title"], row["id"]
+        archived_up = (item.get("time") or {}).get("archived")
+        if row.get("time_archived") is not None:
+            assert archived_up is not None, row["id"]
+        else:
+            assert archived_up is None, row["id"]
+
+    # 3) 排序 / 分页（独立比较器 + 上游真实时间数据）
+    ordered = _eq_v4_order(upstream_rows)
+    for prev, nxt in zip(ordered, ordered[1:]):
+        key_prev = (prev["time"]["updated"], prev["id"])
+        key_next = (nxt["time"]["updated"], nxt["id"])
+        assert key_prev > key_next, f"v4 冻结序被违反：{key_prev} ≤ {key_next}"
+    # 上游自身序一致性（time_created, id) DESC——交叉证明时间数据是活的
+    for prev, nxt in zip(upstream_rows, upstream_rows[1:]):
+        key_prev = (prev["time"]["created"], prev["id"])
+        key_next = (nxt["time"]["created"], nxt["id"])
+        assert key_prev >= key_next, (
+            f"上游返回序与其 (time_created, id) DESC 实现不一致："
+            f"{key_prev} < {key_next}"
+        )
+    # 窗口切分自洽：任意 limit 窗 + 下一窗锚点 = keyset 谓词成立
+    for limit in (1, 3, 7):
+        for start in range(0, min(len(ordered), 12), limit):
+            window = ordered[start:start + limit]
+            rest = ordered[start + limit:start + limit + limit]
+            if not window or not rest:
+                continue
+            anchor = (window[-1]["time"]["updated"], window[-1]["id"])
+            for item in rest:
+                assert (item["time"]["updated"], item["id"]) < anchor, (
+                    f"keyset 违反：anchor={anchor} item={item['id']}"
+                )
+
+    # 4)（可选）发布门 DB 投影对照
+    if not _EQ_DB:
+        return
+
+    async def _db_side() -> list[str]:
+        source = DbAuxiliarySource(
+            ResolvedPath(path=_EQ_DB, source="explicit-env"))
+        status = await source.start()
+        try:
+            assert status.available, f"真库辅助源不可用：{status.reason}"
+            page = await fetch_sessions_page(
+                source, archived="omit", parent="all", limit=1000)
+            return [r["id"] for r in page.records]
+        finally:
+            await source.stop()
+
+    import asyncio
+
+    db_ids = asyncio.run(_db_side())
+    expected_db = [
+        s["id"] for s in ordered
+        if (s.get("time") or {}).get("archived") is None
+    ]
+    assert db_ids == expected_db, "DB 投影行集/序与上游响应漂移"
 
 
 # --- EQ-008 schema 漂移哨兵 ------------------------------------------------

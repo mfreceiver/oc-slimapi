@@ -74,7 +74,9 @@ _VALID_F = '{"archived":"omit","parent":"all","search_hash":"","allowlist_rev":"
         (10**18, "ses_huge_t"),  # 极端 t
         (1755000000000, "ses_%_\\_like_specials"),  # LIKE 通配/转义字符
         (1755000000000, "ses_ünïcödé_会话"),  # unicode（ensure_ascii 转义后仍是 ASCII cursor）
-        (1755000000000, ""),  # 空 id（形态合法即解码——业务校验归 B4）
+        # (1755000000000, "") 已移除：rev gate BLOCKER-2 后空 i 是解码层
+        # 语法拒绝（invalid_cursor），不再可往返——见
+        # test_empty_anchor_rejected（本轮新增）。
     ],
 )
 def test_roundtrip_param_combinations(t: int, i: str) -> None:
@@ -204,6 +206,43 @@ def test_wrong_i_and_f_value_types_raise() -> None:
                 ' "f": {"archived": 1, "parent": "all", "search_hash": "", "allowlist_rev": ""}}'
             )
         )
+
+
+# ---------------------------------------------------------------------------
+# rev gate BLOCKER-2：空 i 锚点拒绝（语法域） + 不过度防御边界
+# ---------------------------------------------------------------------------
+
+
+def test_empty_anchor_rejected() -> None:
+    """``i=""`` 是空 keyset 锚点——解码层拒绝（曾逃逸为 500，DB 构造层补救太晚）。"""
+    with pytest.raises(InvalidCursorError) as ei:
+        decode_cursor(_mint(f'{{"t": 1755000000000, "i": "", "f": {_VALID_F}}}'))
+    assert "empty_anchor" in str(ei.value)
+
+
+def test_empty_anchor_rejected_via_encode_roundtrip_shape() -> None:
+    """编码层永远不会产出空 i cursor（encode_cursor 是唯一合法铸造点）。"""
+    # encode_cursor 不做值域校验（纯铸造），但路由只传 page.anchor
+    # （_window_anchor 保证非空 sid）；空 i 只能来自伪造 wire 输入。
+    raw = _mint(f'{{"t": 1, "i": "", "f": {_VALID_F}}}')
+    assert raw is not None
+    with pytest.raises(InvalidCursorError):
+        decode_cursor(raw)
+
+
+@pytest.mark.parametrize(
+    "i",
+    [
+        "ses_" + "x" * 4096,  # 超长但结构合法
+        "ses_\t\n\x00ctrl",  # 控制字符（合法行 id 形态——不过度防御）
+        "ses_ünïcödé_会话",  # unicode
+    ],
+)
+def test_odd_but_structurally_legal_ids_decode(i: str) -> None:
+    """结构合法即解码——值域防御归路由/DB 层（评审：不过度防御）。"""
+    doc = f'{{"t": 1, "i": {json.dumps(i)}, "f": {_VALID_F}}}'
+    payload = decode_cursor(_mint(doc))
+    assert payload is not None and payload.i == i
 
 
 # ---------------------------------------------------------------------------

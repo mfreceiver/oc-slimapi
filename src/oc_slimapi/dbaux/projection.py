@@ -277,10 +277,37 @@ def rows_to_records(rows: Sequence[Sequence[Any]]) -> list[dict[str, Any]]:
 
 @dataclass(frozen=True)
 class SessionsPage:
-    """一页投影结果：records（≤ limit 行）+ complete（§9.2 LIMIT+1 窗口判定）。"""
+    """一页投影结果。
+
+    - ``records``（≤ limit 行，§8 容忍后）+ ``complete``（§9.2 LIMIT+1
+      窗口判定，原始行集口径——容忍跳行不放大 complete）；
+    - ``anchor``：**本窗口实际消费的最后一个原始行**的
+      ``(time_updated, id)``（rev gate BLOCKER-3）。坏行（JSON 解析失败
+      /缺 id）会从 ``records`` 消失但不丢锚点——nextCursor 用它编码，
+      下一页从其后继续，items 空也能前进（分页不死锁）。complete:true
+      或全窗无可锚行（病态：全窗 id/时间缺失）时为 ``None``。
+    """
 
     records: list[dict[str, Any]]
     complete: bool
+    anchor: tuple[int, str] | None = None
+
+
+def _window_anchor(rows: Sequence[Sequence[Any]], limit: int) -> tuple[int, str] | None:
+    """从前往后找窗口内最后一个可作 keyset 锚点的原始行。
+
+    锚点行必须同时具备 int ``time_updated`` 与非空 str ``id``（keyset
+    复合键的可比较性）；容忍行（坏 JSON）的 id/时间列通常完好——倒序
+    扫描优先取最后消费行，窗口内个别缺 id 行不阻断（取次末行等价，
+    下一页会重见该缺 id 行并被再次跳过，无重复输出）。
+    """
+    for row in reversed(rows[:limit]):
+        record = dict(zip(ROW_KEYS, row))
+        t, sid = record.get("time_updated"), record.get("id")
+        if (isinstance(t, int) and not isinstance(t, bool)
+                and isinstance(sid, str) and sid):
+            return (t, sid)
+    return None
 
 
 async def fetch_sessions_page(
@@ -296,7 +323,8 @@ async def fetch_sessions_page(
     """经 B1 ``query()`` 通道执行投影（同事务快照内完成投影 + complete 判定）。
 
     不可用（禁用/熔断）→ :class:`AuxiliaryUnavailableError` 上抛（B4 映射
-    503 auxiliary_unavailable）；busy 原样 sqlite3.Error（B4 §7 处理）。
+    503 auxiliary_unavailable）；busy 原样 sqlite3.Error（B4 §7 处理——
+    rev gate BLOCKER-1：路由边界统一转 503 fail-closed）。
     """
     query = build_sessions_query(
         archived=archived,
@@ -308,4 +336,8 @@ async def fetch_sessions_page(
     )
     rows = await source.query(query.sql, query.params)
     complete = len(rows) <= limit
-    return SessionsPage(records=rows_to_records(rows[:limit]), complete=complete)
+    return SessionsPage(
+        records=rows_to_records(rows[:limit]),
+        complete=complete,
+        anchor=_window_anchor(rows, limit),
+    )

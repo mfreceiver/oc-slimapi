@@ -110,6 +110,20 @@ def prune_old_snapshots(directory: Path, stem: str, retain_days: int, today: dat
 # with selector.SSE_RESULT_DIMS — the only two copies; grep-verified).
 _SSE_DIMS: tuple[str, ...] = ("v2", "v3", "v4", "absent", "not_applicable")
 
+# v4 sessions degraded kinds (v4-contract §9.1/§9.2, BLOCKER-4): "http" =
+# Class A degraded success (sessionsSource == "http"), "fail_closed" = the
+# degraded-503 marker. Must stay in sync with
+# TrafficLedger.record_sessions_degraded kind values (the only two copies).
+_DEGRADED_KINDS: tuple[str, ...] = ("http", "fail_closed")
+# Canonical seed keys for the per-day degraded maps — _full_dims-style
+# jq-friendly stability (A4 precedent): every day carries both frozen
+# shapes (kind × its only status class × the sessions bucket) even at zero,
+# so downstream series tools see stable key sets.
+_DEGRADED_SEED_KEYS: tuple[str, ...] = (
+    "degraded|http|2xx|sessions",
+    "degraded|fail_closed|5xx|sessions",
+)
+
 
 def _v3_row_key(row: dict) -> str:
     """Flat §9.2 matrix key for one access-log row."""
@@ -123,6 +137,31 @@ def _v3_row_key(row: dict) -> str:
         status_class,
         str(row.get("bucket") or "null"),
     ))
+
+
+def _degraded_row_key(row: dict) -> str | None:
+    """Flat v4 degraded-matrix key for one access-log row, or ``None``.
+
+    Mirrors :meth:`TrafficLedger.record_sessions_degraded` key construction
+    (``degraded|kind|statusClass|bucket``) from the SPARSE access-log fields:
+    ``sessionsSource == "http"`` → kind "http"; ``degraded503 is True`` →
+    kind "fail_closed". Rows without either marker (v3 paths, other routes,
+    non-degraded sessions responses) return ``None`` — old pre-upgrade rows
+    land here too (additive-fields contract).
+    """
+    source = row.get("sessionsSource")
+    if source == "http":
+        kind = "http"
+    elif row.get("degraded503") is True:
+        kind = "fail_closed"
+    else:
+        return None
+    status = row.get("status")
+    status_class = (
+        "none" if isinstance(status, bool) or not isinstance(status, int)
+        else f"{status // 100}xx"
+    )
+    return f"degraded|{kind}|{status_class}|{row.get('bucket') or 'null'}"
 
 
 def aggregate_v3_observability(records: list[dict]) -> dict:
@@ -153,6 +192,11 @@ def aggregate_v3_observability(records: list[dict]) -> dict:
       decrement ``sseActive`` (孤儿补记 close 校正; a mismatched close must
       not drain another live connection's slot).
     * ``sseLive[dim]``: end-of-window running stock.
+    * ``degradedCounts`` / ``degradedCountsByDate`` (v4 §9.1/§9.2): flat
+      ``degraded|kind|statusClass|bucket`` counts from the sparse row
+      markers (all days / per day). Per-day maps are seeded with the two
+      canonical keys at zero (``_DEGRADED_SEED_KEYS``, _full_dims-style
+      stability) so every day carries both kinds.
     """
     counts: dict[str, int] = {}
     counts_by_date: dict[str, dict[str, int]] = {}
@@ -162,6 +206,8 @@ def aggregate_v3_observability(records: list[dict]) -> dict:
     orphan: dict[str, dict[str, int]] = {}
     active: dict[str, int] = {}
     day_start_stock: dict[str, dict[str, int]] = {}
+    degraded_counts: dict[str, int] = {}
+    degraded_by_date: dict[str, dict[str, int]] = {}
     # §11.8 pairing state: per-dim set of open-but-not-yet-closed lifecycle
     # ids visible in the aggregation window.
     open_ids: dict[str, set[int]] = {}
@@ -187,9 +233,20 @@ def aggregate_v3_observability(records: list[dict]) -> dict:
             opens[date] = _full_dims({})
             matched[date] = _full_dims({})
             orphan[date] = _full_dims({})
+            # _full_dims-style seeding for the v4 degraded matrix: both
+            # canonical kinds present at zero even on all-clean days.
+            degraded_by_date[date] = {k: 0 for k in _DEGRADED_SEED_KEYS}
         key = _v3_row_key(row)
         counts[key] = counts.get(key, 0) + 1
         counts_by_date[date][key] = counts_by_date[date].get(key, 0) + 1
+        degraded_key = _degraded_row_key(row)
+        if degraded_key is not None:
+            degraded_counts[degraded_key] = (
+                degraded_counts.get(degraded_key, 0) + 1
+            )
+            degraded_by_date[date][degraded_key] = (
+                degraded_by_date[date].get(degraded_key, 0) + 1
+            )
 
         record_type = row.get("recordType") or "request"
         if record_type in ("sse_open", "sse_close"):
@@ -221,6 +278,11 @@ def aggregate_v3_observability(records: list[dict]) -> dict:
         "sseMatchedCloses": matched,
         "sseOrphanCloses": orphan,
         "sseLive": _full_dims(active),
+        # v4 §9.1/§9.2 (BLOCKER-4): degraded-path per-response counts from
+        # the sparse row markers. Additive keys — pre-upgrade aggregations
+        # simply lacked them.
+        "degradedCounts": degraded_counts,
+        "degradedCountsByDate": degraded_by_date,
     }
 
 
@@ -427,6 +489,11 @@ class TrafficSnapshotter:
             # observability (rate-limit / cache evaluation inputs). Additive
             # tail: legacy field names and order unchanged.
             "expand": snap.get("expand", {}),
+            # v4 §9.1/§9.2 (BLOCKER-4): degraded-path flat matrix rides the
+            # same-source snapshot for the identical reason — the daily JSONL
+            # is the only ≥RETAIN_DAYS carrier of the degraded per-response
+            # counts. Additive tail.
+            "v4": snap.get("v4", {"degradedMatrix": {}}),
         }
 
         # Derive the daily path from the SAME `now` so the ts field and the

@@ -58,8 +58,8 @@ _FINGERPRINT_KEYS = frozenset({"archived", "parent", "search_hash", "allowlist_r
 class InvalidCursorError(ValueError):
     """cursor 语法非法（§4.3 → 400 ``invalid_cursor``；优先于 503，§8.3）。
 
-    ``reason`` 为粗粒度诊断标签（charset/decode/json/shape/type），
-    进日志不进 wire 错误体（§4.2：错误体不泄露内部细节）。
+    ``reason`` 为粗粒度诊断标签（charset/decode/json/shape/type/
+    empty_anchor），进日志不进 wire 错误体（§4.2：错误体不泄露内部细节）。
     """
 
     def __init__(self, reason: str) -> None:
@@ -169,10 +169,14 @@ def decode_cursor(raw: str | None) -> CursorPayload | None:
       与其余 query 参数的 FastAPI 观测形态一致）；
     - 字母表外字符（含标准 base64 的 ``+`` ``/`` 与 padding ``=``）、
       非法 base64url 长度、非法 UTF-8、非法 JSON、顶层非对象、键集
-      非 ``{t,i,f}``、f 子键集非全量四键、类型错（t 非 int、bool 亦拒）→
+      非 ``{t,i,f}``、f 子键集非全量四键、类型错（t 非 int、bool 亦拒）、
+      ``i`` 为空串（keyset 锚点必须有可比对的行 id——rev gate BLOCKER-2：
+      空锚点曾在 SQL 构造层才被拒，DB 可用时逃逸为 500；解码层是 wire
+      输入的第一道门，拒绝属语法域，非业务值域）→
       :class:`InvalidCursorError`；
-    - 结构与类型合法即成功（**不过度防御**：超长但合法的 cursor 正常
-      解码；业务值域校验归 B4）。
+    - 其余结构与类型合法即成功（**不过度防御**：超长但合法的 cursor、
+      含控制字符的 ``i`` 正常解码——它们是合法的行 id 形态；业务值域
+      校验归 B4）。
     """
     if raw is None or raw == "":
         return None
@@ -196,6 +200,11 @@ def decode_cursor(raw: str | None) -> CursorPayload | None:
         raise InvalidCursorError("type")
     if not isinstance(doc["i"], str) or not all(isinstance(v, str) for v in f.values()):
         raise InvalidCursorError("type")
+    if doc["i"] == "":
+        # BLOCKER-2：空 i = 空 keyset 锚点。SQL 构造层不补救 wire 输入
+        # （build_sessions_query 对空锚点 fail-fast），此处解码层统一拒绝
+        # → 400 invalid_cursor（优先于 503）。
+        raise InvalidCursorError("empty_anchor")
     return CursorPayload(t=doc["t"], i=doc["i"], f=CursorFingerprint(**f))
 
 

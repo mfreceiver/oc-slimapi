@@ -246,6 +246,21 @@ _UP_IN_KEY: Final[str] = "traffic_up_in"
 _UP_OUT_KEY: Final[str] = "traffic_up_out"
 _CACHE_KEY: Final[str] = "traffic_cache"
 
+# v4 sessions degraded-observability state markers (v4-contract §9.1/§9.2,
+# rev-gate BLOCKER-4). WRITTEN by the routes/sessions.py ``_sessions_v4``
+# handler (R1 lane) onto ``request.state`` — i.e. into ``scope["state"]``;
+# READ at request end by the traffic-accounting middleware (this module's
+# consumers). Single source of truth for the key spellings on both sides.
+#   * ``slimapi_sessions_source`` = "db" | "http": DB 200 → "db";
+#     Class A degraded 200 → "http"; v3 path / not written → attribute absent.
+#   * ``slimapi_degraded_503`` = True: written on 503 fail-closed only;
+#     absent = not a degraded 503.
+SESSIONS_SOURCE_STATE_KEY: Final[str] = "slimapi_sessions_source"
+DEGRADED_503_STATE_KEY: Final[str] = "slimapi_degraded_503"
+# Accepted ``sessionsSource`` value set (defensive: garbage state values are
+# ignored by the consumers rather than written to the access log).
+SESSIONS_SOURCE_VALUES: Final[frozenset[str]] = frozenset({"db", "http"})
+
 
 def stash_cache(request: Any, state_value: str | None) -> None:
     """Stash the catalog-cache outcome (``"hit"``/``"miss"``) for this request.
@@ -309,6 +324,99 @@ def _read_state_int(scope: dict, key: str) -> int:
     return value if isinstance(value, int) and value > 0 else 0
 
 
+def read_sessions_source(scope: dict) -> str | None:
+    """Read the R1 ``slimapi_sessions_source`` marker (validated).
+
+    Returns ``"db"`` | ``"http"`` or ``None`` (absent / non-string / outside
+    the accepted value set — garbage is ignored, never logged).
+    """
+    state = scope.get("state")
+    if not isinstance(state, dict):
+        return None
+    value = state.get(SESSIONS_SOURCE_STATE_KEY)
+    return value if value in SESSIONS_SOURCE_VALUES else None
+
+
+def read_degraded_503(scope: dict) -> bool:
+    """Read the R1 ``slimapi_degraded_503`` marker (strict ``is True``)."""
+    state = scope.get("state")
+    if not isinstance(state, dict):
+        return False
+    return state.get(DEGRADED_503_STATE_KEY) is True
+
+
+class SessionsDegradedCounters:
+    """Per-response v4 sessions degraded counters (v4-contract §9.1).
+
+    The review point these exist for: the dbaux ``disables``/``trips``
+    counters count **state-machine events** (one disable can serve an
+    arbitrary number of degraded responses), while an operator needs
+    **per-response** truth — three degraded 503s must read as 3, not 1.
+
+    * ``degraded_200``: responses served from the HTTP fallback
+      (``sessionsSource == "http"``, 2xx) — Class A degraded successes.
+    * ``fail_closed_503``: fail-closed degraded responses (the
+      ``degraded_503`` marker, 5xx).
+
+    Mounted lazily on ``app.state.sessions_degraded`` by
+    :func:`ensure_sessions_degraded_counters` (middleware writes, the
+    ``/slimapi/metrics`` route reads) — deliberately OUTSIDE the
+    TrafficLedger so degraded observability does not ride the
+    ``OC_SLIMAPI_TRAFFIC_METRICS_ENABLED`` switch. Thread-safe (lock) and
+    race-free under the single-event-loop model: the lazy get-then-set in
+    :func:`ensure_sessions_degraded_counters` is fully synchronous, so no
+    interleaving point exists on the loop.
+    """
+
+    __slots__ = ("_lock", "_degraded_200", "_fail_closed_503")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._degraded_200 = 0
+        self._fail_closed_503 = 0
+
+    def record_degraded_200(self) -> None:
+        with self._lock:
+            self._degraded_200 += 1
+
+    def record_fail_closed_503(self) -> None:
+        with self._lock:
+            self._fail_closed_503 += 1
+
+    def snapshot(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "degraded_200": self._degraded_200,
+                "fail_closed_503": self._fail_closed_503,
+            }
+
+
+# app.state attribute the counters live under.
+SESSIONS_DEGRADED_STATE_ATTR: Final[str] = "sessions_degraded"
+
+
+def ensure_sessions_degraded_counters(state: Any) -> SessionsDegradedCounters:
+    """Return the app-state degraded counters, creating them if absent.
+
+    Used by both the traffic middleware (write side) and the metrics route
+    (read side, so a freshly-booted app reports the zero state instead of
+    omitting the block). Synchronous get-then-set — no await between the
+    check and the assignment, so the single event loop cannot interleave a
+    second creator; a hypothetical loser instance is simply garbage-collected.
+    """
+    counters = getattr(state, SESSIONS_DEGRADED_STATE_ATTR, None)
+    if counters is None:
+        counters = SessionsDegradedCounters()
+        try:
+            setattr(state, SESSIONS_DEGRADED_STATE_ATTR, counters)
+        except Exception:
+            # Read-only / frozen state object: return the transient instance
+            # (best-effort — counts live only for this call). Never raise:
+            # observability must not break requests.
+            return counters
+    return counters
+
+
 class TrafficLedger:
     """Thread-safe bidirectional byte ledger.
 
@@ -326,6 +434,7 @@ class TrafficLedger:
         "_v3_matrix",   # flat "selectorResult|wireVersion|directoryForm|recordType|statusClass|bucket" -> count (v3 §9.2)
         "_v3_sse",      # sseActive dim -> {opens, closes, active, orphanCloses} (v3 §9.2)
         "_expand",      # "category|status" -> {requests, bytes} (design-expand §11 P4)
+        "_v4_degraded", # flat "degraded|kind|statusClass|bucket" -> count (v4 §9.2 degraded path)
     )
 
     def __init__(self, *, enabled: bool = True) -> None:
@@ -337,6 +446,7 @@ class TrafficLedger:
         self._v3_matrix: dict[str, int] = {}
         self._v3_sse: dict[str, dict[str, int]] = {}
         self._expand: dict[str, dict[str, int]] = {}
+        self._v4_degraded: dict[str, int] = {}
 
     @property
     def enabled(self) -> bool:
@@ -561,6 +671,39 @@ class TrafficLedger:
             entry["requests"] += 1
             entry["bytes"] += max(0, resp_bytes)
 
+    # ---- v4 sessions degraded observability (v4-contract §9.1/§9.2) ----
+
+    def record_sessions_degraded(self, *, kind: str, bucket: str, status: int) -> None:
+        """Count one degraded v4 sessions response into the flat matrix.
+
+        Key = ``degraded|kind|statusClass|bucket`` with ``kind``:
+
+        * ``"http"`` — Class A degraded success (served from the HTTP
+          fallback, ``sessionsSource == "http"``, 2xx).
+        * ``"fail_closed"`` — fail-closed degraded response (the
+          ``degraded_503`` marker, 5xx).
+
+        Per-RESPONSE truth (three degraded 503s → +3), deliberately distinct
+        from the dbaux ``disables``/``trips`` STATE-machine event counters
+        (one disable can produce any number of degraded responses — the
+        rev-gate BLOCKER-4 finding). Flat-key style mirrors
+        :meth:`record_selector_request` / :meth:`record_expand`; the value
+        set is bounded (2 kinds × status classes × the sessions bucket
+        family), so no whitelisting is needed. Cumulative since boot — the
+        per-day series is derived at analysis time from the access log
+        (``traffic_snapshot.aggregate_v3_observability`` degraded section).
+        """
+        if not self._enabled:
+            return
+        key = "|".join((
+            "degraded",
+            kind,
+            self._v3_status_class(status),
+            bucket,
+        ))
+        with self._lock:
+            self._v4_degraded[key] = self._v4_degraded.get(key, 0) + 1
+
     # ---- snapshot for /slimapi/metrics ----
 
     def snapshot(self) -> dict:
@@ -667,7 +810,7 @@ class TrafficLedger:
                 out_buckets[name] = view
                 if up_in > 0:
                     ratios[name] = {"downOutOverUpIn": down_out / up_in}
-            return {
+            out = {
                 "enabled": True,
                 "buckets": out_buckets,
                 "totals": totals,
@@ -691,3 +834,12 @@ class TrafficLedger:
                     key: dict(entry) for key, entry in self._expand.items()
                 },
             }
+            # v4 §9.1/§9.2 (rev-gate BLOCKER-4): degraded-path flat matrix —
+            # per-response counts keyed ``degraded|kind|statusClass|bucket``.
+            # Sparse like ``framesEmitted`` (emitted only when the bucket has
+            # SSE semantics): the key appears only after the first degraded
+            # response, keeping the additive zero-knowledge contract for
+            # existing exact-shape consumers (``set(traffic) == {...}``).
+            if self._v4_degraded:
+                out["v4"] = {"degradedMatrix": dict(self._v4_degraded)}
+            return out
