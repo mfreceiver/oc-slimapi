@@ -514,11 +514,19 @@ class ReplayLog:
         """Wholesale TTL maintenance across all domains.
 
         Evicts expired heads, then garbage-collects barriers whose window
-        lower bound has STRICTLY passed the watermark (entries[0].seq >
-        watermark → every cursor ≤ watermark now lands in replay_expired
-        anyway → the barrier is redundant). An EMPTY window keeps its
-        barrier (its lower bound is undefined, and cursor == watermark ==
-        last must stay intercepted). Returns the number of frames evicted.
+        lower bound has strictly passed the watermark's REACHABLE cursor
+        range (rev-gate R5 off-by-one fix): the GC condition is
+        ``entries[0].seq > watermark + 1``. Rationale: a cursor W
+        reconnect needs the barrier only if the replay window could
+        still serve it the "expected next" frame W+1 — i.e. when
+        ``entries[0].seq == W + 1`` the replay would start exactly at
+        the expected continuation and be judged a normal window replay,
+        silently crossing the barrier (v4-contract.md:205 violation).
+        Only when the oldest retained frame is ≥ W+2 does cursor W fall
+        into ``replay_expired`` on its own (missing W+1), making the
+        barrier genuinely redundant. An EMPTY window keeps its barrier
+        (its lower bound is undefined, and cursor == watermark == last
+        must stay intercepted). Returns the number of frames evicted.
         """
         if now is None:
             now = self._clock()
@@ -526,7 +534,7 @@ class ReplayLog:
         for state in self._domains.values():
             evicted += self._ttl_evict_head(state, now)
             if state.entries and state.barrier_watermark is not None:
-                if state.entries[0].seq > state.barrier_watermark:
+                if state.entries[0].seq > state.barrier_watermark + 1:
                     state.barrier_watermark = None
         return evicted
 

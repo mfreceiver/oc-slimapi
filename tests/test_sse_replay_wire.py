@@ -2037,6 +2037,63 @@ def test_v4_resync_reasons_frozen_literal_set():
     }
 
 
+async def test_r5_barrier_gc_boundary_wire_no_cross_barrier_replay():
+    """Judge condition 4 (wire level): idle writes barrier (wm=W=1), a
+    post-barrier frame lands (seq 2), the ring (max_count=1) evicts the
+    pre-barrier frame so window_start == wm+1, then sweep runs — the
+    cursor-W reconnect must still get ``reconnect_no_replay`` and must
+    NOT replay seq 2 (the pre-fix GC would have deleted the barrier at
+    this exact boundary and served the client a "seamless" continuation
+    across the invalidation — v4-contract.md:205 violation)."""
+    log = ReplayLog(epoch=EPOCH, max_count=1)
+    s = _RealStack(log=log)
+    try:
+        # leg 1 — delta seq 1 REALLY delivered to the wire.
+        async def leg1(sub, sid):
+            s.token_hub.on_part_updated(_text_start(sid, "m1", "p1"))
+            s.token_hub.on_part_delta(_delta(sid, "m1", "p1", "a"))
+            s.token_hub.flush()
+            sub.put(TOKEN_STOP)
+
+        s.token_registry.push_script(leg1)
+        _, body1 = await _read(s.app, f"/slimapi/sessions/{SID}/stream?v=4")
+        frames1 = list(_frames(body1))
+        _assert_v4_no_forbidden_frames(frames1)
+        assert frames1[1][1] == f"t:{SID}:{EPOCH}:1"  # consumed cursor W=1
+
+        # offline invalidation → barrier wm=1; post-barrier frame seq 2
+        # (ring cap 1 evicts seq 1 → window_start == wm+1).
+        assert not s.token_hub._subs_by_sid.get(SID)
+        s.token_hub.on_session_status(SID, "idle")
+        s.token_hub.on_part_updated(_text_start(SID, "m2", "p1"))
+        s.token_hub.on_part_delta(_delta(SID, "m2", "p1", "b"))
+        s.token_hub.flush()
+        assert log.barrier_watermark(token_domain(SID)) == 1
+        assert log.window_start(token_domain(SID)) == 2  # == wm + 1
+        assert log.domain_frame_count(token_domain(SID)) == 1
+
+        # sweep at the dangerous boundary — barrier MUST survive (R5).
+        log.sweep()
+        assert log.barrier_watermark(token_domain(SID)) == 1
+
+        # cursor W=1 reconnect: frozen resync, no seq-2 replay.
+        s.token_registry.push_script(_stop_token_stream)
+        _, body2 = await _read(
+            s.app, f"/slimapi/sessions/{SID}/stream?v=4",
+            headers={"Last-Event-ID": f"t:{SID}:{EPOCH}:1"},
+        )
+        frames2 = list(_frames(body2))
+        _assert_v4_no_forbidden_frames(frames2)
+        assert [f[0] for f in frames2] == ["slimapi.meta", "resync"]
+        assert frames2[1][2] == {
+            "reason": "reconnect_no_replay", "sessionID": SID,
+        }
+        # no business frame crept in — seq 2 was NOT replayed.
+        assert all(f[1] is None for f in frames2)
+    finally:
+        await s.close()
+
+
 # ===========================================================================
 # §4b — rev-gate BLOCKER-1: v4 握手旁路修复的 wire 证据
 # ===========================================================================

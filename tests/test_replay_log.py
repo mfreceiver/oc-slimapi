@@ -421,32 +421,35 @@ def test_barrier_survives_count_and_ttl_eviction():
 
 
 def test_barrier_gc_only_when_window_strictly_passed():
-    # 窗口下界严格越过水位（entries[0].seq > wm）→ barrier 冗余可删；
-    # 恰好相等（seq == wm）→ 保留（水位帧本身须拦截）。
+    # rev-gate R5 off-by-one 修正：GC 边界 = 窗口有效 cursor 下界严格超过
+    # watermark（entries[0].seq > wm + 1）。window_start == wm+1 时 cursor=wm
+    # 恰好能从期望的下一帧续读（正常 replay 判定），只有 barrier 在拦截
+    # ——绝不可删。window_start >= wm+2 时 cursor=wm 因缺 wm+1 自然落入
+    # replay_expired，barrier 才冗余可删。
     log, _ = _log()
     for _ in range(4):
         log.append(GLOBAL_DOMAIN, b"f")
     log.write_barrier()  # wm = 4
-    log.append(GLOBAL_DOMAIN, b"post")  # seq 5 → 严格越过成为可能
+    log.append(GLOBAL_DOMAIN, b"post")  # seq 5
     while log.window_start(GLOBAL_DOMAIN) <= 4:
         log._drop_head(log._domains[GLOBAL_DOMAIN])
-    assert log.window_start(GLOBAL_DOMAIN) == 5
+    assert log.window_start(GLOBAL_DOMAIN) == 5  # == wm + 1
+    log.sweep()
+    # 关键：恰为 wm+1 → 保留 barrier，cursor == watermark 必须被拦截为
+    # reconnect_no_replay（不得 replay seq 5 跨 barrier 续帧）。
+    assert log.barrier_watermark(GLOBAL_DOMAIN) == 4
+    _resync(log.replay(GLOBAL_DOMAIN, 4, _EPOCH), "reconnect_no_replay")
+
+    # window_start 达到 wm+2 → 允许删除；删除后 cursor=watermark 落入
+    # replay_expired（缺 W+1，barrier 已真冗余）。
+    log.append(GLOBAL_DOMAIN, b"post2")  # seq 6（补足窗口后 drop 头帧）
+    log._drop_head(log._domains[GLOBAL_DOMAIN])
+    assert log.window_start(GLOBAL_DOMAIN) == 6  # >= wm + 2
     log.sweep()
     assert log.barrier_watermark(GLOBAL_DOMAIN) is None
-    # cursor 3（≤ 旧水位）：barrier 已删 → 不再 reconnect_no_replay，
-    # 落入窗口判定 → replay_expired。
+    _resync(log.replay(GLOBAL_DOMAIN, 4, _EPOCH), "replay_expired")
+    # cursor 3（更旧）同样 replay_expired，无复活路径。
     _resync(log.replay(GLOBAL_DOMAIN, 3, _EPOCH), "replay_expired")
-    # 相等情形：window_start == wm → 保留
-    log2, _ = _log()
-    for i in range(4):
-        log2.append(GLOBAL_DOMAIN, f"f{i}".encode())
-    log2.write_barrier()
-    while log2.window_start(GLOBAL_DOMAIN) < 4:
-        log2._drop_head(log2._domains[GLOBAL_DOMAIN])
-    assert log2.window_start(GLOBAL_DOMAIN) == 4
-    log2.sweep()
-    assert log2.barrier_watermark(GLOBAL_DOMAIN) == 4
-    _resync(log2.replay(GLOBAL_DOMAIN, 4, _EPOCH), "reconnect_no_replay")
 
 
 def test_barrier_write_single_domain_no_create():
