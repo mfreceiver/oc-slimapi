@@ -205,6 +205,19 @@ def _delta(sid: str, mid: str, pid: str, text: str) -> dict:
     }
 
 
+def _text_end(sid: str, mid: str, pid: str, text: str) -> dict:
+    return {
+        "part": {
+            "sessionID": sid,
+            "messageID": mid,
+            "id": pid,
+            "type": "text",
+            "time": {"start": 1, "end": 2},
+            "text": text,
+        }
+    }
+
+
 async def _kill_hub_tasks(hub: GlobalHub) -> None:
     """Cancel the 4 background tasks subscribe()/ensure_upstream() spawns
     (frame-level tests build bare GlobalHubs outside a registry)."""
@@ -694,19 +707,58 @@ async def test_token_message_removed_tombstone_logged_contiguous():
         th.stop()
 
 
-async def test_token_truncated_frame_logged_as_business(monkeypatch):
+async def test_token_truncated_frame_v3_only_never_logged(monkeypatch):
+    """R2 gate: the truncated marker (message.part.snapshot{truncated:true})
+    is v4-INELIGIBLE — it must reach v3 subscribers (byte-identical
+    semantics) but never enter the ReplayLog nor consume a v4 seq."""
     log = ReplayLog(epoch=EPOCH)
     th = TokenStreamHub(replay_log=log)
     monkeypatch.setattr(tokenstream_hub_module, "TOKEN_PART_MAX_BYTES", 4)
     sub = TokenSubscriber(session_id=SID, metrics=th._metrics)
-    th.attach_subscriber(SID, sub)
+    th.attach_subscriber(SID, sub)  # v3 subscriber (wire_v4=False)
     try:
         th.on_part_updated(_text_start(SID, "m1", "p1"))
         th.on_part_delta(_delta(SID, "m1", "p1", "hello world longer than cap"))
         th.flush()
-        outcome = log.replay(token_domain(SID), after_seq=0, epoch=EPOCH)
-        assert isinstance(outcome, ReplayFrames)
-        assert any(b'"truncated":true' in e.payload for e in outcome.entries)
+        # v3 subscriber still receives the truncated marker frame.
+        drained = []
+        while not sub.queue.empty():
+            try:
+                drained.append(sub.queue.get_nowait())
+            except Exception:
+                break
+        assert any(
+            b"event: message.part.snapshot" in f and b'"truncated":true' in f
+            for f in drained
+        )
+        # ... but it never entered the ReplayLog (no seq allocated).
+        assert log.domain_frame_count(token_domain(SID)) == 0
+        assert log.last_seq(token_domain(SID)) == 0
+    finally:
+        th.detach_subscriber(SID, sub)
+        th.stop()
+
+
+async def test_token_truncated_frame_never_reaches_v4_sub(monkeypatch):
+    """R2 gate: a v4 subscriber never receives the truncated marker on the
+    wire, live or otherwise."""
+    log = ReplayLog(epoch=EPOCH)
+    th = TokenStreamHub(replay_log=log)
+    monkeypatch.setattr(tokenstream_hub_module, "TOKEN_PART_MAX_BYTES", 4)
+    sub = TokenSubscriber(session_id=SID, metrics=th._metrics)
+    th.attach_subscriber(SID, sub, wire_v4=True)
+    try:
+        th.on_part_updated(_text_start(SID, "m1", "p1"))
+        th.on_part_delta(_delta(SID, "m1", "p1", "hello world longer than cap"))
+        th.flush()
+        drained = []
+        while not sub.queue.empty():
+            try:
+                drained.append(sub.queue.get_nowait())
+            except Exception:
+                break
+        assert all(b"message.part.snapshot" not in f for f in drained)
+        assert log.domain_frame_count(token_domain(SID)) == 0
     finally:
         th.detach_subscriber(SID, sub)
         th.stop()
@@ -782,6 +834,7 @@ async def test_v4_events_first_connect_meta_seqbase_and_order(stack: _RealStack)
     response, body = await _read(stack.app, "/slimapi/events?v=4")
     assert response.status_code == 200
     frames = list(_frames(body))
+    _assert_v4_no_forbidden_frames(frames)
 
     event0, id0, data0 = frames[0]
     assert event0 == "slimapi.meta"
@@ -817,6 +870,7 @@ async def test_v4_events_window_replay_strictly_before_new_frames(stack: _RealSt
     )
     assert response.status_code == 200
     frames = list(_frames(body))
+    _assert_v4_no_forbidden_frames(frames)
 
     assert frames[0][0] == "slimapi.meta"
     assert frames[0][2]["seqBase"] == 6
@@ -846,6 +900,7 @@ async def test_v4_events_replay_up_to_date_no_frames_no_resync(stack: _RealStack
     )
     assert response.status_code == 200
     frames = list(_frames(body))
+    _assert_v4_no_forbidden_frames(frames)
     assert frames[0][0] == "slimapi.meta"
     # up-to-date cursor: no replay frames, no resync — and no welcome on
     # v4, so meta is the ONLY frame on the wire.
@@ -864,6 +919,7 @@ async def test_v4_events_old_epoch_resync_epoch_changed(stack: _RealStack):
     )
     assert response.status_code == 200
     frames = list(_frames(body))
+    _assert_v4_no_forbidden_frames(frames)
     assert frames[0][0] == "slimapi.meta"
     assert frames[1] == ("resync", None, {"reason": "epoch_changed"})
     assert frames[1][1] is None  # resync never carries an id
@@ -888,6 +944,7 @@ async def test_v4_events_expired_window_resync_no_snapshot():
         )
         assert response.status_code == 200
         frames = list(_frames(body))
+        _assert_v4_no_forbidden_frames(frames)
         assert frames[1] == ("resync", None, {"reason": "replay_expired"})
         # REPLAY-006: NO snapshot frame ever (client does HTTP full fetch)
         assert all(e != "snapshot" for e, _, _ in frames)
@@ -916,6 +973,7 @@ async def test_v4_events_ignore_reset_inputs(stack: _RealStack, cursor):
     )
     assert response.status_code == 200
     frames = list(_frames(body))
+    _assert_v4_no_forbidden_frames(frames)
     assert frames[0][0] == "slimapi.meta"
     # ignore+reset = first-connect semantics; no welcome on v4 → meta only
     assert len(frames) == 1
@@ -931,6 +989,7 @@ async def test_v4_events_g_label_old_epoch_still_epoch_changed(stack: _RealStack
         headers={"Last-Event-ID": f"g:{OTHER_EPOCH}:5"},
     )
     frames = list(_frames(body))
+    _assert_v4_no_forbidden_frames(frames)
     assert frames[1] == ("resync", None, {"reason": "epoch_changed"})
 
 
@@ -954,6 +1013,7 @@ async def test_v4_events_backpressure_overflow_recovery():
         response, body = await _read(s.app, "/slimapi/events?v=4")
         assert response.status_code == 200
         frames = list(_frames(body))
+        _assert_v4_no_forbidden_frames(frames)
         backpressure = [
             d for e, i, d in frames
             if e == "resync" and d.get("reason") == "subscriber_backpressure"
@@ -969,6 +1029,7 @@ async def test_v4_events_backpressure_overflow_recovery():
             headers={"Last-Event-ID": f"g:{EPOCH}:1"},
         )
         frames = list(_frames(body))
+        _assert_v4_no_forbidden_frames(frames)
         assert [f[1] for f in frames[1:3]] == [f"g:{EPOCH}:2", f"g:{EPOCH}:3"]
         assert frames[1][2]["properties"]["questionID"] == "q2"
         assert frames[2][2]["properties"]["questionID"] == "q3"
@@ -991,6 +1052,7 @@ async def test_v4_events_overflow_beyond_window_expired():
             headers={"Last-Event-ID": f"g:{EPOCH}:1"},
         )
         frames = list(_frames(body))
+        _assert_v4_no_forbidden_frames(frames)
         assert frames[1] == ("resync", None, {"reason": "replay_expired"})
     finally:
         await s.close()
@@ -1042,6 +1104,7 @@ async def test_v4_events_id_no_regression_across_three_connections():
         s.hubs.push_script(_script_publish_global(*[_q_event(n) for n in (1, 2, 3)]))
         _, body = await _read(s.app, "/slimapi/events?v=4")
         ids1 = [i for i in _ids(body) if i]
+        _assert_v4_no_forbidden_frames(list(_frames(body)))
         assert ids1 == [f"g:{EPOCH}:{n}" for n in (1, 2, 3)]
 
         # frames 4,5 published while disconnected
@@ -1053,6 +1116,7 @@ async def test_v4_events_id_no_regression_across_three_connections():
             s.app, "/slimapi/events?v=4", headers={"Last-Event-ID": f"g:{EPOCH}:3"},
         )
         ids2 = [i for i in _ids(body) if i]
+        _assert_v4_no_forbidden_frames(list(_frames(body)))
         assert ids2 == [f"g:{EPOCH}:{n}" for n in (4, 5, 6)]
 
         # connection 3: cursor 5 → replay 6 (published while that client
@@ -1062,6 +1126,7 @@ async def test_v4_events_id_no_regression_across_three_connections():
             s.app, "/slimapi/events?v=4", headers={"Last-Event-ID": f"g:{EPOCH}:5"},
         )
         ids3 = [i for i in _ids(body) if i]
+        _assert_v4_no_forbidden_frames(list(_frames(body)))
         assert ids3 == [f"g:{EPOCH}:6", f"g:{EPOCH}:7"]
         assert log.epoch == EPOCH
     finally:
@@ -1085,6 +1150,7 @@ async def test_v4_events_epoch_switch_resync_and_new_segment():
             headers={"Last-Event-ID": f"g:{EPOCH}:5"},
         )
         frames = list(_frames(body))
+        _assert_v4_no_forbidden_frames(frames)
         assert frames[1] == ("resync", None, {"reason": "epoch_changed"})
         assert frames[0][2]["epoch"] == OTHER_EPOCH
         assert frames[0][2]["seqBase"] == 0
@@ -1113,6 +1179,7 @@ async def test_v4_dual_stream_domain_isolation():
         s.hubs.push_script(_script_publish_global(_q_event(3)))
         _, body_events = await _read(s.app, "/slimapi/events?v=4")
         ids_events = [i for i in _ids(body_events) if i]
+        _assert_v4_no_forbidden_frames(list(_frames(body_events)))
         assert ids_events == [f"g:{EPOCH}:3"]
 
         # /stream v4 reconnect from 0: replay t:s1:1, then the live delta 2.
@@ -1127,6 +1194,7 @@ async def test_v4_dual_stream_domain_isolation():
             headers={"Last-Event-ID": f"t:{SID}:{EPOCH}:0"},
         )
         ids_stream = [i for i in _ids(body_stream) if i]
+        _assert_v4_no_forbidden_frames(list(_frames(body_stream)))
         assert ids_stream == [f"t:{SID}:{EPOCH}:1", f"t:{SID}:{EPOCH}:2"]
         # independent per-domain counters — no shared sequence
         assert log.last_seq(GLOBAL_DOMAIN) == 3
@@ -1169,6 +1237,7 @@ async def test_v4_stream_first_connect_meta_and_live_delta():
         response, body = await _read(s.app, f"/slimapi/sessions/{SID}/stream?v=4")
         assert response.status_code == 200
         frames = list(_frames(body))
+        _assert_v4_no_forbidden_frames(frames)
 
         event0, id0, data0 = frames[0]
         assert event0 == "slimapi.meta"
@@ -1218,6 +1287,7 @@ async def test_v4_stream_tombstone_replay_with_id():
         )
         assert response.status_code == 200
         frames = list(_frames(body))
+        _assert_v4_no_forbidden_frames(frames)
 
         # complete sequence, nothing skipped
         assert [f[0] for f in frames] == [
@@ -1260,6 +1330,7 @@ async def test_v4_stream_cross_sid_cross_endpoint_and_epoch(cursor, expect):
             headers={"Last-Event-ID": cursor},
         )
         frames = list(_frames(body))
+        _assert_v4_no_forbidden_frames(frames)
         assert frames[0][0] == "slimapi.meta"
         if expect == "reset":
             # ignore+reset = first-connect semantics; no welcome on v4 →
@@ -1297,6 +1368,124 @@ async def test_v3_stream_same_stack_unstamped():
         await s.close()
 
 
+async def test_v4_stream_finish_part_no_done_marker_on_wire():
+    """R2 gate bypass ①: a v4 subscriber that is attached when
+    ``finish_part()`` fans ``message.part.snapshot{done:true}`` never sees
+    it — the marker is v4-INELIGIBLE (v3-only delivery, never logged, no
+    seq). The v4 wire goes delta → subsequent business frames with NO
+    terminal snapshot in between."""
+    s = _RealStack()
+    try:
+        async def script(sub, sid):
+            # part 1: text-start + delta → seq 1
+            s.token_hub.on_part_updated(_text_start(sid, "m1", "p1"))
+            s.token_hub.on_part_delta(_delta(sid, "m1", "p1", "hello"))
+            s.token_hub.flush()
+            # finish_part: done:true marker must NOT reach this v4 sub
+            s.token_hub.on_part_updated(_text_end(sid, "m1", "p1", "hello"))
+            # a subsequent business frame proves the wire continues
+            # cleanly after the suppressed marker (no hole, no snapshot)
+            s.token_hub.on_part_updated(_text_start(sid, "m2", "p1"))
+            s.token_hub.on_part_delta(_delta(sid, "m2", "p1", "after"))
+            s.token_hub.flush()
+            sub.put(TOKEN_STOP)
+
+        s.token_registry.push_script(script)
+        _, body = await _read(s.app, f"/slimapi/sessions/{SID}/stream?v=4")
+        frames = list(_frames(body))
+        _assert_v4_no_forbidden_frames(frames)
+
+        # exact v4 sequence: meta → delta(1) → delta(2). The done:true
+        # marker never appears between them.
+        assert [f[0] for f in frames] == [
+            "slimapi.meta", "message.part.delta", "message.part.delta",
+        ]
+        assert [f[1] for f in frames[1:]] == [
+            f"t:{SID}:{EPOCH}:1", f"t:{SID}:{EPOCH}:2",
+        ]
+        # the snapshot family never entered the ReplayLog nor consumed a
+        # seq — the domain carries ONLY the two delta frames.
+        assert s.log.domain_frame_count(token_domain(SID)) == 2
+        assert s.log.last_seq(token_domain(SID)) == 2
+        assert all(b"done" not in json.dumps(f[2]).encode() for f in frames)
+    finally:
+        await s.close()
+
+
+async def test_cross_version_pollution_replay_clean(monkeypatch):
+    """R2 gate judge-test ④: done:true and truncated:true markers produced
+    while ONLY a v3 subscriber is active must never leak into a LATER v4
+    cursor reconnect — the replay window contains business frames only.
+
+    Also anchors the v3 side on the same real stack: the v3 subscriber
+    still receives both snapshot variants byte-semantically (handshake
+    prefill untouched)."""
+    monkeypatch.setattr(tokenstream_hub_module, "TOKEN_PART_MAX_BYTES", 4)
+    s = _RealStack()
+    try:
+        # leg 1 — v3 subscriber sees the classic frames (incl. both
+        # snapshot variants; v3 semantics byte-identical).
+        async def v3_script(sub, sid):
+            s.token_hub.on_part_updated(_text_start(sid, "m1", "p1"))
+            s.token_hub.on_part_delta(_delta(sid, "m1", "p1", "a"))
+            s.token_hub.flush()  # t:s1:1
+            # done:true marker → v3-only fanout
+            s.token_hub.on_part_updated(_text_end(sid, "m1", "p1", "a"))
+            # truncated:true marker (oversized p2) → v3-only fanout
+            s.token_hub.on_part_updated(_text_start(sid, "m2", "p1"))
+            s.token_hub.on_part_delta(
+                _delta(sid, "m2", "p1", "way over the four byte cap")
+            )
+            # a business frame AFTER both markers (seq 2)
+            s.token_hub.on_part_updated(_text_start(sid, "m3", "p1"))
+            s.token_hub.on_part_delta(_delta(sid, "m3", "p1", "c"))
+            s.token_hub.flush()
+            sub.put(TOKEN_STOP)
+
+        s.token_registry.push_script(v3_script)
+        _, body_v3 = await _read(s.app, f"/slimapi/sessions/{SID}/stream?v=3")
+        v3_frames = list(_frames(body_v3))
+        v3_events = [f[0] for f in v3_frames]
+        # v3 still gets: handshake welcome + deltas + done + truncated.
+        assert "server.connected" in v3_events
+        assert v3_events.count("message.part.snapshot") == 2
+        done = [
+            f for f in v3_frames
+            if f[0] == "message.part.snapshot" and f[2].get("done") is True
+        ]
+        trunc = [
+            f for f in v3_frames
+            if f[0] == "message.part.snapshot"
+            and f[2].get("truncated") is True
+        ]
+        assert len(done) == 1 and "text" not in done[0][2]
+        assert len(trunc) == 1
+        for block in _blocks(body_v3):
+            assert not block.startswith(b"id:")
+
+        # leg 2 — v4 cursor reconnect: the replay window must contain ONLY
+        # the two logged deltas; neither snapshot variant is replayed.
+        s.token_registry.push_script(_stop_token_stream)
+        _, body_v4 = await _read(
+            s.app, f"/slimapi/sessions/{SID}/stream?v=4",
+            headers={"Last-Event-ID": f"t:{SID}:{EPOCH}:0"},
+        )
+        v4_frames = list(_frames(body_v4))
+        _assert_v4_no_forbidden_frames(v4_frames)
+        assert [f[0] for f in v4_frames] == [
+            "slimapi.meta", "message.part.delta", "message.part.delta",
+        ]
+        assert [f[1] for f in v4_frames[1:]] == [
+            f"t:{SID}:{EPOCH}:1", f"t:{SID}:{EPOCH}:2",
+        ]
+        assert v4_frames[1][2]["messageID"] == "m1"
+        assert v4_frames[2][2]["messageID"] == "m3"
+        # log integrity: only the two deltas were ever logged.
+        assert s.log.domain_frame_count(token_domain(SID)) == 2
+    finally:
+        await s.close()
+
+
 async def test_v4_stream_expired_window_resync():
     log = ReplayLog(epoch=EPOCH, ttl_s=0.05, clock=lambda: 1000.0)
     s = _RealStack(log=log)
@@ -1313,6 +1502,7 @@ async def test_v4_stream_expired_window_resync():
             headers={"Last-Event-ID": f"t:{SID}:{EPOCH}:0"},
         )
         frames = list(_frames(body))
+        _assert_v4_no_forbidden_frames(frames)
         assert frames[1] == (
             "resync", None,
             {"reason": "replay_expired", "sessionID": SID},
@@ -1326,14 +1516,28 @@ async def test_v4_stream_expired_window_resync():
 # ===========================================================================
 
 _CONTROL_EVENTS = frozenset({"slimapi.meta", "resync", "server.heartbeat"})
+# rev-gate R2 BLOCKER-1 oracle：v4 流上禁止出现的事件——server.connected
+# （R1 裁决抑制）与 message.part.snapshot 族（done:false 预填 / done:true
+# 终态 marker / truncated:true 截断 marker，冻结契约：v4 服务端永不发
+# snapshot 帧）。
+_FORBIDDEN_V4_EVENTS = frozenset({"server.connected", "message.part.snapshot"})
 _GLOBAL_ID_RE = re.compile(rf"^g:{EPOCH}:(\d+)$")
 _TOKEN_ID_RE = re.compile(rf"^t:{re.escape(SID)}:{EPOCH}:(\d+)$")
+
+
+def _assert_v4_no_forbidden_frames(frames):
+    """禁止事件集断言：v4 全流遍历永不出现 server.connected 或
+    message.part.snapshot（任何变体：done/truncated/handshake）。"""
+    for event, frame_id, _data in frames:
+        assert event not in _FORBIDDEN_V4_EVENTS, (event, frame_id, _data)
 
 
 def _assert_v4_id_invariant(frames, domain, *, sid=SID):
     """通用 invariant（评委通过条件 4）：除裁决控制帧（meta/resync/
     heartbeat）外，v4 流上全部业务/token 帧必须携带正确域的 id 且 seq
-    严格递增；控制帧必须无 id。"""
+    严格递增；控制帧必须无 id；且全流永不出现禁止事件集
+    （server.connected / message.part.snapshot——rev-gate R2 BLOCKER-1）。"""
+    _assert_v4_no_forbidden_frames(frames)
     pattern = _GLOBAL_ID_RE if domain == GLOBAL_DOMAIN else _TOKEN_ID_RE
     prev = 0
     for event, frame_id, _data in frames:
@@ -1367,6 +1571,7 @@ async def test_v4_stream_live_part_first_connect_no_snapshot():
         response, body = await _read(s.app, f"/slimapi/sessions/{SID}/stream?v=4")
         assert response.status_code == 200
         frames = list(_frames(body))
+        _assert_v4_no_forbidden_frames(frames)
         # 首连 = meta + live：无 cursor 不重放（seq 1 不出现），无 snapshot
         assert [f[0] for f in frames] == ["slimapi.meta", "message.part.delta"]
         assert frames[1][1] == f"t:{SID}:{EPOCH}:2"
@@ -1397,6 +1602,7 @@ async def test_v4_stream_live_part_window_replay_no_snapshot():
             headers={"Last-Event-ID": f"t:{SID}:{EPOCH}:0"},
         )
         frames = list(_frames(body))
+        _assert_v4_no_forbidden_frames(frames)
         # replay(seq 1) + live(seq 2)，全部带 id，无任何 snapshot/welcome
         assert [f[0] for f in frames] == [
             "slimapi.meta", "message.part.delta", "message.part.delta",
@@ -1433,6 +1639,7 @@ async def test_v4_stream_live_part_resync_no_snapshot():
             headers={"Last-Event-ID": f"t:{SID}:{EPOCH}:0"},
         )
         frames = list(_frames(body))
+        _assert_v4_no_forbidden_frames(frames)
         assert frames[0][0] == "slimapi.meta"
         assert frames[1] == (
             "resync", None,
@@ -1492,6 +1699,7 @@ async def test_v4_no_old_tombstone_prefill_on_first_connect():
         response, body = await _read(s.app, f"/slimapi/sessions/{SID}/stream?v=4")
         assert response.status_code == 200
         frames = list(_frames(body))
+        _assert_v4_no_forbidden_frames(frames)
         assert [f[0] for f in frames] == ["slimapi.meta", "message.part.delta"]
         assert all(f[0] != "message.removed" for f in frames)
         assert all(f[0] != "message.part.snapshot" for f in frames)
@@ -1780,6 +1988,7 @@ async def test_v4_without_replay_log_degrades_to_v3_shape():
     )
     assert response.status_code == 200
     frames = list(_frames(body))
+    _assert_v4_no_forbidden_frames(frames)
     assert frames[0][2].keys() == {"subscriberId", "tokens"}
     assert frames[1] == ("resync", None, {"reason": "reconnect_no_replay"})
     for block in _blocks(body):

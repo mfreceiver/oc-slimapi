@@ -161,6 +161,35 @@ def apply_debug_budget_overrides(settings: Any) -> None:
         TOKEN_LIVE_PARTS_MAX = settings.token_stream_debug_live_parts_max
 
 
+# rev-gate R2 BLOCKER-1: frames whose SSE event name belongs to the
+# ``message.part.snapshot`` family (``snapshot{done:false}`` handshake
+# pre-fill, ``snapshot{done:true}`` terminal marker from :meth:`finish_part`,
+# ``snapshot{truncated:true}`` cap marker from :meth:`_truncate_part_for_all`)
+# are **never eligible for the v4 wire** — the frozen v4 protocol (v4-contract
+# §7 / design-v4-sse-replay) mandates the server NEVER sends snapshot frames:
+# state alignment is done by the client via HTTP full fetch after resync.
+_V4_INELIGIBLE_FRAME_PREFIX = b"event: message.part.snapshot\n"
+
+
+def _v4_frame_eligible(frame: bytes) -> bool:
+    """v4 wire frame eligibility (rev-gate R2 BLOCKER-1).
+
+    Structural check at the token fanout choke point: a frame carrying the
+    ``message.part.snapshot`` event name must NOT
+
+    * be written to the ReplayLog,
+    * consume a per-domain seq (no holes are created — the frame simply
+      never enters the sequence),
+    * be delivered to a v4 subscriber (live fanout, first connect, or
+      replay — it is absent from the log, so it can never be replayed).
+
+    Only v3 subscribers receive it (byte-identical v3 wire, zero change).
+    The check is on the serialized frame prefix so EVERY fanout path is
+    covered regardless of which call site constructed the frame.
+    """
+    return not frame.startswith(_V4_INELIGIBLE_FRAME_PREFIX)
+
+
 def _events_token_frame(key: PartKey, text: str) -> bytes:
     """Curated-events token frame (L2-A, ``/slimapi/events?tokens=1``).
 
@@ -224,17 +253,21 @@ class TokenStreamHub:
     ) -> None:
         self.live_parts: dict[PartKey, LivePart] = {}
         # B3b-2: process-wide replay log (design-v4-sse-replay §3.4). When
-        # attached, every LIVE-fanout business frame (delta / snapshot done
-        # marker / truncated) and every ``message.removed`` tombstone is
-        # appended to the sid's token domain ("published frames" semantics —
-        # logged even with zero subscribers, REPLAY-007/018) and v4
-        # subscribers receive the frame with its ``id: t:<sid>:<epoch>:<seq>``
-        # line prepended. ``None`` (v3-only stacks / minimal test apps) keeps
-        # the pipeline byte-identical to the pre-v4 terminal state: no
-        # logging, no id stamping. Per-sub handshake frames (server.connected
-        # / handshake snapshots / handshake tombstone replay) and resync /
-        # heartbeat frames are connection-scoped or control frames — they are
-        # NEVER logged and NEVER id-stamped.
+        # attached, every LIVE-fanout v4-ELIGIBLE business frame (delta) and
+        # every ``message.removed`` tombstone is appended to the sid's token
+        # domain ("published frames" semantics — logged even with zero
+        # subscribers, REPLAY-007/018) and v4 subscribers receive the frame
+        # with its ``id: t:<sid>:<epoch>:<seq>`` line prepended.
+        # rev-gate R2 BLOCKER-1: the ``message.part.snapshot`` family
+        # (done:true marker / truncated marker) is v4-INELIGIBLE — never
+        # logged, never id-stamped, delivered to v3 subscribers only
+        # (:func:`_v4_frame_eligible`). ``None`` (v3-only stacks / minimal
+        # test apps) keeps the pipeline byte-identical to the pre-v4
+        # terminal state: no logging, no id stamping. Per-sub handshake
+        # frames (server.connected / handshake snapshots / handshake
+        # tombstone replay) and resync / heartbeat frames are
+        # connection-scoped or control frames — they are NEVER logged and
+        # NEVER id-stamped.
         self._replay: ReplayLog | None = replay_log
         # Bounded OrderedDicts (§16-B): key → insertion-time-ms.
         self._nontext_parts: OrderedDict[PartKey, int] = OrderedDict()
@@ -971,6 +1004,10 @@ class TokenStreamHub:
                 key, text=None, done=True,
                 part_revision=self._next_part_revision(key),
             )
+            # rev-gate R2 BLOCKER-1: the done:true marker is
+            # v4-INELIGIBLE (snapshot family) — _fanout_frame routes it to
+            # the v3-only delivery path: not logged, no seq, never on the
+            # v4 wire (live or replay).
             self._fanout_frame(key, marker)
         # Retire via drop_part (idempotent). Disabling ensures any late
         # delta for this key silently drops on _disabled (no orphan noise).
@@ -1228,6 +1265,11 @@ class TokenStreamHub:
             # (prior disconnect / oversized frame) never enters fanout,
             # and TokenStreamRegistry.subscribe's post-attach check
             # rolls the flush-loop/grace side effects back symmetrically.
+            # Stamp the sub's wire view HERE as well (idempotent with the
+            # registry's pre-attach stamp) — the fanout eligibility
+            # checks (_deliver_v3_only & co.) key off ``sub.wire_v4``,
+            # so a direct-attach v4 sub must never carry the v3 default.
+            sub.wire_v4 = True
             if sub.closed:
                 return
             self._subs_by_sid.setdefault(sid, set()).add(sub)
@@ -1304,13 +1346,15 @@ class TokenStreamHub:
         """Append ``frame`` to the sid's replay domain; return its id line.
 
         B3b-2 choke point for token-domain business frames. Called on the
-        LIVE fanout path (``_fanout_frame`` / ``_fanout_message_removed`` /
-        ``_truncate_part_for_all``) BEFORE the no-subscriber early return —
+        LIVE fanout path (``_fanout_frame`` for v4-ELIGIBLE frames /
+        ``_fanout_message_removed``) BEFORE the no-subscriber early return —
         the log records *published* frames, not *delivered* ones, so frames
         emitted while a subscriber was overflowed/disconnected still replay
-        (REPLAY-007). Returns ``None`` when no replay log is wired or the
-        append degrades (bookkeeping must never fail publishing); the
-        caller then delivers the raw frame unchanged.
+        (REPLAY-007). rev-gate R2 BLOCKER-1: callers gate on
+        :func:`_v4_frame_eligible` first — the ``message.part.snapshot``
+        family never reaches this method. Returns ``None`` when no replay
+        log is wired or the append degrades (bookkeeping must never fail
+        publishing); the caller then delivers the raw frame unchanged.
         """
         if self._replay is None:
             return None
@@ -1335,16 +1379,47 @@ class TokenStreamHub:
             sub.put(id_line + frame if (id_line is not None and sub.wire_v4) else frame)
         return len(subs)
 
+    def _deliver_v3_only(self, sid: str, frame: bytes) -> int:
+        """Deliver a v3-ONLY frame (snapshot family) to the sid's v3 subs.
+
+        rev-gate R2 BLOCKER-1: ``message.part.snapshot`` frames are never
+        v4-eligible. This is deliberately NOT ``_deliver_logged(...,
+        id_line=None)`` — that helper delivers the raw frame to v4
+        subscribers too, which is exactly the bypass being closed here.
+        v4 subscribers receive nothing (their state alignment is HTTP-based
+        per the frozen contract); v3 subscribers get the frame byte-identical.
+        Returns the number of v3 subscribers the frame was delivered to.
+        """
+        subs = self._subs_by_sid.get(sid)
+        if not subs:
+            return 0
+        delivered = 0
+        for sub in tuple(subs):
+            if not getattr(sub, "wire_v4", False):
+                sub.put(frame)
+                delivered += 1
+        return delivered
+
     def _fanout_frame(self, key: PartKey, frame: bytes) -> None:
         """Fan a frame to every subscriber of the key's sid + count emits.
 
-        B3b-2: the frame is appended to the sid's replay domain FIRST
-        (published semantics — logged even with zero subscribers), then
-        delivered with per-sub id stamping for v4 connections.
+        B3b-2: a v4-ELIGIBLE frame (:func:`_v4_frame_eligible`) is appended
+        to the sid's replay domain FIRST (published semantics — logged even
+        with zero subscribers), then delivered with per-sub id stamping for
+        v4 connections.
+
+        rev-gate R2 BLOCKER-1: a v4-INELIGIBLE frame (the
+        ``message.part.snapshot`` family — e.g. the ``snapshot{done:true}``
+        terminal marker from :meth:`finish_part`) is NOT logged, consumes no
+        seq, and is delivered to v3 subscribers ONLY via
+        :meth:`_deliver_v3_only`.
         """
         sid = key[0]
-        id_line = self._replay_publish_token(sid, frame)
-        delivered = self._deliver_logged(sid, frame, id_line)
+        if _v4_frame_eligible(frame):
+            id_line = self._replay_publish_token(sid, frame)
+            delivered = self._deliver_logged(sid, frame, id_line)
+        else:
+            delivered = self._deliver_v3_only(sid, frame)
         self._metrics.flushed_frames_total += delivered
 
     def _fanout_message_removed(self, sid: str, mid: str) -> None:
@@ -1537,11 +1612,12 @@ class TokenStreamHub:
         self.drop_part(key)
         sid = key[0]
         trunc = _truncated_frame(key, done, part_revision=captured_rev)
-        # B3b-2: the truncated frame is a live-fanout business frame — it is
-        # replay-logged (a reconnecting client must learn the part was
-        # dropped) and id-stamped for v4 subscribers.
-        id_line = self._replay_publish_token(sid, trunc)
-        self._deliver_logged(sid, trunc, id_line)
+        # rev-gate R2 BLOCKER-1: the truncated marker belongs to the
+        # ``message.part.snapshot`` family — v4-INELIGIBLE. It is NOT
+        # replay-logged (no seq), and delivered to v3 subscribers only.
+        # A v4 reconnect therefore never sees it in the replay window;
+        # v4 state alignment is HTTP-based per the frozen contract.
+        self._deliver_v3_only(sid, trunc)
         self._metrics.truncated_snapshots_total += 1
         return captured_rev
 
