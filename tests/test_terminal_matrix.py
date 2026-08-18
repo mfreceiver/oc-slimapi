@@ -1,9 +1,10 @@
-"""v3-contract **terminal state** (sidecar 3.0.0 / M3) wire matrix.
+"""v3-contract **terminal state** (sidecar 3.0.0 / M3) wire matrix —
+dual-version window update (4.0.0 / B3a): supported set is now [3, 4].
 
 The v2 pipeline is deleted. Frozen terminal clauses under test:
 
 * §2 退役后: no ``v`` / ``v=2`` → 400 ``{"code":"unsupported_version",
-  "supported":[3]}`` (endpoint exists, version retired — never a silent
+  "supported":[3, 4]}`` (endpoint exists, version retired — never a silent
   404). ``v=3`` unchanged. Lexical garbage → ``invalid_version_selector``.
 * §1 header retirement: ``X-Slimapi-Version`` is never read (any value,
   any presence); ``X-Opencode-Directory`` on a §5.3 consuming route →
@@ -119,7 +120,7 @@ async def test_no_v_is_unsupported_version():
         resp = await client.get("/slimapi/sessions", headers=IDENTITY)
         assert resp.status_code == 400
         assert resp.json() == {"code": "unsupported_version",
-                               "supported": [3]}
+                               "supported": [3, 4]}
     assert seen == []  # never forwarded
 
 
@@ -132,7 +133,7 @@ async def test_v2_explicit_is_unsupported_version():
                                 params={"v": "2"}, headers=IDENTITY)
         assert resp.status_code == 400
         assert resp.json() == {"code": "unsupported_version",
-                               "supported": [3]}
+                               "supported": [3, 4]}
     assert seen == []
 
 
@@ -164,7 +165,7 @@ async def test_lexically_invalid_v_400(bad):
         assert resp.json() == {"code": "invalid_version_selector"}
 
 
-@pytest.mark.parametrize("unsupported", ["1", "2", "4", "5", "10", "999999"])
+@pytest.mark.parametrize("unsupported", ["1", "2", "5", "10", "999999"])
 async def test_unsupported_v_reports_supported_3(unsupported):
     app, _ = _build_app(lambda r: httpx.Response(200, content=b"[]"))
     async with _client(app) as client:
@@ -172,7 +173,7 @@ async def test_unsupported_v_reports_supported_3(unsupported):
                                 headers=IDENTITY)
         assert resp.status_code == 400
         assert resp.json() == {"code": "unsupported_version",
-                               "supported": [3]}
+                               "supported": [3, 4]}
 
 
 async def test_multi_value_same_folds_v3():
@@ -398,10 +399,15 @@ async def test_versions_terminal_shape():
         resp = await client.get("/slimapi/versions", headers=IDENTITY)
         assert resp.status_code == 200
         body = resp.json()
-        assert body["current"] == 3
-        assert body["available"] == [3]
-        assert set(body["capabilities"].keys()) == {"3"}
+        # dual-version window: current=4, available=[3, 4] (v4-contract §3.1)
+        assert body["current"] == 4
+        assert body["available"] == [3, 4]
+        assert set(body["capabilities"].keys()) == {"3", "4"}
         assert body["capabilities"]["3"]["directoryQuery"] is True
+        assert body["capabilities"]["4"] == {
+            "globalSessions": True,
+            "auxiliaryFilters": True,
+        }
 
 
 async def test_health_single_v3_view():
@@ -411,12 +417,15 @@ async def test_health_single_v3_view():
                                 params={"v": "3"}, headers=IDENTITY)
         assert resp.status_code == 200
         body = resp.json()
+        # v3 view: view values 3 byte-identical to the 3.x terminal shape;
+        # accepted range is config-driven (dual window: [3, 4]).
         assert body["slimapi_contract"] == 3
         assert body["server"]["api_version"] == 3
         assert body["schema"]["version"] == 3
-        assert body["server"]["accepted_client_versions"] == [3, 3]
+        assert body["server"]["accepted_client_versions"] == [3, 4]
         assert body["schema"]["clientMin"] == 3
-        assert body["schema"]["clientMax"] == 3
+        assert body["schema"]["clientMax"] == 4
+        assert "auxiliary" not in body
         # no v → 400 (health is on the /slimapi surface)
         resp = await client.get("/slimapi/health", headers=IDENTITY)
         assert resp.status_code == 400

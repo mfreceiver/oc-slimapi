@@ -182,7 +182,7 @@ async def test_versions_capabilities_include_expand():
     ) as client:
         body = (await client.get("/slimapi/versions")).json()
     caps = body["capabilities"]
-    assert set(caps.keys()) == {"3"}
+    assert set(caps.keys()) == {"3", "4"}
     expand = caps["3"]["expand"]
     assert expand["categories"] == EXPECTED_CATEGORIES
     # fragmentMaxBytes reflects the running Settings (default 8 MiB unset).

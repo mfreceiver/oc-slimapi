@@ -503,7 +503,7 @@ class TrafficLedger:
     def record_sse_lifecycle(self, *, result: str, opened: bool) -> None:
         """Count one SSE open/close for the per-dim sseActive stock.
 
-        ``result`` is the §9.2 dim (v2|v3|absent|not_applicable — the caller
+        ``result`` is the §9.2 dim (v2|v3|v4|absent|not_applicable — the caller
         normalizes; rejected/exempt have no SSE endpoints). ``active`` is the
         live stock; a close with no tracked open (restart loss / window-start
         carry) clamps at zero and counts in ``orphanCloses`` — never negative.

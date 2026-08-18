@@ -117,7 +117,7 @@ async def test_health_with_accept_encoding_gzip_returns_gzip(upstream_factory):
     # Decoding the (already decompressed) content must match a fresh gzip round-trip.
     body = orjson.loads(response.content)
     assert body["sidecar"]["ok"] is True
-    assert body["server"]["accepted_client_versions"] == [3, 3]
+    assert body["server"]["accepted_client_versions"] == [3, 4]
     assert body["schema"]["degraded"] is False
     assert body["slimapi_contract"] == 3
 
@@ -329,11 +329,11 @@ async def test_health_schema_includes_version_and_client_range(upstream_factory)
         "degraded": False,
         "version": 3,
         "clientMin": 3,
-        "clientMax": 3,
+        "clientMax": 4,
     }
     # Old ``server.*`` keys still there for back-compat.
     assert body["server"]["api_version"] == 3
-    assert body["server"]["accepted_client_versions"] == [3, 3]
+    assert body["server"]["accepted_client_versions"] == [3, 4]
     # lite-v2: static contract revision.
     assert body["slimapi_contract"] == 3
 
@@ -369,7 +369,7 @@ async def test_ready_schema_includes_version_and_client_range(upstream_factory):
         "degraded": False,
         "version": 3,
         "clientMin": 3,
-        "clientMax": 3,
+        "clientMax": 4,
     }
 
 
@@ -387,7 +387,7 @@ async def test_ready_503_path_preserves_schema_fields(upstream_factory):
     body = response.json()
     assert body["schema"]["version"] == 3
     assert body["server"]["api_version"] == 3
-    assert body["server"]["accepted_client_versions"] == [3, 3]
+    assert body["server"]["accepted_client_versions"] == [3, 4]
 
 
 async def test_health_schema_reflects_schema_degraded_state(upstream_factory):

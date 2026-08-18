@@ -965,7 +965,7 @@ class TestTokenStreamHandshake:
                 )
             assert response.status_code == 400
             assert response.json() == {
-                "code": "unsupported_version", "supported": [3]}
+                "code": "unsupported_version", "supported": [3, 4]}
             assert "text/event-stream" not in response.headers.get(
                 "content-type", "")
         finally:

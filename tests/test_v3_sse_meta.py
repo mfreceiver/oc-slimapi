@@ -280,7 +280,7 @@ async def test_v2_events_form_rejected_before_stream():
     )
     assert response.status_code == 400
     assert orjson.loads(body) == {
-        "code": "unsupported_version", "supported": [3]}
+        "code": "unsupported_version", "supported": [3, 4]}
     assert "text/event-stream" not in response.headers.get(
         "content-type", "")
     assert "x-slimapi-subscriber-id" not in response.headers
@@ -383,7 +383,7 @@ async def test_v2_stream_form_rejected_before_stream():
     )
     assert response.status_code == 400
     assert orjson.loads(body) == {
-        "code": "unsupported_version", "supported": [3]}
+        "code": "unsupported_version", "supported": [3, 4]}
     assert "text/event-stream" not in response.headers.get(
         "content-type", "")
     assert "x-slimapi-subscriber-id" not in response.headers

@@ -159,7 +159,7 @@ async def test_file_v2_query_directory_form_is_unsupported(stack):
         "/slimapi/file?path=readme.md&directory=/w", headers=V2_HEADERS)
     assert resp.status_code == 400
     assert orjson.loads(resp.content) == {
-        "code": "unsupported_version", "supported": [3]}
+        "code": "unsupported_version", "supported": [3, 4]}
     assert seen == []
 
 
@@ -219,7 +219,7 @@ async def test_v2_explicit_selector_is_unsupported(stack):
     resp = await client.get("/slimapi/vcs?v=2&a=1", headers=V2_HEADERS)
     assert resp.status_code == 400
     assert orjson.loads(resp.content) == {
-        "code": "unsupported_version", "supported": [3]}
+        "code": "unsupported_version", "supported": [3, 4]}
     assert seen == []
 
 
@@ -637,7 +637,7 @@ async def test_v3_missing_selector_on_read_route_gated(stack):
     resp = await client.get("/slimapi/file?path=r", headers=IDENTITY)
     assert resp.status_code == 400
     assert orjson.loads(resp.content) == {
-        "code": "unsupported_version", "supported": [3]}
+        "code": "unsupported_version", "supported": [3, 4]}
 
 
 async def test_missing_required_query_params_422(stack):

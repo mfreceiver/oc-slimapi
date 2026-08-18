@@ -175,7 +175,7 @@ async def test_messages_retired_v2_forms_rejected(client_factory):
         explicit = await client.get(
             "/slimapi/messages/s1?v=2", headers=V2_HEADERS)
         assert implicit.status_code == explicit.status_code == 400
-        expected = {"code": "unsupported_version", "supported": [3]}
+        expected = {"code": "unsupported_version", "supported": [3, 4]}
         assert orjson.loads(implicit.content) == expected
         assert orjson.loads(explicit.content) == expected
     finally:

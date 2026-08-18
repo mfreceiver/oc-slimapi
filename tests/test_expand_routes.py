@@ -261,7 +261,7 @@ async def test_selector_missing_v_400(upstream_factory):
             "/slimapi/messages/s1/expand/part_text/m1/p_text",
             headers=IDENTITY)
     assert r.status_code == 400
-    assert _json(r) == {"code": "unsupported_version", "supported": [3]}
+    assert _json(r) == {"code": "unsupported_version", "supported": [3, 4]}
     assert r.headers.get("Vary") == "Accept-Encoding"
 
 
@@ -271,7 +271,7 @@ async def test_selector_v2_unsupported(upstream_factory):
             "/slimapi/messages/s1/expand/part_text/m1/p_text?v=2",
             headers=IDENTITY)
     assert r.status_code == 400
-    assert _json(r) == {"code": "unsupported_version", "supported": [3]}
+    assert _json(r) == {"code": "unsupported_version", "supported": [3, 4]}
     assert r.headers.get("Vary") == "Accept-Encoding"
 
 
@@ -341,7 +341,7 @@ async def test_selector_error_preempts_category_error(upstream_factory):
         r = await client.get(
             "/slimapi/messages/s1/expand/not_a_category/m1?v=2", headers=IDENTITY)
     assert r.status_code == 400
-    assert _json(r) == {"code": "unsupported_version", "supported": [3]}
+    assert _json(r) == {"code": "unsupported_version", "supported": [3, 4]}
     assert r.headers.get("Vary") == "Accept-Encoding"
 
 

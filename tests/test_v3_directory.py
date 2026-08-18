@@ -555,7 +555,7 @@ async def test_tolerant_routes_ignore_any_directory_form(stack):
             if "/health" in url:
                 assert body["slimapi_contract"] == 3  # v3 view, no 400
             else:
-                assert body["current"] == 3
+                assert body["current"] == 4  # versions: dual window
         # local tolerant routes never touched the upstream probe
         assert not seen
     finally:

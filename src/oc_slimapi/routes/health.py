@@ -5,29 +5,34 @@ from fastapi import APIRouter, Request
 from .. import __version__
 from ..features import FEATURES
 from ..gzip_util import json_response
+from ..selector import wire_view_from_scope
 from ..traffic import stash_up_in
 from ..upstream import forward_upstream_headers, request_id_from_scope
 
 router = APIRouter(prefix="/slimapi", tags=["health"])
 
-# v3-contract §3a terminal state: single v3 view. Every request that reaches
-# these routes ran v3 semantics (?v=3 enforced by the selector) — there is no
-# v2 view left to fork on.
-WIRE_VIEW = 3
+# v4-contract §3.2: /health is DUAL-VIEW — the wire view comes from the
+# selector stash of the running request (?v=3 → 3, ?v=4 → 4; selector-less
+# direct invocation defaults to 3). /ready is NOT version-forked (contract
+# §12 route table: 零 v4 差异) — shape AND values stay the terminal v3 ones
+# regardless of the requested wire version.
+READY_VIEW = 3
 
 
 @router.get("/health")
 async def health(request: Request):
-    # One constant drives slimapi_contract, server.api_version AND
-    # schema.version — a 3/2 combination is structurally impossible.
+    # One per-request view drives slimapi_contract, server.api_version AND
+    # schema.version — a mismatched 3/4 combination is structurally
+    # impossible (S-B04: the value is the selector stash itself, the single
+    # source the request was dispatched on).
     # accepted_client_versions / clientMin / clientMax stay config-driven
-    # (3.0.0: [3, 3]).
-    view = WIRE_VIEW
+    # (dual window: [3, 4]).
+    view = wire_view_from_scope(request.scope)
     resp = {
         # lite-v2: expose the slim API contract revision as a top-level
         # field. Bumped ONLY on contract-breaking changes; additive wire
-        # changes (e.g. optional fields) do NOT bump this. v3 terminal:
-        # the single view is 3 (v3-contract §3a).
+        # changes (e.g. optional fields) do NOT bump this. Dual window: the
+        # contract revision follows the requested wire view (§3.2).
         "slimapi_contract": view,
         "sidecar": {"ok": True, "version": __version__},
         "server": {
@@ -38,9 +43,8 @@ async def health(request: Request):
             "degraded": request.app.state.schema_degraded,
             # v6 §4: diagnostic re-exposure of the wire-version triplet. These
             # are *view values*, NOT a feature-discovery surface — same source
-            # as server.api_version above (v3-contract §3a: v2 view=2, v3
-            # view=3, never a 3/2 combination). Existing ``server.*`` keys are
-            # preserved for back-compat.
+            # as server.api_version above (§3.2: never a 3/4 combination).
+            # Existing ``server.*`` keys are preserved for back-compat.
             "version": view,
             "clientMin": request.app.state.config.accepted_client_versions[0],
             "clientMax": request.app.state.config.accepted_client_versions[1],
@@ -57,7 +61,7 @@ async def health(request: Request):
         # behaviour does NOT depend on a client acknowledging it — small
         # ``state.output``/``state.error`` is inlined regardless. The numeric
         # ``skeletonInlineOutputMaxBytes`` lets ops confirm the tuned cap; it
-        # does not bump ``X-Slimapi-Version`` (additive wire shape change).
+        # does not bump the view constant (additive wire shape change).
         "features": {
             # L2-T0: static all-true announcements for the consolidated
             # capabilities (tokenCoalesce / permissionEvents / serverMerge /
@@ -68,6 +72,13 @@ async def health(request: Request):
             "skeletonInlineOutputMaxBytes": request.app.state.config.skeleton_inline_output_max_bytes,
         },
     }
+    if view >= 4:
+        # v4-contract §3.2: v4 view adds the TRANSIENT auxiliary field —
+        # availability of the DB auxiliary source. Stage A (B3a): dbaux is
+        # not landed, so this is a frozen placeholder {available: False,
+        # mode: "http"} until the B1/B5 lanes wire the real state. The v3
+        # view carries NO auxiliary key (byte-identical terminal shape).
+        resp["auxiliary"] = {"available": False, "mode": "http"}
     # S-E: optional deployment revision, omitted when None
     rev = request.app.state.deployment_revision
     if rev is not None:
@@ -89,9 +100,9 @@ async def health(request: Request):
 
 @router.get("/ready")
 async def ready(request: Request):
-    # v3-contract §3a terminal: same single-view constant as /health for the
-    # schema triple — NO contract field on this endpoint (shape locked).
-    view = WIRE_VIEW
+    # v4-contract §3.2/§12: ready is 零 v4 差异 — shape AND values frozen to
+    # the terminal v3 view; no contract field on this endpoint.
+    view = READY_VIEW
     started = time.monotonic()
     try:
         # P0-6: forward X-Request-ID so the sidecar access log line can be

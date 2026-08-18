@@ -425,7 +425,14 @@ class Settings:
         "OC_SLIMAPI_MESSAGE_FINGERPRINT_ENABLED", "true"
     ).lower() in ("1", "true", "yes", "on")
     smoke_session_id: str | None = os.getenv("OC_SLIMAPI_SMOKE_SESSION_ID")
-    server_api_version: int = int(os.getenv("OC_SLIMAPI_SERVER_API_VERSION", str(SERVER_API_VERSION)))
+    # S-B04 config migration (4.0.0 dual-version window): the view is
+    # per-request (selector ``?v=``), so a single-value env knob can only
+    # ever create 3/4 mismatched combinations. server_api_version is now
+    # CONSTANT-pinned to the SERVER_API_VERSION constant (=4, the latest
+    # major) and OC_SLIMAPI_SERVER_API_VERSION no longer influences it.
+    # The env var stays *settable without breaking startup* — validate()
+    # warns + ignores when it is present (backward compat).
+    server_api_version: int = SERVER_API_VERSION
     accepted_client_versions: tuple[int, int] = _version_range(
         os.getenv(
             "OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS",
@@ -756,6 +763,20 @@ class Settings:
             raise RuntimeError(
                 "OC_SLIMAPI_PORT must be in [1, 65535] "
                 "(0 is not supported — the client expects a fixed port)"
+            )
+        # S-B04 (4.0.0 dual-version window): OC_SLIMAPI_SERVER_API_VERSION
+        # no longer drives any view — server_api_version is constant-pinned
+        # to SERVER_API_VERSION. A still-set env means a legacy deployment:
+        # warn + ignore so startup never breaks (backward compat; the env
+        # cannot widen/narrow/shift anything anymore).
+        if os.getenv("OC_SLIMAPI_SERVER_API_VERSION") is not None:
+            from .logging_config import get_logger
+
+            get_logger("config").warning(
+                "OC_SLIMAPI_SERVER_API_VERSION is deprecated and ignored "
+                "(dual-version window: the wire view is per-request via ?v=); "
+                "server_api_version is pinned to %d",
+                SERVER_API_VERSION,
             )
         minimum, maximum = self.accepted_client_versions
         if self.server_api_version < 1 or minimum < 1 or minimum > maximum:

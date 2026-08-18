@@ -64,9 +64,9 @@ async def test_health_single_v3_view():
         assert body["slimapi_contract"] == 3
         assert body["server"]["api_version"] == 3
         assert body["schema"]["version"] == 3
-        assert body["server"]["accepted_client_versions"] == [3, 3]
+        assert body["server"]["accepted_client_versions"] == [3, 4]
         assert body["schema"]["clientMin"] == 3
-        assert body["schema"]["clientMax"] == 3
+        assert body["schema"]["clientMax"] == 4
 
 
 async def test_health_retired_header_cannot_change_view():
@@ -89,7 +89,7 @@ async def test_health_no_v_rejected():
         r = await client.get("/slimapi/health",
                              headers={"X-Slimapi-Version": "2"})
         assert r.status_code == 400
-        assert r.json() == {"code": "unsupported_version", "supported": [3]}
+        assert r.json() == {"code": "unsupported_version", "supported": [3, 4]}
 
 
 async def test_ready_single_v3_view_no_contract_field():
@@ -102,8 +102,8 @@ async def test_ready_single_v3_view_no_contract_field():
         assert body["server"]["api_version"] == 3
         assert body["schema"]["version"] == 3
         assert body["schema"]["clientMin"] == 3
-        assert body["schema"]["clientMax"] == 3
-        assert body["server"]["accepted_client_versions"] == [3, 3]
+        assert body["schema"]["clientMax"] == 4
+        assert body["server"]["accepted_client_versions"] == [3, 4]
 
 
 async def test_ready_upstream_down_503():

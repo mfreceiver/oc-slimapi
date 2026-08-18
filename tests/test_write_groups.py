@@ -286,7 +286,7 @@ async def test_write_directory_v2_query_values_unsupported():
             headers=V2_HEADERS)
     assert resp.status_code == 400
     assert orjson.loads(resp.content) == {
-        "code": "unsupported_version", "supported": [3]}
+        "code": "unsupported_version", "supported": [3, 4]}
     assert not seen
 
 

@@ -304,8 +304,8 @@ def write_access_log(
     before the upgrade simply lack them, and consumers must tolerate the
     absence (jq/orjson default behaviour):
 
-    * ``wireVersion``: "2" | "3" | null (null = rejected/exempt/not_applicable).
-    * ``selectorResult``: absent|v2|v3|rejected|exempt|not_applicable.
+    * ``wireVersion``: "2" | "3" | "4" | null (null = rejected/exempt/not_applicable).
+    * ``selectorResult``: absent|v2|v3|v4|rejected|exempt|not_applicable.
     * ``directoryForm``: query|header|both|absent|null (null = non-consuming
       route per §5.3 static table).
     * ``recordType``: "request" for the per-request rows this function owns;

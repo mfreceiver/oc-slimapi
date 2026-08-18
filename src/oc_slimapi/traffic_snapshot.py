@@ -106,7 +106,9 @@ def prune_old_snapshots(directory: Path, stem: str, retain_days: int, today: dat
 # ---------------------------------------------------------------------------
 
 # §9.2 sseActive dims. rejected/exempt have no SSE endpoints — always 0.
-_SSE_DIMS: tuple[str, ...] = ("v2", "v3", "absent", "not_applicable")
+# Dual-window: "v4" rides the same widened value set (must stay in sync
+# with selector.SSE_RESULT_DIMS — the only two copies; grep-verified).
+_SSE_DIMS: tuple[str, ...] = ("v2", "v3", "v4", "absent", "not_applicable")
 
 
 def _v3_row_key(row: dict) -> str:

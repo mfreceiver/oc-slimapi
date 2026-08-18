@@ -32,8 +32,9 @@ async def test_versions_shape_exact():
         assert list(body.keys()) == [
             "current", "available", "capabilities", "sidecarVersion",
         ]
-        assert body["current"] == 3
-        assert body["available"] == [3]
+        # Dual-version window (v4-contract §3.1): current=4, available=[3, 4]
+        assert body["current"] == 4
+        assert body["available"] == [3, 4]
         # current ∈ available; available unique ascending
         assert body["current"] in body["available"]
         assert body["available"] == sorted(set(body["available"]))
@@ -43,7 +44,10 @@ async def test_versions_capabilities_map():
     async with _client(_build_app()) as client:
         body = (await client.get("/slimapi/versions")).json()
         caps = body["capabilities"]
-        assert set(caps.keys()) == {"3"}
+        assert set(caps.keys()) == {"3", "4"}
+        # B3a-A3: capabilities["4"] carries exactly the two static keys;
+        # sseReplay / qpImmediateFull are deliberately absent (B3b owns them).
+        assert caps["4"] == {"globalSessions": True, "auxiliaryFilters": True}
         assert caps["3"]["envelope"] == ["messages", "sessions"]
         assert caps["3"]["directoryQuery"] is True
         assert caps["3"]["versionHeaderOptional"] is True
@@ -80,7 +84,7 @@ async def test_versions_gzip_family():
         assert r.headers.get("content-encoding") == "gzip"
         assert r.headers.get("vary") == "Accept-Encoding"
         # httpx transparently decodes; the JSON still round-trips.
-        assert r.json()["current"] == 3
+        assert r.json()["current"] == 4
         # Without gzip (explicit identity — httpx auto-adds gzip otherwise)
         # → identity body, Vary still present.
         r = await client.get("/slimapi/versions", headers={"Accept-Encoding": "identity"})
@@ -95,5 +99,5 @@ async def test_versions_unknown_fields_tolerated_by_consumer():
     the tolerance requirement is on consumers, this endpoint is producer)."""
     async with _client(_build_app()) as client:
         body = (await client.get("/slimapi/versions")).json()
-        assert body["current"] == 3
-        assert body["available"] == [3]
+        assert body["current"] == 4
+        assert body["available"] == [3, 4]
