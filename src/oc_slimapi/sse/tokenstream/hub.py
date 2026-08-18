@@ -1047,6 +1047,13 @@ class TokenStreamHub:
         # idle
         self._busy_sids.pop(sid, None)
         self._retire_session(sid)
+        # rev-gate R4 BLOCKER-1: the retire above invalidates the
+        # accumulator state for this sid. Write the token-domain replay
+        # barrier AT THE SOURCE, unconditionally (zero-online-subscriber
+        # case included) — a cursor-N reconnect must hit
+        # resync{reconnect_no_replay}, never an up-to-date live entry on
+        # a残缺 part.
+        self._write_replay_barrier(sid, "session_idle")
         self._enqueue_session_resync(sid, "session_idle")
 
     def on_session_deleted(self, sid: str) -> None:
@@ -1091,6 +1098,14 @@ class TokenStreamHub:
         self._retire_session(sid)
         self._session_status.pop(sid, None)
         self._busy_sids.pop(sid, None)
+        # rev-gate R4 核对结论：deletion 有独立 token 域退役逻辑
+        # （_retire_session + deleted-sid gate + terminate），故与 idle/
+        # eviction 同类——不写 barrier 的话，cursor < last_seq 的重连会把
+        # 已删除会话的旧 delta 重放成"活跃"流（复活），cursor == last_seq
+        # 则 up-to-date 挂在死流上。全局 session.digest 只覆盖订阅了全局
+        # 流的客户端；token 流须独立保证旧 cursor 不恢复 → 写 barrier，
+        # 重连走 resync{reconnect_no_replay} → HTTP 对齐（404/缺失确认删除）。
+        self._write_replay_barrier(sid, "session_deleted")
         # CRITICAL 2 gate cleanup for this session.
         for key in [k for k in self._retired_messages if k[0] == sid]:
             self._retired_messages.discard(key)
@@ -1364,6 +1379,36 @@ class TokenStreamHub:
             logger.warning("replay log append failed for sid %r", sid, exc_info=True)
             return None
         return sse_id_line(token_domain(sid), self._replay.epoch, entry.seq)
+
+    def _write_replay_barrier(self, sid: str, why: str) -> None:
+        """Write a replay barrier for the sid's token domain (rev-gate R4).
+
+        Called at every server-side **state invalidation** source for the
+        token accumulator — session idle retire (:meth:`on_session_status`),
+        memory eviction (:meth:`_evict_part_for_memory`), session deletion
+        (:meth:`on_session_deleted`) — UNCONDITIONALLY at the source, i.e.
+        regardless of whether any (v4 or v3) subscriber is currently
+        online. Rationale (v4-contract §7.2 window semantics / R4
+        BLOCKER-1): after the invalidation the accumulator state that
+        produced the logged frames is gone, so a client reconnecting with
+        ``Last-Event-ID == last_seq`` must NOT be judged up-to-date (it
+        would enter live mode holding a残缺 part). The barrier makes any
+        cursor ≤ watermark resolve to ``resync{reconnect_no_replay}`` →
+        HTTP full alignment — the frozen recovery path. The still-open
+        connection's own delivery stays the R3 semantics (silent STOP for
+        non-frozen reasons); this barrier only governs RECONNECTS.
+
+        Degrade pattern mirrors :meth:`_replay_publish_token`: a log
+        failure is logged and swallowed (invalidation must never fail).
+        """
+        if self._replay is None:
+            return
+        try:
+            self._replay.write_barrier(token_domain(sid))
+        except Exception:  # noqa: BLE001 — invalidation never fails on log errors
+            logger.warning(
+                "replay barrier write failed for sid %r (%s)", sid, why, exc_info=True
+            )
 
     def _deliver_logged(self, sid: str, frame: bytes, id_line: bytes | None) -> int:
         """Deliver a (possibly replay-logged) frame to the sid's subscribers.
@@ -1734,6 +1779,13 @@ class TokenStreamHub:
         # I1: drain pending for this sid before resync + re-snapshot
         # (mirrors attach_subscriber handshake step 2, preventing C2 double-count).
         self.flush_sid(sid)
+        # rev-gate R4 BLOCKER-1: the evicted part's server-side state is
+        # gone. Write the barrier AFTER flush_sid so the evicted part's
+        # own drained deltas fall at/below the watermark — a client that
+        # consumed them (cursor == last_seq) reconnects into
+        # resync{reconnect_no_replay} instead of an up-to-date live mode
+        # on a part the server can no longer complete.
+        self._write_replay_barrier(sid, "token_memory_limit")
         self._fanout_resync(sid, "token_memory_limit")
         self._metrics.token_memory_limit_total += 1
         # Re-snapshot remaining live parts of this sid to existing subs.
