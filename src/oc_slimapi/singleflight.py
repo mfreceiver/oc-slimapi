@@ -286,7 +286,26 @@ class SingleFlight:
         defaults 64 / 32 MiB). Leased kwargs: ``max_bytes``,
         ``network_concurrency`` (leader factories only — bypass never
         passes through), ``result_grace_seconds``, ``clock`` (injectable
-        monotonic clock)."""
+        monotonic clock). Profile-only kwargs are rejected up-front with
+        ``TypeError`` (a leased registry bounds budget, not retention;
+        a plain registry admits every flight — no concurrency cap).
+        ``result_grace_seconds``/``clock`` are shared by both profiles."""
+        self._leased = max_bytes is not None
+        if self._leased:
+            if (
+                max_retained_entries is not None
+                or max_retained_bytes is not None
+            ):
+                raise TypeError(
+                    "max_retained_entries/max_retained_bytes are "
+                    "plain-profile-only kwargs (max_bytes=None): a leased "
+                    "registry (max_bytes set) bounds budget, not retention"
+                )
+        elif network_concurrency is not None:
+            raise TypeError(
+                "network_concurrency is a leased-profile-only kwarg: a "
+                "plain registry (max_bytes=None) admits every flight"
+            )
         self._leased = max_bytes is not None
         self._grace = float(result_grace_seconds)
         self._clock = clock

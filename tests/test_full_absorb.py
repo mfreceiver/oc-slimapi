@@ -516,3 +516,48 @@ async def test_singleflight_reusable_after_shutdown_and_entry_isolation(
     sf.shutdown()  # final converge — clean drops this time
     assert sf._retained_bytes == 0
     assert not sf._entries
+
+
+async def test_singleflight_cross_profile_api_misuse_raises():
+    """Profile API separation (B6-1 review nits): a leased registry must
+    use fetch_or_bypass(), a plain registry must use fetch() — the wrong
+    entry point fails fast with an identifiably-worded RuntimeError
+    instead of silently mis-accounting."""
+    leased = sf_mod.SingleFlight(max_bytes=64)
+    plain = sf_mod.SingleFlight()
+
+    async def factory():
+        return b"x"
+
+    with pytest.raises(RuntimeError, match="plain-profile"):
+        await leased.fetch("k", factory)
+    with pytest.raises(RuntimeError, match="leased-profile"):
+        await plain.fetch_or_bypass("k", factory, 8)
+
+
+def test_singleflight_ctor_rejects_plain_only_kwargs_on_leased():
+    """max_retained_entries/max_retained_bytes bound PLAIN retention; on a
+    leased registry (max_bytes set) they are a caller bug → TypeError at
+    construction, before any state exists. Production shapes (bare plain
+    ``fulls``-style, leased with budget) must keep constructing fine."""
+    with pytest.raises(TypeError, match="plain-profile-only"):
+        sf_mod.SingleFlight(max_bytes=10, max_retained_entries=4)
+    with pytest.raises(TypeError, match="plain-profile-only"):
+        sf_mod.SingleFlight(max_bytes=10, max_retained_bytes=1024)
+
+    # The two production shapes stay valid.
+    assert sf_mod.SingleFlight() is not None
+    assert sf_mod.SingleFlight(max_bytes=1024) is not None
+
+
+def test_singleflight_ctor_rejects_leased_only_kwargs_on_plain():
+    """network_concurrency caps leased LEADER factories only; on a plain
+    registry (max_bytes=None, admission-free) it is a caller bug →
+    TypeError. The raw-fetch production shape (budget + concurrency)
+    stays valid."""
+    with pytest.raises(TypeError, match="leased-profile-only"):
+        sf_mod.SingleFlight(network_concurrency=2)
+
+    assert sf_mod.SingleFlight(
+        max_bytes=1024, network_concurrency=2
+    ) is not None
