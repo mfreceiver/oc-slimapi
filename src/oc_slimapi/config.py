@@ -658,6 +658,17 @@ class Settings:
         os.getenv("OC_SLIMAPI_DBAUX_PROBE_INTERVAL_S", "30")
     )
 
+    # B3b-1: v4 SSE bounded ring replay log (design-v4-sse-replay §3.4).
+    # Three independent bounds — count (frames per ID domain), bytes
+    # (process-wide payload byte total, KiB-granular env knob), TTL
+    # (per-frame age). Internal resource knobs (NOT wire-visible);
+    # production wiring flows Settings → ReplayLog ctor in app.py lifespan.
+    # Defaults are the design proposal values: 2048 / 65536 KiB (64 MiB) /
+    # 900 s (15 min).
+    replay_max_count: int = _int_env("OC_SLIMAPI_REPLAY_COUNT", 2048)
+    replay_max_bytes_kb: int = _int_env("OC_SLIMAPI_REPLAY_BYTES_KB", 65536)
+    replay_ttl_s: float = float(os.getenv("OC_SLIMAPI_REPLAY_TTL_S", "900"))
+
     def read_deployment_revision(self) -> str | None:
         """Best-effort deployment revision (env or file). Returns None if unset.
 
@@ -1098,6 +1109,16 @@ class Settings:
             raise RuntimeError(
                 "OC_SLIMAPI_DBAUX_PROBE_INTERVAL_S must be > 0"
             )
+        # B3b-1: replay log bounds (fail-closed, dbaux-precedent style —
+        # a zero/negative bound would either admit nothing (count/bytes) or
+        # evict everything instantly (TTL), making replay permanently
+        # resync-only; all three must be strictly positive).
+        if self.replay_max_count < 1:
+            raise RuntimeError("OC_SLIMAPI_REPLAY_COUNT must be >= 1")
+        if self.replay_max_bytes_kb < 1:
+            raise RuntimeError("OC_SLIMAPI_REPLAY_BYTES_KB must be >= 1")
+        if self.replay_ttl_s <= 0:
+            raise RuntimeError("OC_SLIMAPI_REPLAY_TTL_S must be > 0")
         if self.qp_sweep_daily_budget < 0:
             raise RuntimeError("OC_SLIMAPI_QP_SWEEP_DAILY_BUDGET must be >= 0")
         if not 1 <= self.merged_fanout <= 16:

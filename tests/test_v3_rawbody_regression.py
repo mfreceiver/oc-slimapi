@@ -78,7 +78,8 @@ BASELINE_VERSIONS_BODY = (
     b'"part_state_error","part_state_input_full","part_state_metadata_full",'
     b'"part_state_attachments","part_url","part_source","part_snapshot",'
     b'"compaction_full"],"fragmentMaxBytes":8388608}},"4":{"globalSessions":true,'
-    b'"auxiliaryFilters":true}},"sidecarVersion":"<SIDECAR_VERSION>"}'
+    b'"auxiliaryFilters":true,"sseReplay":true,"qpImmediateFull":true}},'
+    b'"sidecarVersion":"<SIDECAR_VERSION>"}'
 )
 # ------------------------------------------------------------------------
 

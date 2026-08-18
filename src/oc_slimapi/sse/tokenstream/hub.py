@@ -82,6 +82,13 @@ from ...config import (
 )
 from ...logging_config import get_logger
 from ..hub_types import TOKEN_FRAME_TYPE
+from ..replay_log import (
+    FRAME_KIND_BUSINESS,
+    FRAME_KIND_TOMBSTONE,
+    ReplayLog,
+    token_domain,
+)
+from ..replay_wire import sse_id_line
 from .frames import (
     STOP,
     _connected_frame,
@@ -209,8 +216,26 @@ class TokenStreamHub:
       :meth:`detach_subscriber` to enter/leave this ledger.
     """
 
-    def __init__(self, *, max_frame_bytes: int = DEFAULT_TOKEN_MAX_FRAME_BYTES) -> None:
+    def __init__(
+        self,
+        *,
+        max_frame_bytes: int = DEFAULT_TOKEN_MAX_FRAME_BYTES,
+        replay_log: ReplayLog | None = None,
+    ) -> None:
         self.live_parts: dict[PartKey, LivePart] = {}
+        # B3b-2: process-wide replay log (design-v4-sse-replay §3.4). When
+        # attached, every LIVE-fanout business frame (delta / snapshot done
+        # marker / truncated) and every ``message.removed`` tombstone is
+        # appended to the sid's token domain ("published frames" semantics —
+        # logged even with zero subscribers, REPLAY-007/018) and v4
+        # subscribers receive the frame with its ``id: t:<sid>:<epoch>:<seq>``
+        # line prepended. ``None`` (v3-only stacks / minimal test apps) keeps
+        # the pipeline byte-identical to the pre-v4 terminal state: no
+        # logging, no id stamping. Per-sub handshake frames (server.connected
+        # / handshake snapshots / handshake tombstone replay) and resync /
+        # heartbeat frames are connection-scoped or control frames — they are
+        # NEVER logged and NEVER id-stamped.
+        self._replay: ReplayLog | None = replay_log
         # Bounded OrderedDicts (§16-B): key → insertion-time-ms.
         self._nontext_parts: OrderedDict[PartKey, int] = OrderedDict()
         self._disabled_parts: OrderedDict[PartKey, int] = OrderedDict()
@@ -1236,15 +1261,54 @@ class TokenStreamHub:
     # ------------------------------------------------------------------
     # Fanout helpers
     # ------------------------------------------------------------------
-    def _fanout_frame(self, key: PartKey, frame: bytes) -> None:
-        """Fan a frame to every subscriber of the key's sid + count emits."""
-        sid = key[0]
+    def _replay_publish_token(
+        self, sid: str, frame: bytes, kind: str = FRAME_KIND_BUSINESS
+    ) -> bytes | None:
+        """Append ``frame`` to the sid's replay domain; return its id line.
+
+        B3b-2 choke point for token-domain business frames. Called on the
+        LIVE fanout path (``_fanout_frame`` / ``_fanout_message_removed`` /
+        ``_truncate_part_for_all``) BEFORE the no-subscriber early return —
+        the log records *published* frames, not *delivered* ones, so frames
+        emitted while a subscriber was overflowed/disconnected still replay
+        (REPLAY-007). Returns ``None`` when no replay log is wired or the
+        append degrades (bookkeeping must never fail publishing); the
+        caller then delivers the raw frame unchanged.
+        """
+        if self._replay is None:
+            return None
+        try:
+            entry = self._replay.append(token_domain(sid), frame, kind=kind)
+        except Exception:  # noqa: BLE001 — publishing never fails on log errors
+            logger.warning("replay log append failed for sid %r", sid, exc_info=True)
+            return None
+        return sse_id_line(token_domain(sid), self._replay.epoch, entry.seq)
+
+    def _deliver_logged(self, sid: str, frame: bytes, id_line: bytes | None) -> int:
+        """Deliver a (possibly replay-logged) frame to the sid's subscribers.
+
+        v4 subscribers (``sub.wire_v4``) receive ``id_line + frame``; v3
+        subscribers the raw ``frame`` (byte-identical zero-change rule).
+        Returns the number of subscribers the frame was delivered to.
+        """
         subs = self._subs_by_sid.get(sid)
         if not subs:
-            return
+            return 0
         for sub in tuple(subs):
-            sub.put(frame)
-        self._metrics.flushed_frames_total += len(subs)
+            sub.put(id_line + frame if (id_line is not None and sub.wire_v4) else frame)
+        return len(subs)
+
+    def _fanout_frame(self, key: PartKey, frame: bytes) -> None:
+        """Fan a frame to every subscriber of the key's sid + count emits.
+
+        B3b-2: the frame is appended to the sid's replay domain FIRST
+        (published semantics — logged even with zero subscribers), then
+        delivered with per-sub id stamping for v4 connections.
+        """
+        sid = key[0]
+        id_line = self._replay_publish_token(sid, frame)
+        delivered = self._deliver_logged(sid, frame, id_line)
+        self._metrics.flushed_frames_total += delivered
 
     def _fanout_message_removed(self, sid: str, mid: str) -> None:
         """Fan a ``message.removed`` frame to every subscriber of ``sid``.
@@ -1253,14 +1317,17 @@ class TokenStreamHub:
         ``on_message_removed``. The replay half is handled by
         ``_removed_messages`` + the handshake replay in
         :meth:`attach_subscriber`.
+
+        B3b-2: the tombstone is ALSO appended to the sid's replay domain
+        with :data:`FRAME_KIND_TOMBSTONE` — a reconnecting client that
+        missed the live frame replays it WITH its ``id:`` (it consumes a
+        seq exactly like a business frame, keeping the ID sequence
+        hole-free; REPLAY-012).
         """
-        subs = self._subs_by_sid.get(sid)
-        if not subs:
-            return
         frame = _message_removed_frame(sid, mid)
-        for sub in tuple(subs):
-            sub.put(frame)
-        self._metrics.flushed_frames_total += len(subs)
+        id_line = self._replay_publish_token(sid, frame, kind=FRAME_KIND_TOMBSTONE)
+        delivered = self._deliver_logged(sid, frame, id_line)
+        self._metrics.flushed_frames_total += delivered
 
     def _fanout_resync(self, sid: str, reason: str) -> None:
         """Fan ``resync{reason, sessionID}`` to every subscriber of sid."""
@@ -1409,8 +1476,11 @@ class TokenStreamHub:
         self.drop_part(key)
         sid = key[0]
         trunc = _truncated_frame(key, done, part_revision=captured_rev)
-        for sub in tuple(self._subs_by_sid.get(sid, ())):
-            sub.put(trunc)
+        # B3b-2: the truncated frame is a live-fanout business frame — it is
+        # replay-logged (a reconnecting client must learn the part was
+        # dropped) and id-stamped for v4 subscribers.
+        id_line = self._replay_publish_token(sid, trunc)
+        self._deliver_logged(sid, trunc, id_line)
         self._metrics.truncated_snapshots_total += 1
         return captured_rev
 

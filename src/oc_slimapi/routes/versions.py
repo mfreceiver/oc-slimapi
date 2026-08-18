@@ -11,10 +11,14 @@ Dual-version window (4.0.0, B3a-A3): ``available == [3, 4]``,
 ``current == 4`` (S-B04: during the (3,4) window the current view is
 always the newest major) and the capability map carries BOTH keys — the
 ``"3"`` shape verbatim from the 3.x terminal state, plus the ``"4"``
-differential face (§3.1). ``sseReplay`` / ``qpImmediateFull`` are
-deliberately ABSENT from ``"4"`` until B3b lands them — the acceptance
-criteria assert the absence, and capability keys are STATIC (never vary
-with runtime/DB state).
+differential face (§3.1). B3b landed and advertised the remaining two
+keys in the same batch as their implementations (n1 frozen timing):
+``sseReplay`` (Last-Event-ID reconnect replay, §7.2) spreads from the
+same-source ``META_CAPABILITY_KEYS`` constant the v4 SSE ``slimapi.meta``
+frame advertises, and ``qpImmediateFull`` is frozen as "already true"
+(design-v4-qp-payload §2/§3 — zero wire change). Capability keys remain
+STATIC (never vary with runtime/DB state — replay-log configuration does
+not alter the advertisement, §3.1).
 
 Response constraints (§3, frozen):
 
@@ -35,6 +39,7 @@ from fastapi import APIRouter, Request
 from .. import __version__
 from ..config import settings
 from ..gzip_util import json_response
+from ..sse.replay_wire import META_CAPABILITY_KEYS
 from ..traffic import EXPAND_CATEGORIES
 from ..versioning import ACCEPTED_CLIENT_VERSIONS, SERVER_API_VERSION
 
@@ -65,12 +70,19 @@ CAPABILITIES: dict[str, dict] = {
         ],
     },
     # v4 differential face (§3.1): STATIC capability keys only — the wire
-    # deltas the 4.0 window actually ships at this stage. sseReplay /
-    # qpImmediateFull are NOT advertised here (B3b owns them; acceptance
-    # asserts their absence). No runtime-dependent keys ever appear.
+    # deltas the 4.0 window ships. B3b advertises sseReplay /
+    # qpImmediateFull in the same batch as their implementations (n1
+    # frozen timing: B3a shipped "4" WITHOUT them, so the absence was the
+    # B3a-期 wire face). sseReplay spreads from META_CAPABILITY_KEYS — the
+    # same-source constant the v4 SSE meta frame advertises — so the
+    # versions lane and the meta lane can never drift apart. No
+    # runtime-dependent keys ever appear (replay-log env changes never
+    # alter this advertisement).
     "4": {
         "globalSessions": True,
         "auxiliaryFilters": True,
+        **META_CAPABILITY_KEYS,
+        "qpImmediateFull": True,
     },
 }
 

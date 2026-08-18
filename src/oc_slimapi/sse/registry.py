@@ -77,6 +77,10 @@ class HubRegistry:
         # lifespan and pushes it here; the registry forwards the reference
         # onto any lazily-created GlobalHub (mirrors _token_hub wiring).
         self._turn_registry: TurnRegistry | None = None
+        # B3b-2: process-wide replay log (app.state.replay_log), forwarded
+        # onto any lazily-created GlobalHub via the ctor kwarg (mirrors
+        # _token_hub / _turn_registry wiring). ``None`` = v3-only stack.
+        self._replay_log: Any | None = None
         self._removal_task: asyncio.Task | None = None
 
     def set_transforms(self, pool: Any) -> None:
@@ -108,6 +112,20 @@ class HubRegistry:
         if self._global is not None:
             self._global._turn_registry = registry
 
+    def set_replay_log(self, replay_log: Any | None) -> None:
+        """Wire the process-wide :class:`ReplayLog` (B3b-2) onto the
+        registry and any live GlobalHub.
+
+        Mirrors :meth:`set_token_hub`: app.py constructs the replay log in
+        lifespan (``app.state.replay_log``) and pushes it here BEFORE any
+        hub exists; ``get()`` forwards it onto the lazily-created GlobalHub
+        via the ctor kwarg. ``None`` is accepted for tests / v3-only stacks
+        (hub runs the unchanged id-less / un-logged pipeline).
+        """
+        self._replay_log = replay_log
+        if self._global is not None:
+            self._global.set_replay_log(replay_log)
+
     def get(self, directory: str | None = None) -> GlobalHub:
         if self._global is None:
             self._global = GlobalHub(
@@ -117,6 +135,7 @@ class HubRegistry:
                 max_frame_bytes=self.max_frame_bytes,
                 traffic_ledger=self._traffic_ledger,
                 turn_registry=self._turn_registry,
+                replay_log=self._replay_log,
             )
             self._global._token_hub = self._token_hub
         return self._global

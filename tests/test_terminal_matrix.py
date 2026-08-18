@@ -407,6 +407,8 @@ async def test_versions_terminal_shape():
         assert body["capabilities"]["4"] == {
             "globalSessions": True,
             "auxiliaryFilters": True,
+            "sseReplay": True,
+            "qpImmediateFull": True,
         }
 
 

@@ -1,6 +1,6 @@
 # oc-slimapi v4 wire 契约（4.0.0 实施基线）
 
-> **状态**：**4.0.0 实施基线（2026-08-18，B3a 已落地）**。B0 批冻结全部可观察语义（2026-08-17，rev-6 PASS-with-notes + S-B01 四项 owner 终裁全收敛）；wire 终态 = 4.0.0（`ACCEPTED_CLIENT_VERSIONS` (3,3)→(3,4)）。B3a 批（阶段 A selector 双版本 / B1 dbaux 连接生命周期 / B2 投影 SQL / B3 cursor / B4 路由分叉降级矩阵 / B5 观测）已按本契约落地并全量测试通过；§7（SSE id:/重放、token 流）随 4.0.0 B3b 批落地。S-B01 四项（§7.0）**已全部 owner 终裁（2026-08-17）**；其余章节（含 DB 设计 R1/R2/R3/R6，已凭真库实证冻结——见 design-v4-dbaux §0.2）均为冻结语义。
+> **状态**：**4.0.0 实施基线（2026-08-18，B3a+B3b 已落地）**。B0 批冻结全部可观察语义（2026-08-17，rev-6 PASS-with-notes + S-B01 四项 owner 终裁全收敛）；wire 终态 = 4.0.0（`ACCEPTED_CLIENT_VERSIONS` (3,3)→(3,4)）。B3a 批（阶段 A selector 双版本 / B1 dbaux 连接生命周期 / B2 投影 SQL / B3 cursor / B4 路由分叉降级矩阵 / B5 观测）已按本契约落地并全量测试通过；B3b 批（SSE id:/重放、§7 全量、能力键 `sseReplay`/`qpImmediateFull` 广告）**已落地**。S-B01 四项（§7.0）**已全部 owner 终裁（2026-08-17）**；其余章节（含 DB 设计 R1/R2/R3/R6，已凭真库实证冻结——见 design-v4-dbaux §0.2）均为冻结语义。
 > **继承基线**：v3 契约（`docs/specs/v3-contract.md`）全量继承 + 本文件逐条差异覆盖——**凡未提及语义逐字沿用 v3**（投影、SSE 帧名帧形、资源上限、错误映射、gzip 族、指纹、catalog、token stream 帧形等）。v4 = v3 的**严格超集面**上的差异层：新增全局 sessions 面（DB 投影源）、SSE id:/重放、directory 于全局列表退役。
 > **裁决出处**：`docs/system-architecture-proposal-2026-08-17.md`（v2.2，权威基准，行号引用）；工程细化 `docs/refactor-plans/slimapi-refactor-plan.md`；设计文档 `design-v4-selector.md` / `design-v4-dbaux.md` / `design-v4-sse-replay.md` / `design-v4-qp-payload.md`。
 > **消费者**：ocdroid（B5a 探测 / B5b 适配）与 oc-webui 可**仅凭本文件**完成 v4 对接开发。
@@ -47,14 +47,14 @@
    "4": {
      "globalSessions": true,      # B3a 起
      "auxiliaryFilters": true,    # B3a 起
-     "sseReplay": true,           # B3b 起（B3a 期缺席）
-     "qpImmediateFull": true      # B3b 起（B3a 期缺席；语义由 design-v4-qp-payload.md 结论冻结）
+     "sseReplay": true,           # B3b 起已广告（同批落地）
+     "qpImmediateFull": true      # B3b 起已广告（同批落地；语义由 design-v4-qp-payload.md 结论冻结）
    }}}
 ```
 
 - `current` 双版本期恒为最新主版本（=4，S-B04）。
 - **能力键为静态键**（v2.2 行 140/254）：存在即广告，**不随 DB 抖动**——DB 熔断/降级不改变 capabilities，瞬态可用性经 503 + health `auxiliary` 字段（§3.2）+ metrics 表达。
-- **广告时序（n1 冻结）**：`sseReplay`/`qpImmediateFull` 与实现**同批启用**——B3a 的 `capabilities["4"]` **不含**此二键；B3b 实现落地同期广告。消费者：键缺席 = 该能力不可用，不得预依赖。
+- **广告时序（n1 冻结）**：`sseReplay`/`qpImmediateFull` 与实现**同批启用**——B3a 的 `capabilities["4"]` **不含**此二键；B3b 实现落地同期广告（**已执行，B3b-5**：两键随 4.0.0 发布面广告；本条为时序约束的历史记录）。消费者：键缺席 = 该能力不可用，不得预依赖。
 - 消费者探测（B5a）：`capabilities["4"]` 不存在 → 继续 v=3；未知键容忍忽略。
 
 ### §3.2 `GET /slimapi/health` 双视图
@@ -177,7 +177,7 @@ v3 原样（§4.4 已含 v4 差异：v4 sessions 无 ETag）。
 
 ## §7 SSE id: / 重放（v4-only）[四项已全部 owner 终裁，2026-08-17]
 
-> 设计权威：`design-v4-sse-replay.md`（协议矩阵用例表 + 状态机全文）。本节为 wire 可见语义。**v3 SSE 帧名帧形零变化**（v2.2 行 153 冻结）——id:/重放仅 v4 生效；v3 客户端无感知。能力键 `sseReplay` 随 B3b 广告（§3.1 时序）。
+> 设计权威：`design-v4-sse-replay.md`（协议矩阵用例表 + 状态机全文）。本节为 wire 可见语义，**已随 B3b 批落地（B3b-2，全量测试通过）**。**v3 SSE 帧名帧形零变化**（v2.2 行 153 冻结）——id:/重放仅 v4 生效；v3 客户端无感知。能力键 `sseReplay`/`qpImmediateFull` 已随 B3b 落地并广告（§3.1）。
 
 ### §7.0 四项协议裁决记录（S-B01，B0 出门 gate）
 
@@ -202,7 +202,7 @@ v3 原样（§4.4 已含 v4 差异：v4 sessions 无 ETag）。
 - 有界重放日志（新组件，count/bytes/TTL 三维上限，环形覆盖）——现 GlobalHub pending（250ms debounce）与 tombstone 队列**不是** replay log；与既有 token 域重放队列（cap 1000/TTL 24h）并存不混用。
 - `Last-Event-ID` 重连：缺口在日志窗口内 → 补发 replay 帧；ID 过期（早于窗口）→ 发 resync 提示帧（客户端全量对齐）；**epoch 归类（冻结，四类拆分）**：旧 epoch（格式合法、epoch ≠ 当前——随机 nonce 无序不比较大小，即进程重启前世界）→ `resync{reason:"epoch_changed"}`；future（同 epoch 且 seq > 已发布 max）→ 忽略 + 重置（按首连）；格式非法 / 跨端点域 / 跨 sid 域 → 忽略 + 重置。
 - **Last-Event-ID 分类优先级（冻结，严格短路序）**：①完整语法校验（域标签 + epoch 16hex + seq 十进制）→ ②端点标签与路径 sid 校验（`g:` 只属 `/events`；`t:` 只属 `/stream` 且 sid 匹配路径）→ ③epoch 比对（仅对通过 ② 的正确域 ID）→ ④seq/窗口比对（仅同 epoch）。组合输入按最先命中者短路（如 `t:<sid>:<旧epoch>:5` 到 `/events` = 跨端点域 → 忽略重置，不触发 epoch_changed）。
-- **上游断连恢复（触发条件冻结）**：**首次确认上游 loss 即触发**（EOF/异常路径为主，`_upstream_loss_notified` 防重；成功重连仅作未通知时兜底——v3 现行为延续，`global_hub.py:894-904/913-922/847-863`）→ 对全部存量订阅者 fanout `resync{reason:"reconnect_no_replay"}`（无 id）→ 恢复后新帧（seq 继续单调不重置；**epoch 不变**）；token 域另清空该 sid pending live 缓冲（`tokenstream/hub.py:1896-1900` 锚点）。**持久 barrier（S-B01④已裁决冻结，owner 2026-08-17；low-watermark 数据结构为实现细节）**：上游 loss 时写 low-watermark barrier（水位 = 该域已发布 max seq）——**写入范围 = 全局域 + 当前 epoch 内全部已创建 per-sid 域（不限在线订阅者）**；后续任何 `Last-Event-ID` seq **≤** barrier 水位的重连（含断连期间离线的客户端）一律 `resync{reconnect_no_replay}`（水位本身对应的帧亦发布于缺口前），seq > 水位 → 正常窗口判定；**禁止跨 barrier 补帧**（barrier 前后存在 sidecar 未观察到的上游事件缺口，窗口内连续不构成补帧依据）。barrier 不受 count/bytes/TTL 逐出（仅窗口下界严格越过后可删；域回收保留失效水位或 fail-safe resync；进程重启归 `epoch_changed` 拦截）；客户端 HTTP 全量对齐。
+- **上游断连恢复（触发条件冻结）**：**首次确认上游 loss 即触发**（EOF/异常路径为主，`_upstream_loss_notified` 防重；成功重连仅作未通知时兜底——v3 现行为延续，`global_hub.py:894-904/913-922/847-863`）→ 对全部存量订阅者 fanout `resync{reason:"reconnect_no_replay"}`（无 id）→ 恢复后新帧（seq 继续单调不重置；**epoch 不变**）；token 域另清空该 sid pending live 缓冲（`tokenstream/hub.py:1896-1900` 锚点）。**持久 barrier（S-B01④已裁决冻结，owner 2026-08-17；low-watermark 数据结构为实现细节）**：上游 loss 时写 low-watermark barrier（水位 = 该域已发布 max seq）——**写入范围 = 全局域 + 当前 epoch 内全部已创建 per-sid 域（不限在线订阅者）**；后续任何 `Last-Event-ID` seq **≤** barrier 水位的重连（含断连期间离线的客户端）一律 `resync{reconnect_no_replay}`（水位本身对应的帧亦发布于缺口前），seq > 水位 → 走完整第④级分类（**future**（同 epoch 且 seq > 已发布 max）→ 忽略 + 重置按首连；否则窗口内 replay / `replay_expired` / `replay_gap`，§7.2 上文分类）；**禁止跨 barrier 补帧**（barrier 前后存在 sidecar 未观察到的上游事件缺口，窗口内连续不构成补帧依据）。barrier 不受 count/bytes/TTL 逐出（仅窗口下界严格越过后可删；域回收保留失效水位或 fail-safe resync；进程重启归 `epoch_changed` 拦截）；客户端 HTTP 全量对齐。
 - gap 处理：区分「日志逐出」（→ resync）vs 合法缺席（单一/per-sid 域下不存在跨域合法空洞）。**snapshot 不是服务端帧**——resync 后客户端自行 HTTP 全量对齐（全局域如 `/slimapi/sessions` 首屏、token 域重拉消息投影），服务端只发 meta → resync → 新帧。逐出-发布并发的边界 gap 误判风险为实现期待验证项（design-v4-sse-replay.md §5 待裁决 5，可降级防御分支，不影响 wire 语义）。
 - 背压：溢出帧**入**重放日志（日志记录「已发布帧」而非「已送达帧」）；订阅端溢出断连 → 重连走 Last-Event-ID 重放。
 - **resync 帧 reason 值域（v4 冻结，加性扩展）**：`epoch_changed` | `replay_expired` | `replay_gap` | `reconnect_no_replay`（既有）；token 流 tombstone（消息已撤销）在 replay 时**照常消耗其 seq 并以 `message.removed` 轻量撤销帧回放**（既有帧形 `tokenstream/frames.py:137-151` = `event: message.removed` + `{sessionID, messageID}`；保留 `id:`，维持 ID 序列无空洞）。
@@ -210,7 +210,7 @@ v3 原样（§4.4 已含 v4 差异：v4 sessions 无 ETag）。
 
 ### §7.3 tokens=1（已裁决终态）
 
-- `/events?tokens=1`（v4）→ 400 `{"code":"tokens_stream_retired_in_v4","hint":"token 流请使用 /slimapi/sessions/{sid}/stream"}`；v3 请求该参数语义不变。
+- `/events?tokens=1`（v4）→ 400 `{"code":"tokens_stream_retired_in_v4","hint":"token 流请使用 /slimapi/sessions/{sid}/stream"}`；v3 请求该参数语义不变。（**一致性注记，B3b-5**：已核对实现错误体与本条逐字一致——`routes/events.py::TOKENS_STREAM_RETIRED_IN_V4`。）
 - token 流端点 `/slimapi/sessions/{sid}/stream`：v4 起分配独立 id:（§7.1）；directory 消费保留（§5.2）。
 
 ### §7.4 q/p 帧载荷（`qpImmediateFull` 语义）
@@ -307,4 +307,4 @@ v4 sessions 归入 sessions 桶既有记账；降级路径请求带 degraded 标
 | §7 | design-v4-sse-replay.md + design-v4-qp-payload.md |
 | §3 能力键时序 | refactor-plan §4.1（n1 冻结） |
 
-*（完）B0-1 产出。定稿条件已执行（2026-08-18）：S-B01 ②③④ owner 终裁收敛，状态行更新为「4.0.0 实施基线（B3a 已落地）」；§7 条目随 B3b 批落地后，本文件随 4.0.0 发版定稿。*
+*（完）B0-1 产出。定稿条件已执行（2026-08-18）：S-B01 ②③④ owner 终裁收敛，状态行更新为「4.0.0 实施基线（B3a 已落地）」→ B3b 批落地后更新为「B3a+B3b 已落地」（B3b-5，本行）；本文件随 4.0.0 发版定稿。*

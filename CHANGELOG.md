@@ -28,7 +28,7 @@ ocdroid 对接时：
 
 ## [4.0.0] - 2026-08-18 — wire 双版本 (3,4)：?v=4 sessions 全局面（DB 投影 + 降级矩阵）+ versions/health 双视图（包版本 major；wire 版本 3 → **(3,4) 双版本窗口**）
 
-> P3 批次（B3a：阶段 A selector 双版本 + B1 dbaux 连接生命周期 + B2 投影 SQL + B3 cursor + B4 路由分叉降级 + B5 观测 + B6 契约同步）。依据 `docs/specs/v4-contract.md`（**4.0.0 实施基线**）与 B0 设计文档（design-v4-selector / design-v4-dbaux）。**ocdroid 必改点：仅当采用 `?v=4`**——不升级的消费者继续走 `?v=3`，全部 v3 语义**逐字节不变**（既有测试零改动前提下的回归基线）。§7（SSE id:/重放、q/p 载荷）随 4.0.0 B3b 批落地，条目见下文标注。
+> P3 批次（B3a：阶段 A selector 双版本 + B1 dbaux 连接生命周期 + B2 投影 SQL + B3 cursor + B4 路由分叉降级 + B5 观测 + B6 契约同步；B3b：SSE `id:`/重放 + q/p 载荷核对 + 能力键广告）。依据 `docs/specs/v4-contract.md`（**4.0.0 实施基线，B3a+B3b 已落地**）与 B0 设计文档（design-v4-selector / design-v4-dbaux / design-v4-sse-replay / design-v4-qp-payload）。**ocdroid 必改点：仅当采用 `?v=4`**——不升级的消费者继续走 `?v=3`，全部 v3 语义**逐字节不变**（既有测试零改动前提下的回归基线）。§7（SSE id:/重放、q/p 载荷）**已随 B3b 批落地**，条目见下文。
 
 ### Changed（破坏性——wire 主版本 bump 3 → 4）
 
@@ -39,23 +39,28 @@ ocdroid 对接时：
   - 响应 `SessionSkeletonV4`：v3 投影 + `project: {id,name,worktree} | null`（join 缺行 → null）+ v4-only 字段（`tokens_input`/`tokens_output` 等真库列名）；键序 `items,nextCursor,complete[,degraded]`；排序冻结 `(time_updated DESC, id DESC)`；无 ETag/Vary（v3 面的 ETag/304 保留）。
   - **降级矩阵**（dbaux 不可用时）：allowlist 非空 / search 含通配符 / 带 cursor / Class B（`archived=only` 或 `parent∈{only,<sid>}`）→ **503 `auxiliary_unavailable` + `Retry-After: 30`**；Class A（`archived∈{omit,all}` × `parent∈{all,none}`）→ 200 + `degraded:true`（走上游 HTTP `/session`，`parent=none` 映射 `roots=true`；错误体不泄露 DB 路径/schema/allowlist）。
   - **版本参数互斥 422 `param_version_mismatch`**：v3 请求带 `archived`/`parent`/`cursor` → 422；v4 请求带 `roots`/`start` → 422；v4 `limit`>500 → 422。错误优先级：400 `invalid_cursor`（纯内存指纹校验）先于 503。
-- **`GET /slimapi/versions` 双视图载荷**：`{"current":4,"available":[3,4],"capabilities":{"3":<形状不变>,"4":{"globalSessions":true,"auxiliaryFilters":true}}}`；能力键静态（`sseReplay`/`qpImmediateFull` 待 B3b 落地后才广告——本版断言缺席）。
+- **`GET /slimapi/versions` 双视图载荷**：`{"current":4,"available":[3,4],"capabilities":{"3":<形状不变>,"4":{"globalSessions":true,"auxiliaryFilters":true,"sseReplay":true,"qpImmediateFull":true}}}`；能力键静态（不随运行态/DB/重放日志配置抖动）；`sseReplay`/`qpImmediateFull` 随 B3b 实现**同批广告**（B3a 期此二键缺席是过渡面，4.0.0 发布面恒为四键）。
 - **`GET /slimapi/health` 双视图**：按请求 wireVersion——v3 视图形状不变（`schema.version=3`/`server.api_version=3`）；v4 视图双双 =4 + `auxiliary:{"available":…,"mode":"db"|"http"}`（dbaux 真实状态）+ `allowlist:{enabled}` 双视图保持。`GET /slimapi/ready` 形状与取值不变。
 
 ### Removed（v4 面退役——v3 面保留）
 
 - **directory 于 v4 sessions 列表退役**：`?v=4` 的 `GET /slimapi/sessions` 携带 directory（query 单值/多值、header、query+header 混合四形态）→ 一律 **400 `directory_retired_in_v4`**（selector 层拦截，先于路由与多值校验；不泄露目录存在性）。per-session/todo/children/messages 等其余 27 条路由的 `?directory=` 消费语义不变。
-- **token stream 于 v4 退役（随 4.0.0 B3b 批落地）**：v4 下 `GET /slimapi/sessions/{sid}/stream` 退役 → `tokens_stream_retired_in_v4`；SSE `id:`/重放、q/p 直推载荷等 §7 内容随 B3b 批次合入本节（发版前两批均已合入）。
+- **`/events?tokens=1` 统一 token 流于 v4 退役（B3b）**：v4 下 `GET /slimapi/events?tokens=1` → **400 `{"code":"tokens_stream_retired_in_v4","hint":"token 流请使用 /slimapi/sessions/{sid}/stream"}`**（流打开前平面错误，不占订阅位；v3 面该参数语义不变）。token 流端点 `GET /slimapi/sessions/{sid}/stream` **不退役**——v4 起为唯一 token 通道并分配独立 `id:` 序列（见 Added）。
 
 ### Added（加性）
 
-- **观测扩维**：access log / snapshot 维度 `selectorResult` 增 `v4`、`wireVersion` 增 `"4"`（`docs/manual/traffic-accounting.md` §5.1 已同步）；`GET /slimapi/metrics` 新增 `dbaux` 块：`available/mode/reason/generation/source`、查询延迟 `latency{p50_ms,p99_ms,samples,total}`（60s 滑窗 nearest-rank）、`breaker_open`、`counters{queries,probes,trips,swaps,disables}`（不泄露 DB 路径）。
+- **SSE `id:` 序列与 Last-Event-ID 重放（B3b，v4-only——v3 SSE 帧名帧形零变化）**：
+  - **id: 语法（域标签编入）**：全局流 `GET /slimapi/events` 业务帧（digest/q/p/error）带 `id: g:<epoch>:<seq>`；token 流 `GET /slimapi/sessions/{sid}/stream` 带 `id: t:<sid>:<epoch>:<seq>`（per-sid 独立序列）。epoch = 16-hex 随机 boot nonce（**进程重启必换、SSE 重连不换**、无序不比较大小），seq per-domain 单调递增从 1 起。meta/resync/heartbeat 帧**无 id**（不参与序列）；token tombstone（`message.removed`）照常消耗 seq 回放——ID 序列无空洞。
+  - **重连重放（Last-Event-ID）四类输入分类（严格短路序）**：①完整语法校验（域标签+epoch 16hex+seq 十进制）→ ②端点标签与路径 sid 校验（`g:` 只属 `/events`、`t:` 只属 `/stream` 且 sid 匹配路径）→ ③epoch 比对 → ④barrier/窗口/gap 判定。①② 违约与 future cursor（同 epoch 且 seq > 已发布 max）→ **忽略+重置按首连**（不报错不 resync）；③ 旧 epoch → `resync{epoch_changed}`；④ 缺口在窗口内 → 按严格递增 seq 补发 replay 帧（先于任何新帧）；过期/早于窗口 → `resync{replay_expired}`；**resync reason 值域（v4 冻结）= `epoch_changed` | `replay_expired` | `replay_gap` | `reconnect_no_replay`**。服务端**永不发 snapshot 帧**——resync 后客户端自行 HTTP 全量对齐。**上游断连 barrier**：首次确认上游 loss 即对全存量订阅者 fanout `resync{reconnect_no_replay}` 并写 low-watermark（水位=该域已发布 max seq，覆盖全局域+当前 epoch 内全部 per-sid 域）；此后任何 `seq ≤ 水位` 的重连（含断连期间离线客户端）一律 `reconnect_no_replay`（**禁跨 barrier 补帧**），`seq > 水位` 走完整第④级分类。有界重放日志（count/bytes/TTL 三维上限，环形覆盖）；背压溢出帧仍入日志（记「已发布」非「已送达」），订阅端溢出断连 → 重连走重放。
+  - **meta v4 additive 扩展**：`slimapi.meta` 首帧（v3 形状不动）v4 起追加可忽略字段 `capabilities`（摘要 `{"sseReplay":true}`——流作用域子集，同源常量于 versions 端 `capabilities["4"]`）、`epoch`（本连接判定的 epoch 基线）、`seqBase`（连接时域内已发布 max seq；首连首个带 id 帧 = seqBase+1）。meta 帧自身**不带 id**。
+- **观测扩维**：access log / snapshot 维度 `selectorResult` 增 `v4`、`wireVersion` 增 `"4"`（`docs/manual/traffic-accounting.md` §5.1 已同步）；`GET /slimapi/metrics` 新增 `dbaux` 块：`available/mode/reason/generation/source`、查询延迟 `latency{p50_ms,p99_ms,samples,total}`（60s 滑窗 nearest-rank）、`breaker_open`、`counters{queries,probes,trips,swaps,disables}`（不泄露 DB 路径）；**新增 `replay` 块（B3b-5）**：`epoch`（进程 boot nonce，对账客户端 Last-Event-ID epoch 用）+ 窗口状态 `domains/frames/bytes/barriers` + `counters`（按分类结果计数：`replayed`/`up_to_date`/`ignore_reset` + 四类 resync reason；不泄露帧载荷/目录）。
 - **新 env `OC_SLIMAPI_DBAUX_PROBE_INTERVAL_S`**（默认 30，>0；dbaux 探测周期）。DB 通道发现顺序：`OC_SLIMAPI_OPENCODE_DB` > 上游 `OPENCODE_DB`（`XDG_DATA_HOME` 相对解析）> 候选发现；只读 URI（`mode=ro` + `query_only`），零写入。
+- **新 env `OC_SLIMAPI_REPLAY_COUNT` / `OC_SLIMAPI_REPLAY_BYTES_KB` / `OC_SLIMAPI_REPLAY_TTL_S`（B3b）**：重放日志三维上限（默认 2048 帧/域、65536 KiB 进程总额、900s 帧龄；fail-closed 校验 ≥1/≥1/>0）。仅调 v4 重放窗口大小，不影响 v3 面；能力键 `sseReplay` 为静态广告，不随此配置抖动。
 - **部署依赖（运维注意）**：`?v=4` 全局面依赖对 opencode SQLite 的只读访问；不可用时按降级矩阵自动回落（503/`degraded:true`），无需配置干预。
 
 ### 消费者行动项
 
-- **ocdroid**：可选升级 `?v=4`（B5a 探测 → B5b 适配）；升级时 sessions 列表移除 directory 参数（v4 全局面）、改用 `cursor`/`archived`/`parent`/`search`、`limit`≤500、处理 503 `auxiliary_unavailable`（`Retry-After:30`）与 `degraded:true` 标记；不升级则维持 `?v=3` 零改动。
+- **ocdroid**：可选升级 `?v=4`（B5a 探测 → B5b 适配）；升级时 sessions 列表移除 directory 参数（v4 全局面）、改用 `cursor`/`archived`/`parent`/`search`、`limit`≤500、处理 503 `auxiliary_unavailable`（`Retry-After:30`）与 `degraded:true` 标记；SSE 侧可（非必须）启用 `Last-Event-ID` 断线重连（meta 帧 `epoch`/`seqBase` 为基线，收到 `resync` 帧后走 HTTP 全量对齐——服务端不发 snapshot），`?v=4` 下 `/events?tokens=1` 已 400；不升级则维持 `?v=3` 零改动。
 - **oc-webui**：同上；建议先经 `GET /slimapi/versions` 能力探测再启用 v4。
 
 ### 文档勘误（随本版记录）

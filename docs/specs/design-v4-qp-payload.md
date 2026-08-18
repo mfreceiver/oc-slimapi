@@ -22,7 +22,7 @@ opencode EventV2 publish (question.asked / question.v2.asked / permission.asked 
   └─▶ GlobalHub.publish()  global_hub.py:513-535
          props = payload["properties"]          # global_hub.py:522 原样透传，零裁剪
          frame = {directory, type, properties}  # global_hub.py:526-530  ≤ IMMEDIATE 直推
-  └─▶ SSE 帧: event: <type>  data: {directory, type, properties}
+  └─▶ SSE 帧: data: {directory, type, properties}   # 措辞校正（P1, B3b-5）：IMMEDIATE 直推帧**无 `event:` 头**（sse_frame 默认 event=None，raw 直推风格，客户端按 `data.type` 分发）——与行为锁一致
 ```
 
 **关键事实（源码实证）**：

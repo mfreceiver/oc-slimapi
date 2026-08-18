@@ -44,10 +44,13 @@ from .hub_types import (
     _upstream_line_bytes,
     sse_frame,
 )
+from .replay_log import GLOBAL_DOMAIN
+from .replay_wire import sse_id_line
 
 if TYPE_CHECKING:
     from ..traffic import TrafficLedger
     from ..turn_registry import TurnRegistry
+    from .replay_log import ReplayLog
     from .token_hub import TokenStreamHub
 
 logger = get_logger(__name__)
@@ -69,6 +72,7 @@ class GlobalHub:
         traffic_ledger: "TrafficLedger | None" = None,
         turn_registry: "TurnRegistry | None" = None,
         directory_allowlist: list[str] | None = None,
+        replay_log: "ReplayLog | None" = None,
     ):
         self.client = client
         self.subscribers: set[Subscriber] = set()
@@ -77,6 +81,18 @@ class GlobalHub:
         self.max_frame_bytes = max_frame_bytes
         self._traffic_ledger = traffic_ledger
         self.directory_allowlist = directory_allowlist
+        # B3b-2 (v4 SSE replay): the process-wide bounded ring replay log
+        # (app.state.replay_log, forwarded through HubRegistry so the
+        # lazily-created hub gets it too). ``None`` = v3-only stack (no
+        # logging, no id stamping — byte-identical v3 behaviour). When
+        # wired, EVERY published global business frame (IMMEDIATE q/p,
+        # session.digest, session.error) is recorded in the GLOBAL domain
+        # ("已发布帧" semantics — logged even with zero v4 / zero live
+        # subscribers, so a reconnecting client can replay what it missed
+        # while disconnected); per-subscriber delivery then prefixes the
+        # ``id:`` line for wire_v4 subscribers only (v3 subscribers keep
+        # id-less bytes).
+        self._replay = replay_log
         # Turn token fence (S9 ingest-time snapshot stamp). Injected from
         # app.py via set_turn_registry(); ``None`` → no stamping (fields
         # omitted from every digest, ocdroid degrades).
@@ -370,8 +386,25 @@ class GlobalHub:
         Called from BOTH run() reconnect paths; the per-epoch guard
         (``_upstream_loss_notified``) ensures the exception path does not
         fire on every retry-loop iteration.
+
+        B3b-2 (v4 SSE replay, §7.2 S-B01④ frozen): the first confirmed
+        upstream loss also writes a replay **barrier** across the GLOBAL
+        domain AND every per-sid token domain created in this epoch
+        (offline domains included — ``write_barrier(None)`` spans all of
+        them). Any reconnect cursor at/below a domain's watermark is
+        answered ``resync{reconnect_no_replay}`` (禁跨 barrier 补帧);
+        cursors above it fall through to the normal window judgment. The
+        epoch does NOT change and per-domain seq does NOT reset —
+        post-recovery frames simply continue the sequence above the
+        watermark. Best-effort: a barrier-write failure degrades to the
+        pre-replay behaviour (resync fanout only) with a warning.
         """
         self.resync_all()
+        if self._replay is not None:
+            try:
+                self._replay.write_barrier()
+            except Exception:
+                logger.warning("replay barrier write failed", exc_info=True)
         if self._token_hub is not None:
             self._token_hub.on_upstream_reconnect()
 
@@ -492,6 +525,42 @@ class GlobalHub:
         # takes effect on the next config change (documented ops semantic).
         clear_allowlist_roots_cache()
 
+    def set_replay_log(self, replay_log: "ReplayLog | None") -> None:
+        """Wire the process-wide :class:`ReplayLog` (B3b-2).
+
+        Mirrors :meth:`set_token_hub`: ``HubRegistry`` owns the canonical
+        reference (``app.state.replay_log``, constructed in lifespan) and
+        pushes it onto the live GlobalHub and any hub constructed later
+        via ``HubRegistry.get``. ``None`` = v3-only stack (no logging, no
+        id stamping — accepted for tests / detach).
+        """
+        self._replay = replay_log
+
+    def _replay_publish(self, frame: bytes) -> bytes | None:
+        """Record one published global business frame in the replay log.
+
+        Returns the frame's ``id: …\\n`` line, or ``None`` when no replay
+        log is wired / the append failed. Publishing NEVER fails because
+        replay bookkeeping failed: an append error (log closed,
+        unexpected) degrades to id-less fan-out with a warning.
+
+        Called ONLY from :meth:`_emit_directory_frame` after the
+        allowlist pass — a frame dropped by the directory allowlist was
+        never published to anyone and consumes no seq. The append happens
+        regardless of subscriber count / subscriber wire views ("已发布
+        帧" semantics — REPLAY-007/018: frames published while a client
+        was backpressured or fully offline must be replayable).
+        """
+        replay = self._replay
+        if replay is None:
+            return None
+        try:
+            entry = replay.append(GLOBAL_DOMAIN, frame)
+        except Exception:
+            logger.warning("replay log append failed", exc_info=True)
+            return None
+        return sse_id_line(GLOBAL_DOMAIN, replay.epoch, entry.seq)
+
     def _directory_allowed(self, directory: Any) -> bool:
         allowlist = self.directory_allowlist
         if not allowlist:
@@ -508,8 +577,16 @@ class GlobalHub:
         if not self._directory_allowed(directory):
             self.allowlist_dropped_events += 1
             return
+        # B3b-2: log the published frame (global domain) and — only for
+        # wire_v4 subscribers — deliver the id-prefixed bytes. v3
+        # subscribers keep receiving the frame VERBATIM (zero-change iron
+        # rule: the id line exists solely in the v4 subscriber's copy).
+        id_line = self._replay_publish(frame)
         for subscriber in tuple(self.subscribers):
-            subscriber.put(frame)
+            if id_line is not None and subscriber.wire_v4:
+                subscriber.put(id_line + frame)
+            else:
+                subscriber.put(frame)
         if self.subscribers:
             self.emitted_frames_total += len(self.subscribers)
 

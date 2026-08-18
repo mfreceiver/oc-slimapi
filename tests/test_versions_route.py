@@ -45,9 +45,18 @@ async def test_versions_capabilities_map():
         body = (await client.get("/slimapi/versions")).json()
         caps = body["capabilities"]
         assert set(caps.keys()) == {"3", "4"}
-        # B3a-A3: capabilities["4"] carries exactly the two static keys;
-        # sseReplay / qpImmediateFull are deliberately absent (B3b owns them).
-        assert caps["4"] == {"globalSessions": True, "auxiliaryFilters": True}
+        # B3b-5: capabilities["4"] carries the four STATIC keys — B3a's
+        # globalSessions/auxiliaryFilters plus the same-batch-advertised
+        # sseReplay (n1 frozen timing: B3a shipped "4" without them, so
+        # the absence was the B3a-期 wire face) and qpImmediateFull
+        # (semantics frozen as "already true", design-v4-qp-payload).
+        assert caps["4"] == {
+            "globalSessions": True,
+            "auxiliaryFilters": True,
+            "sseReplay": True,
+            "qpImmediateFull": True,
+        }
+        # v3 caps regression: the "3" face is frozen verbatim.
         assert caps["3"]["envelope"] == ["messages", "sessions"]
         assert caps["3"]["directoryQuery"] is True
         assert caps["3"]["versionHeaderOptional"] is True
@@ -56,6 +65,48 @@ async def test_versions_capabilities_map():
             "file", "vcs", "find", "providers",
             "sessionSingle", "activeSessions", "globalHealth",
         ]
+
+
+async def test_versions_caps4_meta_lane_same_source():
+    """B3b-5: the versions lane and the v4 SSE meta lane cannot drift —
+    every capability the meta first-frame advertises must also be
+    advertised (same value) by capabilities["4"]. The meta summary is a
+    stream-scoped subset (per-stream keys only), so the assertion is a
+    keyed subset check, not equality."""
+    from oc_slimapi.sse.replay_wire import META_CAPABILITY_KEYS
+
+    async with _client(_build_app()) as client:
+        body = (await client.get("/slimapi/versions")).json()
+        caps4 = body["capabilities"]["4"]
+        assert META_CAPABILITY_KEYS == {"sseReplay": True}
+        for key, value in META_CAPABILITY_KEYS.items():
+            assert key in caps4, f"meta advertises {key!r} but versions does not"
+            assert caps4[key] == value
+        # Same-source constant: the endpoint spreads it verbatim.
+        assert caps4["sseReplay"] is META_CAPABILITY_KEYS["sseReplay"] is True
+
+
+async def test_versions_caps4_static_key_order():
+    """Producer-owned key order follows contract §3.1 verbatim (the four
+    keys in their frozen order — consumers must not rely on it, but the
+    producer shape stays byte-stable for golden comparisons)."""
+    async with _client(_build_app()) as client:
+        body = (await client.get("/slimapi/versions")).json()
+        assert list(body["capabilities"]["4"].keys()) == [
+            "globalSessions", "auxiliaryFilters",
+            "sseReplay", "qpImmediateFull",
+        ]
+
+
+async def test_versions_caps4_static_face_no_runtime_keys():
+    """§3.1 static-key principle: capabilities["4"] never carries
+    runtime-injected keys (the expand block is a "3"-only face) and every
+    advertised value is a literal boolean True — replay-log configuration
+    or DB state must not bleed into the advertisement."""
+    async with _client(_build_app()) as client:
+        caps = (await client.get("/slimapi/versions")).json()["capabilities"]
+        assert "expand" not in caps["4"]
+        assert all(v is True for v in caps["4"].values())
 
 
 async def test_versions_sidecar_version_is_package_version():

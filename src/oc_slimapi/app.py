@@ -31,6 +31,8 @@ from .routes import actions, agent, children, command, directories, events, heal
 from .routes import diff as diff_routes
 from .selector import SlimapiSelectorMiddleware
 from .sse.hub import HubRegistry
+from .sse.replay_log import ReplayLog, new_epoch
+from .sse.replay_wire import replay_sweep_loop
 from .sse.singleflight import fulls
 from .sse.token_hub import TokenStreamHub, TokenStreamRegistry
 from .sse.tokenstream.hub import apply_debug_budget_overrides
@@ -82,6 +84,12 @@ _TRANSFORM_DRAIN_TIMEOUT = 10.0
 # with a 5s busy_timeout ceiling, so 5s covers the worst legitimate case
 # without stalling the uvicorn graceful-shutdown window.
 _DBAUX_DRAIN_TIMEOUT = 5.0
+
+# B3b-2: replay-log maintenance cadence — TTL GC + barrier GC + expired
+# token-domain recycle (design-v4-sse-replay §3.4). 60s keeps expired-frame
+# memory bounded without measurable sweep cost; the TTL itself (15 min
+# default) is the wire-visible window, this is purely bookkeeping cadence.
+_REPLAY_SWEEP_INTERVAL_S = 60.0
 
 # Graceful shutdown timeout for uvicorn's active-connection (SSE) drain
 # (P0-1). uvicorn waits this long for active connections to finish before
@@ -415,6 +423,52 @@ async def lifespan(app: FastAPI):
         # not raise; the async Semaphore it constructs binds lazily to the
         # running loop, which is always live here (lifespan).
         app.state.actions_registry = actions_load_registry(settings)
+        app.state.replay_epoch = new_epoch()
+        app.state.replay_log = ReplayLog(
+            epoch=app.state.replay_epoch,
+            max_count=settings.replay_max_count,
+            max_bytes=settings.replay_max_bytes_kb * 1024,
+            ttl_s=settings.replay_ttl_s,
+        )
+
+        def _close_replay_log():
+            # No background tasks / file handles — close() just releases
+            # retained frames deterministically (mirrors the dbaux/
+            # token_hub best-effort teardown pattern).
+            try:
+                app.state.replay_log.close()
+            except Exception as exc:  # noqa: BLE001 — best-effort
+                get_logger("app").warning("replay_log.close failed", exc_info=exc)
+        stack.callback(_close_replay_log)
+        # B3b-2: periodic replay-log maintenance (TTL GC + barrier GC +
+        # expired token-domain recycle — design-v4-sse-replay §3.4). The
+        # sweep task stops BEFORE replay_log.close() (LIFO: this cleanup is
+        # registered after _close_replay_log) and is force-cancelled if it
+        # does not drain within the grace window.
+        replay_sweep_stop = asyncio.Event()
+        replay_sweep_task = asyncio.create_task(
+            replay_sweep_loop(
+                app.state.replay_log,
+                interval_s=_REPLAY_SWEEP_INTERVAL_S,
+                stop_event=replay_sweep_stop,
+            )
+        )
+        app.state._replay_sweep_task = replay_sweep_task
+
+        async def _stop_replay_sweep():
+            replay_sweep_stop.set()
+            if replay_sweep_task.done():
+                return
+            replay_sweep_task.cancel()
+            try:
+                await replay_sweep_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:  # noqa: BLE001 — best-effort
+                get_logger("app").warning(
+                    "replay sweep task error during shutdown", exc_info=exc
+                )
+        stack.push_async_callback(_stop_replay_sweep)
         # T3-hardened hub registry (contract §6): per-subscriber byte budget,
         # per-frame ceiling, and per-directory / total admission caps all flow
         # in from Settings so an operator can tune them via env without code.
@@ -430,6 +484,11 @@ async def lifespan(app: FastAPI):
             max_frame_bytes=settings.sse_max_frame_bytes,
             traffic_ledger=app.state.traffic_ledger,
         )
+        # B3b-2: share the process replay log with every lazily-created
+        # GlobalHub — business frames append to the global domain (v4
+        # subscribers get id-stamped deliveries) and confirmed upstream
+        # loss writes cross-domain barriers (design-v4-sse-replay §3.4).
+        app.state.hubs.set_replay_log(app.state.replay_log)
         app.state.hubs.get_global().set_directory_allowlist(
             settings.directory_allowlist
         )
@@ -473,8 +532,13 @@ async def lifespan(app: FastAPI):
         # INV-5 (P1-17): pass max_frame_bytes from Settings so the hub's
         # snapshot/truncation ceiling matches the subscriber's oversized
         # ceiling (same source: settings.token_stream_max_frame_bytes).
+        # B3b-2: the token hub shares the process replay log — live-fanout
+        # delta/done-marker/truncated frames and message.removed tombstones
+        # append to the sid's token domain; v4 subscribers get id-stamped
+        # deliveries (design-v4-sse-replay §3.4).
         app.state.token_hub = TokenStreamHub(
             max_frame_bytes=settings.token_stream_max_frame_bytes,
+            replay_log=app.state.replay_log,
         )
 
         def _stop_token_hub():
@@ -550,6 +614,10 @@ async def lifespan(app: FastAPI):
             except Exception as exc:  # noqa: BLE001 — best-effort
                 get_logger("app").warning("dbaux.stop failed", exc_info=exc)
         stack.push_async_callback(_stop_dbaux)
+        # B3b-1/B3b-2: v4 SSE replay log (app.state.replay_epoch +
+        # app.state.replay_log + the periodic sweep task) is constructed
+        # EARLIER — before the hub registry / token hub — so both can share
+        # the log from their first creation (see the block above).
         await smoke(app)
         # Best-effort upstream health check (contract §4). Non-blocking; failure
         # is tolerated — the smoke() call already proved the client works, and a

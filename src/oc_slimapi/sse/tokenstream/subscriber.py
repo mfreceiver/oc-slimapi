@@ -310,6 +310,17 @@ class TokenSubscriber:
     dropped_frames: int = 0
     forced_disconnects: int = 0
 
+    # B3b-2 (v4 SSE replay): set by the /sessions/{sid}/stream route when
+    # the request ran the v4 wire view. A ``wire_v4`` subscriber receives
+    # live-fanout business frames (delta / done marker / truncated /
+    # message.removed) WITH their ``id: t:<sid>:<epoch>:<seq>`` prefix;
+    # v3 subscribers keep the byte-identical id-less frames (v3
+    # zero-change). Flipped by the route immediately after ``subscribe()``
+    # (no await between); handshake frames (server.connected / tombstone
+    # replay / baseline snapshots) are connection-scoped and never
+    # stamped.
+    wire_v4: bool = False
+
     queue: _SubscriberQueue = field(default=None)
 
     # Handshake guard (Lane A's hub.py attach_subscriber brackets the

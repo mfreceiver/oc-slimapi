@@ -241,6 +241,17 @@ class Subscriber:
     dropped_frames: int = 0
     forced_disconnects: int = 0
 
+    # B3b-2 (v4 SSE replay): set by the /events route when — and only when
+    # — the request ran the v4 wire view (selector-admitted ``?v=4``). A
+    # ``wire_v4`` subscriber receives business frames WITH their
+    # ``id: <domain>:<epoch>:<seq>`` prefix line; v3 subscribers keep the
+    # byte-identical id-less frames (the v3 zero-change iron rule). The
+    # flag is flipped by the route immediately after ``subscribe()``
+    # returns (no await between) so no fanout can race an un-stamped
+    # delivery; the subscriber's own welcome ``server.connected`` frame is
+    # connection-scoped and never stamped.
+    wire_v4: bool = False
+
     # Backing queue (constructed post-init so maxsize honours queue_items).
     queue: asyncio.Queue = field(default=None)
 

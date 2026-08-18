@@ -15,8 +15,9 @@ Covers the Phase-A core deltas:
   the whole v3 validation ladder), and v3-unchanged behaviour on every
   non-retired route.
 * **A3** versions/health dual view: discovery payload
-  (current=4/available=[3, 4]/capabilities{"3","4"} with the two STATIC v4
-  keys and the asserted ABSENCE of sseReplay/qpImmediateFull), the health
+  (current=4/available=[3, 4]/capabilities{"3","4"} with the four STATIC
+  v4 keys — sseReplay/qpImmediateFull advertised same-batch by B3b-5,
+  superseding B3a's interim absence face), the health
   v4 view (view triplet =4 + transient
   ``auxiliary={"available": false, "mode": "http"}``), the v3 view
   byte-regression, and the ready endpoint's zero-v4-difference freeze.
@@ -501,16 +502,21 @@ async def test_versions_payload_dual_window():
         assert body["available"] == [3, 4]
 
 
-async def test_versions_v4_capabilities_two_static_keys_only():
+async def test_versions_v4_capabilities_four_static_keys():
     app = _build_app()
     async with _client(app) as client:
         body = (await client.get("/slimapi/versions", headers=IDENTITY)).json()
         caps = body["capabilities"]
         assert set(caps.keys()) == {"3", "4"}
-        assert caps["4"] == {"globalSessions": True, "auxiliaryFilters": True}
-        # B3b owns these — their absence is the B3a acceptance criterion.
-        assert "sseReplay" not in caps["4"]
-        assert "qpImmediateFull" not in caps["4"]
+        # B3b-5: same-batch advertising (n1 frozen timing) — sseReplay and
+        # qpImmediateFull landed WITH the B3b implementation; B3a's absence
+        # assertions are superseded by the four-key face.
+        assert caps["4"] == {
+            "globalSessions": True,
+            "auxiliaryFilters": True,
+            "sseReplay": True,
+            "qpImmediateFull": True,
+        }
 
 
 async def test_versions_v3_capabilities_shape_unchanged():

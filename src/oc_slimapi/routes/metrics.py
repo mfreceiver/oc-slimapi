@@ -82,6 +82,29 @@ async def metrics(request: Request):
     )
     if degraded_counters is not None:
         hubs_snapshot["sessionsDegraded"] = degraded_counters.snapshot()
+    # v4 SSE replay observability (B3b-5, v4-contract §9.1): outcome
+    # counters by Last-Event-ID classification (``replayed`` /
+    # ``up_to_date`` / ``ignore_reset`` + the four resync reasons
+    # ``epoch_changed`` / ``replay_expired`` / ``replay_gap`` /
+    # ``reconnect_no_replay``) plus window state (``domains`` / ``frames``
+    # / ``bytes`` / ``barriers``) and the process ``epoch`` — the boot
+    # nonce reconnect cursors are judged against, exposed so an operator
+    # can correlate client-reported Last-Event-ID epochs with the running
+    # process generation. Additive — test apps without a wired replay log
+    # keep the original shape (dbaux/traffic/sweep convention); the block
+    # never leaks frame payloads or directory paths (counters and sizes
+    # only).
+    replay_log = getattr(request.app.state, "replay_log", None)
+    if replay_log is not None:
+        snap = replay_log.metrics_snapshot()
+        state_keys = ("domains", "frames", "bytes", "barriers")
+        hubs_snapshot["replay"] = {
+            "epoch": replay_log.epoch,
+            **{k: snap[k] for k in state_keys},
+            "counters": {
+                k: v for k, v in snap.items() if k not in state_keys
+            },
+        }
     return json_response(
         hubs_snapshot,
         accept_encoding=request.headers.get("accept-encoding"),
