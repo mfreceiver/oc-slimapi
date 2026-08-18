@@ -265,10 +265,24 @@ def rows_to_records(rows: Sequence[Sequence[Any]]) -> list[dict[str, Any]]:
             value = record.get(column)
             if isinstance(value, str):
                 try:
-                    record[column] = orjson.loads(value)
+                    parsed = orjson.loads(value)
                 except orjson.JSONDecodeError:
                     invalid_column = column
                     break
+                # R6 形状门（仅 model）：合法 JSON 但非对象形状（数组/标量，
+                # 如 '[]' / '"scalar"' / '123' / 'true'）同样违反冻结判据
+                # 「v4 wire 的 model 必须是对象或 null」（v4-contract §4.1
+                # SessionSkeletonV4 + design §8 键集义务）→ 走同一 §8 跳行
+                # 路径。其他 JSON 列（summary_diffs/revert/permission/
+                # metadata）语义允许多形，不加门。
+                if (
+                    column == "model"
+                    and parsed is not None
+                    and not isinstance(parsed, dict)
+                ):
+                    invalid_column = column
+                    break
+                record[column] = parsed
         if invalid_column is not None:
             _LOGGER.warning(
                 "dbaux projection: skip row sid=%s (invalid JSON in %s)",

@@ -652,6 +652,72 @@ async def test_v4_model_object_on_wire_bad_model_row_skipped(
         await aux.stop()
 
 
+@pytest.mark.parametrize(
+    "raw_model",
+    ["[]", '"scalar"', "123", "true"],
+    ids=["array", "string-scalar", "number", "bool"],
+)
+async def test_v4_model_shape_gate_legal_json_non_dict_skipped(
+    tmp_path, caplog, raw_model
+):
+    """rev gate R6：**合法 JSON 但非 dict 形状**的 model（数组/标量：
+    ``[]`` / ``\"scalar\"`` / ``123`` / ``true``）同样违反冻结判据
+    「v4 wire 的 model 必须是对象或 null」（v4-contract §4.1
+    SessionSkeletonV4 + design §8 键集义务）→ 与语法错误同一 §8 跳行
+    路径（跳行 + warning 含 sid 与 model 字样）。
+
+    - 形状行不出现在 items；其余会话 200 正常（25 原始 − 2 坏 JSON −
+      1 形状行 = 22 可见）；
+    - wire 上所有非 null model 均为 dict（str/list/标量绝不出现）；
+    - 行集与镜像 oracle（§8 形状语义独立重写，S-B03）一致。
+    """
+    import logging
+
+    shape_sid = "zz_model_shape"
+    shape_row = dict(DATASET[0])
+    shape_row.update(
+        id=shape_sid,
+        title="legal json non-dict model",
+        time_created=FIXED_NOW_MS + 10_000,
+        time_updated=FIXED_NOW_MS + 100_000,
+        model=raw_model,
+    )
+    rows = [shape_row] + list(DATASET)
+    aux = await _start_aux_on_rows(tmp_path, rows)
+    app, _ = _build_app(aux)
+    try:
+        with caplog.at_level(logging.WARNING):
+            async with _client(app) as client:
+                resp = await client.get("/slimapi/sessions",
+                                        params={"v": "4", "archived": "all"},
+                                        headers=IDENTITY)
+        assert resp.status_code == 200
+        items = resp.json()["items"]
+        assert shape_sid not in {i["id"] for i in items}
+        assert len(items) == 22
+        for item in items:
+            model = item["model"]
+            assert model is None or isinstance(model, dict), (
+                f"{item['id']}: model 非 dict|null（形状门泄漏）"
+            )
+            assert not isinstance(model, str), item["id"]
+        # 与语法错误同一 §8 跳行路径：warning 含 sid 与 model 字样
+        warns = [
+            r.getMessage() for r in caplog.records
+            if shape_sid in r.getMessage()
+        ]
+        assert len(warns) == 1 and "model" in warns[0], (
+            f"形状行跳行 warning 缺失/不唯一: {warns}"
+        )
+        # 镜像 oracle 行集一致（§8 形状门独立重写）
+        expected, _complete = mirror_page(
+            archived="all", parent="all", limit=100, session_rows=rows,
+        )
+        assert [i["id"] for i in items] == [r["id"] for r in expected]
+    finally:
+        await aux.stop()
+
+
 async def test_v3_model_object_passthrough_from_upstream():
     """rev gate R5 BLOCKER-1 第 6 条：v3 不受影响——v3 model 来自上游
     HTTP（已是对象），skeleton 透传对象而非字符串。"""
@@ -675,6 +741,25 @@ async def test_v3_model_object_passthrough_from_upstream():
     items = resp.json()["items"]
     assert items[0]["model"] == {"id": "m-up", "providerID": "prov-up"}
     assert isinstance(items[0]["model"], dict)
+
+    # rev gate R6：v3 面对非 dict model（数组）照常透传——形状门只属于
+    # dbaux v4 投影组装层；v3 契约形状由上游 wire 决定（回归确认）。
+    list_session = dict(
+        upstream_session, id="h2", model=["list", "from-upstream"],
+    )
+
+    def handler2(request):
+        return httpx.Response(
+            200, content=orjson.dumps([list_session]),
+            headers={"Content-Type": "application/json"},
+        )
+
+    app2, _ = _build_app(_StubAux("disabled"), handler=handler2)
+    async with _client(app2) as client:
+        resp2 = await client.get("/slimapi/sessions",
+                                 params={"v": "3"}, headers=IDENTITY)
+    assert resp2.status_code == 200
+    assert resp2.json()["items"][0]["model"] == ["list", "from-upstream"]
 
 
 async def test_v4_degraded_upstream_param_mapping():

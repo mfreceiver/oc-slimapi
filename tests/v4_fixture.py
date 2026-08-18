@@ -287,13 +287,24 @@ def _allowlist_hit(directory: str, items: Sequence[str]) -> bool:
 
 
 def _valid_record(row: dict[str, Any]) -> bool:
-    """§8 组装容忍镜像：JSON 列解析失败 → 该行不进结果集。"""
+    """§8 组装容忍镜像：JSON 列解析失败 → 该行不进结果集。
+
+    R6 对齐：model 列解析成功但非对象形状（数组/标量——wire 冻结判据
+    「对象或 null」，与生产形状门同规格、实现独立重写）同样视为容忍
+    跳行。其他 JSON 列语义多形，不做形状过滤。
+    """
     for col in JSON_COLS:
         value = row.get(col)
         if isinstance(value, str):
             try:
-                json.loads(value)
+                parsed = json.loads(value)
             except ValueError:
+                return False
+            if (
+                col == "model"
+                and parsed is not None
+                and not isinstance(parsed, dict)
+            ):
                 return False
     return True
 
