@@ -493,6 +493,34 @@ REAL_GOLDEN_HINT = (
     "（需真实 opencode 1.18.18 发布二进制）"
 )
 
+# golden 载荷的权威查询面（builder 与 validator 共用——漂移即校验失败）
+REAL_GOLDEN_QUERY = {
+    "endpoint": "GET /experimental/session?archived=true&limit=1000",
+    "sort": "time_updated DESC, id DESC",
+}
+
+# rev gate BLOCKER-2c：SQL 富化写入的列（值 = fixture 派生，非零且行间
+# 互异——防「全零错列仍通过」）。provenance 头记录（2d）。
+SQL_ENRICHED_FIELDS = [
+    "tokens_input", "tokens_output", "tokens_reasoning",
+    "tokens_cache_read", "tokens_cache_write",
+    "summary_additions", "summary_deletions", "summary_files",
+    "summary_diffs", "revert", "time_compacting",
+]
+
+# 富化替代值：ses_bad_json 的 summary_diffs 是「坏 JSON」容忍样本——真库
+# 写入坏 JSON 会让上游 drizzle 读路径炸掉整列表（§8 跳行是 sidecar 侧
+# 容忍语义，该维度由 fixture 面 + EQ-008 锚定）；真实面以 None 代。
+REAL_ENRICH_SUBSTITUTES: dict[str, dict[str, Any]] = {
+    "ses_bad_json": {"summary_diffs": None},
+}
+
+REAL_ENRICHMENT_NOTE = (
+    "sql-enriched via direct UPDATE on test-owned ephemeral instance "
+    "(fixture-derived values; tokens/summary/revert/time_compacting); "
+    f"substitutes: {json.dumps(REAL_ENRICH_SUBSTITUTES, sort_keys=True)}"
+)
+
 
 def build_real_golden_document(
     sessions: Sequence[dict[str, Any]],
@@ -507,8 +535,11 @@ def build_real_golden_document(
     DESC, id DESC 序——上游 listGlobal 冻结排序）。
 
     ``injected``：注入清单 ``{fixture_id, real_id, fixture_directory,
-    real_directory}``——fixture 语义 ↔ 真实值的桥（CI 降级校验用它做
-    非 server-assigned 字段的全量比对 + parent 链接一致性）。
+    real_directory, agent, model, permission}``——fixture 语义 ↔ 真实值
+    的桥（CI 降级校验用它做非 server-assigned 字段的全量比对 + parent
+    链接一致性；agent/model/permission 桥 = 条目自身记录的 API 注入值）。
+
+    provenance 头额外记录 SQL 富化方法（rev gate 2d）。
     """
     manifest = dataset_manifest()
     return {
@@ -519,23 +550,77 @@ def build_real_golden_document(
         "dataset_digest": manifest["digest"],
         "dataset_manifest": manifest,
         "server_assigned_fields": list(REAL_SERVER_ASSIGNED_FIELDS),
+        "sql_enriched_fields": list(SQL_ENRICHED_FIELDS),
+        "enrichment": REAL_ENRICHMENT_NOTE,
         "regenerate_hint": REAL_GOLDEN_HINT,
         "injected_sessions": list(injected),
         "response_fingerprint": response_fingerprint(sessions),
-        "query": {
-            "endpoint": "GET /experimental/session?archived=true&limit=1000",
-            "sort": "time_updated DESC, id DESC",
-        },
+        "query": dict(REAL_GOLDEN_QUERY),
         "sessions": list(sessions),
     }
 
 
-def validate_real_golden_ci(document: dict[str, Any]) -> list[str]:
-    """日常 CI（无真进程）对真实 golden 的**降级**校验；返回问题清单。
+def _canonical(value: Any) -> str:
+    """比较桥：tuple/list 与 dict 键序差异归一（canonical JSON 文本）。"""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
-    降级规则（任务点 5）：server-assigned 字段 → 存在性 + 排序一致性；
-    其余字段（title / archived 置性 / parent 链接 / tokens 零值族）→ 经
-    injected 清单桥接 fixture 语义后全量比对。
+
+def _expected_enriched(row: dict[str, Any]) -> dict[str, Any]:
+    """fixture 行 → SQL 富化写入真库的期望值（含替代值）。
+
+    summary/revert 置性镜像上游 fromRow（session.ts:59-83）：三列全
+    null → summary undefined；revert JSON 非空才暴露。
+    """
+    fid = row["id"]
+    diffs_raw = REAL_ENRICH_SUBSTITUTES.get(fid, {}).get(
+        "summary_diffs", row["summary_diffs"]
+    )
+    diffs = json.loads(diffs_raw) if isinstance(diffs_raw, str) else diffs_raw
+    summary = (
+        None
+        if row["summary_additions"] is None
+        and row["summary_deletions"] is None
+        and row["summary_files"] is None
+        else [
+            row["summary_additions"], row["summary_deletions"],
+            row["summary_files"], diffs,
+        ]
+    )
+    revert = None
+    if row["revert"]:
+        doc = json.loads(row["revert"])
+        revert = [
+            doc.get("messageID"), doc.get("partID"),
+            doc.get("snapshot"), doc.get("diff"),
+        ]
+    return {
+        "tokens": [
+            row["tokens_input"], row["tokens_output"],
+            row["tokens_reasoning"], row["tokens_cache_read"],
+            row["tokens_cache_write"],
+        ],
+        "summary": summary,
+        "revert": revert,
+        "time_compacting": row["time_compacting"],
+        "metadata": json.loads(row["metadata"]) if row["metadata"] else None,
+    }
+
+
+def validate_real_golden_ci(document: dict[str, Any]) -> list[str]:
+    """日常 CI（无真进程）对真实 golden 的校验；返回问题清单。
+
+    rev gate BLOCKER-1b 增强后三层覆盖：
+    - **载荷身份**：按 canonical sessions **重算 response_fingerprint**
+      并核对——任何 sessions 字段篡改（含 tokens/project/metadata）先在
+      这层失败；
+    - **provenance 全键**：version/generator/opencode_version/
+      generated_at/dataset_digest（= 当前 manifest）/dataset_manifest
+      摘要一致/query 端点+排序/sql_enriched_fields/regenerate_hint/
+      server_assigned_fields/injected 清单 ↔ 可注入 fixture 行集；
+    - **稳定语义字段全量**（server-assigned 之外逐行比对）：title、
+      archived 置性+值、parent 链接、directory、tokens 五列、summary
+      族、revert、time_compacting、metadata（= SQL 富化写入的 fixture
+      派生值）；agent/model/permission（= 注入清单条目记录的 API 注入值）。
     """
     problems: list[str] = []
     if document.get("version") != ALIGNED_VERSION:
@@ -546,14 +631,27 @@ def validate_real_golden_ci(document: dict[str, Any]) -> list[str]:
         problems.append(
             f"opencode_version mismatch: {document.get('opencode_version')!r}"
         )
-    if document.get("dataset_digest") != dataset_manifest()["digest"]:
+    manifest = dataset_manifest()
+    if document.get("dataset_digest") != manifest["digest"]:
         problems.append("dataset_digest mismatch（数据集与 golden 漂移，需再生成）")
+    stored_manifest = document.get("dataset_manifest") or {}
+    if stored_manifest.get("digest") != manifest["digest"]:
+        problems.append("dataset_manifest 摘要与 dataset_digest 不一致")
+    generated_at = document.get("generated_at")
+    if not isinstance(generated_at, str) or "T" not in generated_at:
+        problems.append(f"generated_at 缺失或非 ISO 形状: {generated_at!r}")
+    if document.get("query") != REAL_GOLDEN_QUERY:
+        problems.append(f"query 漂移: {document.get('query')!r}")
+    if document.get("sql_enriched_fields") != SQL_ENRICHED_FIELDS:
+        problems.append("sql_enriched_fields 声明漂移")
     if not document.get("regenerate_hint"):
         problems.append("regenerate_hint missing")
     if document.get("server_assigned_fields") != REAL_SERVER_ASSIGNED_FIELDS:
         problems.append("server_assigned_fields 声明漂移")
-    injected = document.get("injected_sessions") or []
     sessions = document.get("sessions") or []
+    if sessions and document.get("response_fingerprint") != response_fingerprint(sessions):
+        problems.append("response_fingerprint 校验失败（载荷篡改或漂移）")
+    injected = document.get("injected_sessions") or []
     if not injected or not sessions:
         problems.append("injected_sessions / sessions 空")
         return problems
@@ -583,7 +681,8 @@ def validate_real_golden_ci(document: dict[str, Any]) -> list[str]:
             problems.append(f"未知 real_id {rid!r}")
             continue
         row = fixture_by_id[fid]
-        # 非 server-assigned：全量比对（title / archived 置性 / parent 链接）
+        inj = injected_by_fixture[fid]
+        # --- 经注入清单桥接的稳定语义字段 -----------------------------
         if entry.get("title") != row.get("title"):
             problems.append(f"{fid}: title 全量比对失败")
         arch_golden = entry.get("time_archived")
@@ -596,9 +695,120 @@ def validate_real_golden_ci(document: dict[str, Any]) -> list[str]:
             problems.append(f"{fid}: parent 链接置性不一致")
         if parent is not None and real_to_fixture.get(parent) != row.get("parent_id"):
             problems.append(f"{fid}: parent 链接映射不一致")
-        if entry.get("directory") != injected_by_fixture[fid]["real_directory"]:
+        if entry.get("directory") != inj["real_directory"]:
             problems.append(f"{fid}: directory 与注入清单不一致")
+        # --- SQL 富化字段（fixture 派生值全量比对）-------------------
+        expected = _expected_enriched(row)
+        for field in ("tokens", "summary", "revert", "time_compacting", "metadata"):
+            if _canonical(entry.get(field)) != _canonical(expected[field]):
+                problems.append(f"{fid}: {field} 与 fixture 派生富化值不一致")
+        # --- API 注入字段（桥 = 注入清单条目自身记录）----------------
+        if entry.get("agent") != inj.get("agent"):
+            problems.append(f"{fid}: agent 与注入值不一致")
+        if _canonical(entry.get("model")) != _canonical(inj.get("model")):
+            problems.append(f"{fid}: model 与注入值不一致")
+        if _canonical(entry.get("permission")) != _canonical(inj.get("permission")):
+            problems.append(f"{fid}: permission 与注入值不一致")
     return problems
+
+
+def load_real_golden() -> dict[str, Any]:
+    """无条件装载真实 golden 并跑 CI 校验（BLOCKER-1a）。
+
+    **不依赖**真实二进制 / ``real_upstream`` fixture——二进制缺席只影响
+    真进程测试，golden 权威校验永不被 skip。
+    """
+    assert REAL_GOLDEN_PATH.is_file(), (
+        f"真实 golden 缺失：{REAL_GOLDEN_PATH}（再生成：{REAL_GOLDEN_HINT}）"
+    )
+    document = json.loads(REAL_GOLDEN_PATH.read_text(encoding="utf-8"))
+    problems = validate_real_golden_ci(document)
+    assert not problems, f"真实 golden CI 校验失败：{problems}"
+    return document
+
+
+def build_db_from_real_golden(
+    document: dict[str, Any], db_path: Path | str
+) -> Path:
+    """从真实 golden 内容重建确定性 DB fixture（BLOCKER-1c）。
+
+    server-assigned 字段（id / 时间戳 / directory / project 解析）**显式
+    映射写入** fixture 行——EQ-001..006 以 real golden 为期望对生产
+    ``fetch_sessions_page`` 做投影等价断言（mirror oracle 降为辅助）。
+    归一形状（tuple/list 混存）→ DDL 列值的逆映射在此集中。
+    """
+    project_rows: dict[str, dict[str, Any]] = {}
+    session_rows: list[dict[str, Any]] = []
+    for s in document["sessions"]:
+        project = s.get("project")
+        project_id = None
+        if project is not None:
+            project_id = project[0]
+            project_rows[project_id] = {
+                "id": project[0], "name": project[1], "worktree": project[2],
+            }
+        tokens = s.get("tokens") or (None,) * 5
+        summary = s.get("summary")
+        if summary is None:
+            additions = deletions = files = diffs = None
+        else:
+            additions, deletions, files, diffs = (
+                list(summary) + [None] * (4 - len(summary))
+            )[:4]
+        revert = s.get("revert")
+        revert_doc = None
+        if revert is not None:
+            revert_doc = {
+                k: v for k, v in zip(
+                    ("messageID", "partID", "snapshot", "diff"), list(revert))
+                if v is not None
+            }
+        permission = s.get("permission")
+        model = s.get("model")
+        metadata = s.get("metadata")
+        session_rows.append({
+            "id": s["id"],
+            "project_id": project_id,
+            "parent_id": s.get("parent_id"),
+            "directory": s["directory"],
+            "title": s["title"],
+            "version": s["version"],
+            "summary_additions": additions,
+            "summary_deletions": deletions,
+            "summary_files": files,
+            "summary_diffs": (
+                json.dumps(diffs) if isinstance(diffs, (dict, list)) else diffs
+            ),
+            "revert": json.dumps(revert_doc) if revert_doc else None,
+            "permission": (
+                json.dumps([
+                    {"permission": a, "pattern": b, "action": c}
+                    for a, b, c in (list(r) for r in permission)
+                ]) if permission else None
+            ),
+            "time_created": s["time_created"],
+            "time_updated": s["time_updated"],
+            "time_compacting": s.get("time_compacting"),
+            "time_archived": s.get("time_archived"),
+            "agent": s.get("agent"),
+            "model": (
+                json.dumps({
+                    k: v for k, v in zip(("id", "providerID", "variant"),
+                                         list(model) + [None] * (3 - len(model)))
+                    if v is not None
+                }) if model else None
+            ),
+            "tokens_input": tokens[0],
+            "tokens_output": tokens[1],
+            "tokens_reasoning": tokens[2],
+            "tokens_cache_read": tokens[3],
+            "tokens_cache_write": tokens[4],
+            "metadata": json.dumps(metadata) if metadata is not None else None,
+        })
+    return build_fixture_db(
+        db_path, session_rows=session_rows,
+        project_rows=list(project_rows.values()),
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

@@ -14,8 +14,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -34,14 +36,17 @@ from oc_slimapi.skeleton import SESSION_KEYS, project_rows_to_v4_skeletons
 from v4_fixture import (
     ALIGNED_VERSION,
     DATASET,
+    REAL_ENRICH_SUBSTITUTES,
     REAL_GOLDEN_PATH,
     REAL_UPSTREAM_BINARY,
     REAL_UPSTREAM_VERSION,
+    build_db_from_real_golden,
     build_fixture_db,
     build_golden_document,
     build_real_golden_document,
     dataset_fingerprint,
     load_golden,
+    load_real_golden,
     mirror_page,
     validate_golden,
     validate_real_golden_ci,
@@ -336,19 +341,48 @@ def test_golden_in_repo_file_is_current():
 #   （session.ts listGlobal——ORDER BY time_updated DESC, id DESC 与 v4
 #   冻结排序一致；limit+1 窗 + x-next-cursor 单键 cursor 头）。
 
-_REAL_BIN = REAL_UPSTREAM_BINARY
+# OC_SLIMAPI_EQ_BINARY 覆盖二进制路径（rev gate BLOCKER-1d：默认硬编码
+# 路径可被 env 覆盖——调用时读取，release 门验证可 monkeypatch）。
+def _eq_binary() -> str:
+    return os.environ.get("OC_SLIMAPI_EQ_BINARY", REAL_UPSTREAM_BINARY)
+
+
 _REAL_PORT_LO, _REAL_PORT_HI = 14700, 14799
 _INJECTABLE = [row for row in DATASET if row.get("directory")]
 _INJECTABLE_BY_ID = {row["id"]: row for row in _INJECTABLE}
 
 
 def _binary_absent_reason() -> str | None:
-    if os.path.isfile(_REAL_BIN) and os.access(_REAL_BIN, os.X_OK):
+    binary = _eq_binary()
+    if os.path.isfile(binary) and os.access(binary, os.X_OK):
         return None
     return (
-        f"真实 opencode 发布二进制缺席（{_REAL_BIN}）——发布门唯一允许的 "
+        f"真实 opencode 发布二进制缺席（{binary}）——发布门唯一允许的 "
         "skip 理由"
     )
+
+
+def _eq007_gate() -> tuple[str, str | None]:
+    """EQ-007 验收门：``("ok", None)`` / ``("skip", reason)`` / ``("fail", reason)``。
+
+    rev gate BLOCKER-1d：``OC_SLIMAPI_REQUIRE_EQ007=1``（release gate 语义）
+    时二进制缺席 → **fail 不 skip**（版本漂移/起不来在本文件恒 fail）；
+    普通 CI 缺席 → skip 真进程部分（golden CI 校验不受影响——
+    ``test_real_golden_ci_unconditional`` 不依赖本门）。
+
+    用法（release 门跑法）::
+
+        OC_SLIMAPI_EQ_BINARY=/nonexistent OC_SLIMAPI_REQUIRE_EQ007=1 \\
+            .venv/bin/python -m pytest tests/test_equivalence_anchor.py -q
+        # → EQ-007 真进程 case FAIL（而非 skip）
+    """
+    require = os.environ.get("OC_SLIMAPI_REQUIRE_EQ007") == "1"
+    reason = _binary_absent_reason()
+    if reason is None:
+        return "ok", None
+    if require:
+        return "fail", f"[release gate] {reason}"
+    return "skip", reason
 
 
 def _pick_port() -> int:
@@ -383,16 +417,33 @@ def _real_dirs(home) -> dict[str, str]:
     return mapping
 
 
-def _inject_dataset(client: httpx.Client, dir_map: dict[str, str]) -> dict[str, str]:
-    """注入 fixture 数据集；返回 fixture_id → real_id 映射。
+# rev gate BLOCKER-2b：API 注入的互异可观察值（非空 agent / 合法 model
+# 结构 / 非空 permission Ruleset；值互异——防「全零错列仍通过」）。
+_OBS_RULES_A = [{"permission": "bash", "pattern": "rm*", "action": "deny"}]
+_OBS_RULES_B = [
+    {"permission": "edit", "pattern": "*.env", "action": "ask"},
+    {"permission": "webfetch", "pattern": "host:example*", "action": "allow"},
+]
+
+
+def _inject_dataset(
+    client: httpx.Client, dir_map: dict[str, str]
+) -> tuple[dict[str, str], dict[str, dict]]:
+    """注入 fixture 数据集；返回 (fixture_id → real_id, 注入可观察字段)。
 
     逐条创建间隔 5ms——服务端赋值 time_updated 毫秒级互异，使上游
     x-next-cursor 单键翻页不因 tie 丢行（我们的复合 (t,i) cursor 无此
-    约束；tie-break 维度由 EQ-001..006 fixture 面锚定）。parent 先于
-    child 注入（两趟拓扑）。
+    约束；tie-break 维度由 EQ-001..006 fixture 面锚定 + 2e 真实 tie
+    样本）。parent 先于 child 注入（两趟拓扑）。
+
+    BLOCKER-2b：每行注入非空 agent / 合法 model（``{id, providerID}``
+    结构——纯品牌字符串，创建期不解析 provider）+ 部分 Rowset permission
+    （值按注入序互异）。注入值记录进 ``observables``（golden 桥）。
     """
     id_map: dict[str, str] = {}
+    observables: dict[str, dict] = {}
     pending = list(_INJECTABLE)
+    idx = 0
     for _ in range(4):  # 拓扑趟数上限（最深两级父子）
         for row in list(pending):
             parent = row.get("parent_id")
@@ -403,6 +454,20 @@ def _inject_dataset(client: httpx.Client, dir_map: dict[str, str]) -> dict[str, 
                 body["parentID"] = id_map[parent]
             if row.get("metadata"):
                 body["metadata"] = orjson.loads(row["metadata"])
+            agent = "agent-even" if idx % 2 == 0 else "agent-odd"
+            model = {
+                "id": "fixture-model",
+                "providerID": "prov-a" if idx % 2 == 0 else "prov-b",
+            }
+            body["agent"] = agent
+            body["model"] = model
+            permission = None
+            if idx % 7 == 3:
+                permission = _OBS_RULES_A
+            elif idx % 7 == 5:
+                permission = _OBS_RULES_B
+            if permission is not None:
+                body["permission"] = permission
             response = client.post(
                 "/session", params={"directory": dir_map[row["directory"]]},
                 json=body,
@@ -412,7 +477,16 @@ def _inject_dataset(client: httpx.Client, dir_map: dict[str, str]) -> dict[str, 
                 f"{response.text[:200]}"
             )
             id_map[row["id"]] = response.json()["id"]
+            observables[row["id"]] = {
+                "agent": agent,
+                "model": (model["id"], model["providerID"], None),
+                "permission": None if permission is None else tuple(
+                    (r["permission"], r["pattern"], r["action"])
+                    for r in permission
+                ),
+            }
             pending.remove(row)
+            idx += 1
             time.sleep(0.005)
     assert not pending, f"拓扑未收敛：{[r['id'] for r in pending]}"
     for row in _INJECTABLE:
@@ -424,15 +498,78 @@ def _inject_dataset(client: httpx.Client, dir_map: dict[str, str]) -> dict[str, 
             assert response.status_code < 400, (
                 f"archived 注入失败 {row['id']}：{response.text[:200]}"
             )
-    return id_map
+    return id_map, observables
+
+
+def _sql_enrich(db_path: str, id_map: dict[str, str]) -> None:
+    """rev gate BLOCKER-2c：API 不可生成字段的权威生成路径。
+
+    tokens 五列 / summary 四列 / revert / time_compacting 无公开 API 可
+    置值——对**本测试自建的一次性隔离实例**（isolated HOME，teardown 全
+    毁）的 DB 做直接 UPDATE，写入 fixture 派生值（非零且行间互异）。
+
+    合规声明（S-B03/硬规则）：sidecar 生产代码路径零 DB 写（硬规则不
+    变）；写目标仅限本测试自建的 ephemeral 实例，非任何生产/开发库。
+    随后 GET 真实 HTTP 输出 vs ``fetch_sessions_page`` 直读同库比较——
+    **HTTP handler 仍是权威**（它读这些列并暴露到 wire），证明的是
+    列 ↔ wire 字段映射正确，非自证。
+
+    替代值：``ses_bad_json`` 的坏 JSON ``summary_diffs`` 以 None 代
+    （上游 drizzle 读路径对坏 JSON 的行为由独立探针测试实证记录）。
+    """
+    conn = sqlite3.connect(db_path, timeout=10.0)
+    try:
+        for row in _INJECTABLE:
+            rid = id_map[row["id"]]
+            diffs = REAL_ENRICH_SUBSTITUTES.get(row["id"], {}).get(
+                "summary_diffs", row["summary_diffs"]
+            )
+            conn.execute(
+                "UPDATE session SET tokens_input=?, tokens_output=?, "
+                "tokens_reasoning=?, tokens_cache_read=?, "
+                "tokens_cache_write=?, summary_additions=?, "
+                "summary_deletions=?, summary_files=?, summary_diffs=?, "
+                "revert=?, time_compacting=? WHERE id=?",
+                (
+                    row["tokens_input"], row["tokens_output"],
+                    row["tokens_reasoning"], row["tokens_cache_read"],
+                    row["tokens_cache_write"], row["summary_additions"],
+                    row["summary_deletions"], row["summary_files"],
+                    diffs, row["revert"], row["time_compacting"], rid,
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _norm_diffs(value):
+    """summary.diffs 归一：HTTP 可能是 parsed 对象（drizzle json 列）或
+    字符串；统一成解析后的对象比较（None 透传）。"""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return json.loads(value)
+    return value
 
 
 def _norm_upstream(info: dict) -> dict:
-    """GlobalInfo JSON → 比较形状（HTTP 嵌套/缺席键 → 归一 None/扁平）。"""
+    """GlobalInfo JSON → 比较形状（HTTP 嵌套/缺席键 → 归一 None/扁平）。
+
+    rev gate BLOCKER-2a：比较**完整投影字段**——summary 族 / revert /
+    permission / time.compacting / model 对象（评委锚点：GlobalInfo 建立
+    在完整 Info.fields 上，session.ts fromRow:59-115——这些字段 HTTP
+    可观察）。置性镜像 fromRow：summary 三列全 null → undefined；
+    revert JSON 非空才暴露。
+    """
     t = info.get("time") or {}
     tokens = info.get("tokens") or {}
     cache = tokens.get("cache") or {}
     project = info.get("project")
+    summary = info.get("summary")
+    revert = info.get("revert") or None
+    permission = info.get("permission")
+    model = info.get("model")
     return {
         "id": info.get("id"),
         "parent_id": info.get("parentID"),
@@ -442,6 +579,7 @@ def _norm_upstream(info: dict) -> dict:
         "time_created": t.get("created"),
         "time_updated": t.get("updated"),
         "time_archived": t.get("archived"),
+        "time_compacting": t.get("compacting"),
         "tokens": (
             tokens.get("input"), tokens.get("output"),
             tokens.get("reasoning"), cache.get("read"), cache.get("write"),
@@ -451,12 +589,40 @@ def _norm_upstream(info: dict) -> dict:
         ),
         "metadata": info.get("metadata"),
         "agent": info.get("agent"),
-        "model": info.get("model"),
+        "model": None if model is None else (
+            model.get("id"), model.get("providerID"), model.get("variant")
+        ),
+        "summary": None if summary is None else (
+            summary.get("additions"), summary.get("deletions"),
+            summary.get("files"), _norm_diffs(summary.get("diffs")),
+        ),
+        "revert": None if revert is None else (
+            revert.get("messageID"), revert.get("partID"),
+            revert.get("snapshot"), revert.get("diff"),
+        ),
+        "permission": None if permission is None else tuple(
+            (rule["permission"], rule["pattern"], rule["action"])
+            for rule in permission
+        ),
     }
 
 
 def _norm_db(record: dict) -> dict:
-    """fetch_sessions_page 记录（DB 列名）→ 同一比较形状。"""
+    """fetch_sessions_page 记录（DB 列名）→ 同一比较形状。
+
+    model 列不在生产 JSON 解析集（rows_to_records 只解析 summary_diffs/
+    revert/permission/metadata）——此处按 JSON 字符串 parse；置性镜像
+    上游 fromRow（三列全 null → summary None）。
+    """
+    model_raw = record.get("model")
+    model = json.loads(model_raw) if isinstance(model_raw, str) else model_raw
+    revert = record.get("revert")
+    permission = record.get("permission")
+    summary_absent = (
+        record["summary_additions"] is None
+        and record["summary_deletions"] is None
+        and record["summary_files"] is None
+    )
     return {
         "id": record["id"],
         "parent_id": record["parent_id"],
@@ -466,6 +632,7 @@ def _norm_db(record: dict) -> dict:
         "time_created": record["time_created"],
         "time_updated": record["time_updated"],
         "time_archived": record["time_archived"],
+        "time_compacting": record.get("time_compacting"),
         "tokens": (
             record["tokens_input"], record["tokens_output"],
             record["tokens_reasoning"], record["tokens_cache_read"],
@@ -476,19 +643,35 @@ def _norm_db(record: dict) -> dict:
         ),
         "metadata": record["metadata"],
         "agent": record["agent"],
-        "model": record["model"],
+        "model": None if model is None else (
+            model.get("id"), model.get("providerID"), model.get("variant")
+        ),
+        "summary": None if summary_absent else (
+            record["summary_additions"], record["summary_deletions"],
+            record["summary_files"], _norm_diffs(record.get("summary_diffs")),
+        ),
+        "revert": None if revert is None else (
+            revert.get("messageID"), revert.get("partID"),
+            revert.get("snapshot"), revert.get("diff"),
+        ),
+        "permission": None if permission is None else tuple(
+            (rule["permission"], rule["pattern"], rule["action"])
+            for rule in permission
+        ),
     }
 
 
 @pytest.fixture(scope="session")
 def real_upstream(tmp_path_factory):
-    """隔离真实实例：启动 → 注入 → 全量基线 → yield；teardown 全清理。"""
-    absent = _binary_absent_reason()
-    if absent:
-        pytest.skip(absent)
+    """隔离真实实例：启动 → 注入（2b 互异可观察值）→ SQL 富化（2c）→
+    全量基线 → yield；teardown 全清理。"""
+    state, reason = _eq007_gate()
+    if state == "skip":
+        pytest.skip(reason)
+    assert state == "ok", reason
     # 版本门（存在但漂移 = 失败）
     probe = subprocess.run(
-        [_REAL_BIN, "--version"], capture_output=True, text=True, timeout=15,
+        [_eq_binary(), "--version"], capture_output=True, text=True, timeout=15,
     )
     version_line = (probe.stdout + probe.stderr).strip()
     assert REAL_UPSTREAM_VERSION in version_line, (
@@ -502,7 +685,7 @@ def real_upstream(tmp_path_factory):
     port = _pick_port()
     env = {
         "HOME": str(home),
-        "PATH": f"{os.path.dirname(_REAL_BIN)}:/usr/bin:/bin",
+        "PATH": f"{os.path.dirname(_eq_binary())}:/usr/bin:/bin",
         "XDG_DATA_HOME": str(home / "data"),
         "XDG_CONFIG_HOME": str(home / "config"),
         "XDG_CACHE_HOME": str(home / "config" / "cache"),
@@ -511,7 +694,7 @@ def real_upstream(tmp_path_factory):
     log_path = home / "serve.log"
     log_file = open(log_path, "wb")
     proc = subprocess.Popen(
-        [_REAL_BIN, "serve", "--port", str(port), "--hostname", "127.0.0.1",
+        [_eq_binary(), "serve", "--port", str(port), "--hostname", "127.0.0.1",
          "--print-logs"],
         env=env, stdout=log_file, stderr=subprocess.STDOUT, cwd=str(home),
     )
@@ -538,7 +721,12 @@ def real_upstream(tmp_path_factory):
             )
         dir_map = _real_dirs(home)
         with httpx.Client(base_url=base_url, timeout=15.0) as client:
-            id_map = _inject_dataset(client, dir_map)
+            id_map, observables = _inject_dataset(client, dir_map)
+        # BLOCKER-2c：SQL 富化（tokens/summary/revert/time_compacting 的
+        # fixture 派生值）先于基线拉取——全套 EQ-007 与 golden 都在富化后
+        # 世界上断言。
+        _sql_enrich(str(home / "data" / "opencode" / "opencode.db"), id_map)
+        with httpx.Client(base_url=base_url, timeout=15.0) as client:
             response = client.get(
                 "/experimental/session",
                 params={"archived": "true", "limit": 1000},
@@ -562,6 +750,7 @@ def real_upstream(tmp_path_factory):
             base_url=base_url, db_path=str(db_path), home=home,
             id_map=id_map, dir_map=dir_map, real_dir_of=real_dir_of,
             l_up=l_up, opencode_version=REAL_UPSTREAM_VERSION,
+            observables=observables,
         )
     finally:
         log_file.close()
@@ -603,29 +792,11 @@ async def test_eq007_real_identity_full_fields_and_order(real_upstream):
     up = [_norm_upstream(s) for s in real_upstream.l_up]
     db = [_norm_db(r) for r in page.records]
     assert [r["id"] for r in up] == [r["id"] for r in db], "行集/序漂移"
-    # HTTP 面对注入行不暴露的可选投影字段（summary 族 / revert /
-    # permission / time_compacting）：GlobalInfo 缺席 → DB 空值（None/0）
-    # 一致性（wire 形状分歧面——presence-aware 等价，见汇报偏离声明）。
-    _optional_db_only = (
-        "summary_additions", "summary_deletions", "summary_files",
-        "summary_diffs", "revert", "permission", "time_compacting",
-    )
-    # 可选暴露字段：HTTP 缺席 ≡ DB 空值（None/0），存在则精确相等
-    for u, d, raw in zip(up, db, page.records):
-        for field in ("agent", "model", "metadata"):
-            if u[field] is None:
-                assert d[field] in (None, 0, ""), f"{u['id']}.{field}"
-            else:
-                assert u[field] == d[field], f"{u['id']}.{field}"
-        for field in _optional_db_only:
-            assert raw.get(field) in (None, 0, ""), f"{u['id']}.{field}"
-        u_core = {
-            k: v for k, v in u.items() if k not in ("agent", "model", "metadata")
-        }
-        d_core = {
-            k: v for k, v in d.items() if k not in ("agent", "model", "metadata")
-        }
-        assert u_core == d_core, f"逐字段漂移：{u['id']}"
+    # rev gate BLOCKER-2a：**完整投影字段**逐行直比——tokens 五列 / summary
+    # 族（含 diffs）/ revert / permission / time.compacting / model 对象 /
+    # project join / metadata / agent（经 2b/2c 注入+富化，非空代表值在
+    # 场——「HTTP 缺席 ≡ DB 空值」的弱断言已删除）。
+    assert up == db, "逐字段漂移（首个差异见 pytest diff）"
 
 
 async def test_eq007_archived_parent_axes(real_upstream):
@@ -840,8 +1011,17 @@ async def test_eq007_real_golden_provenance(real_upstream):
             # 落库后真实值（上游 create 面 %XX 解码归一——与
             # fixture_directory 的差 = 该上游行为的显式记录）
             "real_directory": real_upstream.real_dir_of[fid],
+            # BLOCKER-2b 注入可观察值（validator 的 agent/model/permission 桥）
+            "agent": obs["agent"],
+            "model": list(obs["model"]),
+            "permission": None if obs["permission"] is None else [
+                list(rule) for rule in obs["permission"]
+            ],
         }
-        for fid, rid in real_upstream.id_map.items()
+        for fid, rid, obs in (
+            (fid, rid, real_upstream.observables[fid])
+            for fid, rid in real_upstream.id_map.items()
+        )
     ]
     document = build_real_golden_document(
         sessions, injected,
@@ -889,6 +1069,332 @@ async def test_eq007_real_golden_provenance(real_upstream):
     assert stored_semantic == live_semantic, (
         "真实 golden 语义面与当前实例漂移（title/archived/parent 结构）"
     )
+
+
+# --- rev gate BLOCKER-1：真实 golden 进日常 CI 权威链路 -------------------
+
+
+def test_real_golden_ci_unconditional():
+    """BLOCKER-1a：真实 golden CI 校验**无条件必跑**。
+
+    不依赖 ``real_upstream`` fixture / 真实二进制——二进制缺席只 skip
+    真进程 case，golden 校验（provenance + 载荷指纹 + 稳定语义字段全量）
+    永不被连带 skip。
+    """
+    document = load_real_golden()
+    assert document["sessions"], "真实 golden 载荷非空"
+
+
+_TAMPER_CASES = {
+    "tokens": lambda doc: doc["sessions"][0].update(
+        tokens=[v + 1 for v in doc["sessions"][0]["tokens"]]),
+    "project": lambda doc: doc["sessions"][0].update(
+        project=["p0", "tampered", "/tampered"]),
+    "project_none": lambda doc: doc["sessions"][0].update(project=None),
+    "metadata": lambda doc: doc["sessions"][0].update(
+        metadata={"tampered": True}),
+    "title": lambda doc: doc["sessions"][0].update(title="tampered"),
+    "time_compacting": lambda doc: doc["sessions"][0].update(
+        time_compacting=999999),
+    "revert": lambda doc: doc["sessions"][0].update(
+        revert=["tampered", None, None, None]),
+    "summary": lambda doc: doc["sessions"][0].update(
+        summary=[7, 7, 7, None]),
+    "agent": lambda doc: doc["sessions"][0].update(agent="tampered"),
+    "permission": lambda doc: doc["sessions"][0].update(
+        permission=[["x", "y", "allow"]]),
+    "fingerprint": lambda doc: doc.update(response_fingerprint="0" * 16),
+    "generated_at": lambda doc: doc.pop("generated_at"),
+    "query_sort": lambda doc: doc["query"].update(sort="tampered"),
+    "injected_empty": lambda doc: doc.update(injected_sessions=[]),
+    "dataset_digest": lambda doc: doc.update(dataset_digest="0" * 16),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_TAMPER_CASES))
+def test_real_golden_tamper_negative(case):
+    """BLOCKER-1b 自测：篡改任一字段（tokens/project/metadata/…）必须使
+    CI 校验失败——载荷指纹重算层 + 语义桥层双保险。"""
+    document = load_real_golden()
+    _TAMPER_CASES[case](document)
+    problems = validate_real_golden_ci(document)
+    assert problems, f"篡改 {case} 未被检出"
+
+
+def test_eq007_gate_release_mode_fail_not_skip(monkeypatch):
+    """BLOCKER-1d：release 门语义。
+
+    - ``OC_SLIMAPI_EQ_BINARY=/nonexistent`` + 无 REQUIRE → skip（普通 CI）；
+    - + ``OC_SLIMAPI_REQUIRE_EQ007=1`` → **fail 不 skip**；
+    - env 指回真实二进制 → ok（路径可覆盖）。
+    """
+    monkeypatch.setenv("OC_SLIMAPI_EQ_BINARY", "/nonexistent/eq-opencode")
+    monkeypatch.delenv("OC_SLIMAPI_REQUIRE_EQ007", raising=False)
+    state, _ = _eq007_gate()
+    assert state == "skip"
+    monkeypatch.setenv("OC_SLIMAPI_REQUIRE_EQ007", "1")
+    state, reason = _eq007_gate()
+    assert state == "fail"
+    assert "release" in reason
+    monkeypatch.setenv("OC_SLIMAPI_EQ_BINARY", REAL_UPSTREAM_BINARY)
+    state, _ = _eq007_gate()
+    assert state == "ok"
+
+
+# --- rev gate BLOCKER-1c：EQ-001..006 生产投影 vs real golden ------------
+
+
+async def test_real_golden_projection_identity_eq001_eq006(tmp_path):
+    """EQ-001/006（real golden 权威期望）：golden 内容重建 DB → 生产
+    ``fetch_sessions_page`` 全量投影 ≡ golden sessions（逐字段 + 序）。
+
+    server-assigned 字段（id/时间戳/directory/project）显式写入 fixture
+    行；mirror oracle 降为辅助（不再是投影等价的唯一权威期望）。
+    """
+    document = load_real_golden()
+    db = build_db_from_real_golden(document, tmp_path / "real-golden.db")
+    source = DbAuxiliarySource(ResolvedPath(path=str(db), source="explicit-env"))
+    status = await source.start()
+    assert status.available, f"golden 派生 DB 不可用：{status.reason}"
+    try:
+        page = await fetch_sessions_page(
+            source, archived="all", parent="all",
+            limit=len(document["sessions"]) + 5,
+        )
+        assert page.complete is True
+        assert len(page.records) == len(document["sessions"])
+        # tuple（_norm_db）vs list（golden JSON）→ canonical 文本逐行比对
+        for got, want in zip(
+            (_norm_db(r) for r in page.records), document["sessions"]
+        ):
+            assert json.dumps(got, sort_keys=True) == json.dumps(
+                want, sort_keys=True
+            ), f"逐字段漂移：{want['id']}"
+    finally:
+        await source.stop()
+
+
+async def test_real_golden_cursor_paging_eq002_eq005(tmp_path):
+    """EQ-002/005（real golden 权威期望）：复合锚点逐页拼接 ≡ 全量；
+    N/N+1 complete 边界。"""
+    document = load_real_golden()
+    db = build_db_from_real_golden(document, tmp_path / "real-golden.db")
+    source = DbAuxiliarySource(ResolvedPath(path=str(db), source="explicit-env"))
+    await source.start()
+    try:
+        full = await fetch_sessions_page(
+            source, archived="all", parent="all", limit=1000)
+        full_ids = [r["id"] for r in full.records]
+        walked: list[str] = []
+        cursor = None
+        for _ in range(200):
+            page = await fetch_sessions_page(
+                source, archived="all", parent="all", limit=3, cursor=cursor)
+            walked.extend(r["id"] for r in page.records)
+            if page.complete:
+                break
+            assert page.anchor is not None
+            cursor = page.anchor
+        assert walked == full_ids, "golden 期望：翻页拼接 ≡ 全量"
+        n = len(full_ids)
+        assert (await fetch_sessions_page(
+            source, archived="all", parent="all", limit=n)).complete is True
+        assert (await fetch_sessions_page(
+            source, archived="all", parent="all", limit=n - 1)).complete is False
+    finally:
+        await source.stop()
+
+
+async def test_real_golden_filter_axes_eq003_eq004(tmp_path):
+    """EQ-003/004（real golden 权威期望）：archived×parent 全轴 vs **测试内
+    独立比较器**（期望源 = golden sessions 本身，不调用生产谓词/降级）。
+
+    EQ-004 tie-break：注入保证 time_updated 毫秒互异 → golden 无并列，
+    tie 维度断言「无 tie + 排序确定」（tie-break 权威锚定在 fixture 面
+    + 2e 真实 tie 样本）。
+    """
+    document = load_real_golden()
+    db = build_db_from_real_golden(document, tmp_path / "real-golden.db")
+    source = DbAuxiliarySource(ResolvedPath(path=str(db), source="explicit-env"))
+    await source.start()
+    try:
+        sessions = document["sessions"]
+        times = [s["time_updated"] for s in sessions]
+        assert len(set(times)) == len(times), "golden 出现 tie（注入前提失效）"
+
+        def _indep(rows, archived, parent):
+            out = []
+            explicit_sid = parent not in ("all", "none", "only")
+            for r in rows:
+                if archived == "omit" and r["time_archived"] is not None:
+                    continue
+                if archived == "only" and r["time_archived"] is None:
+                    continue
+                if parent == "none" and r["parent_id"] is not None:
+                    continue
+                if parent == "only" and r["parent_id"] is None:
+                    continue
+                if explicit_sid and r["parent_id"] != parent:
+                    continue
+                out.append(r["id"])
+            return out
+
+        with_parent = next(
+            s for s in sessions if s["parent_id"] is not None)
+        sid = with_parent["parent_id"]
+        for archived in ("omit", "only", "all"):
+            for parent in ("all", "none", "only", sid):
+                page = await fetch_sessions_page(
+                    source, archived=archived, parent=parent, limit=1000)
+                assert [r["id"] for r in page.records] == _indep(
+                    sessions, archived, parent), (
+                    f"archived={archived} parent={parent}"
+                )
+    finally:
+        await source.stop()
+
+
+# --- rev gate BLOCKER-2c/2e：真实实例上的富化暴露 / 坏 JSON 实证 / tie ---
+
+
+async def test_eq007_sql_enrichment_exposed_on_wire(real_upstream):
+    """BLOCKER-2c 证据面：API 不可生成字段（tokens/summary/revert/
+    time_compacting）经 SQL 富化后**真实 HTTP handler 暴露到 wire**——
+    非零互异代表值在场（防「全零错列仍通过」）；恒等式由全字段
+    identity 测试锚定。"""
+    by_id = {s["id"]: s for s in real_upstream.l_up}
+    # tokens：行内 input≠output 恒成立（100+n vs 50+n）——列映射错误必被
+    # 捕获；行间互异（n 按 sid 哈希分布）
+    for s in real_upstream.l_up:
+        tokens = s["tokens"]
+        assert tokens["input"] != tokens["output"], s["id"]
+    distinct_inputs = {s["tokens"]["input"] for s in real_upstream.l_up}
+    assert len(distinct_inputs) >= len(real_upstream.l_up) // 2, (
+        "tokens 行间互异性不足（错列防护失效）"
+    )
+    # summary 族（含 diffs）暴露
+    sample = by_id[real_upstream.id_map["ses_root_1"]]
+    assert sample["summary"]["additions"] is not None
+    assert "diffs" in sample["summary"]
+    # revert 暴露（fixture 置值行）
+    revert_id = by_id[real_upstream.id_map["ses_revert_full"]]["revert"]
+    assert revert_id["messageID"] == "msg_9"
+    assert revert_id["partID"] == "prt_9"
+    # time_compacting 暴露
+    assert by_id[real_upstream.id_map["ses_root_3"]]["time"]["compacting"] == 1234
+
+
+async def test_eq007_bad_json_probe_upstream_behavior(real_upstream):
+    """BLOCKER-2c 附带实证（不静默放弃）：坏 ``summary_diffs`` 写入单行 →
+    观察上游真实行为并记录（200 行级容忍 / 500 整列表失败）；探针结束
+    恢复原值。sidecar 的 §8 跳行容忍是**我们侧**语义；上游事实在此锚定。"""
+    target = real_upstream.id_map["ses_child_a"]
+    conn = sqlite3.connect(real_upstream.db_path, timeout=10.0)
+    original = conn.execute(
+        "SELECT summary_diffs FROM session WHERE id=?", (target,)
+    ).fetchone()[0]
+    status = None
+    snippet = ""
+    try:
+        conn.execute(
+            "UPDATE session SET summary_diffs='not-json{' WHERE id=?", (target,)
+        )
+        conn.commit()
+        with httpx.Client(
+            base_url=real_upstream.base_url, timeout=10.0
+        ) as client:
+            response = client.get(
+                "/experimental/session",
+                params={"archived": "true", "limit": 1000},
+            )
+            status = response.status_code
+            snippet = response.text[:200]
+    finally:
+        conn.execute(
+            "UPDATE session SET summary_diffs=? WHERE id=?", (original, target)
+        )
+        conn.commit()
+        conn.close()
+    # 实证断言：二选一（任何其他状态 = 上游行为超出已知面，需上报）
+    assert status in (200, 500), f"未预期的上游行为：{status} {snippet}"
+    if status == 500:
+        print(f"[EQ-007 实证] 上游坏 JSON → 500（整列表失败）：{snippet}")
+    else:
+        print("[EQ-007 实证] 上游坏 JSON → 200（列表仍可用）")
+
+
+async def test_eq007_real_tie_break_and_upstream_cursor_boundary(real_upstream):
+    """BLOCKER-2e：真实 tie 样本——SQL 制造 time_updated 并列（顶两行）→
+
+    - 生产 (t,i) keyset：tie-break id DESC 确定 + limit=1 逐页两行都到
+      （复合锚点不丢行）；
+    - 上游单键 cursor：``lt(time_updated)`` 跳过并列兄弟——**边界按预期
+      断言为真**（上游事实记录；fixture 面已覆盖我方 tie-break 权威）。
+
+    finally 恢复原始 time_updated（对后续运行零残留）。
+    """
+    source = await _real_source(real_upstream.db_path)
+    conn = sqlite3.connect(real_upstream.db_path, timeout=10.0)
+    originals: dict[str, int] = {}
+    try:
+        full = await _db_records(source)
+        top1, top2 = full.records[0], full.records[1]
+        t1, t2 = top1["time_updated"], top2["time_updated"]
+        tie_t = max(t1, t2)
+        originals = {top1["id"]: t1, top2["id"]: t2}
+        for rid in originals:
+            conn.execute(
+                "UPDATE session SET time_updated=? WHERE id=?", (tie_t, rid)
+            )
+        conn.commit()
+        # 生产侧：tie-break (t, id) DESC 确定性
+        page = await _db_records(source)
+        top_keys = [
+            (r["time_updated"], r["id"]) for r in page.records[:2]
+        ]
+        assert top_keys == sorted(top_keys, reverse=True)
+        assert all(t == tie_t for t, _ in top_keys)
+        # 生产侧：limit=1 翻页——复合锚点两行都到
+        walked: list[str] = []
+        cursor = None
+        for _ in range(60):
+            p = await fetch_sessions_page(
+                source, archived="all", parent="all", limit=1, cursor=cursor)
+            walked.extend(r["id"] for r in p.records)
+            if p.complete:
+                break
+            cursor = p.anchor
+        assert set(originals) <= set(walked), "复合锚点丢并列行"
+        # 上游侧：单键 cursor 边界——第一页后 cursor=tie_t → lt() 丢兄弟
+        with httpx.Client(
+            base_url=real_upstream.base_url, timeout=10.0
+        ) as client:
+            first = client.get(
+                "/experimental/session", params={"archived": "true", "limit": 1}
+            )
+            assert first.status_code == 200
+            first_id = first.json()[0]["id"]
+            cursor_header = first.headers.get("x-next-cursor")
+            assert cursor_header is not None
+            second = client.get(
+                "/experimental/session",
+                params={"archived": "true", "limit": 1, "cursor": cursor_header},
+            )
+            assert second.status_code == 200
+            second_ids = [s["id"] for s in second.json()]
+        assert first_id == max(originals), "上游首行应为并列组 id 最大者"
+        sibling = next(rid for rid in originals if rid != first_id)
+        assert sibling not in second_ids, (
+            "预期边界失效：上游单键 cursor 未跳过并列行（行为漂移，需上报）"
+        )
+    finally:
+        for rid, t in originals.items():
+            conn.execute(
+                "UPDATE session SET time_updated=? WHERE id=?", (t, rid)
+            )
+        conn.commit()
+        conn.close()
+        await source.stop()
 
 
 # --- EQ-008 schema 漂移哨兵 ------------------------------------------------

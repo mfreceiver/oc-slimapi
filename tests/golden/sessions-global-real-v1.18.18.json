@@ -1,7 +1,7 @@
 {
   "version": "v1.18.18",
   "generator": "real-upstream-http-1.18.18",
-  "generated_at": "2026-08-18T04:04:31+00:00",
+  "generated_at": "2026-08-18T04:47:15+00:00",
   "opencode_version": "1.18.18",
   "dataset_digest": "c7b87f0f653b1694",
   "dataset_manifest": {
@@ -17,161 +17,381 @@
     "project_id",
     "project"
   ],
+  "sql_enriched_fields": [
+    "tokens_input",
+    "tokens_output",
+    "tokens_reasoning",
+    "tokens_cache_read",
+    "tokens_cache_write",
+    "summary_additions",
+    "summary_deletions",
+    "summary_files",
+    "summary_diffs",
+    "revert",
+    "time_compacting"
+  ],
+  "enrichment": "sql-enriched via direct UPDATE on test-owned ephemeral instance (fixture-derived values; tokens/summary/revert/time_compacting); substitutes: {\"ses_bad_json\": {\"summary_diffs\": null}}",
   "regenerate_hint": "OC_SLIMAPI_EQ_WRITE_REAL_GOLDEN=1 .venv/bin/python -m pytest tests/test_equivalence_anchor.py -k eq007_real_golden （需真实 opencode 1.18.18 发布二进制）",
   "injected_sessions": [
     {
       "fixture_id": "ses_root_1",
-      "real_id": "ses_fecf53033ffeqaUrNL4dfy4zA1",
+      "real_id": "ses_fecce1003ffe6pQH4aN8kU9bdl",
       "fixture_directory": "/foo",
-      "real_directory": "/tmp/eq007-home-0c3jr_3s/ws/foo"
+      "real_directory": "/tmp/eq007-home-_wult88v/ws/foo",
+      "agent": "agent-even",
+      "model": [
+        "fixture-model",
+        "prov-a",
+        null
+      ],
+      "permission": null
     },
     {
       "fixture_id": "ses_root_2",
-      "real_id": "ses_fecf52fdbffeUWYrOfQPT6m4xF",
+      "real_id": "ses_fecce0fa5ffeZYv7BaEpmbZLe4",
       "fixture_directory": "/foobar",
-      "real_directory": "/tmp/eq007-home-0c3jr_3s/ws/foobar"
+      "real_directory": "/tmp/eq007-home-_wult88v/ws/foobar",
+      "agent": "agent-odd",
+      "model": [
+        "fixture-model",
+        "prov-b",
+        null
+      ],
+      "permission": null
     },
     {
       "fixture_id": "ses_archived_child",
-      "real_id": "ses_fecf52fabffe37lM5uTHMURsGJ",
+      "real_id": "ses_fecce0f80ffeJdwrr74ERLIZF0",
       "fixture_directory": "/foo/sub",
-      "real_directory": "/tmp/eq007-home-0c3jr_3s/ws/foo/sub"
+      "real_directory": "/tmp/eq007-home-_wult88v/ws/foo/sub",
+      "agent": "agent-even",
+      "model": [
+        "fixture-model",
+        "prov-a",
+        null
+      ],
+      "permission": null
     },
     {
       "fixture_id": "ses_root_3",
-      "real_id": "ses_fecf52f87ffeEJ7sqizeNdqom0",
+      "real_id": "ses_fecce0f5effeN66FEhQ18nWMGx",
       "fixture_directory": "/a",
-      "real_directory": "/tmp/eq007-home-0c3jr_3s/ws/a"
+      "real_directory": "/tmp/eq007-home-_wult88v/ws/a",
+      "agent": "agent-odd",
+      "model": [
+        "fixture-model",
+        "prov-b",
+        null
+      ],
+      "permission": [
+        [
+          "bash",
+          "rm*",
+          "deny"
+        ]
+      ]
     },
     {
       "fixture_id": "ses_a_pct",
-      "real_id": "ses_fecf52f56ffepCkRVDvdYYA0ur",
+      "real_id": "ses_fecce0f27ffe3Fgi4dVnv09iSF",
       "fixture_directory": "/a/%20b/c",
-      "real_directory": "/tmp/eq007-home-0c3jr_3s/ws/a/ b/c"
+      "real_directory": "/tmp/eq007-home-_wult88v/ws/a/ b/c",
+      "agent": "agent-even",
+      "model": [
+        "fixture-model",
+        "prov-a",
+        null
+      ],
+      "permission": null
     },
     {
       "fixture_id": "ses_a_us",
-      "real_id": "ses_fecf52f31ffe9txQb2Uh2mtJam",
+      "real_id": "ses_fecce0ef6ffe3d0d2n4sYcYua2",
       "fixture_directory": "/a/dir_%_x",
-      "real_directory": "/tmp/eq007-home-0c3jr_3s/ws/a/dir_%_x"
+      "real_directory": "/tmp/eq007-home-_wult88v/ws/a/dir_%_x",
+      "agent": "agent-odd",
+      "model": [
+        "fixture-model",
+        "prov-b",
+        null
+      ],
+      "permission": [
+        [
+          "edit",
+          "*.env",
+          "ask"
+        ],
+        [
+          "webfetch",
+          "host:example*",
+          "allow"
+        ]
+      ]
     },
     {
       "fixture_id": "ses_same_level",
-      "real_id": "ses_fecf52f0dffeXSerCmc3BDiKES",
+      "real_id": "ses_fecce0ed3ffevvJSW0tH2xtAUd",
       "fixture_directory": "/a%20b/c",
-      "real_directory": "/tmp/eq007-home-0c3jr_3s/ws/a b/c"
+      "real_directory": "/tmp/eq007-home-_wult88v/ws/a b/c",
+      "agent": "agent-even",
+      "model": [
+        "fixture-model",
+        "prov-a",
+        null
+      ],
+      "permission": null
     },
     {
       "fixture_id": "ses_case",
-      "real_id": "ses_fecf52ee9ffeuJ5e6yyJRKdb5L",
+      "real_id": "ses_fecce0eb4ffeJYdyTly6Pd1AAu",
       "fixture_directory": "/Foo/child",
-      "real_directory": "/tmp/eq007-home-0c3jr_3s/ws/Foo/child"
+      "real_directory": "/tmp/eq007-home-_wult88v/ws/Foo/child",
+      "agent": "agent-odd",
+      "model": [
+        "fixture-model",
+        "prov-b",
+        null
+      ],
+      "permission": null
     },
     {
       "fixture_id": "ses_tie_a",
-      "real_id": "ses_fecf52ec9ffeA3GLiXEdXjyr21",
+      "real_id": "ses_fecce0e8bffeSC5ql0jllM3Xnz",
       "fixture_directory": "/b",
-      "real_directory": "/tmp/eq007-home-0c3jr_3s/ws/b"
+      "real_directory": "/tmp/eq007-home-_wult88v/ws/b",
+      "agent": "agent-even",
+      "model": [
+        "fixture-model",
+        "prov-a",
+        null
+      ],
+      "permission": null
     },
     {
       "fixture_id": "ses_tie_b",
-      "real_id": "ses_fecf52ea3ffemAgPgZXSlKoDcF",
+      "real_id": "ses_fecce0e65ffeqCLr8XRbN5qkIR",
       "fixture_directory": "/b/sub",
-      "real_directory": "/tmp/eq007-home-0c3jr_3s/ws/b/sub"
+      "real_directory": "/tmp/eq007-home-_wult88v/ws/b/sub",
+      "agent": "agent-odd",
+      "model": [
+        "fixture-model",
+        "prov-b",
+        null
+      ],
+      "permission": null
     },
     {
       "fixture_id": "ses_host_style",
-      "real_id": "ses_fecf52e7fffec7CnMw4vXFqCyZ",
+      "real_id": "ses_fecce0e40ffeXY6SYjXcCFXVvL",
       "fixture_directory": "/srv/mar@host-1/proj",
-      "real_directory": "/tmp/eq007-home-0c3jr_3s/ws/srv/mar@host-1/proj"
+      "real_directory": "/tmp/eq007-home-_wult88v/ws/srv/mar@host-1/proj",
+      "agent": "agent-even",
+      "model": [
+        "fixture-model",
+        "prov-a",
+        null
+      ],
+      "permission": [
+        [
+          "bash",
+          "rm*",
+          "deny"
+        ]
+      ]
     },
     {
       "fixture_id": "ses_time_zero",
-      "real_id": "ses_fecf52e6bffenjyVcLbAe3NFA1",
+      "real_id": "ses_fecce0e2cffe4QSvcd7FhnwfkQ",
       "fixture_directory": "/foo",
-      "real_directory": "/tmp/eq007-home-0c3jr_3s/ws/foo"
+      "real_directory": "/tmp/eq007-home-_wult88v/ws/foo",
+      "agent": "agent-odd",
+      "model": [
+        "fixture-model",
+        "prov-b",
+        null
+      ],
+      "permission": null
     },
     {
       "fixture_id": "ses_time_now",
-      "real_id": "ses_fecf52e44ffeAkkVGPJ9CI6HMd",
+      "real_id": "ses_fecce0e05ffe6qnRhW8gU9zauy",
       "fixture_directory": "/b/late",
-      "real_directory": "/tmp/eq007-home-0c3jr_3s/ws/b/late"
+      "real_directory": "/tmp/eq007-home-_wult88v/ws/b/late",
+      "agent": "agent-even",
+      "model": [
+        "fixture-model",
+        "prov-a",
+        null
+      ],
+      "permission": [
+        [
+          "edit",
+          "*.env",
+          "ask"
+        ],
+        [
+          "webfetch",
+          "host:example*",
+          "allow"
+        ]
+      ]
     },
     {
       "fixture_id": "ses_tie_c",
-      "real_id": "ses_fecf52e30ffe5S4yqHPl3ivTa5",
+      "real_id": "ses_fecce0df1ffeJmEvISxQ9AGRys",
       "fixture_directory": "/foo",
-      "real_directory": "/tmp/eq007-home-0c3jr_3s/ws/foo"
+      "real_directory": "/tmp/eq007-home-_wult88v/ws/foo",
+      "agent": "agent-odd",
+      "model": [
+        "fixture-model",
+        "prov-b",
+        null
+      ],
+      "permission": null
     },
     {
       "fixture_id": "ses_orphan_proj",
-      "real_id": "ses_fecf52e20ffeTYKKVAMuvPuQ1j",
+      "real_id": "ses_fecce0de5ffei0T3xM8ry8Jfq2",
       "fixture_directory": "/foo",
-      "real_directory": "/tmp/eq007-home-0c3jr_3s/ws/foo"
+      "real_directory": "/tmp/eq007-home-_wult88v/ws/foo",
+      "agent": "agent-even",
+      "model": [
+        "fixture-model",
+        "prov-a",
+        null
+      ],
+      "permission": null
     },
     {
       "fixture_id": "ses_bad_json",
-      "real_id": "ses_fecf52e11ffeFc5u4DnKKnAPcr",
+      "real_id": "ses_fecce0dd1ffe7Eax0jdbpB6YCn",
       "fixture_directory": "/foo",
-      "real_directory": "/tmp/eq007-home-0c3jr_3s/ws/foo"
+      "real_directory": "/tmp/eq007-home-_wult88v/ws/foo",
+      "agent": "agent-odd",
+      "model": [
+        "fixture-model",
+        "prov-b",
+        null
+      ],
+      "permission": null
     },
     {
       "fixture_id": "ses_revert_full",
-      "real_id": "ses_fecf52dffffeCruCgnBN5eJH48",
+      "real_id": "ses_fecce0dc3ffezA71Vkmd3z9GzC",
       "fixture_directory": "/a",
-      "real_directory": "/tmp/eq007-home-0c3jr_3s/ws/a"
+      "real_directory": "/tmp/eq007-home-_wult88v/ws/a",
+      "agent": "agent-even",
+      "model": [
+        "fixture-model",
+        "prov-a",
+        null
+      ],
+      "permission": null
     },
     {
       "fixture_id": "ses_search_decoy",
-      "real_id": "ses_fecf52df1ffeHekiRFPTT2i2Xj",
+      "real_id": "ses_fecce0daeffe15TpJQspWNjV1X",
       "fixture_directory": "/b",
-      "real_directory": "/tmp/eq007-home-0c3jr_3s/ws/b"
+      "real_directory": "/tmp/eq007-home-_wult88v/ws/b",
+      "agent": "agent-odd",
+      "model": [
+        "fixture-model",
+        "prov-b",
+        null
+      ],
+      "permission": [
+        [
+          "bash",
+          "rm*",
+          "deny"
+        ]
+      ]
     },
     {
       "fixture_id": "ses_case_fold",
-      "real_id": "ses_fecf52ddcffeshdgtgPZq5yz3P",
+      "real_id": "ses_fecce0da3ffeN1eua0IR6VEfN6",
       "fixture_directory": "/b",
-      "real_directory": "/tmp/eq007-home-0c3jr_3s/ws/b"
+      "real_directory": "/tmp/eq007-home-_wult88v/ws/b",
+      "agent": "agent-even",
+      "model": [
+        "fixture-model",
+        "prov-a",
+        null
+      ],
+      "permission": null
     },
     {
       "fixture_id": "ses_child_a",
-      "real_id": "ses_fecf52dcaffe2oy40Xtdu4hD7R",
+      "real_id": "ses_fecce0d91ffeoXIWACipTMAfxC",
       "fixture_directory": "/foo/sub",
-      "real_directory": "/tmp/eq007-home-0c3jr_3s/ws/foo/sub"
+      "real_directory": "/tmp/eq007-home-_wult88v/ws/foo/sub",
+      "agent": "agent-odd",
+      "model": [
+        "fixture-model",
+        "prov-b",
+        null
+      ],
+      "permission": [
+        [
+          "edit",
+          "*.env",
+          "ask"
+        ],
+        [
+          "webfetch",
+          "host:example*",
+          "allow"
+        ]
+      ]
     },
     {
       "fixture_id": "ses_child_b",
-      "real_id": "ses_fecf52da6ffe76WKiDcGSKkGxR",
+      "real_id": "ses_fecce0d6dffeYElSLAmV0dTmm1",
       "fixture_directory": "/foo/bar/deep",
-      "real_directory": "/tmp/eq007-home-0c3jr_3s/ws/foo/bar/deep"
+      "real_directory": "/tmp/eq007-home-_wult88v/ws/foo/bar/deep",
+      "agent": "agent-even",
+      "model": [
+        "fixture-model",
+        "prov-a",
+        null
+      ],
+      "permission": null
     },
     {
       "fixture_id": "ses_child_c",
-      "real_id": "ses_fecf52d74ffe4dpzcHgW64erxC",
+      "real_id": "ses_fecce0d4dffe6Ccx1mDOeR0GbL",
       "fixture_directory": "/foo/baz",
-      "real_directory": "/tmp/eq007-home-0c3jr_3s/ws/foo/baz"
+      "real_directory": "/tmp/eq007-home-_wult88v/ws/foo/baz",
+      "agent": "agent-odd",
+      "model": [
+        "fixture-model",
+        "prov-b",
+        null
+      ],
+      "permission": null
     }
   ],
-  "response_fingerprint": "d75482b4ef033d0a",
+  "response_fingerprint": "70739767254816d2",
   "query": {
     "endpoint": "GET /experimental/session?archived=true&limit=1000",
     "sort": "time_updated DESC, id DESC"
   },
   "sessions": [
     {
-      "id": "ses_fecf52d74ffe4dpzcHgW64erxC",
-      "parent_id": "ses_fecf53033ffeqaUrNL4dfy4zA1",
-      "directory": "/tmp/eq007-home-0c3jr_3s/ws/foo/baz",
+      "id": "ses_fecce0d4dffe6Ccx1mDOeR0GbL",
+      "parent_id": "ses_fecce1003ffe6pQH4aN8kU9bdl",
+      "directory": "/tmp/eq007-home-_wult88v/ws/foo/baz",
       "title": "back\\slash title",
       "version": "1.18.18",
-      "time_created": 1787025871499,
-      "time_updated": 1787025871499,
+      "time_created": 1787028435634,
+      "time_updated": 1787028435634,
       "time_archived": null,
+      "time_compacting": null,
       "tokens": [
-        0,
-        0,
-        0,
-        0,
+        423,
+        373,
+        4,
+        11,
         0
       ],
       "project": [
@@ -182,24 +402,41 @@
       "metadata": {
         "origin": "fixture"
       },
-      "agent": null,
-      "model": null
+      "agent": "agent-odd",
+      "model": [
+        "fixture-model",
+        "prov-b",
+        null
+      ],
+      "summary": [
+        1,
+        2,
+        1,
+        {
+          "files": 1,
+          "additions": 2,
+          "deletions": 3
+        }
+      ],
+      "revert": null,
+      "permission": null
     },
     {
-      "id": "ses_fecf52da6ffe76WKiDcGSKkGxR",
-      "parent_id": "ses_fecf53033ffeqaUrNL4dfy4zA1",
-      "directory": "/tmp/eq007-home-0c3jr_3s/ws/foo/bar/deep",
+      "id": "ses_fecce0d6dffeYElSLAmV0dTmm1",
+      "parent_id": "ses_fecce1003ffe6pQH4aN8kU9bdl",
+      "directory": "/tmp/eq007-home-_wult88v/ws/foo/bar/deep",
       "title": "under_score path",
       "version": "1.18.18",
-      "time_created": 1787025871449,
-      "time_updated": 1787025871449,
+      "time_created": 1787028435602,
+      "time_updated": 1787028435602,
       "time_archived": null,
+      "time_compacting": null,
       "tokens": [
-        0,
-        0,
-        0,
-        0,
-        0
+        216,
+        166,
+        6,
+        12,
+        14
       ],
       "project": [
         "global",
@@ -209,24 +446,41 @@
       "metadata": {
         "origin": "fixture"
       },
-      "agent": null,
-      "model": null
+      "agent": "agent-even",
+      "model": [
+        "fixture-model",
+        "prov-a",
+        null
+      ],
+      "summary": [
+        4,
+        2,
+        0,
+        {
+          "files": 1,
+          "additions": 2,
+          "deletions": 3
+        }
+      ],
+      "revert": null,
+      "permission": null
     },
     {
-      "id": "ses_fecf52dcaffe2oy40Xtdu4hD7R",
-      "parent_id": "ses_fecf53033ffeqaUrNL4dfy4zA1",
-      "directory": "/tmp/eq007-home-0c3jr_3s/ws/foo/sub",
+      "id": "ses_fecce0d91ffeoXIWACipTMAfxC",
+      "parent_id": "ses_fecce1003ffe6pQH4aN8kU9bdl",
+      "directory": "/tmp/eq007-home-_wult88v/ws/foo/sub",
       "title": "fix the 100% bug",
       "version": "1.18.18",
-      "time_created": 1787025871413,
-      "time_updated": 1787025871413,
+      "time_created": 1787028435566,
+      "time_updated": 1787028435566,
       "time_archived": null,
+      "time_compacting": null,
       "tokens": [
+        555,
+        505,
+        4,
         0,
-        0,
-        0,
-        0,
-        0
+        13
       ],
       "project": [
         "global",
@@ -236,24 +490,52 @@
       "metadata": {
         "origin": "fixture"
       },
-      "agent": null,
-      "model": null
+      "agent": "agent-odd",
+      "model": [
+        "fixture-model",
+        "prov-b",
+        null
+      ],
+      "summary": [
+        0,
+        2,
+        1,
+        {
+          "files": 1,
+          "additions": 2,
+          "deletions": 3
+        }
+      ],
+      "revert": null,
+      "permission": [
+        [
+          "edit",
+          "*.env",
+          "ask"
+        ],
+        [
+          "webfetch",
+          "host:example*",
+          "allow"
+        ]
+      ]
     },
     {
-      "id": "ses_fecf52ddcffeshdgtgPZq5yz3P",
+      "id": "ses_fecce0da3ffeN1eua0IR6VEfN6",
       "parent_id": null,
-      "directory": "/tmp/eq007-home-0c3jr_3s/ws/b",
+      "directory": "/tmp/eq007-home-_wult88v/ws/b",
       "title": "PLAIN TITLE UPPER",
       "version": "1.18.18",
-      "time_created": 1787025871395,
-      "time_updated": 1787025871395,
+      "time_created": 1787028435548,
+      "time_updated": 1787028435548,
       "time_archived": null,
+      "time_compacting": null,
       "tokens": [
-        0,
-        0,
-        0,
-        0,
-        0
+        506,
+        456,
+        10,
+        3,
+        15
       ],
       "project": [
         "global",
@@ -263,24 +545,41 @@
       "metadata": {
         "origin": "fixture"
       },
-      "agent": null,
-      "model": null
+      "agent": "agent-even",
+      "model": [
+        "fixture-model",
+        "prov-a",
+        null
+      ],
+      "summary": [
+        0,
+        1,
+        0,
+        {
+          "files": 1,
+          "additions": 2,
+          "deletions": 3
+        }
+      ],
+      "revert": null,
+      "permission": null
     },
     {
-      "id": "ses_fecf52df1ffeHekiRFPTT2i2Xj",
+      "id": "ses_fecce0daeffe15TpJQspWNjV1X",
       "parent_id": null,
-      "directory": "/tmp/eq007-home-0c3jr_3s/ws/b",
+      "directory": "/tmp/eq007-home-_wult88v/ws/b",
       "title": "1004 percent four",
       "version": "1.18.18",
-      "time_created": 1787025871374,
-      "time_updated": 1787025871374,
+      "time_created": 1787028435537,
+      "time_updated": 1787028435537,
       "time_archived": null,
+      "time_compacting": null,
       "tokens": [
-        0,
-        0,
-        0,
-        0,
-        0
+        511,
+        461,
+        4,
+        8,
+        3
       ],
       "project": [
         "global",
@@ -290,24 +589,47 @@
       "metadata": {
         "origin": "fixture"
       },
-      "agent": null,
-      "model": null
+      "agent": "agent-odd",
+      "model": [
+        "fixture-model",
+        "prov-b",
+        null
+      ],
+      "summary": [
+        5,
+        0,
+        1,
+        {
+          "files": 1,
+          "additions": 2,
+          "deletions": 3
+        }
+      ],
+      "revert": null,
+      "permission": [
+        [
+          "bash",
+          "rm*",
+          "deny"
+        ]
+      ]
     },
     {
-      "id": "ses_fecf52dffffeCruCgnBN5eJH48",
-      "parent_id": "ses_fecf52f87ffeEJ7sqizeNdqom0",
-      "directory": "/tmp/eq007-home-0c3jr_3s/ws/a",
+      "id": "ses_fecce0dc3ffezA71Vkmd3z9GzC",
+      "parent_id": "ses_fecce0f5effeN66FEhQ18nWMGx",
+      "directory": "/tmp/eq007-home-_wult88v/ws/a",
       "title": "with revert data",
       "version": "1.18.18",
-      "time_created": 1787025871360,
-      "time_updated": 1787025871360,
+      "time_created": 1787028435516,
+      "time_updated": 1787028435516,
       "time_archived": null,
+      "time_compacting": null,
       "tokens": [
-        0,
-        0,
-        0,
-        0,
-        0
+        267,
+        217,
+        2,
+        11,
+        14
       ],
       "project": [
         "global",
@@ -317,24 +639,46 @@
       "metadata": {
         "k": "v"
       },
-      "agent": null,
-      "model": null
+      "agent": "agent-even",
+      "model": [
+        "fixture-model",
+        "prov-a",
+        null
+      ],
+      "summary": [
+        6,
+        2,
+        1,
+        {
+          "files": 1,
+          "additions": 2,
+          "deletions": 3
+        }
+      ],
+      "revert": [
+        "msg_9",
+        "prt_9",
+        null,
+        null
+      ],
+      "permission": null
     },
     {
-      "id": "ses_fecf52e11ffeFc5u4DnKKnAPcr",
+      "id": "ses_fecce0dd1ffe7Eax0jdbpB6YCn",
       "parent_id": null,
-      "directory": "/tmp/eq007-home-0c3jr_3s/ws/foo",
+      "directory": "/tmp/eq007-home-_wult88v/ws/foo",
       "title": "broken json row",
       "version": "1.18.18",
-      "time_created": 1787025871342,
-      "time_updated": 1787025871342,
+      "time_created": 1787028435502,
+      "time_updated": 1787028435502,
       "time_archived": null,
+      "time_compacting": null,
       "tokens": [
-        0,
-        0,
-        0,
-        0,
-        0
+        388,
+        338,
+        2,
+        2,
+        16
       ],
       "project": [
         "global",
@@ -344,24 +688,37 @@
       "metadata": {
         "origin": "fixture"
       },
-      "agent": null,
-      "model": null
+      "agent": "agent-odd",
+      "model": [
+        "fixture-model",
+        "prov-b",
+        null
+      ],
+      "summary": [
+        1,
+        0,
+        0,
+        null
+      ],
+      "revert": null,
+      "permission": null
     },
     {
-      "id": "ses_fecf52e20ffeTYKKVAMuvPuQ1j",
+      "id": "ses_fecce0de5ffei0T3xM8ry8Jfq2",
       "parent_id": null,
-      "directory": "/tmp/eq007-home-0c3jr_3s/ws/foo",
+      "directory": "/tmp/eq007-home-_wult88v/ws/foo",
       "title": "join miss project",
       "version": "1.18.18",
-      "time_created": 1787025871327,
-      "time_updated": 1787025871327,
+      "time_created": 1787028435482,
+      "time_updated": 1787028435482,
       "time_archived": null,
+      "time_compacting": null,
       "tokens": [
-        0,
-        0,
-        0,
-        0,
-        0
+        172,
+        122,
+        6,
+        7,
+        4
       ],
       "project": [
         "global",
@@ -371,24 +728,41 @@
       "metadata": {
         "origin": "fixture"
       },
-      "agent": null,
-      "model": null
+      "agent": "agent-even",
+      "model": [
+        "fixture-model",
+        "prov-a",
+        null
+      ],
+      "summary": [
+        2,
+        0,
+        0,
+        {
+          "files": 1,
+          "additions": 2,
+          "deletions": 3
+        }
+      ],
+      "revert": null,
+      "permission": null
     },
     {
-      "id": "ses_fecf52e30ffe5S4yqHPl3ivTa5",
-      "parent_id": "ses_fecf53033ffeqaUrNL4dfy4zA1",
-      "directory": "/tmp/eq007-home-0c3jr_3s/ws/foo",
+      "id": "ses_fecce0df1ffeJmEvISxQ9AGRys",
+      "parent_id": "ses_fecce1003ffe6pQH4aN8kU9bdl",
+      "directory": "/tmp/eq007-home-_wult88v/ws/foo",
       "title": "tie c",
       "version": "1.18.18",
-      "time_created": 1787025871311,
-      "time_updated": 1787025871311,
+      "time_created": 1787028435470,
+      "time_updated": 1787028435470,
       "time_archived": null,
+      "time_compacting": null,
       "tokens": [
-        0,
-        0,
-        0,
-        0,
-        0
+        116,
+        66,
+        5,
+        3,
+        16
       ],
       "project": [
         "global",
@@ -398,24 +772,41 @@
       "metadata": {
         "origin": "fixture"
       },
-      "agent": null,
-      "model": null
+      "agent": "agent-odd",
+      "model": [
+        "fixture-model",
+        "prov-b",
+        null
+      ],
+      "summary": [
+        2,
+        1,
+        0,
+        {
+          "files": 1,
+          "additions": 2,
+          "deletions": 3
+        }
+      ],
+      "revert": null,
+      "permission": null
     },
     {
-      "id": "ses_fecf52e44ffeAkkVGPJ9CI6HMd",
-      "parent_id": "ses_fecf52fdbffeUWYrOfQPT6m4xF",
-      "directory": "/tmp/eq007-home-0c3jr_3s/ws/b/late",
+      "id": "ses_fecce0e05ffe6qnRhW8gU9zauy",
+      "parent_id": "ses_fecce0fa5ffeZYv7BaEpmbZLe4",
+      "directory": "/tmp/eq007-home-_wult88v/ws/b/late",
       "title": "now-ish late session",
       "version": "1.18.18",
-      "time_created": 1787025871291,
-      "time_updated": 1787025871291,
+      "time_created": 1787028435450,
+      "time_updated": 1787028435450,
       "time_archived": null,
+      "time_compacting": null,
       "tokens": [
-        0,
-        0,
-        0,
-        0,
-        0
+        511,
+        461,
+        4,
+        8,
+        3
       ],
       "project": [
         "global",
@@ -425,24 +816,52 @@
       "metadata": {
         "origin": "fixture"
       },
-      "agent": null,
-      "model": null
+      "agent": "agent-even",
+      "model": [
+        "fixture-model",
+        "prov-a",
+        null
+      ],
+      "summary": [
+        5,
+        0,
+        1,
+        {
+          "files": 1,
+          "additions": 2,
+          "deletions": 3
+        }
+      ],
+      "revert": null,
+      "permission": [
+        [
+          "edit",
+          "*.env",
+          "ask"
+        ],
+        [
+          "webfetch",
+          "host:example*",
+          "allow"
+        ]
+      ]
     },
     {
-      "id": "ses_fecf52e6bffenjyVcLbAe3NFA1",
+      "id": "ses_fecce0e2cffe4QSvcd7FhnwfkQ",
       "parent_id": null,
-      "directory": "/tmp/eq007-home-0c3jr_3s/ws/foo",
+      "directory": "/tmp/eq007-home-_wult88v/ws/foo",
       "title": "oldest epoch zero",
       "version": "1.18.18",
-      "time_created": 1787025871252,
-      "time_updated": 1787025871252,
+      "time_created": 1787028435411,
+      "time_updated": 1787028435411,
       "time_archived": null,
+      "time_compacting": null,
       "tokens": [
-        0,
-        0,
-        0,
-        0,
-        0
+        197,
+        147,
+        9,
+        6,
+        12
       ],
       "project": [
         "global",
@@ -452,24 +871,41 @@
       "metadata": {
         "origin": "fixture"
       },
-      "agent": null,
-      "model": null
+      "agent": "agent-odd",
+      "model": [
+        "fixture-model",
+        "prov-b",
+        null
+      ],
+      "summary": [
+        6,
+        1,
+        1,
+        {
+          "files": 1,
+          "additions": 2,
+          "deletions": 3
+        }
+      ],
+      "revert": null,
+      "permission": null
     },
     {
-      "id": "ses_fecf52e7fffec7CnMw4vXFqCyZ",
+      "id": "ses_fecce0e40ffeXY6SYjXcCFXVvL",
       "parent_id": null,
-      "directory": "/tmp/eq007-home-0c3jr_3s/ws/srv/mar@host-1/proj",
+      "directory": "/tmp/eq007-home-_wult88v/ws/srv/mar@host-1/proj",
       "title": "owner host dir",
       "version": "1.18.18",
-      "time_created": 1787025871232,
-      "time_updated": 1787025871232,
+      "time_created": 1787028435391,
+      "time_updated": 1787028435391,
       "time_archived": null,
+      "time_compacting": null,
       "tokens": [
-        0,
-        0,
-        0,
-        0,
-        0
+        567,
+        517,
+        5,
+        12,
+        8
       ],
       "project": [
         "global",
@@ -479,24 +915,47 @@
       "metadata": {
         "origin": "fixture"
       },
-      "agent": null,
-      "model": null
+      "agent": "agent-even",
+      "model": [
+        "fixture-model",
+        "prov-a",
+        null
+      ],
+      "summary": [
+        5,
+        2,
+        1,
+        {
+          "files": 1,
+          "additions": 2,
+          "deletions": 3
+        }
+      ],
+      "revert": null,
+      "permission": [
+        [
+          "bash",
+          "rm*",
+          "deny"
+        ]
+      ]
     },
     {
-      "id": "ses_fecf52ea3ffemAgPgZXSlKoDcF",
+      "id": "ses_fecce0e65ffeqCLr8XRbN5qkIR",
       "parent_id": null,
-      "directory": "/tmp/eq007-home-0c3jr_3s/ws/b/sub",
+      "directory": "/tmp/eq007-home-_wult88v/ws/b/sub",
       "title": "tie b",
       "version": "1.18.18",
-      "time_created": 1787025871196,
-      "time_updated": 1787025871196,
+      "time_created": 1787028435354,
+      "time_updated": 1787028435354,
       "time_archived": 9100,
+      "time_compacting": null,
       "tokens": [
-        0,
-        0,
-        0,
-        0,
-        0
+        424,
+        374,
+        5,
+        12,
+        1
       ],
       "project": [
         "global",
@@ -506,24 +965,41 @@
       "metadata": {
         "origin": "fixture"
       },
-      "agent": null,
-      "model": null
+      "agent": "agent-odd",
+      "model": [
+        "fixture-model",
+        "prov-b",
+        null
+      ],
+      "summary": [
+        2,
+        0,
+        0,
+        {
+          "files": 1,
+          "additions": 2,
+          "deletions": 3
+        }
+      ],
+      "revert": null,
+      "permission": null
     },
     {
-      "id": "ses_fecf52ec9ffeA3GLiXEdXjyr21",
+      "id": "ses_fecce0e8bffeSC5ql0jllM3Xnz",
       "parent_id": null,
-      "directory": "/tmp/eq007-home-0c3jr_3s/ws/b",
+      "directory": "/tmp/eq007-home-_wult88v/ws/b",
       "title": "tie a",
       "version": "1.18.18",
-      "time_created": 1787025871158,
-      "time_updated": 1787025871158,
+      "time_created": 1787028435316,
+      "time_updated": 1787028435316,
       "time_archived": null,
+      "time_compacting": null,
       "tokens": [
-        0,
-        0,
-        0,
-        0,
-        0
+        241,
+        191,
+        9,
+        11,
+        5
       ],
       "project": [
         "global",
@@ -533,24 +1009,41 @@
       "metadata": {
         "origin": "fixture"
       },
-      "agent": null,
-      "model": null
+      "agent": "agent-even",
+      "model": [
+        "fixture-model",
+        "prov-a",
+        null
+      ],
+      "summary": [
+        1,
+        0,
+        1,
+        {
+          "files": 1,
+          "additions": 2,
+          "deletions": 3
+        }
+      ],
+      "revert": null,
+      "permission": null
     },
     {
-      "id": "ses_fecf52ee9ffeuJ5e6yyJRKdb5L",
+      "id": "ses_fecce0eb4ffeJYdyTly6Pd1AAu",
       "parent_id": null,
-      "directory": "/tmp/eq007-home-0c3jr_3s/ws/Foo/child",
+      "directory": "/tmp/eq007-home-_wult88v/ws/Foo/child",
       "title": "case mismatch dir",
       "version": "1.18.18",
-      "time_created": 1787025871126,
-      "time_updated": 1787025871126,
+      "time_created": 1787028435275,
+      "time_updated": 1787028435275,
       "time_archived": null,
+      "time_compacting": null,
       "tokens": [
-        0,
-        0,
-        0,
-        0,
-        0
+        447,
+        397,
+        6,
+        9,
+        7
       ],
       "project": [
         "global",
@@ -560,24 +1053,41 @@
       "metadata": {
         "origin": "fixture"
       },
-      "agent": null,
-      "model": null
+      "agent": "agent-odd",
+      "model": [
+        "fixture-model",
+        "prov-b",
+        null
+      ],
+      "summary": [
+        4,
+        2,
+        1,
+        {
+          "files": 1,
+          "additions": 2,
+          "deletions": 3
+        }
+      ],
+      "revert": null,
+      "permission": null
     },
     {
-      "id": "ses_fecf52f0dffeXSerCmc3BDiKES",
+      "id": "ses_fecce0ed3ffevvJSW0tH2xtAUd",
       "parent_id": null,
-      "directory": "/tmp/eq007-home-0c3jr_3s/ws/a b/c",
+      "directory": "/tmp/eq007-home-_wult88v/ws/a b/c",
       "title": "same level name",
       "version": "1.18.18",
-      "time_created": 1787025871090,
-      "time_updated": 1787025871090,
+      "time_created": 1787028435244,
+      "time_updated": 1787028435244,
       "time_archived": null,
+      "time_compacting": null,
       "tokens": [
-        0,
-        0,
-        0,
-        0,
-        0
+        396,
+        346,
+        10,
+        10,
+        7
       ],
       "project": [
         "global",
@@ -587,24 +1097,41 @@
       "metadata": {
         "origin": "fixture"
       },
-      "agent": null,
-      "model": null
+      "agent": "agent-even",
+      "model": [
+        "fixture-model",
+        "prov-a",
+        null
+      ],
+      "summary": [
+        2,
+        2,
+        0,
+        {
+          "files": 1,
+          "additions": 2,
+          "deletions": 3
+        }
+      ],
+      "revert": null,
+      "permission": null
     },
     {
-      "id": "ses_fecf52f31ffe9txQb2Uh2mtJam",
-      "parent_id": "ses_fecf52f87ffeEJ7sqizeNdqom0",
-      "directory": "/tmp/eq007-home-0c3jr_3s/ws/a/dir_%_x",
+      "id": "ses_fecce0ef6ffe3d0d2n4sYcYua2",
+      "parent_id": "ses_fecce0f5effeN66FEhQ18nWMGx",
+      "directory": "/tmp/eq007-home-_wult88v/ws/a/dir_%_x",
       "title": "an underscore dir",
       "version": "1.18.18",
-      "time_created": 1787025871054,
-      "time_updated": 1787025871054,
+      "time_created": 1787028435209,
+      "time_updated": 1787028435209,
       "time_archived": 8900,
+      "time_compacting": null,
       "tokens": [
-        0,
-        0,
-        0,
-        0,
-        0
+        143,
+        93,
+        10,
+        4,
+        9
       ],
       "project": [
         "global",
@@ -614,24 +1141,52 @@
       "metadata": {
         "origin": "fixture"
       },
-      "agent": null,
-      "model": null
+      "agent": "agent-odd",
+      "model": [
+        "fixture-model",
+        "prov-b",
+        null
+      ],
+      "summary": [
+        1,
+        1,
+        1,
+        {
+          "files": 1,
+          "additions": 2,
+          "deletions": 3
+        }
+      ],
+      "revert": null,
+      "permission": [
+        [
+          "edit",
+          "*.env",
+          "ask"
+        ],
+        [
+          "webfetch",
+          "host:example*",
+          "allow"
+        ]
+      ]
     },
     {
-      "id": "ses_fecf52f56ffepCkRVDvdYYA0ur",
-      "parent_id": "ses_fecf52f87ffeEJ7sqizeNdqom0",
-      "directory": "/tmp/eq007-home-0c3jr_3s/ws/a/ b/c",
+      "id": "ses_fecce0f27ffe3Fgi4dVnv09iSF",
+      "parent_id": "ses_fecce0f5effeN66FEhQ18nWMGx",
+      "directory": "/tmp/eq007-home-_wult88v/ws/a/ b/c",
       "title": "a percent dir session",
       "version": "1.18.18",
-      "time_created": 1787025871017,
-      "time_updated": 1787025871017,
+      "time_created": 1787028435160,
+      "time_updated": 1787028435160,
       "time_archived": null,
+      "time_compacting": null,
       "tokens": [
-        0,
-        0,
-        0,
-        0,
-        0
+        547,
+        497,
+        7,
+        5,
+        5
       ],
       "project": [
         "global",
@@ -641,24 +1196,41 @@
       "metadata": {
         "origin": "fixture"
       },
-      "agent": null,
-      "model": null
+      "agent": "agent-even",
+      "model": [
+        "fixture-model",
+        "prov-a",
+        null
+      ],
+      "summary": [
+        6,
+        0,
+        1,
+        {
+          "files": 1,
+          "additions": 2,
+          "deletions": 3
+        }
+      ],
+      "revert": null,
+      "permission": null
     },
     {
-      "id": "ses_fecf52f87ffeEJ7sqizeNdqom0",
+      "id": "ses_fecce0f5effeN66FEhQ18nWMGx",
       "parent_id": null,
-      "directory": "/tmp/eq007-home-0c3jr_3s/ws/a",
+      "directory": "/tmp/eq007-home-_wult88v/ws/a",
       "title": "grp1 alpha work",
       "version": "1.18.18",
-      "time_created": 1787025870968,
-      "time_updated": 1787025870968,
+      "time_created": 1787028435105,
+      "time_updated": 1787028435105,
       "time_archived": null,
+      "time_compacting": 1234,
       "tokens": [
-        0,
-        0,
-        0,
-        0,
-        0
+        252,
+        202,
+        9,
+        9,
+        16
       ],
       "project": [
         "global",
@@ -668,24 +1240,47 @@
       "metadata": {
         "origin": "fixture"
       },
-      "agent": null,
-      "model": null
+      "agent": "agent-odd",
+      "model": [
+        "fixture-model",
+        "prov-b",
+        null
+      ],
+      "summary": [
+        5,
+        2,
+        0,
+        {
+          "files": 1,
+          "additions": 2,
+          "deletions": 3
+        }
+      ],
+      "revert": null,
+      "permission": [
+        [
+          "bash",
+          "rm*",
+          "deny"
+        ]
+      ]
     },
     {
-      "id": "ses_fecf52fabffe37lM5uTHMURsGJ",
-      "parent_id": "ses_fecf52fdbffeUWYrOfQPT6m4xF",
-      "directory": "/tmp/eq007-home-0c3jr_3s/ws/foo/sub",
+      "id": "ses_fecce0f80ffeJdwrr74ERLIZF0",
+      "parent_id": "ses_fecce0fa5ffeZYv7BaEpmbZLe4",
+      "directory": "/tmp/eq007-home-_wult88v/ws/foo/sub",
       "title": "archived child",
       "version": "1.18.18",
-      "time_created": 1787025870933,
-      "time_updated": 1787025870933,
+      "time_created": 1787028435071,
+      "time_updated": 1787028435071,
       "time_archived": 8500,
+      "time_compacting": null,
       "tokens": [
-        0,
-        0,
-        0,
-        0,
-        0
+        499,
+        449,
+        3,
+        9,
+        8
       ],
       "project": [
         "global",
@@ -695,24 +1290,41 @@
       "metadata": {
         "origin": "fixture"
       },
-      "agent": null,
-      "model": null
+      "agent": "agent-even",
+      "model": [
+        "fixture-model",
+        "prov-a",
+        null
+      ],
+      "summary": [
+        0,
+        0,
+        1,
+        {
+          "files": 1,
+          "additions": 2,
+          "deletions": 3
+        }
+      ],
+      "revert": null,
+      "permission": null
     },
     {
-      "id": "ses_fecf52fdbffeUWYrOfQPT6m4xF",
+      "id": "ses_fecce0fa5ffeZYv7BaEpmbZLe4",
       "parent_id": null,
-      "directory": "/tmp/eq007-home-0c3jr_3s/ws/foobar",
+      "directory": "/tmp/eq007-home-_wult88v/ws/foobar",
       "title": "plain title too",
       "version": "1.18.18",
-      "time_created": 1787025870885,
-      "time_updated": 1787025870885,
+      "time_created": 1787028435035,
+      "time_updated": 1787028435035,
       "time_archived": 7900,
+      "time_compacting": null,
       "tokens": [
-        0,
-        0,
-        0,
-        0,
-        0
+        479,
+        429,
+        5,
+        2,
+        5
       ],
       "project": [
         "global",
@@ -722,24 +1334,41 @@
       "metadata": {
         "origin": "fixture"
       },
-      "agent": null,
-      "model": null
+      "agent": "agent-odd",
+      "model": [
+        "fixture-model",
+        "prov-b",
+        null
+      ],
+      "summary": [
+        1,
+        1,
+        1,
+        {
+          "files": 1,
+          "additions": 2,
+          "deletions": 3
+        }
+      ],
+      "revert": null,
+      "permission": null
     },
     {
-      "id": "ses_fecf53033ffeqaUrNL4dfy4zA1",
+      "id": "ses_fecce1003ffe6pQH4aN8kU9bdl",
       "parent_id": null,
-      "directory": "/tmp/eq007-home-0c3jr_3s/ws/foo",
+      "directory": "/tmp/eq007-home-_wult88v/ws/foo",
       "title": "root one plain",
       "version": "1.18.18",
-      "time_created": 1787025870796,
-      "time_updated": 1787025870796,
+      "time_created": 1787028434940,
+      "time_updated": 1787028434940,
       "time_archived": null,
+      "time_compacting": null,
       "tokens": [
-        0,
-        0,
-        0,
-        0,
-        0
+        218,
+        168,
+        8,
+        1,
+        16
       ],
       "project": [
         "global",
@@ -749,8 +1378,24 @@
       "metadata": {
         "origin": "fixture"
       },
-      "agent": null,
-      "model": null
+      "agent": "agent-even",
+      "model": [
+        "fixture-model",
+        "prov-a",
+        null
+      ],
+      "summary": [
+        6,
+        1,
+        0,
+        {
+          "files": 1,
+          "additions": 2,
+          "deletions": 3
+        }
+      ],
+      "revert": null,
+      "permission": null
     }
   ]
 }
