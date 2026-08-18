@@ -1,6 +1,6 @@
-# oc-slimapi v4 wire 契约（B0 起草稿 —— 随 4.0.0 定稿）
+# oc-slimapi v4 wire 契约（4.0.0 实施基线）
 
-> **状态**：**B0 规范先行批次定稿（2026-08-17，rev-6 PASS-with-notes + S-B01 四项 owner 终裁全收敛）**。wire 终态目标 = 4.0.0（`ACCEPTED_CLIENT_VERSIONS` (3,3)→(3,4)）；本文在 B0 批冻结全部可观察语义，实现随 B3a/A3b 分批落地（同属 4.0.0 一个 major）。S-B01 四项（§7.0）**已全部 owner 终裁（2026-08-17）**；其余章节（含 DB 设计 R1/R2/R3/R6，已凭真库实证冻结——见 design-v4-dbaux §0.2）均为冻结语义。
+> **状态**：**4.0.0 实施基线（2026-08-18，B3a 已落地）**。B0 批冻结全部可观察语义（2026-08-17，rev-6 PASS-with-notes + S-B01 四项 owner 终裁全收敛）；wire 终态 = 4.0.0（`ACCEPTED_CLIENT_VERSIONS` (3,3)→(3,4)）。B3a 批（阶段 A selector 双版本 / B1 dbaux 连接生命周期 / B2 投影 SQL / B3 cursor / B4 路由分叉降级矩阵 / B5 观测）已按本契约落地并全量测试通过；§7（SSE id:/重放、token 流）随 4.0.0 B3b 批落地。S-B01 四项（§7.0）**已全部 owner 终裁（2026-08-17）**；其余章节（含 DB 设计 R1/R2/R3/R6，已凭真库实证冻结——见 design-v4-dbaux §0.2）均为冻结语义。
 > **继承基线**：v3 契约（`docs/specs/v3-contract.md`）全量继承 + 本文件逐条差异覆盖——**凡未提及语义逐字沿用 v3**（投影、SSE 帧名帧形、资源上限、错误映射、gzip 族、指纹、catalog、token stream 帧形等）。v4 = v3 的**严格超集面**上的差异层：新增全局 sessions 面（DB 投影源）、SSE id:/重放、directory 于全局列表退役。
 > **裁决出处**：`docs/system-architecture-proposal-2026-08-17.md`（v2.2，权威基准，行号引用）；工程细化 `docs/refactor-plans/slimapi-refactor-plan.md`；设计文档 `design-v4-selector.md` / `design-v4-dbaux.md` / `design-v4-sse-replay.md` / `design-v4-qp-payload.md`。
 > **消费者**：ocdroid（B5a 探测 / B5b 适配）与 oc-webui 可**仅凭本文件**完成 v4 对接开发。
@@ -89,7 +89,7 @@ GET /slimapi/sessions?v=4
 
 - `parent=only` 谓词 = `parent_id IS NOT NULL`（v2.2 未冻结，B0 **实证冻结**：真库 parent_id NULL 86 / NOT NULL 321 / 空串 0——无空串哨兵歧义，design-v4-dbaux §0.2 R6）。
 - **SessionSkeletonV4**：v3 `SESSION_KEYS` 投影（已含 directory）+ `project` 对象（`{id, name, worktree}`——三列均已进 DB 投影 SELECT、schema 门与等价性 golden；join 缺行 → null）+ v4-only 字段。列名以真库实证为准（`tokens_input/tokens_output`，v2.2 行 72 模板 `tokens_in/out` 为撰写笔误——**B0 实证冻结**，design-v4-dbaux §0.2 R2）。
-- **排序冻结**：`(time_updated DESC, id DESC)` 复合排序（上游 session.ts:571-572 事实同构）。
+- **排序冻结**：`(time_updated DESC, id DESC)` 复合排序（上游 session.ts:261-299 事实同构；行号按对齐版本 v1.18.18 勘误，原引 :571-572 为撰写时行号漂移）。
 - **complete**：同查询 `LIMIT :limit+1` 窗口判定（同一只读 snapshot；返回 =limit+1 行 → `complete:false`）。
 - **零缓存**：一条 SQL 一次组装（v2.2 行 139）。
 
@@ -307,4 +307,4 @@ v4 sessions 归入 sessions 桶既有记账；降级路径请求带 degraded 标
 | §7 | design-v4-sse-replay.md + design-v4-qp-payload.md |
 | §3 能力键时序 | refactor-plan §4.1（n1 冻结） |
 
-*（完）B0-1 产出。定稿条件：S-B01 ②③④ owner 终裁后 §7 转冻结、状态行更新为「4.0.0 实施基线」。*
+*（完）B0-1 产出。定稿条件已执行（2026-08-18）：S-B01 ②③④ owner 终裁收敛，状态行更新为「4.0.0 实施基线（B3a 已落地）」；§7 条目随 B3b 批落地后，本文件随 4.0.0 发版定稿。*

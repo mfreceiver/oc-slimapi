@@ -74,11 +74,15 @@ async def health(request: Request):
     }
     if view >= 4:
         # v4-contract §3.2: v4 view adds the TRANSIENT auxiliary field —
-        # availability of the DB auxiliary source. Stage A (B3a): dbaux is
-        # not landed, so this is a frozen placeholder {available: False,
-        # mode: "http"} until the B1/B5 lanes wire the real state. The v3
+        # availability of the DB auxiliary source (B3a-B1 dbaux). Reads the
+        # same-source lifecycle state; absent attribute (test apps without
+        # dbaux wired) degrades to the disabled/http placeholder — the v3
         # view carries NO auxiliary key (byte-identical terminal shape).
-        resp["auxiliary"] = {"available": False, "mode": "http"}
+        dbaux = getattr(request.app.state, "dbaux", None)
+        if dbaux is not None:
+            resp["auxiliary"] = dbaux.status().auxiliary_view()
+        else:
+            resp["auxiliary"] = {"available": False, "mode": "http"}
     # S-E: optional deployment revision, omitted when None
     rev = request.app.state.deployment_revision
     if rev is not None:

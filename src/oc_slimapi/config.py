@@ -646,6 +646,18 @@ class Settings:
     # (no reset, no deletion of the legacy file).
     state_dir: str = os.getenv("OC_SLIMAPI_STATE_DIR", "state")
 
+    # B3a-B1: DB auxiliary source (v4 sessions projection infra). The DB
+    # path itself is NOT a Settings field — resolution is env-driven at
+    # startup (dbaux.path_resolution: OC_SLIMAPI_OPENCODE_DB / OPENCODE_DB /
+    # candidate discovery, fail-closed). Only the shared periodic knob is
+    # exposed: the inode check + circuit probe + disabled reprobe cadence
+    # (design-v4-dbaux §2.3-6/§4.1, frozen default 30s). The remaining
+    # breaker constants (60s window / ≥10 samples / 20ms trip / 10ms
+    # recover) are frozen values internalized in LatencyBreaker defaults.
+    dbaux_probe_interval_s: float = float(
+        os.getenv("OC_SLIMAPI_DBAUX_PROBE_INTERVAL_S", "30")
+    )
+
     def read_deployment_revision(self) -> str | None:
         """Best-effort deployment revision (env or file). Returns None if unset.
 
@@ -1079,6 +1091,12 @@ class Settings:
         if self.qp_sweep_interval_seconds <= 0:
             raise RuntimeError(
                 "OC_SLIMAPI_QP_SWEEP_INTERVAL_SECONDS must be > 0"
+            )
+        # B3a-B1: probe cadence must be strictly positive (fail-closed — a
+        # zero/negative interval would spin the dbaux periodic task).
+        if self.dbaux_probe_interval_s <= 0:
+            raise RuntimeError(
+                "OC_SLIMAPI_DBAUX_PROBE_INTERVAL_S must be > 0"
             )
         if self.qp_sweep_daily_budget < 0:
             raise RuntimeError("OC_SLIMAPI_QP_SWEEP_DAILY_BUDGET must be >= 0")

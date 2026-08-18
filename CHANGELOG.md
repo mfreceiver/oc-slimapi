@@ -26,6 +26,44 @@ ocdroid 对接时：
 
 ---
 
+## [4.0.0] - 2026-08-18 — wire 双版本 (3,4)：?v=4 sessions 全局面（DB 投影 + 降级矩阵）+ versions/health 双视图（包版本 major；wire 版本 3 → **(3,4) 双版本窗口**）
+
+> P3 批次（B3a：阶段 A selector 双版本 + B1 dbaux 连接生命周期 + B2 投影 SQL + B3 cursor + B4 路由分叉降级 + B5 观测 + B6 契约同步）。依据 `docs/specs/v4-contract.md`（**4.0.0 实施基线**）与 B0 设计文档（design-v4-selector / design-v4-dbaux）。**ocdroid 必改点：仅当采用 `?v=4`**——不升级的消费者继续走 `?v=3`，全部 v3 语义**逐字节不变**（既有测试零改动前提下的回归基线）。§7（SSE id:/重放、q/p 载荷）随 4.0.0 B3b 批落地，条目见下文标注。
+
+### Changed（破坏性——wire 主版本 bump 3 → 4）
+
+- **wire 版本双轨 (3,4)**：`ACCEPTED_CLIENT_VERSIONS` (3,3) → **(3,4)**；`server.api_version=4`、`current=4`。`?v=3` 全部语义不变（零改动回归验证）；无 `v` / `?v=2` / 词法非法 / 不支持版本 → 400 行为同 3.x（`unsupported_version` 的 `supported` 由 `[3]` → `[3,4]`）。
+- **env `OC_SLIMAPI_SERVER_API_VERSION` 废弃**：双版本期 `server_api_version` 恒等于常量 4；env 仍被设置时启动打 warning 并**忽略**（不破坏启动）。`OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS` fail-closed 钉死 (3,4) 语义不变。
+- **`GET /slimapi/sessions` 在 `?v=4` 下换源为 DB 投影全局面**（同一路由双语义，v3 面不变）：
+  - 参数矩阵：`archived`（omit/only/all，默认 omit）、`parent`（all/none/only/`<sid>`，默认 all）、`search`（LIKE 转义，`%`/`_`/`\` 字面安全）、`cursor`（keyset 指纹翻页，base64url(JSON `{t,i,f}`)，`f` 含 filter 指纹——跨过滤组合复用 → 400 `invalid_cursor`）、`limit` 1–500（v3 为 1–1000）。
+  - 响应 `SessionSkeletonV4`：v3 投影 + `project: {id,name,worktree} | null`（join 缺行 → null）+ v4-only 字段（`tokens_input`/`tokens_output` 等真库列名）；键序 `items,nextCursor,complete[,degraded]`；排序冻结 `(time_updated DESC, id DESC)`；无 ETag/Vary（v3 面的 ETag/304 保留）。
+  - **降级矩阵**（dbaux 不可用时）：allowlist 非空 / search 含通配符 / 带 cursor / Class B（`archived=only` 或 `parent∈{only,<sid>}`）→ **503 `auxiliary_unavailable` + `Retry-After: 30`**；Class A（`archived∈{omit,all}` × `parent∈{all,none}`）→ 200 + `degraded:true`（走上游 HTTP `/session`，`parent=none` 映射 `roots=true`；错误体不泄露 DB 路径/schema/allowlist）。
+  - **版本参数互斥 422 `param_version_mismatch`**：v3 请求带 `archived`/`parent`/`cursor` → 422；v4 请求带 `roots`/`start` → 422；v4 `limit`>500 → 422。错误优先级：400 `invalid_cursor`（纯内存指纹校验）先于 503。
+- **`GET /slimapi/versions` 双视图载荷**：`{"current":4,"available":[3,4],"capabilities":{"3":<形状不变>,"4":{"globalSessions":true,"auxiliaryFilters":true}}}`；能力键静态（`sseReplay`/`qpImmediateFull` 待 B3b 落地后才广告——本版断言缺席）。
+- **`GET /slimapi/health` 双视图**：按请求 wireVersion——v3 视图形状不变（`schema.version=3`/`server.api_version=3`）；v4 视图双双 =4 + `auxiliary:{"available":…,"mode":"db"|"http"}`（dbaux 真实状态）+ `allowlist:{enabled}` 双视图保持。`GET /slimapi/ready` 形状与取值不变。
+
+### Removed（v4 面退役——v3 面保留）
+
+- **directory 于 v4 sessions 列表退役**：`?v=4` 的 `GET /slimapi/sessions` 携带 directory（query 单值/多值、header、query+header 混合四形态）→ 一律 **400 `directory_retired_in_v4`**（selector 层拦截，先于路由与多值校验；不泄露目录存在性）。per-session/todo/children/messages 等其余 27 条路由的 `?directory=` 消费语义不变。
+- **token stream 于 v4 退役（随 4.0.0 B3b 批落地）**：v4 下 `GET /slimapi/sessions/{sid}/stream` 退役 → `tokens_stream_retired_in_v4`；SSE `id:`/重放、q/p 直推载荷等 §7 内容随 B3b 批次合入本节（发版前两批均已合入）。
+
+### Added（加性）
+
+- **观测扩维**：access log / snapshot 维度 `selectorResult` 增 `v4`、`wireVersion` 增 `"4"`（`docs/manual/traffic-accounting.md` §5.1 已同步）；`GET /slimapi/metrics` 新增 `dbaux` 块：`available/mode/reason/generation/source`、查询延迟 `latency{p50_ms,p99_ms,samples,total}`（60s 滑窗 nearest-rank）、`breaker_open`、`counters{queries,probes,trips,swaps,disables}`（不泄露 DB 路径）。
+- **新 env `OC_SLIMAPI_DBAUX_PROBE_INTERVAL_S`**（默认 30，>0；dbaux 探测周期）。DB 通道发现顺序：`OC_SLIMAPI_OPENCODE_DB` > 上游 `OPENCODE_DB`（`XDG_DATA_HOME` 相对解析）> 候选发现；只读 URI（`mode=ro` + `query_only`），零写入。
+- **部署依赖（运维注意）**：`?v=4` 全局面依赖对 opencode SQLite 的只读访问；不可用时按降级矩阵自动回落（503/`degraded:true`），无需配置干预。
+
+### 消费者行动项
+
+- **ocdroid**：可选升级 `?v=4`（B5a 探测 → B5b 适配）；升级时 sessions 列表移除 directory 参数（v4 全局面）、改用 `cursor`/`archived`/`parent`/`search`、`limit`≤500、处理 503 `auxiliary_unavailable`（`Retry-After:30`）与 `degraded:true` 标记；不升级则维持 `?v=3` 零改动。
+- **oc-webui**：同上；建议先经 `GET /slimapi/versions` 能力探测再启用 v4。
+
+### 文档勘误（随本版记录）
+
+- `v4-contract.md` §4.1 上游行号引用按对齐版本 v1.18.18 勘误（session.ts 实际 486 行，`list()` 位于 :261-299；原引 :571-572 为撰写期行号漂移，语义文字不变）。design-v4-*.md 内同类行号漂移仅记录不改动（设计文档按硬规则不动）。
+
+---
+
 ## [3.3.0] - 2026-08-17 — digest changed + B4 能力路由 + directory allowlist（包版本 minor；wire 版本**不变**，仍 v3——全部加性，ocdroid 零必改点）
 
 > P1 批次（B1a + B1b 阶段1 + B2 + B4）。依据 `docs/system-architecture-proposal-2026-08-17.md` v2.2 与 B0 设计文档。**ocdroid 必改点：无**——所有变更均为加性（新可忽略字段/新路由/可选部署机制）。

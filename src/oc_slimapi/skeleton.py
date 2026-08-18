@@ -778,3 +778,73 @@ def skeleton_agent(agent: dict[str, Any]) -> dict[str, Any]:
 def skeleton_agents(agents: list[dict[str, Any]]) -> list[dict[str, Any]]:
     # Non-dict items are silently skipped — see skeleton_commands for rationale.
     return [skeleton_agent(item) for item in agents if isinstance(item, dict)]
+
+
+# ---------------------------------------------------------------------------
+# v4 sessions DB 投影 skeleton（B3a-B2；additive——v3 既有函数零改动）。
+#
+# v4-contract §4.1：SessionSkeletonV4 = v3 SESSION_KEYS 投影 + ``project``
+# 对象（join 缺行 → null，design-v4-dbaux §8 组装容忍）+ v4-only 字段
+# （tokens 五列平铺，**键名 = 真库列名** tokens_input/tokens_output/...，
+# R2 实证冻结——v2.2 模板 tokens_in/out 为撰写笔误）。输入 =
+# ``dbaux.projection.rows_to_records`` 产出的记录 dict（键 = DB 列名 +
+# p_id/p_name/p_worktree join 列）——DB 列名与 wire 键的映射集中在此处
+# （tokens_input/tokens_output 真库列名，R2 实证；wire 侧 time/summary
+# 子对象与 v3 ``skeleton_session`` 同构，但源是平铺 DB 列而非上游嵌套
+# JSON，故独立投影、不经 ``_pick`` 复用——两函数是不同输入形状的投影，
+# 不是同一投影的两份拷贝）。
+# ---------------------------------------------------------------------------
+
+def project_rows_to_v4_skeletons(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """DB 投影记录 → SessionSkeletonV4 列表（wire v4-only）。
+
+    行级容忍（§8 后处理末段）：非 dict 行 / 缺 ``id`` 行直接跳过——
+    ``rows_to_records`` 已在 SQL 行层执行同样容忍，此处防御的是组装器
+    被绕过直喂原始行的场景。
+    """
+    skeletons: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        sid = row.get("id")
+        if sid is None:
+            continue
+        item: dict[str, Any] = {
+            "id": sid,
+            "directory": row.get("directory"),
+            "parentID": row.get("parent_id"),
+            "projectID": row.get("project_id"),
+            "title": row.get("title"),
+            "agent": row.get("agent"),
+            "model": row.get("model"),
+            "time": {
+                "created": row.get("time_created"),
+                "updated": row.get("time_updated"),
+                "archived": row.get("time_archived"),
+            },
+            "summary": {
+                "additions": row.get("summary_additions"),
+                "deletions": row.get("summary_deletions"),
+                "files": row.get("summary_files"),
+            },
+            "tokens_input": row.get("tokens_input"),
+            "tokens_output": row.get("tokens_output"),
+            "tokens_reasoning": row.get("tokens_reasoning"),
+            "tokens_cache_read": row.get("tokens_cache_read"),
+            "tokens_cache_write": row.get("tokens_cache_write"),
+        }
+        # revert / permission / metadata：上游 JSON 列（解析后 dict 或 NULL）
+        if isinstance(row.get("revert"), dict):
+            item["revert"] = _pick(row["revert"], {"messageID", "partID"})
+        pid = row.get("p_id")
+        if pid is None:
+            # join 缺行（project_id 悬挂/NULL）→ null（session.ts:595 同语义）
+            item["project"] = None
+        else:
+            item["project"] = {
+                "id": pid,
+                "name": row.get("p_name"),
+                "worktree": row.get("p_worktree"),
+            }
+        skeletons.append(item)
+    return skeletons

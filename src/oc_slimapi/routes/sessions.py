@@ -5,13 +5,27 @@ import orjson
 from fastapi import APIRouter, Query, Request
 from starlette.responses import Response
 
+from ..dbaux import (
+    AuxiliaryUnavailableError,
+    build_sessions_query,
+    fetch_sessions_page,
+    has_wildcard,
+    normalized_search,
+)
+from ..dbaux.cursor import (
+    InvalidCursorError,
+    build_fingerprint,
+    decode_cursor,
+    encode_cursor,
+    fingerprint_mismatch,
+)
 from ..directory import validate_directory
-from ..envelope import sessions_envelope_payload
+from ..envelope import sessions_envelope_payload, sessions_envelope_v4
 from ..errors import CodedHTTPException
 from .. import etag as etag_mod
 from ..gzip_util import accepts_gzip, json_response
-from ..selector import resolve_route_directory
-from ..skeleton import skeleton_session
+from ..selector import resolve_route_directory, wire_view_from_scope
+from ..skeleton import project_rows_to_v4_skeletons, skeleton_session
 from ..traffic import stash_up_in
 from ..transform import TransformBusy, read_with_cap
 from ..upstream import forward_directory_headers
@@ -238,6 +252,279 @@ async def _status_via_lease(
     )
 
 
+# ---------------------------------------------------------------------------
+# v4 global sessions facade (B3a-B4; v4-contract §4 / design-v4-dbaux §7).
+#
+# The v3 path below is frozen byte-identical; the v4 fork deliberately
+# DUPLICATES the upstream-fetch call shape instead of refactoring the
+# shared v3 helpers (zero-touch rule for the v3 pipeline).
+# ---------------------------------------------------------------------------
+
+_V4_ARCHIVED_STATES = ("omit", "only", "all")
+_V4_PARENT_RESERVED = ("all", "none", "only")
+_V4_LIMIT_MAX = 500  # §4.1 v4 domain (v3 keeps 1000)
+_AUX_RETRY_AFTER = "30"  # §4.2: same order as the breaker recovery probe
+
+_AUX_UNAVAILABLE_HINT = (
+    "session projection is temporarily served from a degraded source; "
+    "retry shortly"
+)
+
+
+def _raw_query_keys(request: Request) -> set[str]:
+    """Keys present in the (post-selector-strip) raw query string.
+
+    Presence-based (blank values count) — parameter-version policing must
+    not depend on FastAPI's value-typed defaults (§4.1 S-B04: explicit
+    declaration, no reliance on framework-silent ignoring).
+    """
+    from urllib.parse import parse_qsl
+
+    raw = request.scope.get("query_string", b"") or b""
+    try:
+        return {key for key, _ in parse_qsl(raw.decode("latin-1"),
+                                            keep_blank_values=True)}
+    except Exception:  # pragma: no cover — parse_qsl on latin-1 cannot fail
+        return set()
+
+
+def _aux_unavailable() -> CodedHTTPException:
+    # §4.2: flat body, no DB path / schema / allowlist detail leak (§8).
+    return CodedHTTPException(
+        503,
+        code="auxiliary_unavailable",
+        hint=_AUX_UNAVAILABLE_HINT,
+        headers={"Retry-After": _AUX_RETRY_AFTER},
+    )
+
+
+def _http_session_to_v4(item: dict) -> dict:
+    """Upstream ``/session`` JSON (SessionInfo camelCase) → SessionSkeletonV4.
+
+    Degraded-path projection (§4.2 Class A): the upstream HTTP shape has
+    no project join → ``project: null`` (the wire type is object|null;
+    the weakness is flagged by ``degraded: true``). Tokens map from the
+    nested HTTP shape to the flat real-DB column names (R2 freeze).
+    """
+    def _pick(source: dict, *keys: str):
+        return {key: source[key] for key in keys if key in source}
+
+    skeleton: dict = _pick(
+        item, "id", "directory", "parentID", "projectID", "title", "agent",
+        "model",
+    )
+    time_obj = item.get("time")
+    if isinstance(time_obj, dict):
+        skeleton["time"] = _pick(time_obj, "created", "updated", "archived")
+    summary_obj = item.get("summary")
+    if isinstance(summary_obj, dict):
+        skeleton["summary"] = _pick(summary_obj, "additions", "deletions", "files")
+    tokens_obj = item.get("tokens")
+    if isinstance(tokens_obj, dict):
+        cache_obj = tokens_obj.get("cache")
+        cache = cache_obj if isinstance(cache_obj, dict) else {}
+        skeleton["tokens_input"] = tokens_obj.get("input")
+        skeleton["tokens_output"] = tokens_obj.get("output")
+        skeleton["tokens_reasoning"] = tokens_obj.get("reasoning")
+        skeleton["tokens_cache_read"] = cache.get("read")
+        skeleton["tokens_cache_write"] = cache.get("write")
+    revert_obj = item.get("revert")
+    if isinstance(revert_obj, dict):
+        skeleton["revert"] = _pick(revert_obj, "messageID", "partID")
+    skeleton["project"] = None
+    return skeleton
+
+
+def _v4_allowlist_entries(request: Request) -> tuple[str, ...]:
+    """Non-empty allowlist entries for the SQL predicate / fingerprint.
+
+    Empty-string entries are config noise (cannot form a subtree
+    predicate — same rule as ``allowlist_rev``); dropped here so the
+    B2 assembler never sees them. ``None`` (unset) and ``[]`` (explicit
+    empty) both mean "no allowlist axis" (three-state, P1 B4-4).
+    """
+    configured = request.app.state.config.directory_allowlist
+    if not configured:
+        return ()
+    return tuple(entry for entry in configured if entry)
+
+
+async def _sessions_v4(
+    request: Request,
+    *,
+    roots: bool,
+    limit: int,
+    start: int | None,
+    search: str | None,
+    archived: str | None,
+    parent: str | None,
+    cursor: str | None,
+) -> Response:
+    # ---- ④ 参数版本不匹配（§8.3：先于 invalid_cursor/503） --------------
+    raw_keys = _raw_query_keys(request)
+    if "roots" in raw_keys or "start" in raw_keys:
+        raise CodedHTTPException(
+            422, code="param_version_mismatch",
+            hint="roots/start are v3-only; v4 uses the parent filter axis",
+        )
+    if limit > _V4_LIMIT_MAX:
+        raise CodedHTTPException(
+            422, code="param_version_mismatch",
+            hint=f"v4 limit domain is 1..{_V4_LIMIT_MAX}",
+        )
+    if archived is not None and archived not in _V4_ARCHIVED_STATES:
+        raise CodedHTTPException(
+            422, code="param_version_mismatch",
+            hint=f"archived must be one of {_V4_ARCHIVED_STATES}",
+        )
+    if parent is not None and not parent:
+        raise CodedHTTPException(
+            422, code="param_version_mismatch", hint="parent must not be empty",
+        )
+
+    archived_state = archived or "omit"
+    parent_state = parent or "all"
+    normalized = normalized_search(search)
+    allowlist = _v4_allowlist_entries(request)
+
+    # ---- ⑤ invalid_cursor 400 优先于 503（§8.3；纯内存校验） -----------
+    fingerprint = build_fingerprint(
+        archived=archived, parent=parent, search=search, allowlist=allowlist,
+    )
+    try:
+        cursor_payload = decode_cursor(cursor)
+    except InvalidCursorError:
+        raise CodedHTTPException(
+            400, code="invalid_cursor",
+            hint="cursor is malformed; restart pagination from the first page",
+        )
+    if cursor_payload is not None and fingerprint_mismatch(
+        cursor_payload.f, fingerprint
+    ):
+        raise CodedHTTPException(
+            400, code="invalid_cursor",
+            hint="cursor filter context does not match this request; "
+                 "restart pagination from the first page",
+        )
+
+    # ---- ⑥ 降级矩阵（§4.2 formula；db∈{disabled,tripped} 同形） --------
+    dbaux = getattr(request.app.state, "dbaux", None)
+    if dbaux is not None and dbaux.status().available:
+        try:
+            page = await fetch_sessions_page(
+                dbaux,
+                archived=archived_state,
+                parent=parent_state,
+                search=normalized,
+                cursor=(cursor_payload.t, cursor_payload.i)
+                if cursor_payload is not None else None,
+                limit=limit,
+                allowlist=allowlist,
+            )
+        except AuxiliaryUnavailableError:
+            pass  # raced into unavailable between status and query → degrade
+        else:
+            items = project_rows_to_v4_skeletons(page.records)
+            next_cursor = None
+            if not page.complete and items:
+                last = page.records[-1]
+                next_cursor = encode_cursor(
+                    last["time_updated"], last["id"], fingerprint,
+                )
+            return _v4_json_response(
+                sessions_envelope_v4(items, next_cursor, page.complete),
+                request,
+            )
+    # DB unavailable (or raced) → §4.2 degradation formula
+    if allowlist:
+        # fail-closed：白名单 ⊆ 结果集不可由上游保证（ora B-2 选②）
+        raise _aux_unavailable()
+    if has_wildcard(normalized):
+        # %/_/\ 无法等价表达——过滤语义永不降级（§4.6 收窄）
+        raise _aux_unavailable()
+    if cursor_payload is not None:
+        # 上游单键 cursor 无法兑现 (t,i) keyset 指纹
+        raise _aux_unavailable()
+    class_a = (
+        archived_state in ("omit", "all") and parent_state in ("all", "none")
+    )
+    if not class_a:
+        raise _aux_unavailable()
+
+    # ---- Class A 200 + degraded:true（HTTP 降级，v3 调用形态复制） -----
+    params: dict[str, object] = {"limit": limit}
+    if parent_state == "none":
+        params["roots"] = "true"  # §4.2: parent=none → roots=true 透传
+    if normalized is not None:
+        params["search"] = normalized  # 第四消费点：降级传 normalized
+    config = request.app.state.config
+    try:
+        async with request.app.state.transforms as pool:
+            try:
+                response = await request.app.state.upstream.send(
+                    request.app.state.upstream.build_request(
+                        "GET", "/session",
+                        params=params, headers=forward_directory_headers(None),
+                    ),
+                    stream=True,
+                )
+            except httpx.RequestError as exc:
+                raise_upstream_unavailable(exc)
+            try:
+                body = await read_upstream_response(
+                    request, response,
+                    cap=config.max_response_bytes,
+                    read_with_cap=read_with_cap,
+                )
+                if body is None:
+                    raise CodedHTTPException(
+                        413, code="response_too_large",
+                        limit=config.max_response_bytes,
+                    )
+                try:
+                    payload = orjson.loads(body)
+                except (orjson.JSONDecodeError, ValueError) as exc:
+                    raise_upstream_unavailable(exc)
+                if not isinstance(payload, list) or (
+                    payload and not all(isinstance(s, dict) for s in payload)
+                ):
+                    raise_upstream_unavailable()
+                items = await pool.offload(
+                    _project_http_sessions_v4, payload,
+                )
+            finally:
+                await response.aclose()
+    except TransformBusy:
+        return busy_response(request.headers.get("accept-encoding"))
+    # complete best-effort（§4.2 degraded 语义：上游无 LIMIT+1 窗口）；
+    # nextCursor 恒 null——降级页无法用 (t,i) keyset 续读（cursor → 503）。
+    complete = len(items) < limit
+    return _v4_json_response(
+        sessions_envelope_v4(items, None, complete, degraded=True),
+        request,
+    )
+
+
+def _v4_json_response(payload: dict, request: Request) -> Response:
+    """v4 sessions 200 响应：无 ETag / Vary / 304（§4.4 冻结）。
+
+    ``json_response`` 基线会为 gzip 协商统一盖 ``Vary: Accept-Encoding``
+    （v3 §6.2 全仓卫生）；v4 sessions 显式摘除以贴合 §4.4 字面。副作用：
+    gzip 内容协商仍在（body 可能 gzip），无 Vary 声明——见 B4 汇报风险项。
+    """
+    response = json_response(
+        payload, accept_encoding=request.headers.get("accept-encoding"),
+    )
+    if "Vary" in response.headers:
+        del response.headers["Vary"]
+    return response
+
+
+def _project_http_sessions_v4(payload: list[dict]) -> list[dict]:
+    """Worker-thread entry: degraded-path HTTP → SessionSkeletonV4."""
+    return [_http_session_to_v4(item) for item in payload]
+
+
 @router.get("/sessions")
 async def sessions(
     request: Request,
@@ -246,7 +533,26 @@ async def sessions(
     limit: int = Query(100, ge=1, le=1000),
     start: int | None = Query(None, ge=0),
     search: str | None = None,
+    archived: str | None = None,
+    parent: str | None = None,
+    cursor: str | None = None,
 ):
+    # v4 fork (B3a-B4, v4-contract §4). The v3 path below this fork is
+    # byte-identical to the pre-fork route. ``directory`` never reaches
+    # here on v4 — the selector retires it pre-route (§5.2).
+    if wire_view_from_scope(request.scope) >= 4:
+        return await _sessions_v4(
+            request, roots=roots, limit=limit, start=start, search=search,
+            archived=archived, parent=parent, cursor=cursor,
+        )
+    # v3 × v4-only params → 422（§4.1 参数矩阵：显式拒绝，任何值含非法值；
+    # presence-based，不依赖 FastAPI 默认忽略——同 v4 侧 S-B04 纪律）。
+    _v3_reject = _raw_query_keys(request) & {"archived", "parent", "cursor"}
+    if _v3_reject:
+        raise CodedHTTPException(
+            422, code="param_version_mismatch",
+            hint=f"{sorted(_v3_reject)} are v4-only parameters",
+        )
     # v3 (§5, Batch B): a consumed ``?directory=`` was validated + stripped
     # at dispatch — the stash replaces the (absent) query param here.
     directory = resolve_route_directory(request.scope, directory)

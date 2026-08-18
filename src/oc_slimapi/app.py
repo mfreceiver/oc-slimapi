@@ -20,6 +20,7 @@ from .actions import load_registry as actions_load_registry
 from .catalog_cache import CatalogCache
 from .leased_singleflight import LeasedSingleFlight
 from .config import settings
+from .dbaux import DbAuxiliarySource, resolve_db_path
 from .errors import register_error_handlers
 from .logging_config import get_logger, setup_logging
 from .middleware.request_id import RequestIdMiddleware
@@ -75,6 +76,12 @@ _MAINT_DRAIN_TIMEOUT = 30.0
 # uvicorn graceful-shutdown window so a hot reload / systemd stop is not
 # stalled by a single slow worker.
 _TRANSFORM_DRAIN_TIMEOUT = 10.0
+
+# B3a-B1: bounded drain for the dbaux single-worker executor on shutdown.
+# Shorter than the transform pool — dbaux queries are read-only projections
+# with a 5s busy_timeout ceiling, so 5s covers the worst legitimate case
+# without stalling the uvicorn graceful-shutdown window.
+_DBAUX_DRAIN_TIMEOUT = 5.0
 
 # Graceful shutdown timeout for uvicorn's active-connection (SSE) drain
 # (P0-1). uvicorn waits this long for active connections to finish before
@@ -516,6 +523,33 @@ async def lifespan(app: FastAPI):
         incarnation = inc_store.load_or_bump()
         app.state.turn_registry = TurnRegistry(incarnation=incarnation)
         app.state.hubs.set_turn_registry(app.state.turn_registry)
+        # B3a-B1: v4 sessions DB auxiliary source — read-only projection
+        # infrastructure (design-v4-dbaux §1-§6). Resolve path → mode=ro
+        # open + query_only → schema gate; ANY failure disables the
+        # auxiliary (never crashes lifespan — full-degradation HTTP) and
+        # the shared periodic task (probe interval) retries: inode/mtime
+        # checks, circuit half-open probes, disabled reprobes. The v4
+        # sessions routes that consume it land in B4; until then this runs
+        # as background infra whose real state surfaces via /slimapi/health
+        # ``auxiliary`` (v4 view) and the B5 metrics lane.
+        dbaux_resolution = resolve_db_path()
+        app.state.dbaux = DbAuxiliarySource(
+            dbaux_resolution,
+            probe_interval_s=settings.dbaux_probe_interval_s,
+        )
+        await app.state.dbaux.start()
+
+        async def _stop_dbaux():
+            # Bounded drain mirrors _shutdown_transforms (P1-41 pattern):
+            # in-flight worker queries finish naturally, but shutdown never
+            # stalls the event loop past the drain window.
+            try:
+                await app.state.dbaux.stop(
+                    drain_seconds=_DBAUX_DRAIN_TIMEOUT,
+                )
+            except Exception as exc:  # noqa: BLE001 — best-effort
+                get_logger("app").warning("dbaux.stop failed", exc_info=exc)
+        stack.push_async_callback(_stop_dbaux)
         await smoke(app)
         # Best-effort upstream health check (contract §4). Non-blocking; failure
         # is tolerated — the smoke() call already proved the client works, and a

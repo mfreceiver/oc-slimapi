@@ -1,7 +1,7 @@
 # 流量记录与分析（省流实证）使用手册
 
 > 如何查询与解读 oc-slimapi 的**双向字节账本** + **结构化 access log** + **内存账本周期快照**，实证 sidecar 的省流效果。
-> 特性版本：**v0.7.0+**（`/slimapi/metrics` 响应的 `traffic` 块 + access log）；**2026-07-29**（按天切分 + client 标识字段 + traffic snapshot）；**2026-08-01**（turn-token fence scope 简化为仅 sid；移除 serverGroupFp 字段）；**2026-08-16**（v3 Batch A 加性观测字段：`wireVersion`/`selectorResult`/`directoryForm`/`recordType`/`lifecycleId` + SSE 开关行 + snapshot `v3` 节 + `aggregate_v3_observability`，见 §5.1/§9.4）。
+> 特性版本：**v0.7.0+**（`/slimapi/metrics` 响应的 `traffic` 块 + access log）；**2026-07-29**（按天切分 + client 标识字段 + traffic snapshot）；**2026-08-01**（turn-token fence scope 简化为仅 sid；移除 serverGroupFp 字段）；**2026-08-16**（v3 Batch A 加性观测字段：`wireVersion`/`selectorResult`/`directoryForm`/`recordType`/`lifecycleId` + SSE 开关行 + snapshot `v3` 节 + `aggregate_v3_observability`，见 §5.1/§9.4）；**2026-08-18**（4.0.0 双版本期：`wireVersion` 增 `"4"`、`selectorResult` 增 `v4` 取值 + `/slimapi/metrics` 新增 `dbaux` 观测块，见 §5.1）。
 >
 > **术语澄清**：本手册中出现的 `/slimapi/metrics.traffic` / `/metrics.traffic` 等写法，**不是**独立 HTTP 路由——代码里只有 `GET /slimapi/metrics`（`src/oc_slimapi/routes/metrics.py`），流量账本是该响应 JSON 的 `traffic` 子键。下文为简洁起见用 "`metrics.traffic`" 作为该数据块的简称。
 > 性质：**加性 ops 可观测面**（v3-only 终态：`X-Slimapi-Version` 头已删除，不再有 bump 概念）；ocdroid 对接无变化（`/slimapi/metrics` 为 T3 ops 端点，非客户端契约）。
@@ -166,8 +166,8 @@ curl -s "$BASE/slimapi/metrics?$V" | jq '
 | `client` | 客户端 app 名（来自 `X-Client-Name`，明文，**不 hash**） |
 | `clientVer` | 客户端版本（来自 `X-Client-Version`，明文，**不 hash**） |
 | `clientId` | 设备标识 hash（来自 `X-Client-Id`，默认 `sha256(raw)[:16]`；设 `OC_SLIMAPI_CLIENT_ID_SALT` 时为 `hmac_sha256(salt,raw)[:16]`） |
-| `wireVersion` | `"2"` \| `"3"` \| `null`——该请求生效的 wire 语义（`?v=3` → `"3"`；**v2 管线已于 3.0.0 退役**——`"2"` 值及无 `v`/`?v=2` 语义为 2.x 并行期历史维度，3.0.0 起恒为 400（记 `rejected`）；被拒/豁免/非 `/slimapi` → `null`） |
-| `selectorResult` | `absent`（无 `v`）\| `v2`（`?v=2`）\| `v3`（`?v=3`）\| `rejected`（词法/不支持被 400）\| `exempt`（`GET /slimapi/versions`）\| `not_applicable`（catch-all 非 `/slimapi` 路由）。**3.0.0 终态：`absent`/`v2` 值的请求已不可达（一律 400 记 `rejected`）；枚举保留供历史日志（≤2.x 期）与 snapshot 矩阵维度对账** |
+| `wireVersion` | `"2"` \| `"3"` \| `"4"` \| `null`——该请求生效的 wire 语义（`?v=3` → `"3"`、`?v=4` → `"4"`——**4.0.0 起 (3,4) 双版本期**；**v2 管线已于 3.0.0 退役**——`"2"` 值及无 `v`/`?v=2` 语义为 2.x 并行期历史维度，3.0.0 起恒为 400（记 `rejected`）；被拒/豁免/非 `/slimapi` → `null`） |
+| `selectorResult` | `absent`（无 `v`）\| `v2`（`?v=2`）\| `v3`（`?v=3`）\| `v4`（`?v=4`，4.0.0 起）\| `rejected`（词法/不支持被 400）\| `exempt`（`GET /slimapi/versions`）\| `not_applicable`（catch-all 非 `/slimapi` 路由）。**3.0.0 终态：`absent`/`v2` 值的请求已不可达（一律 400 记 `rejected`）；枚举保留供历史日志（≤2.x 期）与 snapshot 矩阵维度对账** |
 | `directoryForm` | `query` \| `header` \| `both` \| `absent` \| `null`——directory 输入形态（仅 directory 消费集路由非 null：messages list/full、sessions 列表/status、todo/children/diff、agent/command、stream；其余含 catch-all = `null`） |
 | `recordType` | `request`（每 HTTP 请求一行）\| `sse_open` \| `sse_close`（SSE 建立断开标记行）。**消费口径：统计请求数/字节时必须过滤 `recordType=="request"`** |
 | `lifecycleId` | 进程内单调递增 int；同一条 SSE 连接的 `sse_open`/`sse_close` 行同值（配对键）。仅生命周期行有值，`request` 行为 `null`。`requestId` 在 SSE 重连时可复用，仅辅助关联，**配对以 `lifecycleId` 为准** |

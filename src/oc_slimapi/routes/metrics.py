@@ -41,6 +41,31 @@ async def metrics(request: Request):
     qp_sweep = getattr(request.app.state, "qp_sweep", None)
     if qp_sweep is not None and getattr(qp_sweep, "enabled", True):
         hubs_snapshot["sweep"] = qp_sweep.metrics()
+    # DB auxiliary observability (B3a-B5, v4-contract §9.1): state +
+    # sliding-window latency percentiles + event counters. Additive —
+    # test apps without a wired source keep the original shape. The
+    # resolved DB path is deliberately NOT echoed here (same no-leak
+    # posture as the health auxiliary view); ``source`` tags the
+    # resolution channel only.
+    dbaux = getattr(request.app.state, "dbaux", None)
+    if dbaux is not None:
+        snap = dbaux.snapshot()
+        breaker = snap["breaker"]
+        hubs_snapshot["dbaux"] = {
+            "available": snap["available"],
+            "mode": snap["mode"],
+            "reason": snap["reason"],
+            "generation": snap["generation"],
+            "source": snap["source"],
+            "latency": {
+                "p50_ms": breaker["p50_ms"],
+                "p99_ms": breaker["p99_ms"],
+                "samples": breaker["samples"],
+                "total": breaker["total"],
+            },
+            "breaker_open": breaker["open"],
+            "counters": snap["counters"],
+        }
     return json_response(
         hubs_snapshot,
         accept_encoding=request.headers.get("accept-encoding"),

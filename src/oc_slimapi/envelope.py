@@ -38,7 +38,30 @@ def sessions_envelope_payload(
     ``complete`` inherits the v2 ``X-Complete`` semantics verbatim,
     including its non-authoritative nature (never a statement about the
     authoritative full set). Serialized with the route's normal
-    ``json_response`` so gzip negotiation / Vary behave exactly like the
-    v2 path.
+    ``json_response`` so gzip / Vary behave exactly like the v2 path.
     """
     return {"items": sessions, "complete": complete}
+
+
+def sessions_envelope_v4(
+    items: list[dict],
+    next_cursor: str | None,
+    complete: bool,
+    *,
+    degraded: bool = False,
+) -> dict[str, object]:
+    """v4 sessions envelope (v4-contract §4.1): key order frozen
+    ``(items, nextCursor, complete[, degraded])``.
+
+    ``degraded`` is ONLY present (and true) on the DB-unavailable Class A
+    fallback (§4.2) — never a key on the DB-path 200. No ETag/Vary/304 on
+    any v4 sessions response (§4.4).
+    """
+    payload: dict[str, object] = {
+        "items": items,
+        "nextCursor": next_cursor,
+        "complete": complete,
+    }
+    if degraded:
+        payload["degraded"] = True
+    return payload
