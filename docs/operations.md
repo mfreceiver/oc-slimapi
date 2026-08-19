@@ -89,8 +89,9 @@ Environment=OC_SLIMAPI_HOST=0.0.0.0   # 或 127.0.0.1（仅 loopback，更保守
 Environment=OC_SLIMAPI_PORT=4097
 Environment=OC_SLIMAPI_UPSTREAM=http://127.0.0.1:4096
 Environment=OC_SLIMAPI_MAX_MESSAGE_BYTES=33554432
-Environment=OC_SLIMAPI_SERVER_API_VERSION=3
-Environment=OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS=3,3   # M3 v3-only 终态（升级必须改，见 CHANGELOG [Unreleased]）
+# OC_SLIMAPI_SERVER_API_VERSION / OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS 已弃用（4.0.0 起
+# 接受区间钉死 (3,4) fail-closed，设置无效；SERVER_API_VERSION 设置仅产生启动 warning 并被
+# 忽略）——生产 unit 已同款清理，模板不再示例。
 Environment=PYTHONUNBUFFERED=1
 
 # v1.0.0: access log + traffic snapshot 落 StateDirectory（systemd 自动建
@@ -376,10 +377,9 @@ curl -s 'http://127.0.0.1:4097/slimapi/ready?v=3'
 ## 7. v4 DB 辅助源运维（B0 预置，随 B3a 生效）
 
 > **B0 批预置文档**：本章为 v4（**4.0.0**，B3a 批次）DB 辅助投影源
-> （`/slimapi/sessions?v=4` 常态路径）的运维说明，**功能随 4.0.0 生效**；
-> 当前 3.x（v3-only 终态）sidecar 不读 SQLite，本章暂不适用（仅预案）。
+> （`/slimapi/sessions?v=4` 常态路径）的运维说明，**功能随 4.0.0 生效**（生产已部署）。
 > 设计权威：`docs/system-architecture-proposal-2026-08-17.md` §3.1/§3.5；
-> wire 见 `docs/specs/v4-contract.md`（B0 起草中，随 4.0.0 定稿）；
+> wire 见 `docs/specs/v4-contract.md`（4.0.0 实施基线 + 2026-08-19 正式修订冻结）；
 > **写域约束：sidecar 零 DDL/DML/PRAGMA 写**（见 `AGENTS.md` 硬规则「SQLite 写域」）。
 
 ### 7.1 DB 路径解析

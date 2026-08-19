@@ -14,15 +14,28 @@
 ocdroid 对接时：
 
 1. 读本文件了解**行为**变更；
-2. 读 `docs/specs/v2-contract.md` 了解**当前完整契约**；
+2. 读 `docs/specs/v3-contract.md`（v3 视图契约权威）+ `docs/specs/v4-contract.md`（(3,4) 双版本窗口的 v4 差异层）了解**当前完整契约**；
 3. 用 `/slimapi/health` 的 `server.api_version` / `accepted_client_versions` 做运行时兼容自检。
 
 ### 维护规约
 
 - **每次**用户可见 / 客户端可观测的 wire 行为变更，必须在对应版本下增加条目（Added / Changed / Fixed / Removed / Security）。
 - 条目写**行为与路径**，不写实现细节（避免“改了哪行 Python”）。
-- 破坏性变更：同时更新 `docs/specs/v2-contract.md` + bump wire API 版本 + 在本文件 **Changed** 中显式写 `X-Slimapi-Version` 与客户端必改点。
+- 破坏性变更：同时更新 `docs/specs/v3-contract.md`（及差异层受影响时的 `docs/specs/v4-contract.md`）+ bump wire API 版本 + 在本文件 **Changed** 中显式写 `X-Slimapi-Version` 与客户端必改点。
 - 发版时由 `./scripts/release.sh` 校验本文件含有目标版本标题（见 `docs/release.md`）。
+
+---
+
+## [Unreleased] — v4 wire 正式修订（v4 尚无消费方，无破坏影响；owner 裁决 2026-08-19）
+
+**契约先行冻结，实现批次随后；本节随首个实现批次发版时折叠为版本节。** 修订只作用 `?v=4` 视图（`?v=3` 语义冻结零改动；无新 wire major，窗口仍 (3,4)），全部语义以 `docs/specs/v4-contract.md`（4.0.0 实施基线 + 2026-08-19 正式修订冻结）为准：
+
+- **readiness 门禁**：`capabilities["4"]` 扩展 `readiness` 对象（9 个 feature ID，`required ⊆ satisfied → ready`，实现批次逐项点亮）；
+- **providers 安全投影**（§12）：白名单 schema + 嵌套递归丢弃 + 四项数值限额 + 三带错误契约（**502/413/503**）+ ETag/canonical 口径；
+- **session 单查 parity**（§13）：`GET /slimapi/session/{sid}?v=4` 升级为与列表同源 canonical skeleton（dbaux 点查优先 + whole-response native fallback + `partial`/`degraded` 标记公式）；
+- **expand 闭环**（§14）：expandRefs href 按 wire 视图生成（v4 响应 → `?v=4`），`capabilities["4"]` 广告 `expand`；
+- **表示层**（§15）：v4 sessions 列表增 ETag（identity 强 / gzip 弱 `W/`），全 v4 路由 `Vary: Accept-Encoding` 修正；
+- **method 边界**（§16）：三条 deferred method-path 组合在 `?v=4` 下精确 405 `method_not_applicable`（`Allow` 头 + coded body + 不转发 + no-store）。
 
 ---
 

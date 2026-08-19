@@ -1,9 +1,9 @@
 # oc-slimapi v3 wire 契约（design-v3 rev11 — 终态）
 
-> 状态：**正式——2.0.0 实施基线，3.0.0（m3 分支）为 v3-only 终态实施**（design-v3 rev11；2026-08-16 十一轮评审收敛 6.8→8.3→8.9→9.2→9.1→8.3→9.1→9.4→9.4→9.4→9.7 PASS，rev-sgpt 十一评）。
+> 状态：**正式——2.0.0 实施基线，3.0.0（m3 分支）为 v3-only 终态实施**（design-v3 rev11；2026-08-16 十一轮评审收敛 6.8→8.3→8.9→9.2→9.1→8.3→9.1→9.4→9.4→9.4→9.7 PASS，rev-sgpt 十一评）。**v3 语义冻结不变；4.0.0 起进入 (3,4) 双版本窗口**——v3 视图经 `?v=3` 持续可达，v4 视图差异见 [`v4-contract.md`](v4-contract.md)（2026-08-19 状态注记）。
 > 方向决策（不可推翻）：单入口终态——`/slimapi/**` 提供完整功能（实测使用集：ocdroid StandardApi 全量端点），catch-all 3.0.0 关闭，全部自定义头退役。两步走（已定）：sidecar 2.0.0 → ocdroid 3.0.0（smoke 门控）→ sidecar 3.0.0。
-> v2 历史契约（已于 3.0.0 退役）：`docs/specs/v2-contract.md`——本文件 §0 所继承的基线语义以其为准；**当前 wire 权威 = 本文件**（3.0.0 起仅 v3 语义可达）。条款标 **[冻结]** 或 **[计划]**。
-> 修订注记（2026-08-17，**3.1.0 包版本 minor（major 与 wire 协议版本绑定，wire 仍 v3 未 bump，不发 major）**；wire 版本**不变**，仍 v3、`?v=3` selector 不变）：expand 契约收编（设计权威 `docs/specs/design-expand.md` v5，rev-sgpt R4 APPROVED WITH CHANGES；实现已合入 969e9c6..757d2d1，check.sh 全绿）。本次仅修订本文件不 bump wire——新增 §4a（消息投影缩减与 expandRefs）/§4b（expand 片段端点）；skeleton 投影缩减（减性）与 expand 片段端点（加性）均直接并入 v3 视图；§3 capabilities 增 `expand` 对象；§5 消费集纳入两 expand 路由；§6 注明 expand 无 ETag；§8 补 expand 错误码与路由内求值序；§10 读组计数 **7→8**（新增第 8 读组 `messages.expand`，raw 受控代理全节条款 carve-out）；§11 测试矩阵扩充。修订处标 **[3.1.0]**。
+> v2 历史契约（已于 3.0.0 退役）：`docs/specs/v2-contract.md`——本文件 §0 所继承的基线语义以其为准；**v3 视图 wire 权威 = 本文件**；(3,4) 双版本窗口下 `?v=4` 视图的差异以 [`v4-contract.md`](v4-contract.md) 为准。条款标 **[冻结]** 或 **[计划]**。
+> 修订注记（2026-08-17，**3.1.0 包版本 minor（major 与 wire 协议版本绑定，wire 仍 v3 未 bump，不发 major）**；wire 版本**不变**，仍 v3、`?v=3` selector 不变）：expand 契约收编（设计权威 `docs/specs/design-expand.md`（rev5 定稿），rev-sgpt R4 APPROVED WITH CHANGES；实现已合入 969e9c6..757d2d1，check.sh 全绿）。本次仅修订本文件不 bump wire——新增 §4a（消息投影缩减与 expandRefs）/§4b（expand 片段端点）；skeleton 投影缩减（减性）与 expand 片段端点（加性）均直接并入 v3 视图；§3 capabilities 增 `expand` 对象；§5 消费集纳入两 expand 路由；§6 注明 expand 无 ETag；§8 补 expand 错误码与路由内求值序；§10 读组计数 **7→8**（新增第 8 读组 `messages.expand`，raw 受控代理全节条款 carve-out）；§11 测试矩阵扩充。修订处标 **[3.1.0]**。
 
 ---
 
@@ -17,6 +17,7 @@
    - **sidecar 3.0.0** = 删 v2 管线/全部自定义头/catch-all 关闭。前置 = ocdroid 3.0.0 已发 + §9.3 判据满足。
 4. **3.1.0 修订（2026-08-17；包版本 minor（major 与 wire 协议版本绑定，wire 仍 v3 未 bump，不发 major）、wire 仍 v3；[冻结]）**：skeleton 投影缩减（§4a）与 expand 片段端点（§4b）并入 v3 视图——§0.1「凡未提及语义逐字沿用 v2」对被 §4a/§4b 覆盖的投影/错误/上限语义**由本节覆盖优先**；**§10 读组计数 7→8**（历史"两步走"块内"读 7 组"保持 2.0.0 交付口径不变，计数修订以本条目与 §10 标题为准）。
 5. **3.3.0 修订（2026-08-17；包版本 minor、wire 仍 v3（纯加性，无 selector 变化）；[冻结]）**：①§7 digest 帧 `changed` 字段（B1a，最小语义）；②§4a TextPart.text 全量内联 [3.2.0] 行为的 B2 兼容性注记与两模式裁剪断言矩阵；③§10.a 第 9 读组 `session.context` + §10.b 写 12→17 端点（agent/model/revert 三段式，B4）；④§3a health `features.allowlist` + §5.7a directory allowlist fail-closed 语义（B4-4，env 三态：未配置=现状零变化——故 allowlist 属**部署配置面**，不开启即无任何 wire 变化）。
+6. **双版本窗口交叉引用（2026-08-19 修订）**：4.0.0 起 `ACCEPTED_CLIENT_VERSIONS = (3,4)`，同一 `/slimapi/**` 路径经 `?v=3` / `?v=4` selector 决定视图——**v3 语义冻结不变**（本文件全量语义即 `?v=3` 请求的可观察行为）；`?v=4` 下的行为差异（全局 sessions 列表、SSE id:/重放、directory 退役集等）由 [`v4-contract.md`](v4-contract.md) 规定，本文件不重复载述。
 
 ## §1 头退役范围（按方向拆分）[冻结]
 
@@ -94,7 +95,7 @@ GET /slimapi/versions → 200
 3. **`expandRefs` 为 sidecar 拥有键**：上游同名键**一律剥离/确定性替换**（skeleton 深拷贝时丢弃上游值后按本映射重建），永不透传、永不进 `omitted`。元素形状 `{category, messageID, partID?, href}`（数组）；去重：每 `(category, messageID, partID?)` 至多 1 条（tool input 多 key 省略 → 仅 1 条 `part_state_input_full`）；排序：category 字典序 + 同 category 内 partID 字典序（确定性）；`href` 含 `?v=3`，directory 由客户端追加；空/null 上游字段与未知字段不生成。基数上界：每 part 理论 ≤ 5（tool part 可同时省略 input/metadata/attachments/output/error）；每条 raw 120–180 B，gzip 后 <100 B/消息。
 4. **可渲染性**：skeleton 模式 `text:null` 但携带 `expandRefs` 的 part **计为可渲染**（part 骨架 + 展开入口，非整页 placeholder）；消息级省略（diffs）不参与可渲染判定；`thin_placeholder` 语义不变（无任何可渲染 part 时注入）。
 5. **merged 语义（best-effort，显式不承诺 null-free）**：候选集 = 占位消息 ∪ 任一 part 携带 `expandRefs` 的消息（消息级 `info.expandRefs` **不进入候选**——diffs 永不 batch 恢复）；**placeholder-first** 优先级（占位消息按页面顺序优先占用预算，行为与现状完全一致、不被 ref 候选挤占）；ref 候选仅在剩余预算内按页面顺序 best-effort 还原；**交集去重**：同一消息同时属于两类时按 mid 去重——占位身份优先、只占 1 个 slot、只发起 1 次 full fetch；还原范围与现有 merge 相同（仅替换 `parts`），`info.summary.diffs` 在 merged 输出**恒 `null` + expandRefs**；预算耗尽/源超限/上游失败/畸形 body → 该项保留 skeleton（含 `null` text + expandRefs），客户端有展开入口兜底——**这是特性而非缺陷**。
-6. **指纹/ETag**：`contentFingerprint` 与列表 ETag 基于 skeleton 字节，缩减后自动确定性变化（测试锁定）。
+6. **指纹/ETag**：`contentFingerprint` 与列表 ETag 基于 skeleton 字节，缩减后自动确定性变化（测试锁定）。**`contentFingerprint` 语义显式复述（2026-08-19 修订注记——v3 就地载明，消除对 v2 契约的继承链歧义；语义与 v2-contract §消息内容指纹等价）**：每条消息 skeleton 加性字段 `contentFingerprint: string`，格式 `"<vN>:<sha256hex>"`（`vN` = 指纹方案版本前缀；SHA-256 全量 hex 不截断）。生成位置：缺省列表 = skeleton 投影完成时；`mode=merged` = placeholder splice 完成后**重算覆盖**（full 抓取失败/预算不足/坏响应等降级路径**不重算**，保留 skeleton 期指纹）。规范化输入 = 排除 `contentFingerprint` 自身后的消息投影 dict，`sort_keys` 序列化（parts 保持上游序）后取 SHA-256——指纹只覆盖 sidecar 投影后的表示，不含被丢弃字段。终态语义：同输入（同投影、同规范化、同 `vN`）恒同指纹（确定性，跨进程重启成立）；**不提供单调性**（不是序号/revision，客户端不得据此排序或版本比较）。**跨表示模式不可比较**：缺省与 merged 对同一消息产生不同指纹，`vN` 前缀不区分模式——仅在同一表示模式内比较；指纹是 `(updatedAt, messageId)` 双水位去重的补充证据，digest 帧不携带指纹。`OC_SLIMAPI_MESSAGE_FINGERPRINT_ENABLED=false` → 省略该字段；该开关状态参与 validator 版本输入（关闭 → 全部 ETag 验证器轮换）。
 
 ## §4b expand 片段端点 [冻结]（[3.1.0]；设计权威 `docs/specs/design-expand.md` §2/§3/§6）
 
@@ -167,16 +168,23 @@ GET /slimapi/versions → 200
 ## §6 ETag / Vary / 304 [冻结]
 
 1. **validator 域隔离**：`representation_version` 输入含 wire 版本标记——v2/v3 validator 互不匹配。
-2. **Vary**：并行期一切 **directory-sensitive 且接受 `X-Opencode-Directory` 头**的路由（原 4 路由 messages/sessions/agent/command + §10.a 收编 directory-消费读路由 + §10.b 写路由）统一 `Vary: Accept-Encoding, X-Opencode-Directory`；directory-不消费路由（active/global health 等）仅 `Vary: Accept-Encoding`。`?v=`/`?directory=` 属 URI 不加 Vary。3.0.0 头退役后全部路由去 directory Vary 值。
+2. **Vary**：**现状（3.0.0 终态，2026-08-19 修订注记）：全部 `/slimapi` ETag 路由恒单值 `Vary: Accept-Encoding`**——directory-消费与不消费路由一致，`X-Opencode-Directory` 维度已随 §1 头退役一并移除（不出现在任何 Vary 值中）。历史形态：2.0.0 并行期（`X-Opencode-Directory` 头仍解析时）directory-sensitive 且接受该头的路由（原 4 路由 messages/sessions/agent/command + §10.a 收编 directory-消费读路由 + §10.b 写路由）曾统一双值 `Vary: Accept-Encoding, X-Opencode-Directory`，directory-不消费路由（active/global health 等）仅 `Vary: Accept-Encoding`；3.0.0 头退役后全部路由去 directory Vary 值（即当前态）。`?v=`/`?directory=` 属 URI 不加 Vary。
 3. ETag/`If-None-Match`/`*`/judge 三态沿用 v2；envelope 路由 canonical 输入 = envelope body。**收编路由 ETag = §10.a 全集**（file/vcs/find/providers/session 单查/active/global health 七组全部 GET）；§10.b 写路由不启用。上游自身 ETag 头不透传（sidecar 生成域，§6.1 隔离）。**expand 两路由（§4b）不在 ETag 全集 [3.1.0]**——成功恒 200、无 304/`If-None-Match` 判定；其响应头冻结（`Cache-Control: no-store`、`Vary: Accept-Encoding`、无 ETag、无自定义辅助头）见 §4b.1。
 4. **v3 304 头集合**：仅 `ETag` + `Vary` + `Cache-Control: no-store`；不复制 `X-Next-Cursor`/`X-Complete`。
 
-## §7 SSE [冻结]（[3.3.0] 修订 digest `changed` 字段）
+## §7 SSE [冻结]（[3.3.0] 修订 digest `changed` 字段；2026-08-19 补载 §7.5–§7.7 现状语义）
 
 1. 两端点（`events`、`/stream`）接受 `?v=3`；帧名/帧形/`Last-Event-ID`/resync/heartbeat 零变化。`?v=3&tokens=1` 合法；`?v=3&directory=` 按 §5.6。
 2. **digest 帧 `changed` 字段（[3.3.0] 加性修订 [冻结]，B1a）**：`session.digest` 帧 data 增可忽略字段 `changed: [sid…]`。**最小语义（裁决冻结）**：digest 为 per-sid 逐帧产出，**帧出现即该 sid changed**，每帧 `changed` 恒为单元素数组 `[本帧 sessionID]`；数组形状为未来聚合预留，客户端消费按「帧到 = 该 sid 变更」处理即可，不应对数组多元素做任何假设。**sidecar 零新增状态**（无 changed 跟踪缓存）。旧客户端忽略未知字段，零必改点；消费端可从整表重拉升级为定向精拉。仅 digest 帧携带；q/p IMMEDIATE 直推帧、`resync` 帧、heartbeat 帧、`slimapi.meta` 帧均不含此字段（帧形零变化）。
 3. **meta 帧（v3）**：v3 SSE 不产出 `X-Slimapi-Subscriber-ID`（v2 照旧）。开流**首帧**元事件：`event: slimapi.meta\ndata: {"subscriberId": "<id>", "tokens": <bool>}\n\n`——早于任何业务帧、heartbeat、**及 Last-Event-ID resync 回放**。**`tokens` 取值冻结**：`/events` = `tokens=1` 时 `true` 否则 `false`；`/stream` 恒 `true`。SSE 流不做 content-encoding（帧字节原样）。客户端从 meta 取 id（无重连 API，观测/对账用途——ocdroid 已回执确认无需求）。
 4. 选择器畸形/不支持 → 开流前 400 普通 JSON。
+5. **digest `lastError` sticky 语义（2026-08-19 补载 [冻结]——现状载明）**：
+   - **记录**：`session.error` 事件携带 sessionID → 该 sid 的 digest 记 `lastError: {name, message, at}`（`name` 截断 128 字符）并**立即定向 flush**（该 sid 单帧，不等 debounce 窗口）；同时记入进程内 sticky 存储。
+   - **清除（唯一显式清除路径）**：该 sid **下一次 `session.status=busy`** → sticky 记录弹出 + digest 帧携带**显式 `lastError:null`**（null = 清除信号，区别于字段省略）+ 定向 flush。`session.deleted` → sticky 记录弹出 + digest `lastError` 字段省略。
+   - **贴回**：该 sid 后续 digest flush 在本窗口未自行设置/清除 `lastError` 时，合并 sticky 值（直到 busy 清除帧弹出）。**sticky 语义仅在同一 sidecar 进程生命周期内成立**：sticky 存储为进程内内存态，**无持久化，进程重启即丢**——重启后 sticky 状态不复活、不重贴；重启后该 sid 的**新 `session.error` 事件**才会重新记录并触发上述记录/贴回链。
+   - **容量**：sticky 存储 FIFO 上限 10,000 sid；逐出后的 sid 不再贴回。
+6. **digest `status` 恒字符串（2026-08-19 现状补载 [冻结]）**：上游 `session.status` 的 status 字段可能以**字符串**（`"busy"`）或**对象信封**（`{"type":"busy"}`）两种 wire 形态到达；sidecar 统一归一化，可观察结果：digest 帧 `status` 恒为**字符串**（busy/idle 等上游状态值原样）；信封无效（缺 `type` / `type` 非字符串）时该次状态更新被忽略（digest 其余字段不受影响）。
+7. **SSE 表示层（2026-08-19 现状补载 [冻结]；§7.3 已冻结 content-encoding，本条补 Vary 维度）**：两端点 SSE 流恒 identity——不做 gzip/content-encoding，响应**无 `Vary` 头**（响应头 = `Cache-Control: no-cache, no-transform` + `X-Accel-Buffering: no`；SSE 路径不参与 `Accept-Encoding` 内容协商，§6 Vary 规则不适用于 SSE 流）。
 
 ## §8 错误体与 catch-all 终局 [冻结]
 
