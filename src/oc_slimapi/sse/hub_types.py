@@ -373,6 +373,37 @@ def _extract_session_id(payload: dict[str, Any], props: dict[str, Any]) -> str |
     return None
 
 
+def normalize_session_status(value: Any) -> str | None:
+    """Normalize an upstream ``session.status`` value to its string form.
+
+    Upstream ``/global/event`` carries ``properties.status`` in TWO shapes
+    (live-wire captured 2026-08-19): the legacy plain string (``"busy"``)
+    and the object envelope (``{"type": "busy"}``). Both must resolve to
+    the same string so the digest ``status`` fill, the G1 busy-clears-
+    sticky path, and the token-hub mirror behave identically regardless
+    of which shape arrives.
+
+    Rules:
+    * ``str`` → returned as-is (legacy format, full value domain).
+    * ``dict`` with a string ``type`` → that string (object envelope).
+    * Anything else — dict without a string ``type`` (missing / null /
+      non-string), non-dict non-string junk — has **no valid status** →
+      ``None`` (the status field is ignored; never a crash).
+
+    Shared by ``global_hub.py`` (digest fill + G1 sticky clear + token-hub
+    mirror) and ``tokenstream/hub.py`` (:meth:`on_session_status`) —
+    ``hub_types`` is the leaf module both already import from, so there is
+    no import-cycle risk and exactly ONE implementation of the semantics.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        inner = value.get("type")
+        if isinstance(inner, str):
+            return inner
+    return None
+
+
 class SubscriberCapacityError(Exception):
     """Raised when admission would exceed a T3 subscriber cap (contract §7).
 

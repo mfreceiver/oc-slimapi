@@ -81,7 +81,7 @@ from ...config import (
     TOKEN_RESYNC_QUEUE_CAP,
 )
 from ...logging_config import get_logger
-from ..hub_types import TOKEN_FRAME_TYPE
+from ..hub_types import TOKEN_FRAME_TYPE, normalize_session_status
 from ..replay_log import (
     FRAME_KIND_BUSINESS,
     FRAME_KIND_TOMBSTONE,
@@ -1016,8 +1016,19 @@ class TokenStreamHub:
     # ------------------------------------------------------------------
     # Session routing (Stage B, §16-B)
     # ------------------------------------------------------------------
-    def on_session_status(self, sid: str, status: str) -> None:
+    def on_session_status(self, sid: str, status: "str | dict[str, Any] | None") -> None:
         """Record upstream session.status and trigger idle cleanup (§16-B).
+
+        ``status`` accepts BOTH upstream shapes — legacy plain string
+        (``"busy"``) and object envelope (``{"type": "busy"}``; live-wire
+        2026-08-19) — normalized via the shared
+        :func:`oc_slimapi.sse.hub_types.normalize_session_status` so the
+        token hub behaves identically to the digest path regardless of
+        which shape the wire carries. The production caller
+        (GlobalHub.publish's mirror branch) already passes a normalized
+        string; normalizing again here is idempotent and keeps this entry
+        point safe for any future direct caller. An invalid shape (no
+        valid status) is treated like an unknown status below: ignored.
 
         WHY only busy/idle are recorded: opencode's session lifecycle uses
         these two states as the authoritative "generation in progress" /
@@ -1034,8 +1045,10 @@ class TokenStreamHub:
         subscribers drop stale stream state and re-fetch authoritative
         /since.
         """
-        if status not in ("busy", "idle"):
+        normalized = normalize_session_status(status)
+        if normalized is None or normalized not in ("busy", "idle"):
             return
+        status = normalized
         self._session_status[sid] = status
         self._session_status.move_to_end(sid)
         self._prune_session_status()

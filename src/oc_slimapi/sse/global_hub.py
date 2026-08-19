@@ -42,6 +42,7 @@ from .hub_types import (
     _now_ms,
     _sanitize_error_message,
     _upstream_line_bytes,
+    normalize_session_status,
     sse_frame,
 )
 from .replay_log import GLOBAL_DOMAIN
@@ -692,8 +693,14 @@ class GlobalHub:
             if isinstance(directory, str):
                 entry.directory = directory
             if event_type == "session.status":
-                status = props.get("status")
-                if isinstance(status, str):
+                # Upstream status arrives in two shapes — legacy plain
+                # string ("busy") and object envelope ({"type": "busy"};
+                # live-wire 2026-08-19). Normalize ONCE here; the same
+                # value feeds the digest fill, the G1 busy-clear below,
+                # and the token-hub mirror branch further down (no second
+                # raw read).
+                status = normalize_session_status(props.get("status"))
+                if status is not None:
                     entry.status = status
                 # S9: ingest-time snapshot stamp of turn/inc. Stamped HERE
                 # (publish/ingest), NOT at flush time, so a turn bump
@@ -706,7 +713,11 @@ class GlobalHub:
                     entry.turn_incarnation, entry.turn = self._turn_registry.snapshot(session_id)
                 # G1: busy clears sticky lastError with explicit null digest.
                 # Per-sid flush only — other sessions stay in the debounce window.
-                if props.get("status") == "busy" and session_id in self.sticky_last_error:
+                # ``status`` is the NORMALIZED value (string | None): the
+                # object envelope {"type":"busy"} used to fail the legacy
+                # ``props.get("status") == "busy"`` string comparison, which
+                # made this the sticky-clear path that never fired (bug A).
+                if status == "busy" and session_id in self.sticky_last_error:
                     self.sticky_last_error.pop(session_id, None)
                     entry.last_error = None  # explicit null → clear frame
                     self.flush_sid(session_id)
@@ -758,8 +769,13 @@ class GlobalHub:
                 "session.status", "session.deleted",
             ):
                 if event_type == "session.status":
-                    status = props.get("status")
-                    if isinstance(status, str):
+                    # Reuse the ``status`` normalized at the top of the
+                    # session.status branch (same publish() invocation —
+                    # that branch always ran first). Object envelope and
+                    # legacy string reach the token hub identically; an
+                    # invalid shape (None) is skipped, matching the legacy
+                    # isinstance(str) guard.
+                    if status is not None:
                         self._token_hub.on_session_status(session_id, status)
                 else:  # session.deleted
                     self._token_hub.on_session_deleted(session_id)
