@@ -26,6 +26,19 @@ ocdroid 对接时：
 
 ---
 
+## [3.3.1] - 2026-08-19 — sticky lastError 永不清除修复（包版本 patch；wire 版本**不变**，仍 (3,4)）
+
+> **版本号特例（owner 决定 2026-08-19）**：现行消费方（ocdroid/WebUI）均使用 **wire v3**，sidecar 包主版本号自此**与实际服务的 wire 主版本对齐 = 3.x**；本版为 3.x 线 patch。4.0.0/4.1.0（wire (3,4) 双版本窗口开启）保留在 tag 历史中不删除；`v3.3.1 < v4.1.0` 的 semver 降序是本特例的已知代价（editable 安装需显式 reinstall，见下）。**ocdroid 必改点：无**——SSE digest/清除帧语义为契约内修复，客户端无需改动。
+
+### Fixed（SSE digest 契约内修复）
+
+- **sticky lastError 永不清除（G1 清除路径失效）**：上游 `/global/event` 的 `session.status` 实测携带**对象**格式 `{"type":"busy"}`（2026-08-19 抓包），而 sidecar 按字符串比较——`global_hub` 的 G1「busy 弹出 sticky + 下发 `lastError:null` 显式清除帧 + 定向 flush」**从未触发**，配额类错误横幅在限额恢复后跨小时残留（冷启动后首次活动经 digest 合并路径复活）。修复：新增共享归一化 helper `normalize_session_status()`（`sse/hub_types.py`）同时接受字符串与对象两种格式（对象缺 `type`/非字符串 → 忽略不 crash），`session.status` 处理链（digest `status` 填充、G1 busy 清 sticky、token-hub 镜像分支）统一改用归一化值。修复后语义恢复契约设计：**该 sid 下一次 busy 事件即清除横幅**。
+- **digest `status` 字段在对象格式下从未填充（连带修复）**：`entry.status` 同样因 `isinstance(str)` 守卫在对象格式下被跳过；现两种格式均正确填充 busy/idle 等状态值。
+- **token stream hub 对齐**：`tokenstream/hub.py` `on_session_status` 防御性归一化（幂等），`_busy_sids`/idle 清理在字符串与对象两格式下行为一致，无回归。
+- 测试：新增 19 用例（对象 busy 弹出 sticky + null 清除帧、字符串格式回归、idle/其他状态填充、5 种畸形形状忽略、清除后 flush 不再贴回、token-hub 镜像两格式一致性）；`check.sh` 2998 通过。
+
+---
+
 ## [4.1.0] - 2026-08-18 — B6-1 singleflight 双实现合并（包版本 minor；wire 版本**不变**，仍 (3,4)——纯内部重构，ocdroid 零感知）
 
 > PHASE-5 终态批次 B6-1。**ocdroid 必改点：无**——无任何 wire 行为变化（v3/v4 响应逐字节不变）。
