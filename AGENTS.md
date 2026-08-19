@@ -114,7 +114,7 @@ ls ~/.local/state/oc-slimapi/logs/           # access-YYYY-MM-DD.jsonl(.gz) + tr
 | 文件 | 用途 |
 |---|---|
 | [`docs/specs/v3-contract.md`](docs/specs/v3-contract.md) | **Wire 契约权威**（v3-only 终态；`v2-contract.md` 为 ≤2.x 历史契约） |
-| [`docs/specs/v4-contract.md`](docs/specs/v4-contract.md) | v4 wire 契约（4.0.0 实施基线 + 2026-08-19 正式修订冻结） |
+| [`docs/specs/v4-contract.md`](docs/specs/v4-contract.md) | v4 wire 契约（4.0.0 实施基线 + 2026-08-19 正式修订冻结（修订二：POST 等效动作族）） |
 | [`docs/specs/design-v2.md`](docs/specs/design-v2.md) | 当前态设计（接口/骨架/部署） |
 | [`docs/specs/INTERFACE_MAP.md`](docs/specs/INTERFACE_MAP.md) | 端点级实现追踪 |
 | [`docs/specs/CLIENT_CHANGES.md`](docs/specs/CLIENT_CHANGES.md) | ocdroid 侧配套改动清单 |

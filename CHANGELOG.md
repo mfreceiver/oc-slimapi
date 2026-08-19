@@ -26,6 +26,18 @@ ocdroid 对接时：
 
 ---
 
+## [Unreleased] — v4 wire 正式修订二：POST 等效动作族 + non-goals 收紧（owner 裁决 2026-08-19；契约先行冻结，实施批次随后——**本节随实施批次发版折叠**）
+
+> **修订范围（全部仅 `?v=4` 视图；`?v=3` 冻结零改动；无 V5）**：
+>
+> - **§3.3**：readiness feature 全集 U 9→10（加性扩展第 10 ID `session.post-actions.v4`，置于 `method.boundary.v4` 之后构成让位关系对；`required ≡ U` 随之 = 十项全集）。
+> - **§16 重写**（「POST 等效动作族 + method 边界」）：`session.post-actions.v4 ∈ satisfied` 时三条 POST 组合激活为等效路由——`POST /slimapi/session/{sid}` ≡ PATCH（同一 PatchPayload 逐字节等效受控写管线）；`POST …/delete` ≡ DELETE（请求实体与 DELETE **完全相同并原样转发**——读取实体/同 cap 413/Content-Type 透传/body 逐字节，无「忽略 body」分支；上游递归删子+吞错语义如实继承，**非幂等可接受**——owner q1）；`POST …/archive` 便捷加性（**octet 层缺省判据**：实体长度 0 → 合成，否则一律不解析逐字节透传；合成体冻结 `Content-Type: application/json` + 紧凑形 `{"time":{"archived":<ms>}}`，`<ms>` = sidecar wall-clock epoch-ms）。**错误映射**：上游 4xx 原样透传（含拒绝 `null` archived）、上游 5xx/网络 → 受控 503（不引入新错误码）。**依赖蕴含**（§3.3 条件⑦）：`session.post-actions.v4 ∈ satisfied ⇒ method.boundary.v4 ∈ satisfied`。未激活过渡期维持 v4.2.0 现行 405 `method_not_applicable`（§16.1 冻结值不回收；激活后 405 面按声明式组合优先级让位、`Allow` 字面随过渡窗口消失）。
+> - **并存非替代**：PATCH/DELETE v3/v4 均继续可用（不退役）；POST 三条仅 `?v=4`（v3 → 404 `thin_route_not_found` 现状）。
+> - **§17 non-goals 收紧**：cascade 编排层（sidecar 自建级联/聚合/重试——owner q1）与 cross-session search（owner q3）升**永久 non-goal**；「POST-only update」deferred 候选移除（被 q2 激活取代）。
+> - **§10/§8.4/§5.2**：路由表三条 POST 补行（write 17→20、总数 51→54，随实施批次落地）；`method_not_applicable` 适用面收窄注记；三条 POST directory 消费 ≡ 等效目标路由。
+>
+> **ocdroid 必改点：无**（`?v=3` 零改动；`?v=4` POST 为加性能力，经 `/slimapi/versions` readiness 广告按 `session.post-actions.v4` 状态消费）。
+
 ## [4.2.0] - 2026-08-19 — v4 wire 正式修订落地：readiness 门禁 + 五项修订面实施（包版本 minor；wire 版本**不变**，仍 (3,4)）
 
 > v4 尚无消费方（ocdroid/WebUI 均在 `?v=3`），修订无破坏影响；owner 裁决 2026-08-19。修订只作用 `?v=4` 视图（`?v=3` 语义冻结零改动），全部语义以 `docs/specs/v4-contract.md`（4.0.0 实施基线 + 2026-08-19 正式修订冻结）为准。实施经 rev-cgpt 四轮发版门控评审（6.0→8.0→9.0→**10.0 PASS**，门禁 9.5）。**ocdroid 必改点：无**——v3 视图逐字节不变；v4 修订面按 readiness 逐 feature opt-in。

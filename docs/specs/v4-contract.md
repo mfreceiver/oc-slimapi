@@ -1,4 +1,4 @@
-# oc-slimapi v4 wire 契约（4.0.0 实施基线 + 2026-08-19 正式修订）
+# oc-slimapi v4 wire 契约（4.0.0 实施基线 + 2026-08-19 正式修订；修订二：POST 等效动作族——冻结待实施）
 
 > **状态**：**4.0.0 实施基线（2026-08-18，B3a+B3b 已落地）+ 2026-08-19 正式修订（owner 裁决：修订并入 v4——v4 尚无消费方，修订无破坏影响）**。B0 批冻结全部可观察语义（2026-08-17，rev-6 PASS-with-notes + S-B01 四项 owner 终裁全收敛）；wire 终态 = 4.0.0（`ACCEPTED_CLIENT_VERSIONS` (3,3)→(3,4)）。B3a 批（阶段 A selector 双版本 / B1 dbaux 连接生命周期 / B2 投影 SQL / B3 cursor / B4 路由分叉降级矩阵 / B5 观测）已按本契约落地并全量测试通过；B3b 批（SSE id:/重放、§7 全量、能力键 `sseReplay`/`qpImmediateFull` 广告）**已落地**。S-B01 四项（§7.0）**已全部 owner 终裁（2026-08-17）**；其余章节（含 DB 设计 R1/R2/R3/R6，已凭真库实证冻结——见 design-v4-dbaux §0.2）均为冻结语义。
 > **2026-08-19 正式修订范围**（各修订节带**当前状态注记**——现行已发布行为 → 修订后冻结目标，实现批次随后落地）：providers 安全投影（§12）/ session 单查 parity（§13）/ expand 闭环（§14）/ 表示层（§15）/ method 边界与修订 non-goals（§16-§17）/ readiness 门禁（§3.3）。修订仅作用 `?v=4` 视图，`?v=3` 零改动（v3 冻结）；无新 major、无版本窗变更（`ACCEPTED_CLIENT_VERSIONS` 仍 (3,4)）。设计出处：`docs/ocmar/plans/2026-08-19-v4-rebaseline.md` §4-§7（owner 终裁 2026-08-19）。
@@ -59,7 +59,7 @@
 - **广告时序（n1 冻结）**：`sseReplay`/`qpImmediateFull` 与实现**同批启用**——B3a 的 `capabilities["4"]` **不含**此二键；B3b 实现落地同期广告（**已执行，B3b-5**：两键随 4.0.0 发布面广告；本条为时序约束的历史记录）。消费者：键缺席 = 该能力不可用，不得预依赖。
 - 消费者探测（B5a）：`capabilities["4"]` 不存在 → 继续 v=3；未知键容忍忽略。
 - **expand 能力探测注记（2026-08-19 补载——如实描述已发布状态）**：messages 的 2 条 expand 路由（§10）在 `?v=4` 下**可达且行为与 v3 逐字节相同**（selector 放行 + 行为继承 v3，无 v4 分叉）；`capabilities["4"]` 为静态键面，**不含 `expand` 键**——expand 能力广告仅存在于 `capabilities["3"].expand`（12 类目表 + `fragmentMaxBytes`）。客户端探测 expand 可用性应读 `capabilities["3"].expand`，不因使用 `?v=4` 而改读他键。
-- **修订扩展键（2026-08-19 修订冻结目标）**：`capabilities["4"]` 随实现批次**加性扩展**两键——`readiness`（§3.3 九 feature 就绪度门）与 `expand`（§14：categories + fragmentMaxBytes，随 `messages.expand.v4` 进入 `satisfied` 加入）。扩键前本节静态四键即 `capabilities["4"]` 全部形状；`expand` 键出现前 expand 能力探测仍读 `capabilities["3"].expand`（上文注记）。
+- **修订扩展键（2026-08-19 修订冻结目标）**：`capabilities["4"]` 随实现批次**加性扩展**两键——`readiness`（§3.3 feature 就绪度门；修订二后全集 U = **十** ID）与 `expand`（§14：categories + fragmentMaxBytes，随 `messages.expand.v4` 进入 `satisfied` 加入）。扩键前本节静态四键即 `capabilities["4"]` 全部形状；`expand` 键出现前 expand 能力探测仍读 `capabilities["3"].expand`（上文注记）。
 
 ### §3.2 `GET /slimapi/health` 双视图
 
@@ -69,19 +69,19 @@
 
 ### §3.3 `capabilities["4"]` 扩展：readiness 就绪度门（2026-08-19 修订冻结）
 
-> **当前状态**：现行 `capabilities["4"]` 为静态 dict（§3.1 四键：`globalSessions`/`auxiliaryFilters`/`sseReplay`/`qpImmediateFull`），**无 `readiness`/`expand` 键**。本节为冻结目标，随首个实现批次扩展——键出现前本节语义不可达，客户端不得预依赖。九 ID 中 `selector.v4` / `session.list.global.v4` / `events.global.replay.v4` / `events.token.replay.v4` 四项在 `readiness` 键首次广告时即入 `satisfied`（4.0.0 已具备对应行为）；其余五项（`session.single.projection.v4` / `messages.expand.v4` / `providers.redacted.v4` / `representation.vary.v4` / `method.boundary.v4`）待对应 feature 进入 `satisfied`（实现批次）。
+> **当前状态**：4.2.0 已实施本节（`readiness` 键已广告，九项全 `satisfied`、`ready:true`）。**修订二（owner 裁决 2026-08-19，冻结待实施）**：U **加性扩展 9→10**——新增第 10 项 `session.post-actions.v4`（§16 修订二：POST 等效动作族）。实施批次落地前，现行服务端仍按 4.2.0 九项全集发出（按其发布时契约合法，不追溯判矛盾）；落地时 `required` 扩为十项全集、`session.post-actions.v4 ∉ satisfied` 为过渡态（`ready:false`）、三条 POST 维持 §16 405 过渡拒绝面，随后入 `satisfied` 激活。键形状与规范化规则不变。
 
 `capabilities["4"].readiness` 形状：
 
 ```ts
 type ReadinessGate = {
   ready: boolean        // 派生值，见下文公式
-  required: string[]    // 服务端恒发九 ID 全集
-  satisfied: string[]   // 已就绪子集 ⊆ 九 ID 全集
+  required: string[]    // 服务端恒发十 ID 全集（修订二后）
+  satisfied: string[]   // 已就绪子集 ⊆ 十 ID 全集
 }
 ```
 
-**九 feature ID 全集 U（冻结）**：
+**feature ID 全集 U（冻结；修订二 9→10 加性扩展）**：
 
 1. `selector.v4`
 2. `session.list.global.v4`
@@ -92,14 +92,16 @@ type ReadinessGate = {
 7. `events.token.replay.v4`
 8. `representation.vary.v4`
 9. `method.boundary.v4`
+10. `session.post-actions.v4`（修订二新增，排序位第 10——置于 `method.boundary.v4` 之后，二者构成 §16.3 的组合优先级 + 依赖蕴含对：`session.post-actions.v4 ∈ satisfied ⇒ method.boundary.v4 ∈ satisfied`）
 
-- **门控模型（owner 裁决 2026-08-19：按 feature ID 独立门控，冻结）**：每个 feature ID 的修订语义**当且仅当该 ID ∈ `satisfied` 时生效可见**——某 ID 未 satisfied → 该 ID 对应的修订面语义不可达（该面维持 4.0.0 已发布 v4 行为），**不影响其他 ID**。`ready` 仅为**聚合指示器**（下款公式），**不作为全局可达闸门**——`ready:false` 只表示「九项中至少一项未就绪」，不使已 satisfied 的单项语义失效。客户端按所关心的**具体 feature ID** 查 `satisfied`（如启用 providers 投影 → 查 `providers.redacted.v4 ∈ satisfied`），不依赖 `ready` 整体值。
-- `required ≡ U`：服务端必须以全集发出（§16-§17 的 deferred/non-goals 边界已编码进该全集——无 cascade、无 POST-only update、无 project-status/Turn/semantic-expand ID）。**规范化规则（比较前双方适用）**：`f(A) = 去重 → UTF-8 字节序排序`；服务端必须以规范化形式发出两数组。**未知 ID（∉ U）拒绝**——不静默忽略；服务端不得发出 U 之外的值。数组元素必须均为 `string`（出现 `null`/非字符串元素 → 按载荷矛盾处理）。
+- **门控模型（owner 裁决 2026-08-19：按 feature ID 独立门控，冻结）**：每个 feature ID 的修订语义**当且仅当该 ID ∈ `satisfied` 时生效可见**——某 ID 未 satisfied → 该 ID 对应的修订面语义不可达（该面维持 4.0.0 已发布 v4 行为），**不影响其他 ID**。`ready` 仅为**聚合指示器**（下款公式），**不作为全局可达闸门**——`ready:false` 只表示「十项中至少一项未就绪」，不使已 satisfied 的单项语义失效。客户端按所关心的**具体 feature ID** 查 `satisfied`（如启用 providers 投影 → 查 `providers.redacted.v4 ∈ satisfied`），不依赖 `ready` 整体值。**两条例外性说明（修订二，冻结——均非对独立门控的违反）**：① **`method.boundary.v4` 的语义定义** = 「三条 POST 组合在 `session.post-actions.v4` 未激活时的 fallback 405」——其 satisfied 态的可见行为随 post-actions 激活而让位，这是**声明式组合优先级**（§16.3 四位组合表）而非对独立门控的违反（历史基线注记：4.2.0 时 `session.post-actions.v4` 尚不存在，该 405 即 boundary 的完整语义；门控模型其余条款对两 ID 各自其余语义面照常成立）。② **第 10 项未 satisfied 时三条 POST 的行为 = 4.2.0 coded 405**（`method_not_applicable`），非「4.0.0 已发布行为」——历史基线例外：该三组合在 4.0.0/4.1.0 为框架 404（`thin_route_not_found`），4.2.0 起（`method.boundary.v4 ∈ satisfied`）为 coded 405，post-actions 激活后为等效路由（版本演进表见 §16.0 操作表；本款为独立门控条款「未 satisfied → 维持 4.0.0 已发布行为」的显式例外）。
+- **`session.post-actions.v4` 语义段（修订二，owner 裁决 q2，冻结）**：门控对象 = §16 修订二的三条 POST 等效动作路由（`POST /slimapi/session/{sid}`、`POST /slimapi/session/{sid}/archive`、`POST /slimapi/session/{sid}/delete`，仅 `?v=4`）。**依赖蕴含（冻结）**：`session.post-actions.v4 ∈ satisfied ⇒ method.boundary.v4 ∈ satisfied`（第 10 项依赖第 9 项）——违反该蕴含的发现端点载荷 = discovery contradiction（下款条件⑦）。蕴含动机：`method.boundary.v4` 的语义 = 三条 POST 组合在 post-actions 未激活时的 **fallback 405**（声明式组合优先级，见门控模型条款例外①）；post-actions 激活（∈ satisfied）→ 三条 POST 激活为等效路由（§16.2：POST≡PATCH / POST …/delete≡DELETE / archive 便捷加性），该 fallback 405 对这三条组合不再产生；post-actions 未激活（∉ satisfied）→ 三条 POST = §16.1 coded 405（4.2.0 现行为，门控模型条款例外②）。**为何新 feature ID 而非复用 `method.boundary.v4`（冻结理由）**：该 ID 在 4.2.0 已 satisfied 且语义冻结为「三条 POST → 405」；在同一 feature 下改行为违反 per-feature 门控不变量（satisfied 语义随版本漂移），故以第 10 项加性扩展承载激活期。
+- `required ≡ U`：服务端必须以全集发出（**修订二后 U = 十项**；§16-§17 的 non-goals 边界仍编码进该全集——cascade 编排与 cross-session search 永久缺 ID（§17 修订二）；POST 等效动作族经 `session.post-actions.v4` 进入 U（修订二）；无 project-status/Turn/semantic-expand ID）。**规范化规则（比较前双方适用）**：`f(A) = 去重 → UTF-8 字节序排序`；服务端必须以规范化形式发出两数组。**未知 ID（∉ U）拒绝**——不静默忽略；服务端不得发出 U 之外的值。数组元素必须均为 `string`（出现 `null`/非字符串元素 → 按载荷矛盾处理）。
 - **`ready` 判定公式（冻结；聚合指示器语义）**：`ready ⇔ f(required) ⊆ f(satisfied)`——`ready` 是派生值，服务端按公式计算并冻结输出，**不允许独立翻转**；`ready:true ⇔ f(required) ⊆ f(satisfied)` 双向等价。`ready` 的用途 = 聚合视图（「修订面全部就绪」的单布尔摘要），单项可达性以上款门控模型为准。
 - **与 selector 放行/版本窗的关系（与已发布行为的边界，冻结）**：`4 ∈ available` 与 `capabilities["4"]` 存在自 4.0.0 发布即成立（版本窗事实），**不随 readiness 变化**——readiness 仅门**修订面**（§12-§17 语义，按 feature ID），不门 selector 放行：`?v=4` 的 4.0.0 已发布语义（§2 状态表、§4 全局列表既有行为等）在 readiness 任何状态下持续可用；修订面中已 satisfied 的 feature 语义同样可用，未 satisfied 的单项面维持 4.0.0 已发布 v4 行为。
 - **客户端 opt-in 公式（按 feature，冻结）**：对单个 feature `F ∈ U`：`optIn(F) = localV4RevisionEnabled && (4 in available) && (F ∈ capabilities["4"].readiness.satisfied)`——三条件合取缺一不可：本地显式 feature flag（默认关）+ 服务端版本窗事实 + 该单项就绪。`current`、静态四键、`available`、`ready` 聚合值单独出现均不构成任何单项 opt-in；`current == 4` 仅为信息性（不是 opt-in 条件、不是 readiness 信号）。
 - **`expand` 键双向不变量（冻结）**：`expand` 键存在 **iff** `messages.expand.v4 ∈ satisfied`（§14）。四种组合穷尽：① `expand` 存在且 `messages.expand.v4 ∈ satisfied` = 唯一合法出现态；② `expand` 缺席且 `messages.expand.v4 ∉ satisfied` = 合法（feature 未就绪的过渡态）；③ `expand` 存在而 `messages.expand.v4 ∉ satisfied` = contradiction（未就绪却广告能力）；④ `expand` 缺席而 `messages.expand.v4 ∈ satisfied` = contradiction（就绪却不广告，能力探测断链）。另：`readiness` 键缺席而 `expand` 键存在 = contradiction（expand 能力必须在 readiness 框架内广告，此态下 `satisfied` 不可评估）。`expand` 键存在而形状非法（`categories` ≠ §14 十二项有序清单 / `fragmentMaxBytes` 非 number）→ contradiction（下款）。未知额外 key 仍按「消费方忽略未知字段」（§3.1 载荷约束）处理，不误判。
-- **`discovery contradiction`（单一结局，客户端侧分类——不定义新服务端错误码，发现端点载荷本身仍 200）**。适用于 **`readiness` 或 `expand` 任一键已出现**的载荷（两键均缺席的静态四键现载荷合法）。任一命中 → 一律归为单一结局：① `ready` 与规范化子集判定不一致（任一方向：`ready:false` 而 `required ⊆ satisfied`，或 `ready:true` 而不满足包含）；② `required ≠ U`（规范化后）；③ 任一数组含未知 ID（∉ U）；④ 数组非 `string[]` 或形状不可解析；⑤ `expand` 键与 `messages.expand.v4 ∈ satisfied` 任一方向不一致（含 `readiness` 缺席而 `expand` 存在）；⑥ `expand` 键存在而形状非法。**结局**：客户端不得使用修订面语义（维持 4.0.0 已发布 v4 行为），不得从 `current` 推断 readiness/能力，按运维渠道上报。**边界（不属于 contradiction）**：`satisfied` 含某 feature ID 而对应路由行为未升级，属**实现 bug**（服务端违约，按运维渠道修复），不属本清单载荷矛盾——contradiction 仅指 `/versions` 载荷自身形状/一致性的可判定违约。
+- **`discovery contradiction`（单一结局，客户端侧分类——不定义新服务端错误码，发现端点载荷本身仍 200）**。适用于 **`readiness` 或 `expand` 任一键已出现**的载荷（两键均缺席的静态四键现载荷合法）。任一命中 → 一律归为单一结局：① `ready` 与规范化子集判定不一致（任一方向：`ready:false` 而 `required ⊆ satisfied`，或 `ready:true` 而不满足包含）；② `required ≠ U`（规范化后）；③ 任一数组含未知 ID（∉ U）；④ 数组非 `string[]` 或形状不可解析；⑤ `expand` 键与 `messages.expand.v4 ∈ satisfied` 任一方向不一致（含 `readiness` 缺席而 `expand` 存在）；⑥ `expand` 键存在而形状非法；⑦ `session.post-actions.v4 ∈ satisfied` 而 `method.boundary.v4 ∉ satisfied`（违反修订二依赖蕴含，语义段冻结款）。**结局**：客户端不得使用修订面语义（维持 4.0.0 已发布 v4 行为），不得从 `current` 推断 readiness/能力，按运维渠道上报。**边界（不属于 contradiction）**：`satisfied` 含某 feature ID 而对应路由行为未升级，属**实现 bug**（服务端违约，按运维渠道修复），不属本清单载荷矛盾——contradiction 仅指 `/versions` 载荷自身形状/一致性的可判定违约。**修订二过渡注记（required 9→10）**：实施批次将 `required` 扩为十项后，仅识别旧九项全集的客户端会把第 10 项 `session.post-actions.v4` 按「未知 ID（③）」判 contradiction——v4 视图现无消费方（ocdroid/WebUI 均在 `?v=3`），无实际影响；客户端应随实施批次同步十项全集。反之，扩项前的 4.2.0 服务端载荷（required = 九项）按其发布时契约合法，不按本修订追溯判矛盾。
 
 ## §4 `GET /slimapi/sessions`（v4 全局会话目录）[冻结]
 
@@ -208,6 +210,7 @@ v3 §5 全部消费/容忍/错误语义逐字沿用。
 | `/slimapi/sessions/status`、`/sessions/{sid}/todo|children|diff|stream`、messages×5、agent、command、读组×10、写组×5 | **v3 消费语义原样**（query 单值消费剥离；header 退役 400；多值 400） |
 
 - **allowlist 作用域全覆盖**（v2.2 行 186，B4-4 落地）：非空时全局 sessions 列表（DB SQL 谓词）、directories 列表、digest/q/p 帧、事件流均过滤非白名单目录；`/slimapi/file/**` fail-closed（空 → 403 `directory_not_allowed`）。allowlist 三态（未配置/显式空/非空）语义见 B4-4（P1 3.3.0 起）。
+- **修订二加注（`session.post-actions.v4 ∈ satisfied` 时生效，§16）**：三条 POST 等效动作路由的 directory 消费 ≡ 各自等效目标路由——`POST /slimapi/session/{sid}` 与 PATCH 同路径（消费集既有行，query 单值消费剥离 → header；多值/header-only 违约梯子 §5.1 适用）；`POST …/archive`、`POST …/delete` 的等效上游目标为消费集路径 `/session/{sid}`（上游写端点声明 WorkspaceRoutingQuery），同样按「query 单值消费剥离 → header、§5.1 违约梯子」消费，v4 无 retirement 差异（非全局列表路由）。门控未激活（过渡态）期间此三组合在 selector 层 405 先行（§8.3 插列），不触达消费判定。
 
 ## §6 ETag / Vary / 304 [冻结]
 
@@ -299,7 +302,7 @@ allowlist 403 族（`directory_not_allowed`，B4-4）与版本/directory 400 族
 
 | code | 码 | 场景 |
 |---|---|---|
-| `method_not_applicable` | 405 | §16：三条 deferred method-path 组合误用（**仅修订后 `?v=4` 视图**）；附 `method`/`allow`；`Allow` 头 + 不转发上游 + `Cache-Control: no-store` |
+| `method_not_applicable` | 405 | §16：三条 deferred method-path 组合误用（**仅修订后 `?v=4` 视图**）；附 `method`/`allow`；`Allow` 头 + 不转发上游 + `Cache-Control: no-store`。**修订二适用面收窄**：仅 `session.post-actions.v4 ∉ satisfied` 的过渡期命中这三条组合（4.2.0 现行为）；该 ID 激活后**无命中面**（三条 POST 成为等效路由），错误码**保留定义**（历史过渡态 + 防御性保留，不删除） |
 | `provider_upstream_malformed` | 502 | §12.5：上游 provider 数据形状违约全类目；错误体零上游细节 |
 | `provider_projection_limit` | 413 | §12.4：四项投影限额任一超限；附 `limit`/`limitValue` |
 
@@ -327,7 +330,7 @@ v4 sessions 归入 sessions 桶既有记账；降级路径请求带 degraded 标
 
 ## §10 路由全集逐条（v4 差异列）[冻结]
 
-**51 条** /slimapi 路由（read **26** + write **17** + SSE 2 + 发现/运维 **6**；**计数口径 = 路由 × 方法表行**，与 `scripts/check_routes_doc.py` 的路由↔INTERFACE_MAP 一致性校验同口径——2026-08-19 修订，取代原「45 条（read 23 + write 12 + 发现/运维 8）」旧计数）。**已发布（4.0.0/4.1.0）v4 差异仅下列 4 条**，其余 **47** 条 v4 = v3 语义原样（经 selector 分派）；**2026-08-19 正式修订（冻结目标）追加差异面见本节末修订块与 §12-§17**：
+**51 条** /slimapi 路由（read **26** + write **17** + SSE 2 + 发现/运维 **6**；**计数方法 = 路由 × 方法表行**，与 `scripts/check_routes_doc.py` 的路由↔INTERFACE_MAP 一致性校验同口径——2026-08-19 修订，取代原「45 条（read 23 + write 12 + 发现/运维 8）」旧计数）。**已发布（4.0.0/4.1.0）v4 差异仅下列 4 条**，其余 **47** 条 v4 = v3 语义原样（经 selector 分派）；**2026-08-19 正式修订（冻结目标）追加差异面见本节末修订块与 §12-§17**；**修订二（owner 裁决 2026-08-19，冻结待实施）再追加 write 组三条 POST 等效动作路由（随 `session.post-actions.v4` 实施批次落地）**：
 
 | 路由 | v4 差异 |
 |---|---|
@@ -351,9 +354,12 @@ v4 sessions 归入 sessions 桶既有记账；降级路径请求带 degraded 标
 | messages 投影 expandRefs href + 2 条 expand 路由能力 | §14：href 按 wire 视图生成（`?v=4` 响应 → `?v=4`，`?v=3` → `?v=3`）；`capabilities["4"]` 增 `expand` 键 |
 | `GET /slimapi/versions` | §3.3：`capabilities["4"]` 增 `readiness`（+随批 `expand`）扩展键 |
 | v4 表示层 | §15：v4 sessions 列表增 ETag（identity 强 / gzip 弱 `W/`）；全 v4 路由 `Vary: Accept-Encoding` 修正（现行 `_v4_json_response` 删 Vary 为已知 bug） |
-| 三条 deferred method-path 组合 | §16：`?v=4` 精确 405 `method_not_applicable`（`Allow` 头 + coded body + 不转发 + no-store） |
+| 三条 deferred method-path 组合 | §16：`?v=4` 精确 405 `method_not_applicable`（`Allow` 头 + coded body + 不转发 + no-store）——**修订二后为过渡态行为**（见下行，`session.post-actions.v4` 激活后 405 面让位） |
+| `POST /slimapi/session/{sid}`（新） | §16 修订二：`session.post-actions.v4 ∈ satisfied` 时激活为 **PATCH 等效路由**（同一 PatchPayload 透传、逐字节等效受控写管线）；`?v=3` → 404 `thin_route_not_found` 现状不变 |
+| `POST /slimapi/session/{sid}/archive`（新） | §16 修订二：同门控激活；body 可选（合法 PATCH body 透传 / 缺省 sidecar 合成 `{"time":{"archived":<now epoch-ms>}}` 走 PATCH 等效管线）；`?v=3` → 404 现状不变 |
+| `POST /slimapi/session/{sid}/delete`（新） | §16 修订二：同门控激活；**DELETE 等效路由**（请求实体处理与 DELETE 完全相同并原样转发——读取实体、同 cap 413、Content-Type 透传、body 逐字节转发，无忽略分支，§16.2-b；上游递归删子+吞错语义如实继承，非幂等可接受——owner q1）；`?v=3` → 404 现状不变 |
 
-其余路由维持零 v4 差异；**计数口径（51 条 = 路由 × 方法表行）不变**。
+其余路由维持零 v4 差异；**计数方法（路由 × 方法表行）不变——当前已实现 51 条，修订二实施批次完成后 54 条（write 20）**。
 
 ## §11 测试矩阵（B0 冻结用例面；落地批次标注）
 
@@ -617,39 +623,68 @@ envelope.degraded == (任一 item.degraded == true) ∨ (本响应采用 native 
 - **域隔离（冻结）**：缓存键 / singleflight 键 / ETag REP_VERSION 均含 wire-view 标记——v3 与修订后 v4 validator 互不匹配，跨视图 `If-None-Match` 保守 200；修订切换（无 ETag → 有 ETag）经 REP_VERSION 投影版本轮换，不可能误 304。
 - v4 sessions 以外的 v4 路由：ETag/Vary 语义与 v3 发布态一致（§6「v3 原样」延续）；providers 路由修订后按 §12.6 口径。
 
-## §16 method applicability 与 deferred 边界 [2026-08-19 修订冻结]
+## §16 POST 等效动作族 + method 边界 [2026-08-19 修订冻结；**修订二：POST 等效动作族——冻结待实施**]
 
-> **当前状态**：三条 deferred method-path 组合（`POST /slimapi/session/{sid}`、`POST /slimapi/session/{sid}/archive`、`POST /slimapi/session/{sid}/delete`）现行在**所有版本**返回框架 405/404（无 coded body、无 `Allow` 数组）。本节为冻结目标——当 feature `method.boundary.v4` 进入 `satisfied`（§3.3 门控）时生效，**仅 `?v=4` 视图**；`?v=3` 保持现状（v3 冻结）。
+> **当前状态**：修订一（feature `method.boundary.v4`，v4.2.0 已 `satisfied`）已落地——三条 POST 组合在 `?v=4` 下返回精确 405 `method_not_applicable`（§16.1，现行为）。**修订二**（owner 裁决 2026-08-19，新 feature `session.post-actions.v4`，§3.3 第 10 ID）为本节冻结目标：该 ID 进入 `satisfied` 时三条 POST 激活为等效路由、§16.1 的 405 拒绝面按**声明式组合优先级**让位（§16.2/§16.3 四位组合表；依赖蕴含 `session.post-actions.v4 ⇒ method.boundary.v4` 见 §3.3）。**全部仅 `?v=4` 视图；`?v=3` 冻结零改动**（三组合在 v3 → 404 `thin_route_not_found` 现状，任何阶段不变）。**加性并存，非替代**：PATCH/DELETE 在 v3/v4 均继续可用，v4 继承不退役。
 
-| 操作 | V3 | V4 |
-|---|---|---|
-| 更新 session（title/metadata/permission / `time.archived`，双 shape） | PATCH（发布语义） | **PATCH 继承**（applicability 行显式声明，非路由 fallthrough） |
-| 删除 session | DELETE（发布语义） | **DELETE 继承** |
-| `POST /slimapi/session/{sid}`（POST-only update，deferred） | 不提供 | 不提供 |
-| `POST /slimapi/session/{sid}/archive`（cascade，deferred） | 不提供 | 不提供 |
-| `POST /slimapi/session/{sid}/delete`（cascade，deferred） | 不提供 | 不提供 |
+| 操作 | V3 | V4（`session.post-actions.v4 ∉ satisfied`，v4.2.0 现行为） | V4（`∈ satisfied`，修订二冻结目标） |
+|---|---|---|---|
+| 更新 session（title/metadata/permission / `time.archived`，双 shape） | PATCH（发布语义） | **PATCH 继承**（applicability 行显式声明，非路由 fallthrough） | PATCH 继承（不退役） |
+| 删除 session | DELETE（发布语义） | **DELETE 继承** | DELETE 继承（不退役） |
+| `POST /slimapi/session/{sid}` | 404 `thin_route_not_found`（现状） | 405 `method_not_applicable`（§16.1 过渡态） | **≡ PATCH 等效路由**（§16.2-a） |
+| `POST /slimapi/session/{sid}/archive` | 404（现状） | 405（§16.1 过渡态，空 `Allow`） | **便捷 archive**（可选 body，§16.2-c） |
+| `POST /slimapi/session/{sid}/delete` | 404（现状） | 405（§16.1 过渡态，空 `Allow`） | **≡ DELETE 等效路由**（§16.2-b） |
 
-**method-not-applicable 精确响应（范围收窄：仅当 selector 已成功选择 `?v=4` 且修订已生效，method-path 为上述三条 deferred 组合之一时返回）**——V3 对同 method/path 保持已发布行为（框架 405/404 现状，不引入本新 code）：
+### §16.1 过渡态 405（`method.boundary.v4`；修订二激活前现行为，冻结值不回收）
+
+**method-not-applicable 精确响应（范围收窄：仅当 selector 已成功选择 `?v=4` 且 `method.boundary.v4 ∈ satisfied ∧ session.post-actions.v4 ∉ satisfied`（两位合取，与 §16.3 四位组合表第二行同口径——boundary 亦未 satisfied 时为框架 404 历史态，不发本 405），method-path 为上述三条组合之一时返回）**——V3 对同 method/path 保持已发布行为（404 `thin_route_not_found` 现状，不引入本 code）：
 
 - **HTTP 405**；
 - **`Allow` 头**（字面冻结，逗号+空格分隔）：`POST /slimapi/session/{sid}` → `Allow: GET, PATCH, DELETE`；`POST /slimapi/session/{sid}/archive`、`POST /slimapi/session/{sid}/delete` → **空 `Allow:`**（RFC 9110 §10.2.1：空值 = 资源不支持任何方法）；
 - **coded error body**（v3 envelope 惯例）：`{"code":"method_not_applicable","method":"<METHOD>","allow":["GET","PATCH","DELETE"]}`（`allow` 数组与 `Allow` 头一致；archive/delete 为 `[]`）；
-- **不转发上游**（零上游 IO）+ **`Cache-Control: no-store`**；**selector 扩展不得自然转发**——修订后 v4 视图下这三条组合永不透传上游；
+- **不转发上游**（零上游 IO）+ **`Cache-Control: no-store`**；**selector 扩展不得自然转发**——v4 视图下这三条组合在过渡态永不透传上游；
 - **优先级**：§8.3 链在「② selector version 族 400」与「③ selector directory 族 400」之间插列本节 405（判定不依赖 query 参数，故先于 directory 消费；§8.4）；
-- **适用范围精确限定**：本 405 仅限三条 deferred 组合且 selector 已选 v4。其他已收编 path 的未注册方法**继承既有路由行为**（框架 405/404 现状——不发本 code、不发 `allow` 数组）；完全未收编 path → 既有 404 `thin_route_not_found`（v3 §8.2）任何版本不变；
+- **适用范围精确限定**：本 405 仅限三条组合且 selector 已选 v4 且门控未激活。其他已收编 path 的未注册方法**继承既有路由行为**（框架 405/404 现状——不发本 code、不发 `allow` 数组）；完全未收编 path → 既有 404 `thin_route_not_found`（v3 §8.2）任何版本不变；
 - V3/V4 的 PATCH/DELETE controlled-write 语义（JSON body 透传、上游 4xx 逐字、5xx/网络 → 受控 503、no-store）两视图**逐字不变**。
 
-## §17 修订 non-goals（明确不做项）[2026-08-19 修订冻结]
+### §16.2 POST 等效动作族（`session.post-actions.v4 ∈ satisfied` 时激活；桥式 **100% 等效优先**——sidecar 不新增语义）
 
-> **当前状态注记**：本节所列能力在现行已发布实现（4.0.0/4.1.0）中**均不存在**，2026-08-19 修订后**仍为 non-goals**（不是待实施 feature）。它们不进入 §3.3 readiness 九 ID 集合的原因：本节是**能力边界声明**（sidecar 明确不提供面），非待点亮 feature——边界本身已编码进 `required ≡ U` 全集（缺 ID 即不做）。其中标注 deferred 候选的三项（cascade archive/delete、POST-only update、cross-session search）上游语义不支持；其启用属**契约修订**事项（须另行走正式修订 + readiness 集 ADD），不随任何现有 feature ID 满足而自动出现。
+- **a. `POST /slimapi/session/{sid}` ≡ `PATCH /slimapi/session/{sid}`**：body = 同一 PatchPayload **透传**；响应/错误/求值序/directory 消费/请求 cap ≡ PATCH 在**同 selector 视图**下的现行受控写管线行为（**逐字节等效**；上游 4xx 逐字、5xx/网络 → 受控 503、`no-store`、gzip 协商头随基线管线）。
+- **b. `POST /slimapi/session/{sid}/delete` ≡ `DELETE /slimapi/session/{sid}`**：请求实体处理与 DELETE **完全相同并原样转发**——读取请求实体、同一 `max_message_bytes` cap（超限 → 413 同码同序）、`Content-Type` 透传、body **逐字节转发上游**；无「忽略 body」分支。求值序 = 受控写管线原序。**上游语义如实继承并载明**（owner 裁决 q1）：上游递归删子 + 吞错语义原样——**非幂等可接受**（重复 delete 返回上游行为，如 404）；部分子会话删除失败**不可见**（上游已知语义）；sidecar **不聚合、不重试、不自建编排层**。等效上游调用形态 = 受控写管线对 `DELETE /session/{sid}` 的现行转发。
+- **c. `POST /slimapi/session/{sid}/archive`（便捷加性）**——三项精确冻结：
+  - **缺省判据（octet 层，冻结）**：请求实体长度 = 0 → 缺省（走下述合成）；非空实体（含空 JSON `{}`、仅空白字节）→ **一律不解析、逐字节透传**上游验证（与 PATCH 同为「sidecar 不预解析」）。`Content-Type` 是否存在/取值**不影响判据**（随实体一并透传）。
+  - **合成体（冻结）**：仅当缺省时——`Content-Type: application/json`；JSON 字节 = 恰 `{"time":{"archived":<ms>}}`（无空格紧凑形，`<ms>` 为十进制毫秒整数）；`<ms>` = 合成点（求值序中 body 判空后立即）的 sidecar wall-clock epoch-ms（`time.time()*1000` 取整——与 digest `updatedAt` 同源口径，不读上游）。
+  - **错误映射（与受控写管线零偏差）**：上游 4xx（含拒绝 `null` archived 的取消归档请求）**原样透传**；上游 5xx/网络故障 → 既有受控写管线统一 503。等效管线**不引入新错误码**（无 502 分支）。
+  - 合成或透传后均走 a 款 PATCH 等效管线。
+- **directory 消费**：三条 POST ≡ 各自等效目标路由（§5.2 修订二加注）。
+- **无 SSE / 缓存新语义**：无**新增** SSE 事件类型、无 sidecar **合成**额外事件；等效上游动作自然触发的既有事件（`session.updated`/`session.deleted` 等）按现行管线照常传播。不参与 ETag（受控写管线 `no-store` 继承）。
+
+### §16.3 组合优先级与蕴含依赖（修订二；与 §3.3 门控模型例外①②同口径）
+
+- **依赖蕴含（冻结，同 §3.3 语义段）**：`session.post-actions.v4 ∈ satisfied ⇒ method.boundary.v4 ∈ satisfied`——违反即 discovery contradiction（§3.3 条件⑦），服务端不得发出该载荷。
+- **四位组合行为表（穷尽；行为列 = 三条 POST 组合在 `?v=4` 下的命中面）**：
+
+| `method.boundary.v4` | `session.post-actions.v4` | 三条 POST 组合（`?v=4`）行为 | 状态 |
+|---|---|---|---|
+| ∉ satisfied | ∉ satisfied | 框架 404 `thin_route_not_found`（4.0.0/4.1.0 历史态） | 合法（boundary 修订未落地时） |
+| ∈ satisfied | ∉ satisfied | §16.1 coded 405 `method_not_applicable` | 合法（**4.2.0 现行为/过渡态**） |
+| ∈ satisfied | ∈ satisfied | §16.2 等效路由（fallback 405 对这三条组合不再产生） | 合法（修订二激活态） |
+| ∉ satisfied | ∈ satisfied | ——（不可达） | **contradiction（条件⑦）** |
+
+- **声明式组合优先级（冻结；非对独立门控的违反，§3.3 门控模型例外①）**：`method.boundary.v4` 的语义定义 = 三条 POST 组合在 post-actions 未激活时的 **fallback 405**；post-actions 激活后该 fallback 对这三条组合不再产生（`method_not_applicable` 无命中面——错误码保留定义，§8.4 注记），boundary **其余 method-path 维度**（其他已收编 path 的未注册方法 → 框架 405/404）**继续现行**。历史基线注记：4.2.0 时 post-actions 尚不存在，该 405 即 boundary 的完整语义。
+- **Allow 字面调整**：§16.1 冻结的 `Allow` 字面（含空 `Allow:`）为**过渡窗口行为**（= 四位组合表第二行），激活后随 fallback 405 一并消失——不再有任何路由为这三条组合发 `Allow` 头；sidecar 亦**不新增**其他任何 method-path 组合的 `Allow` 发射面（框架 405/404 现状继承）。
+- **过渡安全**：门控翻转只改变这三条组合的 v4 命中面（405 → 等效路由）；v3 视图与 PATCH/DELETE 主路径在整个翻转前后逐字节不变。
+
+## §17 修订 non-goals（明确不做项）[2026-08-19 修订冻结；**修订二：non-goals 收紧**]
+
+> **当前状态注记**：本节所列能力在现行已发布实现（4.0.0/4.1.0/4.2.0）中**均不存在**，修订后**仍为 non-goals**（不是待实施 feature）。它们不进入 §3.3 readiness ID 集合的原因：本节是**能力边界声明**（sidecar 明确不提供面），非待点亮 feature——边界本身已编码进 `required ≡ U` 全集（缺 ID 即不做）。**修订二（owner 裁决 2026-08-19）收紧**：cascade 编排层与 cross-session search 为**永久 non-goal**（无对应 feature ID、无 deferred 候选资格，再启用须推翻本节正式修订）；原「POST-only update」deferred 候选已被修订二 q2 激活为 §16.2 POST 等效动作族（经 `session.post-actions.v4` 门控），自本节移除。
 
 - **project status / effectiveStatus / subagentList** 聚合字段——骨架不做会话状态推断；
 - **独立 Turn 资源**——turn 语义维持 `/slimapi/sessions/status` 的 `turnIncarnation`/`turn` 合并字段现状；
 - **exact merged**——merged 模式 best-effort 语义不变（v3 §4a.5 冻结延续）；
 - **512B preview / generic fragment**——expand 类目维持 12 项冻结清单（§14），不加预览/通用片段类目；
-- **cascade archive / cascade delete**（上游无对应语义，deferred 候选——§16 method 边界）；
-- **POST-only update**（上游无对应语义，deferred 候选——§16）；
-- **cross-session search**（上游语义不支持，deferred 候选——§4.6 search 为 per-list 字面子串，不做跨会话检索）。
+- **cascade 编排层**（owner 裁决 q1，永久）——sidecar **不自建**级联编排/子删除聚合/重试/部分失败可见性：delete 语义 = `DELETE`（及 §16.2-b 等效 POST）**沿用上游递归删子 + 吞错现状**（非幂等可接受）；archive = 单会话 PATCH 等效（§16.2-c，**不级联**）；
+- **cross-session search**（owner 裁决 q3，永久）——非必要能力；§4.6 search 维持 per-list 字面子串语义，不做跨会话检索。
 
 ---
 
