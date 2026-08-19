@@ -26,16 +26,23 @@ ocdroid 对接时：
 
 ---
 
-## [Unreleased] — v4 wire 正式修订（v4 尚无消费方，无破坏影响；owner 裁决 2026-08-19）
+## [4.2.0] - 2026-08-19 — v4 wire 正式修订落地：readiness 门禁 + 五项修订面实施（包版本 minor；wire 版本**不变**，仍 (3,4)）
 
-**契约先行冻结，实现批次随后；本节随首个实现批次发版时折叠为版本节。** 修订只作用 `?v=4` 视图（`?v=3` 语义冻结零改动；无新 wire major，窗口仍 (3,4)），全部语义以 `docs/specs/v4-contract.md`（4.0.0 实施基线 + 2026-08-19 正式修订冻结）为准：
+> v4 尚无消费方（ocdroid/WebUI 均在 `?v=3`），修订无破坏影响；owner 裁决 2026-08-19。修订只作用 `?v=4` 视图（`?v=3` 语义冻结零改动），全部语义以 `docs/specs/v4-contract.md`（4.0.0 实施基线 + 2026-08-19 正式修订冻结）为准。实施经 rev-cgpt 四轮发版门控评审（6.0→8.0→9.0→**10.0 PASS**，门禁 9.5）。**ocdroid 必改点：无**——v3 视图逐字节不变；v4 修订面按 readiness 逐 feature opt-in。
 
-- **readiness 门禁**：`capabilities["4"]` 扩展 `readiness` 对象（9 个 feature ID，`required ⊆ satisfied → ready`，实现批次逐项点亮）；
-- **providers 安全投影**（§12）：白名单 schema + 嵌套递归丢弃 + 四项数值限额 + 三带错误契约（**502/413/503**）+ ETag/canonical 口径；
-- **session 单查 parity**（§13）：`GET /slimapi/session/{sid}?v=4` 升级为与列表同源 canonical skeleton（dbaux 点查优先 + whole-response native fallback + `partial`/`degraded` 标记公式）；
-- **expand 闭环**（§14）：expandRefs href 按 wire 视图生成（v4 响应 → `?v=4`），`capabilities["4"]` 广告 `expand`；
-- **表示层**（§15）：v4 sessions 列表增 ETag（identity 强 / gzip 弱 `W/`），全 v4 路由 `Vary: Accept-Encoding` 修正；
-- **method 边界**（§16）：三条 deferred method-path 组合在 `?v=4` 下精确 405 `method_not_applicable`（`Allow` 头 + coded body + 不转发 + no-store）。
+### Added（`?v=4` 修订面，按 feature 独立门控）
+
+- **readiness 门禁**（§3.3）：`capabilities["4"]` 加性扩展 `readiness: {ready, required, satisfied}`——九 feature ID 全集、`f(A)`=去重+UTF-8 字节序规范化、`ready ⇔ required ⊆ satisfied` 派生；**门控模型（owner 裁决）：每 feature 语义当且仅当 ∈ satisfied 生效，单项互不影响**；`expand` 键与 `messages.expand.v4 ∈ satisfied` 双向 iff。本版九项**全部 satisfied**（`ready:true`），五项修订面全部生效。
+- **providers 安全投影**（§12，`GET /slimapi/config/providers?v=4`）：白名单 schema（顶层恰 `providers`+`default`、嵌套未知字段递归丢弃、map key==Model.id）、四限额（256/1024/64/8388608）、十二步求值序（网络等待不持 transform permit）、严格 JSON（重复成员名拒绝）、UTF-8 surrogate 防御（→502 非 500）、canonical 字节=wire body=ETag 输入；错误族 502 `provider_upstream_malformed` / 413 `provider_projection_limit` / 503 既有族。`?v=3` 恒透传。
+- **session 单查 parity**（§13，`GET /slimapi/session/{sid}?v=4`）：**唯一 canonical projector**（列表/单查 × DB/native 四路径归一同一函数）；presence 保留（键缺席=来源不可得→null+partial / 显式 null=业务 null 不 partial）；完整 schema 校验（required 不可表示→整响应 503；summary 数值三元组或整体 null、optional 子键在场 null=对象畸形）；envelope `degraded == any(item.degraded) ∨ native fallback`（恒发布尔）；列表 item 补 `partial`/`degraded` 标记。
+- **expand 闭环**（§14）：expandRefs href 按 wire 视图生成——v4 响应 → `?v=4`（v3 冻结 `?v=3` 逐字节不变），贯穿缺省/merged/骨架全投影链；`capabilities["4"].expand` 首次广告（12 类目 + fragmentMaxBytes）。
+- **表示层**（§15，v4 sessions）：200/304 恒 `Vary: Accept-Encoding`（修复 4.0.0 删 Vary bug）；ETag identity 强/gzip 弱 `W/` + `If-None-Match` 304；validator 域含 `wire=v4`（与 v3 互不误 304）；管线不短路（条件请求仍 fresh 计算）；`OC_SLIMAPI_ETAG_ENABLED=false` → 无 ETag/304 但 Vary 仍发。
+- **method 边界**（§16，selector 层裁决）：三条 deferred POST（`/slimapi/session/{sid}`、`…/archive`、`…/delete`）在 `?v=4` → 405 `method_not_applicable`（coded body + 冻结 `Allow` 字面 + no-store + 零上游 IO），优先级链 selector 400 → **405** → directory 400；v3/其他版本维持框架现状。
+- **门控关态**：任一 feature 移出 satisfied → 对应 v4 面逐字节回退 4.0.0 已发布行为（测试锁定双态）；`?v=3` 全程零改动（回归锁定）。
+
+### 观测
+
+- providers v4 投影路径入既有 `providers` 桶（`wireVersion="4"` 维度区分）；v4 sessions ETag 命中经既有 metrics 体系可见。
 
 ---
 
