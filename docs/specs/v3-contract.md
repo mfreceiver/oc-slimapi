@@ -185,6 +185,12 @@ GET /slimapi/versions → 200
    - **容量**：sticky 存储 FIFO 上限 10,000 sid；逐出后的 sid 不再贴回。
 6. **digest `status` 恒字符串（2026-08-19 现状补载 [冻结]）**：上游 `session.status` 的 status 字段可能以**字符串**（`"busy"`）或**对象信封**（`{"type":"busy"}`）两种 wire 形态到达；sidecar 统一归一化，可观察结果：digest 帧 `status` 恒为**字符串**（busy/idle 等上游状态值原样）；信封无效（缺 `type` / `type` 非字符串）时该次状态更新被忽略（digest 其余字段不受影响）。
 7. **SSE 表示层（2026-08-19 现状补载 [冻结]；§7.3 已冻结 content-encoding，本条补 Vary 维度）**：两端点 SSE 流恒 identity——不做 gzip/content-encoding，响应**无 `Vary` 头**（响应头 = `Cache-Control: no-cache, no-transform` + `X-Accel-Buffering: no`；SSE 路径不参与 `Accept-Encoding` 内容协商，§6 Vary 规则不适用于 SSE 流）。
+8. **digest 水位定位与 catch-up 盲区（2026-08-19 现状补载 [冻结]——after 游标等效方案裁决）**：上游 `MessageV2.page()` 仅 `before` 向后 keyset（`message-v2.ts` page 输入 `{sessionID,limit,before}`，`orderBy desc(time_created,id)`；v1.18.18 实证无 after/前向分页），v3 messages 列表亦无 after 游标。增量 catch-up 的等效方案 = **digest 触发 + 条件重拉**，消费侧按以下定位与盲区消费：
+   - **水位仅当触发器**：digest `messageID`/`updatedAt` 是**变更检测信号**，不得当 keyset 过滤器或水位比较基准——`updatedAt` 为 sidecar 收到事件时的 wall-clock epoch-ms（非上游时间戳），进程内 per-sid 单调（时钟回拨被补偿），但**重启即丢、跨进程不可比**。增量真值判定权归重拉响应（ETag/304 与 `contentFingerprint`）。
+   - **盲区一（message.removed 不进 digest）**：上游 `message.removed` 事件被路由进 token stream hub（tombstone/重放队列），**不产生 digest 帧**——纯 digest 驱动的客户端观察不到删除变更。
+   - **盲区二（SSE 断连窗口）**：`resync` 帧仅报 reason 无补偿；断连期间上游变更不补帧（`reconnect_no_replay`），客户端无从得知漏了什么。
+   - **消费约定（双轨，必选）**：① 快路径 = digest 帧到达（或 `changed` 字段）→ 触发 `GET /slimapi/messages/{sid}` 条件重拉（`If-None-Match`，未变 304≈0 body）；② 兜底路径 = **低频周期性全量 `If-None-Match` 304 对账**（唯一能同时覆盖两盲区的机制，周期由客户端定，建议分钟级）；③ sidecar 重启（epoch 变化）或 SSE resync → 视为全失效，无条件重拉一次（ETag 兜底）。周期对账是方案**显式组成部分**而非可选优化。
+   - 历史页就地编辑（revert/edit 非 append）场景 digest 粒度只到 sid：客户端可配 `contentFingerprint` 逐条比对定位变更消息后 `/full/{mid}` 单拉，避免整表对账。
 
 ## §8 错误体与 catch-all 终局 [冻结]
 

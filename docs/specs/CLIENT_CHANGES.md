@@ -246,6 +246,15 @@
 4. **联调项指引**（详见 ocdroid 仓联合计划 `docs/ocmar/plans/2026-07-26-slim-message-reliability-joint-plan.md` §4.3/§4.4/§7）：token idle/resync 触发策略、resync 后 reconcile 三分法（full 重拉/列表重拉/跳过）等消费侧推进规则**不在本仓冻结范围**——本仓只冻结指纹的生成与语义（确定性、终态语义、跨模式约束、降级不重算），推进规则由联合计划冻结。
 5. **降级兼容**：full 抓取失败/预算不足等降级路径下 merged 指纹回落为 skeleton 期指纹（内容仍是列表级投影）；服务端 ops 关闭指纹（`OC_SLIMAPI_MESSAGE_FINGERPRINT_ENABLED=false`）时字段整体消失——客户端对「无该字段」必须已有兼容（加性字段缺省处理）。
 
+## 消息增量 catch-up 双轨消费（digest 触发 + 周期 304 对账 — 2026-08-19，after 游标等效方案裁决）
+
+上游 opencode `MessageV2.page()` 仅支持 `before` 向后 keyset 分页（无 after/前向游标，v1.18.18 实证）；sidecar 两视图（v3/v4）messages 列表同样无 after。增量获取新消息变更的等效方案已裁决冻结（wire 语义见 `docs/specs/v3-contract.md` §7.8 / `v4-contract.md` §7.5），客户端按**双轨**消费：
+
+1. **快路径（digest 触发精拉）**：`session.digest` 帧到达（`messageID`/`updatedAt`/`changed` 任一）→ 对该 sid 发 `GET /slimapi/messages/{sid}` 携带 `If-None-Match`（上次列表 ETag）→ 未变 304≈0 body，已变拿新列表。**digest 水位仅当触发器**：`updatedAt` 是 sidecar wall-clock（非上游时间戳、重启即丢、跨进程不可比），禁止当 keyset 过滤器或比较基准；增量真值由 304/200 与 `contentFingerprint` 裁决。
+2. **兜底路径（周期对账，必选）**：低频周期性对活跃 sid 全量 `If-None-Match` 304 对账（周期客户端自定，建议分钟级）。这是**方案显式组成部分而非可选优化**——它覆盖 digest 的两个已知盲区：① `message.removed`（消息删除）不进 digest 帧（被路由进 token stream）；② SSE 断连窗口（`resync` 无补偿，断连期间变更全丢）。
+3. **失效重置**：sidecar 重启（v4 meta `epoch` 变化）或收到 `resync` → 本地水位全失效，无条件重拉一次（ETag 兜底未变则 304）。
+4. **历史页就地编辑**（revert/edit 非 append）：digest 粒度只到 sid，尾部重拉会漏历史页变更——已翻页深度 >1 时建议 `contentFingerprint` 逐条比对定位变更消息后 `/full/{mid}` 单拉（同模式内比较，见上节）。
+
 ## T17 thin 路由：todo / children（加性 — 2026-08-16，traffic Batch 3）
 
 两条新 GET 薄路由，承接此前走 catch-all 透传的等价上游调用（配合「直连退役」的上游去载）：
