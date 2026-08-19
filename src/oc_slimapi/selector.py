@@ -27,7 +27,12 @@ which wire pipeline a request runs:
   directory consumption; the (closed) proxy answers them (§8.2).
 
 Directory rules (§5/§8.3 ③) for admitted requests on the consuming set —
-evaluated in the frozen priority order:
+evaluated in the frozen priority order. One slot AHEAD of them (§16,
+2026-08-19 revision): an admitted ``?v=4`` request whose (method, path) is
+one of the three deferred POST combos answers the coded 405
+``method_not_applicable`` BEFORE directory consumption (the §8.3 chain:
+① versions 405 → ② version 400s → method 405 → ③ directory 400s — the
+method judgement reads no query parameter):
 
 **v3** (§5.1 — unchanged terminal semantics):
 
@@ -77,6 +82,7 @@ from urllib.parse import parse_qsl, unquote_plus
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from . import readiness as readiness_mod
 from .directory import normalize_directory, validate_directory
 from .errors import CodedHTTPException
 from .gzip_util import json_response
@@ -204,6 +210,54 @@ _DIRECTORY_RETIRED_IN_V4_BODY: dict[str, Any] = {
         "still accept ?directory=."
     ),
 }
+
+# §16 method applicability / deferred boundary (2026-08-19 formal revision).
+# Three deferred POST combos answer a coded 405 ``method_not_applicable`` on
+# the ?v=4 face ONLY. Enforced HERE — after the selector's version-family
+# admission (②) and BEFORE directory consumption (③) — because §8.3
+# (v4-contract.md:306 + §16 "优先级") slots this 405 between the two: the
+# judgement depends on (method, path) alone, never on a query parameter, so
+# a degenerate directory input must NOT win the race (the §8.3 frozen chain:
+# ① versions 405 → ② version 400s → method 405 → ③ directory 400s).
+#
+# Frozen literals (§16): the Allow header text mirrors the allow array;
+# archive/delete carry an EMPTY Allow: (RFC 9110 §10.2.1 — no method is
+# applicable on the un-annexed sub-action paths). Gate (§3.3): the face is
+# live iff ``method.boundary.v4 ∈ readiness.SATISFIED`` — read dynamically
+# at request time (mirrors the routes' helper convention), so a readiness
+# flip reassigns behavior with zero edits in this module. Gate closed, or
+# any non-v4 wire → the request keeps the 4.0.0 published answer (the
+# directory ladder, then the route pipeline → catch-all 404
+# ``thin_route_not_found``).
+_V4_METHOD_BOUNDARY_FEATURE = "method.boundary.v4"
+
+_METHOD_BOUNDARY_POST_PATTERNS: tuple[tuple[re.Pattern[str], tuple[str, ...]], ...] = (
+    # POST /slimapi/session/{sid} — deferred POST-only update; the collected
+    # methods on that path are the Allow hint.
+    (re.compile(r"^/slimapi/session/[^/]+$"), ("GET", "PATCH", "DELETE")),
+    # Deferred cascade sub-actions — un-annexed paths, nothing is applicable.
+    (re.compile(r"^/slimapi/session/[^/]+/archive$"), ()),
+    (re.compile(r"^/slimapi/session/[^/]+/delete$"), ()),
+)
+
+
+def _v4_method_boundary_revision_active() -> bool:
+    """§3.3 gate: ``method.boundary.v4 ∈ SATISFIED`` (dynamic read)."""
+    return _V4_METHOD_BOUNDARY_FEATURE in readiness_mod.SATISFIED
+
+
+def _method_boundary_allow(
+    normalized_path: str, method: str
+) -> tuple[str, ...] | None:
+    """Frozen ``allow`` tuple when (method, path) is one of the three §16
+    deferred POST combos, else ``None`` (every other combo — including
+    GET/PATCH/DELETE on the same paths — inherits the published behavior)."""
+    if method != "POST":
+        return None
+    for pattern, allow in _METHOD_BOUNDARY_POST_PATTERNS:
+        if pattern.match(normalized_path) is not None:
+            return allow
+    return None
 
 
 def _normalize_path(path: str) -> str:
@@ -503,6 +557,34 @@ class SlimapiSelectorMiddleware:
         # consumption (§5.1/§5.2/§8.3 ③).
         wire = values[0]
         _stash(scope, SELECTOR_V3 if wire == "3" else SELECTOR_V4, wire)
+
+        # §8.3/§16: the method 405 slots between ② (the version-family 400s
+        # above) and ③ (directory consumption below). v4 face + §3.3 gate
+        # open + one of the three deferred POST combos → coded 405 with the
+        # frozen body/Allow literals; zero upstream IO (the combo is
+        # deferred, never forwarded). The admitted stash above stays — the
+        # selector itself succeeded and §9.1 records the truthful
+        # selectorResult=v4; the 405 is a method-level boundary, not a
+        # selector rejection.
+        if wire == "4" and _v4_method_boundary_revision_active():
+            method = (scope.get("method", "") or "").upper()
+            allow = _method_boundary_allow(normalized, method)
+            if allow is not None:
+                await json_response(
+                    {
+                        "code": "method_not_applicable",
+                        "method": method,
+                        "allow": list(allow),
+                    },
+                    status_code=405,
+                    headers={
+                        "Allow": ", ".join(allow),
+                        "Cache-Control": "no-store",
+                    },
+                    accept_encoding=_header(scope, "accept-encoding"),
+                )(scope, receive, send)
+                return
+
         error = self._consume_directory(scope, normalized, int(wire))
         if error is not None:
             _stash(scope, SELECTOR_REJECTED, None)

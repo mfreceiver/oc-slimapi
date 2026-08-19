@@ -241,6 +241,17 @@ async def delete_session(request: Request, session_id: str) -> Response:
         request, method="DELETE", upstream_path=f"/session/{session_id}")
 
 
+# --- §16 method applicability / deferred boundary (v4 formal revision,
+# 2026-08-19): the coded 405 for the three deferred POST combos
+# (POST /session/{sid}, POST …/archive, POST …/delete) is enforced at the
+# SELECTOR layer (selector.py, between the version-family 400s and the
+# directory ladder — §8.3 frozen chain / §16 优先级), so it can outrank the
+# directory 400s on the consuming /session/{sid} path. No route stub lives
+# here any more: on every view the selector does NOT intercept (v3, gate
+# closed, non-POST), these paths fall through to the catch-all exactly as
+# they did in 4.0.0.
+
+
 @router.post("/session/{session_id}/prompt_async")
 async def prompt_async(request: Request, session_id: str) -> Response:
     """#4 promptAsync — POST (PromptPayload passthrough, 202/204 class)."""

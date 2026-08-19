@@ -25,9 +25,15 @@ from ..directory import validate_directory
 from ..envelope import sessions_envelope_payload, sessions_envelope_v4
 from ..errors import CodedHTTPException
 from .. import etag as etag_mod
+from .. import readiness as readiness_mod
 from ..gzip_util import accepts_gzip, json_response
 from ..selector import resolve_route_directory, wire_view_from_scope
-from ..skeleton import project_rows_to_v4_skeletons, skeleton_session
+from ..skeleton import (
+    canonical_session_skeleton_v4,
+    native_session_to_record,
+    project_rows_to_v4_skeletons,
+    skeleton_session,
+)
 from ..traffic import stash_up_in
 from ..transform import TransformBusy, read_with_cap
 from ..upstream import forward_directory_headers
@@ -443,7 +449,20 @@ async def _sessions_v4(
             # 细节（§4.2），延迟已由 lifecycle 计入熔断器画像。
             raise _fail_closed_503(request) from None
         else:
-            items = project_rows_to_v4_skeletons(page.records)
+            if _v4_session_single_revision_active():
+                # §13 修订面（§13.1/§13.3）：items 经唯一 canonical
+                # projector 装配（partial/degraded 标记 + required
+                # nullable 恒发）；§13.2c——不可表示项不混入，整响应
+                # fail-closed 503。
+                items = []
+                for record in page.records:
+                    item = canonical_session_skeleton_v4(record)
+                    if item is None:
+                        raise _fail_closed_503(request) from None
+                    items.append(item)
+            else:
+                # 门控关：4.0.0 已发布 item 形态逐字节保留
+                items = project_rows_to_v4_skeletons(page.records)
             # BLOCKER-3：nextCursor 用**原始窗口锚点**（坏行不丢锚点——
             # items 可为空仍可前进；仅在 complete:false 且锚点存在时编码）。
             next_cursor = None
@@ -452,8 +471,18 @@ async def _sessions_v4(
                     page.anchor[0], page.anchor[1], fingerprint,
                 )
             request.state.slimapi_sessions_source = "db"
+            revision_active = _v4_session_single_revision_active()
+            # §13.4 公式：envelope.degraded == any(item.degraded) ∨ fallback
+            # （DB 常态路径无 fallback 位 → 纯 item 聚合：orphan join 失败
+            # 等 partial item 聚合为 true）。门控关：4.0.0 稀疏形态
+            # （degraded 键省略）逐字节保留——items 无标记键，短路不求值。
             return _v4_json_response(
-                sessions_envelope_v4(items, next_cursor, page.complete),
+                sessions_envelope_v4(
+                    items, next_cursor, page.complete,
+                    degraded=(revision_active
+                              and any(item["degraded"] for item in items)),
+                    degraded_required=revision_active,
+                ),
                 request,
             )
     # DB unavailable (or raced) → §4.2 degradation formula
@@ -510,9 +539,16 @@ async def _sessions_v4(
                     payload and not all(isinstance(s, dict) for s in payload)
                 ):
                     raise_upstream_unavailable()
-                items = await pool.offload(
-                    _project_http_sessions_v4, payload,
-                )
+                if _v4_session_single_revision_active():
+                    # §13 修订面：fallback items 同经唯一 canonical
+                    # projector（§13.3——native 归一化后装配，非第二投影）
+                    items = await pool.offload(
+                        _project_http_sessions_v4_canonical, payload,
+                    )
+                else:
+                    items = await pool.offload(
+                        _project_http_sessions_v4, payload,
+                    )
             finally:
                 await response.aclose()
     except TransformBusy:
@@ -523,29 +559,120 @@ async def _sessions_v4(
     # R2 观测接口（rev gate）：降级 200 标记数据面来源。
     request.state.slimapi_sessions_source = "http"
     return _v4_json_response(
-        sessions_envelope_v4(items, None, complete, degraded=True),
+        sessions_envelope_v4(
+            items, None, complete,
+            degraded=True,
+            degraded_required=_v4_session_single_revision_active(),
+        ),
         request,
     )
 
 
-def _v4_json_response(payload: dict, request: Request) -> Response:
-    """v4 sessions 200 响应：无 ETag / Vary / 304（§4.4 冻结）。
+_V4_REPRESENTATION_FEATURE = "representation.vary.v4"
 
-    ``json_response`` 基线会为 gzip 协商统一盖 ``Vary: Accept-Encoding``
-    （v3 §6.2 全仓卫生）；v4 sessions 显式摘除以贴合 §4.4 字面。副作用：
-    gzip 内容协商仍在（body 可能 gzip），无 Vary 声明——见 B4 汇报风险项。
+_V4_SESSION_SINGLE_FEATURE = "session.single.projection.v4"
+
+
+def _v4_session_single_revision_active() -> bool:
+    """§3.3 门控：``session.single.projection.v4 ∈ SATISFIED`` 时 §13
+    修订面生效（单查 canonical + 列表 item/envelope canonical 形状——
+    同 feature 接线，read_groups 单查路由共用同 ID）。
+
+    调用时读模块全局（与 versions.py 同款动态读法）——readiness 翻转
+    无需改本文件即可 wire 级生效；未 satisfied 时 v4 sessions 维持
+    4.0.0 已发布行为（item 无标记 / envelope 稀疏 degraded）。
     """
-    response = json_response(
-        payload, accept_encoding=request.headers.get("accept-encoding"),
+    return _V4_SESSION_SINGLE_FEATURE in readiness_mod.SATISFIED
+
+
+def _v4_representation_revision_active() -> bool:
+    """§3.3 门控：``representation.vary.v4 ∈ SATISFIED`` 时 §15 修订面生效。
+
+    调用时读模块全局（与 versions.py 同款动态读法）——readiness 翻转
+    无需改本文件即可 wire 级生效；未 satisfied 时 v4 sessions 维持
+    4.0.0 已发布行为（§4.4：无 ETag / 无 Vary / INM 不判定）。
+    """
+    return _V4_REPRESENTATION_FEATURE in readiness_mod.SATISFIED
+
+
+def _v4_json_response(payload: dict, request: Request) -> Response:
+    """v4 sessions 200/304 响应尾（§4.4 门控关闭态 / §15 修订冻结态）。
+
+    调用点在 DB 投影与 Class A 降级判定**之后**（两路径共用本尾）——
+    ETag 管线不短路：条件请求照常 fresh 计算，最后才判 304（§15）。
+
+    - 门控关（§3.3，4.0.0 已发布行为逐字保留）：无 ETag，摘 Vary。
+    - 门控开（§15）：``Vary: Accept-Encoding`` 恒在（修摘除 bug）；
+      200/304 均 ``Cache-Control: no-store``；ETag = sha256(
+      REP_VERSION + NUL + coding + NUL + canonical identity bytes)，
+      identity 强 ``"…"`` / gzip 弱 ``W/"…"``（coding 派生）；
+      ``If-None-Match`` 弱比较命中 → 304（头集合 = ETag + Vary +
+      no-store；envelope 自含 nextCursor/complete，无 aux 头）。
+      REP_VERSION 经 ``wire_view=4`` 与 v3 validator 域隔离；降级
+      200（degraded:true）无 §15 例外条款——canonical = 降级 envelope
+      body，同样发 ETag/Vary。
+    - ``OC_SLIMAPI_ETAG_ENABLED=false`` → 无 ETag / 无 304 判定，但
+      Vary（与 no-store）仍发——表示可变性与 ETag 正交（§12.6 口径）。
+    """
+    accept_encoding = request.headers.get("accept-encoding")
+    if not _v4_representation_revision_active():
+        # 4.0.0 已发布行为（§4.4 冻结，门控关闭态）。
+        response = json_response(payload, accept_encoding=accept_encoding)
+        if "Vary" in response.headers:
+            del response.headers["Vary"]
+        return response
+
+    vary = etag_mod.merged_vary("Accept-Encoding")
+    rep = etag_mod.response_rep_version(
+        request.app.state.config, wire_view=4)
+    if rep is None:
+        # etag 关闭：无 validator / 无 304；Vary 恒发。
+        response = json_response(payload, accept_encoding=accept_encoding)
+        response.headers["Vary"] = vary
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    # canonical identity bytes 即 wire body（json_response 内部对同一
+    # payload dict 再跑一次 orjson.dumps——确定性 key 序，两次字节相同；
+    # 与 v3 _finalize_sessions_response 同款代价口径）。
+    identity = orjson.dumps(payload)
+    coding = "gzip" if accepts_gzip(accept_encoding) else "identity"
+    etag_value = etag_mod.compute_etag(identity, coding, rep)
+    not_modified = etag_mod.conditional_304(
+        {"ETag": etag_value, "Vary": vary},
+        request.headers.get("if-none-match"),
     )
-    if "Vary" in response.headers:
-        del response.headers["Vary"]
+    if not_modified is not None:
+        return not_modified
+    response = json_response(payload, accept_encoding=accept_encoding)
+    response.headers["ETag"] = etag_value
+    response.headers["Vary"] = vary
+    response.headers["Cache-Control"] = "no-store"
     return response
 
 
 def _project_http_sessions_v4(payload: list[dict]) -> list[dict]:
     """Worker-thread entry: degraded-path HTTP → SessionSkeletonV4."""
     return [_http_session_to_v4(item) for item in payload]
+
+
+def _project_http_sessions_v4_canonical(payload: list[dict]) -> list[dict]:
+    """Worker-thread entry：§13 修订面 fallback → canonical items。
+
+    native item 先经 ``native_session_to_record`` 归一化（键 presence =
+    三态载体），再喂唯一 canonical projector（§13.3 同一 projector）；
+    任一 item 不可表示（§13.2a）→ 抛 503，整响应 fail-closed（§13.2c
+    禁不可表示项混入 items）。
+    """
+    items: list[dict] = []
+    for source in payload:
+        item = canonical_session_skeleton_v4(
+            native_session_to_record(source), fallback=True,
+        )
+        if item is None:
+            raise _aux_unavailable()
+        items.append(item)
+    return items
 
 
 @router.get("/sessions")

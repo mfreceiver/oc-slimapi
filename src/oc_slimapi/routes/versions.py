@@ -20,6 +20,14 @@ frame advertises, and ``qpImmediateFull`` is frozen as "already true"
 STATIC (never vary with runtime/DB state — replay-log configuration does
 not alter the advertisement, §3.1).
 
+2026-08-19 revision batch: the ``"4"`` face gains two ADDITIVE keys —
+``readiness`` (§3.3 nine-ID readiness gate, always advertised) and
+``expand`` (§14, emitted iff ``messages.expand.v4`` is satisfied; the
+``"3"`` face keeps its own expand block unconditionally). Both are
+assembled by ``_capabilities4`` below; the four STATIC keys stay frozen
+verbatim in front of them, and the ``"3"`` face stays byte-identical
+(v3 freeze, §0.5).
+
 Response constraints (§3, frozen):
 
 * ``current`` ∈ ``available``; ``available`` unique ascending.
@@ -34,9 +42,12 @@ Response constraints (§3, frozen):
 """
 from __future__ import annotations
 
+from typing import Iterable
+
 from fastapi import APIRouter, Request
 
 from .. import __version__
+from .. import readiness as readiness_mod
 from ..config import settings
 from ..gzip_util import json_response
 from ..sse.replay_wire import META_CAPABILITY_KEYS
@@ -86,6 +97,40 @@ CAPABILITIES: dict[str, dict] = {
     },
 }
 
+# §14 feature ID gating the additive ``expand`` key of the "4" face.
+EXPAND_FEATURE_ID = "messages.expand.v4"
+
+
+def _capabilities4(satisfied: Iterable[str] | None = None) -> dict:
+    """Assemble ``capabilities["4"]`` (§3.1 static keys + §3.3 + §14).
+
+    ``readiness`` (§3.3) is always advertised since this revision batch;
+    ``expand`` (§14) is emitted **iff** ``messages.expand.v4`` ∈ the
+    satisfied set — the double-sided invariant, so the two-illegal-state
+    combinations (present+∉ / absent+∈) are structurally unreachable.
+
+    ``satisfied`` defaults to the LIVE module state (dynamic global
+    lookup at request time — a flip batch that reassigns
+    ``readiness.SATISFIED`` propagates here with zero edits to this
+    file); tests pass explicit sets to exercise the iff matrix. Unknown
+    IDs are rejected inside ``readiness.readiness_payload`` before any
+    emission (server never emits values outside U). Still no
+    runtime/DB-derived state: readiness varies with code version only.
+    """
+    if satisfied is None:
+        satisfied = readiness_mod.SATISFIED
+    sat = frozenset(satisfied)
+    caps4: dict = dict(CAPABILITIES["4"])
+    caps4["readiness"] = readiness_mod.readiness_payload(sat)
+    if EXPAND_FEATURE_ID in sat:
+        # Same-source shape as capabilities["3"].expand (§14): the frozen
+        # twelve-category ordered list plus the live fragment cap.
+        caps4["expand"] = {
+            "categories": EXPAND_CATEGORIES,
+            "fragmentMaxBytes": settings.max_expand_response_bytes,
+        }
+    return caps4
+
 
 @router.get("/versions")
 async def versions(request: Request):
@@ -93,7 +138,8 @@ async def versions(request: Request):
     # the frozen §2.2 categories plus ``fragmentMaxBytes`` read live from
     # Settings at request time, so the advertisement always matches the
     # effective per-fragment response cap of the running process.
-    # capabilities["4"] stays static per §3.1 (no runtime-injected keys).
+    # capabilities["4"] = static §3.1 keys + the additive §3.3 readiness
+    # gate (+ §14 expand, iff its feature ID is satisfied).
     capabilities = {
         "3": {
             **CAPABILITIES["3"],
@@ -102,7 +148,7 @@ async def versions(request: Request):
                 "fragmentMaxBytes": settings.max_expand_response_bytes,
             },
         },
-        "4": dict(CAPABILITIES["4"]),
+        "4": _capabilities4(),
     }
     return json_response(
         {

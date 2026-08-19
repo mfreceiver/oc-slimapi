@@ -310,12 +310,15 @@ async def test_health_stays_responsive_during_slow_transform(app_and_client, mon
     original_pack = msgs_mod._project_list_sorted_and_pack
     slow_packs_started = asyncio.Event()
 
-    def slow_pack(body, *, accept_encoding, limits, sid=None):
+    def slow_pack(body, *, accept_encoding, limits, sid=None, wire_view=3):
         # Signal that the worker has picked up the job, then park it.
+        # ``wire_view`` follows the real worker's §14 seam so the route's
+        # v3/v4 href threading passes through the stand-in unchanged.
         slow_packs_started.set()
         time.sleep(0.5)
         return original_pack(
-            body, accept_encoding=accept_encoding, limits=limits, sid=sid)
+            body, accept_encoding=accept_encoding, limits=limits, sid=sid,
+            wire_view=wire_view)
 
     monkeypatch.setattr(msgs_mod, "_project_list_sorted_and_pack", slow_pack)
 

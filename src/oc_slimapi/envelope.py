@@ -49,19 +49,25 @@ def sessions_envelope_v4(
     complete: bool,
     *,
     degraded: bool = False,
+    degraded_required: bool = False,
 ) -> dict[str, object]:
-    """v4 sessions envelope (v4-contract §4.1): key order frozen
-    ``(items, nextCursor, complete[, degraded])``.
+    """v4 sessions envelope (v4-contract §4.1 + §13.1 修订面)。
 
-    ``degraded`` is ONLY present (and true) on the DB-unavailable Class A
-    fallback (§4.2) — never a key on the DB-path 200. No ETag/Vary/304 on
-    any v4 sessions response (§4.4).
+    Key order frozen ``(items, nextCursor, complete[, degraded])``。
+    两种发布形态由 ``degraded_required`` 切换（§3.3 门控
+    ``session.single.projection.v4``）：
+
+    * ``degraded_required=False``（4.0.0 已发布形态）：``degraded`` 仅在
+      DB-unavailable Class A fallback（§4.2）时出现且恒 true——DB-path
+      200 无此键。
+    * ``degraded_required=True``（§13.1 修订面）：``degraded`` 为 required
+      布尔恒发（含 false；§4.1 可选形态随修订废止）。
     """
     payload: dict[str, object] = {
         "items": items,
         "nextCursor": next_cursor,
         "complete": complete,
     }
-    if degraded:
-        payload["degraded"] = True
+    if degraded or degraded_required:
+        payload["degraded"] = bool(degraded)
     return payload

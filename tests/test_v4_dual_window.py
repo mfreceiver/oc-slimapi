@@ -511,12 +511,19 @@ async def test_versions_v4_capabilities_four_static_keys():
         # B3b-5: same-batch advertising (n1 frozen timing) — sseReplay and
         # qpImmediateFull landed WITH the B3b implementation; B3a's absence
         # assertions are superseded by the four-key face.
-        assert caps["4"] == {
-            "globalSessions": True,
-            "auxiliaryFilters": True,
-            "sseReplay": True,
-            "qpImmediateFull": True,
-        }
+        # 2026-08-19 revision §3.3: the face gains the ADDITIVE readiness
+        # key after the four static keys, plus the §14 expand block since
+        # the 4.2.0 close-out (SATISFIED = full universe); the four static
+        # values stay locked here, the readiness/expand payloads in
+        # test_versions_readiness.py.
+        assert caps["4"]["globalSessions"] is True
+        assert caps["4"]["auxiliaryFilters"] is True
+        assert caps["4"]["sseReplay"] is True
+        assert caps["4"]["qpImmediateFull"] is True
+        assert list(caps["4"].keys()) == [
+            "globalSessions", "auxiliaryFilters",
+            "sseReplay", "qpImmediateFull", "readiness", "expand",
+        ]
 
 
 async def test_versions_v3_capabilities_shape_unchanged():

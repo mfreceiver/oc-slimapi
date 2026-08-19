@@ -35,12 +35,33 @@ from ..upstream_errors import (
 )
 from ._catalog_common import read_upstream_response
 from ..directory import validate_directory
+from .. import readiness as readiness_mod
 
 router = APIRouter(prefix="/slimapi/messages/{sid}", tags=["messages"])
 
 # Fixed Retry-After for transform admission timeouts. Kept as a module constant
 # so tests and the route agree on the wire contract.
 TRANSFORM_RETRY_AFTER_SECONDS = 2
+
+
+# --- §3.3 per-feature gate (2026-08-19 integration close-out) ----------------
+#
+# ``messages.expand.v4 ∈ SATISFIED`` 时 §14 修订面生效：``?v=4`` 请求的
+# expandRefs href 用 ``?v=4``。门控关闭态：wire view 折回 3——v4 响应的
+# href 维持 ``?v=3``（4.0.0 已发布行为）。动态读法镜像
+# sessions.py::_v4_representation_revision_active（调用时读模块全局，
+# readiness 翻转/测试 monkeypatch 无需改本文件）。
+
+_V4_EXPAND_FEATURE = "messages.expand.v4"
+
+
+def _expand_wire_view(scope) -> int:
+    """§14 href view selector under the §3.3 gate: 4 iff selector view is
+    4 AND the feature is satisfied; else 3 (the 4.0.0-published href face)."""
+    if (wire_view_from_scope(scope) == 4
+            and _V4_EXPAND_FEATURE in readiness_mod.SATISFIED):
+        return 4
+    return 3
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +94,7 @@ def _created_sort_key(msg: dict) -> int:
 
 def _parse_sort_project(
     body: bytes, *, limits: SkeletonLimits, sid: str | None = None,
+    wire_view: int = 3,
 ) -> list[dict]:
     """Worker entry: parse + sort by ``info.time.created`` ASC + skeleton
     project (no serialization).
@@ -84,6 +106,11 @@ def _parse_sort_project(
     ``sid`` is threaded through to ``skeleton_messages`` so the projection
     emits ``expandRefs`` (design-expand §5.2) — without it, lane A's refs
     never reach the wire and the merged ref candidate set is empty.
+
+    v4 §14: ``wire_view`` is read from the selector stash by the ROUTE
+    (``wire_view_from_scope``) and threaded here so every expandRefs href
+    carries the request's view (``?v=3`` frozen / ``?v=4``). Default 3 —
+    selector-less stacks keep the historical v3 bytes.
 
     Batch 4 / B3: the fingerprint switch rides on ``limits.fingerprint``
     (built by the route from config) so this worker's signature is
@@ -101,12 +128,14 @@ def _parse_sort_project(
         # route maps to 503.
         raise ValueError("upstream message body is not a list of message dicts")
     parsed.sort(key=_created_sort_key)
-    return skeleton_messages(parsed, limits=limits, sid=sid)
+    return skeleton_messages(
+        parsed, limits=limits, sid=sid, wire_view=wire_view,
+    )
 
 
 def _project_list_sorted_and_pack(
     body: bytes, *, accept_encoding: str | None, limits: SkeletonLimits,
-    sid: str | None = None,
+    sid: str | None = None, wire_view: int = 3,
 ) -> bytes:
     """Worker entry: parse + sort + project + serialize to identity bytes.
 
@@ -126,8 +155,13 @@ def _project_list_sorted_and_pack(
     hash only — zero compression, plan §4) and only then compresses.
     ``accept_encoding`` is retained in the signature for call-site symmetry
     (and existing slow-pack monkeypatches); the route owns coding choice.
+
+    v4 §14: ``wire_view`` is threaded to the projection so expandRefs hrefs
+    carry the request's selector view (default 3 — historical bytes).
     """
-    projected = _parse_sort_project(body, limits=limits, sid=sid)
+    projected = _parse_sort_project(
+        body, limits=limits, sid=sid, wire_view=wire_view,
+    )
     return orjson.dumps(projected)
 
 
@@ -813,6 +847,11 @@ async def _messages_via_lease(
             message_bytes=config.skeleton_inline_output_max_message_bytes,
             fingerprint=config.message_fingerprint_enabled,
         )
+        # v4 §14: the request's selector view picks the expandRefs href
+        # ``?v=`` value (read on the event loop — the worker threads have
+        # no scope access). Selector-less stacks default to 3. §3.3 gate:
+        # unsatisfied → fold to 3 (4.0.0 published href face).
+        wire_view = _expand_wire_view(request.scope)
         projected: list[dict] | None = None
         identity: bytes | None = None
         try:
@@ -825,13 +864,14 @@ async def _messages_via_lease(
                     if merged_mode:
                         projected = await pool.offload(
                             _parse_sort_project, body, limits=limits,
-                            sid=sid,
+                            sid=sid, wire_view=wire_view,
                         )
                     else:
                         identity = await pool.offload(
                             _project_list_sorted_and_pack, body,
                             accept_encoding=accept_encoding,
                             limits=limits, sid=sid,
+                            wire_view=wire_view,
                         )
                 except (orjson.JSONDecodeError, ValueError, TypeError, AttributeError) as exc:
                     raise_upstream_unavailable(exc)
@@ -1003,6 +1043,11 @@ async def messages(
                 # the fan-out + splice + pack run AFTER this admission is
                 # released (see _merge_fulls; oracle §C-2: the fan-out must
                 # not hold the slot across per-full network GETs).
+                #
+                # v4 §14: selector view read on the loop, threaded to the
+                # projection for view-correct expandRefs hrefs. §3.3 gate:
+                # unsatisfied → fold to 3 (4.0.0 published href face).
+                wire_view = _expand_wire_view(request.scope)
                 try:
                     if merged_mode:
                         projected = await pool.offload(
@@ -1012,7 +1057,7 @@ async def messages(
                                 message_bytes=config.skeleton_inline_output_max_message_bytes,
                                 fingerprint=config.message_fingerprint_enabled,
                             ),
-                            sid=sid,
+                            sid=sid, wire_view=wire_view,
                         )
                     else:
                         identity = await pool.offload(
@@ -1023,7 +1068,7 @@ async def messages(
                                 message_bytes=config.skeleton_inline_output_max_message_bytes,
                                 fingerprint=config.message_fingerprint_enabled,
                             ),
-                            sid=sid,
+                            sid=sid, wire_view=wire_view,
                         )
                 except (orjson.JSONDecodeError, ValueError, TypeError, AttributeError) as exc:
                     raise_upstream_unavailable(exc)

@@ -24,6 +24,7 @@ import orjson
 import pytest
 from fastapi import FastAPI
 
+from oc_slimapi import readiness
 from oc_slimapi.config import Settings
 from oc_slimapi.dbaux import AuxiliaryUnavailableError, DbAuxiliarySource
 from oc_slimapi.dbaux.cursor import allowlist_rev, encode_cursor
@@ -41,6 +42,24 @@ IDENTITY = {"Accept-Encoding": "identity"}
 V3 = {"v": "3"}
 V4 = {"v": "4"}
 AL_NONEMPTY = ("/foo",)
+
+
+@pytest.fixture(autouse=True)
+def _session_single_revision_gate_off(monkeypatch):
+    """§13 修订面（``session.single.projection.v4``）关闭态回归钉。
+
+    本文件锁定 v4 sessions **4.0.0 已发布形态**（§4.2 降级矩阵 ×
+    envelope 稀疏 degraded × item 无 partial/degraded 标记）——§13
+    canonical 形状（envelope degraded 恒布尔 + item 标记 + 唯一
+    canonical projector）由 tests/test_session_single_v4.py 双态覆盖
+    （fix-9 集成门控模式：同断言集在门控两态下各自成立）。
+    """
+    monkeypatch.setattr(
+        readiness, "SATISFIED",
+        readiness.SATISFIED - {"session.single.projection.v4"},
+    )
+
+
 HTTP_SESSIONS_BODY = orjson.dumps([
     {"id": "h1", "title": "up one", "directory": "/any",
      "time": {"created": 1, "updated": 2},
@@ -466,7 +485,17 @@ async def test_v4_limit_501_422_and_500_ok(tmp_path):
         await aux.stop()
 
 
-async def test_v4_no_etag_vary_304(tmp_path):
+async def test_v4_gate_off_no_etag_vary_304(tmp_path, monkeypatch):
+    """门控关态（monkeypatch 排除 representation.vary.v4——4.2.0 集成收口
+    后默认全 satisfied，关态须显式复现）：v4 sessions 维持 4.0.0 已发布
+    行为（§4.4：无 ETag / 无 Vary / INM 不判定）。开态（ETag/Vary/304）
+    由 test_sessions_v4_representation.py 锁定。"""
+    monkeypatch.setattr(readiness, "SATISFIED", frozenset({
+        "selector.v4",
+        "session.list.global.v4",
+        "events.global.replay.v4",
+        "events.token.replay.v4",
+    }))
     aux = await _real_aux(tmp_path)
     app, _ = _build_app(aux)
     try:
@@ -515,7 +544,17 @@ async def test_v3_roots_start_still_work():
     assert seen[0].url.params.get("start") == "0"
 
 
-async def test_v3_etag_present_vs_v4_absent(tmp_path):
+async def test_v3_etag_present_vs_v4_gate_off_absent(tmp_path, monkeypatch):
+    """v3 对照意图保留：v3 恒发 ETag/Vary；v4 的「无 ETag」如今是 §3.3
+    门控关态（monkeypatch 排除 representation.vary.v4）而非默认面——
+    默认（4.2.0 集成收口）v4 同样发 ETag/Vary，见
+    test_sessions_v4_representation.py。"""
+    monkeypatch.setattr(readiness, "SATISFIED", frozenset({
+        "selector.v4",
+        "session.list.global.v4",
+        "events.global.replay.v4",
+        "events.token.replay.v4",
+    }))
     aux = await _real_aux(tmp_path)
     app, _ = _build_app(aux)
     try:

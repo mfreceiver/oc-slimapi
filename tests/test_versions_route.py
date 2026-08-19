@@ -45,16 +45,24 @@ async def test_versions_capabilities_map():
         body = (await client.get("/slimapi/versions")).json()
         caps = body["capabilities"]
         assert set(caps.keys()) == {"3", "4"}
-        # B3b-5: capabilities["4"] carries the four STATIC keys — B3a's
-        # globalSessions/auxiliaryFilters plus the same-batch-advertised
-        # sseReplay (n1 frozen timing: B3a shipped "4" without them, so
-        # the absence was the B3a-期 wire face) and qpImmediateFull
-        # (semantics frozen as "already true", design-v4-qp-payload).
-        assert caps["4"] == {
-            "globalSessions": True,
-            "auxiliaryFilters": True,
-            "sseReplay": True,
-            "qpImmediateFull": True,
+        # B3b-5 + 2026-08-19 revision §3.3: capabilities["4"] carries the
+        # four STATIC keys — B3a's globalSessions/auxiliaryFilters plus the
+        # same-batch-advertised sseReplay (n1 frozen timing: B3a shipped "4"
+        # without them, so the absence was the B3a-期 wire face) and
+        # qpImmediateFull (semantics frozen as "already true",
+        # design-v4-qp-payload) — followed by the ADDITIVE readiness gate
+        # (§3.3) and, since the 4.2.0 close-out, the §14 expand block. The
+        # four static keys are locked by value here; the readiness/expand
+        # shapes are locked in test_versions_readiness.py.
+        assert caps["4"]["globalSessions"] is True
+        assert caps["4"]["auxiliaryFilters"] is True
+        assert caps["4"]["sseReplay"] is True
+        assert caps["4"]["qpImmediateFull"] is True
+        # 4.2.0 close-out: readiness + expand both land (SATISFIED is the
+        # full universe); shapes locked in test_versions_readiness.py.
+        assert set(caps["4"].keys()) == {
+            "globalSessions", "auxiliaryFilters",
+            "sseReplay", "qpImmediateFull", "readiness", "expand",
         }
         # v3 caps regression: the "3" face is frozen verbatim.
         assert caps["3"]["envelope"] == ["messages", "sessions"]
@@ -88,25 +96,35 @@ async def test_versions_caps4_meta_lane_same_source():
 
 async def test_versions_caps4_static_key_order():
     """Producer-owned key order follows contract §3.1 verbatim (the four
-    keys in their frozen order — consumers must not rely on it, but the
+    static keys in their frozen order, then the §3.3 readiness gate and
+    the §14 expand block — consumers must not rely on it, but the
     producer shape stays byte-stable for golden comparisons)."""
     async with _client(_build_app()) as client:
         body = (await client.get("/slimapi/versions")).json()
         assert list(body["capabilities"]["4"].keys()) == [
             "globalSessions", "auxiliaryFilters",
-            "sseReplay", "qpImmediateFull",
+            "sseReplay", "qpImmediateFull", "readiness", "expand",
         ]
 
 
 async def test_versions_caps4_static_face_no_runtime_keys():
-    """§3.1 static-key principle: capabilities["4"] never carries
-    runtime-injected keys (the expand block is a "3"-only face) and every
-    advertised value is a literal boolean True — replay-log configuration
-    or DB state must not bleed into the advertisement."""
+    """§3.1 static-key principle: the four §3.1 keys of capabilities["4"]
+    never carry runtime-injected values and every advertised value is a
+    literal boolean True — replay-log configuration or DB state must not
+    bleed into the advertisement. (2026-08-19 revision: the face also
+    carries the module-constant-derived readiness gate and — since the
+    4.2.0 close-out, messages.expand.v4 satisfied — the §14 expand block,
+    same-source as the "3" face's block.)"""
     async with _client(_build_app()) as client:
         caps = (await client.get("/slimapi/versions")).json()["capabilities"]
-        assert "expand" not in caps["4"]
-        assert all(v is True for v in caps["4"].values())
+        for key in ("globalSessions", "auxiliaryFilters", "sseReplay",
+                    "qpImmediateFull"):
+            assert caps["4"][key] is True
+        assert set(caps["4"]) == {
+            "globalSessions", "auxiliaryFilters",
+            "sseReplay", "qpImmediateFull", "readiness", "expand",
+        }
+        assert caps["4"]["expand"] == caps["3"]["expand"]
 
 
 async def test_versions_sidecar_version_is_package_version():

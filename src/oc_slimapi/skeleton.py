@@ -164,22 +164,33 @@ def _utf8_bytes_exceeds(text: Any, limit: int) -> bool:
     return isinstance(text, str) and len(text.encode("utf-8")) > limit
 
 
-def _expand_ref(category: str, message_id: str, part_id: str | None, sid: str) -> dict[str, Any]:
+def _expand_ref(
+    category: str, message_id: str, part_id: str | None, sid: str,
+    wire_view: int = 3,
+) -> dict[str, Any]:
     """Build one §5 expandRef entry (frozen schema).
 
-    Message-level href: ``/slimapi/messages/{sid}/expand/{category}/{mid}?v=3``
-    Part-level href:    ``/slimapi/messages/{sid}/expand/{category}/{mid}/{partID}?v=3``
+    Message-level href: ``/slimapi/messages/{sid}/expand/{category}/{mid}?v={view}``
+    Part-level href:    ``/slimapi/messages/{sid}/expand/{category}/{mid}/{partID}?v={view}``
     ``directory`` is appended by the client (§5.2).
+
+    v4 §14: ``?v=`` carries the request's wire view — v3 requests keep the
+    frozen v3 bytes (``?v=3``), v4 requests emit ``?v=4``. ``v`` stays the
+    FIRST (and, from the sidecar, ONLY) query key — the client appends
+    ``directory`` second (§14 frozen key order: ``v`` then ``directory``).
     """
     base = f"/slimapi/messages/{sid}/expand/{category}/{message_id}"
-    href = f"{base}/{part_id}?v=3" if part_id is not None else f"{base}?v=3"
+    href = f"{base}/{part_id}?v={wire_view}" if part_id is not None else f"{base}?v={wire_view}"
     ref = {"category": category, "messageID": message_id, "href": href}
     if part_id is not None:
         ref["partID"] = part_id
     return ref
 
 
-def _emit_expand_refs(part: dict[str, Any], refs: list[tuple[str, str]], sid: str | None) -> dict[str, Any]:
+def _emit_expand_refs(
+    part: dict[str, Any], refs: list[tuple[str, str]], sid: str | None,
+    wire_view: int = 3,
+) -> dict[str, Any]:
     """Attach deduped, deterministic ``expandRefs`` to a part (§5.2).
 
     ``refs`` entries are ``(category, partID)`` pairs; each (category, partID)
@@ -187,6 +198,9 @@ def _emit_expand_refs(part: dict[str, Any], refs: list[tuple[str, str]], sid: st
     Without ``sid`` no href can be built → refs are dropped (the reductions
     themselves still apply). Parts without a ``messageID`` — or refs whose
     partID is falsy (missing/empty, M3) — get no part-level refs.
+
+    v4 §14: ``wire_view`` selects the ``?v=`` value in every href (dedup /
+    sort semantics are view-invariant — inherited unchanged from v3 §4a).
     """
     if not sid or not refs:
         return part
@@ -194,7 +208,7 @@ def _emit_expand_refs(part: dict[str, Any], refs: list[tuple[str, str]], sid: st
     if not message_id:
         return part
     part["expandRefs"] = [
-        _expand_ref(category, message_id, part_id, sid)
+        _expand_ref(category, message_id, part_id, sid, wire_view)
         for category, part_id in sorted({(c, p) for c, p in refs if p})
     ]
     return part
@@ -327,7 +341,7 @@ def _maybe_inline_state_field(
         omitted.append(f"state.{key}")
 
 
-def _tool(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS, sid: str | None = None) -> dict[str, Any]:
+def _tool(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS, sid: str | None = None, wire_view: int = 3) -> dict[str, Any]:
     result = _pick(part, TOOL_KEYS)
     omitted: list[str] = []
     refs: list[tuple[str, str]] = []
@@ -399,7 +413,7 @@ def _tool(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits:
     for key in part:
         if key not in TOOL_KEYS and key != "state":
             omitted.append(key)
-    return _emit_expand_refs(_mark(result, omitted), refs, sid)
+    return _emit_expand_refs(_mark(result, omitted), refs, sid, wire_view)
 
 
 def _patch(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS, sid: str | None = None) -> dict[str, Any]:
@@ -464,7 +478,7 @@ def _patch(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits
     return _mark(result, omitted)
 
 
-def _file(part: dict[str, Any], *, sid: str | None = None) -> dict[str, Any]:
+def _file(part: dict[str, Any], *, sid: str | None = None, wire_view: int = 3) -> dict[str, Any]:
     result = _pick(part, PART_IDS | {"filename", "mime"})
     omitted: list[str] = []
     refs: list[tuple[str, str]] = []
@@ -484,10 +498,10 @@ def _file(part: dict[str, Any], *, sid: str | None = None) -> dict[str, Any]:
     for key in part:
         if key not in PART_IDS | {"filename", "mime", "url", "source"}:
             omitted.append(key)
-    return _emit_expand_refs(_mark(result, omitted), refs, sid)
+    return _emit_expand_refs(_mark(result, omitted), refs, sid, wire_view)
 
 
-def skeleton_part(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS, sid: str | None = None) -> dict[str, Any]:
+def skeleton_part(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS, sid: str | None = None, wire_view: int = 3) -> dict[str, Any]:
     # §5: ``expandRefs`` is a sidecar-OWNED key — a foreign value from upstream
     # is dropped before any projection. It must never leak into the output, into
     # ``omitted``/``hasFull``, or survive a whole-part deepcopy (compaction);
@@ -503,7 +517,7 @@ def skeleton_part(part: dict[str, Any], *, budget: dict[str, int] | None = None,
         # synthetic/ignored/time are /full-only — omitted, never refs.
         copied = _pick(part, PART_IDS | {"text"})
         omitted = [key for key in part if key not in PART_IDS | {"text"}]
-        return _emit_expand_refs(_mark(copied, omitted), [], sid)
+        return _emit_expand_refs(_mark(copied, omitted), [], sid, wire_view)
     if part_type == "reasoning":
         # n1: threshold evaluated on the ORIGINAL text BEFORE _pick — an
         # oversized text is never deep-copied.
@@ -517,13 +531,13 @@ def skeleton_part(part: dict[str, Any], *, budget: dict[str, int] | None = None,
             if result.get("id"):
                 refs.append(("part_reasoning", result["id"]))
         # reasoning metadata/time omissions are /full-only (§2.3) — no refs.
-        return _emit_expand_refs(_mark(result, omitted), refs, sid)
+        return _emit_expand_refs(_mark(result, omitted), refs, sid, wire_view)
     if part_type == "tool":
-        return _tool(part, budget=budget, limits=limits, sid=sid)
+        return _tool(part, budget=budget, limits=limits, sid=sid, wire_view=wire_view)
     if part_type == "patch":
         return _patch(part, budget=budget, limits=limits, sid=sid)
     if part_type == "file":
-        return _file(part, sid=sid)
+        return _file(part, sid=sid, wire_view=wire_view)
     if part_type in {"step-start", "step-finish"}:
         result = _mark(_pick(part, PART_IDS), [key for key in part if key not in PART_IDS])
         refs: list[tuple[str, str]] = []
@@ -532,7 +546,7 @@ def skeleton_part(part: dict[str, Any], *, budget: dict[str, int] | None = None,
         # tokens are /full-only (§2.3).
         if part.get("snapshot") not in (None, "") and result.get("id"):
             refs.append(("part_snapshot", result["id"]))
-        return _emit_expand_refs(result, refs, sid)
+        return _emit_expand_refs(result, refs, sid, wire_view)
     if part_type == "compaction":
         copied = deepcopy(part)
         # Compaction is retained unless the single part violates its explicit cap.
@@ -543,7 +557,7 @@ def skeleton_part(part: dict[str, Any], *, budget: dict[str, int] | None = None,
         # Lane-A falsy-id guard: partID only when the part id is truthy;
         # _emit_expand_refs suppresses without a messageID.
         refs = [("compaction_full", part["id"])] if part.get("id") else []
-        return _emit_expand_refs(_mark(_pick(part, PART_IDS), ["*"]), refs, sid)
+        return _emit_expand_refs(_mark(_pick(part, PART_IDS), ["*"]), refs, sid, wire_view)
     return _mark(_pick(part, PART_IDS), [key for key in part if key not in PART_IDS] or ["*"])
 
 
@@ -552,6 +566,7 @@ def skeleton_message(
     limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS,
     fingerprint: bool = False,
     sid: str | None = None,
+    wire_view: int = 3,
 ) -> dict[str, Any]:
     # P1-29: normalise nested fields defensively. A malformed upstream message
     # where ``info`` is null or ``parts`` is a non-list (int/bool/string) would
@@ -580,7 +595,9 @@ def skeleton_message(
         summary["diffs"] = None
         if sid and info_id and isinstance(orig_diffs, list) and orig_diffs:
             result["info"]["expandRefs"] = [
-                _expand_ref("info_summary_diffs", message_id, None, sid)
+                _expand_ref(
+                    "info_summary_diffs", message_id, None, sid, wire_view,
+                )
             ]
     parts = message.get("parts") if isinstance(message, dict) else None
     if not isinstance(parts, list):
@@ -591,7 +608,9 @@ def skeleton_message(
     # cap. Created here (per-message) and threaded through skeleton_part.
     budget = {"used": 0}
     thin_parts = [
-        skeleton_part(part, budget=budget, limits=limits, sid=sid)
+        skeleton_part(
+            part, budget=budget, limits=limits, sid=sid, wire_view=wire_view,
+        )
         for part in parts if isinstance(part, dict)
     ]
     if not any(_is_renderable(part) for part in thin_parts):
@@ -620,9 +639,19 @@ def skeleton_messages(
     limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS,
     fingerprint: bool = False,
     sid: str | None = None,
+    wire_view: int = 3,
 ) -> list[dict[str, Any]]:
+    """Project a full upstream message list to skeletons (design-expand §4).
+
+    v4 §14: ``wire_view`` selects the ``?v=`` value in every expandRefs
+    href (3 → frozen v3 bytes, 4 → ``?v=4``); default 3 keeps the pure
+    functions' historical output byte-identical.
+    """
     return [
-        skeleton_message(message, limits=limits, fingerprint=fingerprint, sid=sid)
+        skeleton_message(
+            message, limits=limits, fingerprint=fingerprint, sid=sid,
+            wire_view=wire_view,
+        )
         for message in messages
     ]
 
@@ -848,3 +877,301 @@ def project_rows_to_v4_skeletons(rows: list[dict[str, Any]]) -> list[dict[str, A
             }
         skeletons.append(item)
     return skeletons
+
+
+# ---------------------------------------------------------------------------
+# v4 canonical item projector（§13 正式修订；rev 门禁 P0-1/P0-2 修复）。
+#
+# v4-contract §13.3 冻结不变量：列表 item 与单查**同一 canonical projector
+# 代码路径**——分裂投影 = 实现违约。本节就是那唯一 projector：
+#
+# * ``native_session_to_record``：native 入口**归一化器**（非投影副本）——
+#   把上游 SessionInfo（camelCase）映射为 DB 投影记录形状（snake_case 列 +
+#   p_id/p_name/p_worktree join 列）。键 **presence** 是三态载体：上游键
+#   缺席 → 记录键缺席（来源不可得）；显式 null → 在场 None（业务合法
+#   null）；值 → 值。不做任何形状决策（§13.3「同一 keep/drop 规则」）。
+# * ``canonical_session_skeleton_v4``：唯一装配器——DB 记录
+#   （``rows_to_records`` 产出，列恒在场、值 None = 业务 null）与 native
+#   归一化记录（键可缺席）喂**同一函数**，产出 §13.1 canonical 对象：
+#
+#   - required nullable 恒发（§13.1/§13.2 真值表）：业务 null → null；
+#     来源不可得 → null + partial:true（+ degraded，§13.2b 三态②）。
+#   - ``project`` 双形态（§13.5）：projectID null → project **缺席**；
+#     非空 projectID 且 join 缺行（含 native 无 join）/ id mismatch /
+#     worktree 空串 → project:null + partial:true（三不变量任一不满足）。
+#   - required 且不可 null 字段（§13.2a：id/directory/title/
+#     time.created/time.updated）缺席或 null → 返回 None，路由转整响应
+#     503 ``auxiliary_unavailable``（禁占位值 / 禁丢键 / 禁跨源拼接）。
+#   - ``fallback=True``：native 回退态——item degraded 恒 true（§13.4
+#     公式在 fallback 分支的平凡推论），partial 按字段来源不可得置位。
+# ---------------------------------------------------------------------------
+
+def native_session_to_record(item: dict[str, Any]) -> dict[str, Any]:
+    """上游 SessionInfo（native HTTP）→ DB 投影记录形状（§13.3 归一化）。
+
+    键 presence 原样保留（三态载体）；仅 dict|None 形状通过对象字段
+    （model/summary/tokens/revert），其余形状视为来源不可得（键缺席，
+    装配器置 null+partial——不伪装业务 null，§13.2b）。
+    """
+    record: dict[str, Any] = {}
+    for wire, column in (
+        ("id", "id"), ("directory", "directory"), ("parentID", "parent_id"),
+        ("projectID", "project_id"), ("title", "title"), ("agent", "agent"),
+    ):
+        if wire in item:
+            record[column] = item[wire]
+
+    model = item.get("model")
+    if isinstance(model, dict) or ("model" in item and model is None):
+        record["model"] = model
+
+    time_obj = item.get("time")
+    if isinstance(time_obj, dict):
+        # 非 dict / 缺席 → 不落列：created 不可得 → 装配器判 §13.2a（503）
+        for wire, column in (("created", "time_created"),
+                             ("updated", "time_updated"),
+                             ("archived", "time_archived")):
+            if wire in time_obj:
+                record[column] = time_obj[wire]
+
+    summary = item.get("summary")
+    if isinstance(summary, dict):
+        # §13.2 summary 对象三子键均须 number：**在场 null 子值 = 畸形
+        # 成员**（非业务缺列）→ 不落列（键缺席 = 来源不可得），projector
+        # 置 null+partial；与 ``summary: null``（三列在场 None = 业务
+        # null，不 partial）保持来源形态区分（§13.2b）。
+        for wire, column in (("additions", "summary_additions"),
+                             ("deletions", "summary_deletions"),
+                             ("files", "summary_files")):
+            if wire in summary and summary[wire] is not None:
+                record[column] = summary[wire]
+    elif "summary" in item and summary is None:
+        record["summary_additions"] = None
+        record["summary_deletions"] = None
+        record["summary_files"] = None
+
+    tokens = item.get("tokens")
+    if isinstance(tokens, dict):
+        for wire, column in (("input", "tokens_input"),
+                             ("output", "tokens_output"),
+                             ("reasoning", "tokens_reasoning")):
+            if wire in tokens:
+                record[column] = tokens[wire]
+        cache = tokens.get("cache")
+        if isinstance(cache, dict):
+            if "read" in cache:
+                record["tokens_cache_read"] = cache["read"]
+            if "write" in cache:
+                record["tokens_cache_write"] = cache["write"]
+    elif "tokens" in item and tokens is None:
+        for column in ("tokens_input", "tokens_output", "tokens_reasoning",
+                       "tokens_cache_read", "tokens_cache_write"):
+            record[column] = None
+
+    revert = item.get("revert")
+    if isinstance(revert, dict) or ("revert" in item and revert is None):
+        record["revert"] = revert
+    return record
+
+
+_CANONICAL_REQUIRED_NON_NULL = (
+    "id", "directory", "title", "time_created", "time_updated",
+)
+
+
+def _canonical_number(value: Any) -> bool:
+    """§13.2 数值类型冻结：JSON number（int/float，bool 除外）。"""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _canonical_object_field(
+    source: dict[str, Any],
+    required: dict[str, Any],
+    optional: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """§13.2 nullable 对象子字段校验（model/revert 共用）。
+
+    ``required``/``optional``：wire 子键 → Python 类型。required 子键
+    缺席或类型错、optional 子键**在场**但 null/类型错 → 返回 None
+    （调用方整体 null+partial——禁发含类型违约成员的畸形对象，
+    §13.2b ②）。optional 子键**缺席** → 不置键（``variant?``/
+    ``partID?`` 允许 absent，不允许在场 null）；合法类型 → 照常。
+    """
+    projected: dict[str, Any] = {}
+    for key, kind in required.items():
+        value = source.get(key)
+        if not isinstance(value, kind) or isinstance(value, bool):
+            return None
+        projected[key] = value
+    for key, kind in (optional or {}).items():
+        if key not in source:
+            continue  # absent → 合法，不置键（「absent 不置 null」）
+        value = source[key]
+        # 在场 null / 类型违约 = 对象成员不符合声明类型 → 对象畸形
+        if not isinstance(value, kind) or isinstance(value, bool):
+            return None
+        projected[key] = value
+    return projected
+
+
+def canonical_session_skeleton_v4(
+    record: dict[str, Any], *, fallback: bool = False,
+) -> dict[str, Any] | None:
+    """DB 投影记录形状 → §13.1 canonical SessionSkeletonV4（唯一 projector）。
+
+    输入契约：``rows_to_records`` 产出的 DB 记录（列恒在场，None = 业务
+    null）或 ``native_session_to_record`` 产出的归一化记录（键可缺席 =
+    来源不可得）。列表与单查、DB 与 native 四路径全部经本函数装配
+    （§13.3 同一 projector 不变量）。None = required 字段不可表示
+    （§13.2a：缺席/null/类型约束违约）→ 调用方转整响应 503，不得混入
+    items（§13.2c）。
+
+    §13.2 类型/约束冻结（:521-575）：``id``/``directory`` 非空字符串、
+    ``title`` 字符串（可空串）、``time.created``/``updated`` 非负数值——
+    违约 = 不可表示（None）；nullable 字段类型错（含 nullable 对象子
+    字段）→ ``null + partial``（来源不可得同级，§13.2b ②），禁伪装
+    业务 null、禁发畸形对象。
+    """
+    for key in _CANONICAL_REQUIRED_NON_NULL:
+        # 缺席或 None 均不可表示（DB NOT NULL 列不可达；native 缺失可达）
+        if record.get(key) is None:
+            return None
+    # §13.2a 类型/约束（required 非 nullable 无三态，只有整响应失败）
+    if not isinstance(record["id"], str) or not record["id"]:
+        return None
+    if not isinstance(record["directory"], str) or not record["directory"]:
+        return None  # 全局列表强制非空字符串（真库空目录行 = 不可表示）
+    if not isinstance(record["title"], str):
+        return None  # 可空串，但不可非字符串
+    for key in ("time_created", "time_updated"):
+        value = record[key]
+        if not _canonical_number(value) or value < 0:
+            return None  # 非负数值（字符串/bool/负数均不可表示）
+
+    partial = False
+
+    def nullable(column: str) -> Any:
+        # §13.2b 三态：键缺席 → 来源不可得（null+partial）；
+        # 在场 None → 业务合法 null（null 不 partial）；在场值 → 值。
+        nonlocal partial
+        if column not in record:
+            partial = True
+            return None
+        return record[column]
+
+    def nullable_str(column: str) -> str | None:
+        # nullable string：类型错 → 来源不可得同级（null+partial）
+        nonlocal partial
+        value = nullable(column)
+        if value is not None and not isinstance(value, str):
+            partial = True
+            return None
+        return value
+
+    def nullable_number(column: str) -> int | float | None:
+        # nullable number（tokens 五列）：类型错（bool/字符串）→ null+partial
+        nonlocal partial
+        value = nullable(column)
+        if value is not None and not _canonical_number(value):
+            partial = True
+            return None
+        return value
+
+    project_id = nullable_str("project_id")
+    single: dict[str, Any] = {
+        "id": record["id"],
+        "directory": record["directory"],
+        "parentID": nullable_str("parent_id"),
+        "projectID": project_id,
+    }
+    if project_id is not None:
+        # §13.5 三不变量：join 成功 + project.id == projectID + worktree
+        # 非空串——任一不满足 → project:null + partial（native 归一化记录
+        # 恒无 p_id 列 = join 不可用，同走此分支）。
+        joined_id = record.get("p_id")
+        worktree = record.get("p_worktree")
+        if (joined_id is not None and joined_id == project_id
+                and isinstance(worktree, str) and worktree):
+            project_obj: dict[str, Any] = {
+                "id": joined_id, "worktree": worktree,
+            }
+            name = record.get("p_name")
+            if isinstance(name, str):
+                project_obj = {"id": joined_id, "name": name,
+                               "worktree": worktree}
+            single["project"] = project_obj
+        else:
+            single["project"] = None
+            partial = True
+    # projectID null → project 缺席（不得补 null：§13.5 两形态不得混同）
+
+    single["title"] = record["title"]
+    single["agent"] = nullable_str("agent")
+
+    model = nullable("model")
+    if isinstance(model, dict):
+        # §13.2 model 子字段：id/providerID 必为 string；variant?: string
+        # （absent/None 不置键）——子字段畸形 → 整体 null+partial
+        projected_model = _canonical_object_field(
+            model, {"id": str, "providerID": str}, {"variant": str},
+        )
+        if projected_model is None:
+            partial = True
+            model = None
+        else:
+            model = projected_model
+    elif model is not None:
+        # 非法形状（JSON 列合法解析为非对象 / native 非法值）→ 来源不可得
+        partial = True
+        model = None
+    single["model"] = model
+
+    archived = nullable("time_archived")
+    if archived is not None and not _canonical_number(archived):
+        partial = True  # 畸形时间戳 → 来源不可得同级
+        archived = None
+    single["time"] = {
+        "created": record["time_created"],
+        "updated": record["time_updated"],
+        "archived": archived,
+    }
+    additions = nullable_number("summary_additions")
+    deletions = nullable_number("summary_deletions")
+    files = nullable_number("summary_files")
+    if additions is None and deletions is None and files is None:
+        # 全 null（业务合法 / 全缺席——缺席列已按 §13.2b ②置 partial）
+        single["summary"] = None
+    elif additions is not None and deletions is not None and files is not None:
+        # §13.2 对象时三子键均为数值——完整数值三元组才发对象
+        single["summary"] = {
+            "additions": additions, "deletions": deletions, "files": files,
+        }
+    else:
+        # 混合（部分列 NULL / 部分类型错）→ 禁发含 null 子值的畸形对象
+        partial = True
+        single["summary"] = None
+    single["tokens_input"] = nullable_number("tokens_input")
+    single["tokens_output"] = nullable_number("tokens_output")
+    single["tokens_reasoning"] = nullable_number("tokens_reasoning")
+    single["tokens_cache_read"] = nullable_number("tokens_cache_read")
+    single["tokens_cache_write"] = nullable_number("tokens_cache_write")
+
+    revert = nullable("revert")
+    if isinstance(revert, dict):
+        # §13.2 revert 子字段：messageID 必为 string；partID?: string
+        projected_revert = _canonical_object_field(
+            revert, {"messageID": str}, {"partID": str},
+        )
+        if projected_revert is None:
+            partial = True
+            revert = None
+        else:
+            revert = projected_revert
+    elif revert is not None:
+        partial = True
+        revert = None
+    single["revert"] = revert
+
+    single["partial"] = partial
+    single["degraded"] = partial or fallback
+    return single

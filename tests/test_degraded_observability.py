@@ -55,6 +55,24 @@ from oc_slimapi.traffic_snapshot import (
 
 from v4_fixture import build_fixture_db
 
+from oc_slimapi import readiness
+
+
+@pytest.fixture(autouse=True)
+def _session_single_revision_gate_off(monkeypatch):
+    """§13 修订面（``session.single.projection.v4``）关闭态回归钉。
+
+    本文件锁定 v4 sessions **4.0.0 已发布形态**（envelope 稀疏
+    degraded：DB 路径无 degraded 键 / fallback 路径 degraded:true）
+    ——§13 canonical envelope（degraded 恒布尔）由
+    tests/test_session_single_v4.py 双态覆盖（fix-9 集成门控模式）。
+    """
+    monkeypatch.setattr(
+        readiness, "SATISFIED",
+        readiness.SATISFIED - {"session.single.projection.v4"},
+    )
+
+
 IDENTITY = {"Accept-Encoding": "identity"}
 AL_NONEMPTY = ("/foo",)
 HTTP_SESSIONS_BODY = orjson.dumps([

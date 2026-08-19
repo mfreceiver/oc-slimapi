@@ -404,11 +404,16 @@ async def test_versions_terminal_shape():
         assert body["available"] == [3, 4]
         assert set(body["capabilities"].keys()) == {"3", "4"}
         assert body["capabilities"]["3"]["directoryQuery"] is True
-        assert body["capabilities"]["4"] == {
-            "globalSessions": True,
-            "auxiliaryFilters": True,
-            "sseReplay": True,
-            "qpImmediateFull": True,
+        # four static §3.1 keys by value + the additive §3.3 readiness key
+        # and §14 expand block (2026-08-19 revision / 4.2.0 close-out;
+        # payload shapes locked in test_versions_readiness.py)
+        assert body["capabilities"]["4"]["globalSessions"] is True
+        assert body["capabilities"]["4"]["auxiliaryFilters"] is True
+        assert body["capabilities"]["4"]["sseReplay"] is True
+        assert body["capabilities"]["4"]["qpImmediateFull"] is True
+        assert set(body["capabilities"]["4"]) == {
+            "globalSessions", "auxiliaryFilters",
+            "sseReplay", "qpImmediateFull", "readiness", "expand",
         }
 
 

@@ -1040,7 +1040,10 @@ async def test_b1_1r_incompressible_body_labels_actual_coding(upstream_factory, 
     # route judges and (maybe) compresses.
     monkeypatch.setattr(
         messages, "_project_list_sorted_and_pack",
-        lambda body, *, accept_encoding, limits, sid=None: identity)
+        # wire_view follows the real worker's v4-§14 seam (default 3 — these
+        # stacks are selector-less).
+        lambda body, *, accept_encoding, limits, sid=None, wire_view=3:
+            identity)
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=b"[]")
@@ -1101,7 +1104,9 @@ async def test_b1_1r_rev5_case_matrix(upstream_factory, monkeypatch):
     holder: dict[str, bytes] = {}
     monkeypatch.setattr(
         messages, "_project_list_sorted_and_pack",
-        lambda body, *, accept_encoding, limits, sid=None: holder["identity"])
+        # wire_view follows the real worker's v4-§14 seam (default 3).
+        lambda body, *, accept_encoding, limits, sid=None, wire_view=3:
+            holder["identity"])
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=b"[]")
@@ -1211,7 +1216,10 @@ async def test_b1_1r_identity_only_request_excludes_gzip_validator(upstream_fact
         identity = os.urandom(600)
     monkeypatch.setattr(
         messages, "_project_list_sorted_and_pack",
-        lambda body, *, accept_encoding, limits, sid=None: identity)
+        # wire_view follows the real worker's v4-§14 seam (default 3 — these
+        # stacks are selector-less).
+        lambda body, *, accept_encoding, limits, sid=None, wire_view=3:
+            identity)
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=b"[]")
