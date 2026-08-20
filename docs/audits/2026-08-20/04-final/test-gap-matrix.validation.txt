@@ -1,0 +1,4 @@
+test-gap-matrix validation
+rows=580 header_ok=True pk_unique_ok=True enum_ok=True nonempty_ok=True
+set_equal: expected=580 actual=580 missing=0 extra=0
+RESULT: VALID

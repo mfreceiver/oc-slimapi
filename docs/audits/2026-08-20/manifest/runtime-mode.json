@@ -1,0 +1,16 @@
+{
+ "schema_version": 2,
+ "mode": "workspace",
+ "state": "final",
+ "check_root": "/home/mar/personal_projects/oc-slimapi",
+ "python": "/home/mar/personal_projects/oc-slimapi/.venv/bin/python",
+ "check_argv": [
+  "./scripts/check.sh"
+ ],
+ "env_template": {
+  "PYTHONPYCACHEPREFIX": "/tmp/opencode/runtime-cache/0b836e78c5de62d0c73b8593bf62c6650043dedf/primary/runs/<RUN_ID>/pycache/",
+  "TMPDIR": "/tmp/opencode/runtime-cache/0b836e78c5de62d0c73b8593bf62c6650043dedf/primary/runs/<RUN_ID>/tmp/",
+  "PIP_CACHE_DIR": "/tmp/opencode/runtime-cache/0b836e78c5de62d0c73b8593bf62c6650043dedf/primary/pip-cache/",
+  "PYTEST_TEMPLATE": "-p no:cacheprovider --basetemp=/tmp/opencode/runtime-cache/0b836e78c5de62d0c73b8593bf62c6650043dedf/primary/runs/<RUN_ID>/pytest/"
+ }
+}

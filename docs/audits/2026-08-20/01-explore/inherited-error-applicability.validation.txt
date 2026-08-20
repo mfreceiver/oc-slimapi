@@ -1,0 +1,3 @@
+inherited-error-applicability validation
+rows=337 header_ok=True pk7_ok=True schema_ok=True
+appl_problems=0 cross_problems=0

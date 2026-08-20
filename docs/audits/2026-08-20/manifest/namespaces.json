@@ -1,0 +1,26 @@
+{
+ "schema_version": 1,
+ "baseline_head": "0b836e78c5de62d0c73b8593bf62c6650043dedf",
+ "attempt_id": "primary",
+ "audit_root": "/home/mar/personal_projects/oc-slimapi/docs/audits/2026-08-20",
+ "kinds": {
+  "probes": {
+   "state": "active",
+   "path": "/tmp/opencode/probes/0b836e78c5de62d0c73b8593bf62c6650043dedf/primary",
+   "owner_sha256": "7ae2f23d13e5ccbd5638e3b18c6795a577b6cea88f1841b8a8aa9385a76e8e53"
+  },
+  "runtime-cache": {
+   "state": "active",
+   "path": "/tmp/opencode/runtime-cache/0b836e78c5de62d0c73b8593bf62c6650043dedf/primary",
+   "owner_sha256": "81f1704ae18b75dc9d80dad161aac5267f2c2b9d9b1bcabc8669f4ecd3824979"
+  },
+  "baseline-snapshot": {
+   "state": "active",
+   "path": "/tmp/opencode/baseline-snapshot/0b836e78c5de62d0c73b8593bf62c6650043dedf/primary",
+   "owner_sha256": "d028f9132e5189562f28835804499a8949c4c4c914601e449647543ff541a681"
+  },
+  "venv-source": {
+   "state": "unused"
+  }
+ }
+}

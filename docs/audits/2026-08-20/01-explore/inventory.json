@@ -1,0 +1,1602 @@
+{
+ "generated_at": "2026-08-20T22:53:24+0800",
+ "head": "0b836e78c5de62d0c73b8593bf62c6650043dedf",
+ "src_files": [
+  {
+   "path": "src/oc_slimapi/__init__.py",
+   "lines": 9,
+   "top_level_symbols": []
+  },
+  {
+   "path": "src/oc_slimapi/access_log.py",
+   "lines": 726,
+   "top_level_symbols": [
+    "_LOGGER_NAME",
+    "_MAINT_LOCK",
+    "_MAINT_LOG",
+    "_MAINT_LOG_NAME",
+    "_get_maint_log",
+    "_ACCESS_LOG_RE",
+    "get_access_logger",
+    "hash_client_id",
+    "DailyAccessHandler",
+    "setup_access_log",
+    "write_access_log",
+    "write_sse_lifecycle_log",
+    "_unique_tmp_path",
+    "_cleanup_leftover_tmp",
+    "compress_old_access_logs",
+    "prune_old_access_logs",
+    "migrate_legacy_access_log",
+    "_migrate_one",
+    "run_access_log_maintenance_loop"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/actions.py",
+   "lines": 975,
+   "top_level_symbols": [
+    "_NAME_RE",
+    "_MAX_NAME_LEN",
+    "_DEFAULT_TIMEOUT_S",
+    "_DEFAULT_MIN_INTERVAL_EXEC",
+    "_DEFAULT_MIN_INTERVAL_QUERY",
+    "_DEFAULT_MAX_OUTPUT_BYTES",
+    "_MAX_OUTPUT_BYTES_CAP",
+    "_DESCRIPTION_MAX_LEN",
+    "_READ_CHUNK",
+    "_STDERR_LOG_CAP",
+    "_DRAIN_DEADLINE_S",
+    "_CLEANUP_REAP_S",
+    "_ADMISSION_TIMEOUT_S",
+    "_EXEC_KINDS",
+    "_ALLOWED_FIELDS",
+    "_INTERPOLATION_MARKERS",
+    "_AUDIT_LOGGER",
+    "_APP_LOGGER",
+    "_ACTION_ENV_ALLOWLIST",
+    "_build_action_env",
+    "_ms",
+    "ActionSpec",
+    "ActionResult",
+    "_DrainState",
+    "ActionError",
+    "ActionsDisabled",
+    "ActionNotFound",
+    "ActionConfirmRequired",
+    "ActionThrottled",
+    "ActionBusy",
+    "ActionTimeout",
+    "ActionUnavailable",
+    "_ManifestError",
+    "_load_manifest",
+    "_validate_action",
+    "_as_number",
+    "load_registry",
+    "ActionRegistry"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/app.py",
+   "lines": 785,
+   "top_level_symbols": [
+    "SMOKE_NOT_RUN",
+    "SMOKE_UPSTREAM_UNAVAILABLE",
+    "SMOKE_INVALID_SCHEMA",
+    "SMOKE_VALID",
+    "_SMOKE_TIMEOUT",
+    "_MAINT_DRAIN_TIMEOUT",
+    "_TRANSFORM_DRAIN_TIMEOUT",
+    "_DBAUX_DRAIN_TIMEOUT",
+    "_REPLAY_SWEEP_INTERVAL_S",
+    "_GRACEFUL_SHUTDOWN_TIMEOUT",
+    "_log_maint_task_exception",
+    "_log_directory_allowlist",
+    "smoke",
+    "lifespan",
+    "main"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/catalog_cache.py",
+   "lines": 181,
+   "top_level_symbols": [
+    "CatalogCache"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/config.py",
+   "lines": 1158,
+   "top_level_symbols": [
+    "TOKEN_PART_MAX_BYTES",
+    "TOKEN_LIVE_PARTS_MAX",
+    "TOKEN_LIVEPARTS_MAX_BYTES",
+    "TOKEN_PENDING_MAX_BYTES",
+    "TOKEN_FLUSH_SECONDS",
+    "TOKEN_FLUSH_BYTES",
+    "TOKEN_ACC_IDLE_MS",
+    "TOKEN_HEARTBEAT_SECONDS",
+    "TOKEN_DISABLED_MAX",
+    "TOKEN_DISABLED_TTL_S",
+    "TOKEN_DISABLED_TTL_MS",
+    "TOKEN_RESYNC_QUEUE_CAP",
+    "TOKEN_REMOVED_MESSAGES_MAX",
+    "TOKEN_REMOVED_MESSAGES_TTL_MS",
+    "DEFAULT_TOKEN_MAX_FRAME_BYTES",
+    "TOKEN_HANDSHAKE_ITEMS",
+    "TOKEN_HANDSHAKE_BUFFER_BYTES",
+    "_MAX_MESSAGE_BYTES_CAP",
+    "_MAX_RESPONSE_BYTES_CAP",
+    "_MAX_TRANSFORM_TOTAL_BYTES",
+    "_MAX_RAW_PLUS_TRANSFORM_TOTAL_BYTES",
+    "_MIN_EXPAND_RESPONSE_BYTES",
+    "_MAX_EXPAND_RESPONSE_BYTES",
+    "_ACCESS_LOG_DIR_DEFAULT",
+    "_ACCESS_LOG_PATH_DEFAULT",
+    "_version_range",
+    "_opt_int_env",
+    "_int_env",
+    "_directory_allowlist_env",
+    "clear_allowlist_roots_cache",
+    "allowlist_roots",
+    "candidate_canonical",
+    "match_allowlist",
+    "directory_allowed",
+    "Settings"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/dbaux/__init__.py",
+   "lines": 105,
+   "top_level_symbols": []
+  },
+  {
+   "path": "src/oc_slimapi/dbaux/cursor.py",
+   "lines": 225,
+   "top_level_symbols": [
+    "ARCHIVED_DEFAULT",
+    "PARENT_DEFAULT",
+    "_HASH_HEX_LEN",
+    "_EMPTY_SENTINEL",
+    "_B64URL_RE",
+    "_CURSOR_KEYS",
+    "_FINGERPRINT_KEYS",
+    "InvalidCursorError",
+    "CursorFingerprint",
+    "CursorPayload",
+    "search_hash",
+    "allowlist_rev",
+    "normalize_archived",
+    "normalize_parent",
+    "build_fingerprint",
+    "fingerprint_mismatch",
+    "encode_cursor",
+    "decode_cursor"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/dbaux/lifecycle.py",
+   "lines": 768,
+   "top_level_symbols": [
+    "schema_gate_missing",
+    "classify_sqlite_error",
+    "LatencyBreaker",
+    "AuxiliaryUnavailableError",
+    "DbAuxStatus",
+    "DbAuxiliarySource"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/dbaux/path_resolution.py",
+   "lines": 158,
+   "top_level_symbols": [
+    "ENV_EXPLICIT_DB",
+    "ENV_UPSTREAM_DB",
+    "ENV_XDG_DATA_HOME",
+    "_MEMORY",
+    "_CANDIDATE_GLOB",
+    "SINGLE_CANDIDATE_WARNING",
+    "ResolvedPath",
+    "DisabledResolution",
+    "_clean",
+    "_expanduser",
+    "_data_dir",
+    "resolve_db_path",
+    "stat_inode_marker"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/dbaux/projection.py",
+   "lines": 362,
+   "top_level_symbols": [
+    "_LOGGER",
+    "normalized_search",
+    "escape_like",
+    "has_wildcard",
+    "SessionsQuery",
+    "build_sessions_query",
+    "rows_to_records",
+    "SessionsPage",
+    "_window_anchor",
+    "fetch_sessions_page"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/directory.py",
+   "lines": 52,
+   "top_level_symbols": [
+    "normalize_directory",
+    "validate_directory"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/discovery.py",
+   "lines": 192,
+   "top_level_symbols": [
+    "_DISCOVERY_LIMIT",
+    "_fetch_discovery_body",
+    "_validate_discovery_list",
+    "fetch_global_root_sessions_raw",
+    "fetch_global_root_sessions"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/envelope.py",
+   "lines": 73,
+   "top_level_symbols": [
+    "messages_envelope_bytes",
+    "sessions_envelope_payload",
+    "sessions_envelope_v4"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/errors.py",
+   "lines": 62,
+   "top_level_symbols": [
+    "CodedHTTPException",
+    "coded_exception_handler",
+    "register_error_handlers"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/etag.py",
+   "lines": 294,
+   "top_level_symbols": [
+    "_ETAG_SCHEME_VERSION",
+    "SKELETON_REPRESENTATION_VERSION",
+    "_ConfigLike",
+    "representation_version",
+    "response_rep_version",
+    "compute_etag",
+    "if_none_match_matches",
+    "_opaque_tag",
+    "merged_vary",
+    "judge_conditional",
+    "not_modified_response",
+    "conditional_304"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/features.py",
+   "lines": 20,
+   "top_level_symbols": []
+  },
+  {
+   "path": "src/oc_slimapi/gzip_util.py",
+   "lines": 144,
+   "top_level_symbols": [
+    "MIN_GZIP_BYTES",
+    "accepts_gzip",
+    "compress_if_beneficial",
+    "json_response",
+    "error_response"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/logging_config.py",
+   "lines": 146,
+   "top_level_symbols": [
+    "_ROOT_LOGGER_NAME",
+    "_AUDIT_LOGGER_NAME",
+    "_resolve_log_level",
+    "setup_actions_audit_logging",
+    "setup_logging",
+    "get_logger",
+    "redact"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/middleware/__init__.py",
+   "lines": 1,
+   "top_level_symbols": []
+  },
+  {
+   "path": "src/oc_slimapi/middleware/request_id.py",
+   "lines": 111,
+   "top_level_symbols": [
+    "REQUEST_ID_KEY",
+    "_find_request_id",
+    "RequestIdMiddleware"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/middleware/traffic_accounting.py",
+   "lines": 435,
+   "top_level_symbols": [
+    "_ledger_from_scope",
+    "_config_from_scope",
+    "_read_client_headers",
+    "TrafficAccountingMiddleware",
+    "_record"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/providers_projection.py",
+   "lines": 433,
+   "top_level_symbols": [
+    "ProviderUpstreamMalformed",
+    "ProviderProjectionLimit",
+    "providers_rep_version",
+    "_reject_duplicate_members",
+    "_loads_strict",
+    "_ensure_utf8",
+    "_require_str",
+    "_validate",
+    "_utf8_key",
+    "_project",
+    "project_and_pack"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/proxy.py",
+   "lines": 51,
+   "top_level_symbols": [
+    "install_proxy"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/qp_sweep.py",
+   "lines": 250,
+   "top_level_symbols": [
+    "_EVICTION_AFTER",
+    "_MAX_SLEEP_SECONDS",
+    "QpSweepShadow"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/readiness.py",
+   "lines": 187,
+   "top_level_symbols": [
+    "_POST_ACTIONS_FEATURE",
+    "_IMPLICATION_PAIR",
+    "normalize",
+    "validate",
+    "validate_dependencies",
+    "ready",
+    "readiness_payload"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/routes/__init__.py",
+   "lines": 1,
+   "top_level_symbols": []
+  },
+  {
+   "path": "src/oc_slimapi/routes/_catalog_common.py",
+   "lines": 439,
+   "top_level_symbols": [
+    "TRANSFORM_RETRY_AFTER_SECONDS",
+    "busy_response",
+    "stream_upstream",
+    "read_upstream_response",
+    "make_project_and_pack",
+    "handle_catalog_request",
+    "_offload_catalog_body",
+    "_handle_catalog_cached"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/routes/_read_passthrough.py",
+   "lines": 277,
+   "top_level_symbols": [
+    "_PASSTHROUGH_UPSTREAM_HEADERS",
+    "_upstream_passthrough_headers",
+    "_raw_upstream_url",
+    "_maybe_pool",
+    "_read_error_body",
+    "read_passthrough_get"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/routes/actions.py",
+   "lines": 162,
+   "top_level_symbols": [
+    "_NO_STORE",
+    "_BODY_CAP_BYTES",
+    "_request_too_large",
+    "_read_body",
+    "_envelope",
+    "list_actions",
+    "invoke_action"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/routes/agent.py",
+   "lines": 52,
+   "top_level_symbols": [
+    "agent"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/routes/children.py",
+   "lines": 90,
+   "top_level_symbols": [
+    "_project_children",
+    "session_children"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/routes/command.py",
+   "lines": 49,
+   "top_level_symbols": [
+    "command"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/routes/diff.py",
+   "lines": 110,
+   "top_level_symbols": [
+    "_project_diff",
+    "session_diff"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/routes/directories.py",
+   "lines": 202,
+   "top_level_symbols": [
+    "directories",
+    "_num",
+    "_session_rank",
+    "_aggregate_and_pack"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/routes/events.py",
+   "lines": 253,
+   "top_level_symbols": [
+    "TOKENS_STREAM_RETIRED_IN_V4",
+    "_request_wire_v4",
+    "events"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/routes/health.py",
+   "lines": 141,
+   "top_level_symbols": [
+    "READY_VIEW",
+    "health",
+    "ready"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/routes/messages.py",
+   "lines": 1643,
+   "top_level_symbols": [
+    "TRANSFORM_RETRY_AFTER_SECONDS",
+    "_V4_EXPAND_FEATURE",
+    "_expand_wire_view",
+    "_created_sort_key",
+    "_parse_sort_project",
+    "_project_list_sorted_and_pack",
+    "_REL_PARAM_RE",
+    "_link_rel_tokens",
+    "_extract_before_verbatim",
+    "_parse_link_next_cursor",
+    "_busy_response",
+    "_resolve_messages_directory",
+    "_stream_upstream",
+    "_PLACEHOLDER_PART_ID_PREFIX",
+    "_DEGRADED",
+    "_CapExceeded",
+    "_placeholder_pairs",
+    "_expand_ref_pairs",
+    "_merged_candidate_pairs",
+    "_dedicated_full_get",
+    "_fetch_full_shared",
+    "_merge_fulls",
+    "_merge_fulls_and_pack",
+    "_canonical_list_query",
+    "_messages_list_key",
+    "_fetch_list_raw",
+    "_messages_via_lease",
+    "messages",
+    "message",
+    "_EXPAND_MESSAGE_LEVEL_CATEGORIES",
+    "_expand_shape_error",
+    "_expand_locate_part",
+    "_expand_str_field",
+    "_extract_info_summary_diffs",
+    "_extract_part_text",
+    "_extract_part_reasoning",
+    "_expand_state",
+    "_extract_part_state_output",
+    "_extract_part_state_error",
+    "_extract_part_state_input_full",
+    "_extract_part_state_metadata_full",
+    "_extract_part_state_attachments",
+    "_extract_part_url",
+    "_extract_part_source",
+    "_extract_part_snapshot",
+    "_extract_compaction_full",
+    "_EXPAND_EXTRACTORS",
+    "_expand_fragment_worker",
+    "_expand_fragment",
+    "expand_message_fragment",
+    "expand_part_fragment"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/routes/metrics.py",
+   "lines": 111,
+   "top_level_symbols": [
+    "metrics"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/routes/permissions.py",
+   "lines": 526,
+   "top_level_symbols": [
+    "_DirFetchFailure",
+    "_MAX_AGGREGATE_ITEMS",
+    "_directories_from_sessions",
+    "_PERMISSION_FIELDS",
+    "permissions",
+    "_pack_permissions_envelope",
+    "_fetch_permissions_for_dir",
+    "_collect_with_byte_budget"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/routes/questions.py",
+   "lines": 504,
+   "top_level_symbols": [
+    "_DirFetchFailure",
+    "_MAX_AGGREGATE_ITEMS",
+    "_directories_from_sessions",
+    "questions",
+    "_pack_questions_envelope",
+    "_fetch_questions_for_dir",
+    "_collect_with_byte_budget"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/routes/read_groups.py",
+   "lines": 630,
+   "top_level_symbols": [
+    "_resolve",
+    "_project_session",
+    "_authorized_file_directory",
+    "file_list",
+    "file_content",
+    "file_status",
+    "vcs_info",
+    "vcs_status",
+    "vcs_diff",
+    "find_file",
+    "_handle_providers_v4",
+    "_V4_PROVIDERS_FEATURE",
+    "_V4_PROVIDERS_REVISION_ACTIVE",
+    "_V4_SESSION_SINGLE_FEATURE",
+    "_V4_SESSION_SINGLE_REVISION_ACTIVE",
+    "config_providers",
+    "_session_single_sql",
+    "_SESSION_SINGLE_SQL",
+    "_project_native_session_single",
+    "_session_single_native_fallback",
+    "_handle_session_single_v4",
+    "session_single",
+    "session_active",
+    "global_health",
+    "_strip_directory_query",
+    "session_context"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/routes/sessions.py",
+   "lines": 883,
+   "top_level_symbols": [
+    "_canonical_sessions_query",
+    "_fetch_sessions_raw",
+    "_finalize_sessions_response",
+    "_sessions_via_lease",
+    "_fetch_status_raw",
+    "_status_via_lease",
+    "_V4_ARCHIVED_STATES",
+    "_V4_PARENT_RESERVED",
+    "_V4_LIMIT_MAX",
+    "_AUX_RETRY_AFTER",
+    "_AUX_UNAVAILABLE_HINT",
+    "_raw_query_keys",
+    "_aux_unavailable",
+    "_fail_closed_503",
+    "_http_session_to_v4",
+    "_v4_allowlist_entries",
+    "_sessions_v4",
+    "_V4_REPRESENTATION_FEATURE",
+    "_V4_SESSION_SINGLE_FEATURE",
+    "_v4_session_single_revision_active",
+    "_v4_representation_revision_active",
+    "_v4_json_response",
+    "_project_http_sessions_v4",
+    "_project_http_sessions_v4_canonical",
+    "sessions",
+    "_project_sessions",
+    "sessions_status"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/routes/todo.py",
+   "lines": 84,
+   "top_level_symbols": [
+    "_project_todo",
+    "session_todo"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/routes/token_stream.py",
+   "lines": 324,
+   "top_level_symbols": [
+    "_request_wire_v4",
+    "_accepts_gzip",
+    "_resolve_directory_conflict",
+    "token_stream"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/routes/versions.py",
+   "lines": 162,
+   "top_level_symbols": [
+    "CURRENT_VERSION",
+    "EXPAND_FEATURE_ID",
+    "_capabilities4",
+    "versions"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/routes/write_groups.py",
+   "lines": 583,
+   "top_level_symbols": [
+    "_resolve",
+    "_write_passthrough",
+    "create_session",
+    "update_session",
+    "delete_session",
+    "_POST_ACTIONS_FEATURE",
+    "_post_actions_admitted",
+    "_pre_revision_404",
+    "post_update_session",
+    "post_archive_session",
+    "post_delete_session",
+    "prompt_async",
+    "abort_session",
+    "summarize_session",
+    "fork_session",
+    "revert_session",
+    "respond_permission",
+    "reply_question",
+    "reject_question",
+    "session_command",
+    "_strip_directory_query",
+    "session_agent",
+    "session_model",
+    "revert_stage",
+    "revert_clear",
+    "revert_commit"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/selector.py",
+   "lines": 739,
+   "top_level_symbols": [
+    "SELECTOR_STATE_KEY",
+    "DIRECTORY_FORM_STATE_KEY",
+    "SELECTOR_ABSENT",
+    "SELECTOR_V2",
+    "SELECTOR_V3",
+    "SELECTOR_V4",
+    "SELECTOR_REJECTED",
+    "SELECTOR_EXEMPT",
+    "SELECTOR_NOT_APPLICABLE",
+    "SSE_RESULT_DIMS",
+    "VERSION_QUERY_PARAM",
+    "VERSIONS_PATH",
+    "DIRECTORY_QUERY_PARAM",
+    "DIRECTORY_HEADER_NAME",
+    "V3_DIRECTORY_STATE_KEY",
+    "_SELECTOR_LEXICAL_RE",
+    "_SLASH_RE",
+    "_V4_METHOD_BOUNDARY_FEATURE",
+    "_V4_POST_ACTIONS_FEATURE",
+    "_v4_method_boundary_405_live",
+    "_method_boundary_allow",
+    "_normalize_path",
+    "_is_directory_consuming",
+    "_is_v4_directory_retired",
+    "_directory_consuming_for",
+    "_has_query_key",
+    "_has_directory_header",
+    "_directory_form",
+    "_stash",
+    "selector_info_from_scope",
+    "wire_view_from_scope",
+    "_has_directory_query_pair",
+    "resolve_route_directory",
+    "_collect_v_values",
+    "_collect_directory_values",
+    "_directory_header_value",
+    "_is_stream_path",
+    "_segment_key_in",
+    "_strip_query_keys",
+    "_strip_v_segments",
+    "SlimapiSelectorMiddleware",
+    "_header"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/singleflight.py",
+   "lines": 770,
+   "top_level_symbols": [
+    "_DEFAULT_RESULT_GRACE_SECONDS",
+    "_MAX_RETAINED_ENTRIES",
+    "_MAX_RETAINED_BYTES",
+    "IN_FLIGHT",
+    "GRACE",
+    "RETAINED",
+    "FAILED",
+    "ACTIVE",
+    "RETIRED",
+    "_REJOIN",
+    "FetchFailed",
+    "_Entry",
+    "_current_task_cancelling",
+    "Lease",
+    "full_fetch_key",
+    "SingleFlight"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/skeleton.py",
+   "lines": 1177,
+   "top_level_symbols": [
+    "PLACEHOLDER_TEXT",
+    "PART_IDS",
+    "FINGERPRINT_VERSION",
+    "FINGERPRINT_FIELD",
+    "compute_message_fingerprint",
+    "recompute_fingerprint",
+    "TOOL_KEYS",
+    "TOOL_INPUT_KEYS",
+    "TOOL_METADATA_KEYS",
+    "FILE_URL_LIMIT",
+    "COMPACTION_PART_LIMIT",
+    "TEXT_INLINE_MAX_BYTES",
+    "REASONING_INLINE_MAX_BYTES",
+    "SkeletonLimits",
+    "DEFAULT_SKELETON_LIMITS",
+    "SKELETON_INLINE_FIELDS",
+    "SKELETON_ALWAYS_OMIT_FIELDS",
+    "_pick",
+    "_mark",
+    "_utf8_bytes_exceeds",
+    "_expand_ref",
+    "_emit_expand_refs",
+    "_field_byte_size",
+    "_compute_diffstats",
+    "_compute_diffstats_from_files",
+    "_maybe_inline_state_field",
+    "_tool",
+    "_patch",
+    "_file",
+    "skeleton_part",
+    "skeleton_message",
+    "skeleton_messages",
+    "strip_diagnostics_message",
+    "_is_renderable",
+    "SESSION_KEYS",
+    "skeleton_session",
+    "COMMAND_SKELETON_KEYS",
+    "skeleton_command",
+    "skeleton_commands",
+    "AGENT_SKELETON_KEYS",
+    "skeleton_agent",
+    "skeleton_agents",
+    "project_rows_to_v4_skeletons",
+    "native_session_to_record",
+    "_CANONICAL_REQUIRED_NON_NULL",
+    "_canonical_number",
+    "_canonical_object_field",
+    "canonical_session_skeleton_v4"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/sse/__init__.py",
+   "lines": 1,
+   "top_level_symbols": []
+  },
+  {
+   "path": "src/oc_slimapi/sse/global_hub.py",
+   "lines": 1090,
+   "top_level_symbols": [
+    "_LAST_UPDATED_AT_BY_SID_MAX",
+    "GlobalHub"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/sse/hub.py",
+   "lines": 42,
+   "top_level_symbols": []
+  },
+  {
+   "path": "src/oc_slimapi/sse/hub_types.py",
+   "lines": 419,
+   "top_level_symbols": [
+    "STOP",
+    "_UNSET",
+    "ABORT_NAME",
+    "_UNIX_PATH_RE",
+    "_WIN_PATH_RE",
+    "_STACK_FRAME_RE",
+    "_SECRET_RE",
+    "_sanitize_error_message",
+    "DEFAULT_MAX_SUBSCRIBERS_PER_DIRECTORY",
+    "DEFAULT_MAX_TOTAL_SUBSCRIBERS",
+    "DEFAULT_SSE_QUEUE_ITEMS",
+    "DEFAULT_SSE_BUFFER_BYTES",
+    "DEFAULT_SSE_MAX_FRAME_BYTES",
+    "IMMEDIATE",
+    "SESSION_EVENTS",
+    "MESSAGE_EVENTS",
+    "DEBOUNCE_SECONDS",
+    "HEARTBEAT_SECONDS",
+    "GRACE_SECONDS",
+    "TOKEN_FRAME_TYPE",
+    "sse_frame",
+    "_now_ms",
+    "_upstream_line_bytes",
+    "DigestFields",
+    "Subscriber",
+    "_extract_session_id",
+    "normalize_session_status",
+    "SubscriberCapacityError"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/sse/registry.py",
+   "lines": 408,
+   "top_level_symbols": [
+    "HubRegistry"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/sse/replay_log.py",
+   "lines": 598,
+   "top_level_symbols": [
+    "GLOBAL_DOMAIN",
+    "FRAME_KIND_BUSINESS",
+    "FRAME_KIND_TOMBSTONE",
+    "RESYNC_EPOCH_CHANGED",
+    "RESYNC_REPLAY_EXPIRED",
+    "RESYNC_REPLAY_GAP",
+    "RESYNC_RECONNECT_NO_REPLAY",
+    "DEFAULT_REPLAY_MAX_COUNT",
+    "DEFAULT_REPLAY_MAX_BYTES",
+    "DEFAULT_REPLAY_TTL_S",
+    "_EPOCH_RE",
+    "new_epoch",
+    "token_domain",
+    "_default_size_of",
+    "ReplayEntry",
+    "ReplayFrames",
+    "ReplayResync",
+    "ReplayIgnoreReset",
+    "_DomainState",
+    "ReplayLog"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/sse/replay_wire.py",
+   "lines": 282,
+   "top_level_symbols": [
+    "V4_RESYNC_REASONS",
+    "_EPOCH_RE",
+    "_SEQ_RE",
+    "_GLOBAL_SEGMENTS",
+    "DEFAULT_SWEEP_INTERVAL_S",
+    "sse_id_line",
+    "frame_with_id",
+    "parse_last_event_id",
+    "classify_reconnect",
+    "meta_v4_extension",
+    "replay_sweep_loop"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/sse/token_hub.py",
+   "lines": 23,
+   "top_level_symbols": []
+  },
+  {
+   "path": "src/oc_slimapi/sse/tokenstream/__init__.py",
+   "lines": 8,
+   "top_level_symbols": []
+  },
+  {
+   "path": "src/oc_slimapi/sse/tokenstream/frames.py",
+   "lines": 152,
+   "top_level_symbols": [
+    "STOP",
+    "_now_ms",
+    "sse_frame",
+    "_snapshot_frame",
+    "_delta_frame",
+    "_truncated_frame",
+    "_resync_frame",
+    "_connected_frame",
+    "_heartbeat_frame",
+    "_message_removed_frame"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/sse/tokenstream/hub.py",
+   "lines": 2190,
+   "top_level_symbols": [
+    "_SESSION_STATUS_MAX",
+    "_TTL_TICK_INTERVAL",
+    "_HEARTBEAT_TICK_INTERVAL",
+    "apply_debug_budget_overrides",
+    "_V4_INELIGIBLE_FRAME_PREFIX",
+    "_v4_frame_eligible",
+    "_events_token_frame",
+    "TokenStreamHub"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/sse/tokenstream/models.py",
+   "lines": 96,
+   "top_level_symbols": [
+    "LivePart",
+    "DeltaAccumulator",
+    "_TokenMetrics"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/sse/tokenstream/subscriber.py",
+   "lines": 874,
+   "top_level_symbols": [
+    "_SubscriberQueue",
+    "TokenSubscriber",
+    "TokenSubscriberCapacityError",
+    "TokenStreamRegistry"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/sse_observability.py",
+   "lines": 130,
+   "top_level_symbols": [
+    "next_lifecycle_id",
+    "_access_logger",
+    "_dims",
+    "_ledger_from_scope",
+    "_request_id",
+    "_emit",
+    "sse_open",
+    "sse_close"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/traffic.py",
+   "lines": 845,
+   "top_level_symbols": [
+    "_normalize_expand_category",
+    "bucketize",
+    "_EXPAND_SEGMENT",
+    "_expand_tail",
+    "expand_category_from_path",
+    "stash_cache",
+    "stash_up_in",
+    "stash_up_out",
+    "_read_state_int",
+    "read_sessions_source",
+    "read_degraded_503",
+    "SessionsDegradedCounters",
+    "ensure_sessions_degraded_counters",
+    "TrafficLedger"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/traffic_snapshot.py",
+   "lines": 541,
+   "top_level_symbols": [
+    "_snapshot_file_re",
+    "prune_old_snapshots",
+    "_v3_row_key",
+    "_degraded_row_key",
+    "aggregate_v3_observability",
+    "TrafficSnapshotter"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/transform.py",
+   "lines": 326,
+   "top_level_symbols": [
+    "TransformConfig",
+    "TransformBusy",
+    "_pack_json",
+    "strip_diagnostics_and_pack",
+    "read_with_cap",
+    "TransformPool"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/turn_registry.py",
+   "lines": 314,
+   "top_level_symbols": [
+    "_FALLBACK_INCARNATION",
+    "_TURNS_MAX",
+    "_INCARNATION_FILENAME",
+    "IncarnationStore",
+    "TurnRegistry",
+    "_SESSION_SID_RE",
+    "_TURN_BUMPING_SUFFIX_RE",
+    "extract_sid_from_path",
+    "is_turn_bumping_path"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/upstream.py",
+   "lines": 149,
+   "top_level_symbols": [
+    "HOP_BY_HOP",
+    "DIRECTORY_HEADER",
+    "REQUEST_ID_HEADER",
+    "FORBIDDEN_PREFIXES",
+    "FORBIDDEN_EXACT",
+    "create_client",
+    "strip_hop_by_hop",
+    "forward_directory_headers",
+    "forward_upstream_headers",
+    "request_id_from_scope"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/upstream_errors.py",
+   "lines": 105,
+   "top_level_symbols": [
+    "UPSTREAM_UNAVAILABLE",
+    "raise_upstream_unavailable",
+    "upstream_error_code_for_status",
+    "raise_upstream_status_code",
+    "raise_upstream_status"
+   ]
+  },
+  {
+   "path": "src/oc_slimapi/versioning.py",
+   "lines": 44,
+   "top_level_symbols": [
+    "_SLASH_RE",
+    "_SLIMAPI_PATH",
+    "_is_slimapi_path",
+    "SERVER_API_VERSION"
+   ]
+  }
+ ],
+ "tests": {
+  "files": 109,
+  "test_functions": 2642
+ },
+ "routes": [
+  {
+   "method": "GET",
+   "path": "/slimapi/actions",
+   "defined_at": "src/oc_slimapi/routes/actions.py:130",
+   "func": "list_actions"
+  },
+  {
+   "method": "POST",
+   "path": "/slimapi/actions/{name}",
+   "defined_at": "src/oc_slimapi/routes/actions.py:140",
+   "func": "invoke_action"
+  },
+  {
+   "method": "GET",
+   "path": "/slimapi/agent",
+   "defined_at": "src/oc_slimapi/routes/agent.py:17",
+   "func": "agent"
+  },
+  {
+   "method": "GET",
+   "path": "/slimapi/sessions/{sid}/children",
+   "defined_at": "src/oc_slimapi/routes/children.py:55",
+   "func": "session_children"
+  },
+  {
+   "method": "GET",
+   "path": "/slimapi/command",
+   "defined_at": "src/oc_slimapi/routes/command.py:17",
+   "func": "command"
+  },
+  {
+   "method": "GET",
+   "path": "/slimapi/sessions/{sid}/diff",
+   "defined_at": "src/oc_slimapi/routes/diff.py:63",
+   "func": "session_diff"
+  },
+  {
+   "method": "GET",
+   "path": "/slimapi/directories",
+   "defined_at": "src/oc_slimapi/routes/directories.py:17",
+   "func": "directories"
+  },
+  {
+   "method": "GET",
+   "path": "/slimapi/events",
+   "defined_at": "src/oc_slimapi/routes/events.py:40",
+   "func": "events"
+  },
+  {
+   "method": "GET",
+   "path": "/slimapi/health",
+   "defined_at": "src/oc_slimapi/routes/health.py:22",
+   "func": "health"
+  },
+  {
+   "method": "GET",
+   "path": "/slimapi/ready",
+   "defined_at": "src/oc_slimapi/routes/health.py:105",
+   "func": "ready"
+  },
+  {
+   "method": "GET",
+   "path": "/slimapi/messages/{sid}",
+   "defined_at": "src/oc_slimapi/routes/messages.py:948",
+   "func": "messages"
+  },
+  {
+   "method": "GET",
+   "path": "/slimapi/messages/{sid}/full/{mid}",
+   "defined_at": "src/oc_slimapi/routes/messages.py:1144",
+   "func": "message"
+  },
+  {
+   "method": "GET",
+   "path": "/slimapi/messages/{sid}/expand/{category}/{mid}",
+   "defined_at": "src/oc_slimapi/routes/messages.py:1616",
+   "func": "expand_message_fragment"
+  },
+  {
+   "method": "GET",
+   "path": "/slimapi/messages/{sid}/expand/{category}/{mid}/{partID}",
+   "defined_at": "src/oc_slimapi/routes/messages.py:1631",
+   "func": "expand_part_fragment"
+  },
+  {
+   "method": "GET",
+   "path": "/slimapi/metrics",
+   "defined_at": "src/oc_slimapi/routes/metrics.py:20",
+   "func": "metrics"
+  },
+  {
+   "method": "GET",
+   "path": "/slimapi/permissions",
+   "defined_at": "src/oc_slimapi/routes/permissions.py:84",
+   "func": "permissions"
+  },
+  {
+   "method": "GET",
+   "path": "/slimapi/questions",
+   "defined_at": "src/oc_slimapi/routes/questions.py:78",
+   "func": "questions"
+  },
+  {
+   "method": "GET",
+   "path": "/slimapi/file",
+   "defined_at": "src/oc_slimapi/routes/read_groups.py:149",
+   "func": "file_list"
+  },
+  {
+   "method": "GET",
+   "path": "/slimapi/file/content",
+   "defined_at": "src/oc_slimapi/routes/read_groups.py:166",
+   "func": "file_content"
+  },
+  {
+   "method": "GET",
+   "path": "/slimapi/file/status",
+   "defined_at": "src/oc_slimapi/routes/read_groups.py:178",
+   "func": "file_status"
+  },
+  {
+   "method": "GET",
+   "path": "/slimapi/vcs",
+   "defined_at": "src/oc_slimapi/routes/read_groups.py:192",
+   "func": "vcs_info"
+  },
+  {
+   "method": "GET",
+   "path": "/slimapi/vcs/status",
+   "defined_at": "src/oc_slimapi/routes/read_groups.py:201",
+   "func": "vcs_status"
+  },
+  {
+   "method": "GET",
+   "path": "/slimapi/vcs/diff",
+   "defined_at": "src/oc_slimapi/routes/read_groups.py:210",
+   "func": "vcs_diff"
+  },
+  {
+   "method": "GET",
+   "path": "/slimapi/find/file",
+   "defined_at": "src/oc_slimapi/routes/read_groups.py:227",
+   "func": "find_file"
+  },
+  {
+   "method": "GET",
+   "path": "/slimapi/config/providers",
+   "defined_at": "src/oc_slimapi/routes/read_groups.py:395",
+   "func": "config_providers"
+  },
+  {
+   "method": "GET",
+   "path": "/slimapi/session/{sid}",
+   "defined_at": "src/oc_slimapi/routes/read_groups.py:555",
+   "func": "session_single"
+  },
+  {
+   "method": "GET",
+   "path": "/slimapi/api/session/active",
+   "defined_at": "src/oc_slimapi/routes/read_groups.py:582",
+   "func": "session_active"
+  },
+  {
+   "method": "GET",
+   "path": "/slimapi/global/health",
+   "defined_at": "src/oc_slimapi/routes/read_groups.py:591",
+   "func": "global_health"
+  },
+  {
+   "method": "GET",
+   "path": "/slimapi/session/{sid}/context",
+   "defined_at": "src/oc_slimapi/routes/read_groups.py:619",
+   "func": "session_context"
+  },
+  {
+   "method": "GET",
+   "path": "/slimapi/sessions",
+   "defined_at": "src/oc_slimapi/routes/sessions.py:678",
+   "func": "sessions"
+  },
+  {
+   "method": "GET",
+   "path": "/slimapi/sessions/status",
+   "defined_at": "src/oc_slimapi/routes/sessions.py:806",
+   "func": "sessions_status"
+  },
+  {
+   "method": "GET",
+   "path": "/slimapi/sessions/{sid}/todo",
+   "defined_at": "src/oc_slimapi/routes/todo.py:47",
+   "func": "session_todo"
+  },
+  {
+   "method": "GET",
+   "path": "/slimapi/sessions/{sid}/stream",
+   "defined_at": "src/oc_slimapi/routes/token_stream.py:124",
+   "func": "token_stream"
+  },
+  {
+   "method": "GET",
+   "path": "/slimapi/versions",
+   "defined_at": "src/oc_slimapi/routes/versions.py:135",
+   "func": "versions"
+  },
+  {
+   "method": "POST",
+   "path": "/slimapi/session",
+   "defined_at": "src/oc_slimapi/routes/write_groups.py:256",
+   "func": "create_session"
+  },
+  {
+   "method": "PATCH",
+   "path": "/slimapi/session/{session_id}",
+   "defined_at": "src/oc_slimapi/routes/write_groups.py:262",
+   "func": "update_session"
+  },
+  {
+   "method": "DELETE",
+   "path": "/slimapi/session/{session_id}",
+   "defined_at": "src/oc_slimapi/routes/write_groups.py:274",
+   "func": "delete_session"
+  },
+  {
+   "method": "POST",
+   "path": "/slimapi/session/{session_id}",
+   "defined_at": "src/oc_slimapi/routes/write_groups.py:325",
+   "func": "post_update_session"
+  },
+  {
+   "method": "POST",
+   "path": "/slimapi/session/{session_id}/archive",
+   "defined_at": "src/oc_slimapi/routes/write_groups.py:342",
+   "func": "post_archive_session"
+  },
+  {
+   "method": "POST",
+   "path": "/slimapi/session/{session_id}/delete",
+   "defined_at": "src/oc_slimapi/routes/write_groups.py:398",
+   "func": "post_delete_session"
+  },
+  {
+   "method": "POST",
+   "path": "/slimapi/session/{session_id}/prompt_async",
+   "defined_at": "src/oc_slimapi/routes/write_groups.py:417",
+   "func": "prompt_async"
+  },
+  {
+   "method": "POST",
+   "path": "/slimapi/session/{session_id}/abort",
+   "defined_at": "src/oc_slimapi/routes/write_groups.py:425",
+   "func": "abort_session"
+  },
+  {
+   "method": "POST",
+   "path": "/slimapi/session/{session_id}/summarize",
+   "defined_at": "src/oc_slimapi/routes/write_groups.py:432",
+   "func": "summarize_session"
+  },
+  {
+   "method": "POST",
+   "path": "/slimapi/session/{session_id}/fork",
+   "defined_at": "src/oc_slimapi/routes/write_groups.py:440",
+   "func": "fork_session"
+  },
+  {
+   "method": "POST",
+   "path": "/slimapi/session/{session_id}/revert",
+   "defined_at": "src/oc_slimapi/routes/write_groups.py:448",
+   "func": "revert_session"
+  },
+  {
+   "method": "POST",
+   "path": "/slimapi/session/{session_id}/permissions/{permission_id}",
+   "defined_at": "src/oc_slimapi/routes/write_groups.py:455",
+   "func": "respond_permission"
+  },
+  {
+   "method": "POST",
+   "path": "/slimapi/question/{request_id}/reply",
+   "defined_at": "src/oc_slimapi/routes/write_groups.py:465",
+   "func": "reply_question"
+  },
+  {
+   "method": "POST",
+   "path": "/slimapi/question/{request_id}/reject",
+   "defined_at": "src/oc_slimapi/routes/write_groups.py:473",
+   "func": "reject_question"
+  },
+  {
+   "method": "POST",
+   "path": "/slimapi/session/{session_id}/command",
+   "defined_at": "src/oc_slimapi/routes/write_groups.py:481",
+   "func": "session_command"
+  },
+  {
+   "method": "POST",
+   "path": "/slimapi/session/{session_id}/agent",
+   "defined_at": "src/oc_slimapi/routes/write_groups.py:517",
+   "func": "session_agent"
+  },
+  {
+   "method": "POST",
+   "path": "/slimapi/session/{session_id}/model",
+   "defined_at": "src/oc_slimapi/routes/write_groups.py:531",
+   "func": "session_model"
+  },
+  {
+   "method": "POST",
+   "path": "/slimapi/session/{session_id}/revert/stage",
+   "defined_at": "src/oc_slimapi/routes/write_groups.py:545",
+   "func": "revert_stage"
+  },
+  {
+   "method": "POST",
+   "path": "/slimapi/session/{session_id}/revert/clear",
+   "defined_at": "src/oc_slimapi/routes/write_groups.py:560",
+   "func": "revert_clear"
+  },
+  {
+   "method": "POST",
+   "path": "/slimapi/session/{session_id}/revert/commit",
+   "defined_at": "src/oc_slimapi/routes/write_groups.py:573",
+   "func": "revert_commit"
+  }
+ ],
+ "include_router": [
+  {
+   "file": "src/oc_slimapi/app.py",
+   "line": 761,
+   "router_var": "router",
+   "prefix": ""
+  }
+ ],
+ "env_vars_read": [
+  "OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS",
+  "OC_SLIMAPI_ACCESS_LOG_COMPRESS_ON_STARTUP",
+  "OC_SLIMAPI_ACCESS_LOG_DIR",
+  "OC_SLIMAPI_ACCESS_LOG_ENABLED",
+  "OC_SLIMAPI_ACCESS_LOG_MAINTENANCE_INTERVAL_S",
+  "OC_SLIMAPI_ACCESS_LOG_PATH",
+  "OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS",
+  "OC_SLIMAPI_ACTIONS_FILE",
+  "OC_SLIMAPI_ACTIONS_MAX_CONCURRENT",
+  "OC_SLIMAPI_CATALOG_CACHE_MAX_BYTES",
+  "OC_SLIMAPI_CATALOG_CACHE_MAX_ENTRIES",
+  "OC_SLIMAPI_CATALOG_CACHE_MAX_ENTRY_BYTES",
+  "OC_SLIMAPI_CATALOG_CACHE_TTL_SECONDS",
+  "OC_SLIMAPI_CLIENT_ID_HASH",
+  "OC_SLIMAPI_CLIENT_ID_SALT",
+  "OC_SLIMAPI_COALESCE_ENABLED",
+  "OC_SLIMAPI_DBAUX_PROBE_INTERVAL_S",
+  "OC_SLIMAPI_DEPLOYMENT_REVISION",
+  "OC_SLIMAPI_DEPLOYMENT_REVISION_FILE",
+  "OC_SLIMAPI_DIRECTORY_ALLOWLIST",
+  "OC_SLIMAPI_ETAG_ENABLED",
+  "OC_SLIMAPI_HOST",
+  "OC_SLIMAPI_LOG_LEVEL",
+  "OC_SLIMAPI_MAX_EXPAND_RESPONSE_BYTES",
+  "OC_SLIMAPI_MAX_MESSAGE_BYTES",
+  "OC_SLIMAPI_MAX_RESPONSE_BYTES",
+  "OC_SLIMAPI_MAX_SUBSCRIBERS_PER_DIRECTORY",
+  "OC_SLIMAPI_MAX_TOTAL_SUBSCRIBERS",
+  "OC_SLIMAPI_MAX_TRANSFORMS",
+  "OC_SLIMAPI_MERGED_FANOUT",
+  "OC_SLIMAPI_MERGED_MAX_BYTES",
+  "OC_SLIMAPI_MERGED_MAX_FULLS_PER_PAGE",
+  "OC_SLIMAPI_MESSAGE_FINGERPRINT_ENABLED",
+  "OC_SLIMAPI_OPENCODE_DB",
+  "OC_SLIMAPI_PERMISSIONS_FANOUT",
+  "OC_SLIMAPI_PERMISSIONS_MAX_AGGREGATE_BYTES",
+  "OC_SLIMAPI_PERMISSIONS_MAX_RESPONSE_BYTES",
+  "OC_SLIMAPI_PORT",
+  "OC_SLIMAPI_QP_SWEEP_DAILY_BUDGET",
+  "OC_SLIMAPI_QP_SWEEP_ENABLED",
+  "OC_SLIMAPI_QP_SWEEP_INTERVAL_SECONDS",
+  "OC_SLIMAPI_QUESTIONS_FANOUT_CONCURRENCY",
+  "OC_SLIMAPI_QUESTIONS_MAX_AGGREGATE_BYTES",
+  "OC_SLIMAPI_QUESTIONS_MAX_RESPONSE_BYTES",
+  "OC_SLIMAPI_RAW_FETCH_CONCURRENCY",
+  "OC_SLIMAPI_RAW_FETCH_MAX_BYTES",
+  "OC_SLIMAPI_REPLAY_BYTES_KB",
+  "OC_SLIMAPI_REPLAY_COUNT",
+  "OC_SLIMAPI_REPLAY_TTL_S",
+  "OC_SLIMAPI_SERVER_API_VERSION",
+  "OC_SLIMAPI_SHELL_DENY_LIST_ENABLED",
+  "OC_SLIMAPI_SKELETON_INLINE_OUTPUT_MAX_BYTES",
+  "OC_SLIMAPI_SKELETON_INLINE_OUTPUT_MAX_MESSAGE_BYTES",
+  "OC_SLIMAPI_SMOKE_SESSION_ID",
+  "OC_SLIMAPI_SSE_BUFFER_BYTES",
+  "OC_SLIMAPI_SSE_MAX_FRAME_BYTES",
+  "OC_SLIMAPI_SSE_QUEUE_ITEMS",
+  "OC_SLIMAPI_STATE_DIR",
+  "OC_SLIMAPI_TOKEN_STREAM_BUFFER_BYTES",
+  "OC_SLIMAPI_TOKEN_STREAM_DEBUG_",
+  "OC_SLIMAPI_TOKEN_STREAM_DEBUG_LIVE_BUDGET_BYTES",
+  "OC_SLIMAPI_TOKEN_STREAM_DEBUG_LIVE_PARTS_MAX",
+  "OC_SLIMAPI_TOKEN_STREAM_DEBUG_PART_MAX_BYTES",
+  "OC_SLIMAPI_TOKEN_STREAM_MAX_FRAME_BYTES",
+  "OC_SLIMAPI_TOKEN_STREAM_MAX_SUBSCRIBERS",
+  "OC_SLIMAPI_TOKEN_STREAM_QUEUE_ITEMS",
+  "OC_SLIMAPI_TRAFFIC_METRICS_ENABLED",
+  "OC_SLIMAPI_TRAFFIC_SNAPSHOT_ENABLED",
+  "OC_SLIMAPI_TRAFFIC_SNAPSHOT_INTERVAL_S",
+  "OC_SLIMAPI_TRAFFIC_SNAPSHOT_PATH",
+  "OC_SLIMAPI_TRAFFIC_SNAPSHOT_RETAIN_DAYS",
+  "OC_SLIMAPI_TRANSFORM_ABSORB_BUDGET_SECONDS",
+  "OC_SLIMAPI_TRANSFORM_WAIT_SECONDS",
+  "OC_SLIMAPI_UPSTREAM"
+ ],
+ "error_codes": [
+  "action_busy",
+  "action_confirm_required",
+  "action_not_found",
+  "action_throttled",
+  "action_timeout",
+  "action_unavailable",
+  "actions_disabled",
+  "auxiliary_unavailable",
+  "directory_conflict",
+  "directory_header_retired",
+  "directory_not_allowed",
+  "directory_retired_in_v4",
+  "expand_category_mismatch",
+  "expand_fragment_too_large",
+  "expand_target_not_found",
+  "invalid_cursor",
+  "invalid_directory",
+  "invalid_directory_selector",
+  "invalid_request_body",
+  "invalid_tokens",
+  "invalid_version_selector",
+  "method_not_allowed",
+  "method_not_applicable",
+  "param_version_mismatch",
+  "provider_upstream_malformed",
+  "request_too_large",
+  "response_too_large",
+  "session_not_found",
+  "tokens_stream_retired_in_v4",
+  "unsupported_version",
+  "upstream_http_500",
+  "upstream_invalid_shape",
+  "upstream_unavailable",
+  "websocket_not_supported"
+ ],
+ "todo_markers": [
+  {
+   "path": "src/oc_slimapi/sse/tokenstream/hub.py",
+   "line": 663,
+   "text": "# TODO(§13.2): confirm live wire key casing for properties.part."
+  },
+  {
+   "path": "src/oc_slimapi/sse/tokenstream/hub.py",
+   "line": 760,
+   "text": "# TODO(§13.2): confirm live wire key casing for properties fields."
+  }
+ ],
+ "tracked_executables": [
+  {
+   "path": "deploy/actions.manifest.example.toml",
+   "lines": 55
+  },
+  {
+   "path": "deploy/oc-slimapi.service",
+   "lines": 73
+  },
+  {
+   "path": "deploy/stunnel.conf",
+   "lines": 29
+  },
+  {
+   "path": "pyproject.toml",
+   "lines": 32
+  },
+  {
+   "path": "scripts/check.sh",
+   "lines": 37
+  },
+  {
+   "path": "scripts/check_routes_doc.py",
+   "lines": 322
+  },
+  {
+   "path": "scripts/eqp_matrix.py",
+   "lines": 564
+  },
+  {
+   "path": "scripts/measure_token_overhead.md",
+   "lines": 85
+  },
+  {
+   "path": "scripts/measure_token_overhead.py",
+   "lines": 416
+  },
+  {
+   "path": "scripts/release.sh",
+   "lines": 96
+  }
+ ],
+ "tracked_files_total": 260,
+ "generator": {
+  "path": "/tmp/opencode/probes/0b836e78c5de62d0c73b8593bf62c6650043dedf/primary/gen_inventory.py",
+  "sha256": "40236fadf520dd914091a77f96d1dd0b5a80237268e6127e86aad6966c739cd6"
+ }
+}
