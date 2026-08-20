@@ -20,7 +20,9 @@ Frozen wire semantics (docs/specs/v4-contract.md §12 — authoritative):
   equals ``Model.id``; ``variants`` emits only the sorted map-key array
   (a present-but-non-map ``variants`` is the one optional-key error);
   optional keys (``source``/``status``) pass verbatim iff string, else
-  the key is omitted (never ``null``).
+  the key is omitted (never ``null``); ``limit`` (修订三) passes its
+  int sub-keys ({context, input, output} whitelist) verbatim — any
+  other ``limit`` shape is omitted key/sub-key, never an error.
 * **§12.2 ordering** — providers by id UTF-8 byte order (globally
   unique), models by upstream map-key byte order, variants by key byte
   order, ``default`` keys sorted at serialization (OPT_SORT_KEYS).
@@ -61,7 +63,22 @@ MAX_PROJECTED_BODY_BYTES: Final[int] = 8_388_608  # 8 MiB identity pre-gzip
 # marker this is a domain DISTINCT from the v3 passthrough REP_VERSION
 # (which is skeleton-based) — the passthrough→projection switch itself
 # rotates all validators by construction.
-PROVIDERS_REPRESENTATION_VERSION: Final[bytes] = b"providers-projection-v1"
+PROVIDERS_REPRESENTATION_VERSION: Final[bytes] = b"providers-projection-v2"
+# v2 = [2026-08-20 修订三] ModelEntry restores the optional ``limit``
+# sub-object ({context, input, output} whitelist, per-subkey
+# int-else-omit) — the projected body changes shape, so every v4
+# validator must rotate (old ETags invalidate and re-fetch; the v3
+# passthrough REP_VERSION domain is untouched by construction).
+
+# [2026-08-20 修订三] The "int" in limit's per-subkey int-else-omit is
+# the range the FROZEN canonical algorithm (orjson) can serialise —
+# empirically verified 2026-08-20: 2**64-1 encodes fine, 2**64 and
+# -(2**63)-1 raise ``TypeError: Integer exceeds 64-bit range`` (which
+# would otherwise escape the worker as a route 500 and violate the
+# frozen "no upstream limit shape is ever an error" ruling). Out-of-
+# range integers take the SAME omission path as non-int values.
+_ORJSON_INT_MIN: Final[int] = -(2**63)
+_ORJSON_INT_MAX: Final[int] = 2**64 - 1
 
 _ETAG_SCHEME_VERSION: Final[bytes] = b"etag-v1"
 
@@ -312,6 +329,30 @@ def _project(validated: list[tuple[str, dict]],
                 # only the map keys survive; empty map → []
                 projected_model["variants"] = sorted(
                     variants_in, key=_utf8_key)
+            # [2026-08-20 修订三] optional ``limit``: model spec (the
+            # context-window denominator consumers like oc-webui need),
+            # NOT sensitive. Omission-only policy — no upstream shape is
+            # ever an error: absent/null/non-object → whole key omitted;
+            # sub-key whitelist is EXACTLY {context, input, output} with
+            # independent int-else-omit per sub-key (bool explicitly
+            # excluded: isinstance(True, int) is True in Python; "int"
+            # additionally means within the frozen canonical algorithm's
+            # serialisable range [-(2**63), 2**64-1] — see
+            # _ORJSON_INT_MIN/_MAX); unknown sub-keys are discarded like
+            # any unknown field; zero surviving sub-keys → whole key
+            # omitted (never "limit": {} and never "limit": null).
+            limit_in = model.get("limit")
+            if isinstance(limit_in, dict):
+                limit_out: dict[str, int] = {}
+                for sub_key in ("context", "input", "output"):
+                    sub_value = limit_in.get(sub_key)
+                    if isinstance(sub_value, int) \
+                            and not isinstance(sub_value, bool) \
+                            and _ORJSON_INT_MIN <= sub_value \
+                            <= _ORJSON_INT_MAX:
+                        limit_out[sub_key] = sub_value
+                if limit_out:
+                    projected_model["limit"] = limit_out
             models_out.append(projected_model)
 
         provider_out: dict[str, Any] = {

@@ -1,4 +1,4 @@
-# oc-slimapi v4 wire 契约（4.0.0 实施基线 + 2026-08-19 正式修订；修订二：POST 等效动作族——已实施，待发版）
+# oc-slimapi v4 wire 契约（4.0.0 实施基线 + 2026-08-19 正式修订；修订二：POST 等效动作族——已发版 v4.3.0；修订三 [2026-08-20]：providers 投影 ModelEntry 恢复 optional limit——已发版 v4.4.0）
 
 > **状态**：**4.0.0 实施基线（2026-08-18，B3a+B3b 已落地）+ 2026-08-19 正式修订（owner 裁决：修订并入 v4——v4 尚无消费方，修订无破坏影响）**。B0 批冻结全部可观察语义（2026-08-17，rev-6 PASS-with-notes + S-B01 四项 owner 终裁全收敛）；wire 终态 = 4.0.0（`ACCEPTED_CLIENT_VERSIONS` (3,3)→(3,4)）。B3a 批（阶段 A selector 双版本 / B1 dbaux 连接生命周期 / B2 投影 SQL / B3 cursor / B4 路由分叉降级矩阵 / B5 观测）已按本契约落地并全量测试通过；B3b 批（SSE id:/重放、§7 全量、能力键 `sseReplay`/`qpImmediateFull` 广告）**已落地**。S-B01 四项（§7.0）**已全部 owner 终裁（2026-08-17）**；其余章节（含 DB 设计 R1/R2/R3/R6，已凭真库实证冻结——见 design-v4-dbaux §0.2）均为冻结语义。
 > **2026-08-19 正式修订范围**（各修订节带**当前状态注记**——现行已发布行为 → 修订后冻结目标，实现批次随后落地）：providers 安全投影（§12）/ session 单查 parity（§13）/ expand 闭环（§14）/ 表示层（§15）/ method 边界与修订 non-goals（§16-§17）/ readiness 门禁（§3.3）。修订仅作用 `?v=4` 视图，`?v=3` 零改动（v3 冻结）；无新 major、无版本窗变更（`ACCEPTED_CLIENT_VERSIONS` 仍 (3,4)）。设计出处：`docs/ocmar/plans/2026-08-19-v4-rebaseline.md` §4-§7（owner 终裁 2026-08-19）。
@@ -378,9 +378,11 @@ v4 sessions 归入 sessions 桶既有记账；降级路径请求带 degraded 标
 | 11.11 | DB schema 变更兼容 / 运行中迁移 | 上游升版列变更 → 门失败降级；运行中 inode swap | B3a-B1/B6 |
 | 11.12 | 冷启动 | P99 warmup 豁免；首查延迟 | B3a-B1 |
 
-## §12 Provider 安全投影（`GET /slimapi/config/providers?v=4`）[2026-08-19 修订冻结]
+## §12 Provider 安全投影（`GET /slimapi/config/providers?v=4`）[2026-08-19 修订冻结；修订三 [2026-08-20]：ModelEntry 恢复 optional `limit`——已发版 v4.4.0]
 
 > **当前状态**：现行该路由 `?v=3` / `?v=4` 行为相同（legacy provider map 受控代理 + 既有 ETag，§10 发布态「零 v4 差异」读组）。本节为 `?v=4` 冻结目标——当 feature `providers.redacted.v4` 进入 `satisfied`（§3.3 门控）时生效；`?v=3` 恒透传不变（v3 冻结）。
+
+> **修订三 [2026-08-20]**（owner 批准的正式契约修订；消费方 oc-webui 已确认嵌套形状）：§12.1 ModelEntry 恢复 optional `limit`（子键白名单恰好 `{context, input, output}`，逐子键 int-else-omit）。**动因**：`limit` 是模型规格参数（上下文窗口 / input / output 上限）**非敏感信息**——上游 schema（opencode v1.18.18 `packages/schema/src/model.ts:81-85`）本就携带；v3 raw 透传含 limit，v4 投影丢失使 oc-webui 上下文百分比失去分母。**纯加性 schema 演进**：providers.redacted.v4 面内（无新 readiness feature ID，§3.3 全集不变）、无新 malformed 错误路径（§12.5.3 错误表零增量）、§12.4 四项限额不变（limit 增量约 48B/model 由既有 `projected_body_bytes` 自然覆盖）；表示域投影指纹 bump（§12.6 REP_VERSION `providers-projection-v1` → `v2`），升级后旧 v4 ETag 自然失效重拉，v3 校验器域不受影响。
 
 同路径投影（无 `/safe` 新路径、无负向黑名单）。数据源 = 上游 `ConfigProvidersResult` `{providers: Info[], default: DefaultModelIDs}`（native HTTP）。
 
@@ -403,13 +405,24 @@ type ModelEntry = {
   providerID: string                // required；必须 == 所属 provider.id
   status?: string                   // optional：上游值为 string 时逐字透传；absent/null/非 string → 省略键（不报错）
   variants?: string[]               // optional：上游存在 variants 时必须为 map（否则 malformed）；值为 map key 的排序数组；空 map → []
+  // [2026-08-20 修订三] optional。上游 schema（opencode v1.18.18
+  // packages/schema/src/model.ts:81-85）为 limit: {context: Int, input?: Int,
+  // output: Int}——context/output 在上游为必填。但那是上游的校验语义；投影层
+  // 三子键一律 optional：投影是「省略策略」不是「校验策略」——上游子键缺席/
+  // 错型一律静默省略该子键，绝不报错、绝不补默认值。模型规格参数非敏感信息。
+  limit?: {
+    context?: number                // 子键白名单恰好 {context, input, output}；逐子键独立 int-else-omit（bool 非法）
+    input?: number
+    output?: number
+  }
 }
 ```
 
 - **顶层恰好两 key**：`providers` + `default`；**多余/缺失顶层 key = malformed**（不猜测、不部分转换）。
 - **嵌套规则（冻结）**："Unknown provider/model fields are discarded recursively"——provider/model 内未知字段**递归丢弃**（丢弃不报错）；仅顶层受 exact-two-key 约束。
-- **确定性丢弃清单**（上游存在但不进投影）：`Info.env`/`Info.key`/`Info.options`；model 的 `api`/`capabilities`/`cost`/`limit`/`options`/`headers`/`release_date`；variant 内除 map key 外一切（`name`/`status` 等不进 wire）。
+- **确定性丢弃清单**（上游存在但不进投影）：`Info.env`/`Info.key`/`Info.options`；model 的 `api`/`capabilities`/`cost`/`options`/`headers`/`release_date`（`limit` 曾列于此，修订三恢复进投影——见下条）；variant 内除 map key 外一切（`name`/`status` 等不进 wire）。
 - **optional 字段策略（冻结）**：`source`/`status` 为 absent / null / 非 string → **省略该字段**（不报错、不猜测、无发明枚举）——任何响应绝无 `"source": null`/`"status": null`；`variants` **absent → 省略键**，**存在则必须为 map（object）**，非 map = malformed（§12.5.3）。**字段策略维度的 malformed 全部来源 = required 字段（provider `id`/`name`/`models`，model `id`/`name`/`providerID`）缺失或错型，加上唯一一条 optional-key 错误路径：`variants` 存在但非 map**——除上述来源外，`source`/`status` 的任何上游形态都不产生错误（一律省略该键）；同一输入在合规实现间**唯一结果**。
+- **`limit` optional 省略策略（修订三 [2026-08-20]，冻结）**：上游 `limit` 键 absent / null / 非 object（str/num/array/bool）→ **省略整键，不报错**（任何响应绝无 `"limit": null`）；子键白名单**恰好 {`context`, `input`, `output`}**，逐子键独立 **int-else-omit**——子键存在且值为 int（**显式排除 bool**）→ 逐字透传该子键；缺席/null/非 int（含 float/bool/str）→ 省略该子键；逐子键投影后**零子键存活 → 省略整个 limit 键**（任何响应绝无 `"limit": {}`）；未知子键（如 `limit.reasoning`）丢弃不报错（与「递归丢弃未知字段」一致）。**「int」判定 = 冻结 canonical 算法（orjson）可序列化整数范围 `[-2^63, 2^64-1]`（2026-08-20 实证边界：`2^64`/`-(2^63)-1` 抛 orjson 超界错误；实现以模块内实测边界常量为准）——超界整数值 → 按非 int 处理省略该子键，仍零错误路径，绝不落入 `provider_upstream_malformed`**。`limit` 的**任何上游形态都不产生错误**——上款「字段策略维度的 malformed 全部来源」穷尽句**不因修订三增加任何来源**（§12.5.3 错误表零增量）。
 - **`variants` absent ⇔ 上游无 variants map**；存在时 = 该 map 全部 key 的排序数组（含空 map → `[]`）。
 - `Info.models` 的 **map key == 发出的 `Model.id`**，不一致 = malformed；发出的每个 model `providerID` == 容器 provider 的 `id`，违反 = malformed。
 
@@ -511,7 +524,7 @@ type ModelEntry = {
 
 - **canonical body（canonical 字节冻结）**：canonical 字节 = `orjson.dumps(value, option=orjson.OPT_SORT_KEYS)` 的逐字节输出——UTF-8 直出非 ASCII、不转义 `/`、控制字符转义按 orjson 实测形态（`\n`/`\t`/`\b`/`\f`/`\r` 五个短转义；其余 C0 控制字符 `\uXXXX`；DEL `0x7f` 与 U+2028/U+2029 直出不转义）、紧凑分隔符；**orjson 语义即冻结算法**（转义形态随 orjson 实际输出冻结，不另行规定）；一切 object 含 `default` map 按 key UTF-8 字节序；数组序按 §12.2。**canonical 序列化产生的字节就是 wire body**——ETag 哈希对象 = 实际发送的 canonical identity bytes，不存在另一份重排副本（同一字节双重身份：传输体与哈希输入）。ETag 输入**永不**是上游原始字节；同一上游输入 → 同一 canonical 字节 → 同一 validator。
 - **validator 规则（`src/oc_slimapi/etag.py` 口径）**：identity → 强 validator `"<sha256hex>"`；gzip → 弱 validator `W/"<sha256hex>"`；hash 输入 = `REP_VERSION + NUL + coding + NUL + canonical identity body`（全量 hex，不截断）。
-- **REP_VERSION 域隔离**：含 wire-view 标记 + 投影/配置指纹——v3 validator 与修订后 v4 validator 互不匹配；修订切换（透传 → 投影）本身经 REP_VERSION 投影版本轮换全部 validator（v2 §6.2 机制继承），构造上不可能误 304；上游自身 ETag 不透传（sidecar 生成域，v3 §6.1 不变）。
+- **REP_VERSION 域隔离**：含 wire-view 标记 + 投影/配置指纹——v3 validator 与修订后 v4 validator 互不匹配；修订切换（透传 → 投影）本身经 REP_VERSION 投影版本轮换全部 validator（v2 §6.2 机制继承），构造上不可能误 304；上游自身 ETag 不透传（sidecar 生成域，v3 §6.1 不变）。**修订三注记 [2026-08-20]**：投影字段集演进（ModelEntry 恢复 optional `limit`）同样经指纹 bump 轮换（实现值 `providers-projection-v1` → `v2`）——同输入下新旧 v4 validator 必然不同，旧 ETag 全部自然失效重拉。
 - **`Vary: Accept-Encoding` 强制**（§15）；`If-None-Match`/`*`/judge 三态沿用 v3 §6 冻结行为；200/304 均 `Cache-Control: no-store`（ETag 仅省下行传输字节，管线照跑，非缓存授权）。
 - **ETag 开关**：继承 `OC_SLIMAPI_ETAG_ENABLED`（缺省开）。关闭 → 本路由无 `ETag`、无 304 判定；**`Vary: Accept-Encoding` 仍发**——表示可变性与 ETag 正交。readiness 不受该开关影响：`representation.vary.v4` 恒可满足（§3.3）。
 
@@ -623,7 +636,7 @@ envelope.degraded == (任一 item.degraded == true) ∨ (本响应采用 native 
 - **域隔离（冻结）**：缓存键 / singleflight 键 / ETag REP_VERSION 均含 wire-view 标记——v3 与修订后 v4 validator 互不匹配，跨视图 `If-None-Match` 保守 200；修订切换（无 ETag → 有 ETag）经 REP_VERSION 投影版本轮换，不可能误 304。
 - v4 sessions 以外的 v4 路由：ETag/Vary 语义与 v3 发布态一致（§6「v3 原样」延续）；providers 路由修订后按 §12.6 口径。
 
-## §16 POST 等效动作族 + method 边界 [2026-08-19 修订冻结；**修订二：POST 等效动作族——已实施，待发版**]
+## §16 POST 等效动作族 + method 边界 [2026-08-19 修订冻结；**修订二：POST 等效动作族——已发版 v4.3.0**]
 
 > **当前状态**：修订一（feature `method.boundary.v4`，v4.2.0 已 `satisfied`）已落地——三条 POST 组合在 `?v=4` 下返回精确 405 `method_not_applicable`（§16.1，现行为）。**修订二**（owner 裁决 2026-08-19，新 feature `session.post-actions.v4`，§3.3 第 10 ID）为本节冻结目标：该 ID 进入 `satisfied` 时三条 POST 激活为等效路由、§16.1 的 405 拒绝面按**声明式组合优先级**让位（§16.2/§16.3 四位组合表；依赖蕴含 `session.post-actions.v4 ⇒ method.boundary.v4` 见 §3.3）。**全部仅 `?v=4` 视图；`?v=3` 冻结零改动**（三组合在 v3 → 404 `thin_route_not_found` 现状，任何阶段不变）。**加性并存，非替代**：PATCH/DELETE 在 v3/v4 均继续可用，v4 继承不退役。
 

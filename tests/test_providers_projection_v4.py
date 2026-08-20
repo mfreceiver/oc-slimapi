@@ -34,6 +34,7 @@ import orjson
 import pytest
 from fastapi import FastAPI
 
+from oc_slimapi import etag as etag_mod
 from oc_slimapi.config import Settings
 from oc_slimapi.errors import register_error_handlers
 from oc_slimapi.providers_projection import (
@@ -41,8 +42,10 @@ from oc_slimapi.providers_projection import (
     MAX_PROJECTED_BODY_BYTES,
     MAX_PROVIDERS,
     MAX_VARIANTS_PER_MODEL,
+    PROVIDERS_REPRESENTATION_VERSION,
     ProviderProjectionLimit,
     project_and_pack,
+    providers_rep_version,
 )
 from oc_slimapi.routes import read_groups
 from oc_slimapi.selector import SlimapiSelectorMiddleware
@@ -148,11 +151,14 @@ def _rich_projected() -> dict:
                 "source": "config",
                 "models": [
                     {"id": "claude-haiku", "name": "name-claude-haiku",
-                     "providerID": "anthropic", "variants": []},
+                     "providerID": "anthropic",
+                     "limit": {"context": 8192}, "variants": []},
                     {"id": "claude-opus-4", "name": "name-claude-opus-4",
-                     "providerID": "anthropic"},
+                     "providerID": "anthropic",
+                     "limit": {"context": 8192}},
                     {"id": "claude-sonnet-4", "name": "name-claude-sonnet-4",
                      "providerID": "anthropic", "status": "active",
+                     "limit": {"context": 8192},
                      "variants": ["a-b", "chrome", "vscode"]},
                 ],
             },
@@ -161,7 +167,8 @@ def _rich_projected() -> dict:
                 "name": "OpenAI",
                 "models": [
                     {"id": "gpt-4o", "name": "name-gpt-4o",
-                     "providerID": "openai"},
+                     "providerID": "openai",
+                     "limit": {"context": 8192}},
                 ],
             },
         ],
@@ -307,6 +314,228 @@ async def test_v4_optional_keys_all_omission_forms():
     assert models["m3"]["variants"] == []
     assert "variants" not in models["m1"]
     assert "variants" not in models["m2"]
+
+
+# --- [2026-08-20 修订三] ModelEntry optional `limit` projection -------------
+#
+# 修订三（owner 批准；消费方 oc-webui 已确认嵌套形状）：ModelEntry 恢复
+# optional ``limit``——模型规格参数（上下文窗口分母），非敏感信息。子键
+# 白名单恰好 {context, input, output}，逐子键独立 int-else-omit（bool 显式
+# 排除——isinstance(True, int) 为 True 是 Python 陷阱）；limit 的任何上游
+# 形态都不产生 malformed；零子键存活 → 整键省略（绝无 "limit": null /
+# "limit": {}）。
+
+
+def _model_no_limit(mid: str, pid: str) -> dict:
+    """Upstream Model with the limit key entirely absent."""
+    model = _model(mid, pid)
+    del model["limit"]
+    return model
+
+
+async def test_v4_limit_three_int_subkeys_passthrough_verbatim():
+    # webui 实际案例量级：context=1000000 大窗口 + input/output 逐字透传。
+    doc = _one_provider_doc(providers=[{
+        "id": "p0", "name": "P0",
+        "models": {"m0": _model("m0", "p0", extra={
+            "limit": {"context": 1000000, "input": 500000,
+                      "output": 64000}})},
+    }])
+    async with _stack(_ok(_canonical(doc))) as (client, _app, _s):
+        r = await client.get(f"{ROUTE}?v=4", headers=IDENTITY)
+    assert r.status_code == 200
+    model = r.json()["providers"][0]["models"][0]
+    assert model["limit"] == {"context": 1000000, "input": 500000,
+                              "output": 64000}
+
+
+async def test_v4_limit_absent_null_non_object_omitted_never_malformed():
+    # limit absent / null / "str" / 42 / [1] / true → 整键省略，一律 200
+    # （§12.1 optional 省略策略；无新增 malformed 路径）。
+    doc = _one_provider_doc(providers=[{
+        "id": "p0", "name": "P0",
+        "models": {
+            "m0": _model_no_limit("m0", "p0"),
+            "m1": _model("m1", "p0", extra={"limit": None}),
+            "m2": _model("m2", "p0", extra={"limit": "8192"}),
+            "m3": _model("m3", "p0", extra={"limit": 42}),
+            "m4": _model("m4", "p0", extra={"limit": [1]}),
+            "m5": _model("m5", "p0", extra={"limit": True}),
+        },
+    }])
+    async with _stack(_ok(_canonical(doc))) as (client, _app, _s):
+        r = await client.get(f"{ROUTE}?v=4", headers=IDENTITY)
+    assert r.status_code == 200  # 修订三：limit 无任何 malformed 形态
+    models = {m["id"]: m for m in r.json()["providers"][0]["models"]}
+    for mid in ("m0", "m1", "m2", "m3", "m4", "m5"):
+        assert "limit" not in models[mid], mid
+
+
+async def test_v4_limit_subkeys_independent_int_else_omit():
+    # 子键 null / str / float → 该子键省略、其余存活；子键 bool → 省略
+    # （防 isinstance(True, int) 陷阱——显式排除 bool）。
+    doc = _one_provider_doc(providers=[{
+        "id": "p0", "name": "P0",
+        "models": {
+            "m0": _model("m0", "p0", extra={
+                "limit": {"context": None, "input": 100, "output": 200}}),
+            "m1": _model("m1", "p0", extra={
+                "limit": {"context": "8192", "input": 100, "output": 200}}),
+            "m2": _model("m2", "p0", extra={
+                "limit": {"context": 8192.5, "input": 100, "output": 200}}),
+            "m3": _model("m3", "p0", extra={
+                "limit": {"context": True, "input": False, "output": 200}}),
+        },
+    }])
+    async with _stack(_ok(_canonical(doc))) as (client, _app, _s):
+        r = await client.get(f"{ROUTE}?v=4", headers=IDENTITY)
+    assert r.status_code == 200
+    models = {m["id"]: m for m in r.json()["providers"][0]["models"]}
+    assert models["m0"]["limit"] == {"input": 100, "output": 200}
+    assert models["m1"]["limit"] == {"input": 100, "output": 200}
+    assert models["m2"]["limit"] == {"input": 100, "output": 200}
+    assert models["m3"]["limit"] == {"output": 200}
+
+
+async def test_v4_limit_all_subkeys_non_int_omits_whole_key():
+    # 三子键全部非 int → limit 整键省略（绝无 "limit": {}）；本 doc 仅
+    # 一个 model，故整个响应体不得出现 "limit" 字样。
+    doc = _one_provider_doc(providers=[{
+        "id": "p0", "name": "P0",
+        "models": {"m0": _model("m0", "p0", extra={
+            "limit": {"context": "x", "input": None, "output": True}})},
+    }])
+    async with _stack(_ok(_canonical(doc))) as (client, _app, _s):
+        r = await client.get(f"{ROUTE}?v=4", headers=IDENTITY)
+    assert r.status_code == 200
+    assert "limit" not in r.json()["providers"][0]["models"][0]
+    assert b'"limit"' not in r.content  # 无 {} / null / 任何形态
+
+
+async def test_v4_limit_unknown_subkeys_dropped():
+    # 未知子键（limit.reasoning）丢弃不报错——与递归丢弃未知字段一致。
+    doc = _one_provider_doc(providers=[{
+        "id": "p0", "name": "P0",
+        "models": {"m0": _model("m0", "p0", extra={
+            "limit": {"context": 8192, "reasoning": 1}})},
+    }])
+    async with _stack(_ok(_canonical(doc))) as (client, _app, _s):
+        r = await client.get(f"{ROUTE}?v=4", headers=IDENTITY)
+    assert r.status_code == 200
+    assert r.json()["providers"][0]["models"][0]["limit"] == \
+        {"context": 8192}
+
+
+async def test_v4_limit_subkeys_canonical_byte_order():
+    # 上游子键乱序（output/input/context）→ canonical 输出按 UTF-8 字节序
+    # context < input < output（OPT_SORT_KEYS，§12.6 口径）。
+    doc = _one_provider_doc(providers=[{
+        "id": "p0", "name": "P0",
+        "models": {"m0": _model("m0", "p0", extra={
+            "limit": {"output": 3, "input": 2, "context": 1}})},
+    }])
+    async with _stack(_ok(_canonical(doc))) as (client, _app, _s):
+        r = await client.get(f"{ROUTE}?v=4", headers=IDENTITY)
+    assert r.status_code == 200
+    assert b'"limit":{"context":1,"input":2,"output":3}' in r.content
+    idx = r.content.index(b'"limit"')
+    segment = r.content[idx:idx + 64]
+    assert segment.index(b'"context"') < segment.index(b'"input"') < \
+        segment.index(b'"output"')
+
+
+async def test_v4_limit_revision3_bumps_representation_fingerprint():
+    # 修订三字段集演进必须轮换表示域指纹：同输入下与 bump 前的
+    # providers-projection-v1 validator 不同（旧 v4 ETag 全部自然失效
+    # 重拉；v3 校验器域不受影响——见 test_v4_validator_domain_isolated_
+    # from_v3）。
+    assert PROVIDERS_REPRESENTATION_VERSION == b"providers-projection-v2"
+    rep = providers_rep_version(_settings())
+    assert b"providers-projection-v2" in rep
+    assert b"providers-projection-v1" not in rep
+    canonical = _canonical({"providers": [], "default": {}})
+    old = etag_mod.compute_etag(
+        canonical, "identity", b"providers-projection-v1")
+    new = etag_mod.compute_etag(canonical, "identity", rep)
+    assert old != new
+
+
+async def test_v4_limit_int_range_is_orjson_serializable():
+    # P1 回归（rev-cgpt 修订三轮询）：int-else-omit 的「int」= 冻结
+    # canonical 算法（orjson）可序列化整数范围 [-(2**63), 2**64-1]
+    # （2026-08-20 实证：2**64-1 OK、2**64 与 -(2**63)-1 抛
+    # TypeError "Integer exceeds 64-bit range"）。边界四点 + 10**30：
+    # 超界 → 与非 int 同路径省略该子键，响应 200，绝无 502
+    # provider_upstream_malformed（「limit 任意上游形态零错误」冻结）。
+    doc = _one_provider_doc(providers=[{
+        "id": "p0", "name": "P0",
+        "models": {
+            "m0": _model("m0", "p0", extra={
+                "limit": {"context": 2**64 - 1}}),           # 上界逐字透传
+            "m1": _model("m1", "p0", extra={
+                "limit": {"context": 2**64, "output": 8}}),   # 超上界省略
+            "m2": _model("m2", "p0", extra={
+                "limit": {"context": -(2**63)}}),             # 下界逐字透传
+            "m3": _model("m3", "p0", extra={
+                "limit": {"context": -(2**63) - 1, "input": 7}}),  # 超下界省略
+            "m4": _model("m4", "p0", extra={
+                "limit": {"context": 10**30}}),               # 远超界省略
+        },
+    }])
+    # orjson 无法序列化超界整数（正是被测风险），故上游载荷经 stdlib
+    # json 编码——模拟任意异构上游的 wire 形态，与 _surrogate_json 同法。
+    async with _stack(_ok(json.dumps(doc).encode("ascii"))) as (
+            client, _app, _s):
+        r = await client.get(f"{ROUTE}?v=4", headers=IDENTITY)
+    assert r.status_code == 200  # 不 502、不 500——零错误路径
+    assert b"provider_upstream_malformed" not in r.content
+    models = {m["id"]: m for m in r.json()["providers"][0]["models"]}
+    assert models["m0"]["limit"] == {"context": 2**64 - 1}
+    assert models["m1"]["limit"] == {"output": 8}
+    assert models["m2"]["limit"] == {"context": -(2**63)}
+    assert models["m3"]["limit"] == {"input": 7}
+    assert "limit" not in models["m4"]  # 唯一子键超界 → 整键省略
+    assert b"18446744073709551616" not in r.content  # 2**64 不在 wire 上
+    assert b"1000000000000000000000000000000" not in r.content
+
+
+async def test_v4_limit_zero_and_negative_ints_passthrough_verbatim():
+    # P2-1：0/负整数是合法 int → 逐字透传（钉住：不得加正数过滤）。
+    doc = _one_provider_doc(providers=[{
+        "id": "p0", "name": "P0",
+        "models": {"m0": _model("m0", "p0", extra={
+            "limit": {"context": 0, "input": -1, "output": -5}})},
+    }])
+    async with _stack(_ok(_canonical(doc))) as (client, _app, _s):
+        r = await client.get(f"{ROUTE}?v=4", headers=IDENTITY)
+    assert r.status_code == 200
+    assert r.json()["providers"][0]["models"][0]["limit"] == \
+        {"context": 0, "input": -1, "output": -5}
+
+
+async def test_v4_limit_subkey_nested_object_or_array_omitted():
+    # P2-2：子键值为嵌套 object/array → 该子键省略、其余合法 int 存活。
+    doc = _one_provider_doc(providers=[{
+        "id": "p0", "name": "P0",
+        "models": {"m0": _model("m0", "p0", extra={
+            "limit": {"context": {"a": 1}, "input": [1, 2],
+                      "output": 4096}})},
+    }])
+    async with _stack(_ok(_canonical(doc))) as (client, _app, _s):
+        r = await client.get(f"{ROUTE}?v=4", headers=IDENTITY)
+    assert r.status_code == 200
+    assert r.json()["providers"][0]["models"][0]["limit"] == \
+        {"output": 4096}
+
+
+async def test_v3_raw_limit_verbatim_passthrough_regression():
+    # v3 raw 透传原样含 limit（修订三不触 v3 任何行为）。
+    payload = _canonical(_rich_doc())
+    async with _stack(_ok(payload)) as (client, _app, _s):
+        r = await client.get(f"{ROUTE}?v=3", headers=IDENTITY)
+    assert r.status_code == 200
+    assert r.content == payload
+    assert b'"limit":{"context":8192}' in r.content
 
 
 # --- §12.1 malformed matrix ------------------------------------------------

@@ -26,6 +26,24 @@ ocdroid 对接时：
 
 ---
 
+## [4.4.0] - 2026-08-20 — v4 wire 正式修订三落地：providers 投影恢复 optional limit（包版本 minor；wire 版本**不变**，仍 (3,4)）
+
+> 动因：oc-webui 反馈 v4 投影剥掉 `limit`（模型规格参数非敏感，v3 raw 透传时代本就存在），上下文使用百分比失去分母；消费方已确认嵌套 `limit.context` 形状零改动兼容。纯加性 schema 演进，`providers.redacted.v4` 面内；实施经 rev-cgpt 发版门控评审（**9.2 FAIL→P1 修复→9.8 PASS**，门禁 9.5）。
+
+### Added（`?v=4` 修订面，providers.redacted.v4 面内）
+
+- **`GET /slimapi/config/providers?v=4` ModelEntry 恢复 optional `limit`**（§12.1 修订三）：子键白名单恰好 `{context, input, output}`，逐子键独立 **int-else-omit**——bool 显式排除；int 判定 = 冻结 canonical 算法（orjson）可序列化整数范围 `[-2^63, 2^64-1]`（2026-08-20 实测边界），超界整数按非 int 同路径省略。
+- **省略策略（零错误路径，冻结）**：上游 `limit` absent / null / 非 object → 整键省略；逐子键投影后零存活 → 省略整键（任何响应绝无 `"limit": null` / `"limit": {}`）；未知子键（如 `limit.reasoning`）丢弃不报错。`limit` **任何上游形态都不产生错误**——§12.1 malformed 穷尽句零增量、§12.5.3 错误表零增量。
+- **表示域投影指纹 bump**：`providers-projection-v1` → `v2`——升级后旧 v4 ETag 全部自然失效重拉（构造上不可能误 304）；v3 passthrough 校验器域不受影响（`?v=3` raw 透传含 limit 逐字节不变）。
+- **限额与 readiness 不变**：§12.4 四项投影限额（256 providers / 1024 models / 64 variants / 8 MiB body）不变（limit 增量约 48B/model 由既有 `projected_body_bytes` 自然覆盖）；§3.3 readiness 全集不变（无新 feature ID，本版 10/10 `ready:true`）。
+
+### 消费方提示
+
+- **oc-webui**（v4 消费方）：**零改动**即恢复精确上下文分母——`model.limit?.context`（与 v3 raw 时代同解析路径）；`limit.context` 缺失/0 的除零兜底前端已处理，估算降级链自动让位于精确值。
+- **ocdroid**（v3 消费方）：无影响——`?v=3` 逐字节不变。
+
+---
+
 ## [4.3.0] - 2026-08-20 — v4 wire 正式修订二落地：POST 等效动作族（包版本 minor；wire 版本**不变**，仍 (3,4)）
 
 > owner 裁决 2026-08-19（q1 非幂等可接受 / q2 POST 等效 / q3 永久 non-goal）；实施经 rev-glm 发版门控评审（**9.0 FAIL→P1 修复→放行**，五项 P0 全核清；rev-cgpt 两轮 NO_BINDING 作废后 owner 豁免改派）。
