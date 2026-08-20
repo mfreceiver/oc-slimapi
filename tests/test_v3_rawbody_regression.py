@@ -69,32 +69,36 @@ BASELINE_HEALTH_V3_BODY = (
     b'"transformAbsorb":true,"tokenStream":true,"thresholdedSkeleton":true,'
     b'"skeletonInlineOutputMaxBytes":4096,"allowlist":{"enabled":false}}}'
 )
-# 4.2.0 integration close-out state: readiness {ready:true, nine-ID
-# normalized required/satisfied} + the §14 expand block follow the four
-# static keys on the "4" face; the "3" face is byte-frozen. Regenerate:
+# Revision-2 ACTIVATED state (integration close-out): readiness
+# {ready:true, required = satisfied = ten-ID normalized universe (incl.
+# session.post-actions.v4)} + the §14 expand block follow the four static
+# keys on the "4" face; the "3" face is byte-frozen. Regenerate:
 #   .venv/bin/python tests/test_v3_rawbody_regression.py --capture
 BASELINE_VERSIONS_BODY = (
-    b'{"current":4,"available":[3,4],"capabilities":{"3":{"envelope":["messa'
-    b'ges","sessions"],"directoryQuery":true,"versionHeaderOptional":true,"w'
-    b'riteRoutes":true,"readRoutes":["file","vcs","find","providers","sessio'
-    b'nSingle","activeSessions","globalHealth"],"expand":{"categories":["inf'
-    b'o_summary_diffs","part_text","part_reasoning","part_state_output","par'
-    b't_state_error","part_state_input_full","part_state_metadata_full","par'
-    b't_state_attachments","part_url","part_source","part_snapshot","compact'
-    b'ion_full"],"fragmentMaxBytes":8388608}},"4":{"globalSessions":true,"au'
-    b'xiliaryFilters":true,"sseReplay":true,"qpImmediateFull":true,"readines'
-    b's":{"ready":true,"required":["events.global.replay.v4","events.token.r'
-    b'eplay.v4","messages.expand.v4","method.boundary.v4","providers.redacte'
-    b'd.v4","representation.vary.v4","selector.v4","session.list.global.v4",'
-    b'"session.single.projection.v4"],"satisfied":["events.global.replay.v4"'
-    b',"events.token.replay.v4","messages.expand.v4","method.boundary.v4","p'
-    b'roviders.redacted.v4","representation.vary.v4","selector.v4","session.'
-    b'list.global.v4","session.single.projection.v4"]},"expand":{"categories'
-    b'":["info_summary_diffs","part_text","part_reasoning","part_state_outpu'
-    b't","part_state_error","part_state_input_full","part_state_metadata_ful'
-    b'l","part_state_attachments","part_url","part_source","part_snapshot","'
-    b'compaction_full"],"fragmentMaxBytes":8388608}}},"sidecarVersion":"<SID'
-    b'ECAR_VERSION>"}'
+    b'{"current":4,"available":[3,4],"capabilities":{"3":{"envelope"'
+    b':["messages","sessions"],"directoryQuery":true,"versionHeaderO'
+    b'ptional":true,"writeRoutes":true,"readRoutes":["file","vcs","f'
+    b'ind","providers","sessionSingle","activeSessions","globalHealt'
+    b'h"],"expand":{"categories":["info_summary_diffs","part_text","'
+    b'part_reasoning","part_state_output","part_state_error","part_s'
+    b'tate_input_full","part_state_metadata_full","part_state_attach'
+    b'ments","part_url","part_source","part_snapshot","compaction_fu'
+    b'll"],"fragmentMaxBytes":8388608}},"4":{"globalSessions":true,"'
+    b'auxiliaryFilters":true,"sseReplay":true,"qpImmediateFull":true'
+    b',"readiness":{"ready":true,"required":["events.global.replay.v'
+    b'4","events.token.replay.v4","messages.expand.v4","method.bound'
+    b'ary.v4","providers.redacted.v4","representation.vary.v4","sele'
+    b'ctor.v4","session.list.global.v4","session.post-actions.v4","s'
+    b'ession.single.projection.v4"],"satisfied":["events.global.repl'
+    b'ay.v4","events.token.replay.v4","messages.expand.v4","method.b'
+    b'oundary.v4","providers.redacted.v4","representation.vary.v4","'
+    b'selector.v4","session.list.global.v4","session.post-actions.v4'
+    b'","session.single.projection.v4"]},"expand":{"categories":["in'
+    b'fo_summary_diffs","part_text","part_reasoning","part_state_out'
+    b'put","part_state_error","part_state_input_full","part_state_me'
+    b'tadata_full","part_state_attachments","part_url","part_source"'
+    b',"part_snapshot","compaction_full"],"fragmentMaxBytes":8388608'
+    b'}}},"sidecarVersion":"<SIDECAR_VERSION>"}'
 )
 # ------------------------------------------------------------------------
 

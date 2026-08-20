@@ -1,4 +1,4 @@
-# oc-slimapi v4 wire 契约（4.0.0 实施基线 + 2026-08-19 正式修订；修订二：POST 等效动作族——冻结待实施）
+# oc-slimapi v4 wire 契约（4.0.0 实施基线 + 2026-08-19 正式修订；修订二：POST 等效动作族——已实施，待发版）
 
 > **状态**：**4.0.0 实施基线（2026-08-18，B3a+B3b 已落地）+ 2026-08-19 正式修订（owner 裁决：修订并入 v4——v4 尚无消费方，修订无破坏影响）**。B0 批冻结全部可观察语义（2026-08-17，rev-6 PASS-with-notes + S-B01 四项 owner 终裁全收敛）；wire 终态 = 4.0.0（`ACCEPTED_CLIENT_VERSIONS` (3,3)→(3,4)）。B3a 批（阶段 A selector 双版本 / B1 dbaux 连接生命周期 / B2 投影 SQL / B3 cursor / B4 路由分叉降级矩阵 / B5 观测）已按本契约落地并全量测试通过；B3b 批（SSE id:/重放、§7 全量、能力键 `sseReplay`/`qpImmediateFull` 广告）**已落地**。S-B01 四项（§7.0）**已全部 owner 终裁（2026-08-17）**；其余章节（含 DB 设计 R1/R2/R3/R6，已凭真库实证冻结——见 design-v4-dbaux §0.2）均为冻结语义。
 > **2026-08-19 正式修订范围**（各修订节带**当前状态注记**——现行已发布行为 → 修订后冻结目标，实现批次随后落地）：providers 安全投影（§12）/ session 单查 parity（§13）/ expand 闭环（§14）/ 表示层（§15）/ method 边界与修订 non-goals（§16-§17）/ readiness 门禁（§3.3）。修订仅作用 `?v=4` 视图，`?v=3` 零改动（v3 冻结）；无新 major、无版本窗变更（`ACCEPTED_CLIENT_VERSIONS` 仍 (3,4)）。设计出处：`docs/ocmar/plans/2026-08-19-v4-rebaseline.md` §4-§7（owner 终裁 2026-08-19）。
@@ -69,7 +69,7 @@
 
 ### §3.3 `capabilities["4"]` 扩展：readiness 就绪度门（2026-08-19 修订冻结）
 
-> **当前状态**：4.2.0 已实施本节（`readiness` 键已广告，九项全 `satisfied`、`ready:true`）。**修订二（owner 裁决 2026-08-19，冻结待实施）**：U **加性扩展 9→10**——新增第 10 项 `session.post-actions.v4`（§16 修订二：POST 等效动作族）。实施批次落地前，现行服务端仍按 4.2.0 九项全集发出（按其发布时契约合法，不追溯判矛盾）；落地时 `required` 扩为十项全集、`session.post-actions.v4 ∉ satisfied` 为过渡态（`ready:false`）、三条 POST 维持 §16 405 过渡拒绝面，随后入 `satisfied` 激活。键形状与规范化规则不变。
+> **当前状态**：4.2.0 已实施本节（`readiness` 键已广告，九项全 `satisfied`、`ready:true`）。**修订二（owner 裁决 2026-08-19，已实施——实施批次落地：U 扩为十项全集且 `session.post-actions.v4` 已入 `satisfied`）**：现行服务端按十项全集发出（`required`=`satisfied` 十 ID、`ready:true`）；三条 POST 已激活为等效路由（§16.2），§16.1 的 405 拒绝面按声明式组合优先级让位（四位组合表第三行）。键形状与规范化规则不变。
 
 `capabilities["4"].readiness` 形状：
 
@@ -330,7 +330,7 @@ v4 sessions 归入 sessions 桶既有记账；降级路径请求带 degraded 标
 
 ## §10 路由全集逐条（v4 差异列）[冻结]
 
-**51 条** /slimapi 路由（read **26** + write **17** + SSE 2 + 发现/运维 **6**；**计数方法 = 路由 × 方法表行**，与 `scripts/check_routes_doc.py` 的路由↔INTERFACE_MAP 一致性校验同口径——2026-08-19 修订，取代原「45 条（read 23 + write 12 + 发现/运维 8）」旧计数）。**已发布（4.0.0/4.1.0）v4 差异仅下列 4 条**，其余 **47** 条 v4 = v3 语义原样（经 selector 分派）；**2026-08-19 正式修订（冻结目标）追加差异面见本节末修订块与 §12-§17**；**修订二（owner 裁决 2026-08-19，冻结待实施）再追加 write 组三条 POST 等效动作路由（随 `session.post-actions.v4` 实施批次落地）**：
+**51 条** /slimapi 路由（read **26** + write **17** + SSE 2 + 发现/运维 **6**；**计数方法 = 路由 × 方法表行**，与 `scripts/check_routes_doc.py` 的路由↔INTERFACE_MAP 一致性校验同口径——2026-08-19 修订，取代原「45 条（read 23 + write 12 + 发现/运维 8）」旧计数）。**已发布（4.0.0/4.1.0）v4 差异仅下列 4 条**，其余 **47** 条 v4 = v3 语义原样（经 selector 分派）；**2026-08-19 正式修订（冻结目标）追加差异面见本节末修订块与 §12-§17**；**修订二（owner 裁决 2026-08-19，已实施——write 组三条 POST 等效动作路由已激活，`session.post-actions.v4 ∈ satisfied`）**：
 
 | 路由 | v4 差异 |
 |---|---|
@@ -359,7 +359,7 @@ v4 sessions 归入 sessions 桶既有记账；降级路径请求带 degraded 标
 | `POST /slimapi/session/{sid}/archive`（新） | §16 修订二：同门控激活；body 可选（合法 PATCH body 透传 / 缺省 sidecar 合成 `{"time":{"archived":<now epoch-ms>}}` 走 PATCH 等效管线）；`?v=3` → 404 现状不变 |
 | `POST /slimapi/session/{sid}/delete`（新） | §16 修订二：同门控激活；**DELETE 等效路由**（请求实体处理与 DELETE 完全相同并原样转发——读取实体、同 cap 413、Content-Type 透传、body 逐字节转发，无忽略分支，§16.2-b；上游递归删子+吞错语义如实继承，非幂等可接受——owner q1）；`?v=3` → 404 现状不变 |
 
-其余路由维持零 v4 差异；**计数方法（路由 × 方法表行）不变——当前已实现 51 条，修订二实施批次完成后 54 条（write 20）**。
+其余路由维持零 v4 差异；**计数方法（路由 × 方法表行）不变——4.2.0 已实现 51 条，修订二实施后 54 条（write 20）**。
 
 ## §11 测试矩阵（B0 冻结用例面；落地批次标注）
 
@@ -623,7 +623,7 @@ envelope.degraded == (任一 item.degraded == true) ∨ (本响应采用 native 
 - **域隔离（冻结）**：缓存键 / singleflight 键 / ETag REP_VERSION 均含 wire-view 标记——v3 与修订后 v4 validator 互不匹配，跨视图 `If-None-Match` 保守 200；修订切换（无 ETag → 有 ETag）经 REP_VERSION 投影版本轮换，不可能误 304。
 - v4 sessions 以外的 v4 路由：ETag/Vary 语义与 v3 发布态一致（§6「v3 原样」延续）；providers 路由修订后按 §12.6 口径。
 
-## §16 POST 等效动作族 + method 边界 [2026-08-19 修订冻结；**修订二：POST 等效动作族——冻结待实施**]
+## §16 POST 等效动作族 + method 边界 [2026-08-19 修订冻结；**修订二：POST 等效动作族——已实施，待发版**]
 
 > **当前状态**：修订一（feature `method.boundary.v4`，v4.2.0 已 `satisfied`）已落地——三条 POST 组合在 `?v=4` 下返回精确 405 `method_not_applicable`（§16.1，现行为）。**修订二**（owner 裁决 2026-08-19，新 feature `session.post-actions.v4`，§3.3 第 10 ID）为本节冻结目标：该 ID 进入 `satisfied` 时三条 POST 激活为等效路由、§16.1 的 405 拒绝面按**声明式组合优先级**让位（§16.2/§16.3 四位组合表；依赖蕴含 `session.post-actions.v4 ⇒ method.boundary.v4` 见 §3.3）。**全部仅 `?v=4` 视图；`?v=3` 冻结零改动**（三组合在 v3 → 404 `thin_route_not_found` 现状，任何阶段不变）。**加性并存，非替代**：PATCH/DELETE 在 v3/v4 均继续可用，v4 继承不退役。
 

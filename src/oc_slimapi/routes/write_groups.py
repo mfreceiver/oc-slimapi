@@ -50,20 +50,35 @@ opencode v1.18.16 — ``groups/session.ts:203-397``, ``groups/question.ts:32-48`
 * success responses carry ``Cache-Control: no-store`` and the merged
   ``Vary: Accept-Encoding`` (§6.2 terminal single value
   set: every §10.b write route consumes directory).
+
+§16 修订二 (v4-contract, 2026-08-19 freeze — the POST equivalent action
+family): three more POST routes live in this module (#18-#20 —
+``POST /session/{sid}`` ≡ PATCH, ``POST …/delete`` ≡ DELETE,
+``POST …/archive`` convenience w/ octet-level default synthesis),
+gated per request on the v4 wire view + ``session.post-actions.v4 ∈
+readiness.SATISFIED`` (§3.3 dynamic module read). Admitted requests run
+the very ``_write_passthrough`` pipeline below — zero new wire semantics
+except the archive synthesis; every non-admitted arrival (v3 baseline,
+or gate-closed leakage) answers the pre-revision coded 404
+``thin_route_not_found`` (see the §16.2 section note below).
 """
 
 from __future__ import annotations
+
+import time
 
 import httpx
 from fastapi import APIRouter, Request
 from starlette.responses import Response
 
+from .. import readiness as readiness_mod
 from ..directory import validate_directory
 from ..gzip_util import compress_if_beneficial, error_response
 from ..selector import (
     DIRECTORY_QUERY_PARAM,
     _strip_query_keys,
     resolve_route_directory,
+    wire_view_from_scope,
 )
 from ..traffic import stash_up_in, stash_up_out
 from ..transform import read_with_cap
@@ -99,22 +114,39 @@ async def _write_passthrough(
     *,
     method: str,
     upstream_path: str,
+    preset_body: bytes | bytearray | None = None,
+    content_type_override: str | None = None,
 ) -> Response:
-    """The shared §10.b write pipeline (see module docstring)."""
+    """The shared §10.b write pipeline (see module docstring).
+
+    ``preset_body`` / ``content_type_override`` exist solely for the §16.2-c
+    archive route: the octet-level default judgement must buffer (and
+    cap-check, same loop) the request entity itself before deciding
+    synthesis vs passthrough, then hands the surviving bytes in here — or
+    the sidecar-synthesized entity with its frozen ``application/json``
+    label. With both ``None`` (every other caller) the socket is read
+    exactly as before, byte-for-byte unchanged.
+    """
     config = request.app.state.config
     accept_encoding = request.headers.get("accept-encoding")
 
     # Request body: read once (caps at max_message_bytes — the repo's
     # request-size knob; 413 before any upstream call).
-    body = bytearray()
-    async for chunk in request.stream():
-        if len(body) + len(chunk) > config.max_message_bytes:
-            return error_response(
-                "request_too_large", 413,
-                accept_encoding=accept_encoding,
-                limit=config.max_message_bytes,
-            )
-        body += chunk
+    if preset_body is None:
+        body = bytearray()
+        async for chunk in request.stream():
+            if len(body) + len(chunk) > config.max_message_bytes:
+                return error_response(
+                    "request_too_large", 413,
+                    accept_encoding=accept_encoding,
+                    limit=config.max_message_bytes,
+                )
+            body += chunk
+    else:
+        # §16.2-c: already buffered (and cap-checked by the identical
+        # loop) by the archive route, or synthesized by the sidecar —
+        # never re-read from the socket.
+        body = bytearray(preset_body)
 
     # upOut accounting parity: the retired catch-all forwarder counted the
     # request bytes it relayed upstream; the annexed write pipeline counts
@@ -126,6 +158,11 @@ async def _write_passthrough(
     headers = forward_upstream_headers(
         directory, request_id_from_scope(request.scope))
     content_type = request.headers.get("content-type")
+    if content_type_override is not None:
+        # §16.2-c synthesized entity: always application/json — the
+        # client's content-type described the replaced (empty) entity
+        # and is dropped with it. The octet judgement never read it.
+        content_type = content_type_override
     if content_type is not None:
         # Forward the client's content-type verbatim (write bodies are
         # payload contracts the upstream validates — never re-labelled).
@@ -241,15 +278,140 @@ async def delete_session(request: Request, session_id: str) -> Response:
         request, method="DELETE", upstream_path=f"/session/{session_id}")
 
 
-# --- §16 method applicability / deferred boundary (v4 formal revision,
-# 2026-08-19): the coded 405 for the three deferred POST combos
-# (POST /session/{sid}, POST …/archive, POST …/delete) is enforced at the
-# SELECTOR layer (selector.py, between the version-family 400s and the
-# directory ladder — §8.3 frozen chain / §16 优先级), so it can outrank the
-# directory 400s on the consuming /session/{sid} path. No route stub lives
-# here any more: on every view the selector does NOT intercept (v3, gate
-# closed, non-POST), these paths fall through to the catch-all exactly as
-# they did in 4.0.0.
+# --- §16 修订二：POST 等效动作族（v4-contract 2026-08-19 冻结；feature
+# ``session.post-actions.v4``，§3.3 第 10 ID）。三条 POST 组合的命中面分两层：
+#
+# * **selector 层（过渡态 405，不在本模块）**：``?v=4`` 且门控未激活时，
+#   selector 在 directory 消费前拦下 coded 405 ``method_not_applicable``
+#   （§16.1/§8.3 链——§16.3 四位组合表第二行），请求永远到不了下面三条
+#   路由；
+# * **handler 层（本模块）**：请求一旦到达（selector 已放行的「v4 且
+#   ``session.post-actions.v4 ∈ satisfied``」激活态，或 v3——selector 从不
+#   拦 v3），按下述分叉：
+#     - v4 + 门控激活 → §16.2 等效管线（就是上面 ``_write_passthrough``
+#       的逐字节复用——sidecar 零新增语义，仅 archive 合成一例外）；
+#     - 其余一切（v3 冻结基线；防御性覆盖门控关穿透）→ coded 404
+#       ``thin_route_not_found``，与 4.0.0 catch-all 基线逐字节一致
+#       （proxy.py 同一 error_response 路径：gzip 协商 + Vary，无 Allow）。
+#
+# v3 面：三条组合此前经 catch-all 答 404 ``thin_route_not_found``；路由注册
+# 后由 handler 原样复现该答案（v3-contract §8.2 冻结不变）。
+
+_POST_ACTIONS_FEATURE = "session.post-actions.v4"
+
+
+def _post_actions_admitted(scope: dict) -> bool:
+    """§16.2 handler-side admission: v4 wire view ∧ gate open.
+
+    The gate reads ``readiness.SATISFIED`` dynamically at request time
+    (same convention as the selector's boundary gate) — a flip batch
+    reassigns the set and this predicate changes with zero edits here.
+    """
+    return (wire_view_from_scope(scope) >= 4
+            and _POST_ACTIONS_FEATURE in readiness_mod.SATISFIED)
+
+
+def _pre_revision_404(request: Request) -> Response:
+    """The pre-revision answer for the three POST combos: coded 404
+    ``thin_route_not_found`` (gzip-negotiated, ``Vary: Accept-Encoding``,
+    no Allow / no-store) — byte-identical to the catch-all boundary these
+    paths answered from before the routes existed (proxy.py)."""
+    return error_response(
+        "thin_route_not_found", 404,
+        accept_encoding=request.headers.get("accept-encoding"),
+    )
+
+
+@router.post("/session/{session_id}")
+async def post_update_session(request: Request, session_id: str) -> Response:
+    """#18（§16.2-a）— POST /session/{id} ≡ PATCH /session/{id}.
+
+    Admitted (v4 + ``session.post-actions.v4``): the request runs the very
+    PATCH pipeline ``update_session`` uses — body/content-type verbatim,
+    request/response caps, directory consumption, evaluation order,
+    4xx-verbatim / 5xx→503 error mapping, no-store — byte-for-byte the
+    controlled-write semantics; only the wire method the client chose
+    differs. Non-admitted: pre-revision 404.
+    """
+    if not _post_actions_admitted(request.scope):
+        return _pre_revision_404(request)
+    return await _write_passthrough(
+        request, method="PATCH", upstream_path=f"/session/{session_id}")
+
+
+@router.post("/session/{session_id}/archive")
+async def post_archive_session(request: Request, session_id: str) -> Response:
+    """#20（§16.2-c）— POST /session/{id}/archive 便捷动作（加性）。
+
+    缺省判据（octet 层，冻结）：请求实体长度 = 0 → 合成；非空实体（含空
+    JSON ``{}``、仅空白字节）→ **一律不解析**、逐字节透传上游验证
+    （sidecar 不预解析，与 PATCH 同则）。Content-Type 是否存在/取值不影
+    响判据——随实体透传（合成时客户端 CT 随被替换的空实体一并丢弃）。
+
+    合成体（冻结）：``Content-Type: application/json`` + JSON 字节恰
+    ``{"time":{"archived":<ms>}}``（无空格紧凑形，``<ms>`` 为十进制毫秒
+    整数）；``<ms>`` = 判空后立即读的 sidecar wall-clock epoch-ms
+    （``time.time()*1000`` 取整——与 digest ``updatedAt`` 同源口径，不读
+    上游）。合成或透传后均走 §16.2-a PATCH 等效管线（错误映射零偏差：
+    上游 4xx 原样、5xx/网络 → 既有受控 503，无新错误码）。
+    """
+    if not _post_actions_admitted(request.scope):
+        return _pre_revision_404(request)
+    config = request.app.state.config
+    accept_encoding = request.headers.get("accept-encoding")
+
+    # Entity read + cap: the SAME loop/order the PATCH pipeline runs (413
+    # request_too_large before any upstream call) — the judgement below
+    # needs the buffered octets, so this route performs the read itself
+    # and hands the bytes to the pipeline via preset_body (the socket is
+    # read exactly once, never re-read).
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > config.max_message_bytes:
+            return error_response(
+                "request_too_large", 413,
+                accept_encoding=accept_encoding,
+                limit=config.max_message_bytes,
+            )
+        body += chunk
+
+    if body:
+        # Non-empty: no parse, no shape judgement — straight into the
+        # PATCH pipeline with the buffered bytes (client content-type
+        # forwarded verbatim, whatever it says).
+        return await _write_passthrough(
+            request, method="PATCH", upstream_path=f"/session/{session_id}",
+            preset_body=bytes(body),
+        )
+
+    # Default synthesis — <ms> read immediately after the empty-check
+    # (§16.2-c frozen evaluation point).
+    archived_ms = int(time.time() * 1000)
+    synthesized = (b'{"time":{"archived":'
+                   + str(archived_ms).encode("ascii") + b'}}')
+    return await _write_passthrough(
+        request, method="PATCH", upstream_path=f"/session/{session_id}",
+        preset_body=synthesized, content_type_override="application/json",
+    )
+
+
+@router.post("/session/{session_id}/delete")
+async def post_delete_session(request: Request, session_id: str) -> Response:
+    """#19（§16.2-b）— POST /session/{id}/delete ≡ DELETE /session/{id}.
+
+    Admitted: request-entity handling is EXACTLY the DELETE route's
+    (``delete_session``) — entity read, same ``max_message_bytes`` cap
+    (413 same code, same order), content-type passthrough, body forwarded
+    byte-for-byte, NO ignore-body branch. The upstream recursive
+    child-delete + error-swallowing semantics are inherited as-is
+    (owner ruling q1: non-idempotency acceptable — a repeated delete
+    answers whatever the upstream answers, e.g. 404). Non-admitted:
+    pre-revision 404.
+    """
+    if not _post_actions_admitted(request.scope):
+        return _pre_revision_404(request)
+    return await _write_passthrough(
+        request, method="DELETE", upstream_path=f"/session/{session_id}")
 
 
 @router.post("/session/{session_id}/prompt_async")

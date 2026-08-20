@@ -25,6 +25,20 @@
 §16 收窄护栏：其余 method/path 组合**不新增** 405 语义（未收编路径照旧
 catch-all 404；PATCH/DELETE 既有受控写行为两视图零变化）。
 
+修订二 §16.1 两位合取：405 面存活 ⇔ ``method.boundary.v4 ∈ SATISFIED``
+∧ ``session.post-actions.v4 ∉ SATISFIED``（§16.3 四格组合表）。
+
+**双态测试模型（集成批次后）**：
+
+* **激活态 = 默认**（零 monkeypatch）：``session.post-actions.v4`` 已入
+  ``SATISFIED``（全集、``ready`` 恢复 True）——selector 对三组合 v4
+  **放行**，由等效 handler 接管（路由行为见 ``test_post_actions_v4.py``；
+  本文件用无路由/无上游的最小 selector app 断言「穿透、绝无
+  ``method_not_applicable``」）；
+* **过渡态 = ``transitional_gates`` fixture**（显式回拨九项集）：恢复
+  4.2.0 发布期形态——三组合 v4 答 coded 405，字节冻结断言原样保留
+  （已发布行为的**永久回归锁**）。
+
 harness 镜像 ``app.py`` 对本组路径的装配顺序：write_groups router →
 ``install_proxy``（catch-all 在后）→ selector 中间件最外；上游 MockTransport
 记录每个到达的请求以断言零转发。
@@ -112,6 +126,20 @@ async def boundary_app():
         await client.aclose()
 
 
+@pytest.fixture
+def transitional_gates(monkeypatch):
+    """过渡态（§16.3 第二格：boundary∈∧post∉）＝ 4.2.0 发布期形态。
+
+    集成批次已把 ``session.post-actions.v4`` 点亮进全局 ``SATISFIED``
+    （激活态=默认）；本 fixture 显式回拨九项过渡集，恢复 §16.1 405 面
+    的裁决环境——下方全部字节冻结 405 断言都挂在本 fixture 上，构成
+    4.2.0 已发布行为的永久回归锁（合法集：不触犯⑦蕴含）。"""
+    monkeypatch.setattr(
+        readiness, "SATISFIED",
+        readiness.REQUIRED_SET - {"session.post-actions.v4"},
+    )
+
+
 def _client(app: FastAPI) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
                              base_url="http://t")
@@ -136,9 +164,11 @@ def _canned(request: httpx.Request) -> httpx.Response:
 
 
 @pytest.mark.parametrize("path,allow_header,allow_array", DEFERRED_COMBOS)
-async def test_v4_deferred_post_returns_coded_405(path, allow_header, allow_array, boundary_app):
-    """?v=4 → 405 ``method_not_applicable``，Allow 头与错误体
-    逐字段等于 §16 冻结值；零上游 IO。"""
+async def test_v4_deferred_post_returns_coded_405(path, allow_header, allow_array,
+                                                  boundary_app, transitional_gates):
+    """过渡态（§16.1 合取成立）：?v=4 → 405 ``method_not_applicable``，
+    Allow 头与错误体逐字段等于 §16 冻结值；零上游 IO。4.2.0 已发布
+    行为的永久回归锁（激活态默认下经 ``transitional_gates`` 回拨）。"""
     app, seen = boundary_app(_canned)
     async with _client(app) as client:
         r = await client.post(f"{path}?v=4", content=b"{}", headers=IDENTITY)
@@ -160,9 +190,11 @@ async def test_v4_deferred_post_returns_coded_405(path, allow_header, allow_arra
 
 
 @pytest.mark.parametrize("path,allow_header,allow_array", DEFERRED_COMBOS)
-async def test_v4_deferred_post_gzip_negotiation(path, allow_header, allow_array, boundary_app):
-    """coded 405 走 gzip 协商族（v3 信封惯例）：Accept-Encoding: gzip →
-    Content-Encoding: gzip，解压后错误体逐字段不变。"""
+async def test_v4_deferred_post_gzip_negotiation(path, allow_header, allow_array,
+                                                 boundary_app, transitional_gates):
+    """过渡态 coded 405 走 gzip 协商族（v3 信封惯例）：
+    Accept-Encoding: gzip → Content-Encoding: gzip，解压后错误体
+    逐字段不变。"""
     app, seen = boundary_app(_canned)
     async with _client(app) as client:
         r = await client.post(f"{path}?v=4", content=b"{}",
@@ -214,9 +246,11 @@ async def test_non_v4_views_keep_pre_revision_behaviour(path, query, boundary_ap
         ("/slimapi/session/s1/archive", "?v=4&directory=/w"),
     ],
 )
-async def test_v4_deferred_post_with_directory_still_405(path, query, boundary_app):
-    """携带合法 directory 输入的 v4 deferred POST 仍答 405（不转发、
-    不因 directory 报错）。"""
+async def test_v4_deferred_post_with_directory_still_405(path, query,
+                                                         boundary_app,
+                                                         transitional_gates):
+    """过渡态：携带合法 directory 输入的 v4 deferred POST 仍答 405
+    （不转发、不因 directory 报错）。"""
     app, seen = boundary_app(_canned)
     async with _client(app) as client:
         r = await client.post(f"{path}{query}", content=b"{}", headers=IDENTITY)
@@ -313,10 +347,12 @@ _DIRECTORY_VIOLATIONS = [
 @pytest.mark.parametrize("path,allow_header,allow_array", DEFERRED_COMBOS)
 @pytest.mark.parametrize("violation_kind,extra_headers", _DIRECTORY_VIOLATIONS)
 async def test_v4_method_405_outranks_directory_400(
-    path, allow_header, allow_array, violation_kind, extra_headers, boundary_app
+    path, allow_header, allow_array, violation_kind, extra_headers,
+    boundary_app, transitional_gates
 ):
-    """?v=4 + directory 违约 + 三条 deferred POST → 405 ``method_not_applicable``
-    **先于** directory 族 400；冻结错误体/头逐字段不变；零上游 IO。"""
+    """过渡态：?v=4 + directory 违约 + 三条 deferred POST → 405
+    ``method_not_applicable`` **先于** directory 族 400；冻结错误体/头
+    逐字段不变；零上游 IO。"""
     app, seen = boundary_app(_canned)
     query = "?v=4&directory=alpha&directory=beta"
     headers = {**IDENTITY, **extra_headers}
@@ -390,10 +426,13 @@ async def test_v4_non_deferred_methods_keep_directory_400(method, boundary_app):
 async def test_gate_closed_v4_directory_400_restores_precedence(
     monkeypatch, boundary_app
 ):
-    """门控关（``method.boundary.v4 ∉ SATISFIED``）：§16 修订面整体失效，
+    """门控关（``method.boundary.v4 ∉ SATISFIED``，合法组合：post-actions
+    一并移出——⑦ 蕴含禁止 post∈∧boundary∉）：§16 修订面整体失效，
     v4 复合请求回到 4.0.0 现状——directory 400 先行（消费路径）。"""
     monkeypatch.setattr(
-        readiness, "SATISFIED", readiness.REQUIRED_SET - {"method.boundary.v4"})
+        readiness, "SATISFIED",
+        readiness.REQUIRED_SET - {"method.boundary.v4",
+                                  "session.post-actions.v4"})
     app, seen = boundary_app(_canned)
     async with _client(app) as client:
         r = await client.post(
@@ -402,3 +441,90 @@ async def test_gate_closed_v4_directory_400_restores_precedence(
     assert r.status_code == 400
     assert orjson.loads(r.content)["code"] == "invalid_directory_selector"
     assert seen == []
+
+
+# ---------------------------------------------------------------------------
+# §16.1 两位合取（修订二）：405 面存活 ⇔ method.boundary.v4 ∈ SATISFIED
+# ∧ session.post-actions.v4 ∉ SATISFIED；§16.3 四格组合表。
+# 激活态（post∈）= 集成批次后的**默认**：selector 层**放行**——不再产出
+# coded 405，请求穿透到路由注册表（等效 handler 接管；本层断言点 = 绝无
+# method_not_applicable，用无路由/无上游的最小 app）。过渡态（boundary∈∧
+# post∉）= ``transitional_gates`` fixture——上面全部 405 用例的字节冻结。
+# ---------------------------------------------------------------------------
+
+
+def _selector_only_app() -> FastAPI:
+    """最小 selector 层应用（无任何路由/无 catch-all/无上游）：穿透后落到
+    框架 404（无 coded body）——与等效 handler 装配解耦，只测 selector 层。"""
+    app = FastAPI(title="method-boundary-selector-only")
+    app.add_middleware(SlimapiSelectorMiddleware)
+    return app
+
+
+_COMBO_PATHS = [p for p, _a, _b in DEFERRED_COMBOS]
+
+
+@pytest.mark.parametrize("path", _COMBO_PATHS)
+async def test_activated_default_selector_passes_through(path):
+    """激活态 = 默认（零 monkeypatch，集成批次后 SATISFIED 全集）：三组合
+    v4 请求被 selector 放行——无 coded 405、无 Allow 头；穿透到路由层
+    （本 harness 无路由 → 框架 404 plain body；等效管线行为见
+    ``test_post_actions_v4.py``）。"""
+    async with _client(_selector_only_app()) as client:
+        r = await client.post(f"{path}?v=4", content=b"{}", headers=IDENTITY)
+    assert r.status_code == 404
+    assert b"method_not_applicable" not in r.content
+    assert r.headers.get("allow") is None
+
+
+@pytest.mark.parametrize("path", _COMBO_PATHS)
+async def test_two_condition_conjunction_boundary_off_passes_through(
+    path, monkeypatch
+):
+    """合取另一半（§16.3 第一格的合法复现：boundary∉∧post∉）：405 面
+    关——与激活态同样穿透（4.0.0 现状行为）。"""
+    monkeypatch.setattr(
+        readiness, "SATISFIED",
+        readiness.REQUIRED_SET - {"method.boundary.v4",
+                                  "session.post-actions.v4"})
+    async with _client(_selector_only_app()) as client:
+        r = await client.post(f"{path}?v=4", content=b"{}", headers=IDENTITY)
+    assert r.status_code == 404
+    assert b"method_not_applicable" not in r.content
+    assert r.headers.get("allow") is None
+
+
+@pytest.mark.parametrize("path", _COMBO_PATHS)
+async def test_transitional_gated_coded_405(path, boundary_app, transitional_gates):
+    """过渡态（§16.1 合取成立，经 ``transitional_gates`` 显式回拨——
+    集成批次前曾为默认态）：三组合 v4 仍答 coded 405，冻结值不变——
+    两位合取的语义锁（405 面只随 post-actions 缺席而存活）。"""
+    app, seen = boundary_app(_canned)
+    async with _client(app) as client:
+        r = await client.post(f"{path}?v=4", content=b"{}", headers=IDENTITY)
+    assert r.status_code == 405
+    body = orjson.loads(r.content)
+    assert body["code"] == "method_not_applicable"
+    assert body["method"] == "POST"
+    assert seen == []
+
+
+@pytest.mark.parametrize("query", ["?v=3", ""])
+async def test_activation_does_not_leak_to_v3_or_selectorless(
+    query, monkeypatch
+):
+    """激活态（post∈）不向 v3 / 无 selector 面泄漏：v3 组合照旧 404
+    thin_route_not_found（catch-all 不在此最小 harness——直接断言非
+    coded 405）；无 selector 照旧 selector 族 400。"""
+    monkeypatch.setattr(readiness, "SATISFIED", readiness.REQUIRED_SET)
+    async with _client(_selector_only_app()) as client:
+        r = await client.post(f"/slimapi/session/s1{query}",
+                              content=b"{}", headers=IDENTITY)
+    if query == "?v=3":
+        assert r.status_code == 404
+        assert b"method_not_applicable" not in r.content
+    else:
+        assert r.status_code == 400
+        body = orjson.loads(r.content)
+        assert body["code"] == "unsupported_version"
+        assert body["supported"] == [3, 4]

@@ -288,15 +288,25 @@ async def test_gate_method_boundary(monkeypatch):
     app = _build_app()
     async with _client(app) as client:
         # 关态：v4 复现 4.0.0 现状——catch-all 404 thin_route_not_found。
-        _gate_off(monkeypatch, "method.boundary.v4")
+        # （修订二后 REQUIRED_SET 含第 10 项；关态集合须同时移出
+        # post-actions——§3.3 蕴含 ⑦ 禁止 post∈∧boundary∉。）
+        monkeypatch.setattr(
+            readiness, "SATISFIED",
+            readiness.REQUIRED_SET - {"method.boundary.v4",
+                                      "session.post-actions.v4"})
         r = await client.post("/slimapi/session/s1",
                               params={"v": "4"}, headers=IDENTITY)
         assert r.status_code == 404
         assert r.json()["code"] == "thin_route_not_found"
         assert "Allow" not in r.headers
 
-        # 开态：§16 修订面生效——coded 405 + 冻结 Allow 字面。
-        _gate_on(monkeypatch)
+        # 开态（修订二过渡态）：boundary∈SATISFIED ∧ post-actions∉SATISFIED
+        # ——§16.1 两位合取成立，coded 405 + 冻结 Allow 字面。全量
+        # REQUIRED_SET（post∈）会触发 §16.3 激活格：selector 放行、
+        # 405 面消失（由 test_method_boundary_v4.py 激活分支锁定）。
+        monkeypatch.setattr(
+            readiness, "SATISFIED",
+            readiness.REQUIRED_SET - {"session.post-actions.v4"})
         rr = await client.post("/slimapi/session/s1",
                                params={"v": "4"}, headers=IDENTITY)
         assert rr.status_code == 405

@@ -2,15 +2,25 @@
 
 Contract anchors (docs/specs/v4-contract.md):
 
-* **§3.3** — nine-feature ID universe U in frozen enumeration order;
+* **§3.3** — ten-feature ID universe U in frozen enumeration order
+  (revision 2 expanded U 9→10 additively with the 10th ID
+  ``session.post-actions.v4``, slotted after ``method.boundary.v4``);
   normalization ``f(A)`` = dedupe → UTF-8 byte-order sort (both wire arrays
   are emitted normalized); ``ready ⇔ f(required) ⊆ f(satisfied)`` derived
   both directions (never flipped alone); unknown IDs (∉ U) rejected, never
   silently ignored; ``SATISFIED ⊆ REQUIRED`` module-level invariant. Four
-  IDs were satisfied at first advertisement (4.0.0 behavior); the
-  4.2.0 integration close-out flipped the remaining five — the default
-  SATISFIED now carries the full universe and ``ready`` derives true
-  (gate-closed states are reproduced in tests via monkeypatch).
+  IDs were satisfied at first advertisement (4.0.0 behavior); the 4.2.0
+  integration close-out flipped the remaining five of the original nine.
+  **Revision-2 activation (post-integration-batch default): the
+  implementation batch lit ``session.post-actions.v4`` — SATISFIED now
+  carries the full ten-ID universe and the derived ``ready`` is True again.
+  The transitional nine-of-ten shape (ready:false) is preserved as a
+  construction-level lock below (explicit set, no global-state dependency).**
+* **§3.3 revision-2 dependency implication (contradiction ⑦)** —
+  ``session.post-actions.v4 ∈ satisfied ⇒ method.boundary.v4 ∈ satisfied``;
+  a violating set is rejected at construction (module guard) and at
+  payload-build time (the server structurally NEVER emits a ⑦-violating
+  discovery payload — supply-side defense).
 * **§3.1 + §14** — ``capabilities["4"]`` additive extension keys:
   ``readiness`` (this batch) and ``expand`` (shape
   ``{categories, fragmentMaxBytes}``, emitted **iff**
@@ -41,7 +51,8 @@ from oc_slimapi.routes import versions as versions_mod
 from oc_slimapi.selector import SlimapiSelectorMiddleware
 from oc_slimapi.traffic import EXPAND_CATEGORIES
 
-# §3.3 frozen enumeration order of the universe U (contract numbered list).
+# §3.3 frozen enumeration order of the universe U (contract numbered list;
+# revision 2 appended the 10th ID after method.boundary.v4).
 CONTRACT_REQUIRED_ORDER = (
     "selector.v4",
     "session.list.global.v4",
@@ -52,10 +63,32 @@ CONTRACT_REQUIRED_ORDER = (
     "events.token.replay.v4",
     "representation.vary.v4",
     "method.boundary.v4",
+    "session.post-actions.v4",
 )
 
 # §3.3 normalization f(): dedupe → UTF-8 byte-order sort of U.
 CONTRACT_REQUIRED_NORMALIZED = (
+    "events.global.replay.v4",
+    "events.token.replay.v4",
+    "messages.expand.v4",
+    "method.boundary.v4",
+    "providers.redacted.v4",
+    "representation.vary.v4",
+    "selector.v4",
+    "session.list.global.v4",
+    "session.post-actions.v4",
+    "session.single.projection.v4",
+)
+
+# Revision-2 pair (§3.3 implication / §16.3 combination priority).
+CONTRACT_POST_ACTIONS_FEATURE = "session.post-actions.v4"
+CONTRACT_BOUNDARY_FEATURE = "method.boundary.v4"
+
+# The transitional SATISFIED (revision 2, §3.3 current-state note): the
+# original nine IDs — U minus the 10th — in normalized wire form. Kept as
+# the construction-level transitional lock (the integration batch has since
+# lit the 10th; the global default is the full activated universe).
+TRANSITIONAL_SATISFIED_NORMALIZED = (
     "events.global.replay.v4",
     "events.token.replay.v4",
     "messages.expand.v4",
@@ -103,18 +136,23 @@ async def _get_caps() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# §3.3 — universe U: nine IDs, frozen enumeration order
+# §3.3 — universe U: ten IDs, frozen enumeration order (revision 2: 9→10)
 # ---------------------------------------------------------------------------
 
 
-def test_required_universe_nine_ids_frozen_order():
-    """REQUIRED ≡ U in the contract's numbered enumeration order (§3.3)."""
+def test_required_universe_ten_ids_frozen_order():
+    """REQUIRED ≡ U in the contract's numbered enumeration order (§3.3);
+    revision 2 appends ``session.post-actions.v4`` as the 10th ID,
+    slotted right after ``method.boundary.v4`` (the implication /
+    combination-priority pair travels together)."""
     assert readiness.REQUIRED == CONTRACT_REQUIRED_ORDER
-    assert len(readiness.REQUIRED) == 9
+    assert len(readiness.REQUIRED) == 10
+    assert readiness.REQUIRED[9] == CONTRACT_POST_ACTIONS_FEATURE
+    assert readiness.REQUIRED[8] == CONTRACT_BOUNDARY_FEATURE
 
 
 def test_required_universe_unique_strings():
-    assert len(set(readiness.REQUIRED)) == 9
+    assert len(set(readiness.REQUIRED)) == 10
     assert all(isinstance(i, str) and i for i in readiness.REQUIRED)
     assert readiness.REQUIRED_SET == frozenset(CONTRACT_REQUIRED_ORDER)
 
@@ -154,17 +192,19 @@ def test_normalize_empty():
 
 
 # ---------------------------------------------------------------------------
-# §3.3 — current SATISFIED (4.2.0 close-out: all nine) + module invariants
+# §3.3 — current SATISFIED (revision-2 ACTIVATED default) + module invariants
 # ---------------------------------------------------------------------------
 
 
-def test_satisfied_current_state_all_nine():
-    """§3.3 final state (4.2.0 integration close-out): the five revision
-    batches all landed and their per-feature gates are wired — SATISFIED
-    carries the full universe, nothing pending. The historical 4.0.0 four
-    remain ⊆ SATISFIED (flips only ever ADD)."""
+def test_satisfied_current_state_activated_full_ten():
+    """§3.3 revision-2 close-out: the implementation batch lit
+    ``session.post-actions.v4`` — SATISFIED now carries the FULL ten-ID
+    universe and the derived ``ready`` is True (activation is the shipped
+    default; flips only ever ADD, so the 4.2.0 nine and the historical
+    4.0.0 four remain ⊆ SATISFIED)."""
     assert readiness.SATISFIED == readiness.REQUIRED_SET
-    assert readiness.REQUIRED_SET - readiness.SATISFIED == frozenset()
+    assert CONTRACT_POST_ACTIONS_FEATURE in readiness.SATISFIED
+    assert CONTRACT_BOUNDARY_FEATURE in readiness.SATISFIED
     assert CONTRACT_INITIAL_SATISFIED <= readiness.SATISFIED
 
 
@@ -179,7 +219,7 @@ def test_module_invariant_satisfied_subset_of_required():
         for subset in combinations(readiness.REQUIRED, k):
             readiness.validate(frozenset(subset))  # no raise
     # ...and rejects anything outside U, naming the offender.
-    with pytest.raises(RuntimeError, match="bogus\.v4"):
+    with pytest.raises(RuntimeError, match="bogus\\.v4"):
         readiness.validate(frozenset({"selector.v4", "bogus.v4"}))
     # The empty set is a LEGAL subset (k=0 in the loop above already proves
     # validate() accepts it): it is the all-unsatisfied state, ready=false.
@@ -193,32 +233,111 @@ def test_validate_rejects_non_string_elements():
 
 
 # ---------------------------------------------------------------------------
+# §3.3 revision 2 — dependency implication (contradiction ⑦ supply side)
+# ---------------------------------------------------------------------------
+
+
+def test_validate_dependencies_accepts_legal_combinations():
+    """§3.3 implication (frozen): post-actions ∈ satisfied ⇒ boundary ∈
+    satisfied. Every combination consistent with that implication passes
+    construction: the full ten-ID set (post∈∧boundary∈), the transitional
+    default (post∉, boundary either), both-out, the 4.0.0-era subsets, and
+    the empty set."""
+    legal_sets = [
+        frozenset(CONTRACT_REQUIRED_ORDER),                     # both in
+        readiness.REQUIRED_SET - {CONTRACT_POST_ACTIONS_FEATURE},
+        readiness.REQUIRED_SET - {CONTRACT_POST_ACTIONS_FEATURE,
+                                  CONTRACT_BOUNDARY_FEATURE},   # both out
+        CONTRACT_INITIAL_SATISFIED,                             # 4.0.0 era
+        frozenset(),
+        frozenset({CONTRACT_POST_ACTIONS_FEATURE, CONTRACT_BOUNDARY_FEATURE}),
+    ]
+    for sat in legal_sets:
+        readiness.validate_dependencies(sat)  # no raise
+        payload = readiness.readiness_payload(sat)  # emission also legal
+        assert payload["required"] == list(CONTRACT_REQUIRED_NORMALIZED)
+
+
+def test_validate_dependencies_rejects_post_without_boundary():
+    """The violating combination — post-actions ∈ satisfied while
+    boundary ∉ — fails construction (RuntimeError naming the pair): the
+    server never holds or emits a ⑦-violating set (§3.3 implication,
+    §16.3 marks the fourth table cell unreachable)."""
+    violating = readiness.REQUIRED_SET - {CONTRACT_BOUNDARY_FEATURE}
+    assert CONTRACT_POST_ACTIONS_FEATURE in violating
+    with pytest.raises(RuntimeError, match="session\\.post-actions\\.v4"):
+        readiness.validate_dependencies(violating)
+    # Smallest witness: the pair alone, boundary dropped.
+    with pytest.raises(RuntimeError):
+        readiness.validate_dependencies(
+            frozenset({CONTRACT_POST_ACTIONS_FEATURE}))
+
+
+def test_readiness_payload_never_emits_violating_set():
+    """Emission boundary (⑦ supply-side defense): readiness_payload
+    refuses to BUILD a payload from a violating set — the wire can never
+    carry post∈satisfied ∧ boundary∉satisfied."""
+    with pytest.raises(RuntimeError, match="implication"):
+        readiness.readiness_payload(
+            readiness.REQUIRED_SET - {CONTRACT_BOUNDARY_FEATURE})
+
+
+def test_module_guard_ran_at_import_with_legal_set():
+    """The module-level guard (validate + validate_dependencies) executed
+    at import time — the module imported cleanly, proving the ACTIVATED
+    SATISFIED passes BOTH checks (and would have failed import otherwise)."""
+    readiness.validate(readiness.SATISFIED)
+    readiness.validate_dependencies(readiness.SATISFIED)
+
+
+# ---------------------------------------------------------------------------
 # §3.3 — ready derivation: ready ⇔ f(required) ⊆ f(satisfied), both ways
 # ---------------------------------------------------------------------------
 
 
-def test_ready_true_with_all_nine():
-    """Current state (4.2.0 close-out): all nine satisfied → aggregate
-    ready=True (an indicator only — per-ID gating is what matters, §3.3)."""
+def test_ready_true_in_activated_default():
+    """Activation close-out: the full ten-ID SATISFIED derives
+    ``ready=True`` (an indicator only — per-ID gating is what matters,
+    §3.3)."""
     assert readiness.ready() is True
 
 
-def test_ready_true_only_when_all_nine_satisfied():
+def test_ready_false_for_constructed_transitional_set():
+    """Construction-level transitional lock (§3.3 current-state note,
+    frozen): required expanded to ten IDs, satisfied carries nine — the
+    aggregate ``ready`` is therefore False. Built from an EXPLICIT set
+    (no global SATISFIED dependency): the transitional semantics stays
+    test-locked even though the shipped default is now the activated
+    full universe."""
+    transitional = readiness.REQUIRED_SET - {CONTRACT_POST_ACTIONS_FEATURE}
+    assert readiness.ready(satisfied=transitional) is False
+    payload = readiness.readiness_payload(transitional)
+    assert payload["ready"] is False
+    assert payload["satisfied"] == list(TRANSITIONAL_SATISFIED_NORMALIZED)
+
+
+def test_ready_true_only_when_all_ten_satisfied():
     assert readiness.ready(satisfied=readiness.REQUIRED_SET) is True
-    # Dropping ANY single ID breaks the aggregate (exhaustive over 9).
+    # Dropping ANY single ID breaks the aggregate (exhaustive over 10).
     for missing in readiness.REQUIRED:
         satisfied = readiness.REQUIRED_SET - {missing}
         assert readiness.ready(satisfied=satisfied) is False, missing
 
 
 def test_ready_derivation_exhaustive_all_subsets():
-    """Both directions of the frozen formula, exhausted over all 2^9
+    """Both directions of the frozen formula, exhausted over all 2^10
     subsets of U (payload-level: the wire `ready` equals the subset
-    judgement for every possible satisfied set)."""
+    judgement for every LEGAL satisfied set; ⑦-violating subsets are
+    refused at construction — they never reach a payload)."""
     universe = readiness.REQUIRED
     for k in range(len(universe) + 1):
         for subset in combinations(universe, k):
             sat = frozenset(subset)
+            if (CONTRACT_POST_ACTIONS_FEATURE in sat
+                    and CONTRACT_BOUNDARY_FEATURE not in sat):
+                with pytest.raises(RuntimeError):
+                    readiness.readiness_payload(sat)
+                continue
             payload = readiness.readiness_payload(sat)
             expected = readiness.REQUIRED_SET <= sat
             assert payload["ready"] is expected, sat
@@ -240,6 +359,8 @@ def test_ready_explicit_required_argument():
 
 
 def test_readiness_payload_shape_current_state():
+    """Activated wire shape (revision-2 close-out): required = satisfied =
+    the full ten-ID normalized universe, ready = True (derived)."""
     payload = readiness.readiness_payload()
     assert list(payload.keys()) == ["ready", "required", "satisfied"]
     assert payload["ready"] is True
@@ -289,11 +410,18 @@ def test_caps4_helper_expand_iff_exhaustive_all_subsets():
     """For EVERY subset S ⊆ U: `expand` present ⇔ messages.expand.v4 ∈ S
     (combinations ①/② legal), ③ present+∉ and ④ absent+∈ are structurally
     unreachable on the server side; `readiness` is always present (expand
-    without readiness = contradiction, §3.3)."""
+    without readiness = contradiction, §3.3). Revision 2: subsets that
+    violate the ⑦ implication never reach the caps builder's payload at
+    all — they are refused at construction (RuntimeError)."""
     universe = readiness.REQUIRED
     for k in range(len(universe) + 1):
         for subset in combinations(universe, k):
             sat = frozenset(subset)
+            if (CONTRACT_POST_ACTIONS_FEATURE in sat
+                    and CONTRACT_BOUNDARY_FEATURE not in sat):
+                with pytest.raises(RuntimeError):
+                    versions_mod._capabilities4(sat)
+                continue
             caps4 = versions_mod._capabilities4(sat)
             assert ("expand" in caps4) == (EXPAND_FEATURE_ID in sat), sat
             assert "readiness" in caps4, sat
@@ -355,8 +483,10 @@ def test_caps4_helper_rejects_unknown_ids():
 async def test_versions_caps4_readiness_emitted():
     """The wire emits the readiness gate; the payload equals the
     module-derived shape byte-for-byte, the four STATIC keys keep their
-    frozen order in front of it, and — since the 4.2.0 close-out — the
-    §14 expand block follows (default SATISFIED is the full universe)."""
+    frozen order in front of it, and the §14 expand block follows
+    (messages.expand.v4 stays satisfied). Revision-2 ACTIVATED wire:
+    required = satisfied = the ten-ID universe, ready=True (the
+    transitional nine-of-ten shape is locked construction-level above)."""
     caps = await _get_caps()
     caps4 = caps["4"]
     assert list(caps4.keys()) == [
@@ -447,9 +577,10 @@ async def test_versions_payload_identical_across_views():
             resp = await client.get(f"/slimapi/versions{query}")
             assert resp.status_code == 200
             assert resp.json() == base
-        assert base["capabilities"]["4"]["readiness"]["ready"] is True
-        assert "expand" in base["capabilities"]["4"]
-        assert base["sidecarVersion"] == __version__
+    gate = base["capabilities"]["4"]["readiness"]
+    assert gate["ready"] is True  # revision-2 activated (10 of 10)
+    assert "expand" in base["capabilities"]["4"]
+    assert base["sidecarVersion"] == __version__
 
 
 async def test_versions_route_rejects_unknown_satisfied_never_emits():

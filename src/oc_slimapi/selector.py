@@ -211,25 +211,38 @@ _DIRECTORY_RETIRED_IN_V4_BODY: dict[str, Any] = {
     ),
 }
 
-# §16 method applicability / deferred boundary (2026-08-19 formal revision).
-# Three deferred POST combos answer a coded 405 ``method_not_applicable`` on
-# the ?v=4 face ONLY. Enforced HERE — after the selector's version-family
-# admission (②) and BEFORE directory consumption (③) — because §8.3
-# (v4-contract.md:306 + §16 "优先级") slots this 405 between the two: the
-# judgement depends on (method, path) alone, never on a query parameter, so
-# a degenerate directory input must NOT win the race (the §8.3 frozen chain:
+# §16.1 method applicability / transitional 405 boundary (2026-08-19
+# formal revision, revision 2: two-condition conjunction). Three deferred
+# POST combos answer a coded 405 ``method_not_applicable`` on the ``?v=4``
+# face ONLY while the conjunction holds (§16.1, frozen):
+#
+#     method.boundary.v4 ∈ SATISFIED  ∧  session.post-actions.v4 ∉ SATISFIED
+#
+# §16.3 four-combination table: boundary∈∧post∉ → the coded 405 below
+# (the 4.2.0 published behavior); boundary∈∧post∈ (ACTIVATION) → the
+# selector PASSES the three combos through to the route registry — the
+# §16.2 equivalence handlers take over and the 405 face disappears;
+# boundary∉ → the face is off regardless (4.0.0 behavior; the
+# boundary∉∧post∈ cell is unreachable — §3.3 implication ⑦ is enforced at
+# construction in readiness.py).
+#
+# Enforced HERE — after the selector's version-family admission (②) and
+# BEFORE directory consumption (③) — because §8.3 (v4-contract.md:306 +
+# §16 "优先级") slots this 405 between the two: the judgement depends on
+# (method, path) alone, never on a query parameter, so a degenerate
+# directory input must NOT win the race (the §8.3 frozen chain:
 # ① versions 405 → ② version 400s → method 405 → ③ directory 400s).
 #
-# Frozen literals (§16): the Allow header text mirrors the allow array;
+# Frozen literals (§16.1): the Allow header text mirrors the allow array;
 # archive/delete carry an EMPTY Allow: (RFC 9110 §10.2.1 — no method is
-# applicable on the un-annexed sub-action paths). Gate (§3.3): the face is
-# live iff ``method.boundary.v4 ∈ readiness.SATISFIED`` — read dynamically
-# at request time (mirrors the routes' helper convention), so a readiness
-# flip reassigns behavior with zero edits in this module. Gate closed, or
-# any non-v4 wire → the request keeps the 4.0.0 published answer (the
-# directory ladder, then the route pipeline → catch-all 404
-# ``thin_route_not_found``).
+# applicable on the un-annexed sub-action paths). Both feature gates are
+# read dynamically at request time (mirrors the routes' helper
+# convention), so a readiness flip reassigns behavior with zero edits in
+# this module. Conjunction closed, or any non-v4 wire → the request keeps
+# the 4.0.0 published answer (the directory ladder, then the route
+# pipeline → catch-all 404 ``thin_route_not_found``).
 _V4_METHOD_BOUNDARY_FEATURE = "method.boundary.v4"
+_V4_POST_ACTIONS_FEATURE = "session.post-actions.v4"
 
 _METHOD_BOUNDARY_POST_PATTERNS: tuple[tuple[re.Pattern[str], tuple[str, ...]], ...] = (
     # POST /slimapi/session/{sid} — deferred POST-only update; the collected
@@ -241,9 +254,16 @@ _METHOD_BOUNDARY_POST_PATTERNS: tuple[tuple[re.Pattern[str], tuple[str, ...]], .
 )
 
 
-def _v4_method_boundary_revision_active() -> bool:
-    """§3.3 gate: ``method.boundary.v4 ∈ SATISFIED`` (dynamic read)."""
-    return _V4_METHOD_BOUNDARY_FEATURE in readiness_mod.SATISFIED
+def _v4_method_boundary_405_live() -> bool:
+    """§16.1 two-condition conjunction (revision 2, frozen): the
+    transitional coded 405 is live iff the fallback face exists
+    (``method.boundary.v4 ∈ SATISFIED``) AND the equivalence family is not
+    activated yet (``session.post-actions.v4 ∉ SATISFIED``). With
+    post-actions satisfied the selector passes the three combos through —
+    the §16.2 handlers take over (§16.3 third cell)."""
+    satisfied = readiness_mod.SATISFIED
+    return (_V4_METHOD_BOUNDARY_FEATURE in satisfied
+            and _V4_POST_ACTIONS_FEATURE not in satisfied)
 
 
 def _method_boundary_allow(
@@ -558,15 +578,18 @@ class SlimapiSelectorMiddleware:
         wire = values[0]
         _stash(scope, SELECTOR_V3 if wire == "3" else SELECTOR_V4, wire)
 
-        # §8.3/§16: the method 405 slots between ② (the version-family 400s
-        # above) and ③ (directory consumption below). v4 face + §3.3 gate
-        # open + one of the three deferred POST combos → coded 405 with the
-        # frozen body/Allow literals; zero upstream IO (the combo is
-        # deferred, never forwarded). The admitted stash above stays — the
-        # selector itself succeeded and §9.1 records the truthful
-        # selectorResult=v4; the 405 is a method-level boundary, not a
-        # selector rejection.
-        if wire == "4" and _v4_method_boundary_revision_active():
+        # §8.3/§16.1: the method 405 slots between ② (the version-family
+        # 400s above) and ③ (directory consumption below). v4 face +
+        # two-condition conjunction live (boundary∈SATISFIED ∧
+        # post-actions∉SATISFIED) + one of the three deferred POST combos
+        # → coded 405 with the frozen body/Allow literals; zero upstream IO
+        # (the combo is deferred, never forwarded). With post-actions
+        # satisfied this whole block steps aside (§16.3 activation) and
+        # the request flows to the route registry. The admitted stash
+        # above stays — the selector itself succeeded and §9.1 records the
+        # truthful selectorResult=v4; the 405 is a method-level boundary,
+        # not a selector rejection.
+        if wire == "4" and _v4_method_boundary_405_live():
             method = (scope.get("method", "") or "").upper()
             allow = _method_boundary_allow(normalized, method)
             if allow is not None:
