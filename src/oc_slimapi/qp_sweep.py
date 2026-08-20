@@ -16,6 +16,11 @@ from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from typing import Any
 
+from .logging_config import get_logger
+from .sse.hub_types import record_qp_activity
+
+logger = get_logger(__name__)
+
 
 _EVICTION_AFTER = 30 * 86400.0
 _MAX_SLEEP_SECONDS = 30.0
@@ -110,7 +115,11 @@ class QpSweepShadow:
         if not isinstance(directory, str) or not directory:
             return
         timestamp = self._now() if now is None else now
-        self._activity[directory] = timestamp
+        # F-015: funnel through the shared activity-LRU helper (same one
+        # the hub's IMMEDIATE branch uses — both write points share this
+        # dict reference by app.py construction) so the table stays
+        # bounded and re-touches move to the tail.
+        record_qp_activity(self._activity, directory, timestamp)
         self.observe_directory(directory, now=timestamp)
 
     def record_request_activity(
@@ -162,6 +171,15 @@ class QpSweepShadow:
             self._known_dirs.discard(directory)
             self._seen_at.pop(directory, None)
             self._next_run.pop(directory, None)
+            # F-273: the sweep and the hub share ONE activity dict (app.py
+            # wires ``activity=global_hub.qp_last_activity``). Evicting a
+            # directory here without popping the activity entry left the
+            # shared table growing without bound — the eviction was a
+            # no-op from the hub's memory point of view. (Redundant with
+            # the QP_LAST_ACTIVITY_MAX LRU cap as defense in depth; this
+            # path removes entries PROMPTLY at eviction time instead of
+            # waiting for the cap to be reached.)
+            self._activity.pop(directory, None)
 
     def _next_sleep(self, timestamp: float) -> float:
         self._evict_stale_directories(timestamp)
@@ -217,7 +235,17 @@ class QpSweepShadow:
                     await asyncio.wait_for(self._wake_event.wait(), timeout=delay)
                 except asyncio.TimeoutError:
                     pass
-            self.run_once()
+            # F-007 (half): the scheduler loop must survive a run_once
+            # blow-up. A poisoned directory_source (or any bug in the
+            # shadow evaluation) previously killed the task for the rest
+            # of the process lifetime — silently stopping all shadow
+            # scheduling. Log-and-continue mirrors the app.py exit-stack
+            # isolation; CancelledError is a BaseException and still
+            # propagates so stop() keeps working.
+            try:
+                self.run_once()
+            except Exception:
+                logger.warning("qp sweep run_once failed", exc_info=True)
 
     def start(self) -> asyncio.Task[None] | None:
         if not self.enabled or self.running:

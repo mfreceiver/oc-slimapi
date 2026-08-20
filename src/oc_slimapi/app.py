@@ -1,8 +1,6 @@
 import asyncio
-import functools
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import date
-from pathlib import Path
 
 from fastapi import FastAPI
 import uvicorn
@@ -36,7 +34,7 @@ from .sse.replay_wire import replay_sweep_loop
 from .sse.token_hub import TokenStreamHub, TokenStreamRegistry
 from .sse.tokenstream.hub import apply_debug_budget_overrides
 from .traffic import TrafficLedger
-from .traffic_snapshot import TrafficSnapshotter, prune_old_snapshots
+from .traffic_snapshot import TrafficSnapshotter
 from .transform import TransformConfig, TransformPool
 from .upstream import create_client
 
@@ -292,6 +290,10 @@ async def lifespan(app: FastAPI):
             ledger=app.state.traffic_ledger,
             interval_s=settings.traffic_snapshot_interval_s,
             path=settings.traffic_snapshot_path,
+            # F-009: retention window for daily snapshot files. The
+            # snapshotter's own loop prunes expired files at the top of
+            # every tick — self-managed, independent of ACCESS_LOG_ENABLED.
+            retain_days=settings.traffic_snapshot_retain_days,
         )
 
         async def _stop_snapshotter():
@@ -512,7 +514,15 @@ async def lifespan(app: FastAPI):
             app.state.qp_sweep.start()
 
             async def _stop_qp_sweep():
-                await app.state.qp_sweep.stop()
+                # F-007: exception-isolated like every other exit-stack
+                # callback — a failing qp sweep stop must not skip the
+                # LIFO cleanups registered after this one.
+                try:
+                    await app.state.qp_sweep.stop()
+                except Exception as exc:
+                    get_logger("app").warning(
+                        "qp sweep stop failed", exc_info=exc
+                    )
 
             stack.push_async_callback(_stop_qp_sweep)
             get_logger("app").info(
@@ -655,30 +665,18 @@ async def lifespan(app: FastAPI):
         if access_log_active:
             stop_event = asyncio.Event()
             app.state._access_log_stop_event = stop_event
-            # Task 10 (P2-1): bind the traffic-snapshot prune as the loop's
-            # ``extra_prune`` so it piggybacks on the existing access-log
-            # maintenance loop (no separate background task, single shared
-            # ``today`` per tick). ``functools.partial`` binds positionally
-            # (directory, stem, retain_days); the loop passes ``today`` as a
-            # positional arg → ``extra_prune(today)``. Keyword binding would
-            # collide with the ``today`` positional in the loop body (the
-            # original bug: ``TypeError: prune_old_snapshots() got multiple
-            # values for argument 'directory'`` swallowed by the loop's
-            # ``except Exception``).
-            snapshot_path_obj = Path(settings.traffic_snapshot_path)
-            snapshot_prune = functools.partial(
-                prune_old_snapshots,
-                snapshot_path_obj.parent,
-                snapshot_path_obj.stem,
-                settings.traffic_snapshot_retain_days,
-            )
+            # F-009: the traffic-snapshot prune no longer piggybacks on
+            # this loop as ``extra_prune`` — the snapshotter's own loop
+            # prunes expired daily files at the top of every tick
+            # (self-managed retention, independent of ACCESS_LOG_ENABLED;
+            # see TrafficSnapshotter.__init__ retain_days). This loop now
+            # only handles the access-log compress+prune.
             maint_task = asyncio.create_task(
                 run_access_log_maintenance_loop(
                     dir=access_log_dir,
                     retain_days=settings.access_log_retain_days,
                     interval_s=settings.access_log_maintenance_interval_s,
                     stop_event=stop_event,
-                    extra_prune=snapshot_prune,
                 )
             )
             app.state._access_log_maintenance_task = maint_task
@@ -720,6 +718,15 @@ async def lifespan(app: FastAPI):
         if settings.traffic_snapshot_enabled and settings.traffic_metrics_enabled:
             try:
                 await app.state.traffic_snapshotter.start()
+                # F-009 observability: retention ownership moved into the
+                # snapshotter loop — state it explicitly so operators do not
+                # expect the access-log maintenance loop to cover snapshots.
+                get_logger("app").info(
+                    "traffic snapshot retention is self-managed by the "
+                    "snapshotter loop (independent of ACCESS_LOG_ENABLED); "
+                    "retain_days=%s",
+                    settings.traffic_snapshot_retain_days,
+                )
             except Exception as exc:
                 get_logger("app").warning(
                     "traffic snapshotter start failed", exc_info=exc
@@ -731,7 +738,19 @@ async def lifespan(app: FastAPI):
         # exit path (P0-1).
 
 
-app = FastAPI(title="oc-slimapi", version=__version__, lifespan=lifespan)
+# F-137: the default FastAPI docs/openapi surface (/docs, /redoc,
+# /openapi.json, /docs/oauth2-redirect) is DISABLED — a loopback-exposed
+# sidecar must not serve an API explorer or schema description. Without
+# this, those paths fall through to the catch-all 404
+# (``thin_route_not_found``) like every other unadopted route.
+app = FastAPI(
+    title="oc-slimapi",
+    version=__version__,
+    lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 register_error_handlers(app)
 # Dual-version window (4.0.0, B3a-A) — the version selector (the retired
 # Batch-A gate was removed with the v2 pipeline) sits at this position in

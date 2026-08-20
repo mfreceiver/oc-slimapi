@@ -528,6 +528,54 @@ def test_prune_skips_non_matching_names(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# 12b. prune_old_access_logs — legacy archives (F-008)
+# ---------------------------------------------------------------------------
+
+
+def test_prune_deletes_expired_legacy_archive(tmp_path):
+    """F-008: access-legacy-YYYYMMDD-N.jsonl.gz is aged by its name date and
+    deleted once past the same retain window as standard daily names."""
+    old = tmp_path / "access-legacy-20200101-1.jsonl.gz"
+    old.write_text("data")
+
+    count = prune_old_access_logs(str(tmp_path), 7, date(2026, 7, 29))
+    assert count == 1
+    assert not old.exists()
+
+
+def test_prune_keeps_today_legacy_archive(tmp_path):
+    """F-008: a legacy archive dated today stays (inside the window)."""
+    today = tmp_path / "access-legacy-20260729-1.jsonl.gz"
+    today.write_text("data")
+
+    count = prune_old_access_logs(str(tmp_path), 7, date(2026, 7, 29))
+    assert count == 0
+    assert today.exists()
+
+
+def test_prune_legacy_boundary_and_current_suffix(tmp_path):
+    """F-008: boundary legacy archive (== today - retain_days) is kept and the
+    `-current` migration suffix (main access.jsonl product) is recognized."""
+    boundary = tmp_path / "access-legacy-20260722-current.jsonl.gz"
+    boundary.write_text("data")
+
+    count = prune_old_access_logs(str(tmp_path), 7, date(2026, 7, 29))
+    assert count == 0
+    assert boundary.exists()
+
+
+def test_prune_skips_malformed_legacy_names(tmp_path):
+    """F-008: a legacy-looking name with a non-date segment never matches —
+    untouched regardless of the window."""
+    malformed = tmp_path / "access-legacy-2026AB22-1.jsonl.gz"
+    malformed.write_text("data")
+
+    count = prune_old_access_logs(str(tmp_path), 7, date(2026, 7, 29))
+    assert count == 0
+    assert malformed.exists()
+
+
+# ---------------------------------------------------------------------------
 # 13. migrate_legacy_access_log
 # ---------------------------------------------------------------------------
 

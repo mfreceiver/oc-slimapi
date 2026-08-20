@@ -120,6 +120,8 @@ GET /slimapi/sessions?v=4
            complete: bool, degraded?: true}
 ```
 
+**limit 域外归宿（2026-08-21 审计 F-025 澄清，行为零改动——冻结现状）**：`limit=501..1000`（FastAPI 声明域内、v4 域外）→ 422 coded body `{"code":"param_version_mismatch","hint":"v4 limit domain is 1..500"}`；`limit>1000 / ≤0 / 非整数`（FastAPI 声明域外）→ 框架 422 `{"detail":[...]}`（**只冻结**状态码 + `detail` 为数组存在 + 无 `code` 字段；框架文案不冻结）。`archived` 非三态值 / `parent=""` → 同 coded 422 `param_version_mismatch`。
+
 | 参数 | v3 请求 | v4 请求 |
 |---|---|---|
 | `archived` / `parent` / `cursor` | **422**（未知参数显式拒绝，不依赖框架默认忽略） | 本表语义 |
@@ -169,7 +171,7 @@ result(req, db, al, cursor, search):
 | `invalid_cursor` | 400 | cursor 语法非法 / 指纹不匹配（§4.5）；**优先于** 503（§8.3） |
 | `auxiliary_unavailable` | 503 | 降级矩阵（§4.2）；附 Retry-After |
 | `directory_retired_in_v4` | 400 | §5.2 |
-| 参数版本不匹配 | 422 | v4 收 roots/start；v3 收 archived/parent/cursor |
+| 参数版本不匹配（code `param_version_mismatch`，coded body） | 422 | v4 收 roots/start；v3 收 archived/parent/cursor；**v4 limit 域外 501..1000、archived 非三态、parent 空串**（2026-08-21 审计 F-025 补全；limit>1000/≤0/非 int 为框架 422 `detail` 形状——见 §4.1 域外归宿句） |
 
 ### §4.4 ETag
 
@@ -281,7 +283,7 @@ v3 原样（§4.4 已含 v4 差异：v4 sessions 无 ETag）。
 | `tokens_stream_retired_in_v4` | 400 | §7.3 |
 | `invalid_cursor` | 400 | §4.5 |
 | `auxiliary_unavailable` | 503 | §4.2；附 `Retry-After: 30`；错误体不含 DB 路径/schema/白名单内容 |
-| 参数版本不匹配（`v3 收 v4 参数 / v4 收 v3 参数`） | 422 | §4.1 |
+| 参数版本不匹配（`v3 收 v4 参数 / v4 收 v3 参数`；code 字面量 `param_version_mismatch`——含 v4 limit 域外 501..1000 / archived 非三态 / parent 空串，2026-08-21 F-025 命名） | 422 | §4.1 |
 
 ### §8.2 403 vs 400 族
 

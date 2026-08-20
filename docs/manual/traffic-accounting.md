@@ -183,7 +183,7 @@ curl -s "$BASE/slimapi/metrics?$V" | jq '
 - **按天切分**：每天一个 `access-YYYY-MM-DD.jsonl`，跨天自动切新文件。
 - **启动压缩**：服务启动时把**早于今天的**（日期 `< today`）未压缩 `.jsonl` 原子压缩为 `.gz`（写 `.gz.tmp` → rename → 删源）。当天文件不压缩（活跃写入中）。
 - **legacy 迁移（仅当前目录）**：`migrate_legacy_access_log` 只处理**当前 `access_log_dir` 内**的无日期文件（旧 `access.jsonl` / `access.jsonl.N`），按 mtime 归档为 `access-legacy-{mtimeYYYYMMDD}-{N}.jsonl.gz`。**不跨目录迁移**：生产部署从旧相对目录（如 cwd 下 `logs/`）升级到 `StateDirectory`（`~/.local/state/oc-slimapi/logs`）时，旧位置的历史日志**不会自动迁移**——运维需手动移动（历史日志的清理也由运维处理）。
-- **`access-legacy-*.jsonl.gz` 不受 retain 自动清理**：prune 的严格匹配只认 `access-YYYY-MM-DD.jsonl(.gz)`，迁移产出的 `access-legacy-*.jsonl.gz` **永久保留**，清理由运维手动处理。
+- **`access-legacy-*.jsonl.gz` 纳入 retain 自动清理**：prune 先严格匹配 `access-YYYY-MM-DD.jsonl(.gz)`，迁移产出的 legacy 档案（`access-legacy-YYYYMMDD-*.jsonl.gz`）按**名内归档日期**纳入 `RETAIN_DAYS` 同一保留窗口自动清理（同一判据、同一边界）。
 - **后台 maintenance**（默认 1h）：周期 compress + prune（`OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS`，默认 `0`=不删）。
 - 读取压缩历史文件用 `zcat access-2026-07-23.jsonl.gz | jq ...` 或 `jq` 直接读管道。
 
@@ -249,12 +249,12 @@ access log 的 `downOut` 是 **wire 级**字节（中间件视角，含 SSE 连�
 | `OC_SLIMAPI_ACCESS_LOG_ENABLED` | `1` | access log 落盘开关；`0` 时不建文件、纯 no-op |
 | `OC_SLIMAPI_ACCESS_LOG_DIR` | `logs` | access log 目录（按天文件 `access-YYYY-MM-DD.jsonl` 落在其下；父目录 best-effort 创建）。生产 systemd 覆盖为 `%S/oc-slimapi/logs` |
 | `OC_SLIMAPI_ACCESS_LOG_COMPRESS_ON_STARTUP` | `1` | 启动时压缩早于今天（`< today`）的 `.jsonl` → `.gz` |
-| `OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS` | `0` | prune 早于 N 天的 `access-YYYY-MM-DD.jsonl(.gz)`；**代码默认 `0`=不删**（本地开发/测试）；**生产 unit 配置 `3`**（见 `deploy/oc-slimapi.service` / `docs/operations.md` §3.2）。**不含** `access-legacy-*.jsonl.gz`（永久保留） |
+| `OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS` | `0` | prune 早于 N 天的 `access-YYYY-MM-DD.jsonl(.gz)`；**代码默认 `0`=不删**（本地开发/测试）；**生产 unit 配置 `3`**（见 `deploy/oc-slimapi.service` / `docs/operations.md` §3.2）。`access-legacy-YYYYMMDD-*.jsonl.gz` 按名内归档日期同一判据清理 |
 | `OC_SLIMAPI_ACCESS_LOG_MAINTENANCE_INTERVAL_S` | `3600` | 后台 compress+prune 周期（≥60） |
 | `OC_SLIMAPI_TRAFFIC_SNAPSHOT_ENABLED` | `1` | 内存账本周期快照开关（见 §9） |
 | `OC_SLIMAPI_TRAFFIC_SNAPSHOT_INTERVAL_S` | `300` | 快照周期（≥1） |
 | `OC_SLIMAPI_TRAFFIC_SNAPSHOT_PATH` | `logs/traffic-snapshot.jsonl` | 快照文件名 stem（按天生成 `<stem>-YYYY-MM-DD.jsonl`）；生产 systemd 覆盖为 `%S/oc-slimapi/logs/traffic-snapshot.jsonl` |
-| `OC_SLIMAPI_TRAFFIC_SNAPSHOT_RETAIN_DAYS` | `0` | Task 10 (P2-1)：prune 早于 N 天的 `traffic-snapshot-YYYY-MM-DD.jsonl(.gz)`；**代码默认 `0`=不删**（本地开发/测试）；**生产 unit 配置 `30`**（见 `deploy/oc-slimapi.service` / `docs/operations.md` §3.2/§5.3）。复用 access-log 维护循环同一 tick 的 `today`，边界（`today - retain_days`）保留；与 access-log 不同，**不压缩**仅按天清理 |
+| `OC_SLIMAPI_TRAFFIC_SNAPSHOT_RETAIN_DAYS` | `0` | prune 早于 N 天的 `traffic-snapshot-YYYY-MM-DD.jsonl(.gz)`；**代码默认 `0`=不删**（本地开发/测试）；**生产 unit 配置 `30`**（见 `deploy/oc-slimapi.service` / `docs/operations.md` §3.2/§5.3）。snapshotter 循环每 tick 顶部自持 prune，**不受 `ACCESS_LOG_ENABLED` 影响**，边界（`today - retain_days`）保留；与 access-log 不同，**不压缩**仅按天清理 |
 | `OC_SLIMAPI_CLIENT_ID_HASH` | `1` | 设备 id hash 开关（fail-closed 默认开；读到 false 时才落明文） |
 | `OC_SLIMAPI_CLIENT_ID_SALT` | `None` | HMAC salt（非空时 `sha256`→`hmac_sha256`） |
 
@@ -299,7 +299,7 @@ access log 的 `downOut` 是 **wire 级**字节（中间件视角，含 SSE 连�
 
 - **cumulative 语义**：`buckets`/`totals` 是该进程**自启动以来**的累计值（含 SSE 真实成本 `upIn`/`downOut`），即 `GET /slimapi/metrics` 响应 `traffic` 块的内存账本逐字段 dump。
 - **跨进程分段**：进程重启后 `bootTs`/`runId` 变化、`uptimeS` 归零 → 新的一段 cumulative。分析侧通过 `bootTs`/`runId` 识别进程边界，对相邻两帧算 delta 得到该段时间增量。
-- **跨天切分**：日期变更时自动切新文件 `traffic-snapshot-YYYY-MM-DD.jsonl`（当天文件 append 写入，不压缩）。**snapshot 文件不经 access log 的 compress**（后者只认 `access-` 前缀），但 **Task 10 (P2-1) 起经 access-log 维护循环的 `extra_prune` 钩子按天清理**（`OC_SLIMAPI_TRAFFIC_SNAPSHOT_RETAIN_DAYS`，默认 `0`=不删；生产 unit 配置 `30`）：每个 tick 与 access-log prune 共享同一 `today`，删除早于 N 天的 `traffic-snapshot-YYYY-MM-DD.jsonl(.gz)`（边界 `today - retain_days` 保留）。不另起后台 task。
+- **跨天切分**：日期变更时自动切新文件 `traffic-snapshot-YYYY-MM-DD.jsonl`（当天文件 append 写入，不压缩）。**snapshot 文件不经 access log 的 compress**（后者只认 `access-` 前缀），但 **F-009 起由 snapshotter 循环每 tick 顶部自持清理**（`OC_SLIMAPI_TRAFFIC_SNAPSHOT_RETAIN_DAYS`，默认 `0`=不删；生产 unit 配置 `30`；**不受 `ACCESS_LOG_ENABLED` 影响**）：删除早于 N 天的 `traffic-snapshot-YYYY-MM-DD.jsonl(.gz)`（边界 `today - retain_days` 保留）。prune 失败仅告警，不中断循环。
 - **inactive（首帧失败即停，不重试）**：snapshotter 首帧写入失败（磁盘满 / 路径不可写 / 权限不足）→ 标 **inactive**：**不创建后台 task、不周期重试**，该进程内不再写快照。需运维排查磁盘/路径后**重启**服务恢复。这是有意的 fail-loud 设计（避免无声重试掩盖根因）。
 - **shutdown 终态**：进程优雅退出时写一帧终态（尽可能捕捉最后一段数据）；非优雅退出则缺终态（下次启动补第一帧时由 `bootTs` 变化体现）。
 

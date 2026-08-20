@@ -524,8 +524,9 @@ async def _fetch_full_shared(
     same ``(sid, mid, directory)`` coalesce onto ONE upstream GET.
 
     ``cap`` bounds the per-flight read (rev-fix 2): the merged fan-out passes
-    the item's budget allotment — ``min(max_message_bytes, remaining)`` — so
-    the request-level reservations never exceed ``merged_max_bytes``. The
+    the item's budget allotment — ``min(max_message_bytes, remaining,
+    share)`` with the F-006 equal share — so the request-level reservations
+    never exceed ``merged_max_bytes``. The
     direct route passes no cap (always the full ``max_message_bytes``) and is
     never affected by a merged budget: if it joins a flight truncated at a
     SMALLER cap, the dropped-entry retry re-fetches at its own full cap; if
@@ -602,8 +603,10 @@ async def _merge_fulls(
     Phase B (no pool slot) — ``merged_max_bytes`` is a TRUE FETCH budget
     (rev-fix 2), not a post-hoc filter. A request-level ``remaining`` pool
     starts at ``merged_max_bytes``; a fetch RESERVES its read cap
-    (``min(max_message_bytes, remaining)``) synchronously when it starts and
-    is REFUNDED ``cap - len(body)`` on completion. Invariants:
+    (``min(max_message_bytes, remaining, share)`` with the F-006 equal
+    share ``share = max(1, merged_max_bytes // candidates)``) synchronously
+    when it starts and is REFUNDED ``cap - len(body)`` on completion.
+    Invariants:
 
     * an item finds ``remaining <= 0`` at its start → ``_DEGRADED`` with NO
       upstream request at all;
@@ -652,7 +655,32 @@ async def _merge_fulls(
 
     async def _fetch_one(mid: str):
         async with semaphore:
-            cap = min(config.max_message_bytes, remaining[0])
+            # F-006 anti-starvation: EQUAL-SHARE reservation. Every candidate
+            # reserves ``min(max_message_bytes, remaining, share)`` with
+            # ``share = max(1, merged_max_bytes // max(1, len(pairs)))`` — the
+            # first candidate can no longer reserve the WHOLE page budget and
+            # zero-start the rest (the old defect: the default 32 MiB / 8 MiB
+            # combo deterministically degraded every multi-candidate page to
+            # a single inline).
+            #
+            # I1 (segmented start guarantee): strict segment M >= N
+            # (M = merged_max_bytes, N = len(pairs); the production defaults
+            # 8 MiB >= 16 slots live here) gives N * share <= M, so
+            # ``remaining`` cannot hit 0 before the Nth candidate passes the
+            # gate → ALL N candidates start with a positive cap. Floor
+            # segment M < N pins share to 1: exactly min(N, M) candidates
+            # start (1 byte each, serial worst case) — an anti-monopoly
+            # promise, not all-start (M bytes cannot fund N > M positive
+            # shares).
+            #
+            # I2 (peak): concurrent in-flight reservations sum to
+            # <= N * share — strictly <= M in the M >= N segment; the floor
+            # segment's share = 1 adds at most N - M bytes of slack.
+            cap = min(
+                config.max_message_bytes,
+                remaining[0],
+                max(1, config.merged_max_bytes // max(1, len(pairs))),
+            )
             if cap <= 0:
                 return _DEGRADED  # budget exhausted before start → no fetch
             remaining[0] -= cap  # reserve (serial point: no await yet)
@@ -664,9 +692,12 @@ async def _merge_fulls(
             except CodedHTTPException:
                 body = _DEGRADED  # per-item degrade, not a page failure
             finally:
-                # Refund the un-read reservation. A truncated read (None)
-                # consumed its whole cap → no refund; an error buffered
-                # nothing → full refund. (Also a serial point.)
+                # Refund the un-read reservation (serial point). A successful
+                # read refunds ``cap - len(body)``; a truncated read (None)
+                # and a per-item error (_DEGRADED) return no body →
+                # held = 0 → the FULL reservation is refunded (a truncated
+                # body is discarded — the item degrades anyway — so its
+                # bytes are released for later candidates).
                 held = len(body) if isinstance(body, (bytes, bytearray)) else 0
                 remaining[0] += max(0, cap - held)
             return body

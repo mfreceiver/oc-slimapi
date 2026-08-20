@@ -81,7 +81,7 @@
       - 同 session 多次变化 → 合并取最新；窗口 flush 后清 pending（lastError sticky 经独立持久层跨窗口保留，见 `docs/specs/v2-contract.md` §3）。
    2. **`event: session.error`（G1-B）**——**无** `sessionID` 时**立即直推**（不进 debounce）：`data: {"directory"?,"name","message","at"}`。有 sid 的 `session.error` **不**走本帧，走 digest `lastError`（G1-A）。abort（`MessageAbortedError`）静默丢弃。wire 权威见 `docs/specs/v2-contract.md` §3。
    - **全部丢弃（不进 digest/不策展转发）**：`message.part.delta`/`.updated`/`.removed`（逐 token，仅路由到 token hub 供 token stream 消费）、`message.removed`（仅路由到 token hub 供 tombstone/token stream 维护）、`tool.*`、未知类型——省流核心。
-- **直推转发（观察信号）**：`question.asked`/`v2.asked`、`permission.asked`/`resolved`/`v2.asked`/`v2.resolved`——立即扇出订阅者，不进 debounce；客户端用于驱动 UI 提示，具体应答走 catch-all + `X-Opencode-Directory`（v2 无专用写端点）。
+- **直推转发（观察信号）**：`question.asked`/`v2.asked`、`permission.asked`/`replied`/`v2.asked`/`v2.replied`——立即扇出订阅者，不进 debounce；客户端用于驱动 UI 提示，具体应答走 catch-all + `X-Opencode-Directory`（v2 无专用写端点）。
 - 上游 `session.error` **不**在此列：经 G1 处理（有 sid→digest `lastError`；无 sid→`event: session.error`；abort 过滤），见上吐出帧。
 - **背压**：每订阅 `asyncio.Queue`（item 上限 + 字节预算）；溢出时 **立即断开慢消费者**：标记 `closed` → **清空全部旧 queue 帧** → 入队 `event: resync` `{"reason":"subscriber_backpressure"}` → 入队 `STOP`（**不**交付此前积压帧，**不**「丢最旧续发」）。
 - **不承诺 replay**：无 event store；重连接收 `resync` 后走冷启动流程（sessions + messages）或前台 catch-up。

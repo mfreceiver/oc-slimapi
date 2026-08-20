@@ -43,6 +43,7 @@ from .hub_types import (
     _sanitize_error_message,
     _upstream_line_bytes,
     normalize_session_status,
+    record_qp_activity,
     sse_frame,
 )
 from .replay_log import GLOBAL_DOMAIN
@@ -58,6 +59,18 @@ logger = get_logger(__name__)
 
 
 _LAST_UPDATED_AT_BY_SID_MAX = 10_000
+
+# F-216 (audit 2026-08-20): cardinality bound for the per-type drop counter
+# table. A hostile or simply novel upstream (new event types after an
+# opencode upgrade) must not be able to grow the dict without limit; types
+# beyond the bound fold into a single "__other__" bucket. Internal
+# observability only — NEVER exposed on the wire (snapshot_metrics shape is
+# frozen; see _record_dropped_event).
+_DROPPED_TYPES_MAX = 256
+# Rate limit for the sampled drop log: at most one aggregated "top" line per
+# window, regardless of drop volume (a token firehose upstream must not turn
+# this into a log flood).
+_DROPPED_LOG_INTERVAL_SECONDS = 60.0
 
 
 class GlobalHub:
@@ -147,6 +160,16 @@ class GlobalHub:
         self.emitted_frames_total = 0
         self.reconnects_total = 0
         self.allowlist_dropped_events = 0
+        # F-216: internal per-type counter for the publish() catch-all drop
+        # (the `# Drop text deltas, tool.*, message.part.*` fall-through).
+        # Bounded by _DROPPED_TYPES_MAX distinct keys with an "__other__"
+        # overflow bucket; the sampled log is rate-limited by
+        # _DROPPED_LOG_INTERVAL_SECONDS. Purely internal observability —
+        # deliberately NOT part of snapshot_metrics() (the /slimapi/metrics
+        # wire shape is frozen) and inspectable from tests / a debugger.
+        self.upstream_dropped_events_total: dict[str, int] = {}
+        self._dropped_last_log_ts = 0.0
+        self._dropped_since_log = 0
         # rev-ogpt MAJOR 3 + MAJOR 4 (3rd-round terminal audit): bounded
         # gate of retired (sessionID, messageID) tuples. Populated by
         # ``message.removed``; checked by ``message.part.updated`` to
@@ -655,6 +678,38 @@ class GlobalHub:
         while len(self.deleted_tombstones) > _LAST_UPDATED_AT_BY_SID_MAX:
             self.deleted_tombstones.popitem(last=False)
 
+    def _record_dropped_event(self, event_type: Any) -> None:
+        """F-216: count one catch-all drop by event type, bounded + sampled.
+
+        Called from the tail of :meth:`publish` for every event that falls
+        through all curated branches. Three guarantees:
+
+        * Bounded cardinality: at most ``_DROPPED_TYPES_MAX`` distinct keys;
+          a type arriving when the table is full folds into ``__other__``.
+          Non-string ``event_type`` (missing/unhashable payload ``type``)
+          also lands in ``__other__`` — the counter must never crash on a
+          malformed frame.
+        * Sampled log: at most one aggregated line per
+          ``_DROPPED_LOG_INTERVAL_SECONDS`` window (top-8 by count), so a
+          token firehose upstream cannot flood the log.
+        * Zero wire impact: the table is internal state; nothing here feeds
+          ``snapshot_metrics()`` or any frame (the /slimapi/metrics shape
+          is frozen). ``_dropped_since_log`` ticks the per-window volume
+          for future metrics extension without changing today's wire.
+        """
+        key = event_type if isinstance(event_type, str) else "__other__"
+        table = self.upstream_dropped_events_total
+        if key not in table and len(table) >= _DROPPED_TYPES_MAX:
+            key = "__other__"
+        table[key] = table.get(key, 0) + 1
+        self._dropped_since_log += 1
+        now = time.monotonic()
+        if now - self._dropped_last_log_ts >= _DROPPED_LOG_INTERVAL_SECONDS:
+            top = sorted(table.items(), key=lambda item: -item[1])[:8]
+            logger.info("upstream dropped events (top): %s", top)
+            self._dropped_last_log_ts = now
+            self._dropped_since_log = 0
+
     def publish(self, global_event: dict[str, Any]) -> None:
         # Count every JSON-decoded upstream event we were asked to consider;
         # early-returns below still represent real traffic the GlobalBus saw.
@@ -675,7 +730,11 @@ class GlobalHub:
                 and isinstance(directory, str)
                 and directory
             ):
-                self.qp_last_activity[directory] = time.time()
+                # F-015: funnel through the shared activity-LRU helper so
+                # the table stays bounded and re-touches move to the tail
+                # (both write points — here and QpSweepShadow.record_activity
+                # — share this dict reference by app.py construction).
+                record_qp_activity(self.qp_last_activity, directory, time.time())
             frame = sse_frame({
                 "directory": directory,
                 "type": event_type,
@@ -973,6 +1032,11 @@ class GlobalHub:
             return
 
         # Drop text deltas, tool.*, message.part.*, and anything else.
+        # F-216: internal per-type observability for the drop (bounded
+        # table + sampled log; zero wire impact — see
+        # _record_dropped_event). Curated branches above returned early,
+        # so only genuinely dropped types reach this counter.
+        self._record_dropped_event(event_type)
 
     def resync_all(self) -> None:
         # C⑩: cold-start semantics — a resync means the client cold-starts

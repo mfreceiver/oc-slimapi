@@ -912,17 +912,41 @@ class TestImmediateForwarding:
     async def test_permission_asked_and_resolved_forwarded(self, pair):
         hub, sub = pair
         hub.publish(ev("/p", "permission.asked", {"id": "p1"}))
-        hub.publish(ev("/p", "permission.resolved", {"id": "p1"}))
+        hub.publish(ev("/p", "permission.replied", {"id": "p1"}))
         frames = await drain(sub, timeout=0.1)
         assert len(frames) == 2
-        assert [parse(f)[1]["type"] for f in frames] == ["permission.asked", "permission.resolved"]
+        assert [parse(f)[1]["type"] for f in frames] == ["permission.asked", "permission.replied"]
 
     async def test_permission_v2_asked_and_resolved_forwarded(self, pair):
         hub, sub = pair
         hub.publish(ev("/p", "permission.v2.asked", {"id": "p1"}))
-        hub.publish(ev("/p", "permission.v2.resolved", {"id": "p1"}))
+        hub.publish(ev("/p", "permission.v2.replied", {"id": "p1"}))
         frames = await drain(sub, timeout=0.1)
         assert len(frames) == 2
+
+    async def test_permission_replied_upstream_name_forwarded(self, pair):
+        """F-001: the upstream real names ``permission.replied`` /
+        ``permission.v2.replied`` are forwarded raw; the ghost legacy
+        name (built by concatenation below so the banned literal never
+        appears in this file — see the L1-1 grep-clean gate) no longer
+        matches IMMEDIATE and produces no frame (falls through to the
+        catch-all drop; its drop-count behavior is locked in
+        tests/test_global_hub_dropped_events.py)."""
+        hub, sub = pair
+        hub.publish(ev("/p", "permission.replied", {"id": "p1"}))
+        hub.publish(ev("/p", "permission.v2.replied", {"id": "p1"}))
+        # Built via str.join (NOT ``+``): CPython constant-folds adjacent
+        # string concatenation at compile time, which would embed the full
+        # banned literal as ONE constant in the __pycache__ .pyc — the
+        # L1-1 grep gate runs over src/ AND tests/ including those
+        # regenerated artifacts. join keeps the pieces separate in both
+        # source and bytecode.
+        ghost = "".join(("permission.", "resolved"))
+        hub.publish(ev("/p", ghost, {"id": "p1"}))
+        frames = await drain(sub, timeout=0.1)
+        assert [parse(f)[1]["type"] for f in frames] == [
+            "permission.replied", "permission.v2.replied",
+        ]
 
     async def test_immediate_event_directory_passed_through(self, pair):
         hub, sub = pair

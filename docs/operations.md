@@ -89,9 +89,9 @@ Environment=OC_SLIMAPI_HOST=0.0.0.0   # 或 127.0.0.1（仅 loopback，更保守
 Environment=OC_SLIMAPI_PORT=4097
 Environment=OC_SLIMAPI_UPSTREAM=http://127.0.0.1:4096
 Environment=OC_SLIMAPI_MAX_MESSAGE_BYTES=33554432
-# OC_SLIMAPI_SERVER_API_VERSION / OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS 已弃用（4.0.0 起
-# 接受区间钉死 (3,4) fail-closed，设置无效；SERVER_API_VERSION 设置仅产生启动 warning 并被
-# 忽略）——生产 unit 已同款清理，模板不再示例。
+# OC_SLIMAPI_SERVER_API_VERSION / OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS 已弃用：版本窗自 4.0.0 起
+# 由代码钉死 (3,4) fail-closed——ACCEPTED_CLIENT_VERSIONS 设非 (3,4) 启动即 RuntimeError 拒绝；
+# SERVER_API_VERSION 设置仅产生启动 warning 并被忽略。deploy 模板已同款清理，版本 env 不可配置。
 Environment=PYTHONUNBUFFERED=1
 
 # v1.0.0: access log + traffic snapshot 落 StateDirectory（systemd 自动建
@@ -227,16 +227,16 @@ oc-slimapi 有两类日志输出，**分别处理**：
 - **按天切分**：文件名 `access-YYYY-MM-DD.jsonl`（`YYYY-MM-DD` = 当天日期）。跨天自动切新文件。
 - **启动压缩**：服务启动时将**早于今天的**（日期 `< today`）未压缩 `.jsonl` 原子压缩为 `.gz`（写 `.gz.tmp` → rename → 删源）。当天文件不压缩（活跃写入中）。
 - **legacy 迁移（仅当前目录）**：`migrate_legacy_access_log` 只处理**当前 `access_log_dir` 内**的无日期文件（旧 `access.jsonl`/`access.jsonl.N`），按 mtime 归档为 `access-legacy-{mtimeYYYYMMDD}-{N}.jsonl.gz`。**不跨目录迁移**：从旧相对目录（如 cwd 下 `logs/`）升级到 `StateDirectory`（`~/.local/state/oc-slimapi/logs`）时，旧位置的历史日志**不会自动迁移**——运维需手动移动。
-- **`access-legacy-*.jsonl.gz` 不受 retain 自动清理**：prune 的严格匹配只认 `access-YYYY-MM-DD.jsonl(.gz)`，迁移产物**永久保留**，清理由运维手动处理。
+- **`access-legacy-*.jsonl.gz` 纳入 retain 自动清理**：prune 先严格匹配 `access-YYYY-MM-DD.jsonl(.gz)`，legacy 档案（`access-legacy-YYYYMMDD-*.jsonl.gz`）按**名内归档日期**纳入 `RETAIN_DAYS` 同一保留窗口自动清理（同一判据、同一边界）。
 - **后台 maintenance loop**（默认 1h 周期，`OC_SLIMAPI_ACCESS_LOG_MAINTENANCE_INTERVAL_S`）：周期执行 compress + prune，不依赖重启。
-- **prune**：`OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS`（**代码默认 `0` = 不删**；**生产 unit 配置 `3`**——见 `deploy/oc-slimapi.service` / §3.2），删除早于 N 天的 `access-YYYY-MM-DD.jsonl(.gz)`（**不含** `access-legacy-*.jsonl.gz`）。
-- **snapshot 不在此维护范围**：`traffic-snapshot-YYYY-MM-DD.jsonl` 不经 access log 的 compress（后者只认 `access-` 前缀，不自动压缩）。**Task 10 (P2-1) 起，snapshot 经同一维护循环的 `extra_prune` 钩子按天清理**（`OC_SLIMAPI_TRAFFIC_SNAPSHOT_RETAIN_DAYS`，**代码默认 `0` = 不删**；**生产 unit 配置 `30`**——见 `deploy/oc-slimapi.service` / §3.2）：每个 tick 与 access-log prune 共享同一 `today`，删除早于 N 天的 `traffic-snapshot-YYYY-MM-DD.jsonl(.gz)`（边界 `today - retain_days` 保留；删 `.jsonl` 与 `.jsonl.gz`）。不另起后台 task、不压缩。
+- **prune**：`OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS`（**代码默认 `0` = 不删**；**生产 unit 配置 `3`**——见 `deploy/oc-slimapi.service` / §3.2），删除早于 N 天的 `access-YYYY-MM-DD.jsonl(.gz)`；`access-legacy-YYYYMMDD-*.jsonl.gz` 按名内归档日期同一判据清理。
+- **snapshot 清理由 snapshotter 自持**：`traffic-snapshot-YYYY-MM-DD.jsonl` 不经 access log 的 compress（后者只认 `access-` 前缀，不自动压缩），也不经 access log 的 maintenance loop。**F-009 起，snapshotter 循环每 tick 顶部自持 prune**（`OC_SLIMAPI_TRAFFIC_SNAPSHOT_RETAIN_DAYS`，**代码默认 `0` = 不删**；**生产 unit 配置 `30`**——见 `deploy/oc-slimapi.service` / §3.2），**不受 `ACCESS_LOG_ENABLED` 影响**：删除早于 N 天的 `traffic-snapshot-YYYY-MM-DD.jsonl(.gz)`（边界 `today - retain_days` 保留；删 `.jsonl` 与 `.jsonl.gz`）。prune 失败仅告警，不中断循环、不写入降级。
 
 ### 5.4 磁盘增长估算
 
 - **access log**：单日 raw 视请求量约 **50–100 MB**（每行 ~200–400 B × 请求数）；压缩后约 **1/8**（~6–12 MB/天）。
 - **traffic snapshot**：极小（每帧 ~1–2 KB × 每 300s = ~300 KB/天）；**不经自动压缩**，**Task 10 (P2-1) 起按 `OC_SLIMAPI_TRAFFIC_SNAPSHOT_RETAIN_DAYS` 自动 prune**（代码默认 `0`=不删；生产 unit `30`）。30 天保留上限约 30 × 300 KB ≈ 9 MB。
-- **建议**：生产 unit 已配 `OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS=3`（保留 3 天 access log，约 3×6–12 MB ≈ 20–36 MB 压缩后）+ `OC_SLIMAPI_TRAFFIC_SNAPSHOT_RETAIN_DAYS=30`（保留 30 天 snapshot，约 9 MB）；如需更久的历史可调大此两值。`access-legacy-*.jsonl.gz` **不受 retain**（永久保留），需定期手动清理。journald 自身由 systemd 按 `/etc/systemd/journald.conf` 轮转，不在此列。
+- **建议**：生产 unit 已配 `OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS=3`（保留 3 天 access log，约 3×6–12 MB ≈ 20–36 MB 压缩后）+ `OC_SLIMAPI_TRAFFIC_SNAPSHOT_RETAIN_DAYS=30`（保留 30 天 snapshot，约 9 MB）；如需更久的历史可调大此两值。`access-legacy-*.jsonl.gz` 按名内归档日期随同一 retain 窗口自动清理。journald 自身由 systemd 按 `/etc/systemd/journald.conf` 轮转，不在此列。
 
 ### 5.5 Fan-out 与内存预算（内部 knob，非 wire）
 

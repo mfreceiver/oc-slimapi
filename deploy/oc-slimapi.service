@@ -29,8 +29,7 @@ Environment=OC_SLIMAPI_HOST=0.0.0.0
 Environment=OC_SLIMAPI_PORT=4097
 Environment=OC_SLIMAPI_UPSTREAM=http://127.0.0.1:4096
 Environment=OC_SLIMAPI_MAX_MESSAGE_BYTES=33554432
-Environment=OC_SLIMAPI_SERVER_API_VERSION=2
-Environment=OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS=2,2
+# 版本窗自 4.0.0 起由代码钉死 (3,4)（config.validate fail-closed）——勿设置版本相关 env
 Environment=PYTHONUNBUFFERED=1
 
 # v1.0.0: access log + traffic snapshot 落 StateDirectory（systemd 自动建
@@ -39,9 +38,10 @@ Environment=PYTHONUNBUFFERED=1
 StateDirectory=oc-slimapi
 Environment=OC_SLIMAPI_ACCESS_LOG_DIR=%S/oc-slimapi/logs
 Environment=OC_SLIMAPI_TRAFFIC_SNAPSHOT_PATH=%S/oc-slimapi/logs/traffic-snapshot.jsonl
-# Task 10 (P2-1): prune traffic-snapshot-YYYY-MM-DD.jsonl(.gz) older than 30
-# days. Reuses the access-log maintenance loop (single ``today`` per tick,
-# no separate background task). 0 = never prune (code default for local dev).
+# F-009: prune traffic-snapshot-YYYY-MM-DD.jsonl(.gz) older than 30 days.
+# Retention is self-managed by the snapshotter's own loop (every tick,
+# independent of ACCESS_LOG_ENABLED; no piggyback on the access-log
+# maintenance loop). 0 = never prune (code default for local dev).
 Environment=OC_SLIMAPI_TRAFFIC_SNAPSHOT_RETAIN_DAYS=30
 Environment=OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS=3
 # T9 (P1-4): incarnation state lives in its OWN dir, separate from access

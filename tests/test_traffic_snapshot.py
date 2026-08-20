@@ -1197,3 +1197,103 @@ class TestExpandBlockPersisted:
         assert lines
         for line in lines:
             assert line["expand"] == {}
+
+
+# ---------------------------------------------------------------------------
+# F-009: self-managed retention in the snapshotter loop
+# ---------------------------------------------------------------------------
+
+
+class TestSelfManagedRetention:
+    """F-009: the snapshotter loop prunes expired daily files at the top of
+    every tick — self-managed by the loop, independent of the access-log
+    maintenance loop (snapshot cleanup works even with ACCESS_LOG_ENABLED=
+    false)."""
+
+    async def test_first_tick_prunes_expired_snapshot(
+        self, tmp_path: Path
+    ) -> None:
+        """① An expired file placed before start() is deleted by the FIRST
+        tick — prune is the loop task's first statement, before any sleep."""
+        from datetime import date
+
+        path = str(tmp_path / "snap.jsonl")
+        old = tmp_path / "snap-2026-08-01.jsonl"
+        old.write_text('{"old":true}\n')
+
+        snap = TrafficSnapshotter(
+            ledger=TrafficLedger(enabled=True),
+            interval_s=300,  # long — proves prune ran before the first sleep
+            path=path,
+            retain_days=3,
+            today_fn=lambda: date(2026, 8, 10),  # deadline = 2026-08-07
+        )
+        await snap.start()
+        # Let the loop task get scheduled — its first statement is the prune.
+        await asyncio.sleep(0.05)
+        await snap.stop()
+
+        assert not old.exists()
+
+    async def test_prune_independent_of_access_log(
+        self, tmp_path: Path
+    ) -> None:
+        """② Original defect scenario: with the access log disabled (no
+        access-log maintenance loop anywhere), the snapshotter's own tick
+        still prunes. Exercises the default today_fn (real clock)."""
+        path = str(tmp_path / "snap.jsonl")
+        old_date = datetime.date.today() - datetime.timedelta(days=30)
+        old = tmp_path / f"snap-{old_date.isoformat()}.jsonl"
+        old.write_text('{"old":true}\n')
+
+        snap = TrafficSnapshotter(
+            ledger=TrafficLedger(enabled=True),
+            interval_s=0.05,
+            path=path,
+            retain_days=7,
+        )
+        await snap.start()
+        await asyncio.sleep(0.15)  # several ticks
+        await snap.stop()
+
+        assert not old.exists()
+
+    async def test_prune_failure_loop_survives(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """③ A prune exception is logged (warning) and NEVER kills the loop —
+        later ticks prune and write normally."""
+        from oc_slimapi import traffic_snapshot as ts_mod
+
+        real_prune = ts_mod.prune_old_snapshots
+        calls = {"n": 0}
+
+        def _flaky_prune(directory, stem, retain_days, today):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("injected prune failure")
+            return real_prune(directory, stem, retain_days, today)
+
+        monkeypatch.setattr(ts_mod, "prune_old_snapshots", _flaky_prune)
+
+        path = str(tmp_path / "snap.jsonl")
+        snap = TrafficSnapshotter(
+            ledger=TrafficLedger(enabled=True),
+            interval_s=0.05,
+            path=path,
+            retain_days=3,
+        )
+        with caplog.at_level(logging.WARNING):
+            await snap.start()
+            await asyncio.sleep(0.2)  # several ticks — loop must survive
+            assert snap.active
+            await snap.stop()
+
+        assert calls["n"] >= 2  # prune retried on later ticks
+        assert any(
+            "traffic snapshot prune failed" in r.message
+            for r in caplog.records
+        )
+        # The loop kept writing frames after the prune failure.
+        lines = _read_lines(path)
+        assert len(lines) >= 2

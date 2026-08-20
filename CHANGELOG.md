@@ -26,6 +26,36 @@ ocdroid 对接时：
 
 ---
 
+## [4.5.0] - 2026-08-21 — 审计整改批次一（包版本 minor；wire 版本**不变**，仍 (3,4)；2026-08-20 全面审计 docs/audits/2026-08-20/ 的 12 项发现：P1×3 + P2×8 + P3×1；实施计划经 rev-cgpt 四轮门控 5.5→7.6→8.7→9.2 PASS）
+
+### Fixed（wire）
+
+- **SSE q/p IMMEDIATE 集拼写纠正：`permission.resolved`→`permission.replied`、`permission.v2.resolved`→`permission.v2.replied`**（审计 F-001，P1）。上游 opencode v1.18.18 实际发布 `permission.replied`（schema/v1/permission.ts:61-65）与 `permission.v2.replied`（schema/permission.ts:43-45）；旧拼写为幽灵名（上游全树零发布点），真实权限决议事件此前被 catch-all 静默丢弃——订阅 `/slimapi/events` 的客户端永远收不到决议帧，`permission.asked` 秒推而 `replied` 永失。**幽灵名从未有真实帧上 wire，消费方零迁移**。`question.*` 决议族维持不透传（策展边界不变，处置另行决策）。
+- **`GET /docs`、`GET /redoc`、`GET /openapi.json`、`GET /docs/oauth2-redirect`（含 HEAD）关闭**（审计 F-137，P2）——FastAPI 默认文档路由穿透面收编，四路径现落 catch-all → 404 `thin_route_not_found`（与契约 §8.2「未收编路径 404」终态一致；此前以 200 落 passthrough 桶破坏哨兵语义并暴露全 API schema）。
+
+### Fixed（行为）
+
+- **merged 模式预算预约改按候选数均分**（审计 F-006，P1）：每候选预约 `min(max_message_bytes, remaining, share)`，`share = max(1, merged_max_bytes // 候选数)`——默认参数组合（32MiB > 8MiB）下不再确定性退化为「每页至多 1 条 inline、其余 15 条永不重试」（旧机制：首候选独占全部页预算使其余候选 `cap=0` 单向降级）。**已知代价**：单条 full body > 均分额（默认 8MiB/16=512KiB）的候选截断 → skeleton（契约 §4a.5 已披露的降级语义内，非新增行为）；极端小配置（merged_max_bytes < 候选数）下承诺防独占（启动数 = min(N,M)）而非全启动。测试：默认参数 ×2/×16 回归 + 峰值/地板分段断言（曾因测试 pin 小 max_message_bytes 回避该参数组合——审计点名的测试盲区已补）。
+
+### Added（观测，内部）
+
+- **上游事件 catch-all 丢弃 per-type 有界计数 + 60s 限率采样日志**（审计 F-216，P2）：76 型未策展上游事件的丢弃不再零观测（类型基数上界 256 + `__other__` 兜底桶）；`upstream_dropped_events_total` 为内部属性，**`/slimapi/metrics` wire 形状零改动**（metrics 暴露需 §9.2 加性契约修订，列为后续项）。
+
+### Fixed（内部/运维）
+
+- **app 关停回调 `_stop_qp_sweep` try/except 隔离 + qp_sweep 循环级异常守卫**（F-007）：单回调抛错不再跳过其后全部 LIFO 清理（最终快照/access-log flush 不再因 qp_sweep 单轮 bug 丢失）；后台 sweep task 不因 `run_once` 单轮异常死亡。
+- **HubRegistry 宽限拆除兜底**（F-011，P2）：`_remove_hub_after_grace` 拆除体异常守卫 + 引用清理统一走 `asyncio.current_task()` 身份条件（`_clear_removal_task_if_current`）——单次拆除失败不再使 grace 机制永久失效（旧缺陷：`_removal_task` 残留 → 后续 arming 永久 no-op → hub 永活/上游连接泄漏且不可自愈）；身份条件消除旧 task finally 误清新 task 引用的竞态。
+- **qp 活动表有界化 + 逐出连带清理**（F-015/F-273）：`qp_last_activity` 改 activity-LRU（容量 10k，先删后插移队尾，双写点统一走共享 helper）；qp_sweep 30 天逐出连带清理 `_activity` 键（旧缺陷：ingest 先行刷新 seen_at 使逐出条件对活动键永假，三张镜像表随之有效无界）。
+- **access-legacy-*.jsonl.gz 迁移档案纳入 RETAIN_DAYS 同一保留窗口自动清理**（F-008，P2；旧状「看得见删不掉」的死角 + 文档声称永久保留）；operations.md/traffic-accounting.md 措辞同步。
+- **traffic snapshot 清理自持**（F-009，P2）：`TrafficSnapshotter` 每 tick 顶部自持 prune（新增 `retain_days`/`today_fn` 构造参数），不再挂靠 access-log 维护循环——`OC_SLIMAPI_ACCESS_LOG_ENABLED=false` 时快照目录不再无界增长；operations.md/traffic-accounting.md 同步。
+- **deploy 模板移除残留 v2 版本 env**（F-004/F-005，P1/P3）：`OC_SLIMAPI_SERVER_API_VERSION=2`（废弃，warning+忽略）与 `OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS=2,2`（照抄部署即启动 RuntimeError crash-loop——与 4.0.0 fail-closed 钉死 (3,4) 冲突）两行删除；operations.md「设置无效」表述更正为「启动即 RuntimeError 拒绝」；release checklist 新增「deploy 模板 env 集 ⊆ config.py 读取 env 集」对账项。
+
+### Docs（契约澄清，行为零改动）
+
+- **v4-contract §4.1/§4.3/§8.1 补全 sessions limit 域外/archived 非法/parent 空串错误归宿**（F-025，P2）：命名 code 字面量 `param_version_mismatch`；501..1000 → 422 coded body；>1000/≤0/非 int → 框架 422 `{"detail":[...]}`（只冻结状态码 + detail 数组存在 + 无 code 字段，不冻结框架文案）；测试锁定双形状现状（test_sessions_v4_matrix.py 新增 4 类断言）。
+
+---
+
 ## [4.4.0] - 2026-08-20 — v4 wire 正式修订三落地：providers 投影恢复 optional limit（包版本 minor；wire 版本**不变**，仍 (3,4)）
 
 > 动因：oc-webui 反馈 v4 投影剥掉 `limit`（模型规格参数非敏感，v3 raw 透传时代本就存在），上下文使用百分比失去分母；消费方已确认嵌套 `limit.context` 形状零改动兼容。纯加性 schema 演进，`providers.redacted.v4` 面内；实施经 rev-cgpt 发版门控评审（**9.2 FAIL→P1 修复→9.8 PASS**，门禁 9.5）。

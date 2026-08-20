@@ -490,27 +490,35 @@ async def test_merged_fanout_does_not_starve_direct_full(upstream_factory):
 
 
 # ---------------------------------------------------------------------------
-# Rev-fix 2/4: merged_max_bytes is a TRUE FETCH budget — the request-level
-# peak buffered by the fan-out never exceeds it.
+# Rev-fix 2/4 + F-006 (batch 1): merged_max_bytes is a TRUE FETCH budget
+# reserved in EQUAL SHARES — every candidate starts with its own share
+# (anti-starvation, I1), the concurrent in-flight reservation peak stays
+# ≤ merged_max_bytes in the strict segment (I2), and over-share bodies
+# degrade to their skeleton (§4a.5, I4).
 # ---------------------------------------------------------------------------
 
-async def test_merged_byte_budget_caps_fetch_buffers(upstream_factory):
-    """Reservation model (max_message_bytes=8000, merged_max_bytes=10000):
+async def test_merged_budget_equal_share_all_start_and_peak_capped(
+    upstream_factory,
+):
+    """F-006 equal-share reservation (max_message_bytes=8000,
+    merged_max_bytes=10000, N=4 → share = 10000 // 4 = 2500):
 
-    * item A reserves ``min(8000, 10000)`` = 8000 → its ~6 KiB body fits →
-      inlined;
-    * item B reserves the remaining 2000 → its 6 KiB body TRUNCATES at the
-      allotted cap → degrades (proving the read itself was capped, not a
-      post-hoc filter — without the cap it would have succeeded);
-    * items C/D find ``remaining == 0`` at start → degraded with NO upstream
-      request at all.
+    * **I1 all-start** — every candidate reserves
+      ``min(8000, remaining, 2500)`` = 2500 and STARTS a fetch. The old
+      first-come monopoly (A took 8000, B the last 2000, C/D zero-started
+      with no request at all → 2 upstream GETs) is gone: ``full_calls ==
+      4`` is the F-006 anti-starvation regression assertion.
+    * **I2 peak** — all four reservations are held in flight concurrently
+      and sum to 4 × 2500 = 10000 == merged_max_bytes exactly: the strict
+      segment (M ≥ N) bound N × share ≤ M, with equality here.
+    * **I4 degrade** — each ~6 KiB body exceeds its 2500 share → the read
+      truncates at the allotted cap → the item keeps its skeleton
+      placeholder (proving the read itself was capped, not a post-hoc
+      filter) and the page is still 200 — §4a.5 budget degrade.
 
-    Peak arithmetic: buffered ≤ 8000 (full body) + 2000 (truncated read) =
-    10000 = merged_max_bytes. Exactly 2 upstream full GETs, exactly 1 item
-    inlined, 3 keep their skeleton placeholder. The handler sleeps briefly
-    so the two fetches are IN FLIGHT concurrently (a real network suspends
-    the reader; a synchronous mock would complete item A + refund before
-    item B reserves, serializing the page instead).
+    The handler sleep holds all four budgeted reads IN FLIGHT concurrently
+    (a synchronous mock would complete + refund each fetch before the next
+    candidate reserves, serializing the page and hiding the peak).
     """
     items = [_ph_message(f"msg_{i}", created=i) for i in range(4)]
     full_calls = {"n": 0}
@@ -530,7 +538,7 @@ async def test_merged_byte_budget_caps_fetch_buffers(upstream_factory):
             return _list_response(items, link=None)
         if path.startswith("/session/s1/message/msg_"):
             full_calls["n"] += 1
-            await asyncio.sleep(0.05)  # hold both budgeted reads in flight
+            await asyncio.sleep(0.05)  # hold all four reads in flight
             return httpx.Response(200, content=full_body)
         raise AssertionError(f"unexpected upstream path {path}")
 
@@ -541,8 +549,8 @@ async def test_merged_byte_budget_caps_fetch_buffers(upstream_factory):
         r = await client.get("/slimapi/messages/s1?mode=merged", headers=HDR)
 
     assert r.status_code == 200
-    # Only the two budget-allotted items hit upstream — C/D never started.
-    assert full_calls["n"] == 2
+    # I1: ALL four candidates started (old code: 2 — C/D zero-started).
+    assert full_calls["n"] == 4
     body = r.json()["items"]
     inlined = [
         m for m in body
@@ -553,21 +561,76 @@ async def test_merged_byte_budget_caps_fetch_buffers(upstream_factory):
         if any(str(p.get("id", "")).startswith("thin_placeholder_")
                for p in m["parts"])
     ]
-    assert len(inlined) == 1  # the item that got the 8000-byte allotment
-    assert len(degraded) == 3  # truncated at 2000 + never-started C/D
+    assert len(inlined) == 0  # every read truncated at its 2500 share (I4)
+    assert len(degraded) == 4
 
 
-async def test_merged_budget_refund_lets_serial_items_proceed(upstream_factory):
-    """Completed fetches REFUND their un-read reservation, so under
-    fanout=1 (serial) three ~3 KiB bodies fit a 10000-byte budget even
-    though the first item reserves ``min(8000, 10000)`` = 8000.
+async def test_merged_budget_equal_share_small_bodies_all_inline(
+    upstream_factory,
+):
+    """Equal share with bodies that FIT (same 8000/10000 combo, N=4 →
+    share 2500, body ≈ 1.9 KiB < 2500): every candidate starts AND
+    inlines — equal shares remove the starvation without penalizing small
+    bodies (old code: A inlined at an 8000 monopoly, B truncated at 2000,
+    C/D never started). The sleep keeps all four reads in flight, so the
+    all-inline outcome is not an artifact of serial completion + refunds."""
+    items = [_ph_message(f"msg_{i}", created=i) for i in range(4)]
+    full_calls = {"n": 0}
+    full_body = orjson.dumps({
+        "info": {"id": "msg_x", "role": "user"},
+        "parts": [{"id": "p_small", "type": "text", "messageID": "msg_x",
+                   "text": "y" * 1800}],
+    })
+    stripped_parts = [
+        {"id": "p_small", "type": "text", "messageID": "msg_x",
+         "text": "y" * 1800},
+    ]
 
-    Without the refund, pure pessimistic reservation would leave 2000 bytes
-    after item 1 and truncate items 2-3 (1 fetch). With it: 8000 → refund
-    5000 → 7000 → refund 4000 → 4000 — all 3 fetch (3 calls, all inlined).
-    Peak stays bounded: at most ONE outstanding reservation at a time (≤
-    8000 ≤ 10000)."""
-    items = [_ph_message(f"msg_{i}", created=i) for i in range(3)]
+    async def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/session/s1/message":
+            return _list_response(items, link=None)
+        if path.startswith("/session/s1/message/msg_"):
+            full_calls["n"] += 1
+            await asyncio.sleep(0.05)  # all four reads in flight at once
+            return httpx.Response(200, content=full_body)
+        raise AssertionError(f"unexpected upstream path {path}")
+
+    async with _test_client(
+        upstream_factory, handler,
+        max_message_bytes=8000, merged_max_bytes=10000,
+    ) as client:
+        r = await client.get("/slimapi/messages/s1?mode=merged", headers=HDR)
+
+    assert r.status_code == 200
+    assert full_calls["n"] == 4  # all started (I1)
+    body = r.json()["items"]
+    inlined = [m for m in body if m["parts"] == stripped_parts]
+    degraded = [
+        m for m in body
+        if any(str(p.get("id", "")).startswith("thin_placeholder_")
+               for p in m["parts"])
+    ]
+    assert len(inlined) == 4
+    assert len(degraded) == 0
+
+
+async def test_merged_serial_completion_no_starvation(upstream_factory):
+    """I1 holds under SERIAL completion too (fanout=1, synchronous mock —
+    item A completes and refunds BEFORE item B reserves): with N=2 the
+    share alone (10000 // 2 = 5000 each) funds both starts, so both items
+    fetch and inline regardless of completion ordering — the start
+    guarantee is completion-timing-independent.
+
+    I3 (refund bookkeeping retained): under equal shares the refund is no
+    longer what enables later items WITHIN a page, but the reserve-cap /
+    refund-(cap − len(body)) accounting stays correct for candidates that
+    start after any completion interleaving and keeps ``remaining``
+    accurate for the cumulative splice bound — so it is kept, and this
+    test locks that serial completion still yields all-inline pages
+    (old-code contrast: the monopoly made start rights depend on the
+    completion order)."""
+    items = [_ph_message(f"msg_{i}", created=i) for i in range(2)]
     full_calls = {"n": 0}
     full_body = orjson.dumps({
         "info": {"id": "msg_x", "role": "user"},
@@ -595,11 +658,205 @@ async def test_merged_budget_refund_lets_serial_items_proceed(upstream_factory):
         r = await client.get("/slimapi/messages/s1?mode=merged", headers=HDR)
 
     assert r.status_code == 200
-    assert full_calls["n"] == 3  # refund kept the budget alive for all 3
+    assert full_calls["n"] == 2  # both started — timing-independent (I1)
     body = r.json()["items"]
-    assert len(body) == 3
+    assert len(body) == 2
     for message in body:
         assert message["parts"] == stripped_parts  # every item inlined
+
+
+# ===========================================================================
+# F-006 (batch 1, rev4): equal-share budget — default-param regressions,
+# over-share degrade (I4), and the tiny-budget floor segment (I1).
+# ===========================================================================
+
+async def test_merged_default_params_two_candidates_both_inline(
+    upstream_factory,
+):
+    """Default 32 MiB / 8 MiB combo (the ``_settings`` baseline), 2
+    candidates with ~4 KiB bodies: BOTH inline. Under the old first-come
+    reservation the first candidate took the WHOLE 8 MiB budget and the
+    second degraded with NO upstream request at all — the exact F-006
+    production defect (any 2-placeholder page deterministically merged to
+    a single inline). share = 8 MiB // 2 = 4 MiB ≫ body: both start and
+    fit. The sleep keeps both reads in flight so the second start is NOT
+    an artifact of the first one's refund."""
+    items = [_ph_message(f"msg_{i}", created=i) for i in range(2)]
+    full_calls = {"n": 0}
+    full_body = orjson.dumps({
+        "info": {"id": "msg_x", "role": "user"},
+        "parts": [{"id": "p_def", "type": "text", "messageID": "msg_x",
+                   "text": "y" * 4000}],
+    })
+    stripped_parts = [
+        {"id": "p_def", "type": "text", "messageID": "msg_x",
+         "text": "y" * 4000},
+    ]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/session/s1/message":
+            return _list_response(items, link=None)
+        if path.startswith("/session/s1/message/msg_"):
+            full_calls["n"] += 1
+            await asyncio.sleep(0.05)  # both reads in flight at once
+            return httpx.Response(200, content=full_body)
+        raise AssertionError(f"unexpected upstream path {path}")
+
+    async with _test_client(upstream_factory, handler) as client:
+        r = await client.get("/slimapi/messages/s1?mode=merged", headers=HDR)
+
+    assert r.status_code == 200
+    assert full_calls["n"] == 2  # old code: the 2nd candidate zero-started
+    body = r.json()["items"]
+    inlined = [m for m in body if m["parts"] == stripped_parts]
+    assert len(inlined) == 2
+
+
+async def test_merged_default_params_sixteen_candidates_page_cap(
+    upstream_factory,
+):
+    """Default params × 16 candidates (~10 KiB bodies): all 16 inline. 16
+    is both ``merged_max_fulls_per_page`` (the page-cap boundary — a 17th
+    placeholder would stay skeleton) and the N of the strict segment
+    (8 MiB ≥ 16 → share = 512 KiB each). fanout=8 serves the fetches in
+    waves, but every candidate still starts and fits (old code: roughly
+    one inline per completed monopoly, the rest degraded)."""
+    items = [_ph_message(f"msg_{i}", created=i) for i in range(16)]
+    full_calls = {"n": 0}
+    full_body = orjson.dumps({
+        "info": {"id": "msg_x", "role": "user"},
+        "parts": [{"id": "p_def", "type": "text", "messageID": "msg_x",
+                   "text": "y" * 10000}],
+    })
+    stripped_parts = [
+        {"id": "p_def", "type": "text", "messageID": "msg_x",
+         "text": "y" * 10000},
+    ]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/session/s1/message":
+            return _list_response(items, link=None)
+        if path.startswith("/session/s1/message/msg_"):
+            full_calls["n"] += 1
+            await asyncio.sleep(0.05)  # hold each wave's reads in flight
+            return httpx.Response(200, content=full_body)
+        raise AssertionError(f"unexpected upstream path {path}")
+
+    async with _test_client(upstream_factory, handler) as client:
+        r = await client.get("/slimapi/messages/s1?mode=merged", headers=HDR)
+
+    assert r.status_code == 200
+    assert full_calls["n"] == 16  # every candidate started (I1 strict seg)
+    body = r.json()["items"]
+    assert len(body) == 16
+    inlined = [m for m in body if m["parts"] == stripped_parts]
+    assert len(inlined) == 16
+
+
+async def test_merged_oversized_candidate_degrades_page_ok(upstream_factory):
+    """I4 over-share trade-off: merged_max_bytes=6000, 2 candidates →
+    share=3000. msg_big's ~3.9 KiB body exceeds its share → the read
+    truncates at 3000 → msg_big keeps its skeleton; msg_small still gets
+    its OWN share and inlines; the page is 200. Known cost of equal shares
+    (orchestrator CHANGELOG): the old code here inlined msg_big at a 6000
+    monopoly and STARVED msg_small instead — the degradation moved from
+    "whoever is not first" to "whoever genuinely exceeds their share"."""
+    items = [_ph_message("msg_big", created=1), _ph_message("msg_small", created=2)]
+    full_calls = {"n": 0}
+    big_body = orjson.dumps({
+        "info": {"id": "msg_big", "role": "user"},
+        "parts": [{"id": "p_big", "type": "text", "messageID": "msg_big",
+                   "text": "y" * 3800}],
+    })
+    small_body = orjson.dumps({
+        "info": {"id": "msg_small", "role": "user"},
+        "parts": [{"id": "p_small", "type": "text",
+                   "messageID": "msg_small", "text": "y" * 400}],
+    })
+    small_stripped = [
+        {"id": "p_small", "type": "text", "messageID": "msg_small",
+         "text": "y" * 400},
+    ]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/session/s1/message":
+            return _list_response(items, link=None)
+        if path == "/session/s1/message/msg_big":
+            full_calls["n"] += 1
+            await asyncio.sleep(0.05)  # both shares held in flight
+            return httpx.Response(200, content=big_body)
+        if path == "/session/s1/message/msg_small":
+            full_calls["n"] += 1
+            await asyncio.sleep(0.05)
+            return httpx.Response(200, content=small_body)
+        raise AssertionError(f"unexpected upstream path {path}")
+
+    async with _test_client(
+        upstream_factory, handler, merged_max_bytes=6000,
+    ) as client:
+        r = await client.get("/slimapi/messages/s1?mode=merged", headers=HDR)
+
+    assert r.status_code == 200  # degrade, never a page failure (I4)
+    assert full_calls["n"] == 2  # both candidates started (I1)
+    body = r.json()["items"]
+    assert any(
+        str(p.get("id", "")).startswith("thin_placeholder_")
+        for p in body[0]["parts"]
+    )  # msg_big: truncated at its 3000 share → skeleton
+    assert body[1]["parts"] == small_stripped  # msg_small: inlined
+
+
+async def test_merged_tiny_budget_floor_share_spread(upstream_factory):
+    """I1 floor segment (M < N): merged_max_bytes=3, N=4 → share floors at
+    ``max(1, 3 // 4)`` = 1. The serial-worst start count is exactly
+    min(N, M) = 3: candidates msg_0..msg_2 each reserve 1 byte and start;
+    msg_3 finds ``remaining == 0`` at its gate and never issues a request.
+    All 4 items degrade (3 truncations at cap=1 + 1 never started), page
+    200. Old code in this scenario gave the FIRST candidate the whole
+    3-byte budget (full_calls == 1): the floor-segment promise is
+    anti-monopoly, not all-start — M bytes cannot fund N > M positive
+    shares. The handler sleep keeps the three started reads in flight so
+    their (full) refunds cannot re-open the pool before msg_3's gate
+    check."""
+    items = [_ph_message(f"msg_{i}", created=i) for i in range(4)]
+    called_mids: list[str] = []
+    tiny_body = orjson.dumps({
+        "info": {"id": "msg_x", "role": "user"},
+        "parts": [{"id": "p_tiny", "type": "text", "messageID": "msg_x",
+                   "text": "y" * 10}],
+    })
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/session/s1/message":
+            return _list_response(items, link=None)
+        if path.startswith("/session/s1/message/msg_"):
+            called_mids.append(path.rsplit("/", 1)[-1])
+            await asyncio.sleep(0.05)  # keep the 1-byte reads in flight
+            return httpx.Response(200, content=tiny_body)
+        raise AssertionError(f"unexpected upstream path {path}")
+
+    async with _test_client(
+        upstream_factory, handler,
+        max_message_bytes=8, merged_max_bytes=3,
+    ) as client:
+        r = await client.get("/slimapi/messages/s1?mode=merged", headers=HDR)
+
+    assert r.status_code == 200  # degrade, never a page failure
+    # Exactly min(N, M) = 3 starts — and it is the FIRST three candidates
+    # (msg_3 never requested: remaining == 0 at its gate).
+    assert len(called_mids) == 3
+    assert set(called_mids) == {"msg_0", "msg_1", "msg_2"}
+    body = r.json()["items"]
+    assert len(body) == 4
+    for message in body:  # all four degraded: 3 truncations + 1 no-start
+        assert any(
+            str(p.get("id", "")).startswith("thin_placeholder_")
+            for p in message["parts"]
+        )
 
 
 # ===========================================================================
@@ -646,9 +903,10 @@ async def test_merged_read_chunk_overshoot_bounded(upstream_factory, monkeypatch
       monkeypatch seam — the production default chunk is 64 KiB);
     * the incremental reservation bound for merged-LED reads is
       ``merged_max_bytes + in_flight × chunk_size``: reservations
-      8000 + 2000 = 10000 == ``merged_max_bytes`` (serial-point
-      accounting), the truncated flight's accumulated total stays within
-      ``cap + 1024`` — observed at the read_with_cap boundary.
+      4 × 2500 = 10000 == ``merged_max_bytes`` (serial-point accounting,
+      F-006 equal shares), each truncated flight's accumulated total
+      stays within ``cap + 1024`` — observed at the read_with_cap
+      boundary.
 
     It does NOT claim a whole-page peak: direct-led shared-flight windfalls
     (bodies read at ``max_message_bytes`` by a direct /full leader and held
@@ -656,10 +914,11 @@ async def test_merged_read_chunk_overshoot_bounded(upstream_factory, monkeypatch
     ``test_merged_windfall_from_direct_leader_excluded_at_splice`` for the
     response-level guarantee that covers them.
 
-    4 placeholder items, body ≈ 6049B each, budget 10000: item A inlines
-    (cap 8000), item B truncates at its 2000 reservation, items C/D find the
-    pool empty and never fetch. The handler sleeps so A and B hold their
-    reads concurrently (a synchronous mock would serialize them).
+    F-006 equal shares (4 placeholder items, body ≈ 6049B each, budget
+    10000 → share = 2500 each): ALL FOUR candidates start (I1) and every
+    read truncates at its own 2500 reservation → all four items degrade.
+    The handler sleeps so all four hold their reads concurrently (a
+    synchronous mock would serialize them).
     """
     items = [_ph_message(f"msg_{i}", created=i) for i in range(4)]
     full_body = orjson.dumps({
@@ -685,7 +944,7 @@ async def test_merged_read_chunk_overshoot_bounded(upstream_factory, monkeypatch
             return _list_response(items, link=None)
         if path.startswith("/session/s1/message/msg_"):
             full_calls["n"] += 1
-            await asyncio.sleep(0.05)  # A and B hold their reads concurrently
+            await asyncio.sleep(0.05)  # all four hold their reads in flight
             return httpx.Response(200, content=_PieceStream(full_body))
         raise AssertionError(f"unexpected upstream path {path}")
 
@@ -706,26 +965,26 @@ async def test_merged_read_chunk_overshoot_bounded(upstream_factory, monkeypatch
         )
 
     inlined = sum(1 for m in body if not _has_placeholder(m))
-    assert full_calls["n"] == 2  # A + B only; C/D never fetched
-    assert inlined == 1 and len(body) == 4
+    assert full_calls["n"] == 4  # equal share: ALL candidates started (I1)
+    assert inlined == 0 and len(body) == 4
 
     # Filter out the list read (cap = max_response_bytes 64 KiB): the full
-    # fetch records are the two with cap ≤ max_message_bytes.
+    # fetch records are the four with cap ≤ max_message_bytes.
     full_reads = [(cap, total) for cap, total in reads if cap <= 8000]
-    assert len(full_reads) == 2
-    # Reservations of STARTED flights never exceed the budget.
+    assert len(full_reads) == 4
+    # Reservations of STARTED flights never exceed the budget:
+    # 4 × share(2500) = 10000 == merged_max_bytes (I2 strict segment, peak).
     assert sum(cap for cap, _ in full_reads) == 10000
-    by_cap = dict(full_reads)
-    assert by_cap[8000] <= 8000          # untruncated flight: total ≤ its cap
-    truncated_total = by_cap[2000]
-    assert 2000 < truncated_total        # bail happened...
-    # ...and the overshoot beyond the 2000 reservation is ≤ ONE 1024B chunk
-    # (read_with_cap checks after accumulating a whole chunk).
-    assert truncated_total <= 2000 + 1024
+    overshoot = 0
+    for cap, total in full_reads:
+        assert cap == 2500  # every candidate reserved its equal share
+        assert 2500 < total  # the read bailed past its reservation...
+        # ...and the overshoot beyond the 2500 reservation is ≤ ONE 1024B
+        # chunk (read_with_cap checks after accumulating a whole chunk).
+        assert total <= 2500 + 1024
+        overshoot += total - 2500
     # Composed explicit bound: peak ≤ budget + in_flight × chunk.
-    assert 10000 + 2 * 1024 >= sum(cap for cap, _ in full_reads) + (
-        truncated_total - 2000
-    )
+    assert 10000 + 4 * 1024 >= sum(cap for cap, _ in full_reads) + overshoot
 
 
 async def test_direct_full_recovers_after_joined_merged_truncation(

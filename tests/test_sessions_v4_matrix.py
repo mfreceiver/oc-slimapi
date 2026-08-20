@@ -473,16 +473,67 @@ async def test_v4_limit_501_422_and_500_ok(tmp_path):
     app, _ = _build_app(aux)
     try:
         async with _client(app) as client:
-            resp = await client.get("/slimapi/sessions",
-                                    params={"v": "4", "limit": "501"},
-                                    headers=IDENTITY)
-            assert resp.status_code == 422
+            resp_501 = await client.get("/slimapi/sessions",
+                                        params={"v": "4", "limit": "501"},
+                                        headers=IDENTITY)
+            # F-025：501..1000 通过 FastAPI 声明域（le=1000）后由 handler
+            # 接住 → coded 422 形状（{"code","hint"}，非框架 detail）。
+            assert resp_501.status_code == 422
+            assert resp_501.json()["code"] == "param_version_mismatch"
+            assert "v4 limit domain is 1.." in resp_501.json()["hint"]
             resp = await client.get("/slimapi/sessions",
                                     params={"v": "4", "limit": "500"},
                                     headers=IDENTITY)
             assert resp.status_code == 200
     finally:
         await aux.stop()
+
+
+async def test_v4_limit_1001_framework_422_shape():
+    """F-025：limit=1001 在 FastAPI 声明域（ge=1, le=1000）外 → 框架 422。
+
+    body 是 FastAPI 默认校验形状 ``{"detail": [...]}`` 且无 ``code`` 字段
+    ——与 501..1000 的 coded 422 构成同族双形状，本用例锁定现状
+    （N6：只断言键存在性，不断言框架文案全文）。
+    """
+    app, seen = _build_app(_StubAux("disabled"))
+    async with _client(app) as client:
+        resp = await client.get("/slimapi/sessions",
+                                params={"v": "4", "limit": "1001"},
+                                headers=IDENTITY)
+    assert resp.status_code == 422
+    body = resp.json()
+    assert isinstance(body.get("detail"), list)
+    assert "code" not in body
+    assert not seen  # 校验层拒绝，未触上游
+
+
+async def test_v4_archived_invalid_coded_422():
+    """F-025：archived 非三态值 → 422 param_version_mismatch（coded 形状）。"""
+    app, seen = _build_app(_StubAux("disabled"))
+    async with _client(app) as client:
+        resp = await client.get("/slimapi/sessions",
+                                params={"v": "4", "archived": "sometimes"},
+                                headers=IDENTITY)
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["code"] == "param_version_mismatch"
+    assert "detail" not in body  # coded 形状（区别于框架 422）
+    assert not seen
+
+
+async def test_v4_parent_empty_coded_422():
+    """F-025（N2）：parent="" → 422 param_version_mismatch（coded 形状）。"""
+    app, seen = _build_app(_StubAux("disabled"))
+    async with _client(app) as client:
+        resp = await client.get("/slimapi/sessions",
+                                params={"v": "4", "parent": ""},
+                                headers=IDENTITY)
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["code"] == "param_version_mismatch"
+    assert "detail" not in body
+    assert not seen
 
 
 async def test_v4_gate_off_no_etag_vary_304(tmp_path, monkeypatch):
@@ -583,6 +634,9 @@ async def test_v3_limit_1000_domain():
                                 params={"v": "3", "limit": "1001"},
                                 headers=IDENTITY)
         assert resp.status_code == 422  # FastAPI declarative domain
+        # F-025：域外归宿是框架形状（{"detail": [...]}）——只断言键存在性
+        body = resp.json()
+        assert isinstance(body.get("detail"), list)
 
 
 # ---------------------------------------------------------------------------

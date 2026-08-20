@@ -70,10 +70,17 @@ DEFAULT_SSE_BUFFER_BYTES = 2 * 1024 * 1024  # 2 MiB per subscriber
 DEFAULT_SSE_MAX_FRAME_BYTES = 256 * 1024     # 256 KiB per frame
 
 # Blocking signals forwarded the moment they arrive — no debounce.
+# F-001 (audit 2026-08-20): upstream opencode v1.18.18 publishes
+# ``permission.replied`` (packages/schema/src/v1/permission.ts:61-65) and
+# ``permission.v2.replied`` (packages/schema/src/permission.ts:43-45). The
+# two former "…resolved" members were ghost names with zero upstream
+# emitters — they never matched a real event, so no consumer relies on
+# them (the banned literals are deliberately not repeated here; see the
+# audit finding for the exact names).
 IMMEDIATE = frozenset({
     "question.asked", "question.v2.asked",
-    "permission.asked", "permission.resolved",
-    "permission.v2.asked", "permission.v2.resolved",
+    "permission.asked", "permission.replied",
+    "permission.v2.asked", "permission.v2.replied",
 })
 
 # Session-scoped events folded into the digest window.
@@ -92,6 +99,43 @@ MESSAGE_EVENTS = frozenset({
 DEBOUNCE_SECONDS = 0.25
 HEARTBEAT_SECONDS = 10.0
 GRACE_SECONDS = 30.0
+
+# F-015 (audit 2026-08-20): hard cap for the shared q/p activity table.
+# The table is keyed by directory and, pre-fix, grew unboundedly: the hub's
+# IMMEDIATE write point and the sweep's ``record_activity`` both inserted
+# without ever evicting. 10_000 entries × ~100 bytes ≈ 1 MiB worst case —
+# a deliberate, observable bound. ``hub_types`` is the leaf module both
+# write sites already import from, so the helper and the cap live here
+# (exactly ONE implementation of the semantics, no import-cycle risk).
+QP_LAST_ACTIVITY_MAX = 10_000
+
+
+def record_qp_activity(table: dict[str, float], directory: str, now: float) -> None:
+    """Record one q/p activity touch on ``table`` under an activity-LRU bound.
+
+    F-015 + F-007(half): the two q/p activity write points — GlobalHub's
+    IMMEDIATE branch (``global_hub.py``) and ``QpSweepShadow.record_activity``
+    (``qp_sweep.py``), which share ONE dict reference by construction
+    (app.py wires ``activity=global_hub.qp_last_activity``) — both funnel
+    through this helper so the bound holds regardless of which side grows
+    the table.
+
+    * Move-to-end: a re-touched directory pops before inserting, so its
+      recency is refreshed (a plain ``table[d] = now`` would keep the
+      ORIGINAL insertion position in an insertion-ordered dict and the
+      entry could be evicted as "old" while actually being the hottest).
+      F-273-aligned eviction partner: whoever evicts a directory from the
+      sweep tables also pops it from the activity table.
+    * Cap: while over ``QP_LAST_ACTIVITY_MAX`` entries, evict the
+      least-recently-touched key (front of the insertion order). The cap
+      is read from the module global AT CALL TIME so tests (and ops, if
+      ever needed) can monkeypatch ``hub_types.QP_LAST_ACTIVITY_MAX``
+      once and bound both write points simultaneously.
+    """
+    table.pop(directory, None)
+    table[directory] = now
+    while len(table) > QP_LAST_ACTIVITY_MAX:
+        table.pop(next(iter(table)))
 
 # Curated-events token frame (L2-A: ``/slimapi/events?tokens=1``). A lean
 # projection distinct from the per-session stream's delta frames: carries

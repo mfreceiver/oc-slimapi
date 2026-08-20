@@ -78,6 +78,18 @@ def _get_maint_log() -> logging.Logger:
 # and ``access-YYYY-MM-DD.jsonl.gz``.
 _ACCESS_LOG_RE = re.compile(r"^access-(\d{4}-\d{2}-\d{2})\.jsonl(\.gz)?$")
 
+# F-008: legacy migration archives produced by ``migrate_legacy_access_log``
+# / ``_migrate_one`` — ``access-legacy-YYYYMMDD-{label}.jsonl.gz`` where the
+# compact date is the source file's mtime and ``label`` is either an
+# integer backup index (``access.jsonl.N`` sources) or ``current`` (the
+# main ``access.jsonl`` source). These now share the same retention window
+# as daily files instead of being kept forever. (Plan regex said ``-\d+``;
+# extended to ``current`` too because that is the primary migration
+# product — see L3 completion report.)
+_ACCESS_LEGACY_RE = re.compile(
+    r"^access-legacy-(\d{4})(\d{2})(\d{2})-(?:current|\d+)\.jsonl\.gz$"
+)
+
 
 # ---------------------------------------------------------------------------
 # Public helpers
@@ -551,7 +563,10 @@ def prune_old_access_logs(dir: str, retain_days: int, today: date) -> int:
     * Deletes both ``.jsonl`` and ``.jsonl.gz`` files whose embedded date is
       **strictly less than** ``today - retain_days`` (boundary is kept).
     * Only files matching the strict naming pattern (:data:`_ACCESS_LOG_RE`)
-      are considered.
+      are considered — **plus** legacy migration archives
+      (:data:`_ACCESS_LEGACY_RE`, F-008): ``access-legacy-YYYYMMDD-{label}
+      .jsonl.gz`` files are aged by the date embedded in their name and
+      pruned under the same ``retain_days`` window.
 
     Serialised by :data:`_MAINT_LOCK` so it cannot race with a concurrent
     :func:`compress_old_access_logs` / :func:`migrate_legacy_access_log` on
@@ -565,13 +580,28 @@ def prune_old_access_logs(dir: str, retain_days: int, today: date) -> int:
     with _MAINT_LOCK:
         for pattern in ("access-*.jsonl", "access-*.jsonl.gz"):
             for p in Path(dir).glob(pattern):
+                file_date: date | None = None
                 m = _ACCESS_LOG_RE.match(p.name)
-                if not m:
-                    continue
-                try:
-                    file_date = date.fromisoformat(m.group(1))
-                except ValueError:
-                    continue
+                if m:
+                    try:
+                        file_date = date.fromisoformat(m.group(1))
+                    except ValueError:
+                        continue
+                else:
+                    # F-008: legacy archives age by the compact date in
+                    # their name (source mtime) — same deadline, same
+                    # strictness. Anything else stays untouched.
+                    lm = _ACCESS_LEGACY_RE.match(p.name)
+                    if not lm:
+                        continue
+                    try:
+                        file_date = date(
+                            int(lm.group(1)),
+                            int(lm.group(2)),
+                            int(lm.group(3)),
+                        )
+                    except ValueError:
+                        continue
                 if file_date < deadline:
                     try:
                         p.unlink()

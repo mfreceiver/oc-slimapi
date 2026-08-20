@@ -66,6 +66,7 @@ Tag 格式：**`v` + semver**（例：`v0.1.0`），与 ocdroid 一致。
 5. **directory allowlist 部署状态确认（[3.3.0] 起，B4-4b 联合门槛）**：发版时记录生产环境 `OC_SLIMAPI_DIRECTORY_ALLOWLIST` 三态结论——
    - **未配置**（默认）：零行为变化，无客户端联动要求，直接放行；
    - **显式空**（机制启用，`/slimapi/file/**` 全 403）或 **非空**（子树过滤 + SSE 帧过滤）：**前置条件** = 确认 ocdroid 已适配 `/file` 403 `directory_not_allowed` 语义或不依赖这些端点（对照当时 ocdroid 版本的 `docs/slim-mode-api-routing.md` / CHANGELOG 回执），未确认前**不得**在生产启用该 env（机制为部署事项：sidecar 默认不启用，启用与否由运维按本门槛决定）。
+6. **deploy 模板 env 对账**：`deploy/oc-slimapi.service` 的 env 集 ⊆ `src/oc_slimapi/config.py` 读取 env 集，且值合法（示例值不得与 `config.validate()` fail-closed 规则冲突——版本窗等已钉死项不得出现在模板）。
 
 ### 2.1 P3 major（4.0.0）前置 checklist（n5）
 

@@ -62,7 +62,7 @@ import time
 import uuid
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -301,6 +301,15 @@ class TrafficSnapshotter:
         written each day is ``{parent(stem)}-YYYY-MM-DD.jsonl``.
         Example: ``"logs/traffic-snapshot.jsonl"`` produces
         ``logs/traffic-snapshot-2026-07-29.jsonl``.
+    retain_days : int
+        F-009: retention window (days) for daily snapshot files.  The
+        snapshot loop prunes ``{stem}-YYYY-MM-DD.jsonl(.gz)`` files older
+        than this window at the top of every tick — **self-managed by this
+        loop, independent of ACCESS_LOG_ENABLED**.  ``0`` (default) never
+        prunes.
+    today_fn : Callable[[], date]
+        Clock injection for the prune deadline (defaults to
+        ``date.today``); tests pass a fixed date to control the window.
     """
 
     __slots__ = (
@@ -313,6 +322,8 @@ class TrafficSnapshotter:
         "_pid",
         "_start_monotonic",
         "_task",
+        "_retain_days",
+        "_today_fn",
     )
 
     def __init__(
@@ -321,6 +332,8 @@ class TrafficSnapshotter:
         ledger: Any,  # TrafficLedger (avoid circular dep at type level)
         interval_s: int,
         path: str,
+        retain_days: int = 0,
+        today_fn: Callable[[], date] = date.today,
     ) -> None:
         self._ledger = ledger
         self._interval_s = interval_s
@@ -333,6 +346,9 @@ class TrafficSnapshotter:
         self._pid: int = os.getpid()
         self._start_monotonic: float = time.monotonic()
         self._task: asyncio.Task[None] | None = None
+        # F-009: self-managed retention window + clock injection.
+        self._retain_days: int = retain_days
+        self._today_fn: Callable[[], date] = today_fn
 
     # ------------------------------------------------------------------
     # Public API
@@ -409,13 +425,35 @@ class TrafficSnapshotter:
     # ------------------------------------------------------------------
 
     async def _loop(self) -> None:
-        """Background asyncio loop: sleep → snapshot → repeat.
+        """Background asyncio loop: prune → sleep → snapshot → repeat.
 
-        Every iteration is individually exception-guarded so that a single
-        I/O or serialization error never kills the entire loop.  Only
-        :class:`asyncio.CancelledError` propagates (task cancellation).
+        F-009: the top of every tick prunes expired daily snapshot files
+        (``retain_days`` window, same deadline semantics as
+        :func:`prune_old_snapshots`). Retention is **self-managed by this
+        loop** — it no longer piggybacks on the access-log maintenance loop,
+        so snapshot cleanup works even when the access log is disabled
+        (ACCESS_LOG_ENABLED=false). The prune runs before the first
+        periodic write too; a prune failure is logged and never kills the
+        loop.  Every iteration is individually exception-guarded so that a
+        single I/O or serialization error never kills the entire loop.
+        Only :class:`asyncio.CancelledError` propagates (task
+        cancellation).
         """
         while True:
+            try:
+                prune_old_snapshots(
+                    self._dir,
+                    self._stem,
+                    self._retain_days,
+                    self._today_fn(),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "traffic snapshot prune failed",
+                    exc_info=True,
+                )
             try:
                 await asyncio.sleep(self._interval_s)
                 self._write_once()

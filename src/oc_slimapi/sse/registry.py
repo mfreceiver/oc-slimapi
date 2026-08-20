@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any
 
+from ..logging_config import get_logger
 from .global_hub import GlobalHub
 from .hub_types import (
     DEFAULT_MAX_SUBSCRIBERS_PER_DIRECTORY,
@@ -29,6 +30,8 @@ if TYPE_CHECKING:
     from ..traffic import TrafficLedger
     from ..turn_registry import TurnRegistry
     from .tokenstream import TokenStreamHub
+
+logger = get_logger(__name__)
 
 
 class HubRegistry:
@@ -182,7 +185,9 @@ class HubRegistry:
             return
         if self._removal_task is not None:
             return
-        self._removal_task = asyncio.create_task(self._remove_hub_after_grace(hub))
+        self._removal_task = asyncio.create_task(
+            self._remove_hub_after_grace(hub), name="hub-grace-removal"
+        )
 
     def subscribe(self, wire_v4: bool = False) -> Subscriber:
         """Admit a new subscriber under T3 caps, then start / reuse the hub.
@@ -255,6 +260,29 @@ class HubRegistry:
         # has_consumers() == bool(self.subscribers)).
         self.maybe_arm_grace_if_idle()
 
+    def _clear_removal_task_if_current(self) -> None:
+        """F-011: clear the ``_removal_task`` slot only if THIS task owns it.
+
+        Identity-conditional (``asyncio.current_task()``) so a STALE grace
+        task's exit path can never erase a NEWER task's reference. Race
+        being closed (audit F-011 / B3): task1 is cancelled (its canceller
+        clears the registry slot synchronously), task2 is armed into the
+        slot, and only THEN is task1's coroutine scheduled to run its
+        cancellation / exit path. An unconditional slot clear executed by
+        task1 would drop the registry's only handle on task2 — task2 could
+        then never be cancelled by ``close()`` and, sleeping past
+        ``GRACE_SECONDS``, would tear down a live hub. Under the identity
+        check task1 sees the slot is not itself and leaves it untouched.
+
+        Called from a sync (non-task) context, ``current_task()`` is None
+        and only matches an already-empty slot — a deliberate no-op. The
+        external SYNC clear paths (``cancel_pending_removal`` /
+        ``close``) keep their direct unconditional clears: they run in the
+        canceller's frame, not the task's, and own the slot by convention.
+        """
+        if self._removal_task is asyncio.current_task():
+            self._removal_task = None
+
     async def _remove_hub_after_grace(self, hub: GlobalHub) -> None:
         """Tear down an idle hub after GRACE_SECONDS and drop the reference.
 
@@ -279,50 +307,70 @@ class HubRegistry:
           no-op (zero wire impact). ``_part_revisions`` (CRITICAL 1) and
           ``_removed_messages`` (replay queue) are PRESERVED.
         * ``self._global = None`` drops the strong reference.
+
+        F-011: every slot clear inside this coroutine goes through
+        :meth:`_clear_removal_task_if_current` (identity-conditional — a
+        stale incarnation of this task must not erase a newer task's
+        reference), and the whole teardown body is wrapped so an exception
+        (e.g. a raising ``on_upstream_reconnect``) can no longer kill the
+        task mid-flight and leave the registry holding a dead task it will
+        never again re-arm — the failed clear previously disabled
+        ``maybe_arm_grace_if_idle`` for the rest of the process lifetime.
         """
         try:
             await asyncio.sleep(GRACE_SECONDS)
         except asyncio.CancelledError:
+            self._clear_removal_task_if_current()
             return
-        if hub is not self._global or hub.has_consumers():
-            # Either a new hub replaced this one, or a new subscriber
-            # arrived during grace and re-armed the upstream. Leave it.
-            # Stage B: has_consumers() spans BOTH ledgers — a token-only
-            # subscriber (Stage D) keeps the hub alive too (§16-B).
-            self._removal_task = None
-            return
-        # Cancel the hub's 4 tasks.
-        tasks = [
-            task for task in (hub.task, hub.flush_task, hub.heartbeat_task, hub.stop_task)
-            if task is not None and not task.done()
-        ]
-        for task in tasks:
-            task.cancel()
-        # INV-2: await full exit so the old run() releases /global/event
-        # BEFORE we null the reference (aligns with close()'s gather).
-        if tasks:
-            try:
-                await asyncio.gather(*tasks, return_exceptions=True)
-            except asyncio.CancelledError:
-                # A new subscriber (or close()) cancelled this removal
-                # task during the gather. Return without nulling — the
-                # hub was revived (subscribe→ensure_upstream) or will be
-                # cleaned up by close().
+        try:
+            if hub is not self._global or hub.has_consumers():
+                # Either a new hub replaced this one, or a new subscriber
+                # arrived during grace and re-armed the upstream. Leave it.
+                # Stage B: has_consumers() spans BOTH ledgers — a token-only
+                # subscriber (Stage D) keeps the hub alive too (§16-B).
+                self._clear_removal_task_if_current()
                 return
-        # INV-2: re-check after gather — a new subscriber may have arrived
-        # during the await, reviving the hub. If so, abandon removal.
-        if hub is not self._global or hub.has_consumers():
-            self._removal_task = None
-            return
-        # INV-2: no-await sync segment. on_upstream_reconnect() clears the
-        # token hub's old-epoch state so the next hub starts clean.
-        # has_consumers()==False → resync fanout is a no-op. CRITICAL 1:
-        # _part_revisions and _removed_messages are PRESERVED by
-        # on_upstream_reconnect (see its docstring).
-        if self._token_hub is not None:
-            self._token_hub.on_upstream_reconnect()
-        self._global = None
-        self._removal_task = None
+            # Cancel the hub's 4 tasks.
+            tasks = [
+                task for task in (hub.task, hub.flush_task, hub.heartbeat_task, hub.stop_task)
+                if task is not None and not task.done()
+            ]
+            for task in tasks:
+                task.cancel()
+            # INV-2: await full exit so the old run() releases /global/event
+            # BEFORE we null the reference (aligns with close()'s gather).
+            if tasks:
+                try:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                except asyncio.CancelledError:
+                    # A new subscriber (or close()) cancelled this removal
+                    # task during the gather. Return without clearing the
+                    # slot ourselves — the canceller owns it (and the
+                    # finally below only clears it if we still do).
+                    return
+            # INV-2: re-check after gather — a new subscriber may have arrived
+            # during the await, reviving the hub. If so, abandon removal.
+            if hub is not self._global or hub.has_consumers():
+                self._clear_removal_task_if_current()
+                return
+            # INV-2: no-await sync segment. on_upstream_reconnect() clears the
+            # token hub's old-epoch state so the next hub starts clean.
+            # has_consumers()==False → resync fanout is a no-op. CRITICAL 1:
+            # _part_revisions and _removed_messages are PRESERVED by
+            # on_upstream_reconnect (see its docstring).
+            if self._token_hub is not None:
+                self._token_hub.on_upstream_reconnect()
+            self._global = None
+            self._clear_removal_task_if_current()
+        except Exception:
+            # F-011: teardown must never strand the registry with a dead
+            # task in the slot — log and let the finally release it so a
+            # later idle period can re-arm. CancelledError is NOT caught
+            # here (BaseException): cancellation keeps its propagate-and-
+            # return semantics via the branches above.
+            logger.warning("hub grace removal failed", exc_info=True)
+        finally:
+            self._clear_removal_task_if_current()
 
     def snapshot_metrics(self) -> dict[str, Any]:
         """Return the /slimapi/metrics snapshot (contract §2 / REFINE §3).
