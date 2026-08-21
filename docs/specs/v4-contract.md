@@ -282,11 +282,50 @@ v4 sessions **无 ETag/Vary/304**（v2.2 行 254 §6）；v3 全表面 ETag 原�
 以下 SSE 语义 v3/v4 两视图一致（逐条现状载明，本节即权威全文）；v4 附加差异单独标注：
 
 - **digest `status` 恒字符串**：上游 `session.status` 的 status 字段可能以字符串（`"busy"`）或对象信封（`{"type":"busy"}`）两种 wire 形态到达；sidecar 统一归一化——digest `status` 字段**恒为字符串**（busy/idle 等上游状态值原样）；信封无效（缺 `type` / `type` 非字符串）时该次状态更新被忽略（digest 其余字段不受影响）。两视图一致。
-- **digest `lastError` sticky 清除语义**：`session.error` 携带 sessionID → 该 sid digest 记 `lastError:{name, message, at}`（`name` 截断 128 字符）并立即定向 flush + 记入 sticky 存储；该 sid **下一次 `session.status=busy`** → sticky 弹出 + digest **显式 `lastError:null` 清除帧** + 定向 flush（busy 判定对字符串/对象信封两形态一致）；`session.deleted` → sticky 弹出 + 字段省略；后续 flush 在本窗口未自行设置/清除时合并 sticky 值（贴回语义，直到 busy 清除帧）；**sticky 仅在同一 sidecar 进程生命周期内成立**（进程内内存态、无持久化，重启即丢、不复活不重贴；重启后新 `session.error` 才重新记录）；FIFO 容量上限 10,000 sid，逐出后不再贴回。两视图一致。
+- **digest `lastError` sticky 清除语义**：`session.error` 携带 sessionID → 该 sid digest 记 `lastError:{name, message, at}`（`name` 截断 128 字符）并立即定向 flush + 记入 sticky 存储；该 sid **下一次 `session.status=busy`** → sticky 弹出 + digest **显式 `lastError:null` 清除帧** + 定向 flush（busy 判定对字符串/对象信封两形态一致）；`session.deleted` → sticky 弹出 + 字段省略；后续 flush 在本窗口未自行设置/清除时合并 sticky 值（贴回语义，直到 busy 清除帧）；**sticky 仅在同一 sidecar 进程生命周期内成立**（进程内内存态、无持久化，重启即丢、不复活不重贴；重启后新 `session.error` 才重新记录）；FIFO 容量上限 10,000 sid，逐出后不再贴回。两视图一致。`lastError` 对象另含**可选结构化 provider 字段**（§7.6，2026-08-21 加性——`{name,message,at}` 基线三键与本条三态语义零变化）。
 - **SSE 恒 identity**：两端点 SSE 流不做 gzip/content-encoding，响应**无 `Vary` 头**（响应头 = `Cache-Control: no-cache, no-transform` + `X-Accel-Buffering: no`；SSE 路径不参与 `Accept-Encoding` 内容协商）。两视图一致。
 - **digest 水位定位与 catch-up 盲区（after 游标等效方案裁决，2026-08-19 冻结）**：上游 `MessageV2.page()` 仅 `before` 向后 keyset（v1.18.18 实证），v4 messages 亦无 after 游标；增量 catch-up 等效方案 = **digest 触发 + 条件重拉**（水位仅当触发器不当过滤器；两盲区：`message.removed` 不进 digest、SSE 断连窗口无补偿；双轨消费 = digest 触发 If-None-Match 精拉 + 低频周期 304 对账兜底，重启/epoch 变化视为全失效）。v4 重放（§7.2 `id:`/Last-Event-ID）可缩小断连盲区但不消除（逐出/barrier 仍 resync），周期对账在两视图均为必选。两视图一致。
 - **v4 附加——meta 首帧字段集（v3 形状不动）**：v4 视图首帧 `event: slimapi.meta` data 字段序 = `subscriberId, tokens, capabilities, epoch, seqBase`；v4 追加三键：`capabilities: {"sseReplay": true}`（**恒此一键**——`qpImmediateFull` 仅广告于 `GET /slimapi/versions` 的 `capabilities["4"]`，不入 meta 帧）、`epoch`（进程代，16 hex 字符串）、`seqBase`（连接建立时该域已发布最大 seq，整数；首连后首个带 `id:` 帧恰为 `seqBase + 1`）。meta 帧自身**无 `id:`**（§7.0②）。
 - **v4 附加——welcome 帧抑制**：v4 连接不产出连接本地 `server.connected` 首帧（v3 照旧产出）；v4 线上首帧恒为 `slimapi.meta`。
+
+### §7.6 lastError 结构化 provider 字段（2026-08-21 加性修订 [冻结]）
+
+digest `lastError` 对象（G1-A，有 sid）与 session-less `event: session.error` **直推帧**（G1-B，帧形 `{directory?, name, message, at, code, provider?, model?, retryAfter?, quotaResetAt?}`）**同步增补**下列字段（camelCase）；既有基线键 `{name, message, at}` 不变，§7.5 sticky 三态语义（记录 / `busy` 显式 `null` 清除 / `session.deleted` 弹出省略）**零变化**——增补字段位于错误对象内部，清除帧与字段省略行为不受影响。
+
+**字段表**：
+
+| 字段 | 类型 | 何时出现 | 约束 |
+|---|---|---|---|
+| `code` | string | **恒有**（增补生效后的错误对象） | 枚举见下表；无法分类 → `provider_error` 兜底 |
+| `provider?` | string | 仅可推导时 | ≤64 字符，字符集 `[A-Za-z0-9._\-/:]`；不满足 → 字段缺省（不报错） |
+| `model?` | string | 仅可推导时 | 同 `provider` 约束 |
+| `retryAfter?` | int（秒） | 仅可推导时（**来源一**：上游结构化字段；**来源二**：`message` 文本提取 regex v3 `(?i)(?:retry\|try again)\s+(?:in\|after)\s+(\d+(?:\.\d+)?)(?:[ \t]*(?:seconds?\|secs?\|s)(?![A-Za-z0-9])\|(?![A-Za-z0-9.])(?![ \t]*[A-Za-z]))`——两分支：① 单位分支：同行空白 `[ \t]*` + 完整单位词（seconds?/secs?/s），后卫仅拒字母数字（句号/逗号/续句合法）；② 无单位分支：拒紧邻字母数字点（`30ms`/`1e3s`/`30.5.5s`）+ 拒**同行**空格后字母（`30 ms`/`30 minutes`；不跨行）。示例：`30 seconds.`→30、`30 seconds before retrying`→30、`30\nNext line`→30、`30, please wait`→30；`30 ms`/`30 minutes` 拒；`\|` 为正则 alternation 的表格转义） | 任何来源的值一律**向上取整（ceil）后 clamp 1..86400**；纯整数部分 >9 位或总长 >15 的天文数字直接 clamp 86400（不做浮点转换）；非数字结构化值丢弃（字段缺省） |
+| `quotaResetAt?` | number（int/float）或 ISO-8601 字符串 | **仅上游结构化数据提供时** | 仅接受 number 或 ≤64 字符且可被 ISO-8601 解析的字符串；int 值仅在 **[-2^63, 2^63-1]**（64-bit 有符号整数范围）内原样输出，超范围 → 字段安全缺省（丢弃）；float 仅要求有限（isfinite）；其余类型（含对象/数组/超长/非 ISO 文本/NaN/Inf）**安全降级为缺省——绝不原样透传任意上游值**（sidecar 不从文本推导） |
+
+（`name` 截断 128 字符、`message` 沿用既有脱敏管线——增补字段不改变两者既有约束。）
+
+**code 枚举与客户端展示建议**：
+
+| code | 语义 | 客户端展示建议 |
+|---|---|---|
+| `provider_rate_limited` | 限速 | 可配 `retryAfter` 倒计时，到点前禁用重发 |
+| `provider_quota_exceeded` | 配额耗尽 | 可用 `quotaResetAt`（如有）提示恢复时间；勿自动重试 |
+| `provider_model_overloaded` | 模型过载 | 提示稍后重试（可短退避，`retryAfter` 如有可用） |
+| `provider_context_length_exceeded` | 上下文超长 | 提示精简对话/开新会话，勿原样重试 |
+| `provider_unauthorized` | 认证/凭据失败 | 提示检查 provider 凭据，勿自动重试 |
+| `provider_model_not_found` | 模型不存在 | 提示更换模型 |
+| `provider_error` | 无法分类兜底 | 回退展示脱敏 `message` |
+
+- **分类依据与优先级（两级，冻结）**：
+  1. **结构化信号（优先）**，来源 `error.data` 白名单：
+     - `code`（string）：值**等于**七枚举成员之一 → 直接采用；其他值忽略。
+     - `type`（string，小写匹配）白名单映射：`rate_limit_error`→`provider_rate_limited`、`overloaded_error`→`provider_model_overloaded`、`authentication_error`→`provider_unauthorized`、`insufficient_quota`→`provider_quota_exceeded`；未列 type 忽略。
+     - `status`（整数）：401→`provider_unauthorized`、429→`provider_rate_limited`、402→`provider_quota_exceeded`；其他值忽略。
+     - 结构化内部优先级：`code` 直用 > `type` 映射 > `status` 映射；全部未命中 → 落文本分类。
+  2. **文本模式（兜底）**：`name` + 原始 `message`（pre-sanitize）小写子串匹配；多类命中按严格短路序取首个：**unauthorized → model_not_found → context_length → quota → rate_limited → overloaded → 兜底**；`401`/`429` 以数字边界匹配（前后非字母数字，防 `1401` 类假阳性）。
+- **安全白名单承诺**：sidecar 只输出上表白名单字段 + **已脱敏** `message`（沿用既有脱敏管线）；**绝不透传**上游原始响应体 / 内部堆栈；`provider`/`model` 输出承诺 = **白名单 + 字符集 + 长度 + 凭据形态多重防线，覆盖常见凭据形态**（非对任意未知形态的绝对"绝不泄露"保证）——字符集与长度校验之外另设两道凭据形态防线：① 已知凭据前缀黑名单（`sk-` / `sk_` / `pk-` / `rk-` / `ghp_` / `gho_` / `ghu_` / `ghs_` / `github_pat_` / `xoxb-` / `xoxp-` / `xoxa-` / `AKIA` / `AGPA` / `AIDA` / `AIza` / `eyJ`）；② 高熵启发式（连续字母数字段 ≥32 丢弃）。任一校验/防线不满足 → 字段缺省（不报错）。
+- **向后兼容（加性）**：老客户端忽略未知键即可，零必改点；不 bump wire 版本。未知 `code` 值（未来扩展）客户端应回退按 `message` 展示。
+- **写路径不变**：provider 错误经 SSE `session.error` 送达；`prompt_async` 等写路由（§10.1 基线）**立返 202**，4xx verbatim / 5xx→503 冻结职责不受本修订影响。
 
 ## §8 错误族与优先级 [冻结]
 

@@ -468,6 +468,7 @@ ocdroid 可在每个请求（含 SSE）**可选**附加三个 request header：
 - **连接建立期 coalescing**：带 `Last-Event-ID` 重连时同连接可能先 `resync` 再 `server.connected`（既有）。客户端 **SHOULD** 对同一连接建立期 cold-start 触发帧做 once-latch（至多一次 reconcile）。
 - **`server.heartbeat` ≠ 上游健康**：仅证 sidecar + 订阅存活；outage 探测用 `/slimapi/ready` 或自然 fetch/write 失败。sidecar 重启后重连收 `server.connected` → **应** cold-start。
 - digest `lastError`：sticky 跨窗口，`status=busy` 清除（显式 `null` 帧）；客户端据此显隐 session 错误 banner。`MessageAbortedError` 被 sidecar 过滤，不下发。
+- **`lastError` / `session.error` 增补字段（加性）**：错误对象在 `{name,message,at}` 基线上另含 `code`（恒有，枚举与约束见 `v4-contract.md` §7.6）+ 可选 `provider` / `model` / `retryAfter`（int 秒，clamp 1..86400）/ `quotaResetAt`，digest `lastError` 与无 sid 直推帧两处同步生效。ocdroid/webui 建议：解析 `code` 渲染差异化文案——`provider_rate_limited` 可配 `retryAfter` 倒计时（值为向上取整（ceil）后的整数秒；到点前禁用重发），`provider_quota_exceeded` 可用 `quotaResetAt`（如有）提示恢复时间，`provider_context_length_exceeded` / `provider_unauthorized` 勿自动重试；未知 `code` 回退展示脱敏 `message`。老客户端忽略未知键零影响。
 - 客户端所有 `/slimapi/**` 请求（含 SSE）须带查询参数 `?v=3`（4.0.0 起 `?v=4` 亦合法——(3,4) 双版本窗口；`X-Slimapi-Version` 头已于 3.0.0 删除，出现不解读）；连接时读 `/slimapi/health?v=3` 自检（见下 schema 三键）。
 - **仍推送帧类型（仅作观察信号）**：`question.asked` / `v2.asked`、`permission.asked` / `resolved` / `v2.asked` / `v2.resolved`——这些帧仍通过 SSE 直推，但 v2 已删除 q/p 写端点与 routeToken；客户端应答 q/p 走 catch-all + `X-Opencode-Directory`（写路径现以 v3-contract §10 为准；v2-contract §2 为历史出处）。帧的 wire 形态不变。
 - **已移除帧类型**：`server.reconfigured`（对应 discovery 数据流整体下线）。
