@@ -32,6 +32,7 @@ v3-retirement-plan.md:155-159（§6.1，亲验）列三阻塞；按新方向重�
 ### 2.1 阻塞①：ocdroid v3 全量锁定（工程量主项）
 
 - 证据（审计锚点，v3-retirement-plan.md:157）：ocdroid 全量流量 `?v=3`（CHANGELOG [3.3.1]「现行消费方（ocdroid/WebUI）均使用 wire v3」；[4.2.0]「ocdroid/WebUI 均在 ?v=3」——同窗口 oc-webui 已迁 v4、ocdroid 未迁）。
+- **【进展注记 2026-08-21 10:30，ocdroid 侧会话确认】阻塞①实质解除在望**：① 观测到的 v3 流量（4h 窗口 7,378 条，大头 `/slimapi/sessions/status` 轮询 61%）归属**已发布存量客户端 3.2.0**，非当前开发线；② 迁移树已完成 v4 全量迁移（仅 v4 + 硬门禁 + V3 fallback 全删），`sessions/status` 经统一拦截器自动 `?v=4`（同端点无字段差）、列表已按客户端补偿模式迁移（`?v=4&parent=none&archived=omit` + 本地 directory 分桶）、SSE 281 路全 v4 与迁移树一致；③ **无契约级阻碍**（per-directory 客户端过滤、providers limit 子键已处理）；④ 排期：W4 发版前评审收敛尾段（r9 评审→模拟器 v4 冒烟→终审→release.sh），预期近端发版，存量 v3 流量随用户升级清零。Phase 1（§6）准入条件已在满足路径上。
 - **迁移工程量框架** = 该文档 §2 十六项 checklist（A1-A16，v3-retirement-plan.md:41-58，亲验）。核心四项（:62）：
   - **A2** sessions 参数轴换轨（directory/roots/start → archived/parent/search/cursor；`start` 时间水位无 v4 等价，增量列表逻辑重写）——**高**风险；
   - **A3** directory 服务端过滤缺口（唯一无服务端等价物项，F-121；全局拉取 + `item.directory` 客户端过滤，v3-retirement-plan.md:64-75）——**高**风险；
