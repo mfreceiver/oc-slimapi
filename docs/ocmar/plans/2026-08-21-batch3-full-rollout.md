@@ -90,6 +90,8 @@
 
 ## v4 分支：v3 全面移除（Wave 3 后从 main HEAD 拉出；不发版不部署）
 
+> **W3 收尾注记（2026-08-21，B12 落地后）**：测试侧 B12 已完成（双视图 golden 化 + 106 函数三分处置 + 白名单 `docs/ocmar/plans/2026-08-21-batch3-b12-whitelist.md`）——v4 分支**开工门（B12）要件达成**。契约侧 B12（F-126：v4-contract 自包含化，67+13 处 v3 引用正文化）未入 Wave 3，按门控 rev3 裁定 = **v4 分支上的第一个动作**，先于任何 v3 面移除（满足「唯一必须在任何 v3 面拆除之前完成」的顺序纪律）。
+
 - [ ] `git branch v4`（Wave 3 完成后）；**分支纪律（B6 措辞冻结）：merge gate 通过前，禁止 merge 回 main / 运行 release.sh / 本机部署；gate 通过后允许一次性合并**。机械防线：① 分支内 `scripts/` 加 preflight 检查——`git branch --show-current == v4` 时 release/deploy 类脚本直接非零退出并打印「v4 branch: merge gate not passed」；② docs/operations.md 部署节加规则「本机部署仅允许 main 分支 HEAD + 已发版 tag（`git describe --exact-match` 校验），v4 分支拒绝」；③ 编排者每次会话接触本仓库先 `git branch --show-current` 确认所在分支。
 - [ ] **版本窗收窄**：versioning.py `ACCEPTED_CLIENT_VERSIONS (3,4)→(4,)`、`SERVER_API_VERSION=4` 不变；validate/测试同步；`?v=3` → 400 `unsupported_version supported:[4]`。
 - [ ] **v3 面拆除**：v3-only 分支逻辑（selector/路由/投影）、providers v3 passthrough、双视图测试的 v3 侧、v3 ETag 域；`/slimapi/versions`、health `accepted_client_versions` 输出同步。

@@ -45,6 +45,8 @@
 
 ### 4.3 v4 分支：v3 全面移除（Wave 3 后从 main HEAD 拉出）
 
+> **W3 交接更新（2026-08-21）**：Wave 3 已闭环（v4.7.0）；测试侧 B12 完成（白名单 `docs/ocmar/plans/2026-08-21-batch3-b12-whitelist.md`）= **开工门达成**。契约侧 F-126（v4-contract 自包含化）按门控 rev3 裁定 = v4 分支**第一个动作**（先于一切 v3 面移除）。
+
 计划 §「v4 分支（:91）」：**不发版不部署**，merge 回 main 后才 major 发版。内容：wire 面 v3 selector 移除、`ACCEPTED_CLIENT_VERSIONS` 收窄、契约 v3 视图退役标注、测试 v3 面清理。
 
 **关键进展（2026-08-21 04:19Z ocdroid 通报）**：ocdroid **v4.1.0 已发版**（tag 已 push）——客户端全量 V4-only：`?v=4` 钉死、v3 fallback 代码全删、连接硬门禁。唯一存量 v3 流量来自旧版 3.2.0 客户端的 `/slimapi/sessions/status` 轮询，将随用户升级自然清零。
