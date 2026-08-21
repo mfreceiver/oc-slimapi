@@ -150,14 +150,14 @@ return Response(encoded, status_code=200, media_type="application/json",
 
 ## 6. 验收清单
 
-- [ ] 金样在基线代码录制（`OC_SLIMAPI_TEST_RECORD_GOLDEN=1`）并提交（含 `_meta` 头：基线 commit / gzip mtime=0 / 同环境告诫）；
-- [ ] 实现后回放全矩阵 hash 相等（含 lease 路径 7 与 etag_enabled=false 8）；
-- [ ] offload/to_thread 计数证明（messages ≥1/请求，直连与 lease；read-group 大体量 ≥1、小体量 0）；
-- [ ] 更新 `_read_passthrough.py:39-41` 模块注释（"run inline" 句）；
-- [ ] 定向 pytest：test_messages_routes / test_messages_merged / test_messages_coalesce / read-group 相关（test_read_groups*） / test_etag / test_gzip_negotiation + 新测试全绿；
-- [ ] `./scripts/check.sh` 全量绿（**编排者收尾**）；
-- [ ] follow-up-backlog.md 追加 F-203..206 处置节 + transform.py offload docstring 偏离注记（N6）；CHANGELOG [4.6.2] 条目（**编排者**）；
-- [ ] `./scripts/release.sh patch` → push → 本机部署 → 四件套终验（**编排者**）。
+- [x] 金样在基线代码录制（`OC_SLIMAPI_TEST_RECORD_GOLDEN=1`）并提交（含 `_meta` 头：基线 commit / gzip mtime=0 / 同环境告诫）；
+- [x] 实现后回放全矩阵 hash 相等（含 lease 路径 7 与 etag_enabled=false 8）；
+- [x] offload/to_thread 计数证明（messages ≥1/请求，直连与 lease；read-group 大体量 ≥1、小体量 0）；
+- [x] 更新 `_read_passthrough.py:39-41` 模块注释（"run inline" 句）；
+- [x] 定向 pytest：test_messages_routes / test_messages_merged / test_messages_coalesce / read-group 相关（test_read_groups*） / test_etag / test_gzip_negotiation + 新测试全绿；
+- [x] `./scripts/check.sh` 全量绿（**编排者收尾**）；
+- [x] follow-up-backlog.md 追加 F-203..206 处置节 + transform.py offload docstring 偏离注记（N6）；CHANGELOG [4.6.2] 条目（**编排者**）；
+- [x] `./scripts/release.sh patch` → push → 本机部署 → 四件套终验（**编排者**）。
 
 ## 7. 评审记录
 

@@ -39,3 +39,16 @@
 2. 裁决项 R-1/R-2 安全面优先（E-II 是生产实际暴露面）——裁决后可并入批次二尾或独立小批；
 3. 批次三大拆分最后（offload 落地后）；
 4. 每批沿用已验证流程：实施计划（writing-plans）→ rev 门控 ≥9.0 → 写域互斥并行 fixer 泳道 → 编排者收尾（CHANGELOG/契约/check.sh）→ release.sh。
+
+## 批次三 Wave 2 处置记录（2026-08-21，v4.6.2）
+
+F-203..206 逐项豁免/延期（所在文件不在 W2 冻结写域 + 量级小，走计划允许的「逐项记录豁免理由」路径）+ 实施中新发现两项：
+
+| 项 | 处置 | 理由 |
+|---|---|---|
+| F-203 sessions 尾双 dumps+sha256+gzip on-loop | **延期** | envelope KB~低百 KB，合计 <数 ms；最小修法 = `gzip_util.json_response` 接受现成 identity bytes 消 double-dumps，归后续触及 sessions.py 的泳道 |
+| F-204 write_groups POST 回显 gzip on-loop | **豁免** | 回显体 KB 级 + MIN_GZIP_BYTES 门，现实量级最小 |
+| F-205 access-log 每请求同步 write+flush on-loop | **延期** | 本地盘 µs~亚 ms；QueueHandler/QueueListener 改造触及 logging 时序语义，风险>收益（P3） |
+| F-206 snapshotter `_write_once` 同步写 on-loop | **延期** | 300s 一次 + 关停一次的 KB 级写；`asyncio.to_thread` 一行改动归后续触及该文件的泳道 |
+| transform.py offload docstring 偏离（评审 N6） | **注记** | 「queueing naturally bounded by admission」经 W2 尾部无 admission offload 进一步偏离（questions/permissions:260-269/278-286 先例 + W2 设计 §1.3 论证）；transform.py 不在 W2 写域，docstring 修正随后续触及 |
+| **skeleton `_pick` 键序跨进程不确定（W2 实施新发现）** | **新档（候选 P3）** | `skeleton.py` `_pick` 以 `{k: … for k in keys}` 迭代**集合**（PART_IDS/TOOL_KEYS/SESSION_KEYS…）→ 投影 dict 键序随 PYTHONHASHSEED 变化 → **同一构建不同进程对同一上游响应产出键序不同的 wire 字节、且 ETag/contentFingerprint 验证器随每次进程重启轮换**（客户端缓存每次重启多吃一轮 200）。仓内测试已有规避先例：`test_v3_rawbody_regression._fetch_pinned` 的 `PYTHONHASHSEED=0` 子进程（docstring 自述「sessions 键序唯一确定性来源」）。候选修法 = `_pick` 改 `sorted(keys)` 迭代（键序字母序规范化，验证器重启稳定）；**注意**：该修复会改变 `BASELINE_SESSIONS_V3_BODY_HEX`/`BASELINE_SESSIONS_V3_ETAG` 逐字节基线（需按测试内指引 `--capture` 回填 + review），且 skeleton.py 不在 W2 写域——故 W2 未修，金样 harness 按同先例以 hashseed=0 子进程规避（`tests/test_offload_equivalence.py`） |

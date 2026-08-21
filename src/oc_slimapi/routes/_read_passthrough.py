@@ -37,8 +37,10 @@ chain, factored here:
   validator on the identity body with the wire-view domain marker (§6.1),
   304 via ``If-None-Match`` weak compare, gzip re-encode negotiated;
 * per contract §10.a admission rule, pure-raw controlled proxies do NOT
-  occupy the transform pool (no projection → no ``transform_busy``); hashing
-  and gzip run inline like ``routes/sessions.py``.
+  occupy the transform pool (no projection → no ``transform_busy``); the
+  tail's hashing/gzip runs inline for small bodies and leaves the event
+  loop via ``asyncio.to_thread`` (the DEFAULT executor — never the
+  transform pool) at/above ``_TAIL_OFFLOAD_MIN_BYTES`` (F-202).
 
 Vary: directory-sensitive routes (consuming set) emit the merged double
 value ``Accept-Encoding, X-Opencode-Directory``; tolerant routes emit
@@ -48,6 +50,7 @@ upstream ETag headers are never passed through (sidecar-owned domain).
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Callable
 
@@ -75,6 +78,52 @@ _PASSTHROUGH_UPSTREAM_HEADERS = (
     "x-request-id",
     "last-request-id",
 )
+
+# F-202: bodies at/above this size run the judge/gzip/validator tail off
+# the event loop (``asyncio.to_thread``). gzip level-6 throughput is
+# ~20-60 MB/s single-core → a 1 MiB body costs ~17-50 ms inline (worth
+# offloading); below it the whole tail (sha256 ~1.5-2 GB/s + gzip) is
+# single-digit milliseconds and an executor round-trip costs more than it
+# saves. Both branches call the SAME pure function — byte-identical output.
+_TAIL_OFFLOAD_MIN_BYTES = 1 << 20
+
+
+def _tail_encode(
+    body: bytes, *, accept_encoding: str | None,
+    if_none_match: str | None, rep_version: bytes | None,
+) -> tuple[str | None, bytes, dict[str, str], str | None]:
+    """F-202 response tail: 304 judgment + gzip + validator (§10.a chain).
+
+    Same contract as ``routes.messages._judge_pack_tail`` (Wave 2 design
+    §2.2): returns ``(verdict, encoded, coding_headers, etag_value)`` where
+    a non-None ``verdict`` (tag or ``"*"``) means 304 with ``etag_value``
+    the validator to echo, and ``None`` means the 200 payload is ready.
+    The ``rep_version is not None and body`` guard mirrors the historical
+    inline tail exactly — bodiless successes (204/3xx etc.) never judge
+    and never carry an ETag. Pure CPU; runs inline below
+    ``_TAIL_OFFLOAD_MIN_BYTES`` and via ``asyncio.to_thread`` above.
+    """
+    verdict: str | None = None
+    if rep_version is not None and body:
+        verdict = etag_mod.judge_conditional(
+            body, if_none_match, rep_version,
+            accept_encoding=accept_encoding,
+        )
+        if verdict == "*":
+            _, coding = compress_if_beneficial(body, accept_encoding)
+            actual = "gzip" if "Content-Encoding" in coding else "identity"
+            return (
+                "*", b"", {},
+                etag_mod.compute_etag(body, actual, rep_version),
+            )
+        if verdict is not None:
+            return verdict, b"", {}, verdict
+    encoded, coding = compress_if_beneficial(body, accept_encoding)
+    etag_value: str | None = None
+    if rep_version is not None and body:
+        actual = "gzip" if "Content-Encoding" in coding else "identity"
+        etag_value = etag_mod.compute_etag(body, actual, rep_version)
+    return None, encoded, coding, etag_value
 
 
 def _upstream_passthrough_headers(
@@ -242,21 +291,23 @@ async def read_passthrough_get(
     except TransformBusy:
         return busy_response(accept_encoding)
 
-    if rep_version is not None and body:
-        # §10: ETag canonical is status-independent, but a bodiless
-        # success (204 etc.) has no entity to describe — the validator
-        # naturally degrades away (gzip gate likewise skips empty bodies).
-        verdict = etag_mod.judge_conditional(
-            body, if_none_match, rep_version, accept_encoding=accept_encoding)
-        if verdict == "*":
-            encoded, coding = compress_if_beneficial(body, accept_encoding)
-            actual = "gzip" if "Content-Encoding" in coding else "identity"
-            return etag_mod.not_modified_response(
-                etag_mod.compute_etag(body, actual, rep_version), vary)
-        if verdict is not None:
-            return etag_mod.not_modified_response(verdict, vary)
-
-    encoded, coding = compress_if_beneficial(body, accept_encoding)
+    if len(body) >= _TAIL_OFFLOAD_MIN_BYTES:
+        # F-202: large bodies leave the event loop via the DEFAULT
+        # executor — §10.a freeze intact (raw routes never queue on the
+        # transform pool). ``asyncio.to_thread`` attribute call form is
+        # load-bearing: tests spy it via monkeypatch (design §2.2/M4).
+        verdict, encoded, coding, etag_value = await asyncio.to_thread(
+            _tail_encode, body,
+            accept_encoding=accept_encoding, if_none_match=if_none_match,
+            rep_version=rep_version,
+        )
+    else:
+        verdict, encoded, coding, etag_value = _tail_encode(
+            body, accept_encoding=accept_encoding,
+            if_none_match=if_none_match, rep_version=rep_version,
+        )
+    if verdict is not None:
+        return etag_mod.not_modified_response(etag_value, vary)
     headers: dict[str, str] = {
         "Cache-Control": "no-store",
         # §10.a frozen passthrough set (Content-Type/Location/Retry-After/
@@ -268,9 +319,8 @@ async def read_passthrough_get(
     # overwrite AFTER merging so directory-sensitive routes keep the
     # merged double value.
     headers["Vary"] = vary
-    if rep_version is not None and body:
-        actual = "gzip" if "Content-Encoding" in coding else "identity"
-        headers["ETag"] = etag_mod.compute_etag(body, actual, rep_version)
+    if etag_value is not None:
+        headers["ETag"] = etag_value
     # §10: success status passes through verbatim (201/202/204/206/3xx) —
     # the sidecar never rewrites it and never follows redirects
     # (upstream client follow_redirects=False).

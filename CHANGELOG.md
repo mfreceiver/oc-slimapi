@@ -26,6 +26,14 @@ ocdroid 对接时：
 
 ---
 
+## [4.6.2] - 2026-08-21 — 审计整改批次三 Wave 2：响应尾部性能 offload（包版本 patch；wire 版本**不变**，仍 (3,4)；**零 wire 字节变更**——29 用例金样回放逐字节全等；实施设计 docs/ocmar/reviews/2026-08-21-wave2-offload-design.md，独立评审门 8.7→9.5 PASS）
+
+### Fixed（性能内部，零 wire 变更）
+
+- **messages 列表/merged 响应尾部下放 worker（F-201/F-271）**：`GET /slimapi/messages/{sid}`（含 `?mode=merged`）投影产出后的 304 判定（全量 sha256 ×≤2）+ gzip level-6 + 验证器计算，从事件循环迁入 transform worker（`pool.offload`，不占 admission——饱和时不再出现「已投影请求被尾部 503」的新失败面）。此前 merged 200 尾部（identity ≤8 MiB）在事件循环上 gzip 最坏 ~130-400ms，期间全部 SSE 心跳/帧扇出/其它请求协程停摆；现事件循环仅剩毫秒级组包。响应字节/头/ETag 逐字节不变（金样 `tests/golden/offload-baseline-v1.json` 29 用例回放全等：lease/直连 × 200/304/`*` × 五种 Accept-Encoding 变体 × 空页/单条/16 条边界 × 422/503 错误体）。
+- **§10.a read-group 响应尾部阈值下放（F-202）**：file/vcs/find/providers/session-single/active/global-health 读组的尾部 sha256 判定 + gzip，body ≥1 MiB 时经 `asyncio.to_thread`（默认 executor）离开事件循环，<1 MiB 保持 inline；raw 路由仍完全不占 transform 池（§10.a admission 冻结不变）。大 body（上界 64 MiB）压缩不再产生秒级事件循环停摆。
+- **同族豁免记录（F-203/F-204/F-205/F-206）**：sessions 尾双 dumps、write 回显 gzip、access-log 逐行 flush、snapshotter 写盘四项经量级评估豁免/延期；处置与理由落 `docs/ocmar/plans/2026-08-21-follow-up-backlog.md`「批次三 Wave 2 处置记录」节（含 W2 实施新发现：skeleton `_pick` 键序跨进程不确定致 ETag 验证器随重启轮换——已立案候选修法，未并入本版）。
+
 ## [4.6.1] - 2026-08-21 — 审计整改批次三 Wave 1：机械清理与文档对齐（包版本 patch；wire 版本**不变**，仍 (3,4)；实施计划 docs/ocmar/plans/2026-08-21-batch3-full-rollout.md，经 rev-cgpt 两轮门控 5.8→9.4 PASS）
 
 ### Removed（内部死码，零 wire 影响）

@@ -1,0 +1,41 @@
+{
+  "_meta": {
+    "matrix": 1,
+    "recorded_on": "pre-offload baseline (Wave 2 design §4)",
+    "digest_basis": "raw wire bytes via aiter_raw (gzip pinned)",
+    "hashseed": "matrix runs under PYTHONHASHSEED=0 (skeleton _pick key order is per-process; same workaround as test_v3_rawbody_regression._fetch_pinned)",
+    "gzip_mtime0": true,
+    "same_env_note": "deflate bytes vary with the zlib build — record and verify must run on the same machine/venv (single-host check.sh satisfies this)"
+  },
+  "cases": {
+    "etag_gzip_200": "7fe07c1e58b2cfaf5d9516bc1f1cb95f09eaf5566b52d564f732c952f90df3bf",
+    "etag_gzip_304": "b1e293c3213592928086eb052c1727ecb2ae86762ac5756b33d2ae47631a78fb",
+    "etag_gzip_miss_200": "7fe07c1e58b2cfaf5d9516bc1f1cb95f09eaf5566b52d564f732c952f90df3bf",
+    "etag_identity_200": "116cd0cb7f111c75cbc9606ade867d27a6532c5b323849a430eebb946c503ae0",
+    "etag_identity_304": "e23b22b9b91f46a37cfb89777311c111a954b887886c7a6042fe942c7047def5",
+    "etag_identity_miss_200": "116cd0cb7f111c75cbc9606ade867d27a6532c5b323849a430eebb946c503ae0",
+    "etag_off_200_gzip": "e52a1128d5a290f94b5e3bb598aeea0448f284029f4e6f38df29581a5325752e",
+    "etag_star_304_gzip": "b1e293c3213592928086eb052c1727ecb2ae86762ac5756b33d2ae47631a78fb",
+    "lease_200_gzip": "7fe07c1e58b2cfaf5d9516bc1f1cb95f09eaf5566b52d564f732c952f90df3bf",
+    "lease_304": "b1e293c3213592928086eb052c1727ecb2ae86762ac5756b33d2ae47631a78fb",
+    "lease_star_304": "b1e293c3213592928086eb052c1727ecb2ae86762ac5756b33d2ae47631a78fb",
+    "list_16_200_gzip": "4b4086bc7af059244a8ac3e7d45ba1684746b0832aeb797eb5a64a8970fbd44b",
+    "list_200_gzip": "7fe07c1e58b2cfaf5d9516bc1f1cb95f09eaf5566b52d564f732c952f90df3bf",
+    "list_200_gzip_q0": "116cd0cb7f111c75cbc9606ade867d27a6532c5b323849a430eebb946c503ae0",
+    "list_200_identity": "116cd0cb7f111c75cbc9606ade867d27a6532c5b323849a430eebb946c503ae0",
+    "list_200_wildcard": "7fe07c1e58b2cfaf5d9516bc1f1cb95f09eaf5566b52d564f732c952f90df3bf",
+    "list_200_xgzip": "7fe07c1e58b2cfaf5d9516bc1f1cb95f09eaf5566b52d564f732c952f90df3bf",
+    "list_422": "3a58963dc005ed76875bffdb642da5887895a35b20a8a9240470de629fcbf9c7",
+    "list_503": "76ba86a784df7076bbeedb5c7efaf621d763aee0c547b71364a73dec987be148",
+    "list_empty_200_gzip": "8da358697b727ad5aaf69983c575f4b1ded35fcabbf0584438323ed131692dc5",
+    "list_single_200_gzip": "3ca5ecb0b7d34fb082b4a06073dc245f2a2064a016af0ddf09aa703bb62d7175",
+    "merged_200_gzip": "78520221a1131cb04828e093a84cc0d1b754ee30f24740a8f128a61550b95b0b",
+    "merged_200_identity": "a95ac409c9d485ec52801dc002387fc1ebcf2bcf612e12a60fa53c0fa6613f48",
+    "session_single_200_gzip": "e898a8c374402148257bcf318b929a8b70b4f076a8b542d9d310d135a47fd41d",
+    "vcs_200_gzip": "3019bb9f961ed46536e7460053f042e558e592083a031cfafda3b26398ae7e53",
+    "vcs_200_identity": "3019bb9f961ed46536e7460053f042e558e592083a031cfafda3b26398ae7e53",
+    "vcs_etag_200": "3019bb9f961ed46536e7460053f042e558e592083a031cfafda3b26398ae7e53",
+    "vcs_etag_304": "661663acee7c789cd21ee772779a99d366ba66841a00aff0d33ffa3182d27836",
+    "vcs_large_200_gzip": "735ce9b1cb34fe24255910d3d2dd7e171e9df496603fd28dd9a63c601a71b52b"
+  }
+}

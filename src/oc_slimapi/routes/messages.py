@@ -165,6 +165,57 @@ def _project_list_sorted_and_pack(
     return orjson.dumps(projected)
 
 
+def _judge_pack_tail(
+    identity: bytes, *, accept_encoding: str | None,
+    if_none_match: str | None, rep_version: bytes | None,
+) -> tuple[str | None, bytes | None, dict[str, str], str | None]:
+    """F-201/F-271 off-loop response tail: 304 judgment + gzip + validator.
+
+    The list/merged routes produce the envelope identity bytes in the
+    transform worker, but their POST-projection tail (up to two full-body
+    sha256 passes for the conditional judgment + gzip level-6 on the merged
+    8 MiB worst case) used to run on the event loop, stalling every SSE
+    heartbeat for tens to hundreds of milliseconds. This worker is that
+    tail, executed via ``pool.offload`` — WITHOUT holding admission (a slot
+    here would 503 requests that already finished projecting; see the
+    design doc §1.3). Pure CPU; same functions, same order, same inputs as
+    the historical inline tail → wire bytes are identical.
+
+    Returns ``(verdict, encoded, coding_headers, etag_value)``:
+
+    * ``verdict is None`` → serve 200: ``encoded``/``coding_headers`` ready,
+      ``etag_value`` the validator of the coding actually carried (``None``
+      when ``rep_version`` is None — ETag disabled, byte-identical legacy).
+    * ``verdict == "*"`` → 304: compressed once to label the coding it
+      would serve; ``etag_value`` is that coding's validator.
+    * other ``verdict`` string → 304 echoing exactly that validator; zero
+      compression happened.
+    """
+    verdict: str | None = None
+    if rep_version is not None:
+        verdict = etag_mod.judge_conditional(
+            identity, if_none_match, rep_version,
+            accept_encoding=accept_encoding,
+        )
+        if verdict == "*":
+            _, c_headers = compress_if_beneficial(identity, accept_encoding)
+            actual = (
+                "gzip" if "Content-Encoding" in c_headers else "identity")
+            return (
+                "*", None, None,
+                etag_mod.compute_etag(identity, actual, rep_version),
+            )
+        if verdict is not None:
+            return verdict, None, None, verdict
+    encoded, c_headers = compress_if_beneficial(identity, accept_encoding)
+    etag_value: str | None = None
+    if rep_version is not None:
+        actual = (
+            "gzip" if "Content-Encoding" in c_headers else "identity")
+        etag_value = etag_mod.compute_etag(identity, actual, rep_version)
+    return None, encoded, c_headers, etag_value
+
+
 _REL_PARAM_RE = re.compile(
     # Match the ``rel`` link-param anywhere in a Link entry's attribute
     # string. Pre-anchor on start/whitespace/``;`` so we don't false-match
@@ -930,44 +981,32 @@ async def _messages_via_lease(
             # 200 — B1-C5 reverse direction). ``*`` compresses once and
             # echoes the actual coding's tag. The 200 below labels its
             # validator with the coding it ACTUALLY carries (B1-1R).
+            # F-201/F-271: the judge+gzip+validator tail runs in the
+            # transform worker (``_judge_pack_tail``) — off the event loop,
+            # admission NOT held (a slot here would 503 requests that
+            # already finished projecting; design §1.3).
             rep_version = etag_mod.response_rep_version(
                 config, wire_view=3)
             # §6.2 (gate C3): directory-sensitive route — the directory
             # Vary dimension is unconditional (cache-correctness semantics,
             # NOT an ETag accessory; Batch 3 merge_directory_vary precedent).
             vary_value = etag_mod.merged_vary("Accept-Encoding")
-            if rep_version is not None:
-                # 304 never carries aux headers (§6.4 terminal: the
-                # X-Next-Cursor channel is retired; the cached envelope
-                # carries the cursor).
-                aux = None
-                verdict = etag_mod.judge_conditional(
-                    identity,
-                    request.headers.get("if-none-match"),
-                    rep_version,
-                    accept_encoding=accept_encoding,
-                )
-                if verdict == "*":
-                    encoded, c_headers = compress_if_beneficial(
-                        identity, accept_encoding)
-                    actual = (
-                        "gzip" if "Content-Encoding" in c_headers
-                        else "identity")
-                    return etag_mod.not_modified_response(
-                        etag_mod.compute_etag(identity, actual, rep_version),
-                        vary_value, aux=aux,
-                    )
-                if verdict is not None:
-                    return etag_mod.not_modified_response(
-                        verdict, vary_value, aux=aux)
-            encoded, c_headers = compress_if_beneficial(identity, accept_encoding)
+            # 304 never carries aux headers (§6.4 terminal: the
+            # X-Next-Cursor channel is retired; the cached envelope
+            # carries the cursor).
+            verdict, encoded, c_headers, etag_value = await pool.offload(
+                _judge_pack_tail, identity,
+                accept_encoding=accept_encoding,
+                if_none_match=request.headers.get("if-none-match"),
+                rep_version=rep_version,
+            )
+            if verdict is not None:
+                return etag_mod.not_modified_response(
+                    etag_value, vary_value, aux=None)
             final_headers = dict(c_headers)
             final_headers["Vary"] = vary_value
-            if rep_version is not None:
-                actual_coding = (
-                    "gzip" if "Content-Encoding" in c_headers else "identity")
-                final_headers["ETag"] = etag_mod.compute_etag(
-                    identity, actual_coding, rep_version)
+            if etag_value is not None:
+                final_headers["ETag"] = etag_value
             return Response(
                 encoded, status_code=200, media_type="application/json",
                 headers={**base_headers, **final_headers},
@@ -1126,44 +1165,27 @@ async def messages(
         # once and echoes the actual coding). Zero compression on every
         # non-star 304. The 200 labels its validator with the coding it
         # ACTUALLY carries. Aux header value comes from THIS run.
+        # F-201/F-271: same offloaded tail worker as the lease path.
         rep_version = etag_mod.response_rep_version(
             config, wire_view=3)
         # §6.2 (gate C3): unconditional directory Vary — same as the lease
         # tail; directory-sensitivity does not depend on validator support.
         vary_value = etag_mod.merged_vary("Accept-Encoding")
-        if rep_version is not None:
-            # 304 never carries aux headers (§6.4 terminal — same as the
-            # lease tail).
-            aux = None
-            verdict = etag_mod.judge_conditional(
-                identity,
-                request.headers.get("if-none-match"),
-                rep_version,
-                accept_encoding=request.headers.get("accept-encoding"),
-            )
-            if verdict == "*":
-                encoded, c_headers = compress_if_beneficial(
-                    identity, request.headers.get("accept-encoding"))
-                actual = (
-                    "gzip" if "Content-Encoding" in c_headers
-                    else "identity")
-                return etag_mod.not_modified_response(
-                    etag_mod.compute_etag(identity, actual, rep_version),
-                    vary_value, aux=aux,
-                )
-            if verdict is not None:
-                return etag_mod.not_modified_response(
-                    verdict, vary_value, aux=aux)
-        encoded, c_headers = compress_if_beneficial(
-            identity, request.headers.get("accept-encoding"),
+        # 304 never carries aux headers (§6.4 terminal — same as the lease
+        # tail).
+        verdict, encoded, c_headers, etag_value = await pool.offload(
+            _judge_pack_tail, identity,
+            accept_encoding=request.headers.get("accept-encoding"),
+            if_none_match=request.headers.get("if-none-match"),
+            rep_version=rep_version,
         )
+        if verdict is not None:
+            return etag_mod.not_modified_response(
+                etag_value, vary_value, aux=None)
         final_headers = dict(c_headers)
         final_headers["Vary"] = vary_value
-        if rep_version is not None:
-            actual_coding = (
-                "gzip" if "Content-Encoding" in c_headers else "identity")
-            final_headers["ETag"] = etag_mod.compute_etag(
-                identity, actual_coding, rep_version)
+        if etag_value is not None:
+            final_headers["ETag"] = etag_value
         return Response(
             encoded, status_code=200, media_type="application/json",
             headers={**base_headers, **final_headers},
