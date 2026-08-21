@@ -15,6 +15,7 @@ from starlette.responses import Response
 
 from ...errors import CodedHTTPException
 from ...gzip_util import compress_if_beneficial, error_response
+from ...skeleton import _files_from_diff_text
 from ...traffic import EXPAND_CATEGORIES as _EXPAND_CATEGORIES
 from ...traffic import EXPAND_CATEGORIES_SET as _EXPAND_CATEGORIES_SET
 from ...transform import TransformBusy
@@ -182,7 +183,15 @@ def _extract_part_state_input_full(_message: dict, part: dict) -> dict:
 
 def _extract_part_state_metadata_full(_message: dict, part: dict) -> dict:
     """state.metadata → {metadata: object|null}, with the never-consumed LSP
-    ``diagnostics`` map dropped (same strip as /full §2.1 / P3)."""
+    ``diagnostics`` map dropped (same strip as /full §2.1 / P3).
+
+    §4d B2 (P1-3 + P1-N6): for ``edit`` parts whose source metadata carries
+    no ``files`` of its own, the diff text is parsed and the COMPLETE
+    synthetic files list (NO cap — the cap is skeleton-view only) is added
+    under ``metadata.files``. Eligibility is the SAME guard as the skeleton
+    projection: tool == edit, source has no ``files`` key,
+    ``truncated`` is not true, diff parses. Additive — every other key is
+    returned exactly as upstream sent it."""
     state = _expand_state(part)
     if state is None:
         return {"metadata": None}
@@ -191,9 +200,16 @@ def _extract_part_state_metadata_full(_message: dict, part: dict) -> dict:
         return {"metadata": None}
     if not isinstance(value, dict):
         _expand_shape_error()
-    return {"metadata": {
+    metadata = {
         key: item for key, item in value.items() if key != "diagnostics"
-    }}
+    }
+    if (part.get("tool") == "edit"
+            and "files" not in value
+            and value.get("truncated") is not True):
+        parsed_files = _files_from_diff_text(value.get("diff"))
+        if parsed_files:
+            metadata["files"] = parsed_files
+    return {"metadata": metadata}
 
 
 def _extract_part_state_attachments(_message: dict, part: dict) -> dict:

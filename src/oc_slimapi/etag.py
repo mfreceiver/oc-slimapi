@@ -36,7 +36,12 @@ _ETAG_SCHEME_VERSION = b"etag-v1"
 #: the compress-if-beneficial gate also changes which coding a response
 #: actually carries — treat that as a representation change and bump
 #: (rev-5 Batch 2 condition C1).
-SKELETON_REPRESENTATION_VERSION = b"skeleton-v1"
+#: v2 (4.9.0, toolcard plan §5a): compress title synthesis, outputBytes,
+#: patch files {path} normalization + filesTotal, metadata.files compact
+#: projection, aggregate diffStats priority chain, edit diff-text files
+#: synthesis. FINGERPRINT_VERSION deliberately unchanged — derived fields
+#: enter the fingerprint naturally through the projected body.
+SKELETON_REPRESENTATION_VERSION = b"skeleton-v2"
 
 
 class _ConfigLike(Protocol):

@@ -112,6 +112,8 @@ GET /slimapi/messages/{sid}/expand/{category}/{mid}/{partID}?v=3[&directory=...]
 - 无 `part_files_full`：`files` 是纯路径数组（12,334 条 patch part 实测单条几十字节），skeleton 原样保留即可。
 - `part_snapshot` 覆盖 step-start 与 step-finish（schema 证实两类型均有 optional snapshot）。
 
+> **[4.9.0] 历史注记（2026-08-21）**：上节及 §2.2 中「PatchPart `files: string[]` 原样保留 / 无 files ref」的现行态表述，已被 v4 契约**修订四**（4.9.0，`docs/specs/v4-contract.md` §10.2/§14）取代——`files` 现为归一化对象数组投影（string → `{"path"}`；cap 10 + `filesTotal`）；`part_state_metadata_full` 触发条件增补「源 metadata.files 非空」、且对 edit 返回合成 `files`。本文件为设计存档，现行行为以 v4-contract 为准。
+
 ### 2.3 不提供 expand 的省略（/full-only，显式穷举）
 
 | 省略项 | 理由 |
@@ -201,6 +203,8 @@ in-flight 合并 + 1 秒成功结果 grace，非缓存（singleflight.py:15-23, 
 ### 4.2 PatchPart 存量 bug 修复（P0 前置）
 
 `_patch()`（skeleton.py:328-378）假定 `files` 为 dict 数组，对 v1.18.16 的 `string[]` 产出**空列表**（12,334 条 patch part 全受影响）。修复：`files: string[]` 原样保留 + 保留 `hash`。独立于 expand 先行合入。
+
+> **[4.9.0] 历史注记（2026-08-21）**：本节「`files: string[]` 原样保留 + 保留 `hash`」为 3.1.0 修复时点的现行态口径，已被 v4 契约修订四（4.9.0）取代——现行 `files` 为归一化对象数组投影（string → `{"path"}`；legacy dict 条目四键投影；cap 10 + `filesTotal` 源计数 + `diffStats` 防伪造守卫；wire 形状变更经 owner 批准随 minor 发布）。现行行为以 `docs/specs/v4-contract.md` §10.2 修订四为准。
 
 ### 4.3 可渲染性与 mode=merged（R3-B 重写：与现有架构相容的诚实模型）
 

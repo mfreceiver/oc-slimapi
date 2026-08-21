@@ -682,6 +682,96 @@ async def test_extract_compaction_full_strips_expand_refs(upstream_factory):
 
 
 # ---------------------------------------------------------------------------
+# 4a) §4d B2 extractor: edit metadata_full gains synthetic ``files`` parsed
+# from ``metadata.diff`` (NO cap — unlike the skeleton's 10-entry compact
+# projection). Same eligibility as the skeleton: tool == edit, no source
+# ``files``, ``truncated`` is not true, diff parseable.
+# ---------------------------------------------------------------------------
+
+def _edit_diff(path="src/a.ts", body=" ctx\n-old\n+new\n", spec="-1,3 +1,3"):
+    return f"--- {path}\tt1\n+++ {path}\tt2\n@@ {spec} @@\n{body}"
+
+
+def _edit_message(metadata):
+    return _wrap([{"id": "p_edit", "type": "tool", "messageID": "m1",
+                   "tool": "edit",
+                   "state": {"status": "completed",
+                             "input": {"filePath": "src/a.ts"},
+                             "metadata": metadata}}])
+
+
+async def test_extract_metadata_full_edit_synthetic_files_no_cap(upstream_factory):
+    """11 parsed files: the expand payload carries ALL of them (the skeleton
+    caps at 10 + filesTotal — the 11th entry is only reachable HERE)."""
+    diff = "\n".join(_edit_diff(f"src/f{i}.ts") for i in range(11))
+    message = _edit_message({"diff": diff})
+    async with _test_client(upstream_factory, _message_handler(message)) as client:
+        r = await _expand_part(client, "part_state_metadata_full", "p_edit")
+    assert r.status_code == 200
+    data = _json(r)["data"]
+    metadata = data["metadata"]
+    # NO cap: all 11 parsed entries, in parse order
+    assert [entry["path"] for entry in metadata["files"]] == [
+        f"src/f{i}.ts" for i in range(11)]
+    assert all(entry["additions"] == 1 and entry["deletions"] == 1
+               for entry in metadata["files"])
+    assert "filesTotal" not in metadata            # expand is uncapped
+    # the raw diff rides along verbatim (it IS the source metadata)
+    assert metadata["diff"] == diff
+
+
+async def test_extract_metadata_full_edit_truncated_no_synthetic_files(upstream_factory):
+    """``truncated == true`` → NO synthetic files (same guard as the skeleton
+    — the parse of a truncated diff would fabricate wrong counts)."""
+    message = _edit_message({"diff": _edit_diff(), "truncated": True})
+    async with _test_client(upstream_factory, _message_handler(message)) as client:
+        r = await _expand_part(client, "part_state_metadata_full", "p_edit")
+    assert r.status_code == 200
+    metadata = _json(r)["data"]["metadata"]
+    assert "files" not in metadata
+    assert metadata["truncated"] is True           # source key survives
+    assert metadata["diff"] == _edit_diff()
+
+
+async def test_extract_metadata_full_edit_source_files_verbatim(upstream_factory):
+    """Edit part WITH its own metadata.files → returned verbatim (no
+    synthesis, no cap, no merge with the parsed diff)."""
+    source_files = [{"filePath": "/abs/x.ts", "relativePath": "x.ts",
+                     "type": "modified", "patch": "@@ body @@", "additions": 9}]
+    message = _edit_message({"diff": _edit_diff(), "files": source_files})
+    async with _test_client(upstream_factory, _message_handler(message)) as client:
+        r = await _expand_part(client, "part_state_metadata_full", "p_edit")
+    assert r.status_code == 200
+    metadata = _json(r)["data"]["metadata"]
+    assert metadata["files"] == source_files       # verbatim, patch included
+
+
+async def test_extract_metadata_full_edit_non_diff_no_synthesis(upstream_factory):
+    message = _edit_message({"diff": "not a diff\n", "cursor": 3})
+    async with _test_client(upstream_factory, _message_handler(message)) as client:
+        r = await _expand_part(client, "part_state_metadata_full", "p_edit")
+    assert r.status_code == 200
+    metadata = _json(r)["data"]["metadata"]
+    assert "files" not in metadata
+    assert metadata["cursor"] == 3
+
+
+async def test_extract_metadata_full_non_edit_tool_no_synthesis(upstream_factory):
+    """A non-edit tool part carrying a diff-shaped metadata.diff gets NO
+    synthetic files — the extractor is edit-only."""
+    message = _wrap([{"id": "p_bash", "type": "tool", "messageID": "m1",
+                      "tool": "bash",
+                      "state": {"status": "completed",
+                                "input": {"command": "ls"},
+                                "metadata": {"diff": _edit_diff()}}}])
+    async with _test_client(upstream_factory, _message_handler(message)) as client:
+        r = await _expand_part(client, "part_state_metadata_full", "p_bash")
+    assert r.status_code == 200
+    metadata = _json(r)["data"]["metadata"]
+    assert "files" not in metadata
+
+
+# ---------------------------------------------------------------------------
 # 4b) Nested type mismatches → 502 upstream_invalid_shape
 # ---------------------------------------------------------------------------
 

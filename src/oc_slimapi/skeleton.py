@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
@@ -67,7 +68,14 @@ TOOL_INPUT_KEYS = {
     "path", "filePath", "file_path", "command", "agent", "description",
     "subagent_type", "todos",
 }
-TOOL_METADATA_KEYS = {"sessionId", "sessionID", "description", "agent", "diffStats"}
+TOOL_METADATA_KEYS = {"sessionId", "sessionID", "description", "agent", "diffStats", "files"}
+# §4a/§4b: per-part ``files`` projection cap — a toolcard renders a compact
+# list (≤10); the full list stays reachable via ``filesTotal`` (source count)
+# + the ``part_state_metadata_full`` expand ref (P2-N2) or ``/full``.
+FILES_PROJECTION_CAP = 10
+# §2: character cap for the synthesized compress title (readable card size,
+# NOT a byte cap — multibyte titles clip at the same character count).
+COMPRESS_TITLE_CLIP_CHARS = 160
 FILE_URL_LIMIT = 8 * 1024
 COMPACTION_PART_LIMIT = 64 * 1024
 
@@ -231,6 +239,35 @@ def _field_byte_size(value: Any) -> int:
         return len(str(value).encode("utf-8"))
 
 
+def _clip(value: Any, limit: int) -> str | None:
+    """§2: clip a candidate title string for skeleton projection.
+
+    Frozen semantics: ``str`` only (any other type → ``None`` — never
+    ``str()``-coerced); leading/trailing whitespace stripped first; a
+    whitespace-only result counts as MISSING (→ ``None``); truncation is by
+    CHARACTERS to ``limit`` with NO ellipsis appended. Coercion here would
+    fabricate a title the upstream never sent — so no coercion, ever.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    return text[:limit]
+
+
+def _valid_count(value: Any) -> bool:
+    """§4a/§4b: the SINGLE strict numeric validator for per-file count
+    fields (``additions`` / ``deletions`` / ``files``).
+
+    int-only (``bool`` is an ``int`` subclass — rejected explicitly), zero
+    allowed, negatives rejected; floats — including the degenerate ``1.0``,
+    ``inf``, ``nan`` — are rejected outright (P1-5: coercing 1.5 → 1 would
+    silently publish a number upstream never sent).
+    """
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
 def _compute_diffstats(
     filediff: dict[str, Any] | list[dict[str, Any]] | Any,
 ) -> dict[str, int] | None:
@@ -241,73 +278,377 @@ def _compute_diffstats(
     Returns ``None`` when the input is not a recognised shape (no data to
     derive statistics from), so callers can safely skip injection.
 
-    Edge cases:
-      * Single filediff dict with missing/non-numeric ``additions`` /
-        ``deletions`` → treated as zero.
-      * List of filediff dicts → sums per-file additions/deletions across the
-        list; ``files`` = list length.
-      * ``None`` / non-dict / non-list → ``None`` (no stats).
-      * Non-finite numbers (inf, nan) are not expected on the wire (Schema
-        ``Schema.Finite`` rejects them upstream), but ``int(val) or 0``
-        guards against degenerate values defensively.
+    Exception-safe rewrite (P1-N3): every count value passes through the
+    SINGLE strict validator :func:`_valid_count` — invalid values (strings,
+    floats, bools, negatives, ``inf``/``nan``) contribute 0 and non-dict
+    list entries are skipped, so this NEVER raises regardless of upstream
+    shape. A non-empty input whose every entry is malformed (no entry
+    carries ≥1 valid ``additions``/``deletions``) → ``None``: garbage must
+    not masquerade as ``{0, 0, N}`` — the caller falls through to the
+    lower-priority derivations (② ``files`` / ③ edit diff parse, §4b).
     """
     # ── digest 对账标注 ────────────────────────────────────────────────
     # digest 对账（tool 完成→message.updated 映射）：后续 SSE 实测验证项，
     # 本轮不实现。参见 **ocdroid 仓** docs/specs/chat-toolcard-investigation.md
     # §B.8（F-353：跨仓文件，本仓无此路径）。
     # ────────────────────────────────────────────────────────────────────
+    entries: list[Any]
     if isinstance(filediff, list):
         if not filediff:
             return None
-        total_additions = 0
-        total_deletions = 0
-        for item in filediff:
-            if isinstance(item, dict):
-                total_additions += int(item.get("additions", 0) or 0)
-                total_deletions += int(item.get("deletions", 0) or 0)
-        return {
-            "additions": total_additions,
-            "deletions": total_deletions,
-            "files": len(filediff),
-        }
-    if isinstance(filediff, dict):
-        additions = int(filediff.get("additions", 0) or 0)
-        deletions = int(filediff.get("deletions", 0) or 0)
-        return {
-            "additions": additions,
-            "deletions": deletions,
-            "files": 1,
-        }
-    return None
+        entries = filediff
+    elif isinstance(filediff, dict):
+        entries = [filediff]
+    else:
+        return None
+    total_additions = 0
+    total_deletions = 0
+    valid_entries = 0
+    has_valid_count = False
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        valid_entries += 1
+        additions = item.get("additions")
+        deletions = item.get("deletions")
+        if _valid_count(additions):
+            has_valid_count = True
+            total_additions += additions
+        if _valid_count(deletions):
+            has_valid_count = True
+            total_deletions += deletions
+    if valid_entries == 0 or not has_valid_count:
+        # No dict entries at all, or every entry malformed → nothing to
+        # derive (fall through to ②/③ at the call site).
+        return None
+    return {
+        "additions": total_additions,
+        "deletions": total_deletions,
+        "files": valid_entries,
+    }
 
 
 def _compute_diffstats_from_files(files: list[dict[str, Any]] | Any) -> dict[str, int] | None:
-    """Compute ``diffStats = {additions, deletions, files}`` from a ``files[]``
-    array (as used by patch parts and multi-file apply_patch). Each file item
-    must be a dict with ``additions`` / ``deletions`` (schema ``NonNegativeInt``).
+    """Compute ``diffStats = {additions, deletions, files}`` from a
+    (projected/mapped) ``files[]`` array of dict entries — as used by patch
+    parts (§4a normalized entries) and multi-file apply_patch metadata
+    (§4b compact entries).
 
-    Returns ``None`` when input is not a non-empty list containing at least one
-    dict item — a pure ``string[]`` (the v1.18.16 PatchPart ``files`` shape)
-    carries no per-file stat data and must NOT yield a fabricated
-    ``{additions: 0, deletions: 0, files: N}`` (rev-gpt R1-M1).
+    Anti-fabrication guard (R1-M1 + P1-5/N4): injects only when at least ONE
+    entry carries ≥1 ``_valid_count`` ``additions``/``deletions``. Count-less
+    entries — a pure ``string[]`` patch (v1.18.16 shape), its §4a-normalized
+    ``{path}`` derivations, or dict entries without stats — must NOT yield a
+    fabricated ``{additions: 0, deletions: 0, files: N}``. Sums count valid
+    values only (invalid → 0); ``files`` = number of mapped entries (not the
+    source array length). Never raises.
     """
     if not isinstance(files, list) or not files:
         return None
     total_additions = 0
     total_deletions = 0
-    has_dict_item = False
+    has_valid_count = False
     for item in files:
-        if isinstance(item, dict):
-            has_dict_item = True
-            total_additions += int(item.get("additions", 0) or 0)
-            total_deletions += int(item.get("deletions", 0) or 0)
-    if not has_dict_item:
+        if not isinstance(item, dict):
+            continue
+        additions = item.get("additions")
+        deletions = item.get("deletions")
+        if _valid_count(additions):
+            has_valid_count = True
+            total_additions += additions
+        if _valid_count(deletions):
+            has_valid_count = True
+            total_deletions += deletions
+    if not has_valid_count:
         return None
     return {
         "additions": total_additions,
         "deletions": total_deletions,
         "files": len(files),
     }
+
+
+# ---------------------------------------------------------------------------
+# §4d B2: unified-diff text parser (opencode ``edit`` tool ``metadata.diff``).
+#
+# Production format (upstream ``tool/edit.ts`` → jsdiff
+# ``createTwoFilesPatch(resource, resource, old, new)``):
+#
+#     Index: /abs/path/file.ts
+#     ===================================================================
+#     --- /abs/path/file.ts	2026-08-21T10:00:00.000Z
+#     +++ /abs/path/file.ts	2026-08-21T10:00:00.000Z
+#     @@ -1,4 +1,4 @@
+#      context
+#     -removed
+#     +added
+#
+# (bare paths, optional ``\t`` timestamp suffix on the ---/+++ lines; git
+# style ``a/``/``b/`` prefixes and ``/dev/null`` sides are supported
+# defensively). Single-pass O(n), never raises, never fabricates: a text
+# without any VALID file section (paired ---/+++ headers — an isolated
+# ``Index:`` line does NOT validate a section, P1-N5) → ``None``.
+# ---------------------------------------------------------------------------
+_HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+def _hunk_line_budget(line: str) -> int | None:
+    """Remaining hunk-body budget from an ``@@ -l,s +l,s @@`` header.
+
+    A hunk body line consumes: context 2 (one old + one new), ``+`` 1 (new),
+    ``-`` 1 (old), ``\\`` marker 0. An unparseable header → ``None``
+    (unbounded — only the ② boundary lines can then close the hunk).
+    """
+    match = _HUNK_HEADER_RE.match(line)
+    if match is None:
+        return None
+    old_count = match.group(2)
+    new_count = match.group(4)
+    return (
+        (int(old_count) if old_count is not None else 1)
+        + (int(new_count) if new_count is not None else 1)
+    )
+
+
+def _diff_header_path(raw: str) -> str:
+    """Strip the optional ``\t<timestamp>`` suffix and git ``a/``/``b/``
+    prefix from a ``---``/``+++`` header operand."""
+    value = raw.split("\t", 1)[0]
+    if value.startswith("a/") or value.startswith("b/"):
+        return value[2:]
+    return value
+
+
+def _pair_path(old_raw: str, new_raw: str) -> str | None:
+    """Resolve a file path from a paired ``--- old`` / ``+++ new`` header.
+
+    ``+++ /dev/null`` → deletion (path from the old side); ``--- /dev/null``
+    → addition (path from the new side); otherwise the new side is
+    authoritative (modify/rename). Both ``/dev/null`` → invalid pair → None.
+    """
+    old = old_raw.split("\t", 1)[0]
+    new = new_raw.split("\t", 1)[0]
+    if old == "/dev/null" and new == "/dev/null":
+        return None
+    if old == "/dev/null":
+        return _diff_header_path(new) or None
+    if new == "/dev/null":
+        return _diff_header_path(old) or None
+    return _diff_header_path(new) or None
+
+
+def _files_from_diff_text(text: Any) -> list[dict[str, Any]] | None:
+    """Parse unified-diff text into ``[{path, additions, deletions}, ...]``.
+
+    State machine (idle → in_file → in_hunk):
+
+    * File-segment recognition: a segment becomes VALID only on a paired
+      ``---``/``+++`` header (isolated ``Index:`` lines never validate a
+      segment — P1-N5); ``Index: <path>`` supplies the authoritative path
+      for the next pair, otherwise the pair sides resolve it
+      (``/dev/null`` distinguishing add/delete).
+    * Hunk exit — dual mechanism (P1-N5): ① ``@@`` line counts
+      (``@@ -l,s +l,s @@``); body exhaustion returns to ``in_file`` (before
+      exhaustion, everything — including ``---``/``+++``-prefixed lines — is
+      hunk BODY, git semantics); ② while NOT exhausted, ``Index: `` / an
+      adjacent ``---``→``+++`` PAIR / ``diff --git`` are section boundaries:
+      malformed/truncated — the current segment closes with the lines seen,
+      the new segment starts normally (宁少计不误归属: undercount rather
+      than misattribute).
+    * Counting only happens in ``in_hunk``: leading ``+``/``-`` count; header
+      lines never do; ``\\ No newline`` markers are ignored. Zero-hunk
+      segments (paired headers, no ``@@`` — rename-only) count with ±0.
+    """
+    if not isinstance(text, str):
+        return None
+    files: list[dict[str, Any]] = []
+    state = "idle"  # idle | in_file | in_hunk
+    current: dict[str, Any] | None = None
+    section_paired = False
+    index_path: str | None = None  # pending Index: path for the NEXT pair
+    pending_old: str | None = None  # "--- " operand awaiting its "+++ " pair
+    pending_old_counted = False  # that "--- " was consumed as hunk body
+    hunk_left: int | None = None  # remaining old+new body budget (None = ∞)
+
+    def _close_section() -> None:
+        nonlocal current, section_paired, pending_old, pending_old_counted
+        if current is not None and section_paired:
+            files.append(current)
+        current = None
+        section_paired = False
+        pending_old = None
+        pending_old_counted = False
+
+    for raw_line in text.split("\n"):
+        line = raw_line.rstrip("\r")
+        # ── adjacent ---/+++ PAIR boundary (any state, ②) ──────────────
+        if line.startswith("+++ ") and pending_old is not None:
+            if pending_old_counted and current is not None:
+                # the "--- " was consumed as a body deletion — undo it
+                current["deletions"] -= 1
+            path = index_path if index_path else _pair_path(pending_old, line[4:])
+            _close_section()
+            index_path = None
+            if path:
+                current = {"path": path, "additions": 0, "deletions": 0}
+                section_paired = True
+                state = "in_file"
+            else:
+                state = "idle"
+            hunk_left = None
+            continue
+        if line.startswith("diff --git "):
+            _close_section()
+            index_path = None
+            hunk_left = None
+            state = "idle"
+            continue
+        if line.startswith("Index: "):
+            _close_section()
+            index_path = line[len("Index: "):].strip() or None
+            hunk_left = None
+            state = "in_file"
+            continue
+        # ── hunk body (① within the budget everything is body) ─────────
+        if state == "in_hunk" and (hunk_left is None or hunk_left > 0):
+            if line.startswith("\\"):
+                # ``\ No newline at end of file`` — neither counted nor budgeted
+                pending_old = None
+                pending_old_counted = False
+                continue
+            if line.startswith("--- "):
+                assert current is not None
+                current["deletions"] += 1
+                if hunk_left is not None:
+                    hunk_left -= 1
+                    if hunk_left <= 0:
+                        # budget exhausted exactly on this line → it was body
+                        state = "in_file"
+                        pending_old = None
+                        pending_old_counted = False
+                        continue
+                pending_old = line[4:]
+                pending_old_counted = True
+                continue
+            pending_old = None
+            pending_old_counted = False
+            assert current is not None
+            if line.startswith("+"):
+                current["additions"] += 1
+                consumed = 1
+            elif line.startswith("-"):
+                current["deletions"] += 1
+                consumed = 1
+            else:
+                consumed = 2  # context line: one old + one new
+            if hunk_left is not None:
+                hunk_left -= consumed
+                if hunk_left <= 0:
+                    state = "in_file"
+            continue
+        # ── idle / in_file (outside any counted hunk body) ─────────────
+        if line.startswith("@@") and state == "in_file" and current is not None:
+            # new hunk for the open (paired) section — ``current`` is only
+            # ever set together with ``section_paired``. A ``@@`` with no
+            # valid section cannot be attributed → 宁少计: ignored (the
+            # pending ``Index:`` attempt survives for a later pair).
+            pending_old = None
+            pending_old_counted = False
+            hunk_left = _hunk_line_budget(line)
+            if hunk_left:  # 0-line hunk (``@@ -0,0 +0,0 @@``) → stays in_file
+                state = "in_hunk"
+            continue
+        if line.startswith("--- "):
+            pending_old = line[4:]
+            pending_old_counted = False
+            continue
+        if line.startswith("+++ "):
+            # stray +++ without a pending --- : not a pair, ignore
+            pending_old = None
+            continue
+        # everything else (=== separators, context, garbage) is ignored
+    _close_section()
+    return files if files else None
+
+
+def _compact_tool_files(source_files: list[Any]) -> list[dict[str, Any]]:
+    """§4b: compact projection of upstream ``state.metadata.files`` (the
+    multi-file apply_patch shape ``{filePath, relativePath, type, patch,
+    additions, deletions}``) → ``{path, additions?, deletions?, status?}``.
+
+    ``path = relativePath ?? filePath``; ``status`` mirrors ``type``; heavy
+    bodies (``patch``) are stripped. Non-dict entries are skipped (they still
+    count toward the SOURCE-based ``filesTotal`` / ref eligibility at the
+    call site — the ref-保活 judgment uses the source value, P2-N1). Count
+    values are re-validated with :func:`_valid_count` — a malformed count is
+    dropped rather than coerced. Pure projection: builds fresh dicts, never
+    mutates the source.
+    """
+    compact: list[dict[str, Any]] = []
+    for item in source_files:
+        if not isinstance(item, dict):
+            continue
+        entry: dict[str, Any] = {}
+        relative = item.get("relativePath")
+        file_path = item.get("filePath")
+        path = relative if isinstance(relative, str) else (
+            file_path if isinstance(file_path, str) else None
+        )
+        if path is not None:
+            entry["path"] = path
+        additions = item.get("additions")
+        if _valid_count(additions):
+            entry["additions"] = additions
+        deletions = item.get("deletions")
+        if _valid_count(deletions):
+            entry["deletions"] = deletions
+        status = item.get("type")
+        if isinstance(status, str) and status:
+            entry["status"] = status
+        compact.append(entry)
+    return compact
+
+
+def _valid_source_diffstats(value: Any) -> bool:
+    """⓪-leg guard: a source ``metadata.diffStats`` is authoritative when it
+    is a dict whose ``additions``/``deletions``/``files`` all pass
+    :func:`_valid_count` — upstream (or an existing consumer) already
+    blessed the value, derived stats never override it."""
+    if not isinstance(value, dict):
+        return False
+    return all(_valid_count(value.get(key)) for key in ("additions", "deletions", "files"))
+
+
+def _aggregate_metadata_diffstats(
+    source_metadata: dict[str, Any], tool: Any,
+) -> dict[str, int] | None:
+    """§4b FROZEN aggregate priority chain for ``state.metadata.diffStats``:
+
+    ⓪ source ``diffStats`` present & legal shape → ``None`` (keep source —
+    it was already picked verbatim by the whitelist; derivation skipped);
+    ① ``filediff`` structurally valid (exception-safe
+    :func:`_compute_diffstats` → non-None) → inject;
+    ② ``files`` compact entries carry ≥1 valid count →
+    :func:`_compute_diffstats_from_files`;
+    ③ ``tool == "edit"`` and ``metadata.diff`` parses (not truncated) →
+    :func:`_files_from_diff_text` aggregation;
+    ④ no injection. Caller injects the non-None result after thresholding.
+    """
+    if _valid_source_diffstats(source_metadata.get("diffStats")):
+        return None  # ⓪ keep source value
+    diffstats = _compute_diffstats(source_metadata.get("filediff"))  # ①
+    if diffstats is not None:
+        return diffstats
+    source_files = source_metadata.get("files")  # ②
+    if isinstance(source_files, list) and source_files:
+        diffstats = _compute_diffstats_from_files(
+            _compact_tool_files(source_files))
+        if diffstats is not None:
+            return diffstats
+    if tool == "edit" and source_metadata.get("truncated") is not True:  # ③
+        parsed = _files_from_diff_text(source_metadata.get("diff"))
+        if parsed:
+            return _compute_diffstats_from_files(parsed)
+    return None  # ④
 
 
 def _maybe_inline_state_field(
@@ -340,6 +681,13 @@ def _maybe_inline_state_field(
             budget["used"] += size
     else:
         omitted.append(f"state.{key}")
+        if key == "output" and state[key] not in (None, ""):
+            # §3 P1-4: omitting a real output still hands the toolcard a
+            # size hint — the SAME wire byte size that failed the caps
+            # (len(orjson.dumps(value)), multibyte counted like the wire).
+            # error gets no counterpart (no consumer); None/"" never reach
+            # here meaningfully but stay guarded anyway.
+            thin_state["outputBytes"] = size
 
 
 def _tool(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS, sid: str | None = None, wire_view: int = 3) -> dict[str, Any]:
@@ -350,6 +698,27 @@ def _tool(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits:
     state = part.get("state")
     if isinstance(state, dict):
         thin_state = _pick(state, {"status", "title", "time"})
+        # §2 P1-3: compress-only title synthesis, FROZEN evaluation order —
+        # (1) input is a dict (never .get() on a non-dict), (2) ``content``
+        # is a non-empty list, (3) ``content[0]`` is a dict, (4) only then
+        # topic → summary → segment-count fallback. Any miss → no title at
+        # all (the fallback fires only after 1-3 passed and both keys
+        # missed). An existing title (non-empty) is never overwritten.
+        if part.get("tool") == "compress" and not thin_state.get("title"):
+            synth_input = state.get("input")
+            if isinstance(synth_input, dict):
+                synth_content = synth_input.get("content")
+                if isinstance(synth_content, list) and synth_content:
+                    first = synth_content[0]
+                    if isinstance(first, dict):
+                        synth_title = _clip(
+                            first.get("topic"), COMPRESS_TITLE_CLIP_CHARS)
+                        if synth_title is None:
+                            synth_title = _clip(
+                                first.get("summary"), COMPRESS_TITLE_CLIP_CHARS)
+                        if synth_title is None:
+                            synth_title = f"压缩 {len(synth_content)} 段"
+                        thin_state["title"] = synth_title
         source_input = state.get("input")
         if isinstance(source_input, dict):
             thin_input = _pick(source_input, TOOL_INPUT_KEYS)
@@ -366,14 +735,34 @@ def _tool(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits:
             omitted.append("state.input")
         source_metadata = state.get("metadata")
         if isinstance(source_metadata, dict):
-            thin_metadata = _pick(source_metadata, TOOL_METADATA_KEYS)
+            # §4b: ``files`` is whitelisted VIA the compact projection
+            # (never verbatim) — pick the other whitelist keys, then attach
+            # the mapped, capped list (source-count filesTotal on overflow).
+            metadata_whitelist = TOOL_METADATA_KEYS - {"files"}
+            thin_metadata = _pick(source_metadata, metadata_whitelist)
+            source_files = source_metadata.get("files")
+            source_files_live = isinstance(source_files, list) and bool(source_files)
+            if source_files_live:
+                compact_files = _compact_tool_files(source_files)
+                if compact_files:
+                    thin_metadata["files"] = compact_files[:FILES_PROJECTION_CAP]
+                if len(source_files) > FILES_PROJECTION_CAP:
+                    thin_metadata["filesTotal"] = len(source_files)
             if thin_metadata:
                 thin_state["metadata"] = thin_metadata
             omitted.extend(
                 f"state.metadata.{key}"
                 for key in source_metadata if key not in TOOL_METADATA_KEYS
             )
-            if part_id and any(key not in TOOL_METADATA_KEYS for key in source_metadata):
+            # Ref保活 (P1-2 + P2-N1): the part_state_metadata_full ref fires
+            # when any non-whitelist key is omitted OR the SOURCE
+            # ``metadata.files`` is a non-empty list — the SOURCE value
+            # decides (not the mapped result), so an all-malformed source
+            # list still keeps the expand ref alive.
+            if part_id and (
+                any(key not in TOOL_METADATA_KEYS for key in source_metadata)
+                or source_files_live
+            ):
                 refs.append(("part_state_metadata_full", part_id))
         # Thresholded: inline small output/error (per-field + per-message caps),
         # omit large or budget-spent ones. A field is fully inlined or fully
@@ -393,23 +782,37 @@ def _tool(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits:
                 # result / raw are /full-only (§2.3) — no refs.
                 if key == "attachments" and state[key] not in (None, [], {}) and part_id:
                     refs.append(("part_state_attachments", part_id))
-        # Inject compact diffStats from upstream filediff (computed, injected
-        # AFTER thresholding so it is never elligible for omission — the ~50 B
-        # object is well below the per-field cap, and sits in TOOL_METADATA_KEYS
-        # so it survives the whitelist). digest 对账（tool 完成→message.updated
-        # 映射）为后续 SSE 实测验证项，本轮不实现.
+        # Inject compact aggregate diffStats AFTER thresholding so it is
+        # never elligible for omission — the ~50 B object is well below the
+        # per-field cap, and sits in TOOL_METADATA_KEYS so it survives the
+        # whitelist. §4b FROZEN priority chain: ⓪ source diffStats kept →
+        # ① filediff → ② files → ③ edit diff parse → ④ none. digest 对账
+        # （tool 完成→message.updated 映射）为后续 SSE 实测验证项，本轮不实现.
         #
         # NOTE: ``thin_metadata`` from ``_pick`` above is a local var (empty
         # disconnected dict when no whitelist keys matched). We must write
         # to ``thin_state["metadata"]`` explicitly to ensure the key exists.
         if isinstance(source_metadata, dict):
-            source_filediff = source_metadata.get("filediff")
-            if source_filediff is not None:
-                diffStats = _compute_diffstats(source_filediff)
-                if diffStats is not None:
+            diffstats = _aggregate_metadata_diffstats(
+                source_metadata, part.get("tool"))
+            if diffstats is not None:
+                if "metadata" not in thin_state:
+                    thin_state["metadata"] = {}
+                thin_state["metadata"]["diffStats"] = diffstats
+            # §4d B2: edit synthetic ``metadata.files`` — ONLY when the
+            # source metadata has no ``files`` of its own and the diff is
+            # not truncated (same eligibility as the expand extractor);
+            # capped like §4b (filesTotal = parsed count on overflow).
+            if (part.get("tool") == "edit"
+                    and "files" not in source_metadata
+                    and source_metadata.get("truncated") is not True):
+                parsed_files = _files_from_diff_text(source_metadata.get("diff"))
+                if parsed_files:
                     if "metadata" not in thin_state:
                         thin_state["metadata"] = {}
-                    thin_state["metadata"]["diffStats"] = diffStats
+                    thin_state["metadata"]["files"] = parsed_files[:FILES_PROJECTION_CAP]
+                    if len(parsed_files) > FILES_PROJECTION_CAP:
+                        thin_state["metadata"]["filesTotal"] = len(parsed_files)
         result["state"] = thin_state
     for key in part:
         if key not in TOOL_KEYS and key != "state":
@@ -419,20 +822,27 @@ def _tool(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits:
 
 def _patch(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS, sid: str | None = None) -> dict[str, Any]:
     # §4.2 (P0): v1.18.16 PatchPart = {type, hash, files: string[]}. ``hash``
-    # was previously dropped into omitted — now preserved. ``files`` a plain
-    # string[] carries no per-file stat projection value → kept verbatim.
-    # Legacy dict-item files (pre-v1.18 shape) keep the old per-file pick.
+    # was previously dropped into omitted — now preserved.
+    # §4a: ``files`` normalizes to ``{path}`` objects — a string entry maps
+    # to ``{"path": s}`` (the card reads ONE shape); legacy dict entries
+    # (pre-v1.18) keep the per-file pick ``{path, additions, deletions,
+    # status}``; non-str/dict entries are skipped but still count toward the
+    # SOURCE-count ``filesTotal``. Cap 10 entries; on overflow attach
+    # ``filesTotal = len(source list)`` so the true breadth stays readable.
     result = _pick(part, PART_IDS | {"hash"})
     omitted: list[str] = []
+    normalized: list[dict[str, Any]] = []
     files = part.get("files")
     if isinstance(files, list):
-        if files and all(isinstance(item, str) for item in files):
-            result["files"] = deepcopy(files)
-        else:
-            result["files"] = [
-                _pick(item, {"path", "additions", "deletions", "status"})
-                for item in files if isinstance(item, dict)
-            ]
+        for item in files:
+            if isinstance(item, str):
+                normalized.append({"path": item})
+            elif isinstance(item, dict):
+                normalized.append(
+                    _pick(item, {"path", "additions", "deletions", "status"}))
+        result["files"] = normalized[:FILES_PROJECTION_CAP]
+        if len(files) > FILES_PROJECTION_CAP:
+            result["filesTotal"] = len(files)
     metadata = part.get("metadata")
     if isinstance(metadata, dict) and "path" in metadata:
         result["metadata"] = {"path": deepcopy(metadata["path"])}
@@ -461,9 +871,11 @@ def _patch(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits
     # the ~50 B object is never omit-eligible. A patch part may carry files[]
     # WITHOUT an upstream state object — create the minimal state.metadata
     # container so the client read path (state.metadata?.get) does not
-    # chain-break.
+    # chain-break. §4a guard: only when ≥1 normalized entry carries a
+    # _valid_count addition/deletion — string-derived {path} entries never
+    # fabricate stats (R1-M1), invalid values contribute 0, never raises.
     if isinstance(files, list):
-        diffStats = _compute_diffstats_from_files(files)
+        diffStats = _compute_diffstats_from_files(normalized)
         if diffStats is not None:
             if "state" not in result:
                 result["state"] = {}

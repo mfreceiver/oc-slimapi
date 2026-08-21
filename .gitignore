@@ -15,3 +15,6 @@ logs/
 
 # runtime state (incarnation counter etc.); prod unit overrides via OC_SLIMAPI_STATE_DIR=%S/oc-slimapi
 state/
+
+# opencode upstream source reference snapshots (clones; see AGENTS.md)
+src-ref/

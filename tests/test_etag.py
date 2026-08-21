@@ -1246,3 +1246,61 @@ async def test_b1_1r_identity_only_request_excludes_gzip_validator(upstream_fact
             assert r.content  # full body served
     finally:
         _teardown(app)
+
+
+# ---------------------------------------------------------------------------
+# §5a/§5c.7 — SKELETON_REPRESENTATION_VERSION v1 → v2 rotation at the route
+# level (4.9.0 derived fields changed the skeleton face). An ETag minted
+# under one representation must never 304 against the other.
+# ---------------------------------------------------------------------------
+
+MSG_EDIT_TOOL = {
+    "info": {"id": "msg_e", "role": "assistant",
+             "time": {"created": 1002, "updated": 1002}},
+    "parts": [
+        {"id": "p_edit", "type": "tool", "messageID": "msg_e", "tool": "edit",
+         "state": {"status": "completed", "input": {"filePath": "src/a.ts"},
+                   "metadata": {
+                       "diff": "--- src/a.ts\tt1\n+++ src/a.ts\tt2\n"
+                               "@@ -1,3 +1,3 @@\n ctx\n-old\n+new\n"}}},
+    ],
+}
+
+
+async def test_skeleton_rep_version_v2_rotates_messages_etag(
+        upstream_factory, monkeypatch):
+    """Route-level proof on the messages skeleton (the face that gained the
+    4.9.0 derived fields): a validator minted under the CURRENT (v2)
+    representation, replayed after rolling the representation back to the
+    pre-4.9.0 value, gets 200 + a different ETag — never a stale 304."""
+    state = {"list": orjson.dumps([MSG_EDIT_TOOL])}
+    upstream = upstream_factory(_catalog_handler(state))
+    app = _build_app(_settings(), upstream)
+    try:
+        async with _client(app) as client:
+            path = "/slimapi/messages/s1"
+            r1 = await client.get(path, headers=HDR)
+            assert r1.status_code == 200
+            v2_etag = r1.headers["ETag"]
+            # sanity: the new projection really carries the derived fields
+            # (synthetic metadata.files + diffStats from the parsed diff)
+            assert b'"files"' in r1.content
+            assert b'"diffStats"' in r1.content
+
+            # roll the representation back to the pre-4.9.0 world
+            monkeypatch.setattr(
+                etag_mod, "SKELETON_REPRESENTATION_VERSION", b"skeleton-v1")
+            r2 = await client.get(
+                path, headers={**HDR, "If-None-Match": v2_etag})
+            assert r2.status_code == 200        # cross-representation: no hit
+            assert r2.headers["ETag"] != v2_etag
+
+            # and the v1-minted validator replays against v2 the same way
+            r3 = await client.get(path, headers=HDR)
+            assert r3.status_code == 200
+            assert r3.headers["ETag"] == r2.headers["ETag"]
+            r4 = await client.get(
+                path, headers={**HDR, "If-None-Match": r2.headers["ETag"]})
+            assert r4.status_code == 304        # same representation: hit
+    finally:
+        _teardown(app)

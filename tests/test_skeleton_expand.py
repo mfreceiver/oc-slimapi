@@ -36,12 +36,17 @@ def _msg(parts, info=None):
 # ---------------------------------------------------------------------------
 
 def test_patch_files_string_array_preserved_verbatim_with_hash():
+    """§4a: a string[] files array normalizes to {path} object entries — the
+    card reads ONE shape. hash preserved; no refs (patch has no categories)."""
     src = {"id": "p1", "type": "patch", "messageID": "m1", "hash": "abc123",
            "files": ["src/a.ts", "src/b.ts", "src/c.ts"]}
     out = skeleton_messages([{"info": {"id": "m1"}, "parts": [src]}])[0]["parts"][0]
 
-    assert out["files"] == ["src/a.ts", "src/b.ts", "src/c.ts"]  # verbatim, not []
+    assert out["files"] == [{"path": "src/a.ts"},
+                            {"path": "src/b.ts"},
+                            {"path": "src/c.ts"}]  # §4a normalized, not []
     assert out["hash"] == "abc123"                                # hash preserved
+    assert "filesTotal" not in out                                # 3 ≤ cap 10
     assert "omitted" not in out                                   # nothing else omitted
     assert "hasFull" not in out
     assert "expandRefs" not in out  # §5.3: patch files → no category
@@ -387,13 +392,14 @@ def test_no_sid_reductions_apply_but_refs_suppressed():
 # ---------------------------------------------------------------------------
 
 def test_patch_string_array_no_fabricated_diffstats():
-    """R1-M1: a pure string[] files carries no per-file stat data — deriving
-    diffStats would fabricate {0,0,N}. Not injected; state not created."""
+    """R1-M1 (kept under §4a): the normalized {path} entries derived from a
+    pure string[] carry no per-file stat data — deriving diffStats would
+    fabricate {0,0,N}. Not injected; state not created."""
     src = {"id": "p1", "type": "patch", "messageID": "m1", "hash": "h",
            "files": ["src/a.ts", "src/b.ts"]}
     out = skeleton_messages([{"info": {"id": "m1"}, "parts": [src]}])[0]["parts"][0]
 
-    assert out["files"] == ["src/a.ts", "src/b.ts"]
+    assert out["files"] == [{"path": "src/a.ts"}, {"path": "src/b.ts"}]
     assert out["hash"] == "h"
     assert "state" not in out          # no fabricated state.metadata.diffStats
     assert "diffStats" not in out
@@ -542,3 +548,33 @@ def test_source_summary_diffs_untouched_by_projection():
     assert source[0]["info"]["summary"] is src_summary
     assert source[0]["info"]["summary"]["diffs"] == [{"file": "a.ts", "additions": 3}]
     assert source[0]["info"]["summary"]["files"] == 1
+
+
+# ---------------------------------------------------------------------------
+# §5c.10 — the 12-category expand face is FROZEN under the 4.9.0 derived
+# fields: no category added/removed, and part_state_metadata_full stays
+# tool-only (patch parts keep their 400 — see test_expand_routes.py).
+# ---------------------------------------------------------------------------
+
+def test_expand_registry_frozen_twelve_categories():
+    from oc_slimapi.routes.messages._expand import (
+        _EXPAND_APPLICABLE_TYPES,
+        _EXPAND_EXTRACTORS,
+    )
+
+    assert sorted(_EXPAND_EXTRACTORS) == [
+        "compaction_full",
+        "info_summary_diffs",
+        "part_reasoning",
+        "part_snapshot",
+        "part_source",
+        "part_state_attachments",
+        "part_state_error",
+        "part_state_input_full",
+        "part_state_metadata_full",
+        "part_state_output",
+        "part_text",
+        "part_url",
+    ]
+    assert _EXPAND_APPLICABLE_TYPES["part_state_metadata_full"] == ("tool",)
+    assert _EXPAND_APPLICABLE_TYPES["part_state_input_full"] == ("tool",)

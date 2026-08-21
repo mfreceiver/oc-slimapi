@@ -6,7 +6,7 @@
     "hashseed": "PYTHONHASHSEED=0 subprocess (skeleton _pick key order is per-process)"
   },
   "cases": {
-    "agent_200_gzip": "b6098ae046e854c7967050457c38a0a3a5756d3bedad6065434123e13c1813a8",
+    "agent_200_gzip": "32365605111e7da783dcda007c71f6d2cd8d30ad524f343279daab0334516850",
     "permissions_empty": "c753397cc9c504e3562aaf2d207ba52b1f1685bc46b8483c1a95c8391c833ec8",
     "permissions_ok": "1bb219fa13142ba978c1223ca8d3e23d3a13e7315e4d221d07454bd4e3947f86",
     "permissions_ok_identity": "590339cb9e05fe09f69eec5d318ae9f704cabd9a17ea19eee245844e376831f7",
@@ -19,8 +19,8 @@
     "questions_partial_failure": "eac7da31f88de58d8884f1247239f28a3ac577aa279fa5ee3590d3aa5bbde22e",
     "questions_truncated": "fae1c2218918e7da1ea85aee1fd78321ba298258601417eff018ccf678df894e",
     "route_table": "b63f2474acfa71a25a3b45dc54916d34346d79fd4029c03dfa3520479ef8984b",
-    "sessions_200_gzip": "15e23f05e465ab6adf4927fc3682907972279a97c245e71f77c0d79604a35675",
-    "sessions_200_identity": "472550c80d448ad2754d9fa13423ed835cdf5c366ff92626db37a3126084ef1c",
+    "sessions_200_gzip": "d45a4ef7f38754e05bc0087520299fc51127bc720e602f0ac499084fbbd5402f",
+    "sessions_200_identity": "74dce1bf98d5c752f6a617d15452d50a8a3ff94ad5318d6ad1a57562fafa8b9d",
     "token_frames": "9ed3cf27136aacd302759a82bf233a166cb85c6dab30506e9fb429081dc6aa0c",
     "token_frames_count": "4"
   }
