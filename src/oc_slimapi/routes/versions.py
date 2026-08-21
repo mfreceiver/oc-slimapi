@@ -7,7 +7,7 @@ without any ``v``, so a client can discover before it knows which versions
 exist. Non-GET → 405 + ``Allow: GET`` (enforced by the selector middleware
 with priority over everything).
 
-Version-window narrowing (2026-08-21, target 5.0.0): ``available == [4]``,
+Version-window narrowing (2026-08-21, shipped 4.8.0): ``available == [4]``,
 ``current == 4`` and the capability map carries ONLY the ``"4"`` face —
 the ``"3"`` capability key is gone with the window collapse (the ``?v=3``
 pipeline itself answers 400 ``unsupported_version`` ``supported:[4]``).

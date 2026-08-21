@@ -6,7 +6,7 @@ which wire pipeline a request runs:
 
 * **``?v=4``** → the v4 pipeline (marked ``v4`` in ASGI scope state,
   ``wire="4"``). Since the 2026-08-21 version-window narrowing (target
-  5.0.0) this is the ONLY admitted wire version.
+  4.8.0) this is the ONLY admitted wire version.
 * **``?v=3``** / **no ``v``** / **lexically valid but not in {4}** → 400
   ``{"code":"unsupported_version","supported":[4]}`` — the endpoint
   exists, the protocol version is unsupported; never a silent 404.

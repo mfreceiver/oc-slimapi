@@ -38,7 +38,7 @@
 ## 4. 待 owner 裁定项
 
 1. **② 占比阈值与窗长**：当前事实基线 = SSE v3 已零两日；v3 请求占比 36.8%（08-21，全部 ocdroid 旧设备）。若裁定「SSE v3=0 连续两日 + 非 ocdroid 通道 v3=0」即为达标，则 ② 现已满足；若要求占比绝对值（如 <5%），需等待设备侧升级渗透。
-2. **⑤ 终审 + 发版放行**：过门后动作链（编排者执行）= merge v4→main → CHANGELOG `[Unreleased]`→`[5.0.0] - YYYY-MM-DD` → `./scripts/release.sh major` → 本机部署。用户已指示错误展示特性（`8c7fe03`）随本次一并发版。
+2. **⑤ 终审 + 发版放行**：过门后动作链（编排者执行）= merge v4→main → CHANGELOG `[Unreleased]`→`[4.8.0] - YYYY-MM-DD` → `./scripts/release.sh minor`（owner 2026-08-21 裁定：major 只跟协议大版本走，版本窗收窄发 minor） → 本机部署。用户已指示错误展示特性（`8c7fe03`）随本次一并发版。
 
 ## 5. 发版注意
 

@@ -14,7 +14,7 @@
 ocdroid 对接时：
 
 1. 读本文件了解**行为**变更；
-2. 读 `docs/specs/v4-contract.md`（**现行契约权威**，5.0.0 起 v4-only 自包含）了解**当前完整契约**；`docs/specs/v3-contract.md` 为 ≤4.x 历史存档（v3 视图已退役）；
+2. 读 `docs/specs/v4-contract.md`（**现行契约权威**，4.8.0 起 v4-only 自包含）了解**当前完整契约**；`docs/specs/v3-contract.md` 为 ≤4.x 历史存档（v3 视图已退役）；
 3. 用 `/slimapi/health` 的 `server.api_version` / `accepted_client_versions` 做运行时兼容自检。
 
 ### 维护规约
@@ -26,7 +26,7 @@ ocdroid 对接时：
 
 ---
 
-## [Unreleased] — 版本窗收窄 + v3 退役（v4 分支，目标 5.0.0 major）
+## [Unreleased] — 版本窗收窄 + v3 退役（v4 分支，目标 4.8.0 minor；owner 2026-08-21 裁定 major 只跟协议大版本走）
 
 ### Changed
 
@@ -210,7 +210,7 @@ ocdroid 对接时：
 ### Changed（内部重构，wire 零变化）
 
 - **SingleFlight 双实现合并为单一实现**：`leased_singleflight.py`（LeasedSingleFlight，439 行）与 `sse/singleflight.py`（SingleFlight，329 行）合并为新单一模块 `src/oc_slimapi/singleflight.py`（统一 SingleFlight 类，plain/leased 双 profile，别名 `LeasedSingleFlight` 保留）；两旧文件删除，全仓 import 迁移。合并的价值定位是**统一实现所有权与公共控制流**——失败信封、三分支取消机、shield-join 循环、lead/失败路径、grace 定时器、关停收敛去重为单一实现，profile 仅在 admission/保留记账上分叉；跨 profile 构造参数误用与 API 误用即早拒绝（TypeError/RuntimeError，零调用方受影响）。两调用方（/full+expand+catalog 的 plain profile；列表路由 coalesce 的 leased profile）行为逐项等价：并发去重、预算 admission/bypass、lease exactly-once 释放、grace 超时、三分支取消、关停收敛语义均由既有测试锁定，全量回归通过（2979）。
-- **组件账目同步（计账修正 17→16，singleflight 合并 −1）**：owner 终态裁决 2026-08-18——协议封顶 4 系，(3,4) 永久双版本，5.0.0 与 B6-2（sticky/三形状退役）取消。与 v2.2 §5 原账目差异说明：v2.2 phase-aware 预测「P3=18 → B6 后 17」为计划口径（含 B6 全量前提）；实际按 4.0.0 组件清点为 17，B6-1 合并后 16。B6-3 全面复核随 owner 裁决取消，账目以本节为准。
+- **组件账目同步（计账修正 17→16，singleflight 合并 −1）**：owner 终态裁决 2026-08-18——协议封顶 4 系，(3,4) 永久双版本，4.8.0 与 B6-2（sticky/三形状退役）取消。与 v2.2 §5 原账目差异说明：v2.2 phase-aware 预测「P3=18 → B6 后 17」为计划口径（含 B6 全量前提）；实际按 4.0.0 组件清点为 17，B6-1 合并后 16。B6-3 全面复核随 owner 裁决取消，账目以本节为准。
 
 ---
 

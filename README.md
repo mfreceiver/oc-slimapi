@@ -26,15 +26,15 @@ python -m venv .venv
 另一终端验证：
 
 ```bash
-curl --fail 'http://127.0.0.1:4097/slimapi/health?v=3'
+curl --fail 'http://127.0.0.1:4097/slimapi/health?v=4'
 .venv/bin/python -m pytest tests/
 ```
 
 生产部署走 systemd **user** service（`deploy/oc-slimapi.service` 部署到 `~/.config/systemd/user/`），日志落 `StateDirectory`，详见 [`docs/operations.md`](docs/operations.md) §3。
 
-## 范围（`?v=` selector；(3,4) 双版本窗口）
+## 范围（`?v=` selector；4.8.0 起 v4-only 单版本窗口）
 
-- `/slimapi/**`：sessions / sessions/status / messages（list·full skeleton 投影）/ questions（跨目录聚合）/ permissions（跨目录聚合）/ command / agent（catalog skeleton）/ events（策展 SSE）/ token-stream / metrics / health，以及 §10 收编的受控代理读/写路由（file/vcs/find/providers/session 单查等）。每个请求（含 SSE）必须带查询参数 `?v=3` 或 `?v=4`（4.0.0 起 (3,4) 双版本窗口；`GET /slimapi/versions` 无条件豁免）；缺失、`v=2` 或不支持值 → 400 `unsupported_version supported=[3,4]`。`X-Slimapi-Version` 请求头已删除（出现不解读）。版本只在破坏性变更时递增，加性变更保持兼容（见 [`docs/release.md`](docs/release.md)）。
+- `/slimapi/**`：sessions / sessions/status / messages（list·full skeleton 投影）/ questions（跨目录聚合）/ permissions（跨目录聚合）/ command / agent（catalog skeleton）/ events（策展 SSE）/ token-stream / metrics / health，以及 §10 收编的受控代理读/写路由（file/vcs/find/providers/session 单查等）。每个请求（含 SSE）必须带查询参数 `?v=4`（4.8.0 起 v4-only 单版本窗口；`GET /slimapi/versions` 无条件豁免）；`?v=3`/缺失、`v=2` 或不支持值 → 400 `unsupported_version supported=[4]`。`X-Slimapi-Version` 请求头已删除（出现不解读）。版本只在破坏性变更时递增，加性变更保持兼容（见 [`docs/release.md`](docs/release.md)）。
 - 其他 HTTP path：catch-all 反代**已于 3.0.0 关闭**——未收编路径直接 404 `thin_route_not_found`（不再转发上游）。
 - WebSocket：501 语义，不支持 PTY；需要时在前方部署专用 HTTP/WS proxy。
 - REST 精简 JSON：按 `Accept-Encoding` 自 gzip 并返回 `Vary: Accept-Encoding`。

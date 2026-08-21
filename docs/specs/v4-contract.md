@@ -3,7 +3,7 @@
 > **状态**：**4.0.0 实施基线（2026-08-18，B3a+B3b 已落地）+ 2026-08-19 正式修订（owner 裁决：修订并入 v4——v4 尚无消费方，修订无破坏影响）**。B0 批冻结全部可观察语义（2026-08-17，rev-6 PASS-with-notes + S-B01 四项 owner 终裁全收敛）；wire 终态 = 4.0.0（`ACCEPTED_CLIENT_VERSIONS` (3,3)→(3,4)；现行窗 (4,4) v4-only——见 §0.1 版本窗收窄修订）。B3a 批（阶段 A selector 双版本——历史批次命名，交付于 4.0.0–4.7.0 双版本窗 / B1 dbaux 连接生命周期 / B2 投影 SQL / B3 cursor / B4 路由分叉降级矩阵 / B5 观测）已按本契约落地并全量测试通过；B3b 批（SSE id:/重放、§7 全量、能力键 `sseReplay`/`qpImmediateFull` 广告）**已落地**。S-B01 四项（§7.0）**已全部 owner 终裁（2026-08-17）**；其余章节（含 DB 设计 R1/R2/R3/R6，已凭真库实证冻结——见 design-v4-dbaux §0.2）均为冻结语义。
 > **2026-08-19 正式修订范围**（各修订节带**当前状态注记**——现行已发布行为 → 修订后冻结目标，实现批次随后落地）：providers 安全投影（§12）/ session 单查 parity（§13）/ expand 闭环（§14）/ 表示层（§15）/ method 边界与修订 non-goals（§16-§17）/ readiness 门禁（§3.3）。修订仅作用 `?v=4` 视图，`?v=3` 零改动（v3 冻结）；无新 major、无版本窗变更（`ACCEPTED_CLIENT_VERSIONS` 仍 (3,4)——该窗口前提已被 2026-08-21 版本窗收窄修订覆盖，见 §0）。设计出处：`docs/ocmar/plans/2026-08-19-v4-rebaseline.md` §4-§7（owner 终裁 2026-08-19）。
 > **自包含声明（2026-08-21 修订注记，F-126 契约自包含化）**：本文件为 v4 wire 契约的**自包含权威**——`?v=4` 视图的全部可观察语义（路由全集 §10.1、消息投影 §10.2、directory 消费 §5.1、SSE 帧名帧形 §7、ETag/Vary/304 与 judge 三态 §6、expand 端点 §14、资源上限、错误映射、gzip 族、指纹、token stream 帧形等）以**本文件**为规范源。历史演进：v4 于 4.0.0 由 v3 契约「全量继承 + 本文件逐条差异覆盖」演进而来（差异层 = 新增全局 sessions 面（DB 投影源）、SSE id:/重放、directory 于全局列表退役）；本修订将原继承基线条款（未提及语义逐字取自 v3 契约）**就地正文化**（被继承条款全文转录进 §1/§2/§5.1/§6/§10.1/§10.2/§14），**不再以 v3 契约为规范源**；历史/演进注记与「与 v3 不同」对比性、状态性说明按原样保留。
-> **版本窗收窄修订（2026-08-21，本修订实施；owner 方向指令出处：`docs/ocmar/reviews/2026-08-21-v3-retirement-reassessment.md` §1）**：版本窗自 5.0.0 起收窄为 **v4-only**（`ACCEPTED_CLIENT_VERSIONS (4,4)`）。原 (3,4) 永久双版本裁决被本节覆盖——`?v=3` 请求自 5.0.0 起答复 400 `unsupported_version` `supported:[4]`。§0.3/§9.4 相应修订。
+> **版本窗收窄修订（2026-08-21，本修订实施；owner 方向指令出处：`docs/ocmar/reviews/2026-08-21-v3-retirement-reassessment.md` §1）**：版本窗自 4.8.0 起收窄为 **v4-only**（`ACCEPTED_CLIENT_VERSIONS (4,4)`）。原 (3,4) 永久双版本裁决被本节覆盖——`?v=3` 请求自 4.8.0 起答复 400 `unsupported_version` `supported:[4]`。§0.3/§9.4 相应修订。
 > **裁决出处**：`docs/system-architecture-proposal-2026-08-17.md`（v2.2，权威基准，行号引用）；工程细化 `docs/refactor-plans/slimapi-refactor-plan.md`；设计文档 `design-v4-selector.md` / `design-v4-dbaux.md` / `design-v4-sse-replay.md` / `design-v4-qp-payload.md`。
 > **消费者**：ocdroid（B5a 探测 / B5b 适配）与 oc-webui 可**仅凭本文件**完成 v4 对接开发。
 
@@ -11,9 +11,9 @@
 
 ## §0 版本原则与并存退役规则 [冻结]
 
-1. **版本窗（5.0.0 起 v4-only）**：5.0.0 起 `ACCEPTED_CLIENT_VERSIONS = (4, 4)`（2026-08-21 版本窗收窄修订；owner 方向指令 `docs/ocmar/reviews/2026-08-21-v3-retirement-reassessment.md` §1）。`?v=4` 是唯一合法入口。`?v=3`、无 `v`、其他合法值 → 400 `unsupported_version`，`supported:[4]`（端点存在、不静默 404）。历史：4.0.0–4.7.0 曾为 (3,4) 双版本窗口；`?v=3` 在此时期语义逐字节不变。
-2. **major 与 wire 协议版本绑定**（release.md §1.1 铁律）：版本窗任何变更均为 major 发版（历史例：(3,3)→(3,4) 即 4.0.0 major；(3,4)→(4,4) 即 5.0.0 major）。
-3. **v3 退役（2026-08-21 版本窗收窄修订实施）**：5.0.0 起 v3 wire 版本已退役。`?v=3` 答复 400 `unsupported_version` `supported:[4]`。原 (3,4) 永久双版本裁决（2026-08-19 owner 终态裁决，CHANGELOG [4.1.0]）被本修订覆盖——退役形式为版本窗收窄至 v4-only（major 5.0.0），不再经观测判据评估。`?v=3` 管线在本分支（v4 分支）上不再可达。
+1. **版本窗（4.8.0 起 v4-only）**：4.8.0 起 `ACCEPTED_CLIENT_VERSIONS = (4, 4)`（2026-08-21 版本窗收窄修订；owner 方向指令 `docs/ocmar/reviews/2026-08-21-v3-retirement-reassessment.md` §1）。`?v=4` 是唯一合法入口。`?v=3`、无 `v`、其他合法值 → 400 `unsupported_version`，`supported:[4]`（端点存在、不静默 404）。历史：4.0.0–4.7.0 曾为 (3,4) 双版本窗口；`?v=3` 在此时期语义逐字节不变。
+2. **major 与 wire 协议版本绑定**（release.md §1.1 铁律；owner 2026-08-21 重申：major 只跟协议大版本走）：仅当 wire `ACCEPTED_CLIENT_VERSIONS` bump（协议大版本升级，如 4 系→5 系）时发 major。版本窗**收窄**不 bump 协议大版本（4 系窗口内 (3,4)→(4,4)），按 owner 2026-08-21 裁定发 **minor**（4.8.0 收窄即先例；历史例：(3,3)→(3,4) 窗口扩大伴随协议 3→4 bump，故 4.0.0 为 major）。
+3. **v3 退役（2026-08-21 版本窗收窄修订实施）**：4.8.0 起 v3 wire 版本已退役。`?v=3` 答复 400 `unsupported_version` `supported:[4]`。原 (3,4) 永久双版本裁决（2026-08-19 owner 终态裁决，CHANGELOG [4.1.0]）被本修订覆盖——退役形式为版本窗收窄至 v4-only（4.8.0 minor），不再经观测判据评估。`?v=3` 管线在本分支（v4 分支）上不再可达。
 4. **消费者回退语义**：503 族 = 显式错误，客户端**不自动回退旧版本**（维持当前 wire 版本，按 Retry-After/手动重试处理）。v4-only 窗下 `available` 不再含 3，无版本回退路径。历史（4.0.0–4.7.0 双版本期）：v3 目录级浏览仅经**用户显式触发**的整体版本重协商（`available` 含 3 时覆写 selectedWireVersion=3，全端点一致），且是**功能降级非等价回退**——v4 的跨目录 parent/archived 过滤与全局 cursor 翻页在 v3 无对应语义，UX 按功能降级建模。
 5. **2026-08-19 正式修订 [冻结目标]**：owner 裁决修订直接落在 `?v=4` 视图（v4 尚无消费方，无破坏影响；无新 major、无版本窗变更——该"无版本窗变更"前提已被 2026-08-21 版本窗收窄修订覆盖）。修订语义 = §3.3 readiness 门禁（**按 feature ID 独立门控**）+ §12-§17。**契约先行冻结纪律**：各修订节描述冻结目标语义并载**当前状态注记**（现行 4.0.0/4.1.0 已发布行为 → 修订后目标）；实现批次随后落地——各修订面语义**当且仅当对应 feature ID ∈ `satisfied`**（§3.3 门控）方可达，落地前 `capabilities["4"]` 不含对应扩展键、readiness 对应 feature 不 satisfied。`?v=3` 零改动（v3 冻结）。
 
@@ -53,11 +53,11 @@
    }}}
 ```
 
-- **历史载荷形态（4.0.0–4.7.0 双版本期）**：`available` 曾为 `[3, 4]`，`capabilities` 曾含 `"3"` 面（既有形状不变：envelope/directoryQuery/versionHeaderOptional/writeRoutes/readRoutes/expand）——5.0.0 版本窗收窄后随 `?v=3` 管线一并移除（§0.1）。
+- **历史载荷形态（4.0.0–4.7.0 双版本期）**：`available` 曾为 `[3, 4]`，`capabilities` 曾含 `"3"` 面（既有形状不变：envelope/directoryQuery/versionHeaderOptional/writeRoutes/readRoutes/expand）——4.8.0 版本窗收窄后随 `?v=3` 管线一并移除（§0.1）。
 - `current` 恒为最新主版本（=4，S-B04；「双版本期」限定为 4.0.0–4.7.0 历史表述，v4-only 窗下仍成立且与 `available` 唯一元素同值）。
 - **能力键为静态键**（v2.2 行 140/254）：存在即广告，**不随 DB 抖动**——DB 熔断/降级不改变 capabilities，瞬态可用性经 503 + health `auxiliary` 字段（§3.2）+ metrics 表达。
 - **广告时序（n1 冻结）**：`sseReplay`/`qpImmediateFull` 与实现**同批启用**——B3a 的 `capabilities["4"]` **不含**此二键；B3b 实现落地同期广告（**已执行，B3b-5**：两键随 4.0.0 发布面广告；本条为时序约束的历史记录）。消费者：键缺席 = 该能力不可用，不得预依赖。
-- 消费者探测（B5a；历史条款——4.0.0–4.7.0 双版本期）：`capabilities["4"]` 不存在 → 继续 v=3；未知键容忍忽略。v4-only 窗（5.0.0 起）：`capabilities` 恒仅含 `"4"` 面、`?v=3`/无 `v` → 400（§0.1），该回退分支不可达；未知键容忍忽略仍适用。
+- 消费者探测（B5a；历史条款——4.0.0–4.7.0 双版本期）：`capabilities["4"]` 不存在 → 继续 v=3；未知键容忍忽略。v4-only 窗（4.8.0 起）：`capabilities` 恒仅含 `"4"` 面、`?v=3`/无 `v` → 400（§0.1），该回退分支不可达；未知键容忍忽略仍适用。
 - **expand 能力探测注记（2026-08-19 补载——如实描述已发布状态；2026-08-21 版本窗收窄后注记）**：messages 的 2 条 expand 路由（§10/§14）在 `?v=4` 下**可达**（selector 放行；端点行为零版本分叉，语义全文 = §14）。历史（4.0.0–4.7.0 双版本期）：`capabilities["4"]` 静态键面不含 `expand` 键，expand 能力广告仅存在于 `capabilities["3"].expand`，客户端探测读该键、不因使用 `?v=4` 而改读他键。v4-only 窗下 `capabilities["3"]` 面已随版本窗移除，expand 探测唯一口径 = `capabilities["4"].expand`（§14 修订扩展键，iff `messages.expand.v4 ∈ satisfied` 方广告，§3.3 双向不变量）。
 - **修订扩展键（2026-08-19 修订冻结目标）**：`capabilities["4"]` 随实现批次**加性扩展**两键——`readiness`（§3.3 feature 就绪度门；修订二后全集 U = **十** ID）与 `expand`（§14：categories + fragmentMaxBytes，随 `messages.expand.v4` 进入 `satisfied` 加入）。扩键前本节静态四键即 `capabilities["4"]` 全部形状；`expand` 键出现前 expand 能力探测仍读 `capabilities["3"].expand`（上文注记——历史 4.0.0–4.7.0 行为；v4-only 窗下该键不存在，探测唯一口径 = `capabilities["4"].expand`）。
 
@@ -385,7 +385,7 @@ v4 sessions 归入 sessions 桶既有记账；降级路径请求带 degraded 标
 
 ### §9.4 v3 退役（P4，2026-08-21 版本窗收窄修订）
 
-**5.0.0 起 v3 wire 版本已退役**：`ACCEPTED_CLIENT_VERSIONS = (4,4)`，`?v=3` 答复 400 `unsupported_version` `supported:[4]`。原 (3,4) 永久双版本裁决（2026-08-19 owner 终态裁决）被本修订覆盖——退役通过版本窗收窄（major 5.0.0）直接实施，不经观测判据评估。历史观测数据（08-19 99.7% → 08-20 69.5% → 08-21 49.1%，SSE active v3=0 连续两日）为 merge 门佐证，非退役触发条件。
+**4.8.0 起 v3 wire 版本已退役**：`ACCEPTED_CLIENT_VERSIONS = (4,4)`，`?v=3` 答复 400 `unsupported_version` `supported:[4]`。原 (3,4) 永久双版本裁决（2026-08-19 owner 终态裁决）被本修订覆盖——退役通过版本窗收窄（4.8.0 minor；major 仅跟协议大版本 bump，owner 2026-08-21 裁定）直接实施，不经观测判据评估。历史观测数据（08-19 99.7% → 08-20 69.5% → 08-21 49.1%，SSE active v3=0 连续两日）为 merge 门佐证，非退役触发条件。
 
 ## §10 路由全集逐条（v4 差异列）[冻结]
 
@@ -745,7 +745,7 @@ envelope.degraded == (任一 item.degraded == true) ∨ (本响应采用 native 
 
 ## §14 expand 端点全文语义与能力闭环 [2026-08-19 修订冻结]
 
-> **当前状态（2026-08-21 版本窗收窄更新）**：feature `messages.expand.v4` 已 `satisfied`（§3.3 门控全集点亮）——**本节语义已生效**。href 按解析后 selector 生成（`skeleton.py` `_expand_ref` 收 `wire_view`；v4-only 窗下恒 `?v=4`）；`capabilities["4"].expand` 已广告（§3.1）。历史状态（4.0.0–4.7.0）：href 硬编码 `?v=3`、`capabilities["4"]` 无 `expand` 键——该形态随 5.0.0 版本窗收窄一并移除。
+> **当前状态（2026-08-21 版本窗收窄更新）**：feature `messages.expand.v4` 已 `satisfied`（§3.3 门控全集点亮）——**本节语义已生效**。href 按解析后 selector 生成（`skeleton.py` `_expand_ref` 收 `wire_view`；v4-only 窗下恒 `?v=4`）；`capabilities["4"].expand` 已广告（§3.1）。历史状态（4.0.0–4.7.0）：href 硬编码 `?v=3`、`capabilities["4"]` 无 `expand` 键——该形态随 4.8.0 版本窗收窄一并移除。
 
 - **12 类目有序清单（冻结）**：`info_summary_diffs` → `part_text` → `part_reasoning` → `part_state_output` → `part_state_error` → `part_state_input_full` → `part_state_metadata_full` → `part_state_attachments` → `part_url` → `part_source` → `part_snapshot` → `compaction_full`（单一事实源 `src/oc_slimapi/traffic.py::EXPAND_CATEGORIES` 表序延续；versions 广告与流量记账同源；类目级别/适用 part 类型/返回 `data` 形状见 §14.2）。
 - **`fragmentMaxBytes` = `OC_SLIMAPI_MAX_EXPAND_RESPONSE_BYTES` 运行时值**（缺省 **8388608**，界 **1024..33554432** 含边界；非法值启动 RuntimeError——config.py 既有冻结）。capability 广告 `capabilities["4"].expand = {categories, fragmentMaxBytes}` 与历史键 `capabilities["3"].expand`（§3.1——4.0.0–4.7.0 形状锚点，v4-only 窗下该键已随版本窗移除）形状同构（categories = 12 类目有序数组 + fragmentMaxBytes = 数值）；**仅当全部 12 类目在 v4 视图闭环（href/响应/错误）才广告**（§3.3 批次闭合）。

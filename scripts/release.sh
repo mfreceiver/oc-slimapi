@@ -26,7 +26,7 @@ TYPE="${1:?用法: release.sh <patch|minor|major>}"
 BRANCH=$(git branch --show-current)
 # B6 分支纪律（batch3 v4 分支）：merge gate 通过前 v4 分支禁止一切发版。
 if [[ "$BRANCH" == "v4" ]]; then
-  echo "❌ v4 branch: merge gate not passed — v4 分支禁止发版（merge 回 main 且 merge 门五条件通过后，由编排者在 main 执行 release.sh major）"
+  echo "❌ v4 branch: merge gate not passed — v4 分支禁止发版（merge 回 main 且 merge 门五条件通过后，由编排者在 main 执行 release.sh minor）"
   exit 1
 fi
 [[ "$BRANCH" == "main" ]] || { echo "❌ 当前分支=$BRANCH，发版必须在 main"; exit 1; }

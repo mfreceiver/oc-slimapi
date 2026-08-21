@@ -1,7 +1,7 @@
 """Wire-contract version pins (v3-contract §0 / v4-contract §0).
 
 v4-only window (2026-08-21 version-window narrowing, target release
-5.0.0): ``ACCEPTED_CLIENT_VERSIONS == (4, 4)`` — the inclusive window
+4.8.0): ``ACCEPTED_CLIENT_VERSIONS == (4, 4)`` — the inclusive window
 collapsed to the single newest major, so ``?v=3`` (and every other
 version form) is a 400 ``unsupported_version`` with
 ``supported:[4]``. The per-request view is decided by the selector
@@ -44,6 +44,6 @@ SERVER_API_VERSION = 4
 # Fail-closed production pin: the inclusive (min, max) wire-version window
 # accepted from clients. 4.0.0: (3, 3) → (3, 4) (v4-contract §0.1; major
 # release — v3 semantics unchanged, ?v=4 admitted). 2026-08-21 narrowing
-# (target 5.0.0): (3, 4) → (4, 4) — the window collapsed to v4-only,
+# (shipped 4.8.0): (3, 4) → (4, 4) — the window collapsed to v4-only,
 # ?v=3 answers 400 unsupported_version supported:[4] (§0.3 revision).
 ACCEPTED_CLIENT_VERSIONS: tuple[int, int] = (4, 4)

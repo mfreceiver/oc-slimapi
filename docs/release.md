@@ -34,7 +34,7 @@
 | 类型 | 变化 | 何时使用 |
 |---|---|---|
 | `patch` | `0.1.0 → 0.1.1` | Bug 修复、内部重构、测试/文档、无客户端行为变化 |
-| `minor` | `0.1.0 → 0.2.0` | **加性** wire 能力（新可选字段/新端点、旧客户端可忽略）；含 v3 视图内的减性投影缩减等 owner 决策收编变更（唯一消费方同步发版承接） |
+| `minor` | `0.1.0 → 0.2.0` | **加性** wire 能力（新可选字段/新端点、旧客户端可忽略）；含 v3 视图内的减性投影缩减等 owner 决策收编变更（唯一消费方同步发版承接）；含版本窗**收窄**（owner 2026-08-21 裁定：收窄不 bump 协议大版本，如 4.8.0 (3,4)→(4,4) v3 退役） |
 | `major` | `0.1.0 → 1.0.0` | **与 wire 协议版本绑定**（owner 决策 2026-08-17）：仅当 wire `ACCEPTED_CLIENT_VERSIONS` bump（协议大版本升级）时使用；减性/破坏性 wire 变更若不 bump wire 协议版本，不发 major |
 
 Tag 格式：**`v` + semver**（例：`v0.1.0`），与 ocdroid 一致。
@@ -50,9 +50,9 @@ Tag 格式：**`v` + semver**（例：`v0.1.0`），与 ocdroid 一致。
 
 4.0.0（P3）起 sidecar 进入 wire **双版本期**（路线见 `docs/system-architecture-proposal-2026-08-17.md` §7）：
 
-- `GET /slimapi/versions` 报 `available: [3, 4]`、`current: 4`（v3/v4 并存，v3 降级隔离）。
-- **major 与 wire 协议版本绑定铁律不变**：wire `ACCEPTED_CLIENT_VERSIONS` bump 才发 major。
-- accepted-range 收窄 `(3,4) → (4,4)`（v3 退役）即下一次 major（5.0.0；对齐 v2→v3 退役先例）。
+- `GET /slimapi/versions` 曾报 `available: [3, 4]`、`current: 4`（4.0.0–4.7.0 v3/v4 并存；4.8.0 起收窄为 `available: [4]`）。
+- **major 与 wire 协议版本绑定铁律不变**：wire `ACCEPTED_CLIENT_VERSIONS` bump（协议大版本升级）才发 major。
+- accepted-range 收窄 `(3,4) → (4,4)`（v3 退役）按 owner 2026-08-21 裁定发 **minor（4.8.0 先例）**——收窄不 bump 协议大版本（4 系窗口内变化），major 只跟协议大版本走。
 
 ---
 

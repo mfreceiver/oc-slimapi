@@ -1,6 +1,6 @@
 # oc-slimapi v3 wire 契约（design-v3 rev11 — 终态，**已退役**）
 
-> **退役声明（2026-08-21）**：本契约描述的 v3 wire 版本自 **5.0.0 起已退役**（`ACCEPTED_CLIENT_VERSIONS = (4,4)`；`?v=3` 答复 400 `unsupported_version` `supported:[4]`）。本文件保留为**历史存档**——正文不做任何语义改动，供 v3 消费方与运维查阅 4.0.0–4.7.0 双版本期的 wire 行为。现行 wire 行为以 [`v4-contract.md`](v4-contract.md) 为准。
+> **退役声明（2026-08-21）**：本契约描述的 v3 wire 版本自 **4.8.0 起已退役**（`ACCEPTED_CLIENT_VERSIONS = (4,4)`；`?v=3` 答复 400 `unsupported_version` `supported:[4]`）。本文件保留为**历史存档**——正文不做任何语义改动，供 v3 消费方与运维查阅 4.0.0–4.7.0 双版本期的 wire 行为。现行 wire 行为以 [`v4-contract.md`](v4-contract.md) 为准。
 >
 > 状态：**正式——2.0.0 实施基线，3.0.0（m3 分支）为 v3-only 终态实施**（design-v3 rev11；2026-08-16 十一轮评审收敛 6.8→8.3→8.9→9.2→9.1→8.3→9.1→9.4→9.4→9.4→9.7 PASS，rev-sgpt 十一评）。**v3 语义冻结不变；4.0.0 起进入 (3,4) 双版本窗口**——v3 视图经 `?v=3` 持续可达，v4 视图差异见 [`v4-contract.md`](v4-contract.md)（2026-08-19 状态注记）。
 > 方向决策（不可推翻）：单入口终态——`/slimapi/**` 提供完整功能（实测使用集：ocdroid StandardApi 全量端点），catch-all 3.0.0 关闭，全部自定义头退役。两步走（已定）：sidecar 2.0.0 → ocdroid 3.0.0（smoke 门控）→ sidecar 3.0.0。

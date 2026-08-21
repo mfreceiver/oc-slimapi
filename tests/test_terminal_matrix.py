@@ -1,5 +1,5 @@
 """v3-contract **terminal state** (sidecar 3.0.0 / M3) wire matrix —
-version-window narrowing update (2026-08-21, target 5.0.0): supported set
+version-window narrowing update (2026-08-21, shipped 4.8.0): supported set
 is now [4] only (``?v=3`` answers the unsupported-version 400).
 
 The v2 pipeline is deleted. Frozen terminal clauses under test:

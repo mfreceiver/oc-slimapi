@@ -125,7 +125,7 @@ async def test_v2_with_header_also_unsupported():
 
 async def test_v3_without_header_ok():
     """v3 was the 3.x terminal admission view; since the 2026-08-21 window
-    narrowing (target 5.0.0) it answers the unsupported-version 400."""
+    narrowing (shipped 4.8.0) it answers the unsupported-version 400."""
     app = _build_app()
     async with _client(app) as client:
         resp = await client.get("/slimapi/health", params={"v": "3"})
