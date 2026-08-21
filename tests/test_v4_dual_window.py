@@ -10,7 +10,7 @@ Covers the Phase-A core deltas:
   the fail-closed pin on ``OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS`` is kept.
 * **A2** selector dual-version: ``?v=4`` admitted + stashed
   (``selectorResult=v4`` / ``wireVersion="4"``), request-scope
-  ``wire_view_from_scope`` (stash-read, default 3), the §5.2
+  ``wire_view_from_scope`` (stash-read), the §5.2
   consuming-set fork (v4 = v3 − {global sessions list}), the uniform
   ``directory_retired_in_v4`` 400 over ALL four input forms (priority over
   the whole v3 validation ladder), and v3-unchanged behaviour on every
@@ -274,16 +274,6 @@ async def test_v4_health_dual_view():
         assert body["features"]["allowlist"] == {"enabled": False}
 
 
-async def test_v3_health_view_regression_no_auxiliary():
-    """B12-② guard net, temporarily flipped at the 2026-08-21 narrowing
-    (V2b deletes): the former v3 view is now the unsupported-version 400."""
-    app = _build_app()
-    async with _client(app) as client:
-        resp = await client.get("/slimapi/health?v=3", headers=IDENTITY)
-        assert resp.status_code == 400
-        assert resp.json() == {"code": "unsupported_version", "supported": [4]}
-
-
 async def test_v4_wire_stash():
     app = _build_app()
     async with _client(app) as client:
@@ -296,45 +286,14 @@ async def test_v4_wire_stash():
         assert body["query"] == ""
 
 
-async def test_v3_wire_stash_unchanged():
-    """B12-② guard net, temporarily flipped at the 2026-08-21 narrowing
-    (V2b deletes): ``?v=3`` no longer admits/stashes a v3 wire view."""
-    app = _build_app()
-    async with _client(app) as client:
-        resp = await client.get("/slimapi/sessions?v=3&x=1", headers=IDENTITY)
-        assert resp.status_code == 400
-        assert resp.json() == {"code": "unsupported_version", "supported": [4]}
-
-
-async def test_selector_less_stack_defaults_to_v3_view():
-    """Backward-compat ironclad: without the selector (direct route
-    invocation), the observed wire view is 3 — v4 capability is only
-    reachable through the explicit selector."""
-    app = _build_app(with_selector=False)
-    async with _client(app) as client:
-        # No ?v needed — no selector in the stack; the route runs the
-        # default v3 view.
-        resp = await client.get("/slimapi/health", headers=IDENTITY)
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["slimapi_contract"] == 3
-        assert body["schema"]["version"] == 3
-        assert "auxiliary" not in body
-
-
 def test_wire_view_from_scope_unit():
-    assert wire_view_from_scope({}) == 3
-    assert wire_view_from_scope({"state": {}}) == 3
-    assert wire_view_from_scope(
-        {"state": {sel.SELECTOR_STATE_KEY: {"result": "v3", "wire": "3"}}}
-    ) == 3
+    """Stash-read mechanism on the only admitted wire. The default-view
+    legs (no stash → 3) were the Phase-4 guard pins and are removed with
+    the V2b test teardown; the src lane re-asserts the flipped default
+    (no stash → 4) when the physical v3 removal lands."""
     assert wire_view_from_scope(
         {"state": {sel.SELECTOR_STATE_KEY: {"result": "v4", "wire": "4"}}}
     ) == 4
-    # rejected / exempt / not_applicable carry no wire → default 3.
-    assert wire_view_from_scope(
-        {"state": {sel.SELECTOR_STATE_KEY: {"result": "rejected", "wire": None}}}
-    ) == 3
 
 
 async def test_v4_sessions_directory_query_single_retired():
@@ -403,25 +362,6 @@ async def test_v4_sessions_no_directory_forwards_untouched():
         assert body["query"] == "cursor=abc"
 
 
-async def test_v3_sessions_directory_ladder_unchanged():
-    """B12-② guard net, temporarily flipped at the 2026-08-21 narrowing
-    (V2b deletes the whole ladder guard): every former v3 ladder outcome is
-    pre-empted by the version-family 400 (priority ② before ③)."""
-    app = _build_app()
-    async with _client(app) as client:
-        for url, headers in (
-            ("/slimapi/sessions?v=3&directory=/a&directory=/b", IDENTITY),
-            ("/slimapi/sessions?v=3&directory=/a",
-             {**IDENTITY, DIRECTORY_HEADER: "/b"}),
-            ("/slimapi/sessions?v=3", {**IDENTITY, DIRECTORY_HEADER: "/w"}),
-            ("/slimapi/sessions?v=3&directory=/w&cursor=c", IDENTITY),
-        ):
-            resp = await client.get(url, headers=headers)
-            assert resp.status_code == 400, url
-            assert resp.json() == {"code": "unsupported_version",
-                                   "supported": [4]}
-
-
 async def test_v4_non_retired_consuming_route_keeps_v3_semantics():
     """sessions/status is in the v4 consuming set (NOT retired): a v4
     request consumes ``?directory=`` exactly like v3."""
@@ -448,13 +388,15 @@ async def test_v4_non_retired_consuming_route_keeps_v3_semantics():
 
 
 def test_directory_fork_is_set_difference():
-    """Design invariant: the v4 fork is a SET DIFFERENCE over the shared v3
+    """Design invariant: the v4 fork is a SET DIFFERENCE over the shared
     pattern source — exactly one pattern (the global sessions list) leaves,
-    every other consuming route stays consuming for wire 4."""
+    every other consuming route stays consuming for wire 4. (V2b removed
+    the wire-3 legs so the src teardown may change the underlying
+    consuming-set mechanism/signature.)"""
     retired = [p.pattern for p in sel._DIRECTORY_V4_RETIRED_PATTERNS]
     assert retired == [r"^/slimapi/sessions$"]
     total = len(sel._DIRECTORY_CONSUMING_PATTERNS)
-    assert total == 25  # v3 source of truth
+    assert total == 25  # shared pattern source of truth
     # Kept list below instantiates every remaining pattern family.
     kept = [
         "/slimapi/messages/s1",
@@ -489,15 +431,13 @@ def test_directory_fork_is_set_difference():
         "/slimapi/question/q1/reject",
     ]
     for path in kept:
-        assert sel._directory_consuming_for(path, 3), path
         assert sel._directory_consuming_for(path, 4), path
-    # The retired route: consuming under v3, retired under v4.
-    assert sel._directory_consuming_for("/slimapi/sessions", 3)
+    # The retired route: retired under wire 4 (its v3 consumption ends with
+    # the Phase-4 teardown).
     assert not sel._directory_consuming_for("/slimapi/sessions", 4)
-    # Tolerant routes stay tolerant under both views.
+    # Tolerant routes stay tolerant.
     for path in ("/slimapi/versions", "/slimapi/health", "/slimapi/ready",
                  "/slimapi/metrics.traffic"):
-        assert not sel._directory_consuming_for(path, 3), path
         assert not sel._directory_consuming_for(path, 4), path
 
 
@@ -596,22 +536,17 @@ async def test_versions_v3_capabilities_shape_unchanged():
 
 async def test_versions_payload_independent_of_wire_view():
     """Discovery is version-independent (selector-exempt): the no-selector
-    base, ``?v=3`` and ``?v=4`` answer the exact same payload.
-
-    B12: the comparison basis is the literal module golden
-    (``VERSIONS_PAYLOAD_GOLDEN``) — transitive invariance: each view is
-    independently pinned, none derives its expectation from a live sibling
-    response anymore. The ``?v=3`` leg doubles as the v3 guard net (kept
-    until the Phase-4 v3 face removal)."""
+    base and ``?v=4`` answer the exact same literal module golden
+    (``VERSIONS_PAYLOAD_GOLDEN``) — each view independently pinned, none
+    derives its expectation from a live sibling response. (V2b removed the
+    ``?v=3`` guard leg with the Phase-4 v3-face teardown.)"""
     app = _build_app()
     async with _client(app) as client:
         base = (await client.get("/slimapi/versions", headers=IDENTITY)).json()
         assert base == VERSIONS_PAYLOAD_GOLDEN
-        for query in ("?v=3", "?v=4"):
-            resp = await client.get(f"/slimapi/versions{query}",
-                                    headers=IDENTITY)
-            assert resp.status_code == 200
-            assert resp.json() == VERSIONS_PAYLOAD_GOLDEN
+        resp = await client.get("/slimapi/versions?v=4", headers=IDENTITY)
+        assert resp.status_code == 200
+        assert resp.json() == VERSIONS_PAYLOAD_GOLDEN
 
 
 async def test_health_allowlist_enabled_in_both_views():
@@ -625,21 +560,12 @@ async def test_health_allowlist_enabled_in_both_views():
         assert body["server"]["api_version"] == 4
         assert body["slimapi_contract"] == 4
         assert body["features"]["allowlist"]["enabled"] is True
-        # 2026-08-21 narrowing: the v3 leg is the unsupported-version 400.
-        resp = await client.get("/slimapi/health?v=3", headers=IDENTITY)
-        assert resp.status_code == 400
-        assert resp.json() == {"code": "unsupported_version", "supported": [4]}
 
 
 async def test_ready_zero_v4_difference():
     """Contract §3.2/§12: ready is frozen — shape AND values stay the v3
-    terminal ones even for a v4 wire request.
-
-    B12: the v4 half is pinned to the literal parsed golden
-    (``_READY_GOLDEN``; ``upstream`` popped first — its ``latencyMs``
-    differs per ping); the v3 leg stays as the guard net, independently
-    asserting the SAME golden (previously the v4 expectation WAS the live
-    v3 body — the dual-view equivalence form this refactor removes)."""
+    terminal ones even for a v4 wire request (the v3-guard leg was removed
+    with the V2b Phase-4 teardown)."""
     app = _build_ready_app()
     async with _client(app) as client:
         resp = await client.get("/slimapi/ready?v=4", headers=IDENTITY)
@@ -649,9 +575,3 @@ async def test_ready_zero_v4_difference():
         assert set(body) == {"upstream", "server", "schema"}
         body.pop("upstream")
         assert body == _READY_GOLDEN
-
-        # v3 守护网临时翻转（2026-08-21 收窄，V2b 删）：?v=3 现为版本族 400
-        #（/ready 非 selector 豁免路由）。
-        v3 = await client.get("/slimapi/ready?v=3", headers=IDENTITY)
-        assert v3.status_code == 400
-        assert v3.json() == {"code": "unsupported_version", "supported": [4]}

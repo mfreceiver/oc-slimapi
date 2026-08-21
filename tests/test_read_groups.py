@@ -112,9 +112,10 @@ def _build_app(handler, *, settings: Settings | None = None,
     app.include_router(read_groups.router)
     register_error_handlers(app)
     # selector=False → selector-less direct invocation (the route's default
-    # view). Used by the 2026-08-21 narrowing to keep the v3-branch shape
-    # locks (skeleton projection / verbatim passthrough / providers
-    # passthrough) exercisable until V2b removes the v3 branch.
+    # view). Used by the B5 no-projection guards (204/301 verbatim —
+    # view-agnostic route mechanics); the former v3-branch shape locks
+    # (providers v3 passthrough / session-single v3 skeleton) were deleted
+    # by the V2b Phase-4 teardown.
     if selector:
         app.add_middleware(SlimapiSelectorMiddleware)
     return app, seen
@@ -326,46 +327,9 @@ async def test_providers_directory_sensitive(stack):
     assert seen[0].headers.get(DIRECTORY_HEADER) == "/w"
 
 
-async def test_providers_v3_branch_passthrough_bytes():
-    """B12-②-style v3-branch lock (selector-less): the byte-identical
-    controlled-proxy passthrough of the frozen v3 providers face. V2b
-    removes the v3 branch (and this lock) with the physical teardown."""
-    app, _seen = _build_app(_default_handler, selector=False)
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport,
-                                 base_url="http://t") as client:
-        resp = await client.get("/slimapi/config/providers",
-                                headers=IDENTITY)
-        assert resp.status_code == 200
-        assert resp.content == _read_payloads()["/config/providers"]
-        assert resp.headers["vary"].lower() == "accept-encoding"  # §6.2 terminal
-
-
 # ---------------------------------------------------------------------------
 # session single
 # ---------------------------------------------------------------------------
-
-async def test_session_single_skeleton_projection():
-    """B12-②-style v3-branch lock (selector-less): the frozen v3 skeleton
-    projection shape. The v4 canonical projector face is locked in
-    test_session_single_v4.py; V2b removes the v3 branch with the
-    physical teardown."""
-    app, _seen = _build_app(_default_handler, selector=False)
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport,
-                                 base_url="http://t") as client:
-        resp = await client.get("/slimapi/session/s1", headers=IDENTITY)
-        assert resp.status_code == 200
-        projected = orjson.loads(resp.content)
-        assert projected["id"] == "s1"
-        assert projected["title"] == "one"
-        assert projected["time"]["created"] == 1
-        assert projected["model"]["modelID"] == "m"
-        # Whitelist drops heavy/never-consumed fields (skeleton_session).
-        for dropped in ("cost", "tokens", "location", "subpath", "repoPath",
-                        "commit", "branch", "status", "version"):
-            assert dropped not in projected
-
 
 async def test_session_single_directory(stack):
     client, seen = stack

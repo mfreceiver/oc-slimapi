@@ -3,10 +3,10 @@
 B12 (2026-08-21) three-way split: the consumer-ladder functions below now
 drive the ``?v=4`` face — v4-contract §5.1 inherits the v3 §5 consumption /
 tolerance / error semantics verbatim on every non-retired route, so the
-ladder assertions are v4-equivalent and were rewritten selector 3→4. The
-v3-only guardians (sessions-list consumption, v2-form rejections, tolerant
-health/versions view locks) and the §9.1 observability dims stay on the
-v3 face (Phase 3/4 rewrite).
+ladder assertions are v4-equivalent and were rewritten selector 3→4.
+V2b (2026-08-21 Phase-4 guard teardown) deleted the v3-only guardians
+(sessions-list consumption face, v2-form rejections). The §9.1
+observability dims (§9 frozen schema naming) stay.
 
 Covers:
 
@@ -18,16 +18,13 @@ Covers:
 * v3 forwarding — the consumed directory (query OR compatible header)
   reaches upstream as ``X-Opencode-Directory``; the ``directory`` pairs
   are stripped from the downstream query (other params intact).
-* v2 regression — directory query keeps its v2 semantics (no v3-style
-  header-only forwarding for consuming routes' query paths; sessions v2
-  still re-adds ``?directory=`` upstream).
 * §5.6 stream exception — multi-value different → 400
   ``invalid_directory_selector`` (selector pre-check + route guard);
   query-only accepted (no-op); query+header different → 400
   ``directory_not_allowed`` (inherited v2 guard).
 * §5.5 tolerant-ignore set — any directory form on non-consuming routes
-  is ignored under v3 (no 400, no consumption).
-* Invalid directory value under v3 → 400 ``invalid_directory``.
+  is ignored (no 400, no consumption).
+* Invalid directory value → 400 ``invalid_directory``.
 """
 
 from __future__ import annotations
@@ -56,7 +53,6 @@ from oc_slimapi.selector import SlimapiSelectorMiddleware
 from oc_slimapi.transform import TransformConfig, TransformPool
 
 IDENTITY = {"Accept-Encoding": "identity"}
-V2_HEADERS = {"X-Slimapi-Version": "2", **IDENTITY}
 DIRECTORY_HEADER = "X-Opencode-Directory"
 
 
@@ -331,67 +327,6 @@ async def test_diff_forwards_messageid_without_directory(stack):
 
 
 # ---------------------------------------------------------------------------
-# v2 regression — directory semantics unchanged
-# ---------------------------------------------------------------------------
-
-async def test_v2_agent_directory_query_form_unsupported(stack):
-    client, seen = await stack()
-    try:
-        response = await client.get(
-            "/slimapi/agent?directory=/w", headers=V2_HEADERS)
-        assert response.status_code == 400
-        assert orjson.loads(response.content)["code"] == "unsupported_version"
-        assert not seen
-    finally:
-        await client.aclose()
-
-
-async def test_v2_agent_header_only_unsupported(stack):
-    """Terminal: the selector error (②) outranks the retired-header rule
-    (③) — the v2 form is rejected before the header is even examined."""
-    client, seen = await stack()
-    try:
-        response = await client.get(
-            "/slimapi/agent",
-            headers={**V2_HEADERS, DIRECTORY_HEADER: "/w"})
-        assert response.status_code == 400
-        assert orjson.loads(response.content)["code"] == "unsupported_version"
-        assert not seen
-    finally:
-        await client.aclose()
-
-
-async def test_v2_sessions_form_unsupported(stack):
-    """Terminal: the frozen v2 sessions re-add behavior is gone with the
-    v2 pipeline itself — the form is rejected at the selector."""
-    client, seen = await stack()
-    try:
-        response = await client.get(
-            "/slimapi/sessions?directory=/w", headers=V2_HEADERS)
-        assert response.status_code == 400
-        assert orjson.loads(response.content)["code"] == "unsupported_version"
-        assert not seen
-    finally:
-        await client.aclose()
-
-
-async def test_v3_sessions_header_only_upstream_query_clean(stack):
-    """B12-② guard net, temporarily flipped at the 2026-08-21 narrowing
-    (V2b deletes): the v3 sessions consumption face is now the
-    unsupported-version 400."""
-    client, seen = await stack()
-    try:
-        response = await client.get(
-            "/slimapi/sessions?v=3&directory=/w", headers=IDENTITY)
-        assert response.status_code == 400
-        assert orjson.loads(response.content) == {
-            "code": "unsupported_version", "supported": [4]}
-        assert not seen
-    finally:
-        await client.aclose()
-
-
-# ---------------------------------------------------------------------------
 # §5.6 stream exception
 # ---------------------------------------------------------------------------
 
@@ -558,8 +493,8 @@ async def test_tolerant_routes_ignore_any_directory_form(stack):
         cases = [
             "/slimapi/health?v=4&directory=../etc",
             "/slimapi/health?v=4&directory=/w&directory=/p",
-            "/slimapi/versions?v=3&directory=x&directory=y",
-            "/slimapi/versions?v=3&directory=/w",
+            "/slimapi/versions?v=4&directory=x&directory=y",
+            "/slimapi/versions?v=4&directory=/w",
         ]
         for url in cases:
             response = await client.get(url, headers=IDENTITY)

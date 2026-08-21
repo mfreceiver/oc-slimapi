@@ -890,30 +890,6 @@ class TestTokenStreamHandshake:
         finally:
             await _close_app(app)
 
-    async def test_last_event_id_emits_leading_reconnect_no_replay(self):
-        """Last-Event-ID (value ignored) → leading resync{reconnect_no_replay,
-        sessionID} BEFORE server.connected (§5.5 step 1)."""
-        app = _build_app(_settings())
-        try:
-            status, headers, body = await _drive_stream(
-                app, "/slimapi/sessions/s1/stream",
-                [
-                    ("X-Slimapi-Version", "1"),
-                    ("Accept-Encoding", "identity"),
-                    ("Last-Event-ID", "anything-ignored"),
-                ],
-            )
-            assert status == 200
-            events = parse_sse_stream(body)
-            # Terminal §7.2: meta precedes even the resync frame.
-            assert events[0][0] == "slimapi.meta"
-            assert events[1][0] == "resync"
-            assert events[1][1] == {"reason": "reconnect_no_replay", "sessionID": "s1"}
-            # server.connected comes right after.
-            assert events[2][0] == "server.connected"
-        finally:
-            await _close_app(app)
-
     async def test_no_sse_id_field_in_frames(self):
         """Contract: token stream NEVER emits an SSE ``id:`` field (no replay
         buffer; clients must not rely on id for resumption)."""

@@ -1,13 +1,14 @@
-"""v3-contract §3a — /slimapi/health + /slimapi/ready, single v3 view
-(terminal state: the dual view is collapsed — every admitted request ran
-``?v=3``).
+"""v3-contract §3a — /slimapi/health + /slimapi/ready.
 
 B12 (2026-08-21) three-way split: /ready is 零 v4 分叉 (v4-contract §12 —
 shape AND values frozen to the terminal v3 view regardless of the
 requested wire version) and the deploymentRevision omission holds on both
 health views, so those three functions were rewritten to the ``?v=4``
-face. The health v3-view value locks and the version-window rejection
-stay on the v3 face as Phase 3/4 guardians."""
+face. V2b (2026-08-21 Phase-4 teardown) removed the remaining v3-face
+guards (the ?v=3 view lock, the retired-header-next-to-?v=3 rejection and
+the header-only no-?v rejection) — version-window 400 coverage for the
+window itself lives in the selector test-suite.
+"""
 from __future__ import annotations
 
 import httpx
@@ -58,39 +59,6 @@ def _upstream(ok: bool = True) -> httpx.AsyncClient:
     return httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://u"
     )
-
-
-async def test_health_single_v3_view():
-    """v3 view lock (B12 ② guard net, temporarily flipped at the 2026-08-21
-    narrowing): ``?v=3`` used to answer the terminal v3 view triplet; it
-    now answers the unsupported-version 400 face. V2b deletes this guard
-    with the v3 view removal."""
-    app = _build_app(_upstream())
-    async with _client(app) as client:
-        r = await client.get("/slimapi/health?v=3")
-        assert r.status_code == 400
-        assert r.json() == {"code": "unsupported_version", "supported": [4]}
-
-
-async def test_health_retired_header_cannot_change_view():
-    """The retired X-Slimapi-Version header is not read — any value next to
-    a ?v=3 request cannot rescue it across the window narrowing."""
-    app = _build_app(_upstream())
-    async with _client(app) as client:
-        for value in ("2", "3", "9"):
-            r = await client.get("/slimapi/health?v=3",
-                                 headers={"X-Slimapi-Version": value})
-            assert r.status_code == 400
-            assert r.json() == {"code": "unsupported_version", "supported": [4]}
-
-
-async def test_health_no_v_rejected():
-    app = _build_app(_upstream())
-    async with _client(app) as client:
-        r = await client.get("/slimapi/health",
-                             headers={"X-Slimapi-Version": "2"})
-        assert r.status_code == 400
-        assert r.json() == {"code": "unsupported_version", "supported": [4]}
 
 
 async def test_ready_v4_request_keeps_frozen_v3_view_no_contract_field():
