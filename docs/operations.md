@@ -172,6 +172,8 @@ sudo loginctl enable-linger "$USER"
 
 代码升级 / 发版后部署流程（**三步缺一不可**）：
 
+> **分支纪律（batch3 v4 分支，B6）**：本机部署**仅允许 main 分支 HEAD 且已发版 tag**——部署前先 `git branch --show-current`（必须 `main`）+ `git describe --tags --exact-match`（必须命中 tag）。`v4` 分支**拒绝部署**（merge gate 未通过；merge 回 main 并 `release.sh major` 之后才可在 main 部署）。`scripts/release.sh` 对 v4 分支已内置同样的非零退出防线。
+
 ```bash
 cd /home/mar/personal_projects/oc-slimapi
 git pull                                          # 1. 拉代码（含 pyproject version）
