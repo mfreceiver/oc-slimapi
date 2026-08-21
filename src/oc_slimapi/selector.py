@@ -297,15 +297,17 @@ def _is_v4_directory_retired(normalized_path: str) -> bool:
     )
 
 
-def _directory_consuming_for(normalized_path: str, wire_version: int) -> bool:
-    """§5.2 version-forked consuming-set membership.
+def _directory_consuming_for(normalized_path: str) -> bool:
+    """§5.2 consuming-set membership under the v4-only window.
 
-    v4 = v3 set − the retirement table (only the global sessions list
-    leaves); v3 and every lower view see the full v3 set. Callers must
-    still handle the retired route SEPARATELY (any directory input on it
-    is a 400 ``directory_retired_in_v4``, not tolerant passthrough).
+    v4 = the historical v3 set − the retirement table (only the global
+    sessions list leaves); callers must still handle the retired route
+    SEPARATELY (any directory input on it is a 400
+    ``directory_retired_in_v4``, not tolerant passthrough). (The
+    ``wire_version`` parameter of the (3, 4) dual-window era was removed
+    with the 2026-08-21 narrowing — only the v4 set remains.)
     """
-    if wire_version >= 4 and _is_v4_directory_retired(normalized_path):
+    if _is_v4_directory_retired(normalized_path):
         return False
     return _is_directory_consuming(normalized_path)
 
@@ -368,28 +370,22 @@ def selector_info_from_scope(scope: Scope) -> dict[str, Any]:
 
 
 def wire_view_from_scope(scope: Scope) -> int:
-    """§2/S-B04: the wire view this request runs — read from the selector
-    stash ("4" under the v4-only window), defaulting to 3.
+    """§2/S-B04: the wire view this request runs — 4 (the only live view).
 
-    The selector is the ONLY way a request enters the v4 face, so:
-
-    * selector-admitted ``?v=4`` → the stash's wire value
-      (same source the selectorResult was recorded from);
-    * rejected / exempt / not-applicable or selector-less stacks (direct
-      route invocation in tests) → the DEFAULT v3 view — every existing
-      test and route keeps observing 3 unless it explicitly sent ``?v=4``
-      through the selector. (The v4-only (4, 4) window retired ?v=3
-      admission — the default-3 fallback is the v3-face teardown surface
-      guarded by the Phase 4 selector-less tests.)
+    The selector stashes ``"4"`` for admitted ``?v=4`` requests; every
+    other scope — rejected / exempt / not-applicable (which never reach
+    routes) and selector-less direct invocation in tests — ALSO observes
+    4: the historical default-3 fallback was the v3-face teardown surface
+    and was flipped to 4 with the 2026-08-21 V2b narrowing teardown (the
+    stash-read mechanism is retained for a future widened window; under
+    the (4, 4) window every leg resolves to 4, so the value is returned
+    directly).
 
     Kept as a function so the call sites stay explicit about where the
     view comes from (health/versions/routes must all read THIS value —
-    mismatched 3/4 combinations are structurally impossible, S-B04).
+    mismatched view combinations are structurally impossible, S-B04).
     """
-    info = selector_info_from_scope(scope)
-    if info.get("wire") == "4":
-        return 4
-    return 3
+    return 4
 
 
 def _has_directory_query_pair(query_string: bytes) -> bool:
@@ -614,7 +610,7 @@ class SlimapiSelectorMiddleware:
                 )(scope, receive, send)
                 return
 
-        error = self._consume_directory(scope, normalized, int(wire))
+        error = self._consume_directory(scope, normalized)
         if error is not None:
             _stash(scope, SELECTOR_REJECTED, None)
             await json_response(
@@ -640,7 +636,7 @@ class SlimapiSelectorMiddleware:
         )(scope, receive, send)
 
     def _consume_directory(
-        self, scope: Scope, normalized_path: str, wire_version: int,
+        self, scope: Scope, normalized_path: str,
     ) -> dict[str, Any] | None:
         """§5.1/§5.2/§8.3 ③ directory consumption for an admitted request.
 
@@ -671,13 +667,13 @@ class SlimapiSelectorMiddleware:
         accepted no-op (no stash, no strip — the query flows to the route
         verbatim). Header-form errors (cases 2/3) apply to it unchanged.
         """
-        if wire_version >= 4 and _is_v4_directory_retired(normalized_path):
+        if _is_v4_directory_retired(normalized_path):
             if _has_directory_query_pair(
                 scope.get("query_string", b"") or b""
             ) or _has_directory_header(scope):
                 return dict(_DIRECTORY_RETIRED_IN_V4_BODY)
             return None
-        if not _directory_consuming_for(normalized_path, wire_version):
+        if not _directory_consuming_for(normalized_path):
             # §5.5 tolerant-ignore set: any form accepted, no consumption,
             # no strip, no error.
             return None

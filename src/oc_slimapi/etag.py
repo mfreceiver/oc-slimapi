@@ -47,7 +47,7 @@ class _ConfigLike(Protocol):
 
 
 def representation_version(
-    config: _ConfigLike, *, wire_view: int = 3,
+    config: _ConfigLike, *, wire_view: int = 4,
 ) -> bytes:
     """REP_VERSION = projection version + config fingerprint.
 
@@ -61,11 +61,14 @@ def representation_version(
     v3-contract §6.1: the fingerprint also carries a **wire-view marker**
     (``wire=v{view}``) — validators from different wire domains never
     cross-match (a cross-view ``If-None-Match`` must never 304). The
-    marker is GENERALISED (M3-5 structural terminal enforcement): the
-    default view is the terminal 3 and there is no v2 special-case branch
-    left in the code; any future version simply passes its own integer
-    and gets its own isolated domain (one one-time 304-miss round per
-    rotation, by design — the same cost as any representation change).
+    marker is GENERALISED (M3-5 structural terminal enforcement): there
+    is no v2/v3 special-case branch in the code; any view simply passes
+    its own integer and gets its own isolated domain (one one-time
+    304-miss round per rotation, by design — the same cost as any
+    representation change). (V2b: the DEFAULT view flipped 3 → 4 with the
+    v4-only narrowing teardown — every production call site passes the
+    view explicitly, so only default-reliant pure-function callers, i.e.
+    tests, observe the change.)
     """
     fingerprint_parts = [
         _ETAG_SCHEME_VERSION,
@@ -89,7 +92,7 @@ def representation_version(
 
 
 def response_rep_version(
-    config: _ConfigLike | None, *, wire_view: int = 3,
+    config: _ConfigLike | None, *, wire_view: int = 4,
 ) -> bytes | None:
     """REP_VERSION for response emission, or ``None`` when ETag/304 is
     disabled (``etag_enabled=false`` → byte-identical legacy behaviour)."""

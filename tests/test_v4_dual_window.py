@@ -287,13 +287,15 @@ async def test_v4_wire_stash():
 
 
 def test_wire_view_from_scope_unit():
-    """Stash-read mechanism on the only admitted wire. The default-view
-    legs (no stash → 3) were the Phase-4 guard pins and are removed with
-    the V2b test teardown; the src lane re-asserts the flipped default
-    (no stash → 4) when the physical v3 removal lands."""
+    """Stash-read mechanism on the only admitted wire, and the flipped
+    default: no stash (selector-less direct invocation) → 4 as well —
+    the default-3 fallback was removed with the V2b src teardown."""
     assert wire_view_from_scope(
         {"state": {sel.SELECTOR_STATE_KEY: {"result": "v4", "wire": "4"}}}
     ) == 4
+    # Flipped default (V2b): selector-less scopes run the v4 view.
+    assert wire_view_from_scope({"state": {}}) == 4
+    assert wire_view_from_scope({}) == 4
 
 
 async def test_v4_sessions_directory_query_single_retired():
@@ -431,14 +433,14 @@ def test_directory_fork_is_set_difference():
         "/slimapi/question/q1/reject",
     ]
     for path in kept:
-        assert sel._directory_consuming_for(path, 4), path
+        assert sel._directory_consuming_for(path), path
     # The retired route: retired under wire 4 (its v3 consumption ends with
     # the Phase-4 teardown).
-    assert not sel._directory_consuming_for("/slimapi/sessions", 4)
+    assert not sel._directory_consuming_for("/slimapi/sessions")
     # Tolerant routes stay tolerant.
     for path in ("/slimapi/versions", "/slimapi/health", "/slimapi/ready",
                  "/slimapi/metrics.traffic"):
-        assert not sel._directory_consuming_for(path, 4), path
+        assert not sel._directory_consuming_for(path), path
 
 
 async def test_v4_repeated_same_value_folds():

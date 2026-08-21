@@ -946,8 +946,10 @@ async def test_v4_etag_disabled_still_varies():
 
 
 async def test_selector_less_stack_defaults_to_v3_passthrough():
-    # wire_view_from_scope defaults to 3 without the selector stash —
-    # direct route invocation keeps the frozen v3 passthrough.
+    # (V2b default flip: wire_view_from_scope is constant 4 — the
+    # selector-less direct invocation now runs the §12 safe-projection
+    # pipeline, same as the ?v=4 face; the frozen v3 byte-identical
+    # passthrough face no longer exists.)
     payload = _canonical(_rich_doc())
     handler = _ok(payload)
     seen: list[httpx.Request] = []
@@ -974,7 +976,7 @@ async def test_selector_less_stack_defaults_to_v3_passthrough():
                                  base_url="http://slimapi") as client:
         r = await client.get(ROUTE, headers=IDENTITY)
     assert r.status_code == 200
-    assert r.content == payload
+    assert r.content == _canonical(_rich_projected())
 
 
 # --- directory consumption (②) ---------------------------------------------

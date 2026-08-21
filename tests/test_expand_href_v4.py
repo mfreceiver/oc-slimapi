@@ -393,17 +393,17 @@ async def test_route_v4_merged_part_level_href_survives_unspliced(
     assert b"?v=3" not in r.content
 
 
-async def test_route_selectorless_stack_defaults_to_v3(upstream_factory):
+async def test_route_selectorless_stack_defaults_to_v4(upstream_factory):
     """Selector-less stack (no middleware, direct route invocation):
-    ``wire_view_from_scope`` defaults to 3 — historical v3 hrefs."""
+    ``wire_view_from_scope`` is constant 4 (V2b default flip) — v4 hrefs."""
     async with _route_client(
         upstream_factory, _list_handler([_rich_message()]), selector=False,
     ) as client:
         r = await client.get("/slimapi/messages/s1", headers=IDENTITY)
     assert r.status_code == 200
-    assert b'"href":"/slimapi/messages/s1/expand/info_summary_diffs/m1?v=3"' \
+    assert b'"href":"/slimapi/messages/s1/expand/info_summary_diffs/m1?v=4"' \
         in r.content
-    assert b"?v=4" not in r.content
+    assert b"?v=3" not in r.content
 
 
 async def test_expand_endpoint_v4_envelope_bytes_frozen(upstream_factory):

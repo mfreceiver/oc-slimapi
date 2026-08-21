@@ -236,64 +236,14 @@ async def test_sessions_list_oversize_body_returns_413(upstream_factory):
 
 # ---------------------------------------------------------------------------
 # slimapi no longer gates directories (regression coverage)
+#
+# (The two sessions-LIST directory locks — unknown ``?directory=/nope``
+# passthrough and trailing-slash normalisation before forward — were
+# removed with the V2b src teardown: the v4 facade ignores the directory
+# axis entirely on the global list (the selector retires the channel
+# pre-route in production; §5.2). Directory forwarding stays locked for
+# the directory-consuming routes in test_selector.py / test_directory.py.)
 # ---------------------------------------------------------------------------
-
-async def test_sessions_list_unknown_directory_passes_through(upstream_factory):
-    """``GET /slimapi/sessions?directory=/nope`` used to 400 with
-    ``directory_not_allowed`` when ``/nope`` was outside the discovery
-    allowlist. slimapi now normalises and forwards; opencode decides.
-
-    Locks the new passthrough on the sessions-list endpoint specifically
-    (batch /sessions/status and per-session /sessions/{sid}/status are
-    covered by sibling tests).
-    """
-    captured: dict[str, str | None] = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/session":
-            captured["dir"] = request.headers.get("x-opencode-directory")
-            captured["query"] = request.url.params.get("directory")
-            return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
-        return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
-
-    upstream = upstream_factory(handler)
-    app = _build_app(upstream)
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get(
-            "/slimapi/sessions?directory=/nope", headers=VERSION_HEADERS,
-        )
-    assert response.status_code == 200
-    # v3 terminal: consumed by the sidecar, forwarded as the header only.
-    assert captured["query"] is None
-    assert captured["dir"] == "/nope"
-
-
-async def test_sessions_list_normalizes_trailing_slash_before_forward(upstream_factory):
-    """``?directory=/app/`` (trailing slash) is forwarded normalised as
-    ``/app`` in both query and header — the allowlist gate is gone but
-    ``normalize_directory`` stays for forwarding consistency."""
-    captured: dict[str, str | None] = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/session":
-            captured["dir"] = request.headers.get("x-opencode-directory")
-            captured["query"] = request.url.params.get("directory")
-            return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
-        return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
-
-    upstream = upstream_factory(handler)
-    app = _build_app(upstream)
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get(
-            "/slimapi/sessions?directory=/app/", headers=VERSION_HEADERS,
-        )
-    assert response.status_code == 200
-    # v3 terminal: ?directory is consumed by the sidecar and forwarded as
-    # the X-Opencode-Directory header only (no upstream query re-add).
-    assert captured["query"] is None
-    assert captured["dir"] == "/app"
 
 
 # ---------------------------------------------------------------------------
@@ -320,11 +270,14 @@ async def test_sessions_completeness_headers_absent_on_5xx(upstream_factory):
 
 
 async def test_sessions_x_complete_true_when_below_limit(upstream_factory):
-    """len < limit → X-Complete: true (not "full page")."""
+    """len < limit → complete: true in the envelope (V2b: the v4 facade
+    computes the same best-effort flag on the Class A HTTP fallback)."""
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=orjson.dumps([
-            {"id": "s1", "directory": "/a"},
-            {"id": "s2", "directory": "/a"},
+            {"id": "s1", "title": "t", "directory": "/a",
+             "time": {"created": 1, "updated": 1}},
+            {"id": "s2", "title": "t", "directory": "/a",
+             "time": {"created": 2, "updated": 2}},
         ]), headers={"Content-Type": "application/json"})
 
     upstream = upstream_factory(handler)
@@ -339,11 +292,13 @@ async def test_sessions_x_complete_true_when_below_limit(upstream_factory):
 
 
 async def test_sessions_x_complete_false_at_limit(upstream_factory):
-    """len == limit → X-Complete: false (page is full; raise limit to recheck)."""
+    """len == limit → complete: false (page is full; raise limit to recheck)."""
     def handler(request: httpx.Request) -> httpx.Response:
         # 5 items, limit=5 → full.
         return httpx.Response(200, content=orjson.dumps([
-            {"id": f"s{i}", "directory": "/a"} for i in range(5)
+            {"id": f"s{i}", "title": "t", "directory": "/a",
+             "time": {"created": i, "updated": i}}
+            for i in range(5)
         ]), headers={"Content-Type": "application/json"})
 
     upstream = upstream_factory(handler)
@@ -357,29 +312,11 @@ async def test_sessions_x_complete_false_at_limit(upstream_factory):
     assert response.json()["complete"] is False
 
 
-async def test_sessions_roots_default_unchanged_false(upstream_factory):
-    """``roots`` Query default is False — upstream must see ``roots=false``
-    when the client omits the param. v6 explicitly does NOT flip the default;
-    clients are advised to pass ``roots=true`` to exclude subagent sessions."""
-    captured: dict[str, str | None] = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured["roots"] = request.url.params.get("roots")
-        return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
-
-    upstream = upstream_factory(handler)
-    app = _build_app(upstream)
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        # No roots= param → default.
-        r = await client.get("/slimapi/sessions", headers=VERSION_HEADERS)
-    assert r.status_code == 200
-    assert captured["roots"] == "false"
-
-    # Explicit roots=true still passes through.
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        r = await client.get("/slimapi/sessions?roots=true", headers=VERSION_HEADERS)
-    assert captured["roots"] == "true"
+# (test_sessions_roots_default_unchanged_false was removed with the V2b src
+# teardown: it locked the v3 leg's ``roots=false`` default forwarding (and
+# the explicit ``roots=true`` passthrough). Under the v4-only facade
+# ``roots`` is a v3-only parameter — present → 422 param_version_mismatch
+# (locked in tests/test_sessions_v4_matrix.py), absent → not forwarded.)
 
 
 async def test_sessions_list_scalar_element_list_returns_503(upstream_factory):

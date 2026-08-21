@@ -3,7 +3,6 @@ from starlette.responses import StreamingResponse
 
 from ..errors import CodedHTTPException
 from ..gzip_util import json_response
-from ..selector import wire_view_from_scope
 from ..sse.hub import STOP, SubscriberCapacityError, sse_frame
 from ..sse.replay_log import (
     GLOBAL_DOMAIN,
@@ -24,19 +23,6 @@ TOKENS_STREAM_RETIRED_IN_V4 = {
 }
 
 
-def _request_wire_v4(request: Request) -> bool:
-    """True iff this request runs the v4 wire face (§2 selector stash).
-
-    Selector-less stacks (direct route invocation in tests, mock requests
-    without ``.scope``) observe the default v3 view — identical to
-    :func:`~oc_slimapi.selector.wire_view_from_scope` semantics.
-    """
-    scope = getattr(request, "scope", None)
-    if scope is None:
-        return False
-    return wire_view_from_scope(scope) == 4
-
-
 @router.get("/events")
 async def events(request: Request, tokens: str | None = None):
     """Process-wide curated SSE stream.
@@ -50,23 +36,17 @@ async def events(request: Request, tokens: str | None = None):
     which we map to a 503 with ``Retry-After`` so the client backs off and
     retries instead of burning an upstream connection.
 
-    ``?tokens=1`` (L2-A, additive): additionally receive lean ``token``
-    frames — coalesced per-``(sessionID, messageID, partID)`` window concats
-    fanned from the token-stream flush loop (reusing its existing 100ms /
-    4KiB coalescing). Absent (default) = current behaviour unchanged. Only
-    the literal value ``"1"`` is legal; anything else → 400 ``invalid_tokens``
-    (same strictness as the messages ``directory_not_allowed`` structural
-    guard). ``tokens=1`` covers ALL sessions' coalesced deltas (no per-sid
-    filter, MVP) and is mutually exclusive with the per-session token stream
-    at the CLIENT (server does not force-disconnect a double-subscriber).
-
-    v3 (§7.2, Batch D): a ``?v=3`` request gets a leading
-    ``slimapi.meta`` first frame — ``{"subscriberId": <id>, "tokens": <bool>}``
-    (``tokens`` = whether ``tokens=1`` was attached) — before ANY business
-    frame, heartbeat, or Last-Event-ID resync replay; the response-header id
-    frame replaces the retired ``X-Slimapi-Subscriber-ID`` header (§1:
-    removed at 3.0.0 — never produced; the meta frame's ``subscriberId``
-    is the sole id channel).
+    ``?tokens=1`` is RETIRED on the v4-only face — flat 400
+    ``tokens_stream_retired_in_v4`` (§7.3) before the stream opens; only
+    the literal value ``"1"`` reaches the retirement check (anything else
+    → 400 ``invalid_tokens``). A first frame ``slimapi.meta`` —
+    ``{"subscriberId": <id>, "tokens": false}`` — always precedes ANY
+    business frame, heartbeat, or replay (the ``tokens`` key is the
+    frozen meta field set; it is always ``false`` now that ``tokens=1``
+    is retired — the v3-only L2-A token attach was removed with the V2b
+    src teardown). The meta frame's ``subscriberId`` is the sole id
+    channel (the ``X-Slimapi-Subscriber-ID`` header was removed at
+    3.0.0 — never produced).
 
     v4 (B3b-2, v4-contract §7 / design-v4-sse-replay):
 
@@ -88,8 +68,10 @@ async def events(request: Request, tokens: str | None = None):
     if tokens is not None and tokens != "1":
         raise CodedHTTPException(400, code="invalid_tokens")
 
-    v4 = _request_wire_v4(request)
-    if v4 and tokens == "1":
+    # v4-only (4, 4) window: every request runs the v4 wire face (the
+    # selector-less default-3 leg was removed with the V2b src teardown —
+    # ``wire_view_from_scope`` is constant 4 now).
+    if tokens == "1":
         # §7.3: tokens=1 retired in v4 — flat coded error before the stream
         # opens (no SSE bytes, no subscriber slot consumed).
         raise CodedHTTPException(
@@ -112,11 +94,11 @@ async def events(request: Request, tokens: str | None = None):
     # carries every frame published after attach, so a frame can never be
     # delivered twice and none can fall in the gap.
     replay_plan = None
-    if v4 and replay_log is not None:
+    if replay_log is not None:
         replay_plan = classify_reconnect(
             last_event_id, replay_log, domain=GLOBAL_DOMAIN,
         )
-    elif v4 and last_event_id:
+    elif last_event_id:
         # No replay infrastructure on this app (minimal/test stack): a
         # reconnect cursor we cannot evaluate is NEVER first-connect — the
         # client may be missing frames we have no record of. Fail safe with
@@ -125,11 +107,12 @@ async def events(request: Request, tokens: str | None = None):
 
     try:
         # rev-gate BLOCKER-1 / condition 5: the wire version flows INTO
-        # the subscription — v4 suppresses the connection-local
+        # the subscription — the v4 face suppresses the connection-local
         # ``server.connected`` welcome frame (outside the frozen no-id
         # control set; must not bypass the replay log) and is stamped on
         # the subscriber so fanout frames carry ``id:`` from the start.
-        subscriber = request.app.state.hubs.subscribe(wire_v4=v4)
+        # (Constant ``True`` under the v4-only window.)
+        subscriber = request.app.state.hubs.subscribe(wire_v4=True)
     except SubscriberCapacityError as exc:
         return json_response(
             {"code": exc.code, "limit": exc.limit, "current": exc.current},
@@ -148,18 +131,16 @@ async def events(request: Request, tokens: str | None = None):
         "subscriberId": subscriber_id,
         "tokens": tokens == "1",
     }
-    if v4 and replay_log is not None and replay_epoch is not None:
+    if replay_log is not None and replay_epoch is not None:
         meta_fields.update(
             meta_v4_extension(replay_epoch, replay_log.last_seq(GLOBAL_DOMAIN))
         )
     meta = sse_frame(meta_fields, event="slimapi.meta")
-    # L2-A: opt-in token frames. The events subscriber becomes a first-class
-    # consumer of the token flush loop (TokenStreamRegistry.events_tokens +
-    # TokenStreamHub.events_tap) so token frames arrive at ~100ms cadence and
-    # the flush loop stays alive even when no per-session stream is open.
-    token_registry = getattr(request.app.state, "token_registry", None)
-    if tokens == "1" and token_registry is not None:
-        token_registry.attach_events_subscriber(subscriber)
+    # (L2-A v3 face: ``tokens=1`` attached the events subscriber to the
+    # token flush loop (TokenStreamRegistry.events_tokens / events_tap) so
+    # lean ``token`` frames arrived at ~100ms cadence. Removed with the
+    # V2b src teardown — ?tokens=1 is a flat 400 on the v4-only face, so
+    # no stream can ever open with a token consumer.)
     # Pull the traffic ledger here (not in the generator) so a missing /
     # disabled ledger does not crash the SSE path on the first yield.
     traffic_ledger = getattr(request.app.state, "traffic_ledger", None)
@@ -204,14 +185,11 @@ async def events(request: Request, tokens: str | None = None):
                         await _accounted(frame)
                         yield frame
                 # ReplayIgnoreReset → first-connect semantics: nothing.
-            elif not v4 and request.headers.get("last-event-id"):
-                # v3 (frozen): any Last-Event-ID → resync{reconnect_no_replay}.
-                # v4 NEVER reaches this branch — a ①② violation is an
-                # ignore+reset (no resync), NOT the v3 blanket resync.
-                resync = sse_frame(
-                    {"reason": RESYNC_RECONNECT_NO_REPLAY}, event="resync")
-                await _accounted(resync)
-                yield resync
+            # (The v3 blanket-resync branch — any Last-Event-ID on the v3
+            # face → leading resync{reconnect_no_replay} — was removed with
+            # the V2b src teardown: under the v4-only face the handler-time
+            # classification above ALWAYS yields a plan when a cursor is
+            # present, so there is no reachable generator-side leg left.)
             while True:
                 item = await subscriber.queue.get()
                 if item is STOP:
@@ -231,11 +209,9 @@ async def events(request: Request, tokens: str | None = None):
                 await _accounted(item)
                 yield item
         finally:
-            # L2-A: release the events-token ledger slot before the control
-            # admission slot, so the flush loop stops on the true last-detach
-            # (both ledgers empty) and GlobalHub grace re-arms symmetrically.
-            if tokens == "1" and token_registry is not None:
-                token_registry.detach_events_subscriber(subscriber)
+            # (The L2-A events-token ledger detach — released before the
+            # control admission slot on the v3 face — was removed with the
+            # attach above: no token consumer can exist on the v4 face.)
             # Must go through HubRegistry.unsubscribe (not GlobalHub) so
             # total_subscribers is decremented — otherwise the registry
             # counter leaks and admission permanently 503s after the cap.

@@ -18,7 +18,9 @@ from ... import etag as etag_mod
 from ... import readiness as readiness_mod
 from ...envelope import messages_envelope_bytes
 from ...gzip_util import compress_if_beneficial, error_response
-from ...selector import wire_view_from_scope
+# (V2b: the ``wire_view_from_scope`` import was removed with the v4-only
+# teardown — the view is constant 4 and the §14 href face is decided by
+# the readiness gate alone; see ``_expand_wire_view`` above.)
 from ...skeleton import SkeletonLimits, skeleton_messages
 from ...transform import TransformBusy, read_with_cap
 from ...upstream import forward_directory_headers
@@ -39,10 +41,12 @@ _V4_EXPAND_FEATURE = "messages.expand.v4"
 
 
 def _expand_wire_view(scope) -> int:
-    """§14 href view selector under the §3.3 gate: 4 iff selector view is
-    4 AND the feature is satisfied; else 3 (the 4.0.0-published href face)."""
-    if (wire_view_from_scope(scope) == 4
-            and _V4_EXPAND_FEATURE in readiness_mod.SATISFIED):
+    """§14 href view selector under the §3.3 gate: 4 iff the feature is
+    satisfied; else 3 (the 4.0.0-published href face). (V2b: the
+    wire-view fork guard was removed — wire_view_from_scope is constant 4
+    under the v4-only window, so the readiness gate alone decides; the
+    ``scope`` parameter is kept for the call sites' shape.)"""
+    if _V4_EXPAND_FEATURE in readiness_mod.SATISFIED:
         return 4
     return 3
 
@@ -90,10 +94,10 @@ def _parse_sort_project(
     emits ``expandRefs`` (design-expand §5.2) — without it, lane A's refs
     never reach the wire and the merged ref candidate set is empty.
 
-    v4 §14: ``wire_view`` is read from the selector stash by the ROUTE
-    (``wire_view_from_scope``) and threaded here so every expandRefs href
-    carries the request's view (``?v=3`` frozen / ``?v=4``). Default 3 —
-    selector-less stacks keep the historical v3 bytes.
+    v4 §14: ``wire_view`` is threaded by the ROUTE so every expandRefs href
+    carries the request's view. Since the V2b default flip it is constant 4
+    (``wire_view_from_scope`` no longer forks) — selector-less stacks emit
+    the same v4 hrefs.
 
     Batch 4 / B3: the fingerprint switch rides on ``limits.fingerprint``
     (built by the route from config) so this worker's signature is

@@ -710,14 +710,14 @@ async def test_health_auxiliary_absent_dbaux_placeholder(good_db: Path):
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         r = await c.get("/slimapi/health", params={"v": "4"}, headers=IDENTITY)
     assert r.json()["auxiliary"] == {"available": False, "mode": "http"}
-    # v3 视图零 auxiliary 键（byte-identical terminal shape 保持）——
-    # selector-less 直调锁（B12-②式；V2b 随 v3 视图拆除移除该锁）
+    # selector-less 直调（V2b 默认翻转后跑 v4 视图）→ 占位键同样呈现
+    # （v3 视图的零 auxiliary 键形态随 v3 面拆除消亡）
     app3 = _health_app(None, selector=False)
     app3.state.dbaux = None
     transport3 = ASGITransport(app=app3)
     async with httpx.AsyncClient(transport=transport3, base_url="http://t") as c:
         r3 = await c.get("/slimapi/health", headers=IDENTITY)
-    assert "auxiliary" not in r3.json()
+    assert r3.json()["auxiliary"] == {"available": False, "mode": "http"}
 
 
 async def test_health_auxiliary_real_source_states(good_db: Path):

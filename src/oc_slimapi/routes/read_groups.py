@@ -68,7 +68,6 @@ from ..selector import (
     DIRECTORY_QUERY_PARAM,
     _strip_query_keys,
     resolve_route_directory,
-    wire_view_from_scope,
 )
 from ..skeleton import (
     canonical_session_skeleton_v4,
@@ -396,12 +395,16 @@ def _V4_SESSION_SINGLE_REVISION_ACTIVE() -> bool:
 async def config_providers(request: Request, directory: str | None = None):
     """Upstream ``GET /config/providers`` — provider catalog map.
 
-    ``?v=4`` (§12): the §12 safe-projection pipeline above. ``?v=3`` /
-    selector-less default: the byte-identical v3 controlled-proxy
-    passthrough (v3 is frozen — zero change)."""
+    ``?v=4`` (§12): the §12 safe-projection pipeline above — the default
+    under the v4-only window. Gate-off (§3.3, readiness not SATISFIED):
+    the byte-identical controlled-proxy passthrough (historically the v3
+    face; kept verbatim as the readiness fallback — zero change)."""
     resolved = _resolve(request, directory)
-    if (wire_view_from_scope(request.scope) == 4
-            and _V4_PROVIDERS_REVISION_ACTIVE()):
+    # (V2b: the wire-view fork guard was removed — wire_view_from_scope is
+    # constant 4 under the v4-only window, so the readiness gate alone
+    # decides; the else leg is the §3.3 gate-OFF controlled-proxy
+    # passthrough, not a v3 face.)
+    if _V4_PROVIDERS_REVISION_ACTIVE():
         return await _handle_providers_v4(request, resolved)
     return await read_passthrough_get(
         request, upstream_path="/config/providers",
@@ -562,12 +565,16 @@ async def session_single(request: Request, sid: str,
 
     ``?v=4`` (§13): dbaux 点查 → 裸 SessionSkeletonV4（同一 canonical
     projector as v4 列表）；dbaux 不可用 → native 回退 + degraded；
-    required 不可表示 → 503。``?v=3`` / selector-less default: the
-    byte-identical v3 controlled-proxy passthrough (v3 is frozen — zero
-    change)."""
+    required 不可表示 → 503 — the default under the v4-only window.
+    Gate-off（§3.3，readiness not SATISFIED）: the byte-identical
+    controlled-proxy passthrough through ``_project_session``
+    (historically the v3 skeleton face; kept verbatim as the readiness
+    fallback — zero change)."""
     resolved = _resolve(request, directory)
-    if (wire_view_from_scope(request.scope) == 4
-            and _V4_SESSION_SINGLE_REVISION_ACTIVE()):
+    # (V2b: the wire-view fork guard was removed — wire_view_from_scope is
+    # constant 4 under the v4-only window, so the readiness gate alone
+    # decides; the else leg is the §3.3 gate-OFF v3-skeleton passthrough.)
+    if _V4_SESSION_SINGLE_REVISION_ACTIVE():
         return await _handle_session_single_v4(request, sid, resolved)
     return await read_passthrough_get(
         request, upstream_path=f"/session/{sid}",

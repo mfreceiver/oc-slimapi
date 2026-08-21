@@ -1214,21 +1214,11 @@ async def test_gate_off_list_fallback_sparse_degraded(gate_off):
 # v3 回归 / selector-less
 # ---------------------------------------------------------------------------
 
-async def test_v3_regression_skeleton_shape():
-    """B12-②-style v3-branch lock (selector-less): the frozen v3 skeleton
-    shape. V2b removes the v3 branch (and this lock) with the teardown."""
-    app, seen = _build_app(_StubAux("disabled"), selector=False)
-    async with _client(app) as client:
-        resp = await client.get("/slimapi/session/h1", headers=IDENTITY)
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body == skeleton_session(UPSTREAM_SINGLE)
-    for key in ("tokens_input", "tokens_output", "tokens_reasoning",
-                "tokens_cache_read", "tokens_cache_write", "project",
-                "partial", "degraded"):
-        assert key not in body
-    assert len(seen) == 1
-    assert seen[0].url.path == "/session/h1"
+# V2b teardown note: test_v3_regression_skeleton_shape (selector-less lock
+# asserting the frozen v3 skeleton from the session_single v3 branch) was
+# removed with the branch itself — wire_view_from_scope is constant 4 and
+# the selector-less direct invocation now runs the v4 session_single
+# pipeline. The v4 shape itself is locked by the projection tests above.
 
 
 async def test_selectorless_never_routes_v4():

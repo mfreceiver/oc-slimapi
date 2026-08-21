@@ -128,10 +128,13 @@ class _FakeTurnRegistry:
 
 
 SESSIONS_PAYLOAD = orjson.dumps([
-    {"id": f"s{n}", "title": f"session {n}",
+    {"id": f"s{n}", "title": f"session {n}", "directory": "w",
      "time": {"created": 1000 + n, "updated": 1000 + n}}
     for n in range(3)
 ])
+# (V2b note: ``directory`` added so the items stay representable under the
+# v4 canonical projector — the sessions list now runs the v4 facade on
+# every scope and an item without a directory is fail-closed 503, §13.2a.)
 
 STATUS_PAYLOAD = orjson.dumps({"s1": {"type": "idle"}})
 
@@ -140,85 +143,15 @@ STATUS_PAYLOAD = orjson.dumps({"s1": {"type": "idle"}})
 # A3-C1 — sessions list coalescing.
 # ---------------------------------------------------------------------------
 
-async def test_sessions_list_one_get_burst(upstream_factory):
-    calls = {"list": 0}
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        calls["list"] += 1
-        await asyncio.sleep(0.05)  # ensure all 20 join the same flight
-        return httpx.Response(200, content=SESSIONS_PAYLOAD)
-
-    upstream = upstream_factory(handler)
-    app = _build_app(_settings(), upstream)
-    registry = app.state.raw_fetch_registry
-    try:
-        async with _client(app) as client:
-            responses = await _get_many(
-                client, ["/slimapi/sessions?limit=100"] * 20)
-        assert calls["list"] == 1, "burst coalesces to ONE upstream GET"
-        assert all(r.status_code == 200 for r in responses)
-        # per-caller projection: identical bodies, per-caller complete
-        bodies = {r.content for r in responses}
-        assert len(bodies) == 1
-        assert {r.json()["complete"] for r in responses} == {True}
-        registry.shutdown()
-        assert registry.leased_bytes == 0
-    finally:
-        _teardown(app)
-
-
-async def test_sessions_list_x_complete_false_per_caller(upstream_factory):
-    """Projection stays per-caller: the SAME shared body projects
-    ``X-Complete`` according to each caller's own ``limit`` — here a tight
-    limit equal to the payload length flips it to false."""
-    calls = {"list": 0}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        calls["list"] += 1
-        return httpx.Response(200, content=SESSIONS_PAYLOAD)
-
-    upstream = upstream_factory(handler)
-    app = _build_app(_settings(), upstream)
-    try:
-        async with _client(app) as client:
-            big, tight = await asyncio.gather(
-                client.get("/slimapi/sessions?limit=100", headers=HDR),
-                client.get("/slimapi/sessions?limit=3", headers=HDR),
-            )
-        # limit=3 vs limit=100 are DIFFERENT keys → 2 GETs (not shared)
-        assert calls["list"] == 2
-        assert big.json()["complete"] is True
-        assert tight.json()["complete"] is False
-    finally:
-        _teardown(app)
-
-
-async def test_sessions_list_distinct_query_directory(upstream_factory):
-    calls: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(str(request.url.query))
-        return httpx.Response(200, content=SESSIONS_PAYLOAD)
-
-    upstream = upstream_factory(handler)
-    app = _build_app(_settings(), upstream)
-    try:
-        async with _client(app) as client:
-            responses = await _get_many(client, [
-                "/slimapi/sessions",
-                "/slimapi/sessions?search=x",
-                "/slimapi/sessions?directory=/a",
-                "/slimapi/sessions?directory=/b",
-            ])
-        assert all(r.status_code == 200 for r in responses)
-        assert len(calls) == 4, calls
-    finally:
-        _teardown(app)
-
-
 # ---------------------------------------------------------------------------
-# A3-C2 — sessions/status shared body + per-caller turn merge.
+# A3-C1 — sessions list coalescing. (REMOVED with the V2b src teardown: the
+# sessions list runs the v4 facade on every scope under the v4-only (4, 4)
+# window and the facade has no lease/coalesce path — the three A3-C1 list
+# tests asserted the retired join-first flight. The v4 list behavior is
+# locked by tests/test_sessions_v4_matrix.py; the registry itself stays
+# alive for sessions/STATUS below.)
 # ---------------------------------------------------------------------------
+
 
 async def test_status_body_shared_turn_merge_per_caller(upstream_factory):
     """The upstream body is fetched once; the turn merge runs per-caller at
@@ -349,35 +282,23 @@ async def test_status_cross_app_not_merged(upstream_factory):
     try:
         async with _client(app_a) as client_a, _client(app_b) as client_b:
             await asyncio.gather(
-                _get_many(client_a, ["/slimapi/sessions"] * 3),
-                _get_many(client_b, ["/slimapi/sessions"] * 3),
+                _get_many(client_a, ["/slimapi/sessions/status"] * 3),
+                _get_many(client_b, ["/slimapi/sessions/status"] * 3),
             )
         assert calls == {"a": 1, "b": 1}
     finally:
         _teardown(app_a)
         _teardown(app_b)
+        # (V2b note: this was originally a sessions-LIST cross-app test;
+        # the list lease flight was removed with the v4-only teardown, so
+        # it now guards the STATUS flight's cross-app isolation instead.)
 
 
-async def test_list_upstream_5xx_all_waiters_503(upstream_factory):
-    calls = {"list": 0}
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        calls["list"] += 1
-        await asyncio.sleep(0.05)
-        return httpx.Response(500, content=b"boom")
-
-    upstream = upstream_factory(handler)
-    app = _build_app(_settings(), upstream)
-    try:
-        async with _client(app) as client:
-            responses = await _get_many(
-                client, ["/slimapi/sessions"] * 6)
-        assert calls["list"] == 1
-        assert all(r.status_code == 503 for r in responses)
-        codes = {orjson.loads(r.content).get("code") for r in responses}
-        assert codes == {"upstream_unavailable"}
-    finally:
-        _teardown(app)
+# (test_list_upstream_5xx_all_waiters_503 — the LIST half of the 5xx
+# propagation family — was removed with the V2b src teardown: the list
+# lease flight no longer exists; the v4 facade's per-caller 5xx → 503
+# mapping is locked by tests/test_sessions_v4_matrix.py. The STATUS
+# waiters variant below keeps guarding the shared-flight failure shape.)
 
 
 async def test_coalesce_disabled_bypass(upstream_factory):
@@ -429,144 +350,9 @@ async def test_status_upstream_5xx_all_waiters_503(upstream_factory):
 
 # ---------------------------------------------------------------------------
 # rev-gpt B1 — lease path keeps the direct path's admission semantics.
+# (REMOVED with the V2b src teardown: both tests drove the sessions-LIST
+# lease path via monkeypatched ``sessions._project_sessions`` / the
+# orjson spy — the list lease no longer exists under the v4-only window
+# and the helper was physically removed. The v4 facade's own
+# admission-under-busy discipline is locked by tests/test_sessions_v4_matrix.py.)
 # ---------------------------------------------------------------------------
-
-async def test_list_projection_admission_busy_semantics_unchanged(
-        upstream_factory, monkeypatch):
-    """rev-gpt B1: the lease path must NOT bypass TransformPool admission.
-    With a slow projection and a tight pool wait (max_transforms=1,
-    transform_wait_seconds=0.05) coalesced callers get either the 200
-    projection or the direct path's byte-identical 503 ``transform_busy``
-    shape — while still sharing ONE upstream list GET. Busy callers release
-    their lease refs (no shared-body budget leak)."""
-    import time
-
-    calls = {"list": 0}
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        calls["list"] += 1
-        await asyncio.sleep(0.05)  # all four join the SAME in-flight fetch
-        return httpx.Response(200, content=SESSIONS_PAYLOAD)
-
-    upstream = upstream_factory(handler)
-    app = _build_app(
-        _settings(max_transforms=1, transform_wait_seconds=0.05), upstream)
-    registry = app.state.raw_fetch_registry
-
-    real_project = sessions._project_sessions
-
-    def slow_project(payload):
-        time.sleep(0.15)  # hold the single transform slot past the 0.05s wait
-        return real_project(payload)
-
-    monkeypatch.setattr(sessions, "_project_sessions", slow_project)
-    try:
-        async with _client(app) as client:
-            responses = await _get_many(client, ["/slimapi/sessions"] * 4)
-        # join-first sharing is unaffected by the busy discipline
-        assert calls["list"] == 1
-        outcomes = set()
-        for r in responses:
-            if r.status_code == 200:
-                outcomes.add("ok")
-            else:
-                # byte-identical busy shape vs the direct path
-                assert r.status_code == 503, r.status_code
-                body = orjson.loads(r.content)
-                assert body["code"] == "transform_busy"
-                assert r.headers.get("retry-after") == "2"
-                outcomes.add("busy")
-        # WITHOUT admission (the B1 defect) every caller queues unbounded
-        # and outcomes == {"ok"}; WITH it, the slot holder projects while
-        # the other three hit the direct path's busy 503.
-        assert outcomes == {"ok", "busy"}
-        # every caller released its lease ref — no shared-body budget leak
-        registry.shutdown()
-        assert registry.leased_bytes == 0
-    finally:
-        _teardown(app)
-
-
-async def test_list_json_parse_inside_admission(upstream_factory, monkeypatch):
-    """rev-gpt B1-residual: the lease path must expand the shared body only
-    AFTER acquiring the transform slot — joiners queued on admission hold
-    the raw shared bytes only, never a per-caller JSON object graph (plan
-    :110,179; mirrors the direct path's fetch→parse→project-under-admission
-    and messages.py:710-723)."""
-    import time
-
-    calls = {"list": 0}
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        calls["list"] += 1
-        await asyncio.sleep(0.05)  # all four join the SAME in-flight fetch
-        return httpx.Response(200, content=SESSIONS_PAYLOAD)
-
-    upstream = upstream_factory(handler)
-    # defaults: max_transforms=1, transform_wait_seconds=0.5 → three of the
-    # four callers QUEUE on admission while the slot holder projects.
-    app = _build_app(_settings(), upstream)
-    registry = app.state.raw_fetch_registry
-    real_pool = app.state.transforms
-    real_orjson = orjson
-
-    events: list[str] = []
-
-    class _AdmissionSpy:
-        async def __aenter__(self):
-            events.append("acquire")
-            return await real_pool.__aenter__()
-
-        async def __aexit__(self, *exc):
-            events.append("release")
-            return await real_pool.__aexit__(*exc)
-
-        def offload(self, *args, **kwargs):
-            return real_pool.offload(*args, **kwargs)
-
-        def shutdown(self):
-            return real_pool.shutdown()
-
-    app.state.transforms = _AdmissionSpy()
-
-    class _OrjsonSpy:
-        def loads(self, data):
-            events.append("loads")
-            return real_orjson.loads(data)
-
-        def __getattr__(self, name):
-            return getattr(real_orjson, name)
-
-    monkeypatch.setattr(sessions, "orjson", _OrjsonSpy())
-
-    real_project = sessions._project_sessions
-
-    def slow_project(payload):
-        time.sleep(0.08)  # hold the single slot so the others queue
-        return real_project(payload)
-
-    monkeypatch.setattr(sessions, "_project_sessions", slow_project)
-    try:
-        async with _client(app) as client:
-            responses = await _get_many(client, ["/slimapi/sessions"] * 4)
-        assert calls["list"] == 1
-        assert all(r.status_code == 200 for r in responses)
-        # Ordering lock: every ``orjson.loads`` happens only after its
-        # caller holds an admission slot — at any prefix of the event
-        # stream the number of parses never exceeds the number of
-        # acquires. Pre-fix the FIRST caller parses before ANY acquire
-        # (parse lived ahead of the pool section) and this fails.
-        acquires = 0
-        for ev in events:
-            if ev == "acquire":
-                acquires += 1
-            elif ev == "loads":
-                assert acquires >= 1, (
-                    "JSON parsed before transform admission — queued "
-                    "joiners would hold expanded object graphs"
-                )
-        assert events.count("loads") == 4  # one parse per caller, in-slot
-        registry.shutdown()
-        assert registry.leased_bytes == 0
-    finally:
-        _teardown(app)

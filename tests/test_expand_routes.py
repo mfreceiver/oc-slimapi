@@ -1180,11 +1180,11 @@ async def test_merged_diffs_stay_null_with_expand_refs(upstream_factory):
     item = _json(r)["items"][0]
     assert item["info"]["summary"]["diffs"] is None
     refs = item["info"]["expandRefs"]
-    # Selector-less stack: default view 3 -> the frozen v3 href face
-    # (V2b retargets this to the v4 face with the v3-branch teardown).
+    # Selector-less stack: wire_view_from_scope is constant 4 (V2b default
+    # flip) -> the v4 href face.
     assert refs == [{
         "category": "info_summary_diffs", "messageID": "m_ph",
-        "href": "/slimapi/messages/s1/expand/info_summary_diffs/m_ph?v=3",
+        "href": "/slimapi/messages/s1/expand/info_summary_diffs/m_ph?v=4",
     }]
 
 

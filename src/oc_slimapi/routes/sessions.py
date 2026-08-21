@@ -21,17 +21,16 @@ from ..dbaux.cursor import (
     fingerprint_mismatch,
 )
 from ..directory import validate_directory
-from ..envelope import sessions_envelope_payload, sessions_envelope_v4
+from ..envelope import sessions_envelope_v4
 from ..errors import CodedHTTPException
 from .. import etag as etag_mod
 from .. import readiness as readiness_mod
 from ..gzip_util import accepts_gzip, json_response
-from ..selector import resolve_route_directory, wire_view_from_scope
+from ..selector import resolve_route_directory
 from ..skeleton import (
     canonical_session_skeleton_v4,
     native_session_to_record,
     project_rows_to_v4_skeletons,
-    skeleton_session,
 )
 from ..traffic import stash_up_in
 from ..transform import TransformBusy, read_with_cap
@@ -45,156 +44,18 @@ router = APIRouter(prefix="/slimapi", tags=["sessions"])
 # ---------------------------------------------------------------------------
 # Upstream-fetch coalescing (traffic plan Batch 1 / A3, §3.x join-first).
 #
-# Both endpoints share ONLY the upstream GET (+ cap-read / status mapping):
-# the skeleton projection, ``X-Complete`` computation and the TurnRegistry
-# merge stay per-caller. A full registry budget (``fetch_or_bypass`` →
-# ``None``) falls back to the unchanged admission-first direct path.
+# (The sessions-LIST lease family — ``_canonical_sessions_query`` /
+# ``_fetch_sessions_raw`` / ``_finalize_sessions_response`` /
+# ``_sessions_via_lease`` — was removed with the V2b src teardown: the
+# v4 facade (``_sessions_v4``) has no lease path, and under the v4-only
+# (4, 4) window every request runs the facade. The registry itself stays
+# alive for sessions/STATUS below, which keeps its own lease flight.)
+#
+# sessions/status shares ONLY the upstream GET (+ status mapping): the
+# TurnRegistry merge stays per-caller. A full registry budget
+# (``fetch_or_bypass`` → ``None``) falls back to the unchanged direct
+# path.
 # ---------------------------------------------------------------------------
-
-def _canonical_sessions_query(
-    limit: int, roots: bool, start: int | None, search: str | None,
-) -> str:
-    """Deterministic sorted query for the list key (directory is a separate
-    key component — it is both a query param and a routing header)."""
-    parts: dict[str, str] = {"limit": str(limit), "roots": str(roots).lower()}
-    if start is not None:
-        parts["start"] = str(start)
-    if search is not None:
-        parts["search"] = search
-    return "&".join(f"{name}={parts[name]}" for name in sorted(parts))
-
-
-async def _fetch_sessions_raw(
-    request: Request, params: dict, directory: str | None, *, cap: int,
-) -> bytes | None:
-    """Shared factory body: ONE upstream ``GET /session`` + cap-read."""
-    try:
-        response = await request.app.state.upstream.send(
-            request.app.state.upstream.build_request(
-                "GET", "/session",
-                params=params, headers=forward_directory_headers(directory),
-            ),
-            stream=True,
-        )
-    except httpx.RequestError as exc:
-        raise_upstream_unavailable(exc)
-    try:
-        return await read_upstream_response(
-            request, response,
-            cap=cap,
-            read_with_cap=read_with_cap,
-        )
-    finally:
-        await response.aclose()
-
-
-def _finalize_sessions_response(
-    request: Request, sessions: list[dict], limit: int,
-    accept_encoding: str | None,
-) -> Response:
-    """Shared response tail for BOTH sessions-list paths.
-
-    Batch 2 / B1: per-caller conditional-request evaluation AFTER the
-    pipeline (shared or direct GET + projection) has fully run. The
-    canonical ETag input is the identity serialization of the projected
-    list — note this ``orjson.dumps`` runs on the event loop, but so does
-    the one inside ``json_response`` (pre-existing shape); the duplicated
-    pass is the cost of keeping ``json_response`` untouched.
-
-    ``etag_enabled=false`` (rep ``None``) → the exact pre-ETag response,
-    byte-identical.
-
-    v3 terminal (§4.2, v3-only): the payload is the envelope
-    ``{"items":[...],"complete":<bool>}`` — the envelope bytes are the
-    canonical ETag input (§6.3), the ``X-Complete`` header is never
-    emitted on 200 or 304 (§1 retirement: the client reads ``complete``
-    from the cached envelope, §6.4), and the validator carries the
-    wire-view marker so v2-era tags never cross-match (§6.1).
-    """
-    complete = len(sessions) < limit
-    rep = etag_mod.response_rep_version(
-        request.app.state.config, wire_view=3)
-    payload: list[dict] | dict = sessions_envelope_payload(sessions, complete)
-    if rep is None:
-        response = json_response(payload, accept_encoding=accept_encoding)
-        # §6.2 terminal: Vary is Accept-Encoding single value (the
-        # directory header channel is retired).
-        response.headers["Vary"] = etag_mod.merged_vary("Accept-Encoding")
-        return response
-    identity = orjson.dumps(payload)
-    coding = "gzip" if accepts_gzip(accept_encoding) else "identity"
-    etag_value = etag_mod.compute_etag(identity, coding, rep)
-    vary = etag_mod.merged_vary("Accept-Encoding")
-    not_modified = etag_mod.conditional_304(
-        {"ETag": etag_value, "Vary": vary},
-        request.headers.get("if-none-match"),
-    )
-    if not_modified is not None:
-        return not_modified
-    response = json_response(payload, accept_encoding=accept_encoding)
-    response.headers["ETag"] = etag_value
-    response.headers["Vary"] = vary
-    return response
-
-
-async def _sessions_via_lease(
-    request: Request, registry, pool, config, params: dict,
-    directory: str | None, limit: int,
-    *, roots: bool, start: int | None, search: str | None,
-):
-    """Join-first lease path for the sessions list. Returns ``None`` when
-    the registry budget is full (caller takes the direct path)."""
-    accept_encoding = request.headers.get("accept-encoding")
-
-    async def _factory() -> bytes | None:
-        return await _fetch_sessions_raw(
-            request, params, directory, cap=config.max_response_bytes,
-        )
-
-    lease = await registry.fetch_or_bypass(
-        (
-            "sessions-list", id(request.app.state.upstream), directory,
-            _canonical_sessions_query(limit, roots, start, search),
-        ),
-        _factory,
-        reserve_bytes=config.max_response_bytes,
-    )
-    if lease is None:
-        return None
-    async with lease:
-        body = lease.body
-        if body is None:
-            raise CodedHTTPException(
-                413, code="response_too_large",
-                limit=config.max_response_bytes,
-            )
-        try:
-            # rev-gpt B1: the caller's OWN admission + offload — identical
-            # admission-before-projection discipline (and byte-identical
-            # ``transform_busy`` 503 shape) as the direct path below; only
-            # the raw GET moved out (join-first). The lease context still
-            # releases the caller ref on the busy exit (no budget leak).
-            # rev-gpt B1-residual: the JSON parse + payload guards live
-            # INSIDE the admission section (mirroring the direct path's
-            # fetch→parse→project-under-admission and messages.py:710-723),
-            # so joiners queued on the transform slot hold only the shared
-            # raw body — never a per-caller expanded object graph
-            # (plan :110,179 per-caller memory bound).
-            async with pool:
-                try:
-                    payload = orjson.loads(body)
-                except (orjson.JSONDecodeError, ValueError) as exc:
-                    raise_upstream_unavailable(exc)
-                if not isinstance(payload, list):
-                    raise_upstream_unavailable()
-                if payload and not all(isinstance(s, dict) for s in payload):
-                    raise_upstream_unavailable()
-                sessions = await pool.offload(_project_sessions, payload)
-        except TransformBusy:
-            return busy_response(accept_encoding)
-    # X-Complete is computed per-caller from the caller's own limit; the
-    # ETag/304 evaluation is per-caller too (Batch 2 / B1).
-    return _finalize_sessions_response(request, sessions, limit, accept_encoding)
 
 
 async def _fetch_status_raw(
@@ -685,120 +546,18 @@ async def sessions(
     parent: str | None = None,
     cursor: str | None = None,
 ):
-    # v4 fork (B3a-B4, v4-contract §4). The v3 path below this fork is
-    # byte-identical to the pre-fork route. ``directory`` never reaches
-    # here on v4 — the selector retires it pre-route (§5.2).
-    if wire_view_from_scope(request.scope) >= 4:
-        return await _sessions_v4(
-            request, roots=roots, limit=limit, start=start, search=search,
-            archived=archived, parent=parent, cursor=cursor,
-        )
-    # v3 × v4-only params → 422（§4.1 参数矩阵：显式拒绝，任何值含非法值；
-    # presence-based，不依赖 FastAPI 默认忽略——同 v4 侧 S-B04 纪律）。
-    _v3_reject = _raw_query_keys(request) & {"archived", "parent", "cursor"}
-    if _v3_reject:
-        raise CodedHTTPException(
-            422, code="param_version_mismatch",
-            hint=f"{sorted(_v3_reject)} are v4-only parameters",
-        )
-    # v3 (§5, Batch B): a consumed ``?directory=`` was validated + stripped
-    # at dispatch — the stash replaces the (absent) query param here.
-    directory = resolve_route_directory(request.scope, directory)
-    if directory is not None:
-        # slimapi no longer gates directories — normalize and forward; the
-        # upstream opencode decides whether it can serve the directory.
-        directory = validate_directory(directory)
-    params = {"limit": limit, "roots": str(roots).lower()}
-    # §5.2 terminal (v3-only): a consumed directory travels upstream as
-    # the canonical ``X-Opencode-Directory`` header ONLY — the dispatch
-    # layer stripped the client's query pair, and the sidecar never
-    # re-adds it as an upstream query param.
-    if start is not None:
-        params["start"] = start
-    if search is not None:
-        params["search"] = search
-    # Admission BEFORE the upstream GET (mirrors messages.py): bound
-    # concurrent sessions-list requests (upstream body buffering + parse +
-    # projection) by max_transforms so a burst cannot monopolise memory /
-    # event-loop CPU. The slot is held across fetch→parse→project.
-    config = request.app.state.config
-    registry = getattr(request.app.state, "raw_fetch_registry", None)
-    if registry is not None and config.coalesce_enabled:
-        leased = await _sessions_via_lease(
-            request, registry, request.app.state.transforms, config,
-            params, directory, limit,
-            roots=roots, start=start, search=search,
-        )
-        if leased is not None:
-            return leased
-        # budget full → unchanged admission-first direct path below
-    try:
-        async with request.app.state.transforms as pool:
-            # Stream + cap-read so an oversized upstream /session body cannot
-            # spike sidecar RSS (mirrors messages.py:275-303). Cap metric =
-            # decompressed logical bytes.
-            try:
-                response = await request.app.state.upstream.send(
-                    request.app.state.upstream.build_request(
-                        "GET", "/session",
-                        params=params, headers=forward_directory_headers(directory),
-                    ),
-                    stream=True,
-                )
-            except httpx.RequestError as exc:
-                raise_upstream_unavailable(exc)
-            try:
-                # Shared drain-or-cap-read skeleton (status mapping +
-                # read_with_cap + mid-stream RequestError → 503); no sid
-                # here (list endpoint), so a 404 reports as
-                # upstream_http_404 like any other 4xx.
-                body = await read_upstream_response(
-                    request, response,
-                    cap=config.max_response_bytes,
-                    read_with_cap=read_with_cap,
-                )
-                if body is None:
-                    raise CodedHTTPException(
-                        413, code="response_too_large",
-                        limit=config.max_response_bytes,
-                    )
-                try:
-                    payload = orjson.loads(body)
-                except (orjson.JSONDecodeError, ValueError) as exc:
-                    raise_upstream_unavailable(exc)
-                if not isinstance(payload, list):
-                    # v6 §1.1: dict / string / null etc. would have been silently
-                    # iterated by ``for item in payload`` and yielded a 200 with
-                    # ``X-Complete: true`` (the empty skeleton list). Treat non-list
-                    # bodies as a malformed upstream — same 503 as the sibling
-                    # ``response.json()`` failure path. No completeness headers on
-                    # this branch (the contract is: 200 only).
-                    raise_upstream_unavailable()
-                if payload and not all(isinstance(s, dict) for s in payload):
-                    # Scalar-element list (e.g. [1, null, "x"]) would make
-                    # skeleton_session() call .get() on non-dict → AttributeError.
-                    # Mirrors messages list element-level guard (Task 1).
-                    raise_upstream_unavailable()
-                # Offload skeleton projection to the worker so the event loop is
-                # not blocked by deep copy of potentially many sessions.
-                sessions = await pool.offload(
-                    _project_sessions,  # helper below
-                    payload,
-                )
-            finally:
-                await response.aclose()
-    except TransformBusy as exc:
-        return busy_response(request.headers.get("accept-encoding"))
-    # v6 §1.1: completeness signal header (200-only — 503 / 502 paths above
-    # do not emit it, by design). ETag/304 per-caller (Batch 2 / B1).
-    return _finalize_sessions_response(
-        request, sessions, limit, request.headers.get("accept-encoding"),
+    # v4 facade (B3a-B4, v4-contract §4) — unconditional under the v4-only
+    # (4, 4) window: the selector stashes "4" for admitted ``?v=4`` requests
+    # and every other scope observes the V2b-flipped default 4, so the wire
+    # view is structurally always 4. (The historical v3 leg below the fork —
+    # directory resolution, the lease/coalesce join, the raw ``GET /session``
+    # pipeline and the ``{"items": …, "complete": …}`` v3 envelope — was
+    # removed with the V2b src teardown; ``directory`` never reaches here
+    # anyway — the selector retires it pre-route, §5.2.)
+    return await _sessions_v4(
+        request, roots=roots, limit=limit, start=start, search=search,
+        archived=archived, parent=parent, cursor=cursor,
     )
-
-
-def _project_sessions(payload: list[dict]) -> list[dict]:
-    """Worker-thread entry: project each session dict (no side effects)."""
-    return [skeleton_session(item) for item in payload]
 
 
 @router.get("/sessions/status")

@@ -859,12 +859,17 @@ class TestBGraceSymmetry:
 
 class TestTokenStreamHandshake:
     async def test_handshake_emits_connected_then_snapshot(self):
-        """§5.5: server.connected{sessionID} first, then snapshot{done:false}
-        for each active LivePart."""
+        """§5.5 under the v4-only face (V2b default flip): the handshake is
+        a NO-prefill join — slimapi.meta is the only connection-local
+        frame; ``server.connected`` is suppressed and live parts get NO
+        server-originated ``message.part.snapshot`` (state alignment is a
+        client HTTP full fetch after resync)."""
         app = _build_app(_settings())
         try:
             th = app.state.token_hub
-            # Seed an active part BEFORE subscribe so the handshake snapshots it.
+            # Seed an active part BEFORE subscribe — v3 prefilled a
+            # snapshot; v4 must NOT (the pending window is flushed via the
+            # regular loop, never as a server-originated snapshot).
             th.on_part_updated(_updated_props("s1", "m1", "p1", text=""))
             th.on_part_delta(_delta_props("s1", "m1", "p1", delta="accumulated"))
             status, headers, body = await _drive_stream(
@@ -877,14 +882,10 @@ class TestTokenStreamHandshake:
             assert events[0][0] == "slimapi.meta"
             assert set(events[0][1]) == {"subscriberId", "tokens"}
             assert events[0][1]["tokens"] is True
-            # Then server.connected bound to s1.
-            assert events[1][0] == "server.connected"
-            assert events[1][1] == {"sessionID": "s1"}
-            # Then a snapshot with the full accumulated text.
-            snaps = [e for e in events if e[0] == "message.part.snapshot"]
-            assert len(snaps) == 1
-            assert snaps[0][1]["text"] == "accumulated"
-            assert snaps[0][1]["done"] is False
+            # v4 no-prefill handshake: no connection-local welcome frame…
+            assert all(e[0] != "server.connected" for e in events)
+            # …and no server-originated snapshot for the seeded LivePart.
+            assert all(e[0] != "message.part.snapshot" for e in events)
             # After disconnect the subscriber was detached.
             assert app.state.token_registry.total_subscribers == 0
         finally:
@@ -967,37 +968,12 @@ class TestTokenStreamHandshake:
         finally:
             await _close_app(app)
 
-    async def test_handshake_overflow_returns_sse_token_handshake_overflow(
-        self, monkeypatch,
-    ):
-        """Handshake buffer overflow → 503 with ``sse_token_handshake_overflow``
-        code (not ``sse_token_subscriber_limit``)."""
-        from oc_slimapi.sse.tokenstream.subscriber import _SubscriberQueue
-
-        original_init = _SubscriberQueue.__init__
-
-        def tiny_handshake_init(self, *, runtime_max_items, handshake_max_items, handshake_max_bytes):
-            original_init(
-                self,
-                runtime_max_items=runtime_max_items,
-                handshake_max_items=0,         # force handshake overflow on first put
-                handshake_max_bytes=handshake_max_bytes,
-            )
-
-        monkeypatch.setattr(_SubscriberQueue, "__init__", tiny_handshake_init)
-        app = _build_app(_settings(token_stream_max_subscribers=2))
-        try:
-            response = await _get(app, "/slimapi/sessions/s1/stream",
-                                  extra_headers={"Accept-Encoding": "identity"})
-            assert response.status_code == 503
-            assert response.headers["Retry-After"] == "5"
-            body = response.json()
-            assert body["code"] == "sse_token_handshake_overflow"
-            assert body["limit"] == 2
-            assert body["current"] == 0
-            assert body["bufferBytes"] == 8 * 1024 * 1024
-        finally:
-            await _close_app(app)
+    # (test_handshake_overflow_returns_sse_token_handshake_overflow was
+    # removed with the V2b src teardown: it forced the v3 handshake
+    # pre-fill to overflow (handshake_max_items=0) → 503
+    # ``sse_token_handshake_overflow``. The v4 no-prefill join never
+    # brackets a handshake, so the failure mode is structurally
+    # unreachable under the v4-only face.)
 
     async def test_disconnect_detaches_subscriber(self):
         """Cancelling the stream (client disconnect) unwinds the generator's
@@ -1064,9 +1040,11 @@ class TestGzipLever2:
             assert raw[:2] != b"\x1f\x8b"  # plaintext SSE, no gzip magic
             events = parse_sse_stream(raw)
             assert events[0][0] == "slimapi.meta"
-            assert events[1][0] == "server.connected"
-            snaps = [e for e in events if e[0] == "message.part.snapshot"]
-            assert snaps and snaps[0][1]["text"] == "seeded"
+            # (V2b default flip: v4 face suppresses server.connected and
+            # the live-part snapshot prefill — identity is still asserted
+            # above, which is this test's subject.)
+            assert all(e[0] != "server.connected" for e in events)
+            assert all(e[0] != "message.part.snapshot" for e in events)
         finally:
             await _close_app(app)
 
@@ -1086,7 +1064,9 @@ class TestGzipLever2:
             assert body[:2] != b"\x1f\x8b"
             events = parse_sse_stream(body)
             assert events[0][0] == "slimapi.meta"
-            assert events[1][0] == "server.connected"
+            # (V2b default flip: v4 face suppresses the connection-local
+            # ``server.connected`` welcome frame.)
+            assert all(e[0] != "server.connected" for e in events)
         finally:
             await _close_app(app)
 

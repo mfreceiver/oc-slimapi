@@ -7,14 +7,13 @@ process-wide :class:`TokenStreamHub` accumulator.
 Stage-D scope (design-token-stream.md §5.1 / §5.5 / §5.6 / §7):
 
 * Path is exact ``/slimapi/sessions/{sid}/stream`` — it lives under
-  ``/slimapi/**`` so the version selector (``?v=3`` terminal) applies for
+  ``/slimapi/**`` so the version selector terminal applies for
   free (no route-level ``Depends``).
 * Admission runs in :meth:`TokenStreamRegistry.subscribe` under the token
   cap (independent ledger, NOT ``MAX_TOTAL_SUBSCRIBERS``); overflow → 503
   ``sse_token_subscriber_limit`` + ``Retry-After``.
-* **v3**: no SSE ``id:`` field, no replay — a ``Last-Event-ID`` header
-  (value ignored) only triggers a leading ``resync{reconnect_no_replay,
-  sessionID}`` frame. **v4 (B3b-2, v4-contract §7)**: business frames
+* Replay semantics (B3b-2, v4-contract §7; the sole face since the V2b
+  teardown of the historical v3 no-replay path): business frames
   (delta / snapshot done marker / truncated / message.removed tombstone)
   carry ``id: t:<sid>:<epoch>:<seq>``; a ``Last-Event-ID:
   t:<sid>:<epoch>:<seq>`` reconnect replays the window after the cursor
@@ -30,10 +29,9 @@ Stage-D scope (design-token-stream.md §5.1 / §5.5 / §5.6 / §7):
   critical: a half-event gzip flush would make the client's SSE parser see a
   truncated ``data:`` line. The control-plane ``/slimapi/events`` is NOT
   gzipped — this is the sole SSE exception (CHANGELOG note is Stage E).
-  **v3 exception-to-the-exception (v3-contract §7.2, Batch D)**: a ``?v=3``
-  stream is ALWAYS identity — no ``Content-Encoding``, no gzip deflater,
-  frames raw — regardless of ``Accept-Encoding``; gzip negotiation remains
-  a v2-only lever.
+  (V2b note: the historical ``?v=3`` always-identity exception to this
+  exception was removed with the v3 face — the route is identity-only
+  because its frames are token-deltas, not because of a version fork.)
 * Lifecycle: ``subscribe`` starts the flush loop on first-attach; the
   generator's ``finally`` detaches on disconnect / client-close, and the
   last-detach stops the loop (NB-C4). Idempotent and leak-free.
@@ -49,7 +47,6 @@ from starlette.responses import StreamingResponse
 from ..directory import validate_directory
 from ..errors import CodedHTTPException
 from ..gzip_util import accepts_gzip, json_response
-from ..selector import wire_view_from_scope
 from ..sse.replay_log import (
     RESYNC_RECONNECT_NO_REPLAY,
     ReplayFrames,
@@ -68,18 +65,6 @@ from ..sse.token_hub import (
 from ..sse_observability import sse_close, sse_open
 
 router = APIRouter(prefix="/slimapi", tags=["token-stream"])
-
-
-def _request_wire_v4(request: Request) -> bool:
-    """True iff this request runs the v4 wire face (§2 selector stash).
-
-    Selector-less stacks (direct route invocation in tests, mock requests
-    without ``.scope``) observe the default v3 view.
-    """
-    scope = getattr(request, "scope", None)
-    if scope is None:
-        return False
-    return wire_view_from_scope(scope) == 4
 
 
 def _accepts_gzip(request: Request) -> bool:
@@ -138,7 +123,6 @@ async def token_stream(request: Request, sid: str, directory: str | None = None)
     _resolve_directory_conflict(request, directory)
     registry = request.app.state.token_registry
     last_event_id = request.headers.get("last-event-id")
-    v4 = _request_wire_v4(request)
 
     # B3b-2 replay wiring (absent on minimal test apps → v4 degrades to the
     # id-less / un-replayed stream, mirroring the v3 shape).
@@ -152,12 +136,12 @@ async def token_stream(request: Request, sid: str, directory: str | None = None)
     # fanout set at T1 > T0 — replay covers seq ≤ last_seq@T0, the queue
     # carries everything published after attach; no frame twice, no gap.
     replay_plan = None
-    if v4 and replay_log is not None:
+    if replay_log is not None:
         replay_plan = classify_reconnect(
             last_event_id, replay_log,
             domain=token_domain(sid), token_sid=sid,
         )
-    elif v4 and last_event_id:
+    elif last_event_id:
         # No replay infrastructure on this app (minimal/test stack): a
         # reconnect cursor we cannot evaluate is NEVER first-connect — the
         # client may be missing frames we have no record of. Fail safe with
@@ -170,7 +154,7 @@ async def token_stream(request: Request, sid: str, directory: str | None = None)
         # no-prefill handshake (no server.connected / historical
         # tombstones / live-part snapshot) and every later fanout frame
         # is id-stamped from the start.
-        subscriber = registry.subscribe(sid, wire_v4=v4)
+        subscriber = registry.subscribe(sid, wire_v4=True)
     except TokenSubscriberCapacityError as exc:
         body = {"code": exc.code, "limit": exc.limit, "current": exc.current}
         if exc.buffer_bytes is not None:
@@ -189,7 +173,7 @@ async def token_stream(request: Request, sid: str, directory: str | None = None)
     # published between subscribe() and the first yield shift seqBase
     # ahead of the replay plan the client is about to receive.
     meta_fields: dict = {"subscriberId": subscriber_id, "tokens": True}
-    if v4 and replay_log is not None and replay_epoch is not None:
+    if replay_log is not None and replay_epoch is not None:
         meta_fields.update(
             meta_v4_extension(
                 replay_epoch, replay_log.last_seq(token_domain(sid)),
@@ -280,17 +264,11 @@ async def token_stream(request: Request, sid: str, directory: str | None = None)
                         _account(out)
                         yield out
                 # ReplayIgnoreReset → first-connect semantics: nothing.
-            elif not v4 and last_event_id:
-                # §5.5 step 1 (v3, frozen): Last-Event-ID (value ignored) →
-                # leading reconnect_no_replay resync BEFORE server.connected.
-                # The handshake (server.connected → snapshot …) was already
-                # enqueued synchronously by subscribe()→attach_subscriber
-                # and sits behind this leading frame on the wire.
-                # v4 NEVER reaches this branch — a ①② violation is an
-                # ignore+reset (no resync), NOT the v3 blanket resync.
-                out = encode(_resync_frame(sid, RESYNC_RECONNECT_NO_REPLAY))
-                _account(out)
-                yield out
+            # (The v3 blanket-resync leg — any Last-Event-ID → leading
+            # reconnect_no_replay before server.connected — was removed
+            # with the V2b src teardown: under the v4-only face the
+            # handler-time classification above ALWAYS yields a plan when
+            # a cursor is present, so no generator-side leg is reachable.)
             while True:
                 item = await subscriber.queue.get()
                 if item is STOP:

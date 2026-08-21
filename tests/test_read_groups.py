@@ -928,8 +928,11 @@ async def test_session_single_204_empty_body_verbatim_no_projection(monkeypatch)
     async with httpx.AsyncClient(transport=transport,
                                  base_url="http://t") as client:
         resp = await client.get("/slimapi/session/s1", headers=IDENTITY)
-        assert resp.status_code == 204
-        assert resp.content == b""
+        # V2b default flip: selector-less runs the §13 v4 pipeline — an
+        # empty 204 body cannot satisfy the §13.2a required fields, so the
+        # response fail-closes 503 instead of the v3 verbatim 204 pass.
+        assert resp.status_code == 503
+        assert resp.json()["code"] == "upstream_unavailable"
         assert calls == []  # never projected
 
 
@@ -946,9 +949,11 @@ async def test_session_single_301_non_json_verbatim_no_projection(monkeypatch):
     async with httpx.AsyncClient(transport=transport,
                                  base_url="http://t") as client:
         resp = await client.get("/slimapi/session/s1", headers=IDENTITY)
-        assert resp.status_code == 301
-        assert resp.content == b"moved"
-        assert resp.headers["location"] == "/session/s2"
+        # V2b default flip: 301 is not a 4xx verbatim / 5xx upstream fault;
+        # its non-JSON body is unprojectable under the v4 face → the §13
+        # fail-closed 503 (no redirect semantics exist on this route).
+        assert resp.status_code == 503
+        assert resp.json()["code"] == "upstream_unavailable"
         assert calls == []  # never projected
 
 
