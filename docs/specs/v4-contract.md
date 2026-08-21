@@ -2,7 +2,7 @@
 
 > **状态**：**4.0.0 实施基线（2026-08-18，B3a+B3b 已落地）+ 2026-08-19 正式修订（owner 裁决：修订并入 v4——v4 尚无消费方，修订无破坏影响）**。B0 批冻结全部可观察语义（2026-08-17，rev-6 PASS-with-notes + S-B01 四项 owner 终裁全收敛）；wire 终态 = 4.0.0（`ACCEPTED_CLIENT_VERSIONS` (3,3)→(3,4)）。B3a 批（阶段 A selector 双版本 / B1 dbaux 连接生命周期 / B2 投影 SQL / B3 cursor / B4 路由分叉降级矩阵 / B5 观测）已按本契约落地并全量测试通过；B3b 批（SSE id:/重放、§7 全量、能力键 `sseReplay`/`qpImmediateFull` 广告）**已落地**。S-B01 四项（§7.0）**已全部 owner 终裁（2026-08-17）**；其余章节（含 DB 设计 R1/R2/R3/R6，已凭真库实证冻结——见 design-v4-dbaux §0.2）均为冻结语义。
 > **2026-08-19 正式修订范围**（各修订节带**当前状态注记**——现行已发布行为 → 修订后冻结目标，实现批次随后落地）：providers 安全投影（§12）/ session 单查 parity（§13）/ expand 闭环（§14）/ 表示层（§15）/ method 边界与修订 non-goals（§16-§17）/ readiness 门禁（§3.3）。修订仅作用 `?v=4` 视图，`?v=3` 零改动（v3 冻结）；无新 major、无版本窗变更（`ACCEPTED_CLIENT_VERSIONS` 仍 (3,4)）。设计出处：`docs/ocmar/plans/2026-08-19-v4-rebaseline.md` §4-§7（owner 终裁 2026-08-19）。
-> **继承基线**：v3 契约（`docs/specs/v3-contract.md`）全量继承 + 本文件逐条差异覆盖——**凡未提及语义逐字沿用 v3**（投影、SSE 帧名帧形、资源上限、错误映射、gzip 族、指纹、catalog、token stream 帧形等）。v4 = v3 的**严格超集面**上的差异层：新增全局 sessions 面（DB 投影源）、SSE id:/重放、directory 于全局列表退役。
+> **自包含声明（2026-08-21 修订注记，F-126 契约自包含化）**：本文件为 v4 wire 契约的**自包含权威**——`?v=4` 视图的全部可观察语义（路由全集 §10.1、消息投影 §10.2、directory 消费 §5.1、SSE 帧名帧形 §7、ETag/Vary/304 与 judge 三态 §6、expand 端点 §14、资源上限、错误映射、gzip 族、指纹、token stream 帧形等）以**本文件**为规范源。历史演进：v4 于 4.0.0 由 v3 契约「全量继承 + 本文件逐条差异覆盖」演进而来（差异层 = 新增全局 sessions 面（DB 投影源）、SSE id:/重放、directory 于全局列表退役）；本修订将原继承基线条款（未提及语义逐字取自 v3 契约）**就地正文化**（被继承条款全文转录进 §1/§2/§5.1/§6/§10.1/§10.2/§14），**不再以 v3 契约为规范源**；历史/演进注记与「与 v3 不同」对比性、状态性说明按原样保留。§0.3/§9.4 的 (3,4) 双版本窗口表述归后续版本窗收窄修订（随 src 一并改），本修订不触碰。
 > **裁决出处**：`docs/system-architecture-proposal-2026-08-17.md`（v2.2，权威基准，行号引用）；工程细化 `docs/refactor-plans/slimapi-refactor-plan.md`；设计文档 `design-v4-selector.md` / `design-v4-dbaux.md` / `design-v4-sse-replay.md` / `design-v4-qp-payload.md`。
 > **消费者**：ocdroid（B5a 探测 / B5b 适配）与 oc-webui 可**仅凭本文件**完成 v4 对接开发。
 
@@ -10,7 +10,7 @@
 
 ## §0 版本原则与并存退役规则 [冻结]
 
-1. **双版本期**：4.0.0 起 `ACCEPTED_CLIENT_VERSIONS = (3, 4)`（v2.2 行 245）。`?v=3` 语义**逐字节不变**（v3 管线原样）；`?v=4` 启用本契约差异面。无 `v` / `v=3` 以外旧版本 → 400 `unsupported_version`，`supported:[3,4]`（端点存在不 404，沿袭 v3 §2 退役后语义）。
+1. **双版本期**：4.0.0 起 `ACCEPTED_CLIENT_VERSIONS = (3, 4)`（v2.2 行 245）。`?v=3` 语义**逐字节不变**（v3 管线原样）；`?v=4` 启用本契约差异面。无 `v` / `v=3` 以外旧版本 → 400 `unsupported_version`，`supported:[3,4]`（端点存在、不静默 404——不支持版本以显式 400 应答而非路由 404）。
 2. **major 与 wire 协议版本绑定**（release.md §1.1 铁律）：版本窗任何变更均为 major 发版（历史例：(3,3)→(3,4) 即 4.0.0 major）。
 3. **v3 退役判据（观测性判据，2026-08-19 owner 终态裁决改写）**：协议封顶 4 系、**(3,4) 永久双版本窗口**、原预定 major 退役发版已取消（见 CHANGELOG [4.1.0]）。若未来评估 v3 退役，判据为**纯观测性**：access log `wireVersion` 维度 v3 流量占比持续低于阈值 + SSE active 无 v3 连接（连续观察窗）方启动评估；**退役形式与版本号另行 owner 裁决，本契约不预设任何未来版本窗**。若裁决发生，收窄即 major，写入本节。
 4. **消费者回退语义**：503 族 = 显式错误，客户端**不自动回退 v3**（维持当前 wire 版本，按 Retry-After/手动重试处理）。v3 目录级浏览仅经**用户显式触发**的整体版本重协商（`available` 含 3 时覆写 selectedWireVersion=3，全端点一致），且是**功能降级非等价回退**——v4 的跨目录 parent/archived 过滤与全局 cursor 翻页在 v3 无对应语义，UX 按功能降级建模。
@@ -19,7 +19,7 @@
 ## §1 头与参数总则 [冻结]
 
 - `X-Slimapi-Version` 头：3.0.0 已删除，v4 维持——出现不解读、不报错。
-- `?v=` selector：v3 §2 词法与消费规则不变（sidecar 保留参数，dispatch 层消费剥离，永不转发上游）；支持集扩为 `[3,4]`；多值同值宽容折叠不变。
+- `?v=` selector：sidecar **保留参数**，dispatch 层消费剥离，**永不转发上游**（消费剥离仅发生在 `/slimapi/**` 路由）。词法冻结：合法值 = `^[1-9][0-9]*$`；`0`、`03`、`+3`、` 3`、`3.0`、空串 → 词法非法。支持集 `[3,4]`；多值**同值**宽容折叠、多值异值 → 400。
 - 其余保留参数（`directory` 等）按 §5 消费矩阵。
 
 ## §2 selector 双版本状态表 [冻结]
@@ -31,11 +31,11 @@
 | `v=3` | v3 | v3 管线逐字节不变（含 directory 消费 §5） |
 | `v=4` | v4 | v4 语义（本契约差异面）；directory 于 §5.2 退役集 → 400 `directory_retired_in_v4` |
 | 无 `v` / `v` 词法合法但 ∉{3,4} | 不支持 | 400 `{"code":"unsupported_version","supported":[3,4]}` |
-| `v` 词法非法 / 多值不同 | 畸形 | 400 `invalid_version_selector`（v3 §2 词法不变） |
-| `GET /slimapi/versions` | 豁免 | 无条件豁免 selector；非 GET → 405+`Allow: GET` 优先于一切（v3 §8.3 ①不变） |
+| `v` 词法非法 / 多值不同 | 畸形 | 400 `invalid_version_selector`（词法 = §1 `^[1-9][0-9]*$`） |
+| `GET /slimapi/versions` | 豁免 | 无条件豁免 selector；非 GET → 405+`Allow: GET` 优先于一切（§8.3 总链 ①） |
 
 - **request-scope wireVersion**：selector 将本次请求 wire 视图（"3"|"4"）写入 scope state；路由/health/versions 同源读此值，禁止错配组合（S-B04）。v4 能力只能经 selector 显式进入（测试直调缺省 = v3 视图）。
-- **directory 消费集版本分叉**：v4 仅将 `^/slimapi/sessions$`（全局列表）移出消费集；`/sessions/status`、`/sessions/{sid}/**`、messages、读组、写组等**全部保留** v3 消费语义（v4 无新语义的路由不动）。
+- **directory 消费集版本分叉**：v4 仅将 `^/slimapi/sessions$`（全局列表）移出消费集；`/sessions/status`、`/sessions/{sid}/**`、messages、读组、写组等**全部保留** §5.1 基线消费语义（v4 无新语义的路由不动）。
 - 观测：`selectorResult` 枚举增 `v4`；`wireVersion` 增 "4"（§9.1）。
 
 ## §3 发现端点与能力面 [冻结]
@@ -45,7 +45,7 @@
 ```
 {"current": 4, "available": [3, 4],
  "capabilities": {
-   "3": {…v3 既有形状不变…},
+   "3": {…既有形状不变：envelope/directoryQuery/versionHeaderOptional/writeRoutes/readRoutes/expand…},
    "4": {
      "globalSessions": true,      # B3a 起
      "auxiliaryFilters": true,    # B3a 起
@@ -58,13 +58,13 @@
 - **能力键为静态键**（v2.2 行 140/254）：存在即广告，**不随 DB 抖动**——DB 熔断/降级不改变 capabilities，瞬态可用性经 503 + health `auxiliary` 字段（§3.2）+ metrics 表达。
 - **广告时序（n1 冻结）**：`sseReplay`/`qpImmediateFull` 与实现**同批启用**——B3a 的 `capabilities["4"]` **不含**此二键；B3b 实现落地同期广告（**已执行，B3b-5**：两键随 4.0.0 发布面广告；本条为时序约束的历史记录）。消费者：键缺席 = 该能力不可用，不得预依赖。
 - 消费者探测（B5a）：`capabilities["4"]` 不存在 → 继续 v=3；未知键容忍忽略。
-- **expand 能力探测注记（2026-08-19 补载——如实描述已发布状态）**：messages 的 2 条 expand 路由（§10）在 `?v=4` 下**可达且行为与 v3 逐字节相同**（selector 放行 + 行为继承 v3，无 v4 分叉）；`capabilities["4"]` 为静态键面，**不含 `expand` 键**——expand 能力广告仅存在于 `capabilities["3"].expand`（12 类目表 + `fragmentMaxBytes`）。客户端探测 expand 可用性应读 `capabilities["3"].expand`，不因使用 `?v=4` 而改读他键。
+- **expand 能力探测注记（2026-08-19 补载——如实描述已发布状态）**：messages 的 2 条 expand 路由（§10/§14）在 `?v=4` 下**可达**（selector 放行；端点行为零版本分叉，语义全文 = §14）；`capabilities["4"]` 为静态键面，**不含 `expand` 键**——expand 能力广告仅存在于 `capabilities["3"].expand`（12 类目表 + `fragmentMaxBytes`）。客户端探测 expand 可用性应读 `capabilities["3"].expand`，不因使用 `?v=4` 而改读他键。
 - **修订扩展键（2026-08-19 修订冻结目标）**：`capabilities["4"]` 随实现批次**加性扩展**两键——`readiness`（§3.3 feature 就绪度门；修订二后全集 U = **十** ID）与 `expand`（§14：categories + fragmentMaxBytes，随 `messages.expand.v4` 进入 `satisfied` 加入）。扩键前本节静态四键即 `capabilities["4"]` 全部形状；`expand` 键出现前 expand 能力探测仍读 `capabilities["3"].expand`（上文注记）。
 
 ### §3.2 `GET /slimapi/health` 双视图
 
 - 按请求 wireVersion 返回对应视图：v3 视图 `schema.version=3`/`server.api_version=3`；v4 视图双双 =4（同源同值，S-B04）。
-- v4 视图新增瞬态字段：`auxiliary: {available: bool, mode: "db"|"http"}`（v2.2 行 140；available=false 时 mode="http"；根级）；`features.allowlist: {enabled: bool}`（机制是否启用，B4-4 落地，未配置=false；不泄露清单内容——嵌套于 `features.allowlist`，沿 v3 §3a，非根级）。
+- v4 视图新增瞬态字段：`auxiliary: {available: bool, mode: "db"|"http"}`（v2.2 行 140；available=false 时 mode="http"；根级）；`features.allowlist: {enabled: bool}`（机制是否启用，B4-4 落地，未配置=false；只报布值**不泄露清单内容**——嵌套于 `features.allowlist`，非根级；hub registry 可达时附 `droppedEvents: <int>`（SSE 帧丢弃计数，allowlist 非空清单过滤所致）；`/slimapi/ready` 不加该块）。
 - `ready` 端点形状不变。
 
 ### §3.3 `capabilities["4"]` 扩展：readiness 就绪度门（2026-08-19 修订冻结）
@@ -130,7 +130,7 @@ GET /slimapi/sessions?v=4
 | `search` / `limit` | 现状 | v4 语义（limit 上限 500） |
 
 - `parent=only` 谓词 = `parent_id IS NOT NULL`（v2.2 未冻结，B0 **实证冻结**：真库 parent_id NULL 86 / NOT NULL 321 / 空串 0——无空串哨兵歧义，design-v4-dbaux §0.2 R6）。
-- **SessionSkeletonV4**：v3 `SESSION_KEYS` 投影（已含 directory）+ `project` 对象（`{id, name, worktree}`——三列均已进 DB 投影 SELECT、schema 门与等价性 golden；join 缺行 → null）+ v4-only 字段。列名以真库实证为准（`tokens_input/tokens_output`，v2.2 行 72 模板 `tokens_in/out` 为撰写笔误——**B0 实证冻结**，design-v4-dbaux §0.2 R2）。
+- **SessionSkeletonV4**：既有 skeleton 列投影（`skeleton.py::SESSION_KEYS` 白名单：顶层 `id/directory/parentID/projectID/title/agent/model` + 嵌套 `time{created,updated,archived}`、`summary{additions,deletions,files}`、`revert{messageID,partID}`——已含 directory）+ `project` 对象（`{id, name, worktree}`——三列均已进 DB 投影 SELECT、schema 门与等价性 golden；join 缺行 → null）+ v4-only 字段。列名以真库实证为准（`tokens_input/tokens_output`，v2.2 行 72 模板 `tokens_in/out` 为撰写笔误——**B0 实证冻结**，design-v4-dbaux §0.2 R2）。
 - **排序冻结**：`(time_updated DESC, id DESC)` 复合排序（上游 session.ts:261-299 事实同构；行号按对齐版本 v1.18.18 勘误，原引 :571-572 为撰写时行号漂移）。
 - **complete**：同查询 `LIMIT :limit+1` 窗口判定（同一只读 snapshot；返回 =limit+1 行 → `complete:false`）。
 - **零缓存**：一条 SQL 一次组装（v2.2 行 139）。
@@ -200,23 +200,38 @@ v4 sessions **无 ETag/Vary/304**（v2.2 行 254 §6）；v3 全表面 ETag 原�
 
 ## §5 directory 消费矩阵 [冻结]
 
-### §5.1 v3（不变）
+### §5.1 基线 directory 消费语义（2026-08-21 正文化转录 [冻结]；`?v=3` 视图全量适用，v4 视图经 §5.2 对非退役路由引用同一语义）
 
-v3 §5 全部消费/容忍/错误语义逐字沿用。
+> 历史演进注记：本节语义 4.0.0 起原以「v3 契约 §5 逐字引用」的继承基线条款承载；F-126 自包含化后就地正文化，语义零改动。
+
+1. **canonical：`?directory=` query**（单值）；消费集内由 sidecar 消费并转上游 `X-Opencode-Directory` 头（wire 等价）。
+2. **消费剥离规则**：`v` 在 `/slimapi/**` 路由上**无条件消费剥离**（任何视图均剥离、永不转发上游，§1）；`directory` 的消费/转换**仅限消费集内**。
+3. **消费集**：`messages/{sid}`（含 **expand 两路由，§14——同样消费 `?directory=`**）、`sessions`（列表+status）、`todo`/`children`/`diff`、`agent`/`command`、**§10.1 全部收编路由（按各自 directory 列——以上游组声明为准：file=FileQuery、file/status=WorkspaceRoutingQuery、vcs=WorkspaceRoutingQuery、find=FindFileQuery、providers=WorkspaceRoutingQuery、session 单查=WorkspaceRoutingQuery 等）**。
+4. **多值规则**：`?directory=` **多值异值** → 400 `{"code":"invalid_directory_selector"}`。
+5. **双现/头退役规则（仅消费集）**：query 与 `X-Opencode-Directory` 头同时出现——归一化后同值 → 正常；不同值 → 400 `{"code":"directory_conflict","queryDirectory":<str>,"headerDirectory":<str>}`；**消费集内 directory 头出现（头退役终态）** → 400 `directory_header_retired`（提示改用 `?directory=`）。
+6. **stream 例外**：query-only directory 接受（no-op，不报错）；query 与头同时存在且归一化后不同值 → 400 `directory_not_allowed`；多值异值前置 400 `invalid_directory_selector`（消费集统一规则），单值化后按前述规则判定。
+7. **不在消费集（宽容忽略）**：`questions`/`permissions`（跨目录自发现聚合）、`events`、`health`/`versions`/`ready`/`metrics`/`actions`/`directories`。
 
 ### §5.2 v4
 
 | 路由 | v4 × directory |
 |---|---|
 | `GET /slimapi/sessions`（全局列表） | **整体退役**：query（单值/多值）、header（任何形式）、query+header 混合 → 一律 **400 `directory_retired_in_v4`**（selector 层拦截，先于路由；不泄露目录存在性） |
-| `/slimapi/sessions/status`、`/sessions/{sid}/todo|children|diff|stream`、messages×5、agent、command、读组×10、写组×5 | **v3 消费语义原样**（query 单值消费剥离；header 退役 400；多值 400） |
+| `/slimapi/sessions/status`、`/sessions/{sid}/todo|children|diff|stream`、messages×5、agent、command、读组×10、写组×5 | **§5.1 基线消费语义原样**（query 单值消费剥离；header 退役 400；多值 400） |
 
 - **allowlist 作用域全覆盖**（v2.2 行 186，B4-4 落地）：非空时全局 sessions 列表（DB SQL 谓词）、directories 列表、digest/q/p 帧、事件流均过滤非白名单目录；`/slimapi/file/**` fail-closed（空 → 403 `directory_not_allowed`）。allowlist 三态（未配置/显式空/非空）语义见 B4-4（P1 3.3.0 起）。
 - **修订二加注（`session.post-actions.v4 ∈ satisfied` 时生效，§16）**：三条 POST 等效动作路由的 directory 消费 ≡ 各自等效目标路由——`POST /slimapi/session/{sid}` 与 PATCH 同路径（消费集既有行，query 单值消费剥离 → header；多值/header-only 违约梯子 §5.1 适用）；`POST …/archive`、`POST …/delete` 的等效上游目标为消费集路径 `/session/{sid}`（上游写端点声明 WorkspaceRoutingQuery），同样按「query 单值消费剥离 → header、§5.1 违约梯子」消费，v4 无 retirement 差异（非全局列表路由）。门控未激活（过渡态）期间此三组合在 selector 层 405 先行（§8.3 插列），不触达消费判定。
 
 ## §6 ETag / Vary / 304 [冻结]
 
-v3 原样（§4.4 已含 v4 差异：v4 sessions 无 ETag）。
+> 历史演进注记：本节基线语义 4.0.0 起原整节指回 v3 契约 §6；F-126 自包含化后就地正文化，语义零改动。§4.4 已含 v4 差异（发布态 v4 sessions 列表无 ETag，修订目标见 §15）。
+
+1. **validator 规则**：按实际 coding 派生——identity → 强 validator `"<sha256hex>"`；gzip → 弱 validator `W/"<sha256hex>"`（canonical 输入恒为 identity body 字节；hash 输入 = `REP_VERSION + NUL + coding + NUL + canonical identity body`，全量 hex 不截断——§12.6 同口径）。`REP_VERSION` 输入含 wire 版本标记 + 投影/配置指纹——**跨视图 validator 互不匹配**（交叉 `If-None-Match` → 保守 200）；投影/配置变化 → 全部 validator 轮换 → 构造上不可能误 304。
+2. **Vary**：全部 `/slimapi` ETag 路由恒单值 `Vary: Accept-Encoding`（directory-消费与不消费路由一致；`X-Opencode-Directory` 头维度已随 §1 头退役移除，不出现在任何 Vary 值中）。`?v=`/`?directory=` 属 URI 维度不加 Vary。
+3. **`If-None-Match`/`*`/judge 三态（冻结）**：RFC 9110 **弱比较**（忽略 `W/` 前缀按 opaque tag 比较）+ `*`。三态结局：① 无 `If-None-Match` / 无命中 → **200**（正常管线）；② `If-None-Match: *`（资源存在）→ **304**（回显实际将服务的 coding 的 validator——benefit-gated 路由须真实压缩一次以确定 coding，回显不误标）；③ 弱比较命中 validator → **304**、精确回显该 validator（零压缩达判定）。保守 200 边界：请求可接受 gzip 且 body 过 gzip 受益门时，服务 coding 不可静态判定——identity 强 validator 命中亦**保守 200**（绝不冒 304 回显错 coding 的风险）；反之 identity-only 请求携带 gzip validator 不匹配 → 200。**管线照常执行不短路**——上游 GET/投影/admission 全部照跑，命中仅省**下行传输体**（非缓存授权）。
+4. **ETag 路由全集**：既有 envelope/catalog 四端点（`sessions` 列表、`messages/{sid}` 列表（`mode=merged` 同样适用——以最终 splice 后 body 为准）、`agent`、`command`）+ §10.1 收编读组全部 GET 路由（file/vcs/find/providers/session 单查/active/global health/context）；todo/children/diff thin 路由**不在全集**（`If-None-Match` 忽略、恒 200）；**expand 两路由（§14）不在全集**（成功恒 200、无 304/`If-None-Match` 判定）；§10.1 写路由不启用。envelope 路由 canonical 输入 = envelope body。上游自身 ETag 头不透传（sidecar 生成域）。
+5. **304 头集合**：仅 `ETag` + `Vary` + `Cache-Control: no-store`（sessions/messages envelope 自含 `nextCursor`/`complete`，304 不复制分页信息）。
+6. **边界**：4xx/5xx 不带 `ETag`、不参与 304；`OC_SLIMAPI_ETAG_ENABLED=false` → 不输出 `ETag`、不判 304（`Vary` 仍发——表示可变性与 ETag 正交，§15）。
 
 ## §7 SSE id: / 重放（v4-only）[四项已全部 owner 终裁，2026-08-17]
 
@@ -245,7 +260,7 @@ v3 原样（§4.4 已含 v4 差异：v4 sessions 无 ETag）。
 - 有界重放日志（新组件，count/bytes/TTL 三维上限，环形覆盖）——现 GlobalHub pending（250ms debounce）与 tombstone 队列**不是** replay log；与既有 token 域重放队列（cap 1000/TTL 24h）并存不混用。
 - `Last-Event-ID` 重连：缺口在日志窗口内 → 补发 replay 帧；ID 过期（早于窗口）→ 发 resync 提示帧（客户端全量对齐）；**epoch 归类（冻结，四类拆分）**：旧 epoch（格式合法、epoch ≠ 当前——随机 nonce 无序不比较大小，即进程重启前世界）→ `resync{reason:"epoch_changed"}`；future（同 epoch 且 seq > 已发布 max）→ 忽略 + 重置（按首连）；格式非法 / 跨端点域 / 跨 sid 域 → 忽略 + 重置。
 - **Last-Event-ID 分类优先级（冻结，严格短路序）**：①完整语法校验（域标签 + epoch 16hex + seq 十进制）→ ②端点标签与路径 sid 校验（`g:` 只属 `/events`；`t:` 只属 `/stream` 且 sid 匹配路径）→ ③epoch 比对（仅对通过 ② 的正确域 ID）→ ④seq/窗口比对（仅同 epoch）。组合输入按最先命中者短路（如 `t:<sid>:<旧epoch>:5` 到 `/events` = 跨端点域 → 忽略重置，不触发 epoch_changed）。
-- **上游断连恢复（触发条件冻结）**：**首次确认上游 loss 即触发**（EOF/异常路径为主，`_upstream_loss_notified` 防重；成功重连仅作未通知时兜底——v3 现行为延续，`global_hub.py:894-904/913-922/847-863`）→ 对全部存量订阅者 fanout `resync{reason:"reconnect_no_replay"}`（无 id）→ 恢复后新帧（seq 继续单调不重置；**epoch 不变**）；token 域另清空该 sid pending live 缓冲（`tokenstream/hub.py:1896-1900` 锚点）。**持久 barrier（S-B01④已裁决冻结，owner 2026-08-17；low-watermark 数据结构为实现细节）**：上游 loss 时写 low-watermark barrier（水位 = 该域已发布 max seq）——**写入范围 = 全局域 + 当前 epoch 内全部已创建 per-sid 域（不限在线订阅者）**；后续任何 `Last-Event-ID` seq **≤** barrier 水位的重连（含断连期间离线的客户端）一律 `resync{reconnect_no_replay}`（水位本身对应的帧亦发布于缺口前），seq > 水位 → 走完整第④级分类（**future**（同 epoch 且 seq > 已发布 max）→ 忽略 + 重置按首连；否则窗口内 replay / `replay_expired` / `replay_gap`，§7.2 上文分类）；**禁止跨 barrier 补帧**（barrier 前后存在 sidecar 未观察到的上游事件缺口，窗口内连续不构成补帧依据）。barrier 不受 count/bytes/TTL 逐出（仅窗口下界严格越过后可删；域回收保留失效水位或 fail-safe resync；进程重启归 `epoch_changed` 拦截）；客户端 HTTP 全量对齐。
+- **上游断连恢复（触发条件冻结）**：**首次确认上游 loss 即触发**（EOF/异常路径为主，`_upstream_loss_notified` 防重；成功重连仅作未通知时兜底——现行为延续，`global_hub.py:894-904/913-922/847-863`）→ 对全部存量订阅者 fanout `resync{reason:"reconnect_no_replay"}`（无 id）→ 恢复后新帧（seq 继续单调不重置；**epoch 不变**）；token 域另清空该 sid pending live 缓冲（`tokenstream/hub.py:1896-1900` 锚点）。**持久 barrier（S-B01④已裁决冻结，owner 2026-08-17；low-watermark 数据结构为实现细节）**：上游 loss 时写 low-watermark barrier（水位 = 该域已发布 max seq）——**写入范围 = 全局域 + 当前 epoch 内全部已创建 per-sid 域（不限在线订阅者）**；后续任何 `Last-Event-ID` seq **≤** barrier 水位的重连（含断连期间离线的客户端）一律 `resync{reconnect_no_replay}`（水位本身对应的帧亦发布于缺口前），seq > 水位 → 走完整第④级分类（**future**（同 epoch 且 seq > 已发布 max）→ 忽略 + 重置按首连；否则窗口内 replay / `replay_expired` / `replay_gap`，§7.2 上文分类）；**禁止跨 barrier 补帧**（barrier 前后存在 sidecar 未观察到的上游事件缺口，窗口内连续不构成补帧依据）。barrier 不受 count/bytes/TTL 逐出（仅窗口下界严格越过后可删；域回收保留失效水位或 fail-safe resync；进程重启归 `epoch_changed` 拦截）；客户端 HTTP 全量对齐。
 - gap 处理：区分「日志逐出」（→ resync）vs 合法缺席（单一/per-sid 域下不存在跨域合法空洞）。**snapshot 不是服务端帧**——resync 后客户端自行 HTTP 全量对齐（全局域如 `/slimapi/sessions` 首屏、token 域重拉消息投影），服务端只发 meta → resync → 新帧。逐出-发布并发的边界 gap 误判风险为实现期待验证项（design-v4-sse-replay.md §5 待裁决 5，可降级防御分支，不影响 wire 语义）。
 - 背压：溢出帧**入**重放日志（日志记录「已发布帧」而非「已送达帧」）；订阅端溢出断连 → 重连走 Last-Event-ID 重放。
 - **resync 帧 reason 值域（v4 冻结，加性扩展）**：`epoch_changed` | `replay_expired` | `replay_gap` | `reconnect_no_replay`（既有）；token 流 tombstone（消息已撤销）在 replay 时**照常消耗其 seq 并以 `message.removed` 轻量撤销帧回放**（既有帧形 `tokenstream/frames.py:137-151` = `event: message.removed` + `{sessionID, messageID}`；保留 `id:`，维持 ID 序列无空洞）。
@@ -258,18 +273,18 @@ v3 原样（§4.4 已含 v4 差异：v4 sessions 无 ETag）。
 
 ### §7.4 q/p 帧载荷（`qpImmediateFull` 语义）
 
-- 逐字段核对结论（`design-v4-qp-payload.md`，B0-4 产出）：**已完整**——sidecar `properties` = 上游 event.data 原样透传（`event-v2-bridge.ts:39-44` 构造 → `global_hub.py:522,529` 零裁剪 → 上游 `core/question.ts:93-110`、`permission.ts:164-174` 发布完整 Request）；`question.asked`（10 字段）与 `permission.asked`（10 字段）逐字段比对**无缺失、无改名、无裁剪**。EventV2 envelope 字段（evt_ id/metadata/durable/location）v3 契约本就不进 properties，不属于缺失。
+- 逐字段核对结论（`design-v4-qp-payload.md`，B0-4 产出）：**已完整**——sidecar `properties` = 上游 event.data 原样透传（`event-v2-bridge.ts:39-44` 构造 → `global_hub.py:522,529` 零裁剪 → 上游 `core/question.ts:93-110`、`permission.ts:164-174` 发布完整 Request）；`question.asked`（10 字段）与 `permission.asked`（10 字段）逐字段比对**无缺失、无改名、无裁剪**。EventV2 envelope 字段（evt_ id/metadata/durable/location）按既有投影语义本就不进 properties，不属于缺失。
 - **`qpImmediateFull` 语义冻结 = 现状已成立**：B1b 零 wire 变更，webui/ocdroid 直投为纯客户端改动；不触发 B3b-3 补全路径（该任务留空）。两套字段表（上游完整直投字段集 / 最小可渲染字段集）以 design-v4-qp-payload.md §2/§3 为权威，随实现批同步引用。
 - digest 帧跨版本注记：B1a（P1 3.3.0）起 `session.digest` 增可忽略字段 `changed:[sid…]`（**最小语义已裁决**：changed = [本帧 sid]——digest 为 per-sid 逐帧产出，帧出现即 changed；形状保留列表为未来聚合留形），v4 帧形沿用。
 
-### §7.5 与 v3 §7 的同步语义（2026-08-19 补载 [冻结]）
+### §7.5 SSE 跨视图同步语义（2026-08-19 补载 [冻结]）
 
-以下语义 v3/v4 两视图一致（继承 v3 §7，逐条现状载明）；v4 附加差异单独标注：
+以下 SSE 语义 v3/v4 两视图一致（逐条现状载明，本节即权威全文）；v4 附加差异单独标注：
 
 - **digest `status` 恒字符串**：上游 `session.status` 的 status 字段可能以字符串（`"busy"`）或对象信封（`{"type":"busy"}`）两种 wire 形态到达；sidecar 统一归一化——digest `status` 字段**恒为字符串**（busy/idle 等上游状态值原样）；信封无效（缺 `type` / `type` 非字符串）时该次状态更新被忽略（digest 其余字段不受影响）。两视图一致。
-- **digest `lastError` sticky 清除语义**：`session.error` 携带 sessionID → 该 sid digest 记 `lastError:{name, message, at}`（`name` 截断 128 字符）并立即定向 flush + 记入 sticky 存储；该 sid **下一次 `session.status=busy`** → sticky 弹出 + digest **显式 `lastError:null` 清除帧** + 定向 flush（busy 判定对字符串/对象信封两形态一致）；`session.deleted` → sticky 弹出 + 字段省略；后续 flush 在本窗口未自行设置/清除时合并 sticky 值（贴回语义，直到 busy 清除帧）；**sticky 仅在同一 sidecar 进程生命周期内成立**（进程内内存态、无持久化，重启即丢、不复活不重贴；重启后新 `session.error` 才重新记录）；FIFO 容量上限 10,000 sid，逐出后不再贴回。两视图一致（全文语义同 v3 §7.5）。
+- **digest `lastError` sticky 清除语义**：`session.error` 携带 sessionID → 该 sid digest 记 `lastError:{name, message, at}`（`name` 截断 128 字符）并立即定向 flush + 记入 sticky 存储；该 sid **下一次 `session.status=busy`** → sticky 弹出 + digest **显式 `lastError:null` 清除帧** + 定向 flush（busy 判定对字符串/对象信封两形态一致）；`session.deleted` → sticky 弹出 + 字段省略；后续 flush 在本窗口未自行设置/清除时合并 sticky 值（贴回语义，直到 busy 清除帧）；**sticky 仅在同一 sidecar 进程生命周期内成立**（进程内内存态、无持久化，重启即丢、不复活不重贴；重启后新 `session.error` 才重新记录）；FIFO 容量上限 10,000 sid，逐出后不再贴回。两视图一致。
 - **SSE 恒 identity**：两端点 SSE 流不做 gzip/content-encoding，响应**无 `Vary` 头**（响应头 = `Cache-Control: no-cache, no-transform` + `X-Accel-Buffering: no`；SSE 路径不参与 `Accept-Encoding` 内容协商）。两视图一致。
-- **digest 水位定位与 catch-up 盲区（after 游标等效方案裁决，2026-08-19 冻结）**：上游 `MessageV2.page()` 仅 `before` 向后 keyset（v1.18.18 实证），v4 messages 亦无 after 游标；增量 catch-up 等效方案 = **digest 触发 + 条件重拉**（水位仅当触发器不当过滤器；两盲区：`message.removed` 不进 digest、SSE 断连窗口无补偿；双轨消费 = digest 触发 If-None-Match 精拉 + 低频周期 304 对账兜底，重启/epoch 变化视为全失效）。全文语义同 v3 §7.8；v4 重放（§7.2 `id:`/Last-Event-ID）可缩小断连盲区但不消除（逐出/barrier 仍 resync），周期对账在两视图均为必选。两视图一致。
+- **digest 水位定位与 catch-up 盲区（after 游标等效方案裁决，2026-08-19 冻结）**：上游 `MessageV2.page()` 仅 `before` 向后 keyset（v1.18.18 实证），v4 messages 亦无 after 游标；增量 catch-up 等效方案 = **digest 触发 + 条件重拉**（水位仅当触发器不当过滤器；两盲区：`message.removed` 不进 digest、SSE 断连窗口无补偿；双轨消费 = digest 触发 If-None-Match 精拉 + 低频周期 304 对账兜底，重启/epoch 变化视为全失效）。v4 重放（§7.2 `id:`/Last-Event-ID）可缩小断连盲区但不消除（逐出/barrier 仍 resync），周期对账在两视图均为必选。两视图一致。
 - **v4 附加——meta 首帧字段集（v3 形状不动）**：v4 视图首帧 `event: slimapi.meta` data 字段序 = `subscriberId, tokens, capabilities, epoch, seqBase`；v4 追加三键：`capabilities: {"sseReplay": true}`（**恒此一键**——`qpImmediateFull` 仅广告于 `GET /slimapi/versions` 的 `capabilities["4"]`，不入 meta 帧）、`epoch`（进程代，16 hex 字符串）、`seqBase`（连接建立时该域已发布最大 seq，整数；首连后首个带 `id:` 帧恰为 `seqBase + 1`）。meta 帧自身**无 `id:`**（§7.0②）。
 - **v4 附加——welcome 帧抑制**：v4 连接不产出连接本地 `server.connected` 首帧（v3 照旧产出）；v4 线上首帧恒为 `slimapi.meta`。
 
@@ -308,7 +323,7 @@ allowlist 403 族（`directory_not_allowed`，B4-4）与版本/directory 400 族
 | `provider_upstream_malformed` | 502 | §12.5：上游 provider 数据形状违约全类目；错误体零上游细节 |
 | `provider_projection_limit` | 413 | §12.4：四项投影限额任一超限；附 `limit`/`limitValue` |
 
-**复用既有码**（不重定义、不改语义）：`response_too_large`（providers 源 body 超限，§12.5.2 ④）、`upstream_http_<N>`（providers 3xx/4xx 转换路由映射）、`upstream_unavailable`、`transform_busy`、`auxiliary_unavailable`（§13 整响应失败复用——扩展触发面不改 status/body/`Retry-After` 形状）、`invalid_cursor`、`session_not_found`、`thin_route_not_found`、v3 §4b expand 错误族。`discovery contradiction`（§3.3）为客户端分类结局，非服务端错误码。**优先级插列**：修订生效后 §8.3 总链在「② selector version 族 400」与「③ selector directory 族 400」之间插列 method 405（§16——判定不依赖 query 参数）。
+**复用既有码**（不重定义、不改语义）：`response_too_large`（providers 源 body 超限，§12.5.2 ④）、`upstream_http_<N>`（providers 3xx/4xx 转换路由映射）、`upstream_unavailable`、`transform_busy`、`auxiliary_unavailable`（§13 整响应失败复用——扩展触发面不改 status/body/`Retry-After` 形状）、`invalid_cursor`、`session_not_found`、`thin_route_not_found`、expand 错误族（§14.3）。`discovery contradiction`（§3.3）为客户端分类结局，非服务端错误码。**优先级插列**：修订生效后 §8.3 总链在「② selector version 族 400」与「③ selector directory 族 400」之间插列 method 405（§16——判定不依赖 query 参数）。
 
 **[4.6.1] 追加：405 `method_not_allowed`（非 GET `/slimapi/versions`）、WS 501 `websocket_not_supported`、actions `invalid_request_body`（422 POST body 畸形）三码补录（历史实现现状固化）**——v3-contract §8 末尾镜像同句。
 
@@ -335,7 +350,7 @@ v4 sessions 归入 sessions 桶既有记账；降级路径请求带 degraded 标
 
 ## §10 路由全集逐条（v4 差异列）[冻结]
 
-**51 条** /slimapi 路由（read **26** + write **17** + SSE 2 + 发现/运维 **6**；**计数方法 = 路由 × 方法表行**，与 `scripts/check_routes_doc.py` 的路由↔INTERFACE_MAP 一致性校验同口径——2026-08-19 修订，取代原「45 条（read 23 + write 12 + 发现/运维 8）」旧计数）。**已发布（4.0.0/4.1.0）v4 差异仅下列 4 条**，其余 **47** 条 v4 = v3 语义原样（经 selector 分派）；**2026-08-19 正式修订（冻结目标）追加差异面见本节末修订块与 §12-§17**；**修订二（owner 裁决 2026-08-19，已实施——write 组三条 POST 等效动作路由已激活，`session.post-actions.v4 ∈ satisfied`）**：
+**51 条** /slimapi 路由（read **26** + write **17** + SSE 2 + 发现/运维 **6**；**计数方法 = 路由 × 方法表行**，与 `scripts/check_routes_doc.py` 的路由↔INTERFACE_MAP 一致性校验同口径——2026-08-19 修订，取代原「45 条（read 23 + write 12 + 发现/运维 8）」旧计数）。**已发布（4.0.0/4.1.0）v4 差异仅下列 4 条**，其余 **47** 条 v4 无版本分叉（经 selector 分派、两视图行为一致——路由/方法/directory/ETag/统一行为语义全文见 §10.1 基线路由表与 §10.2 消息投影基线）；**2026-08-19 正式修订（冻结目标）追加差异面见本节末修订块与 §12-§17**；**修订二（owner 裁决 2026-08-19，已实施——write 组三条 POST 等效动作路由已激活，`session.post-actions.v4 ∈ satisfied`）**：
 
 | 路由 | v4 差异 |
 |---|---|
@@ -346,9 +361,76 @@ v4 sessions 归入 sessions 桶既有记账；降级路径请求带 degraded 标
 
 `GET /slimapi/health` 双视图（§3.2）为响应差异，路由行为不变。messages（4 条 + 2 expand）、sessions/status、todo/children/diff、directories、agent、command、file/vcs/find/config/session-single/context（读组）、active、global/health、metrics、ready、actions（2）、write 17 条：**零 v4 差异**。其中两处显式注载（2026-08-19 补载）：
 
-- **`GET /slimapi/session/{sid}` 单查**：`?v=4` 下**不升级 v4 骨架形状**——恒返回 v3 skeleton 投影（SessionSkeletonV4 仅用于 `GET /slimapi/sessions?v=4` 列表项；单查无 v4 分叉）。v4 客户端取单会话 v4 骨架走 `/slimapi/sessions?v=4` 列表。
-- **`GET /slimapi/sessions/status`**：零 v4 分叉（无版本分支代码路径），directory 消费继承 v3（§5.2 表行：query 单值消费剥离、头出现 400、多值 400）；上游 `/session/status` 数据与 directory 无关（恒全局 map），`directory` 仅作 workspace 路由通道。
+- **`GET /slimapi/session/{sid}` 单查**：`?v=4` 下**不升级 v4 骨架形状**——恒返回既有 skeleton 投影（§4.1 `SESSION_KEYS` 白名单列集；SessionSkeletonV4 仅用于 `GET /slimapi/sessions?v=4` 列表项；单查无 v4 分叉）。v4 客户端取单会话 v4 骨架走 `/slimapi/sessions?v=4` 列表。
+- **`GET /slimapi/sessions/status`**：零 v4 分叉（无版本分支代码路径），directory 消费 = §5.1 基线（§5.2 表行：query 单值消费剥离、头出现 400、多值 400）；上游 `/session/status` 数据与 directory 无关（恒全局 map），`directory` 仅作 workspace 路由通道。
 - 2 条 expand 路由的可达性与能力探测口径见 §3.1 注记（`capabilities["4"]` 无 `expand` 键）。
+
+### §10.1 基线路由表（47 条零差异路由的权威语义；2026-08-21 正文化转录 [冻结]）
+
+> 历史演进注记：本小节语义 4.0.0 起原经继承基线条款指向 v3 契约 §10/§4；F-126 自包含化后就地正文化，语义零改动。
+
+**统一行为（受控代理，冻结）**：路径 = legacy 路径加 `/slimapi` 前缀；sidecar 不改写成功语义，叠加保护 + 审计 + `?v=`/`?directory=` 消费（§5.1）。**错误两级制**：成功（2xx）状态码+body 逐字透传；**4xx 状态码+body 逐字透传**（客户端校验错误原样到达）；**上游 5xx/网络错误 → 503 `upstream_unavailable`**（legacy 直连会收到上游原始 5xx 码，此为已知迁移点）。**admission（冻结）**：请求超限 → 413（既有 `max_request_bytes` 语义）；响应超限 → 413 `response_too_large`（读 cap = `max_response_bytes`，`read_with_cap` 口径——严格大于才超限、恰等于上限合法）；**纯 raw 受控代理不占 transform 池**（无投影变换，仅流式透传+上限检查，不产生 `transform_busy`）。**上游响应头透传集合冻结** = `Content-Type`、`Location`（上游 3xx 重定向：状态码 + body 均逐字透传，sidecar 不跟随不重写）、`Retry-After`、上游 `X-Request-ID`/`Last-Request-ID` 追踪头；其余上游自定义头不透传。**content-coding 规则**：上游 `Content-Encoding` 不透传——上游响应经解码后取实体字节，admission 按实体字节计，sidecar 按自身 gzip 族重新编码并生成自己的 `Content-Encoding`/`ETag`（「body 逐字透传」均指实体字节）。**错误 body 读取上限**：错误路径 body 读取同样受 `max_response_bytes` 保护；超限时无法逐字透传，降级 503 `upstream_unavailable`（资源保护优先于逐字义务）。**投影路由执行域（session 单查）**：仅当上游响应为 2xx 且 body 为合法 JSON object 时投影；其余一切状态（含 204 空 body、3xx 非 JSON）逐字透传不投影；投影属转换工作，经转换池 offload 执行（事件循环不承载 JSON 解析/序列化）。
+
+**envelope 与分页（messages/sessions 列表；status 不 envelope 化）**：`GET /slimapi/messages/{sid}` → `{"items": [...], "nextCursor": <string|null>}`（游标不回退；`nextCursor` 为 opaque base64url，解析自上游 `Link: <...?before=CURSOR>; rel="next"`，客户端以 `?before=` 向旧方向翻页 drain；列表按 `time.created` 升序；`mode=merged` 同样适用）；`GET /slimapi/sessions`（`?v=3` 视图）→ `{"items": [...], "complete": <bool>}`（complete 非权威性强制语言沿用，无 `nextCursor`；v4 视图 envelope 见 §4.1）；`GET /slimapi/sessions/status` 不 envelope 化（map，无分页）；错误响应不 envelope；304 无 body（§6）。
+
+**读组（9 组；directory 列 = §5.1 消费语义，ETag 列 = §6 全集归属）**：
+
+| 组 | 路由 | 上游 legacy | 方法 | directory | ETag |
+|---|---|---|---|---|---|
+| file | `/slimapi/file`、`/slimapi/file/content`、`/slimapi/file/status` | `/file*` | GET | 消费（`/file`、`/file/content`=FileQuery 族；`/file/status`=WorkspaceRoutingQuery） | 启用 |
+| vcs | `/slimapi/vcs`、`/slimapi/vcs/status`、`/slimapi/vcs/diff` | `/vcs*` | GET | 消费（WorkspaceRoutingQuery） | 启用 |
+| find | `/slimapi/find/file` | `/find/file` | GET | 消费（FindFileQuery） | 启用 |
+| providers | `/slimapi/config/providers` | `/config/providers` | GET | 消费（WorkspaceRoutingQuery） | 启用 |
+| session 单查 | `/slimapi/session/{id}` | `/session/{id}` | GET | 消费 | 启用 |
+| active | `/slimapi/api/session/active` | `/api/session/active` | GET | 不消费 | 启用 |
+| global health | `/slimapi/global/health` | `/global/health` | GET | 不消费 | 启用 |
+| messages.expand | `GET /slimapi/messages/{sid}/expand/{category}/{mid}`、`GET /slimapi/messages/{sid}/expand/{category}/{mid}/{partID}`（§14；**转换端点**，非 raw 受控代理） | `/session/{sid}/message/{mid}`（singleflight 共享 GET） | GET | 消费（§5.1） | 不启用（恒 200） |
+| session.context | `GET /slimapi/session/{sid}/context` | `/api/session/{sid}/context`（上游 v2 session 组） | GET | 不消费（按 sid 自路由；`?directory=` 宽容剥离不转发不报错） | 启用 |
+
+（既有 thin 不重复列：sessions/messages/status/todo/children/diff/permission/question/agent/command/directories——todo/children/diff 无 ETag（`If-None-Match` 忽略、恒 200）；messages.expand 组不适用「错误两级制」与「上游响应头透传」（响应头由 sidecar 全权拥有 §14.1、错误映射 §14.3、占用 transform 池——池满 503 `transform_busy` + `Retry-After`）。）
+
+**写路由（17 端点；#1-12 directory 消费——上游 session/question 组均声明 WorkspaceRoutingQuery；#13-17 不消费——上游 v2 session 组按 sid 自路由，`?directory=` 宽容剥离不转发不报错）**：
+
+| # | 路由 | 上游 | 方法 | 备注 |
+|---|---|---|---|---|
+| 1 | `/slimapi/session` | `/session` | POST | createSession |
+| 2 | `/slimapi/session/{id}` | `/session/{id}` | PATCH | **双 shape 透传**：title/metadata/permission（UpdatePayload）与 time.archived——上游校验，sidecar 不区分 |
+| 3 | `/slimapi/session/{id}` | `/session/{id}` | DELETE | deleteSession |
+| 4 | `/slimapi/session/{id}/prompt_async` | 同名 | POST | PromptPayload 透传 |
+| 5 | `/slimapi/session/{id}/abort` | 同名 | POST | abortSession |
+| 6 | `/slimapi/session/{id}/summarize` | 同名 | POST | SummarizePayload 透传 |
+| 7 | `/slimapi/session/{id}/fork` | 同名 | POST | ForkPayload；**`messageID` 为可选 body JSON 字段**，非 query |
+| 8 | `/slimapi/session/{id}/revert` | 同名 | POST | RevertPayload（messageId+partId body） |
+| 9 | `/slimapi/session/{id}/permissions/{permissionId}` | 同名 | POST | respondPermission |
+| 10 | `/slimapi/question/{requestId}/reply` | 同名 | POST | replyQuestion |
+| 11 | `/slimapi/question/{requestId}/reject` | 同名 | POST | rejectQuestion |
+| 12 | `/slimapi/session/{id}/command` | 同名 | POST | CommandPayload 透传 |
+| 13 | `/slimapi/session/{id}/agent` | `/api/session/{id}/agent` | POST | switchAgent；body `{"agent":"<id>"}` 透传；成功 **204** 无体（错误两级制照旧） |
+| 14 | `/slimapi/session/{id}/model` | `/api/session/{id}/model` | POST | switchModel；body `{"model":"<provider/model>"}` 透传；成功 204 |
+| 15 | `/slimapi/session/{id}/revert/stage` | `/api/session/{id}/revert/stage` | POST | revert 三段式之 stage；body `{"messageID":…,"files"?:bool}` 透传；成功 **200** `{"data":…}` 逐字（无投影）；与 #8 单步 `/revert` **加性并存**，互不替代 |
+| 16 | `/slimapi/session/{id}/revert/clear` | `/api/session/{id}/revert/clear` | POST | 无 payload；成功 204 |
+| 17 | `/slimapi/session/{id}/revert/commit` | `/api/session/{id}/revert/commit` | POST | 无 payload；成功 204 |
+
+（修订二激活后 write 组另有三条 POST 等效动作路由（§16.2），见本节末修订块——计数 51→54。）
+
+### §10.2 消息投影基线（`GET /slimapi/messages/{sid}` 骨架缩减与 expandRefs；2026-08-21 正文化转录 [冻结]）
+
+> 历史演进注记：本小节语义 4.0.0 起原经继承基线条款指向 v3 契约 §4a；F-126 自包含化后就地正文化，语义零改动。
+
+范围：messages 缺省 skeleton 与 `mode=merged` 投影。原则：skeleton 内字段**整字段保留或整字段省略，不做部分截断**；多字节按 UTF-8 编码字节计数。省略字段（除 /full-only 清单）必携带 `expandRefs`。
+
+1. **阈值与省略规则**：
+   - `info.summary.diffs`：**总是省略** → `null` + 消息级 `info.expandRefs`（`category:"info_summary_diffs"`）；summary 其余 key 保留；仅省略时刻非 null/非空 list 才生成 ref。
+   - `TextPart.text`：**永远全量内联，不折叠、无阈值**（对话正文无论字节数一律呈现；skeleton 与 merged 两模式经断言测试矩阵锁定全量内联——投影层零 text 截断分支、零 `truncated` 语义）。折叠内容按 omitted+expandRefs 模式 1 / 缩略信息模式 2；`part_text` 类目端点保留服务历史响应与降级场景（§14.2）。
+   - `ReasoningPart.text`：UTF-8 编码字节 > **2048** → 整字段 `null` + `omitted:["text"]` + `hasFull:true` + part 级 `expandRefs`（`part_reasoning`）；≤ 2048 原样内联。
+   - `ToolPart.state.output/error`：阈值 4 KB/字段、16 KB/消息，省略时新增 `expandRefs`（`part_state_output` / `part_state_error`）。
+   - `tool state.input`/`metadata`/`attachments`（`object|null` / `object|null` / `object[]|null`）、`file.url`/`source`、`step-start`/`step-finish` 的 `snapshot`、compaction 整体超限：按 §14.2 映射生成 `expandRefs`。
+   - **/full-only**（省略但不生成 refs，显式穷举）：`state.structured/result/raw`、tool input 非白名单单个 key、step-finish `reason/cost/tokens`、reasoning `metadata/time`、text `synthetic/ignored/time`、未知上游字段、`omitted:["*"]`（compaction 超限除外）、`thin_placeholder` 的 `omitted:["parts"]`。
+2. **PatchPart**：`files` 为上游 `string[]`，skeleton **原样保留 verbatim**（+ 保留 `hash`）——不省略、不生成 refs、不做 dict 数组假设。
+3. **`expandRefs` 为 sidecar 拥有键**：上游同名键**一律剥离/确定性替换**（skeleton 深拷贝时丢弃上游值后按本映射重建），永不透传、永不进 `omitted`。元素形状 `{category, messageID, partID?, href}`（数组）；去重：每 `(category, messageID, partID?)` 至多 1 条（tool input 多 key 省略 → 仅 1 条 `part_state_input_full`）；排序：category 字典序 + 同 category 内 partID 字典序（确定性）；`href` 含 selector 值（§14），directory 由客户端追加；空/null 上游字段与未知字段不生成。基数上界：每 part 理论 ≤ 5（tool part 可同时省略 input/metadata/attachments/output/error）。
+4. **可渲染性**：skeleton 模式 `text:null` 但携带 `expandRefs` 的 part **计为可渲染**（part 骨架 + 展开入口，非整页 placeholder）；消息级省略（diffs）不参与可渲染判定；`thin_placeholder` 语义不变（无任何可渲染 part 时注入）。
+5. **merged 语义（best-effort，显式不承诺 null-free）**：候选集 = 占位消息 ∪ 任一 part 携带 `expandRefs` 的消息（消息级 `info.expandRefs` **不进入候选**——diffs 永不 batch 恢复）；**placeholder-first** 优先级（占位消息按页面顺序优先占用预算，行为不被 ref 候选挤占）；ref 候选仅在剩余预算内按页面顺序 best-effort 还原；**交集去重**：同一消息同时属于两类时按 mid 去重——占位身份优先、只占 1 个 slot、只发起 1 次 full fetch；还原范围与现有 merge 相同（仅替换 `parts`），`info.summary.diffs` 在 merged 输出**恒 `null` + expandRefs**；预算耗尽/源超限/上游失败/畸形 body → 该项保留 skeleton（含 `null` text + expandRefs），客户端有展开入口兜底。
+6. **`contentFingerprint`**：每条消息 skeleton 加性字段 `contentFingerprint: string`，格式 `"<vN>:<sha256hex>"`（`vN` = 指纹方案版本前缀；SHA-256 全量 hex 不截断）。生成位置：缺省列表 = skeleton 投影完成时；`mode=merged` = placeholder splice 完成后**重算覆盖**（full 抓取失败/预算不足/坏响应等降级路径**不重算**，保留 skeleton 期指纹）。规范化输入 = 排除 `contentFingerprint` 自身后的消息投影 dict，`sort_keys` 序列化（parts 保持上游序）后取 SHA-256——指纹只覆盖 sidecar 投影后的表示，不含被丢弃字段。终态语义：同输入（同投影、同规范化、同 `vN`）恒同指纹（确定性，跨进程重启成立）；**不提供单调性**（不是序号/revision，客户端不得据此排序或版本比较）；**跨表示模式不可比较**（缺省与 merged 对同一消息产生不同指纹，`vN` 前缀不区分模式——仅在同一表示模式内比较）；指纹是 `(updatedAt, messageId)` 双水位去重的补充证据，digest 帧不携带指纹。`OC_SLIMAPI_MESSAGE_FINGERPRINT_ENABLED=false` → 省略该字段；该开关状态参与 validator 版本输入（关闭 → 全部 ETag validator 轮换）。
 
 **2026-08-19 正式修订追加差异面 [冻结目标——逐项当对应 feature ID 进入 `satisfied`（§3.3 门控）时生效；生效前上述发布态注载继续成立]**：
 
@@ -479,8 +561,8 @@ type ModelEntry = {
 ```
 [main context — 事件循环]
 ① selector（400 族，§2）
-② directory 消费/校验（400 族——providers 路由的 directory 规则出处为 v3 §10.a C1 消费集
-   （providers=WorkspaceRoutingQuery）与 §5 directory 消费矩阵）
+② directory 消费/校验（400 族——providers 路由为 §10.1 读组消费集成员
+   （providers=WorkspaceRoutingQuery），按 §5.1 基线消费矩阵）
 ③ 上游 fetch + HTTP 状态映射（§12.5.1）——异步网络 I/O
                                             → 502 upstream_http_<N> / 502 provider_upstream_malformed /
                                                503 upstream_unavailable
@@ -508,7 +590,7 @@ type ModelEntry = {
    （identity/gzip 字节与 validator 均由 worker 产出——主上下文零序列化、零压缩）
 ```
 
-**offload 边界（冻结）**：⑥-⑪ 的**全部 CPU 工作**（JSON 解码、重复 member 检查、schema 校验、投影、限额、canonical 序列化、body 限额、**gzip 协商判定与压缩**）**只在该 transform worker job 内执行，绝不在 event loop 上执行**（v3 §10.a 既有纪律延续；不存在「8 MiB body 在 event loop 压缩」的合法路径）。③-④ 为异步上游 I/O + 流式字节计数，留在主上下文——**网络等待不占 transform 配额**。⑤ = **transform permit 获取**：permit 语义 = worker/CPU 配额（门的是 ⑥-⑪ 的 CPU 工作，不是上游 I/O）；获取时机 = body cap 检查通过之后、worker job 提交之前——**permit 持有期 = worker job 生命周期**（job 结束即释放），网络等待期不持有。因此 **503 `transform_busy` 仅可能发生在 ⑤ 提交点**（数据级错误 ③/④ 先于 permit 判定；这与 v3 §4b.3 ③ 「准入先于上游工作」的语义差异是本路由的显式设计——上游 I/O 不消耗 CPU 配额，先做完 I/O 与 cap 检查再竞争 permit）。⑫ 回主上下文仅做 conditional 判定与响应发射。
+**offload 边界（冻结）**：⑥-⑪ 的**全部 CPU 工作**（JSON 解码、重复 member 检查、schema 校验、投影、限额、canonical 序列化、body 限额、**gzip 协商判定与压缩**）**只在该 transform worker job 内执行，绝不在 event loop 上执行**（既有受控代理 offload 纪律延续，§10.1；不存在「8 MiB body 在 event loop 压缩」的合法路径）。③-④ 为异步上游 I/O + 流式字节计数，留在主上下文——**网络等待不占 transform 配额**。⑤ = **transform permit 获取**：permit 语义 = worker/CPU 配额（门的是 ⑥-⑪ 的 CPU 工作，不是上游 I/O）；获取时机 = body cap 检查通过之后、worker job 提交之前——**permit 持有期 = worker job 生命周期**（job 结束即释放），网络等待期不持有。因此 **503 `transform_busy` 仅可能发生在 ⑤ 提交点**（数据级错误 ③/④ 先于 permit 判定；这与 §14.3 求值序 ③「准入先于上游工作」的语义差异是本路由的显式设计——上游 I/O 不消耗 CPU 配额，先做完 I/O 与 cap 检查再竞争 permit）。⑫ 回主上下文仅做 conditional 判定与响应发射。
 
 #### §12.5.3 错误表（逐类目）
 
@@ -529,15 +611,15 @@ type ModelEntry = {
 
 - **canonical body（canonical 字节冻结）**：canonical 字节 = `orjson.dumps(value, option=orjson.OPT_SORT_KEYS)` 的逐字节输出——UTF-8 直出非 ASCII、不转义 `/`、控制字符转义按 orjson 实测形态（`\n`/`\t`/`\b`/`\f`/`\r` 五个短转义；其余 C0 控制字符 `\uXXXX`；DEL `0x7f` 与 U+2028/U+2029 直出不转义）、紧凑分隔符；**orjson 语义即冻结算法**（转义形态随 orjson 实际输出冻结，不另行规定）；一切 object 含 `default` map 按 key UTF-8 字节序；数组序按 §12.2。**canonical 序列化产生的字节就是 wire body**——ETag 哈希对象 = 实际发送的 canonical identity bytes，不存在另一份重排副本（同一字节双重身份：传输体与哈希输入）。ETag 输入**永不**是上游原始字节；同一上游输入 → 同一 canonical 字节 → 同一 validator。
 - **validator 规则（`src/oc_slimapi/etag.py` 口径）**：identity → 强 validator `"<sha256hex>"`；gzip → 弱 validator `W/"<sha256hex>"`；hash 输入 = `REP_VERSION + NUL + coding + NUL + canonical identity body`（全量 hex，不截断）。
-- **REP_VERSION 域隔离**：含 wire-view 标记 + 投影/配置指纹——v3 validator 与修订后 v4 validator 互不匹配；修订切换（透传 → 投影）本身经 REP_VERSION 投影版本轮换全部 validator（v2 §6.2 机制继承），构造上不可能误 304；上游自身 ETag 不透传（sidecar 生成域，v3 §6.1 不变）。**修订三注记 [2026-08-20]**：投影字段集演进（ModelEntry 恢复 optional `limit`）同样经指纹 bump 轮换（实现值 `providers-projection-v1` → `v2`）——同输入下新旧 v4 validator 必然不同，旧 ETag 全部自然失效重拉。
-- **`Vary: Accept-Encoding` 强制**（§15）；`If-None-Match`/`*`/judge 三态沿用 v3 §6 冻结行为；200/304 均 `Cache-Control: no-store`（ETag 仅省下行传输字节，管线照跑，非缓存授权）。
+- **REP_VERSION 域隔离**：含 wire-view 标记 + 投影/配置指纹——v3 validator 与修订后 v4 validator 互不匹配；修订切换（透传 → 投影）本身经 REP_VERSION 投影版本轮换全部 validator（v2 §6.2 机制继承），构造上不可能误 304；上游自身 ETag 不透传（sidecar 生成域，§6 第 4 条基线）。**修订三注记 [2026-08-20]**：投影字段集演进（ModelEntry 恢复 optional `limit`）同样经指纹 bump 轮换（实现值 `providers-projection-v1` → `v2`）——同输入下新旧 v4 validator 必然不同，旧 ETag 全部自然失效重拉。
+- **`Vary: Accept-Encoding` 强制**（§15）；`If-None-Match`/`*`/judge 三态 = §6 第 3 条冻结行为；200/304 均 `Cache-Control: no-store`（ETag 仅省下行传输字节，管线照跑，非缓存授权）。
 - **ETag 开关**：继承 `OC_SLIMAPI_ETAG_ENABLED`（缺省开）。关闭 → 本路由无 `ETag`、无 304 判定；**`Vary: Accept-Encoding` 仍发**——表示可变性与 ETag 正交。readiness 不受该开关影响：`representation.vary.v4` 恒可满足（§3.3）。
 
 ## §13 Session 单查 parity（`GET /slimapi/session/{sid}?v=4`）[2026-08-19 修订冻结]
 
-> **当前状态**：现行 `?v=4` 单查恒返回 v3 skeleton 投影（§10 发布态注载——单查无 v4 分叉）。本节为冻结目标——当 feature `session.single.projection.v4` 进入 `satisfied`（§3.3 门控）时生效：单查升级为与 v4 列表同源 canonical 形状，列表 item 形态与本节对象同批统一；`?v=3` 恒 v3 skeleton（v3 冻结）。
+> **当前状态**：现行 `?v=4` 单查恒返回既有 skeleton 投影（§4.1 `SESSION_KEYS` 列集；§10 发布态注载——单查无 v4 分叉）。本节为冻结目标——当 feature `session.single.projection.v4` 进入 `satisfied`（§3.3 门控）时生效：单查升级为与 v4 列表同源 canonical 形状，列表 item 形态与本节对象同批统一；`?v=3` 恒 v3 skeleton（v3 冻结）。
 
-单查与全局列表 `GET /slimapi/sessions?v=4` 共用**同一 canonical 对象**；列表请求参数矩阵（`archived`/`parent`/`search`/`cursor`/`limit` 1..500）、cursor 语义、降级判定（何时允许 fallback、何时 503 `auxiliary_unavailable`，含 `Retry-After: 30`）**继承 §4 冻结**——本节在其上统一 item 投影并叠加标记语义。单查 `directory` 消费语义沿 v3（单查为 v3 消费集路由：query 单值消费剥离、头退役 400、多值 400）；未命中 → 404 `session_not_found`（既有）；native 4xx 逐字 / 5xx/网络 → 503 `upstream_unavailable`（继承）。
+单查与全局列表 `GET /slimapi/sessions?v=4` 共用**同一 canonical 对象**；列表请求参数矩阵（`archived`/`parent`/`search`/`cursor`/`limit` 1..500）、cursor 语义、降级判定（何时允许 fallback、何时 503 `auxiliary_unavailable`，含 `Retry-After: 30`）**继承 §4 冻结**——本节在其上统一 item 投影并叠加标记语义。单查 `directory` 消费语义 = §5.1 基线（单查为消费集路由：query 单值消费剥离、头退役 400、多值 400）；未命中 → 404 `session_not_found`（既有）；native 4xx 逐字 / 5xx/网络 → 503 `upstream_unavailable`（继承）。
 
 ### §13.1 canonical 形状（list item 与 single 共用）
 
@@ -570,14 +652,14 @@ type SessionsV4 = {
 }
 ```
 
-修订形态 = §4.1 发布态字段集（v3 `SESSION_KEYS` 投影 + `project` 对象 + **tokens 五列平铺 v4-only 字段**，§4.1 R2 真库列名实证：`tokens_input/tokens_output/tokens_reasoning/tokens_cache_read/tokens_cache_write`）+ **`partial`/`degraded` 两个 item 标记** + envelope `degraded` 改 **required 布尔**。单查响应 = **裸 `SessionSkeletonV4` 对象**（无 envelope；响应级 degraded 即 item 自身 degraded，§13.4 公式平凡成立）。无 effectiveStatus / subagentList / Turn / cost 聚合 / exact-merged / generic fragment 字段（§17）。
+修订形态 = §4.1 发布态字段集（§4.1 `SESSION_KEYS` 白名单列投影 + `project` 对象 + **tokens 五列平铺 v4-only 字段**，§4.1 R2 真库列名实证：`tokens_input/tokens_output/tokens_reasoning/tokens_cache_read/tokens_cache_write`）+ **`partial`/`degraded` 两个 item 标记** + envelope `degraded` 改 **required 布尔**。单查响应 = **裸 `SessionSkeletonV4` 对象**（无 envelope；响应级 degraded 即 item 自身 degraded，§13.4 公式平凡成立）。无 effectiveStatus / subagentList / Turn / cost 聚合 / exact-merged / generic fragment 字段（§17）。
 
 ### §13.2 字段真值表（requiredness / null / absent + fallback 可表示性，冻结）
 
 | 字段 | requiredness | null / absent 语义 | dbaux 来源 | native fallback 来源 / 行为 |
 |---|---|---|---|---|
 | `id` | required | 永不 null | session 行 | native session id；不可得 → **整响应失败**（§13.2a） |
-| `directory` | required | 全局列表强制**非空字符串**；单查继承 v3 directory 消费（显式传入仍经 v3 校验，非法值 → 400 `invalid_directory` 族） | session 行 | native directory（同值，禁跨源合并）；不可得 → **整响应失败** |
+| `directory` | required | 全局列表强制**非空字符串**；单查按 §5.1 基线 directory 消费（显式传入经基线校验，非法值 → 400 `invalid_directory` 族） | session 行 | native directory（同值，禁跨源合并）；不可得 → **整响应失败** |
 | `parentID` | required | `null` = 根会话（业务合法 null） | session 行 | 不可得 → `null` + `partial:true, degraded:true`（可 null 字段，§13.2b） |
 | `projectID` | required | `null` = 上游确无 project（**≠** join 失败） | session 行 | 不可得 → `null` + partial/degraded |
 | `project` | optional | **absent ⇔ `projectID == null`**；`null` 仅当非空 `projectID` 的 join 不可用/无效（必伴 `partial:true, degraded:true`）；对象形 `{id, name?, worktree}`，`name` 可 absent | project join | 同 §13.5 三不变量；join 不可用/无效 → `null` + partial/degraded |
@@ -622,24 +704,84 @@ envelope.degraded == (任一 item.degraded == true) ∨ (本响应采用 native 
 
 任一不满足——**缺失 / ID mismatch / join 失败** → 该 item `project: null, partial: true, degraded: true`。**"无 project"（`projectID:null` → `project` absent）与 "join 不可用"（`project:null` + 标记）是两种不同 wire 形态**，不得混同。
 
-## §14 expand href 与能力闭环 [2026-08-19 修订冻结]
+## §14 expand 端点全文语义与能力闭环 [2026-08-19 修订冻结]
 
 > **当前状态**：现行 expandRefs href 硬编码 `?v=3`（`skeleton.py` `_expand_ref`）——`?v=4` 响应亦发 `v=3` href（§3.1/§10 发布态注载）；`capabilities["4"]` 无 `expand` 键。本节为冻结目标——当 feature `messages.expand.v4` 进入 `satisfied`（§3.3 门控）时生效。
 
-- **12 类目有序清单（原样照抄 v3 §3/§4b.2，冻结）**：`info_summary_diffs` → `part_text` → `part_reasoning` → `part_state_output` → `part_state_error` → `part_state_input_full` → `part_state_metadata_full` → `part_state_attachments` → `part_url` → `part_source` → `part_snapshot` → `compaction_full`（单一事实源 `src/oc_slimapi/traffic.py::EXPAND_CATEGORIES` 表序延续；versions 广告与流量记账同源）。
-- **`fragmentMaxBytes` = `OC_SLIMAPI_MAX_EXPAND_RESPONSE_BYTES` 运行时值**（缺省 **8388608**，界 **1024..33554432** 含边界；非法值启动 RuntimeError——config.py 既有冻结）。capability 广告 `capabilities["4"].expand = {categories, fragmentMaxBytes}` 与 v3 §3 形状同构；**仅当全部 12 类目在 v4 视图闭环（href/响应/错误）才广告**（§3.3 批次闭合）。
+- **12 类目有序清单（冻结）**：`info_summary_diffs` → `part_text` → `part_reasoning` → `part_state_output` → `part_state_error` → `part_state_input_full` → `part_state_metadata_full` → `part_state_attachments` → `part_url` → `part_source` → `part_snapshot` → `compaction_full`（单一事实源 `src/oc_slimapi/traffic.py::EXPAND_CATEGORIES` 表序延续；versions 广告与流量记账同源；类目级别/适用 part 类型/返回 `data` 形状见 §14.2）。
+- **`fragmentMaxBytes` = `OC_SLIMAPI_MAX_EXPAND_RESPONSE_BYTES` 运行时值**（缺省 **8388608**，界 **1024..33554432** 含边界；非法值启动 RuntimeError——config.py 既有冻结）。capability 广告 `capabilities["4"].expand = {categories, fragmentMaxBytes}` 与 `capabilities["3"].expand`（§3.1）形状同构（categories = 12 类目有序数组 + fragmentMaxBytes = 数值）；**仅当全部 12 类目在 v4 视图闭环（href/响应/错误）才广告**（§3.3 批次闭合）。
 - **href canonical 形态（冻结）**：`GET /slimapi/messages/{sid}/expand/{category}/{mid}?v=<selector>[&directory=...]`（part 级含 `/{partID}`）。query 键序：**`v` 第一、客户端追加 `directory` 第二、无其他 key**；`v` 值来自**解析后 selector**——`?v=3` 请求的响应 → `v=3`（v3 冻结，修订不触碰）；`?v=4` 请求的响应 → `v=4`（本节修订）；经既有 query 编码**恰编码一次**。
-- 端点求值序（含 transform 准入先于 part 级错误）、错误码族、响应 envelope（`{"category","messageID"[,"partID"],"data"}`）、`Cache-Control: no-store` / `Vary: Accept-Encoding` / 无 ETag——全部继承 v3 §4b 冻结语义，本修订不另立。
+- 端点求值序、错误码族、响应 envelope、响应头基线语义（两视图一致）全文 = §14.1-§14.5（2026-08-21 正文化转录 [冻结]，本修订不另立）。
+
+### §14.1 路由、selector 与响应头
+
+`GET /slimapi/messages/{sid}/expand/{category}/{mid}?v=<selector>[&directory=...]`（消息级，仅 `info_summary_diffs` 合法）与 `GET /slimapi/messages/{sid}/expand/{category}/{mid}/{partID}?v=<selector>[&directory=...]`（part 级，其余 11 类目）。两路由均挂 messages 面、require selector、消费 `?directory=`（§5.1 消费集）；`category` 以 str 接收 + 手工白名单校验（不用 Enum 路径参数）→ 400 `invalid_expand_category`。响应**无 ETag/304**（成功恒 200）、`Cache-Control: no-store`、`Vary: Accept-Encoding`、无自定义辅助头。
+
+### §14.2 类目表与映射要点
+
+| category | 级别 | 适用 part 类型 | 返回 `data` |
+|---|---|---|---|
+| `info_summary_diffs` | 消息级 | — | `{diffs: <FileDiff[]> \| null}`（`info.summary.diffs`） |
+| `part_text` | part | text | `{text: string \| null}`（`part.text`；现行 skeleton 不再产生 `part_text` ref——text 永远内联，端点保留服务历史响应与降级场景） |
+| `part_reasoning` | part | reasoning | `{text: string \| null}`（`part.text`） |
+| `part_state_output` | part | tool | `{output: string \| null}`（`state.output`） |
+| `part_state_error` | part | tool | `{error: string \| null}`（`state.error`） |
+| `part_state_input_full` | part | tool | `{input: object \| null}`（`state.input`） |
+| `part_state_metadata_full` | part | tool | `{metadata: object \| null}`（**剥离 `diagnostics`**） |
+| `part_state_attachments` | part | tool | `{attachments: object[] \| null}`（`state.attachments`） |
+| `part_url` | part | file | `{url: string \| null}`（`part.url`） |
+| `part_source` | part | file | `{source: object \| null}`（`part.source`） |
+| `part_snapshot` | part | step-start / step-finish | `{snapshot: string \| null}`（`part.snapshot`，均 optional） |
+| `compaction_full` | part | compaction | 完整 compaction part（**剥离 `expandRefs`**） |
+
+**映射要点**：state 类 category 全部 **tool-only**（PatchPart `{type:"patch", hash, files: string[]}` 无 state；跨类型请求 → 400 `expand_category_mismatch`）；`part_snapshot` 覆盖 step-start 与 step-finish 两类型；无 `part_files_full`（`files` 为路径数组，skeleton 原样保留，§10.2）；extractor 全部白名单构造，不暴露 category 外字段。
+
+### §14.3 冻结求值顺序链与错误族
+
+路由内求值序（独立于 §8.3 middleware 链——selector/directory 400 仍先于路由内错误）：
+
+```
+① category ∈ 白名单（str 校验，12 项）        → 400 invalid_expand_category（附有效类目表序）
+② 级别匹配（part 级缺 partID / 消息级 category 携带 partID）
+                                               → 400 expand_category_mismatch（附 expectedLevel）
+③ transform pool 准入（镜像 /full 吸收语义）  → 503 transform_busy（Retry-After）——先于一切 part 级错误
+④ 共享 single-flight GET（与 direct /full、merged fan-out 同键去重；键含 scope+sid+mid+directory）：
+   a. 发送/网络失败                          → 503 upstream_unavailable
+   b. 上游错误状态（≥400）：drain 失败        → 503 upstream_unavailable；drain 成功按状态映射——
+      sid 级 404                             → 404 session_not_found（带 sessionID）
+      5xx                                   → 503 upstream_unavailable
+      其余 4xx                              → 502 upstream_http_N
+   c. 上游 2xx cap-read 网络失败              → 503 upstream_unavailable
+      源 body 超 max_message_bytes          → 413 expand_source_too_large（limitBytes）——先于 JSON 解码（超限且畸形 body 仍 413）
+   d. JSON 解码失败 / 顶层非 dict body        → 503 upstream_unavailable
+⑤ parts 定位/形状（parts 缺失/null/标量/元素非对象/重复 partID）
+                                               → 502 upstream_invalid_shape；partID 未命中 → 404 expand_target_not_found（附 reason:"part_missing"）
+⑥ part.type ∈ category 适用集                 → 400 expand_category_mismatch（附 expectedTypes）
+⑦ 提取（白名单构造）+ 嵌套类型校验：字段存在但类型与冻结 schema 不符 → 502 upstream_invalid_shape；
+      缺失或 JSON null                          → 200 + data 对应键 null
+⑧ 片段字节 cap（序列化后、gzip 前）超 max_expand_response_bytes
+                                               → 413 expand_fragment_too_large（limitBytes）
+```
+
+**错误码唯一命名**：全文仅存在 `expand_target_not_found`（附 `reason:"part_missing"` 字段）与 `expand_category_mismatch` 两码，无独立 `part_missing`/`category_mismatch` 码。要点：503/413(源)/502 **可能先于** 404(part)/400(类型) 出现——「准入在前、先取后析」既有管线（与 /full 同构）的固有序，如实冻结为契约。
+
+### §14.4 响应 envelope（200）
+
+消息级 `{"category": <str>, "messageID": <mid>, "data": {...}}`；part 级 `{"category", "messageID", "partID", "data": {...}}`——`data` 形状按 §14.2 表对应键，缺失或显式 null 均 `data.<key> = null`。无 `contentFingerprint`（片段端点不适用）。成功响应携带 `messageID`/`partID` 供对账；**读当前态**（非 skeleton 快照）：当前态字段值；part 已删 → 404（`reason:"part_missing"`）；part 类型已变 → 400——客户端据此刷新 skeleton。
+
+### §14.5 配置与观测
+
+`OC_SLIMAPI_MAX_EXPAND_RESPONSE_BYTES`（默认 **8 MiB**，界 **1 KiB–32 MiB** 含边界，非法值启动 `RuntimeError`）；全局内存信封按 `max(max_response_bytes, max_expand_response_bytes) × max_transforms` 计账（expand worker 同时持有原始 full-message bytes、解析对象、片段序列化 bytes、可选 gzip bytes），expand cap 配置导致信封超限的组合 **startup 拒绝**。观测：traffic ledger/snapshot/metrics `expand` 块——按 category × status 聚合（12 类目白名单），伪造/非法 category 折叠进固定 `invalid` 桶（防基数 DoS）；`traffic-snapshot-YYYY-MM-DD.jsonl` 持久化含 expand。
 
 ## §15 表示层：Vary 规则与 v4 ETag [2026-08-19 修订冻结]
 
 > **当前状态**：现行 v4 sessions 列表 200 响应**无 ETag 且显式删除 `Vary`**（`sessions.py` `_v4_json_response`——`json_response` 基线为 gzip 协商统一盖 `Vary: Accept-Encoding`，该 helper 将其删除；**已知 bug/风险项**，§4.4 发布契约载「v4 sessions 无 ETag/Vary/304」）。本节为冻结目标——当 feature `representation.vary.v4` 进入 `satisfied`（§3.3 门控）时生效。
 
 - **`Vary: Accept-Encoding` 直接规则（冻结）**：凡可随 `Accept-Encoding` 变化的 v4 表示（200/304）**必带** `Vary: Accept-Encoding`。修订修正上述删除 bug——全 v4 路由正确发 Vary（v4 sessions 列表含 body gzip 协商，无 Vary 声明即缓存不正确）。SSE 帧化为**显式例外**（§7.5：SSE 恒 identity、无 Vary）。
-- **v4 sessions 列表 ETag（新增）**：canonical 口径与 §12.6 同规则——canonical identity bytes 即 wire body；identity 强 validator `"<sha256hex>"` / gzip 弱 `W/"<sha256hex>"`；hash 输入 = `REP_VERSION + NUL + coding + NUL + canonical identity body`。`If-None-Match`/`*`/judge 三态沿用 v3 §6；304 头集合 = `ETag` + `Vary` + `Cache-Control: no-store`（sessions envelope 自含 `nextCursor`/`complete`，无 aux 头）；200/304 均 `no-store`。
+- **v4 sessions 列表 ETag（新增）**：canonical 口径与 §12.6 同规则——canonical identity bytes 即 wire body；identity 强 validator `"<sha256hex>"` / gzip 弱 `W/"<sha256hex>"`；hash 输入 = `REP_VERSION + NUL + coding + NUL + canonical identity body`。`If-None-Match`/`*`/judge 三态 = §6 第 3 条；304 头集合 = `ETag` + `Vary` + `Cache-Control: no-store`（sessions envelope 自含 `nextCursor`/`complete`，无 aux 头）；200/304 均 `no-store`。
 - **`merged_vary` 说明（如实）**：现行 `merged_vary`（`etag.py`）将任意输入折叠为单值 `"Accept-Encoding"`——v4 修订表示层**恰好只需该单值形态**（directory Vary 值已随 §1 头退役移除，v4 无其他 Vary token），无需扩展 helper；如未来出现多 token 合并需求，须先扩展该 helper 并保持 v3/v4 既有输出逐字节不变。
 - **域隔离（冻结）**：缓存键 / singleflight 键 / ETag REP_VERSION 均含 wire-view 标记——v3 与修订后 v4 validator 互不匹配，跨视图 `If-None-Match` 保守 200；修订切换（无 ETag → 有 ETag）经 REP_VERSION 投影版本轮换，不可能误 304。
-- v4 sessions 以外的 v4 路由：ETag/Vary 语义与 v3 发布态一致（§6「v3 原样」延续）；providers 路由修订后按 §12.6 口径。
+- v4 sessions 以外的 v4 路由：ETag/Vary 语义 = §6 基线发布态（无版本分叉）；providers 路由修订后按 §12.6 口径。
 
 ## §16 POST 等效动作族 + method 边界 [2026-08-19 修订冻结；**修订二：POST 等效动作族——已发版 v4.3.0**]
 
@@ -659,10 +801,10 @@ envelope.degraded == (任一 item.degraded == true) ∨ (本响应采用 native 
 
 - **HTTP 405**；
 - **`Allow` 头**（字面冻结，逗号+空格分隔）：`POST /slimapi/session/{sid}` → `Allow: GET, PATCH, DELETE`；`POST /slimapi/session/{sid}/archive`、`POST /slimapi/session/{sid}/delete` → **空 `Allow:`**（RFC 9110 §10.2.1：空值 = 资源不支持任何方法）；
-- **coded error body**（v3 envelope 惯例）：`{"code":"method_not_applicable","method":"<METHOD>","allow":["GET","PATCH","DELETE"]}`（`allow` 数组与 `Allow` 头一致；archive/delete 为 `[]`）；
+- **coded error body**（统一错误体惯例，§8.1）：`{"code":"method_not_applicable","method":"<METHOD>","allow":["GET","PATCH","DELETE"]}`（`allow` 数组与 `Allow` 头一致；archive/delete 为 `[]`）；
 - **不转发上游**（零上游 IO）+ **`Cache-Control: no-store`**；**selector 扩展不得自然转发**——v4 视图下这三条组合在过渡态永不透传上游；
 - **优先级**：§8.3 链在「② selector version 族 400」与「③ selector directory 族 400」之间插列本节 405（判定不依赖 query 参数，故先于 directory 消费；§8.4）；
-- **适用范围精确限定**：本 405 仅限三条组合且 selector 已选 v4 且门控未激活。其他已收编 path 的未注册方法**继承既有路由行为**（框架 405/404 现状——不发本 code、不发 `allow` 数组）；完全未收编 path → 既有 404 `thin_route_not_found`（v3 §8.2）任何版本不变；
+- **适用范围精确限定**：本 405 仅限三条组合且 selector 已选 v4 且门控未激活。其他已收编 path 的未注册方法**继承既有路由行为**（框架 405/404 现状——不发本 code、不发 `allow` 数组）；完全未收编 path → 既有 404 `thin_route_not_found`（catch-all 关闭终态：未收编路径显式 404，任何版本不变）；
 - V3/V4 的 PATCH/DELETE controlled-write 语义（JSON body 透传、上游 4xx 逐字、5xx/网络 → 受控 503、no-store）两视图**逐字不变**。
 
 ### §16.2 POST 等效动作族（`session.post-actions.v4 ∈ satisfied` 时激活；桥式 **100% 等效优先**——sidecar 不新增语义）
@@ -699,7 +841,7 @@ envelope.degraded == (任一 item.degraded == true) ∨ (本响应采用 native 
 
 - **project status / effectiveStatus / subagentList** 聚合字段——骨架不做会话状态推断；
 - **独立 Turn 资源**——turn 语义维持 `/slimapi/sessions/status` 的 `turnIncarnation`/`turn` 合并字段现状；
-- **exact merged**——merged 模式 best-effort 语义不变（v3 §4a.5 冻结延续）；
+- **exact merged**——merged 模式 best-effort 语义不变（§10.2 第 5 条基线冻结延续）；
 - **512B preview / generic fragment**——expand 类目维持 12 项冻结清单（§14），不加预览/通用片段类目；
 - **cascade 编排层**（owner 裁决 q1，永久）——sidecar **不自建**级联编排/子删除聚合/重试/部分失败可见性：delete 语义 = `DELETE`（及 §16.2-b 等效 POST）**沿用上游递归删子 + 吞错现状**（非幂等可接受）；archive = 单会话 PATCH 等效（§16.2-c，**不级联**）；
 - **cross-session search**（owner 裁决 q3，永久）——非必要能力；§4.6 search 维持 per-list 字面子串语义，不做跨会话检索。
