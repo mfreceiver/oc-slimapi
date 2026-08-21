@@ -57,6 +57,7 @@ from ..sse.replay_log import (
     ReplayResync,
     token_domain,
 )
+from ..sse.hub_types import RESYNC_RECONNECT_NO_REPLAY
 from ..sse.replay_wire import classify_reconnect, frame_with_id, meta_v4_extension
 from ..sse.token_hub import (
     STOP,
@@ -287,7 +288,7 @@ async def token_stream(request: Request, sid: str, directory: str | None = None)
                 # and sits behind this leading frame on the wire.
                 # v4 NEVER reaches this branch — a ①② violation is an
                 # ignore+reset (no resync), NOT the v3 blanket resync.
-                out = encode(_resync_frame(sid, "reconnect_no_replay"))
+                out = encode(_resync_frame(sid, RESYNC_RECONNECT_NO_REPLAY))
                 _account(out)
                 yield out
             while True:

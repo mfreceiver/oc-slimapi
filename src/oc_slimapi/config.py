@@ -23,7 +23,9 @@ from .versioning import ACCEPTED_CLIENT_VERSIONS, SERVER_API_VERSION
 #
 # Debug/联调-only env overrides (``OC_SLIMAPI_TOKEN_STREAM_DEBUG_*``):
 # these three caps also support env override via
-# :func:`~oc_slimapi.sse.tokenstream.hub.apply_debug_budget_overrides`,
+# :func:`~oc_slimapi.sse.tokenstream.budgets.apply_debug_budget_overrides`
+# (re-exported from ``tokenstream.hub``; W3-1 moved it next to its
+# mutation/read namespace),
 # which is called once during app lifespan startup. The override is OFF by
 # default (env unset = code-level cap unchanged). Intended only for
 # development / integration testing where a small data volume must trigger

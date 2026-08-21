@@ -253,7 +253,8 @@ def _compute_diffstats(
     """
     # ── digest 对账标注 ────────────────────────────────────────────────
     # digest 对账（tool 完成→message.updated 映射）：后续 SSE 实测验证项，
-    # 本轮不实现。参见 docs/specs/chat-toolcard-investigation.md §B.8
+    # 本轮不实现。参见 **ocdroid 仓** docs/specs/chat-toolcard-investigation.md
+    # §B.8（F-353：跨仓文件，本仓无此路径）。
     # ────────────────────────────────────────────────────────────────────
     if isinstance(filediff, list):
         if not filediff:

@@ -208,7 +208,8 @@ async def events(request: Request, tokens: str | None = None):
                 # v3 (frozen): any Last-Event-ID → resync{reconnect_no_replay}.
                 # v4 NEVER reaches this branch — a ①② violation is an
                 # ignore+reset (no resync), NOT the v3 blanket resync.
-                resync = sse_frame({"reason": "reconnect_no_replay"}, event="resync")
+                resync = sse_frame(
+                    {"reason": RESYNC_RECONNECT_NO_REPLAY}, event="resync")
                 await _accounted(resync)
                 yield resync
             while True:
