@@ -1166,6 +1166,8 @@ ocdroid 对接时：
 - **终态错误优先级链（§8.3）**：① 非 GET `/slimapi/versions` → 405 → ② selector 400（`invalid_version_selector`/`unsupported_version`）→ ③ directory 400（多值 `invalid_directory_selector` → 双现异值 `directory_conflict` → 消费集头 `directory_header_retired`）→ ④ 路由未命中 404 `thin_route_not_found`。
 - **观测不变式**：access log/snapshot 字段与枚举（`selectorResult` 六值、`sseActive` 四维）**不变**——`absent`/`v2` 维度自然归零是预期（不再有 v2 语义请求）。
 
+## [Unreleased]
+
 ## [4.9.0] - 2026-08-22 — 工具卡投影族：patch files 归一化 + metadata.files compact/diffStats 优先级链 + edit diff 合成 + compress title 合成 + outputBytes（owner 例外：wire 形状变更随 minor，wire 版本不变仍 (4,4)）
 
 ### Changed
