@@ -11,8 +11,9 @@ ID 的修订语义当且仅当 ∈ satisfied 时生效；未 satisfied → 该�
   ``messages.expand.v4 ∈ SATISFIED``（§14/§3.3 双向不变量）。
 
 B12（2026-08-21 v4 自包含 golden 化）：关态 v4 期望不再以「先发 ?v=3
-再比对」动态构造——全部字面化（golden 常量见文件头部）；?v=3 请求仅作
-v3 守护网断言（Phase 4 v3 面拆除前保留），v4 断言的求值不依赖 v3 路径。
+再比对」动态构造——全部字面化（golden 常量见文件头部）；v3 守护网
+请求已随 (4,4) 版本窗收窄拆除（A2a, 2026-08-21），v4 断言的求值不依赖
+任何 v3 路径。
 
 各面的「修订语义正确性」由各批次测试文件锁定（providers /
 session_single / expand_href / method_boundary / representation 五件），
@@ -259,12 +260,6 @@ async def test_gate_providers_redacted(monkeypatch):
         assert v4.status_code == 200
         assert v4.content == PROVIDERS_RAW
 
-        # v3 守护网（Phase 4 拆除前保留）：v3 面同字节透传。
-        v3 = await client.get("/slimapi/config/providers",
-                              params={"v": "3"}, headers=IDENTITY)
-        assert v3.status_code == 200
-        assert v3.content == PROVIDERS_RAW
-
         # 开态：§12 修订投影生效（canonical 形状，标记键被丢弃）。
         _gate_on(monkeypatch)
         v4r = await client.get("/slimapi/config/providers",
@@ -290,12 +285,6 @@ async def test_gate_session_single_projection(monkeypatch):
         assert v4.status_code == 200
         assert v4.json() == SESSION_SINGLE_OFF_GOLDEN
         assert "degraded" not in v4.json()
-
-        # v3 守护网（Phase 4 拆除前保留）：v3 面同一 skeleton 投影。
-        v3 = await client.get("/slimapi/session/s1",
-                              params={"v": "3"}, headers=IDENTITY)
-        assert v3.status_code == 200
-        assert v3.json() == SESSION_SINGLE_OFF_GOLDEN
 
         # 开态：§13 修订面生效（dbaux disabled → native 回退 +
         # degraded:true，§13 冻结回退语义）。
@@ -324,12 +313,6 @@ async def test_gate_messages_expand_href(monkeypatch):
         assert v4.json() == MESSAGES_LIST_OFF_GOLDEN
         assert b"?v=3" in v4.content
         assert b"?v=4" not in v4.content
-
-        # v3 守护网（Phase 4 拆除前保留）：v3 面同形状（href 同 ?v=3）。
-        v3 = await client.get("/slimapi/messages/s1",
-                              params={"v": "3"}, headers=IDENTITY)
-        assert v3.status_code == 200
-        assert v3.json() == MESSAGES_LIST_OFF_GOLDEN
 
         # 开态：§14 修订面生效——href 翻为 ?v=4。
         _gate_on(monkeypatch)
@@ -439,8 +422,5 @@ async def test_versions_expand_key_iff_gate(monkeypatch):
             ],
             "fragmentMaxBytes": 8 * 1024 * 1024,
         }
-        # v3 守护网（Phase 4 拆除前保留）：v3 面同源同形 expand 块
-        # （原「4 面 == 3 面」等价断言；v4 已独立字面钉）。
-        assert caps2["3"]["expand"] == caps2["4"]["expand"]
         assert caps2["4"]["readiness"]["ready"] is True
         assert "messages.expand.v4" in caps2["4"]["readiness"]["satisfied"]

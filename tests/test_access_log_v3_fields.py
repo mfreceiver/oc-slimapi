@@ -127,14 +127,14 @@ async def test_row_v2_explicit_rejected(capture_logger):
     assert row["wireVersion"] is None
 
 
-async def test_row_v3(capture_logger):
+async def test_row_v4(capture_logger):
     app = _build_app(capture_logger)
     async with _client(app) as client:
-        r = await client.get("/slimapi/health?v=3")
+        r = await client.get("/slimapi/health?v=4")
         assert r.status_code == 200
     row = _rows(capture_logger)[0]
-    assert row["selectorResult"] == "v3"
-    assert row["wireVersion"] == "3"
+    assert row["selectorResult"] == "v4"
+    assert row["wireVersion"] == "4"
 
 
 async def test_row_rejected(capture_logger):
@@ -219,10 +219,10 @@ async def test_directory_form_absent_on_consuming_route(capture_logger):
 async def test_directory_form_null_on_non_consuming_route(capture_logger):
     app = _build_app(capture_logger)
     async with _client(app) as client:
-        # v=3 admitted; health is tolerant — the header form is ignored
+        # v=4 admitted; health is tolerant — the header form is ignored
         # (not an error), directoryForm stays None (non-consuming route).
         r = await client.get(
-            "/slimapi/health?directory=/proj&v=3",
+            "/slimapi/health?directory=/proj&v=4",
             headers={"X-Opencode-Directory": "/proj"},
         )
         assert r.status_code == 200
@@ -237,7 +237,7 @@ async def test_directory_form_null_on_non_consuming_route(capture_logger):
 async def test_legacy_row_key_prefix_preserved(capture_logger):
     app = _build_app(capture_logger)
     async with _client(app) as client:
-        r = await client.get("/slimapi/health?v=3")
+        r = await client.get("/slimapi/health?v=4")
         assert r.status_code == 200
     row = _rows(capture_logger)[0]
     assert list(row.keys())[:14] == [
@@ -308,7 +308,7 @@ async def test_events_sse_open_close_rows(capture_logger, monkeypatch):
 
     async with _client(app) as client:
         async with client.stream(
-            "GET", "/slimapi/events?v=3",
+            "GET", "/slimapi/events?v=4",
         ) as response:
             assert response.status_code == 200
             # Read the whole (finite) stream.
@@ -325,13 +325,13 @@ async def test_events_sse_open_close_rows(capture_logger, monkeypatch):
     assert open_row["lifecycleId"] == close_row["lifecycleId"]
     assert isinstance(open_row["lifecycleId"], int)
     # Selector context propagated to the lifecycle rows.
-    assert open_row["selectorResult"] == "v3"
-    assert open_row["wireVersion"] == "3"
+    assert open_row["selectorResult"] == "v4"
+    assert open_row["wireVersion"] == "4"
     assert open_row["bucket"] == "events_sse"
     # The request row for the same connection is still exactly one.
     req_rows = [r for r in rows if r.get("recordType") == "request"]
     assert len(req_rows) == 1
-    assert req_rows[0]["selectorResult"] == "v3"
+    assert req_rows[0]["selectorResult"] == "v4"
 
 
 async def test_sse_helpers_no_selector_scope_defaults_absent(capture_logger, monkeypatch):

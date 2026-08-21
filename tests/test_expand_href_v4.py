@@ -1,10 +1,11 @@
 """V4 formal revision §14 — expandRefs href generated per wire view.
 
 v4-contract §14 (2026-08-19 frozen): every ``expandRefs`` href carries the
-REQUEST's selector view — v3 requests keep the frozen v3 bytes (``?v=3``),
-v4 requests emit ``?v=4``. This file locks:
+REQUEST's selector view — v4 requests emit ``?v=4`` (the v3 wire face was
+retired with the (4,4) window; requests with a retired/unknown selector
+are rejected by the selector middleware). This file locks:
 
-* **v3 byte regression** — href is byte-identical ``?v=3`` (route-level
+* **v4 byte regression** — href is byte-identical ``?v=4`` (route-level
   rawbody assertions, not just parsed-field equality);
 * **v4 fork** — ``?v=4`` in the messages list default mode AND
   ``mode=merged`` (message-level ``info_summary_diffs`` + part-level refs);
@@ -15,11 +16,11 @@ v4 requests emit ``?v=4``. This file locks:
   semantics are view-invariant (inherited unchanged from v3 §4a);
 * **selector-less default v3** — stacks without the selector middleware
   keep the historical v3 hrefs;
-* **expand endpoint parity** — the /expand routes behave identically for
-  v3/v4 (§14 inherits v3 §4b): only the href's TARGET view differs.
+* **expand endpoint bytes** — the /expand route renders the same frozen
+  envelope on the v4 face (§14 inherits v3 §4b).
 
 Pure-function tests thread ``wire_view`` explicitly; route tests go through
-``SlimapiSelectorMiddleware`` with ``?v=3`` / ``?v=4`` selectors.
+``SlimapiSelectorMiddleware`` with the ``?v=4`` selector.
 """
 from __future__ import annotations
 
@@ -299,23 +300,23 @@ def _list_handler(items: list[dict], fulls: list[str] | None = None):
     return handler
 
 
-async def test_route_v3_rawbody_href_bytes_frozen(upstream_factory):
-    """§14 v3 byte regression: with the ``?v=3`` selector, the raw body
-    carries the exact frozen v3 hrefs and NEVER a ``?v=4`` byte."""
+async def test_route_v4_rawbody_href_bytes_frozen(upstream_factory):
+    """§14 v4 byte regression: with the ``?v=4`` selector, the raw body
+    carries the exact frozen v4 hrefs and NEVER a ``?v=3`` byte."""
     async with _route_client(
         upstream_factory, _list_handler([_rich_message()]),
     ) as client:
-        r = await client.get("/slimapi/messages/s1?v=3", headers=IDENTITY)
+        r = await client.get("/slimapi/messages/s1?v=4", headers=IDENTITY)
     assert r.status_code == 200
-    assert b'"href":"/slimapi/messages/s1/expand/info_summary_diffs/m1?v=3"' \
+    assert b'"href":"/slimapi/messages/s1/expand/info_summary_diffs/m1?v=4"' \
         in r.content
-    assert b'"href":"/slimapi/messages/s1/expand/part_reasoning/m1/prt?v=3"' \
+    assert b'"href":"/slimapi/messages/s1/expand/part_reasoning/m1/prt?v=4"' \
         in r.content
-    assert b'"href":"/slimapi/messages/s1/expand/part_state_output/m1/p_tool?v=3"' \
+    assert b'"href":"/slimapi/messages/s1/expand/part_state_output/m1/p_tool?v=4"' \
         in r.content
-    assert b'"href":"/slimapi/messages/s1/expand/part_source/m1/p_file?v=3"' \
+    assert b'"href":"/slimapi/messages/s1/expand/part_source/m1/p_file?v=4"' \
         in r.content
-    assert b"?v=4" not in r.content
+    assert b"?v=3" not in r.content
 
 
 async def test_route_v4_default_mode_all_hrefs_v4(upstream_factory):
@@ -357,21 +358,6 @@ async def test_route_v4_merged_message_level_href(upstream_factory):
         "href": "/slimapi/messages/s1/expand/info_summary_diffs/m1?v=4",
     }]
     assert b"?v=3" not in r.content
-
-
-async def test_route_v3_merged_message_level_href_frozen(upstream_factory):
-    """Merged counterpart of the v3 byte lock: message-level ref stays
-    ``?v=3`` under the ``?v=3`` selector."""
-    async with _route_client(
-        upstream_factory, _list_handler([_rich_message()]),
-    ) as client:
-        r = await client.get(
-            "/slimapi/messages/s1?mode=merged&v=3", headers=IDENTITY,
-        )
-    assert r.status_code == 200
-    assert b'"href":"/slimapi/messages/s1/expand/info_summary_diffs/m1?v=3"' \
-        in r.content
-    assert b"?v=4" not in r.content
 
 
 async def test_route_v4_merged_part_level_href_survives_unspliced(
@@ -420,10 +406,10 @@ async def test_route_selectorless_stack_defaults_to_v3(upstream_factory):
     assert b"?v=4" not in r.content
 
 
-async def test_expand_endpoint_behavior_identical_v3_v4(upstream_factory):
-    """§14 inherits v3 §4b: the /expand endpoint itself is view-agnostic —
-    same envelope bytes under both selectors (only the href TARGET view
-    differs, which the endpoint never renders)."""
+async def test_expand_endpoint_v4_envelope_bytes_frozen(upstream_factory):
+    """§14 inherits v3 §4b: the /expand endpoint renders the frozen
+    envelope bytes + no-store on the v4 face (it never renders an href,
+    so the view question does not arise)."""
     single = {
         "info": {"id": "m1", "role": "assistant",
                  "summary": {"diffs": [{"file": "a.ts", "additions": 1}]}},
@@ -437,18 +423,13 @@ async def test_expand_endpoint_behavior_identical_v3_v4(upstream_factory):
         )
 
     async with _route_client(upstream_factory, handler) as client:
-        r3 = await client.get(
-            "/slimapi/messages/s1/expand/info_summary_diffs/m1?v=3",
-            headers=IDENTITY,
-        )
         r4 = await client.get(
             "/slimapi/messages/s1/expand/info_summary_diffs/m1?v=4",
             headers=IDENTITY,
         )
-    assert r3.status_code == r4.status_code == 200
-    assert r3.content == r4.content == orjson.dumps({
+    assert r4.status_code == 200
+    assert r4.content == orjson.dumps({
         "category": "info_summary_diffs", "messageID": "m1",
         "data": {"diffs": [{"file": "a.ts", "additions": 1}]},
     })
-    assert r3.headers.get("Cache-Control") == "no-store"
     assert r4.headers.get("Cache-Control") == "no-store"

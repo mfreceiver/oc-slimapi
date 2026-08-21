@@ -28,16 +28,18 @@ Contract anchors (docs/specs/v4-contract.md):
   invariant: ① present+∈ and ② absent+∉ are the only legal states; the
   server side structurally never produces ③ present+∉ or ④ absent+∈, nor
   ``expand`` without ``readiness``.
-* **§0.5 / §3.1** — the v3 face stays byte-unchanged
-  (``capabilities["3"]`` regression lock, including its expand block); the
-  four STATIC v4 keys keep their frozen shape and order with ``readiness``
-  appended after them.
+* **§0.5 / §3.1** — the (3,4) dual-version window closed to (4,4) (v3
+  wire retired): the discovery payload advertises only ``available: [4]``
+  and ``capabilities["4"]`` (the former ``capabilities["3"]`` terminal
+  freeze lock was removed with the v3 face); the four STATIC v4 keys keep
+  their frozen shape and order with ``readiness`` appended after them.
 
 B12 (2026-08-21 v4 自包含 golden 化): the three former dynamic-equivalence
 sites (expand-block ×2, three-view payload invariance) are literalized
 against the module goldens ``EXPAND_BLOCK_GOLDEN`` /
 ``VERSIONS_PAYLOAD_GOLDEN`` — see the ``B12`` block comment above them;
-the v3 halves survive only as annotated guard nets.
+the v3 guard-net halves were removed with the (4,4) window narrowing
+(A2a, 2026-08-21).
 """
 from __future__ import annotations
 
@@ -147,19 +149,8 @@ EXPAND_BLOCK_GOLDEN = {
 
 VERSIONS_PAYLOAD_GOLDEN = {
     "current": 4,
-    "available": [3, 4],
+    "available": [4],
     "capabilities": {
-        "3": {                                # v3 terminal face（§0.5 冻结）
-            "envelope": ["messages", "sessions"],
-            "directoryQuery": True,
-            "versionHeaderOptional": True,
-            "writeRoutes": True,
-            "readRoutes": [
-                "file", "vcs", "find", "providers",
-                "sessionSingle", "activeSessions", "globalHealth",
-            ],
-            "expand": EXPAND_BLOCK_GOLDEN,
-        },
         "4": {                                # v4 differential face（§3.1）
             "globalSessions": True,
             "auxiliaryFilters": True,
@@ -572,42 +563,17 @@ async def test_versions_caps4_static_four_keys_byte_unchanged():
     assert caps4["qpImmediateFull"] is True
 
 
-async def test_versions_caps3_face_zero_change():
-    """§0.5 v3 freeze: capabilities["3"] keeps its exact terminal shape
-    (including the expand block) — the revision touches only the "4"
-    face."""
-    caps = await _get_caps()
-    assert caps["3"] == {
-        "envelope": ["messages", "sessions"],
-        "directoryQuery": True,
-        "versionHeaderOptional": True,
-        "writeRoutes": True,
-        "readRoutes": [
-            "file", "vcs", "find", "providers",
-            "sessionSingle", "activeSessions", "globalHealth",
-        ],
-        "expand": {
-            "categories": EXPAND_CATEGORIES,
-            "fragmentMaxBytes": settings.max_expand_response_bytes,
-        },
-    }
-
-
 async def test_versions_wire_expand_present_current_state():
     """Since the 4.2.0 close-out the default wire carries capabilities
     ["4"].expand — same-source single truth (EXPAND_CATEGORIES + settings
     cap).
 
     B12: the v4 expand block is pinned to the literal golden
-    (self-contained); the former ``caps["4"]["expand"] ==
-    caps["3"]["expand"]`` equivalence survives only as the annotated v3
-    guard net below."""
+    (self-contained; the former ``caps["4"]["expand"] ==
+    caps["3"]["expand"]`` guard net was removed with the (4,4) window)."""
     caps = await _get_caps()
     assert "expand" in caps["4"]
     assert caps["4"]["expand"] == EXPAND_BLOCK_GOLDEN
-    # v3 守护网（Phase 4 拆除前保留）："3" 面自身 expand 块同落同一 golden
-    # （原「4 面 == 3 面」等价断言；v4 已独立字面钉）。
-    assert caps["3"]["expand"] == EXPAND_BLOCK_GOLDEN
 
 
 async def test_versions_route_reads_live_satisfied(monkeypatch):
@@ -622,8 +588,6 @@ async def test_versions_route_reads_live_satisfied(monkeypatch):
     # Combination ① at wire level — B12: v4 expand block literally pinned
     # (was ``caps4["expand"] == caps["3"]["expand"]``).
     assert caps4["expand"] == EXPAND_BLOCK_GOLDEN
-    # v3 守护网（Phase 4 拆除前保留）："3" 面 expand 同落同一 golden。
-    assert caps["3"]["expand"] == EXPAND_BLOCK_GOLDEN
     assert caps4["expand"]["categories"] == EXPAND_CATEGORIES
 
     # And the transitional legal state (②) at wire level: five satisfied
@@ -638,21 +602,21 @@ async def test_versions_route_reads_live_satisfied(monkeypatch):
 
 
 async def test_versions_payload_identical_across_views():
-    """Discovery is selector-exempt: no selector, ``?v=3`` and ``?v=4``
-    carry the exact same payload — the additive readiness key lands in the
-    shared discovery face, not in any v3-scoped route behavior (§2
-    exemption, §3.1 consumers ignore unknown keys).
+    """Discovery is selector-exempt: no selector and ``?v=4`` carry the
+    exact same payload — the additive readiness key lands in the shared
+    discovery face (§2 exemption, §3.1 consumers ignore unknown keys).
 
     B12: the comparison basis is the literal module golden
-    (``VERSIONS_PAYLOAD_GOLDEN``) — transitive invariance: each view is
-    independently pinned, none derives its expectation from a live
-    sibling response anymore; the ``?v=3`` leg doubles as the v3 guard
-    net. ready/expand/sidecarVersion assertions of the former tail are
+    (``VERSIONS_PAYLOAD_GOLDEN``) — each view is independently pinned,
+    none derives its expectation from a live sibling response anymore
+    (the former ``?v=3`` guard-net leg was removed with the (4,4) window;
+    unknown/retired selectors on the exempt endpoint are ignored).
+    ready/expand/sidecarVersion assertions of the former tail are
     all implied by the golden equality."""
     async with _client(_build_app()) as client:
         base = (await client.get("/slimapi/versions")).json()
         assert base == VERSIONS_PAYLOAD_GOLDEN
-        for query in ("?v=3", "?v=4"):
+        for query in ("?v=4",):
             resp = await client.get(f"/slimapi/versions{query}")
             assert resp.status_code == 200
             assert resp.json() == VERSIONS_PAYLOAD_GOLDEN
