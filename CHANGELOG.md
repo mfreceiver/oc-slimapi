@@ -26,7 +26,7 @@ ocdroid 对接时：
 
 ---
 
-## [Unreleased] — 版本窗收窄 + v3 退役（v4 分支，目标 4.8.0 minor；owner 2026-08-21 裁定 major 只跟协议大版本走）
+## [4.8.0] - 2026-08-21 — 版本窗收窄 + v3 退役（owner 2026-08-21 裁定：major 只跟协议大版本走，收窄发 minor；wire (3,4)→(4,4) v4-only；含 provider error 结构化字段）
 
 ### Changed
 
