@@ -10,6 +10,10 @@ ID 的修订语义当且仅当 ∈ satisfied 时生效；未 satisfied → 该�
 - versions 端点双态：``capabilities["4"].expand`` iff
   ``messages.expand.v4 ∈ SATISFIED``（§14/§3.3 双向不变量）。
 
+B12（2026-08-21 v4 自包含 golden 化）：关态 v4 期望不再以「先发 ?v=3
+再比对」动态构造——全部字面化（golden 常量见文件头部）；?v=3 请求仅作
+v3 守护网断言（Phase 4 v3 面拆除前保留），v4 断言的求值不依赖 v3 路径。
+
 各面的「修订语义正确性」由各批次测试文件锁定（providers /
 session_single / expand_href / method_boundary / representation 五件），
 本文件只锁**门控开关本身**：关 → 4.0.0 行为，开 → 修订行为。
@@ -104,6 +108,47 @@ def _rich_message(mid="m1"):
 
 
 MESSAGES_LIST_RAW = orjson.dumps([_rich_message()])
+
+# --- B12 v4 自包含 golden（2026-08-21 从实际 ?v=4 响应忠实转录） -------------
+#
+# 关态（gate off）v4 = 4.0.0 已发布行为的期望不再以「先发 ?v=3 再比对」
+# 构造——期望值字面钉在此处；v3 半区作为守护网（Phase 4 拆除前保留）
+# 各自独立断言（见各用例内 ``v3 守护网`` 注记）。
+#
+# 转录口径：sessions/messages 投影的 item 键序跨进程随 PYTHONHASHSEED
+# 漂移（skeleton ``_pick`` set 迭代；见 test_v3_rawbody_regression.py 头
+# 注），故以 parsed 形状钉——值本身跨进程稳定；messages 的
+# ``contentFingerprint`` 是 sha256(OPT_SORT_KEYS) 产物，跨进程恒定。
+
+SESSION_SINGLE_OFF_GOLDEN = {
+    "id": "s1", "directory": "/d", "title": "t",
+    "time": {"created": 1, "updated": 2},   # cost/tokens 被 skeleton 丢弃
+}
+
+MESSAGES_LIST_OFF_GOLDEN = {
+    "items": [{
+        "info": {
+            "id": "m1", "role": "assistant",
+            "time": {"created": 1000, "updated": 1000},
+            "summary": {"diffs": None},
+            "expandRefs": [{
+                "category": "info_summary_diffs", "messageID": "m1",
+                "href": "/slimapi/messages/s1/expand/info_summary_diffs/m1?v=3",
+            }],
+        },
+        "parts": [{
+            "id": "prt", "messageID": "m1", "type": "reasoning",
+            "text": None, "hasFull": True, "omitted": ["text"],
+            "expandRefs": [{
+                "category": "part_reasoning", "messageID": "m1",
+                "href": "/slimapi/messages/s1/expand/part_reasoning/m1/prt?v=3",
+                "partID": "prt",
+            }],
+        }],
+        "contentFingerprint": "v1:427c04d5d9553986a21c0fdaa169d44e42a51e863bd10a9419c19e789bb19051",
+    }],
+    "nextCursor": None,
+}
 
 SEEN_POSTS: list[str] = []
 
@@ -206,15 +251,19 @@ def _client(app) -> httpx.AsyncClient:
 async def test_gate_providers_redacted(monkeypatch):
     app = _build_app()
     async with _client(app) as client:
-        # 关态：v4 = 4.0.0 已发布行为（受控透传，与 ?v=3 逐字节相同，
-        # 上游原始字节原样到达——含透传标记键）。
+        # 关态：v4 = 4.0.0 已发布行为（受控透传，上游原始字节原样到达
+        # ——含透传标记键）——B12：v4 期望字面自包含。
         _gate_off(monkeypatch, "providers.redacted.v4")
-        v3 = await client.get("/slimapi/config/providers",
-                              params={"v": "3"}, headers=IDENTITY)
         v4 = await client.get("/slimapi/config/providers",
                               params={"v": "4"}, headers=IDENTITY)
-        assert v4.status_code == v3.status_code == 200
-        assert v4.content == v3.content == PROVIDERS_RAW
+        assert v4.status_code == 200
+        assert v4.content == PROVIDERS_RAW
+
+        # v3 守护网（Phase 4 拆除前保留）：v3 面同字节透传。
+        v3 = await client.get("/slimapi/config/providers",
+                              params={"v": "3"}, headers=IDENTITY)
+        assert v3.status_code == 200
+        assert v3.content == PROVIDERS_RAW
 
         # 开态：§12 修订投影生效（canonical 形状，标记键被丢弃）。
         _gate_on(monkeypatch)
@@ -232,15 +281,21 @@ async def test_gate_providers_redacted(monkeypatch):
 async def test_gate_session_single_projection(monkeypatch):
     app = _build_app()
     async with _client(app) as client:
-        # 关态：v4 走 v3 skeleton 投影路径（与 ?v=3 逐字节相同）。
+        # 关态：v4 走 v3 skeleton 投影路径（4.0.0 已发布行为）——B12：
+        # v4 期望以 parsed golden 字面自包含（cost/tokens 丢弃、无
+        # degraded 键）。
         _gate_off(monkeypatch, "session.single.projection.v4")
-        v3 = await client.get("/slimapi/session/s1",
-                              params={"v": "3"}, headers=IDENTITY)
         v4 = await client.get("/slimapi/session/s1",
                               params={"v": "4"}, headers=IDENTITY)
-        assert v4.status_code == v3.status_code == 200
-        assert v4.content == v3.content
-        assert "degraded" not in v4.json()  # v3 面无 degraded 键
+        assert v4.status_code == 200
+        assert v4.json() == SESSION_SINGLE_OFF_GOLDEN
+        assert "degraded" not in v4.json()
+
+        # v3 守护网（Phase 4 拆除前保留）：v3 面同一 skeleton 投影。
+        v3 = await client.get("/slimapi/session/s1",
+                              params={"v": "3"}, headers=IDENTITY)
+        assert v3.status_code == 200
+        assert v3.json() == SESSION_SINGLE_OFF_GOLDEN
 
         # 开态：§13 修订面生效（dbaux disabled → native 回退 +
         # degraded:true，§13 冻结回退语义）。
@@ -249,7 +304,7 @@ async def test_gate_session_single_projection(monkeypatch):
                                params={"v": "4"}, headers=IDENTITY)
         assert v4r.status_code == 200
         assert v4r.json().get("degraded") is True
-        assert v4r.content != v3.content
+        assert v4r.content != v4.content  # 修订面生效 → 投影改变
 
 
 # ---------------------------------------------------------------------------
@@ -259,17 +314,22 @@ async def test_gate_session_single_projection(monkeypatch):
 async def test_gate_messages_expand_href(monkeypatch):
     app = _build_app()
     async with _client(app) as client:
-        # 关态：v4 的 expandRefs href 维持 ?v=3（4.0.0 已发布行为——
-        # 整响应与 ?v=3 逐字节相同）。
+        # 关态：v4 的 expandRefs href 维持 ?v=3（4.0.0 已发布行为）——
+        # B12：v4 期望以 parsed golden 字面自包含（含 href 字面与
+        # contentFingerprint），另加字节向断言钉 ?v=3 方向。
         _gate_off(monkeypatch, "messages.expand.v4")
-        v3 = await client.get("/slimapi/messages/s1",
-                              params={"v": "3"}, headers=IDENTITY)
         v4 = await client.get("/slimapi/messages/s1",
                               params={"v": "4"}, headers=IDENTITY)
-        assert v4.status_code == v3.status_code == 200
-        assert v4.content == v3.content
+        assert v4.status_code == 200
+        assert v4.json() == MESSAGES_LIST_OFF_GOLDEN
         assert b"?v=3" in v4.content
         assert b"?v=4" not in v4.content
+
+        # v3 守护网（Phase 4 拆除前保留）：v3 面同形状（href 同 ?v=3）。
+        v3 = await client.get("/slimapi/messages/s1",
+                              params={"v": "3"}, headers=IDENTITY)
+        assert v3.status_code == 200
+        assert v3.json() == MESSAGES_LIST_OFF_GOLDEN
 
         # 开态：§14 修订面生效——href 翻为 ?v=4。
         _gate_on(monkeypatch)
@@ -363,11 +423,24 @@ async def test_versions_expand_key_iff_gate(monkeypatch):
         assert caps["4"]["readiness"]["ready"] is False
         assert "messages.expand.v4" not in caps["4"]["readiness"]["satisfied"]
 
-        # 开态（默认 = 4.2.0 集成收口终态）：expand 出现且与 "3" 面
-        # 同源同形，ready=true。
+        # 开态（默认 = 4.2.0 集成收口终态）：expand 出现，B12：v4 块以
+        # 字面 golden 钉（冻结十二类有序列表 + 本文件 _settings 的
+        # fragment 上限 8 MiB）；ready=true。
         _gate_on(monkeypatch)
         caps2 = (await client.get("/slimapi/versions")).json()["capabilities"]
         assert "expand" in caps2["4"]
-        assert caps2["4"]["expand"] == caps2["3"]["expand"]
+        assert caps2["4"]["expand"] == {
+            "categories": [
+                "info_summary_diffs", "part_text", "part_reasoning",
+                "part_state_output", "part_state_error",
+                "part_state_input_full", "part_state_metadata_full",
+                "part_state_attachments", "part_url", "part_source",
+                "part_snapshot", "compaction_full",
+            ],
+            "fragmentMaxBytes": 8 * 1024 * 1024,
+        }
+        # v3 守护网（Phase 4 拆除前保留）：v3 面同源同形 expand 块
+        # （原「4 面 == 3 面」等价断言；v4 已独立字面钉）。
+        assert caps2["3"]["expand"] == caps2["4"]["expand"]
         assert caps2["4"]["readiness"]["ready"] is True
         assert "messages.expand.v4" in caps2["4"]["readiness"]["satisfied"]

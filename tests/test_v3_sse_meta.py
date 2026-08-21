@@ -1,5 +1,13 @@
 """v3-contract §7.2 — SSE meta first frame (Batch D).
 
+B12 (2026-08-21) three-way split: the two header-retirement checks
+(X-Slimapi-Subscriber-ID never produced) were rewritten to the ``?v=4``
+face — the 3.0.0 header retirement applies to both views. Everything else
+is v3-only wire behavior (v3 meta field set, blanket Last-Event-ID resync,
+tokens=1 transport, always-identity stream coding) and stays on the v3
+face as the Phase 4 guardian net; the two lifecycle-pairing functions are
+§9.1 observability (Phase 3 rewrite).
+
 Covers the v3-only ``slimapi.meta`` opening event on BOTH SSE endpoints:
 
 * ``GET /slimapi/events?v=3`` — first frame ``slimapi.meta`` with
@@ -259,11 +267,13 @@ async def test_v3_events_meta_before_resync_replay():
     assert frames[1] == ("resync", {"reason": "reconnect_no_replay"})
 
 
-async def test_v3_events_response_has_no_subscriber_id_header():
+async def test_v4_events_response_has_no_subscriber_id_header():
+    """B12 ①: the 3.0.0 header retirement is view-agnostic — the v4 face
+    never carries X-Slimapi-Subscriber-ID either."""
     hubs = _FakeHubs()
     _put_business_frame(hubs.sub)
     app = _build_app(hubs=hubs)
-    response, _ = await _read_stream(app, "/slimapi/events?v=3")
+    response, _ = await _read_stream(app, "/slimapi/events?v=4")
     assert "x-slimapi-subscriber-id" not in response.headers
 
 
@@ -331,12 +341,14 @@ async def test_v3_stream_meta_before_resync_replay():
     assert frames[2] == ("server.connected", {"sessionID": SID})
 
 
-async def test_v3_stream_response_has_no_subscriber_id_header():
+async def test_v4_stream_response_has_no_subscriber_id_header():
+    """B12 ①: the 3.0.0 header retirement is view-agnostic — the v4 face
+    never carries X-Slimapi-Subscriber-ID either."""
     registry = _FakeTokenRegistry()
     _put_handshake(registry.sub)
     app = _build_app(token_registry=registry)
     response, _ = await _read_stream(
-        app, f"/slimapi/sessions/{SID}/stream?v=3",
+        app, f"/slimapi/sessions/{SID}/stream?v=4",
     )
     assert "x-slimapi-subscriber-id" not in response.headers
 

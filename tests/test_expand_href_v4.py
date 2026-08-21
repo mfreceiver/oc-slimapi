@@ -140,9 +140,34 @@ def test_projection_v4_view_swaps_all_hrefs():
 
 def test_projection_dedup_and_sort_invariant_under_v4():
     """§14 inherits v3 §4a: dedup (multi-key collapse) + (category, partID)
-    sort are IDENTICAL under v4 — only the ``?v=`` value differs."""
-    v3 = skeleton_messages([_rich_message()], sid=SID)[0]
-    v4 = skeleton_messages([_rich_message()], sid=SID, wire_view=4)[0]
+    sort are IDENTICAL under v4 — only the ``?v=`` value differs.
+
+    B12: both views are pinned to the SAME literal refs-shape golden —
+    the invariance property follows transitively without evaluating the
+    v4 expectation off a live v3 result (v3 half kept as guard net)."""
+    golden = {
+        "message": [{"category": "info_summary_diffs", "messageID": "m1"}],
+        "parts": [
+            ("prt", [{"category": "part_reasoning", "messageID": "m1",
+                      "partID": "prt"}]),
+            ("p_tool", [
+                {"category": "part_state_attachments", "messageID": "m1",
+                 "partID": "p_tool"},
+                {"category": "part_state_input_full", "messageID": "m1",
+                 "partID": "p_tool"},
+                {"category": "part_state_metadata_full", "messageID": "m1",
+                 "partID": "p_tool"},
+                {"category": "part_state_output", "messageID": "m1",
+                 "partID": "p_tool"},
+            ]),
+            ("p_file", [
+                {"category": "part_source", "messageID": "m1",
+                 "partID": "p_file"},
+                {"category": "part_url", "messageID": "m1",
+                 "partID": "p_file"},
+            ]),
+        ],
+    }
 
     def _refs_shape(msg: dict):
         def _strip(nodes):
@@ -159,7 +184,8 @@ def test_projection_dedup_and_sort_invariant_under_v4():
             ],
         }
 
-    assert _refs_shape(v3) == _refs_shape(v4)
+    v4 = skeleton_messages([_rich_message()], sid=SID, wire_view=4)[0]
+    assert _refs_shape(v4) == golden
 
     tool = v4["parts"][1]["expandRefs"]
     cats = [r["category"] for r in tool]
@@ -170,6 +196,11 @@ def test_projection_dedup_and_sort_invariant_under_v4():
     assert [r["category"] for r in file_refs] == ["part_source", "part_url"]
     for r in tool + file_refs + v4["parts"][0]["expandRefs"]:
         assert r["href"].endswith("?v=4")
+
+    # v3 守护网（Phase 4 拆除前保留）：默认视图（v3）同形状——href 侧
+    # 由 test_projection_default_view_keeps_frozen_v3_bytes 字节锁定。
+    v3 = skeleton_messages([_rich_message()], sid=SID)[0]
+    assert _refs_shape(v3) == golden
 
 
 def test_projection_without_sid_emits_no_refs_either_view():

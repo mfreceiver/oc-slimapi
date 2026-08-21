@@ -33,6 +33,12 @@ Harnesses:
   sharing a real ReplayLog; scripted finite streams (the script coroutine
   publishes into the hub, then enqueues STOP) so httpx can read a complete
   deterministic body.
+
+B12（2026-08-21 v4 自包含 golden 化清点）：本文件**无**「先发 ?v=3 求
+期望再比 v4」形态——每条 v4 wire 断言本就内联字面；v3 半区（§6 字节锚
+三件 + 各 R3/R2/R4 用例的 v3 leg）为 v3 守护网（三分处置②，Phase 4 v3
+面拆除前保留），字节回归与 budgets 命名空间 patch（W3-1 迁移的 5 处）
+均不动。
 """
 from __future__ import annotations
 

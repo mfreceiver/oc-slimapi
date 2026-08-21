@@ -32,6 +32,12 @@ Contract anchors (docs/specs/v4-contract.md):
   (``capabilities["3"]`` regression lock, including its expand block); the
   four STATIC v4 keys keep their frozen shape and order with ``readiness``
   appended after them.
+
+B12 (2026-08-21 v4 自包含 golden 化): the three former dynamic-equivalence
+sites (expand-block ×2, three-view payload invariance) are literalized
+against the module goldens ``EXPAND_BLOCK_GOLDEN`` /
+``VERSIONS_PAYLOAD_GOLDEN`` — see the ``B12`` block comment above them;
+the v3 halves survive only as annotated guard nets.
 """
 from __future__ import annotations
 
@@ -115,6 +121,60 @@ CONTRACT_INITIAL_SATISFIED_NORMALIZED = (
 )
 
 EXPAND_FEATURE_ID = "messages.expand.v4"
+
+# --- B12 v4 自包含 golden（2026-08-21 从实际 ?v=4 响应忠实转录） -------------
+#
+# 本文件原有三处「动态对照」等价断言（caps["4"].expand == caps["3"].expand
+# ×2、versions 三视图 == 无 selector 兄弟响应）——B12 改造后 v4 期望字面钉
+# 在此处，求值不再依赖任何 v3/兄弟请求路径；原等价关系仅以注记的
+# v3 守护网形式保留（三分处置②，Phase 4 v3 面拆除前）。
+#
+# 转录口径：parsed 形状钉（== 比较，键序不敏感；caps4 键序由
+# test_versions_caps4_readiness_emitted 单独锁）。两处非 v3 派生值按
+# sidecar 自身单一源引用——fragmentMaxBytes 读全局 settings 旋钮（路由
+# 同源）、sidecarVersion 读包版本 __version__——均非 v3 wire 路径。
+
+EXPAND_BLOCK_GOLDEN = {
+    "categories": [
+        "info_summary_diffs", "part_text", "part_reasoning",
+        "part_state_output", "part_state_error",
+        "part_state_input_full", "part_state_metadata_full",
+        "part_state_attachments", "part_url", "part_source",
+        "part_snapshot", "compaction_full",
+    ],
+    "fragmentMaxBytes": settings.max_expand_response_bytes,
+}
+
+VERSIONS_PAYLOAD_GOLDEN = {
+    "current": 4,
+    "available": [3, 4],
+    "capabilities": {
+        "3": {                                # v3 terminal face（§0.5 冻结）
+            "envelope": ["messages", "sessions"],
+            "directoryQuery": True,
+            "versionHeaderOptional": True,
+            "writeRoutes": True,
+            "readRoutes": [
+                "file", "vcs", "find", "providers",
+                "sessionSingle", "activeSessions", "globalHealth",
+            ],
+            "expand": EXPAND_BLOCK_GOLDEN,
+        },
+        "4": {                                # v4 differential face（§3.1）
+            "globalSessions": True,
+            "auxiliaryFilters": True,
+            "sseReplay": True,
+            "qpImmediateFull": True,
+            "readiness": {
+                "ready": True,
+                "required": list(CONTRACT_REQUIRED_NORMALIZED),
+                "satisfied": list(CONTRACT_REQUIRED_NORMALIZED),
+            },
+            "expand": EXPAND_BLOCK_GOLDEN,
+        },
+    },
+    "sidecarVersion": __version__,
+}
 
 
 def _build_app() -> FastAPI:
@@ -535,11 +595,19 @@ async def test_versions_caps3_face_zero_change():
 
 async def test_versions_wire_expand_present_current_state():
     """Since the 4.2.0 close-out the default wire carries capabilities
-    ["4"].expand, byte-equal to the capabilities["3"] expand block
-    (same-source single truth: EXPAND_CATEGORIES + settings cap)."""
+    ["4"].expand — same-source single truth (EXPAND_CATEGORIES + settings
+    cap).
+
+    B12: the v4 expand block is pinned to the literal golden
+    (self-contained); the former ``caps["4"]["expand"] ==
+    caps["3"]["expand"]`` equivalence survives only as the annotated v3
+    guard net below."""
     caps = await _get_caps()
     assert "expand" in caps["4"]
-    assert caps["4"]["expand"] == caps["3"]["expand"]
+    assert caps["4"]["expand"] == EXPAND_BLOCK_GOLDEN
+    # v3 守护网（Phase 4 拆除前保留）："3" 面自身 expand 块同落同一 golden
+    # （原「4 面 == 3 面」等价断言；v4 已独立字面钉）。
+    assert caps["3"]["expand"] == EXPAND_BLOCK_GOLDEN
 
 
 async def test_versions_route_reads_live_satisfied(monkeypatch):
@@ -551,8 +619,11 @@ async def test_versions_route_reads_live_satisfied(monkeypatch):
     caps4 = caps["4"]
     assert caps4["readiness"]["ready"] is True
     assert caps4["readiness"]["satisfied"] == list(CONTRACT_REQUIRED_NORMALIZED)
-    # Combination ① at wire level, same-source shape as capabilities["3"]:
-    assert caps4["expand"] == caps["3"]["expand"]
+    # Combination ① at wire level — B12: v4 expand block literally pinned
+    # (was ``caps4["expand"] == caps["3"]["expand"]``).
+    assert caps4["expand"] == EXPAND_BLOCK_GOLDEN
+    # v3 守护网（Phase 4 拆除前保留）："3" 面 expand 同落同一 golden。
+    assert caps["3"]["expand"] == EXPAND_BLOCK_GOLDEN
     assert caps4["expand"]["categories"] == EXPAND_CATEGORIES
 
     # And the transitional legal state (②) at wire level: five satisfied
@@ -567,20 +638,24 @@ async def test_versions_route_reads_live_satisfied(monkeypatch):
 
 
 async def test_versions_payload_identical_across_views():
-    """Discovery is selector-exempt: ?v=3, ?v=4 and no selector carry the
-    exact same payload — the additive readiness key lands in the shared
-    discovery face, not in any v3-scoped route behavior (§2 exemption,
-    §3.1 consumers ignore unknown keys)."""
+    """Discovery is selector-exempt: no selector, ``?v=3`` and ``?v=4``
+    carry the exact same payload — the additive readiness key lands in the
+    shared discovery face, not in any v3-scoped route behavior (§2
+    exemption, §3.1 consumers ignore unknown keys).
+
+    B12: the comparison basis is the literal module golden
+    (``VERSIONS_PAYLOAD_GOLDEN``) — transitive invariance: each view is
+    independently pinned, none derives its expectation from a live
+    sibling response anymore; the ``?v=3`` leg doubles as the v3 guard
+    net. ready/expand/sidecarVersion assertions of the former tail are
+    all implied by the golden equality."""
     async with _client(_build_app()) as client:
         base = (await client.get("/slimapi/versions")).json()
+        assert base == VERSIONS_PAYLOAD_GOLDEN
         for query in ("?v=3", "?v=4"):
             resp = await client.get(f"/slimapi/versions{query}")
             assert resp.status_code == 200
-            assert resp.json() == base
-    gate = base["capabilities"]["4"]["readiness"]
-    assert gate["ready"] is True  # revision-2 activated (10 of 10)
-    assert "expand" in base["capabilities"]["4"]
-    assert base["sidecarVersion"] == __version__
+            assert resp.json() == VERSIONS_PAYLOAD_GOLDEN
 
 
 async def test_versions_route_rejects_unknown_satisfied_never_emits():

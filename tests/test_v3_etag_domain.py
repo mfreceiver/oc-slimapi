@@ -1,5 +1,14 @@
 """v3-contract §6 ETag domain-isolation tests (Batch B, TDD).
 
+B12 (2026-08-21) three-way split: the two messages-route ETag behavioural
+checks (same request → same validator; envelope-content change rotates it)
+were rewritten to the ``?v=4`` face — v4 messages ≡ v3 (§10) with the
+validator keyed to the REP wire=v4 domain (§15), so the behaviour holds
+per-view. The wire-marker unit locks (b"wire=v3" fingerprints, the
+default-view-3 terminal) and the sessions-route checks stay on the v3
+face — the v4 global sessions list carries no ETag at all (§4), so its
+v3 304/Vary shape is Phase 4 guardian material.
+
 Covers:
 
 * §6.1 — ``representation_version`` carries a wire-view marker: v2 and v3
@@ -158,17 +167,18 @@ async def test_v3_validator_on_retired_v2_form_rejected(client_factory):
         await client.aclose()
 
 
-async def test_v3_etag_same_request_stable_and_own_view_304(client_factory):
-    """§6.3: same v3 request → same ETag; re-sent on the v3 view → 304."""
+async def test_v4_etag_same_request_stable_and_own_view_304(client_factory):
+    """§6.3 (B12 ①: v4 messages ≡ v3, §10 + §15 wire=v4 REP domain): same
+    v4 request → same ETag; re-sent on the v4 view → 304."""
     client = await client_factory(lambda req: httpx.Response(
         200, content=_message_payload(),
         headers={"Content-Type": "application/json"}))
     try:
-        first = await client.get("/slimapi/messages/s1?v=3", headers=IDENTITY)
-        second = await client.get("/slimapi/messages/s1?v=3", headers=IDENTITY)
+        first = await client.get("/slimapi/messages/s1?v=4", headers=IDENTITY)
+        second = await client.get("/slimapi/messages/s1?v=4", headers=IDENTITY)
         assert first.headers["ETag"] == second.headers["ETag"]
         reval = await client.get(
-            "/slimapi/messages/s1?v=3",
+            "/slimapi/messages/s1?v=4",
             headers={**IDENTITY, "If-None-Match": first.headers["ETag"]},
         )
         assert reval.status_code == 304
@@ -177,9 +187,10 @@ async def test_v3_etag_same_request_stable_and_own_view_304(client_factory):
         await client.aclose()
 
 
-async def test_v3_etag_changes_with_envelope_content(client_factory):
-    """§6.3: the canonical input is the envelope body — a nextCursor change
-    (different envelope bytes, same items) rotates the validator."""
+async def test_v4_etag_changes_with_envelope_content(client_factory):
+    """§6.3 (B12 ①: v4 messages ≡ v3, §10): the canonical input is the
+    envelope body — a nextCursor change (different envelope bytes, same
+    items) rotates the validator."""
     state = {"link": None}
     link_next = '</session/s1/message?limit=40&before=CURSOR123>; rel="next"'
 
@@ -191,13 +202,13 @@ async def test_v3_etag_changes_with_envelope_content(client_factory):
 
     client = await client_factory(handler)
     try:
-        no_cursor = await client.get("/slimapi/messages/s1?v=3", headers=IDENTITY)
+        no_cursor = await client.get("/slimapi/messages/s1?v=4", headers=IDENTITY)
         state["link"] = link_next
-        with_cursor = await client.get("/slimapi/messages/s1?v=3", headers=IDENTITY)
+        with_cursor = await client.get("/slimapi/messages/s1?v=4", headers=IDENTITY)
         assert no_cursor.headers["ETag"] != with_cursor.headers["ETag"]
         # …and the old validator no longer 304s against the new envelope.
         stale = await client.get(
-            "/slimapi/messages/s1?v=3",
+            "/slimapi/messages/s1?v=4",
             headers={**IDENTITY, "If-None-Match": no_cursor.headers["ETag"]},
         )
         assert stale.status_code == 200

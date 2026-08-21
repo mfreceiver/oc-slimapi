@@ -14,6 +14,11 @@ Terminal semantics under test (dual-version window: ``?v=4`` also admitted):
 * ``GET /slimapi/versions`` exempt; non-GET → 405 (+``Allow: GET``) with
   priority above the selector.
 * non-/slimapi paths: zero-touch passthrough.
+
+B12（2026-08-21 v4 自包含 golden 化清点）：本文件**无**「先发 ?v=3 求
+期望再比 v4」形态——所有断言本就内联字面；``?v=3`` admitted 半区
+（test_v3_without_header_ok 等）是 v3 守护网（三分处置②，Phase 4 v3 面
+拆除前保留），v4 admitted 的正向覆盖在 tests/test_v4_dual_window.py。
 """
 from __future__ import annotations
 

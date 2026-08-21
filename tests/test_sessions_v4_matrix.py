@@ -11,6 +11,14 @@
 - rev gate BLOCKER-3：坏行窗口锚点（items=[] 仍可 cursor 前进）。
 - rev gate R2 接口：``request.state`` 降级标记（source=db/http、
   degraded_503）断言。
+
+B12（2026-08-21 v4 自包含 golden 化清点）：本文件**无**「先发 ?v=3 求
+期望再比 v4」形态——144 等价类的期望来自独立手推判定函数
+``_expect_v4_outcome`` 与 ``v4_fixture.mirror_page`` 镜像 oracle（均非
+v3 wire 路径），v4 断言本就自包含；文末 v3 回归面测试为 v3 守护网
+（三分处置②，Phase 4 v3 面拆除前保留）。唯一清理：删除两个无消费者
+的死常量 ``V3 = {"v": "3"}`` / ``V4 = {"v": "4"}``（各测试均内联
+``params={"v": ...}``）。
 """
 
 from __future__ import annotations
@@ -39,8 +47,6 @@ from oc_slimapi.transform import TransformConfig, TransformPool
 from v4_fixture import DATASET, FIXED_NOW_MS, build_fixture_db, mirror_page
 
 IDENTITY = {"Accept-Encoding": "identity"}
-V3 = {"v": "3"}
-V4 = {"v": "4"}
 AL_NONEMPTY = ("/foo",)
 
 

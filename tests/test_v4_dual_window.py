@@ -25,6 +25,11 @@ Covers the Phase-A core deltas:
 Existing-route scaffolding mirrors test_selector.py (minimal stack:
 selector + health + versions + local echo routes on consuming paths so the
 fork is observable without the full session router).
+
+B12 (2026-08-21 v4 自包含 golden 化): the two former dynamic-equivalence
+sites (/ready v4-vs-v3, /versions three-view) are literalized against the
+module goldens below — see the ``B12`` block comment above
+``_READY_GOLDEN``; all other assertions in this file were already literal.
 """
 from __future__ import annotations
 
@@ -34,8 +39,9 @@ import pytest
 from fastapi import FastAPI, Request
 from httpx import ASGITransport
 
+from oc_slimapi import __version__
 from oc_slimapi import selector as sel
-from oc_slimapi.config import Settings
+from oc_slimapi.config import Settings, settings
 from oc_slimapi.routes import health as health_routes
 from oc_slimapi.routes import versions as versions_routes
 from oc_slimapi.errors import register_error_handlers
@@ -51,6 +57,91 @@ RETIREMENT_BODY = {
         "(and the X-Opencode-Directory header). Token/per-session routes "
         "still accept ?directory=."
     ),
+}
+
+# --- B12 v4 自包含 golden（2026-08-21 从实际 ?v=4 响应忠实转录） -------------
+#
+# 本文件原有两处「动态对照」等价断言（/ready 的 v4 期望 = 先发 ?v=3 取
+# body 再比对；/versions 的三视图期望 = 无 selector 兄弟响应）——B12 改造
+# 后对照系字面钉在此处，v4 断言的求值不再依赖任何 v3/兄弟请求路径；
+# ?v=3 半区仅作 v3 守护网（三分处置②，Phase 4 v3 面拆除前保留）各自
+# 独立断言同一 golden。
+#
+# 转录口径：parsed 形状钉（== 比较，键序不敏感；键序由
+# test_versions_payload_dual_window 单独锁）。两处非 v3 派生值按 sidecar
+# 自身单一源引用——fragmentMaxBytes 读全局 settings 旋钮（路由同源）、
+# sidecarVersion 读包版本 __version__——均非 v3 wire 路径。
+
+_READY_GOLDEN = {
+    "server": {
+        "api_version": 3,                    # READY_VIEW 恒 3（§12 零 v4 差异）
+        "accepted_client_versions": [3, 4],
+    },
+    "schema": {
+        "degraded": False,                   # _build_app 的 schema_degraded
+        "version": 3,
+        "clientMin": 3,
+        "clientMax": 4,
+    },
+    # "upstream": {"ok": ..., "latencyMs": ...} — 每次 ping 动态，测试侧 pop 后比较
+}
+
+_B12_NORMALIZED_TEN = (
+    "events.global.replay.v4",
+    "events.token.replay.v4",
+    "messages.expand.v4",
+    "method.boundary.v4",
+    "providers.redacted.v4",
+    "representation.vary.v4",
+    "selector.v4",
+    "session.list.global.v4",
+    "session.post-actions.v4",
+    "session.single.projection.v4",
+)
+
+_B12_EXPAND_CATEGORIES_TWELVE = (
+    "info_summary_diffs", "part_text", "part_reasoning",
+    "part_state_output", "part_state_error",
+    "part_state_input_full", "part_state_metadata_full",
+    "part_state_attachments", "part_url", "part_source",
+    "part_snapshot", "compaction_full",
+)
+
+VERSIONS_PAYLOAD_GOLDEN = {
+    "current": 4,
+    "available": [3, 4],
+    "capabilities": {
+        "3": {                                # v3 terminal face（§0.5 冻结）
+            "envelope": ["messages", "sessions"],
+            "directoryQuery": True,
+            "versionHeaderOptional": True,
+            "writeRoutes": True,
+            "readRoutes": [
+                "file", "vcs", "find", "providers",
+                "sessionSingle", "activeSessions", "globalHealth",
+            ],
+            "expand": {
+                "categories": list(_B12_EXPAND_CATEGORIES_TWELVE),
+                "fragmentMaxBytes": settings.max_expand_response_bytes,
+            },
+        },
+        "4": {                                # v4 differential face（§3.1）
+            "globalSessions": True,
+            "auxiliaryFilters": True,
+            "sseReplay": True,
+            "qpImmediateFull": True,
+            "readiness": {
+                "ready": True,
+                "required": list(_B12_NORMALIZED_TEN),
+                "satisfied": list(_B12_NORMALIZED_TEN),
+            },
+            "expand": {
+                "categories": list(_B12_EXPAND_CATEGORIES_TWELVE),
+                "fragmentMaxBytes": settings.max_expand_response_bytes,
+            },
+        },
+    },
+    "sidecarVersion": __version__,
 }
 
 
@@ -543,15 +634,23 @@ async def test_versions_v3_capabilities_shape_unchanged():
 
 
 async def test_versions_payload_independent_of_wire_view():
-    """Discovery is version-independent: ?v=3, ?v=4 and no v answer the
-    exact same payload (the endpoint is selector-exempt)."""
+    """Discovery is version-independent (selector-exempt): the no-selector
+    base, ``?v=3`` and ``?v=4`` answer the exact same payload.
+
+    B12: the comparison basis is the literal module golden
+    (``VERSIONS_PAYLOAD_GOLDEN``) — transitive invariance: each view is
+    independently pinned, none derives its expectation from a live sibling
+    response anymore. The ``?v=3`` leg doubles as the v3 guard net (kept
+    until the Phase-4 v3 face removal)."""
     app = _build_app()
     async with _client(app) as client:
         base = (await client.get("/slimapi/versions", headers=IDENTITY)).json()
+        assert base == VERSIONS_PAYLOAD_GOLDEN
         for query in ("?v=3", "?v=4"):
-            resp = await client.get(f"/slimapi/versions{query}", headers=IDENTITY)
+            resp = await client.get(f"/slimapi/versions{query}",
+                                    headers=IDENTITY)
             assert resp.status_code == 200
-            assert resp.json() == base
+            assert resp.json() == VERSIONS_PAYLOAD_GOLDEN
 
 
 async def test_health_allowlist_enabled_in_both_views():
@@ -571,20 +670,27 @@ async def test_health_allowlist_enabled_in_both_views():
 
 async def test_ready_zero_v4_difference():
     """Contract §3.2/§12: ready is frozen — shape AND values stay the v3
-    terminal ones even for a v4 wire request."""
+    terminal ones even for a v4 wire request.
+
+    B12: the v4 half is pinned to the literal parsed golden
+    (``_READY_GOLDEN``; ``upstream`` popped first — its ``latencyMs``
+    differs per ping); the v3 leg stays as the guard net, independently
+    asserting the SAME golden (previously the v4 expectation WAS the live
+    v3 body — the dual-view equivalence form this refactor removes)."""
     app = _build_ready_app()
     async with _client(app) as client:
         resp = await client.get("/slimapi/ready?v=4", headers=IDENTITY)
         assert resp.status_code == 200
         body = resp.json()
         assert "slimapi_contract" not in body
-        assert body["server"]["api_version"] == 3
-        assert body["schema"]["version"] == 3
-        assert "auxiliary" not in body
-        # ...and byte-equal to the v3 request's answer.
+        assert set(body) == {"upstream", "server", "schema"}
+        body.pop("upstream")
+        assert body == _READY_GOLDEN
+
+        # v3 守护网（Phase 4 拆除前保留）：v3 请求同落同一 frozen golden。
         v3 = await client.get("/slimapi/ready?v=3", headers=IDENTITY)
         assert v3.status_code == 200
         v3_body = v3.json()
+        assert set(v3_body) == {"upstream", "server", "schema"}
         v3_body.pop("upstream")
-        body.pop("upstream")  # latencyMs may differ between the two pings
-        assert body == v3_body
+        assert v3_body == _READY_GOLDEN

@@ -1,5 +1,13 @@
 """v3-contract §5 directory-query tests (Batch B, TDD).
 
+B12 (2026-08-21) three-way split: the consumer-ladder functions below now
+drive the ``?v=4`` face — v4-contract §5.1 inherits the v3 §5 consumption /
+tolerance / error semantics verbatim on every non-retired route, so the
+ladder assertions are v4-equivalent and were rewritten selector 3→4. The
+v3-only guardians (sessions-list consumption, v2-form rejections, tolerant
+health/versions view locks) and the §9.1 observability dims stay on the
+v3 face (Phase 3/4 rewrite).
+
 Covers:
 
 * Consuming set × full matrix — none / query-only / header-only /
@@ -149,7 +157,7 @@ def _last_upstream(seen: list[httpx.Request]) -> httpx.Request:
 async def test_agent_matrix_none(stack):
     client, seen = await stack()
     try:
-        response = await client.get("/slimapi/agent?v=3", headers=IDENTITY)
+        response = await client.get("/slimapi/agent?v=4", headers=IDENTITY)
         assert response.status_code == 200
         upstream = _last_upstream(seen)
         assert upstream.headers.get(DIRECTORY_HEADER) is None
@@ -161,7 +169,7 @@ async def test_agent_matrix_query_only_consumed_and_forwarded(stack):
     client, seen = await stack()
     try:
         response = await client.get(
-            "/slimapi/agent?v=3&directory=/w", headers=IDENTITY)
+            "/slimapi/agent?v=4&directory=/w", headers=IDENTITY)
         assert response.status_code == 200
         upstream = _last_upstream(seen)
         assert upstream.headers.get(DIRECTORY_HEADER) == "/w"
@@ -176,7 +184,7 @@ async def test_agent_matrix_header_only_retired(stack):
     client, seen = await stack()
     try:
         response = await client.get(
-            "/slimapi/agent?v=3",
+            "/slimapi/agent?v=4",
             headers={**IDENTITY, DIRECTORY_HEADER: "/w"})
         assert response.status_code == 400
         assert orjson.loads(response.content)["code"] == "directory_header_retired"
@@ -191,7 +199,7 @@ async def test_agent_matrix_dual_same_normalized_retired(stack):
     client, seen = await stack()
     try:
         response = await client.get(
-            "/slimapi/agent?v=3&directory=/w",
+            "/slimapi/agent?v=4&directory=/w",
             headers={**IDENTITY, DIRECTORY_HEADER: "/w/"})
         assert response.status_code == 400
         assert orjson.loads(response.content)["code"] == "directory_header_retired"
@@ -204,7 +212,7 @@ async def test_agent_matrix_dual_different_conflict_fields_frozen(stack):
     client, seen = await stack()
     try:
         response = await client.get(
-            "/slimapi/agent?v=3&directory=/w",
+            "/slimapi/agent?v=4&directory=/w",
             headers={**IDENTITY, DIRECTORY_HEADER: "/p"})
         assert response.status_code == 400
         assert orjson.loads(response.content) == {
@@ -221,7 +229,7 @@ async def test_agent_matrix_multi_same_folds(stack):
     client, seen = await stack()
     try:
         response = await client.get(
-            "/slimapi/agent?v=3&directory=/w&directory=/w&marker=1",
+            "/slimapi/agent?v=4&directory=/w&directory=/w&marker=1",
             headers=IDENTITY)
         assert response.status_code == 200
         upstream = _last_upstream(seen)
@@ -237,7 +245,7 @@ async def test_agent_matrix_multi_different_rejected(stack):
     client, seen = await stack()
     try:
         response = await client.get(
-            "/slimapi/agent?v=3&directory=/w&directory=/p", headers=IDENTITY)
+            "/slimapi/agent?v=4&directory=/w&directory=/p", headers=IDENTITY)
         assert response.status_code == 400
         assert orjson.loads(response.content) == {
             "code": "invalid_directory_selector"}
@@ -250,7 +258,7 @@ async def test_agent_matrix_invalid_value_rejected(stack):
     client, seen = await stack()
     try:
         response = await client.get(
-            "/slimapi/agent?v=3&directory=../etc", headers=IDENTITY)
+            "/slimapi/agent?v=4&directory=../etc", headers=IDENTITY)
         assert response.status_code == 400
         assert orjson.loads(response.content)["code"] == "invalid_directory"
         assert not seen
@@ -293,7 +301,7 @@ async def test_messages_keeps_other_params_after_strip(stack):
     client, seen = await stack()
     try:
         response = await client.get(
-            "/slimapi/messages/s1?v=3&directory=/w&limit=7&before=abc",
+            "/slimapi/messages/s1?v=4&directory=/w&limit=7&before=abc",
             headers=IDENTITY)
         assert response.status_code == 200
         upstream = _last_upstream(seen)
@@ -309,7 +317,7 @@ async def test_diff_forwards_messageid_without_directory(stack):
     client, seen = await stack()
     try:
         response = await client.get(
-            "/slimapi/sessions/s1/diff?v=3&directory=/w&messageID=m1",
+            "/slimapi/sessions/s1/diff?v=4&directory=/w&messageID=m1",
             headers=IDENTITY)
         assert response.status_code == 200
         upstream = _last_upstream(seen)
@@ -383,14 +391,15 @@ async def test_v3_sessions_header_only_upstream_query_clean(stack):
 # §5.6 stream exception
 # ---------------------------------------------------------------------------
 
-def _stream_request(query: str, *, v3: bool, header: str | None = None):
+def _stream_request(query: str, *, header: str | None = None):
+    """Direct-invocation Request with a simulated ADMITTED v4 selector stash
+    (B12 ①: the §5.6 route guard is wire-agnostic and the stream route keeps
+    the v3 consumption semantics in v4 — v4-contract §5.2)."""
     headers: list[tuple[bytes, bytes]] = []
     if header is not None:
         headers.append((b"x-opencode-directory", header.encode()))
-    state: dict = {}
-    if v3:
-        from oc_slimapi.selector import SELECTOR_STATE_KEY
-        state[SELECTOR_STATE_KEY] = {"result": "v3", "wire": "3"}
+    from oc_slimapi.selector import SELECTOR_STATE_KEY
+    state = {SELECTOR_STATE_KEY: {"result": "v4", "wire": "4"}}
     scope = {
         "type": "http", "asgi": {"version": "3.0"},
         "http_version": "1.1", "method": "GET",
@@ -403,42 +412,42 @@ def _stream_request(query: str, *, v3: bool, header: str | None = None):
     return Request(scope)
 
 
-def test_stream_v3_multi_different_invalid_directory_selector():
+def test_stream_v4_multi_different_invalid_directory_selector():
     from oc_slimapi.routes.token_stream import _resolve_directory_conflict
-    request = _stream_request("directory=/w&directory=/p", v3=True)
+    request = _stream_request("directory=/w&directory=/p")
     with pytest.raises(CodedHTTPException) as excinfo:
         _resolve_directory_conflict(request, "/p")
     assert excinfo.value.status_code == 400
     assert excinfo.value.code == "invalid_directory_selector"
 
 
-def test_stream_v3_multi_same_folds_to_single_value():
+def test_stream_v4_multi_same_folds_to_single_value():
     from oc_slimapi.routes.token_stream import _resolve_directory_conflict
-    request = _stream_request("directory=/w&directory=/w", v3=True)
+    request = _stream_request("directory=/w&directory=/w")
     # no raise — folded, then the single value flows through the v2 guard
     _resolve_directory_conflict(request, "/w")
 
 
-def test_stream_v3_query_only_accepted_noop():
+def test_stream_v4_query_only_accepted_noop():
     from oc_slimapi.routes.token_stream import _resolve_directory_conflict
-    request = _stream_request("directory=/w", v3=True)
+    request = _stream_request("directory=/w")
     _resolve_directory_conflict(request, "/w")
 
 
-def test_stream_v3_dual_different_directory_not_allowed():
+def test_stream_v4_dual_different_directory_not_allowed():
     """§5.6: after single-valuing, the inherited v2 guard owns the
     both-present-different rejection (existing code ``directory_not_allowed``)."""
     from oc_slimapi.routes.token_stream import _resolve_directory_conflict
-    request = _stream_request("directory=/w", v3=True, header="/p")
+    request = _stream_request("directory=/w", header="/p")
     with pytest.raises(CodedHTTPException) as excinfo:
         _resolve_directory_conflict(request, "/w")
     assert excinfo.value.status_code == 400
     assert excinfo.value.code == "directory_not_allowed"
 
 
-def test_stream_v3_header_only_noop():
+def test_stream_v4_header_only_noop():
     from oc_slimapi.routes.token_stream import _resolve_directory_conflict
-    request = _stream_request("", v3=True, header="/w")
+    request = _stream_request("", header="/w")
     _resolve_directory_conflict(request, None)
 
 
@@ -466,7 +475,7 @@ async def test_stream_selector_precheck_rejects_multi_different():
         "type": "http", "http_version": "1.1", "method": "GET",
         "path": "/slimapi/sessions/s1/stream",
         "raw_path": b"/slimapi/sessions/s1/stream",
-        "query_string": b"v=3&directory=/w&directory=/p",
+        "query_string": b"v=4&directory=/w&directory=/p",
         "headers": [], "client": ("127.0.0.1", 1), "server": ("t", 80),
         "state": {},
     }
@@ -515,7 +524,7 @@ async def test_stream_selector_single_value_not_consumed():
         "type": "http", "http_version": "1.1", "method": "GET",
         "path": "/slimapi/sessions/s1/stream",
         "raw_path": b"/slimapi/sessions/s1/stream",
-        "query_string": b"v=3&directory=/w",
+        "query_string": b"v=4&directory=/w",
         "headers": [], "client": ("127.0.0.1", 1), "server": ("t", 80),
         "state": {},
     }
@@ -528,7 +537,7 @@ async def test_stream_selector_single_value_not_consumed():
 
     await middleware(scope, receive, send)
     assert capture.scope is not None
-    assert capture.scope["state"][SELECTOR_STATE_KEY]["result"] == "v3"
+    assert capture.scope["state"][SELECTOR_STATE_KEY]["result"] == "v4"
     assert V3_DIRECTORY_STATE_KEY not in capture.scope["state"]
     # `v` stripped (sidecar-reserved), `directory` preserved verbatim for
     # the route guard.
@@ -593,7 +602,7 @@ async def test_selector_never_consumes_tolerant_paths():
         scope = {
             "type": "http", "http_version": "1.1", "method": "GET",
             "path": path, "raw_path": path.encode(),
-            "query_string": b"v=3&directory=../etc&directory=/other",
+            "query_string": b"v=4&directory=../etc&directory=/other",
             "headers": [], "client": ("127.0.0.1", 1), "server": ("t", 80),
             "state": {},
         }

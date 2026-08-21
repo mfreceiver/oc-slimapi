@@ -1,5 +1,13 @@
 """v3-contract §4 envelope tests (Batch B, TDD).
 
+B12 (2026-08-21) three-way split: the messages-envelope family and the
+sessions-status map passthrough were rewritten to the ``?v=4`` face —
+v4-contract §10 freezes messages as byte-identical to v3 (envelope shape,
+nextCursor splice, 304 header set) and §12 marks /sessions/status 零 v4
+分叉. The sessions-list envelope functions stay on the v3 face (the v4
+global list is a different DB-projection pipeline) as the Phase 4
+guardian net, as do the retired-v2-form rejection checks.
+
 Covers:
 
 * ``GET /slimapi/messages/{sid}`` v3 — ``{"items":[<v2 bare array bytes>],
@@ -130,19 +138,19 @@ async def client_factory():
 # messages envelope
 # ---------------------------------------------------------------------------
 
-async def test_messages_v3_envelope_null_cursor_byte_verbatim(client_factory):
-    """Terminal §4: the messages list body is the
-    {"items":…,"nextCursor":null} envelope (bare arrays no longer exist on
-    the wire); the pagination header is NOT produced (the client reads the
-    cursor from the envelope)."""
+async def test_messages_v4_envelope_null_cursor_byte_verbatim(client_factory):
+    """Terminal §4 (B12 ①: v4 messages ≡ v3, §10 zero difference): the
+    messages list body is the {"items":…,"nextCursor":null} envelope (bare
+    arrays no longer exist on the wire); the pagination header is NOT
+    produced (the client reads the cursor from the envelope)."""
     client = await client_factory(_message_handler())
     try:
-        v3 = await client.get("/slimapi/messages/s1?v=3", headers=IDENTITY)
-        assert v3.status_code == 200
-        assert v3.content.startswith(b'{"items":')
-        assert "x-next-cursor" not in v3.headers
-        assert "X-Next-Cursor" not in v3.headers
-        body = orjson.loads(v3.content)
+        v4 = await client.get("/slimapi/messages/s1?v=4", headers=IDENTITY)
+        assert v4.status_code == 200
+        assert v4.content.startswith(b'{"items":')
+        assert "x-next-cursor" not in v4.headers
+        assert "X-Next-Cursor" not in v4.headers
+        body = orjson.loads(v4.content)
         assert list(body.keys()) == ["items", "nextCursor"]
         assert body["nextCursor"] is None
         assert "complete" not in body
@@ -152,15 +160,15 @@ async def test_messages_v3_envelope_null_cursor_byte_verbatim(client_factory):
         await client.aclose()
 
 
-async def test_messages_v3_envelope_non_null_cursor(client_factory):
+async def test_messages_v4_envelope_non_null_cursor(client_factory):
     """Upstream Link → envelope nextCursor carries the opaque cursor
-    verbatim."""
+    verbatim (B12 ①: v4 messages ≡ v3, §10 zero difference)."""
     link = '</session/s1/message?limit=40&before=CURSOR123>; rel="next"'
     client = await client_factory(_message_handler(link=link))
     try:
-        v3 = await client.get("/slimapi/messages/s1?v=3", headers=IDENTITY)
-        assert orjson.loads(v3.content)["nextCursor"] == "CURSOR123"
-        assert "x-next-cursor" not in v3.headers
+        v4 = await client.get("/slimapi/messages/s1?v=4", headers=IDENTITY)
+        assert orjson.loads(v4.content)["nextCursor"] == "CURSOR123"
+        assert "x-next-cursor" not in v4.headers
     finally:
         await client.aclose()
 
@@ -182,13 +190,14 @@ async def test_messages_retired_v2_forms_rejected(client_factory):
         await client.aclose()
 
 
-async def test_messages_v3_error_response_not_enveloped(client_factory):
-    """§4.4: error bodies keep the v2 shape (code, no items)."""
+async def test_messages_v4_error_response_not_enveloped(client_factory):
+    """§4.4 (B12 ①: v4 messages ≡ v3, §10 zero difference): error bodies
+    keep the v2 shape (code, no items)."""
     client = await client_factory(
         _message_handler(body=b'{"error": "not found"}'))
     try:
         # body is not a JSON array → projection failure → 502
-        response = await client.get("/slimapi/messages/s1?v=3", headers=IDENTITY)
+        response = await client.get("/slimapi/messages/s1?v=4", headers=IDENTITY)
         assert response.status_code in (502, 503)
         body = orjson.loads(response.content)
         assert "items" not in body
@@ -197,19 +206,20 @@ async def test_messages_v3_error_response_not_enveloped(client_factory):
         await client.aclose()
 
 
-async def test_messages_v3_304_empty_body_no_aux_headers(client_factory):
-    """§6.4: v3 304 = no body + only the ETag/Vary/Cache-Control set — the
-    pagination headers are NOT copied (client reads them from the cached
-    envelope)."""
+async def test_messages_v4_304_empty_body_no_aux_headers(client_factory):
+    """§6.4 (B12 ①: v4 messages ≡ v3, §10 zero difference; ETag validator
+    differs by wire=v4 domain but the 304 header SET is frozen): v4 304 =
+    no body + only the ETag/Vary/Cache-Control set — the pagination headers
+    are NOT copied (client reads them from the cached envelope)."""
     link = '</session/s1/message?limit=40&before=CURSOR123>; rel="next"'
     client = await client_factory(_message_handler(link=link))
     try:
-        first = await client.get("/slimapi/messages/s1?v=3", headers=IDENTITY)
+        first = await client.get("/slimapi/messages/s1?v=4", headers=IDENTITY)
         etag = first.headers["ETag"]
         assert etag  # validators enabled by default
         assert "x-next-cursor" not in first.headers
         reval = await client.get(
-            "/slimapi/messages/s1?v=3",
+            "/slimapi/messages/s1?v=4",
             headers={**IDENTITY, "If-None-Match": etag},
         )
         assert reval.status_code == 304
@@ -298,12 +308,13 @@ async def test_sessions_v3_304_no_x_complete_header(client_factory):
         await client.aclose()
 
 
-async def test_sessions_status_v3_not_enveloped(client_factory):
-    """§4.3: /slimapi/sessions/status keeps its map shape under v3."""
+async def test_sessions_status_v4_not_enveloped(client_factory):
+    """§4.3 (B12 ①: /sessions/status is 零 v4 分叉, v4-contract §12):
+    /slimapi/sessions/status keeps its map shape under v4."""
     client = await client_factory(_message_handler())
     try:
         response = await client.get(
-            "/slimapi/sessions/status?v=3", headers=IDENTITY)
+            "/slimapi/sessions/status?v=4", headers=IDENTITY)
         assert response.status_code == 200
         body = orjson.loads(response.content)
         assert "items" not in body

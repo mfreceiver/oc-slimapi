@@ -5,6 +5,12 @@ Scope: the selectorResult / wireVersion dimension VALUE SETS widen with
 and the SSE active dims. The compatibility iron-rule: shapes stay
 identical — old rows / snapshots remain interpretable (new values only
 appear for new requests). DB-auxiliary metrics are NOT here (B5 lane).
+
+B12（2026-08-21 v4 自包含 golden 化清点）：本文件**无**「先发 ?v=3 求
+期望再比 v4」形态——维度常量与逐行断言本就内联字面；v3 行/lifecycle
+测试（test_access_log_row_v3_request_unchanged、
+test_sse_lifecycle_v3_scope_unchanged）为 v3 守护网（三分处置②，
+Phase 4 v3 面拆除前保留）。
 """
 from __future__ import annotations
 
