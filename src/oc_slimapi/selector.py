@@ -94,10 +94,11 @@ from .versioning import ACCEPTED_CLIENT_VERSIONS, _is_slimapi_path
 SELECTOR_STATE_KEY = "slimapi_selector"
 DIRECTORY_FORM_STATE_KEY = "slimapi_directory_form"
 
-# §9.1 selectorResult enum (frozen — v3/v4/rejected/exempt/not_applicable are
-# the producible values; the historical absent/v2 dims live on only as
-# sseActive literals below, keeping old access-log rows interpretable).
-SELECTOR_V3 = "v3"
+# §9.1 selectorResult enum (frozen — v4/rejected/exempt/not_applicable are
+# the producible values under the v4-only (4, 4) window; the v3 producer was
+# removed with the 2026-08-21 narrowing — the "v3" dim lives on in
+# SSE_RESULT_DIMS below, and the historical absent/v2 dims live on only as
+# sseActive literals, keeping old access-log rows interpretable).
 SELECTOR_V4 = "v4"
 SELECTOR_REJECTED = "rejected"
 SELECTOR_EXEMPT = "exempt"
@@ -368,16 +369,18 @@ def selector_info_from_scope(scope: Scope) -> dict[str, Any]:
 
 def wire_view_from_scope(scope: Scope) -> int:
     """§2/S-B04: the wire view this request runs — read from the selector
-    stash ("3" | "4"), defaulting to 3.
+    stash ("4" under the v4-only window), defaulting to 3.
 
     The selector is the ONLY way a request enters the v4 face, so:
 
-    * selector-admitted ``?v=3`` / ``?v=4`` → the stash's wire value
+    * selector-admitted ``?v=4`` → the stash's wire value
       (same source the selectorResult was recorded from);
     * rejected / exempt / not-applicable or selector-less stacks (direct
       route invocation in tests) → the DEFAULT v3 view — every existing
       test and route keeps observing 3 unless it explicitly sent ``?v=4``
-      through the selector.
+      through the selector. (The v4-only (4, 4) window retired ?v=3
+      admission — the default-3 fallback is the v3-face teardown surface
+      guarded by the Phase 4 selector-less tests.)
 
     Kept as a function so the call sites stay explicit about where the
     view comes from (health/versions/routes must all read THIS value —
@@ -572,12 +575,14 @@ class SlimapiSelectorMiddleware:
             await self._reject_version(scope, receive, send)
             return
 
-        # Admitted: mark the wire view (§2 request-scope wireVersion — v3
-        # and v4 stashed symmetrically; routes/health read it back via
-        # wire_view_from_scope) and run the version-forked directory
-        # consumption (§5.1/§5.2/§8.3 ③).
+        # Admitted: mark the wire view (§2 request-scope wireVersion — under
+        # the v4-only (4, 4) window only SELECTOR_V4 can be stashed here;
+        # routes/health read it back via wire_view_from_scope) and run the
+        # version-forked directory consumption (§5.1/§5.2/§8.3 ③).
+        # (Historical: the 4.0.0 (3, 4) dual window stashed SELECTOR_V3
+        # here for ?v=3 — removed by the 2026-08-21 narrowing.)
         wire = values[0]
-        _stash(scope, SELECTOR_V3 if wire == "3" else SELECTOR_V4, wire)
+        _stash(scope, SELECTOR_V4, wire)
 
         # §8.3/§16.1: the method 405 slots between ② (the version-family
         # 400s above) and ③ (directory consumption below). v4 face +
