@@ -448,9 +448,9 @@ class TestRunReconnectWiring:
 class TestBoundedDisabled:
     def test_cap_evicts_oldest(self, monkeypatch):
         """Over-cap insert evicts the oldest tombstone (insertion order)."""
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_DISABLED_MAX", 3)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_DISABLED_MAX", 3)
         # Effectively disable TTL so cap is the binding constraint.
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_DISABLED_TTL_MS", 10**9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_DISABLED_TTL_MS", 10**9)
         th = TokenStreamHub()
         for i in range(4):
             th._remember_disabled(("s", "m", f"p{i}"))
@@ -462,8 +462,8 @@ class TestBoundedDisabled:
 
     def test_ttl_expires_old_entries_on_next_insert(self, monkeypatch):
         """Entries older than TTL are pruned when the next entry is inserted."""
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_DISABLED_MAX", 100)
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_DISABLED_TTL_MS", 100)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_DISABLED_MAX", 100)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_DISABLED_TTL_MS", 100)
         th = TokenStreamHub()
         th._remember_disabled(("s", "m", "old"))
         # Backdate the entry past TTL.
@@ -494,8 +494,8 @@ class TestBoundedDisabled:
 
 class TestBoundedNontext:
     def test_cap_evicts_oldest(self, monkeypatch):
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_DISABLED_MAX", 3)
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_DISABLED_TTL_MS", 10**9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_DISABLED_MAX", 3)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_DISABLED_TTL_MS", 10**9)
         th = TokenStreamHub()
         for i in range(4):
             th._remember_nontext(("s", "m", f"p{i}"))
@@ -503,8 +503,8 @@ class TestBoundedNontext:
         assert ("s", "m", "p0") not in th._nontext_parts
 
     def test_ttl_expires_old_entries(self, monkeypatch):
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_DISABLED_MAX", 100)
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_DISABLED_TTL_MS", 100)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_DISABLED_MAX", 100)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_DISABLED_TTL_MS", 100)
         th = TokenStreamHub()
         th._remember_nontext(("s", "m", "old"))
         th._nontext_parts[("s", "m", "old")] = _now_ms() - 1000

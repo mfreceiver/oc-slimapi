@@ -914,7 +914,9 @@ async def test_b1_4_gzip_hit_does_not_compress_messages(upstream_factory, monkey
         compress_calls["n"] += 1
         return original_cib(body, accept_encoding)
 
-    monkeypatch.setattr(messages, "compress_if_beneficial", spy_cib)
+    # W3-2 (F-302): the messages list route resolves compress_if_beneficial
+    # through _judge_pack_tail in the _list submodule — spy on THAT binding.
+    monkeypatch.setattr(messages._list, "compress_if_beneficial", spy_cib)
 
     state: dict = {}
 
@@ -1037,9 +1039,10 @@ async def test_b1_1r_incompressible_body_labels_actual_coding(upstream_factory, 
     assert len(identity) >= 64
 
     # Replace the list pack worker: its output IS the identity body the
-    # route judges and (maybe) compresses.
+    # route judges and (maybe) compresses. (W3-2/F-302: patch the _list
+    # submodule binding — that is where the route resolves the worker.)
     monkeypatch.setattr(
-        messages, "_project_list_sorted_and_pack",
+        messages._list, "_project_list_sorted_and_pack",
         # wire_view follows the real worker's v4-§14 seam (default 3 — these
         # stacks are selector-less).
         lambda body, *, accept_encoding, limits, sid=None, wire_view=3:
@@ -1102,8 +1105,9 @@ async def test_b1_1r_rev5_case_matrix(upstream_factory, monkeypatch):
     small = b"[{}]"  # 3 bytes < MIN_GZIP_BYTES: min gate forces identity
 
     holder: dict[str, bytes] = {}
+    # W3-2/F-302: patch the _list submodule binding (see test above).
     monkeypatch.setattr(
-        messages, "_project_list_sorted_and_pack",
+        messages._list, "_project_list_sorted_and_pack",
         # wire_view follows the real worker's v4-§14 seam (default 3).
         lambda body, *, accept_encoding, limits, sid=None, wire_view=3:
             holder["identity"])
@@ -1215,9 +1219,9 @@ async def test_b1_1r_identity_only_request_excludes_gzip_validator(upstream_fact
     while len(gzip.compress(identity, compresslevel=6)) < len(identity):
         identity = os.urandom(600)
     monkeypatch.setattr(
-        messages, "_project_list_sorted_and_pack",
+        messages._list, "_project_list_sorted_and_pack",
         # wire_view follows the real worker's v4-§14 seam (default 3 — these
-        # stacks are selector-less).
+        # stacks are selector-less). W3-2/F-302: _list submodule binding.
         lambda body, *, accept_encoding, limits, sid=None, wire_view=3:
             identity)
 

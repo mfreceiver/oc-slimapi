@@ -302,7 +302,7 @@ class HubRegistry:
         cleanup→null segment after re-check is a no-await sync block:
 
         * ``token_hub.on_upstream_reconnect()`` clears old-epoch state
-          (live_parts / _session_status / _busy_sids / _retired_messages).
+          (live_parts / _session_status / _retired_messages).
           ``has_consumers()`` is False here → the resync fanout is a natural
           no-op (zero wire impact). ``_part_revisions`` (CRITICAL 1) and
           ``_removed_messages`` (replay queue) are PRESERVED.

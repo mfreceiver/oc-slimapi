@@ -352,14 +352,16 @@ async def _scenario_lease(cases: dict[str, str]) -> None:
         with_registry=True,
     )
     lease_calls: list[int] = []
-    original = messages._messages_via_lease
+    # W3-2 (F-302): the lease helper lives in the _list submodule — the spy
+    # must wrap THAT namespace binding to observe the route's lookup.
+    original = messages._list._messages_via_lease
 
     async def _spy(*args, **kwargs):
         lease_calls.append(1)
         return await original(*args, **kwargs)
 
     mp = pytest.MonkeyPatch()
-    mp.setattr(messages, "_messages_via_lease", _spy)
+    mp.setattr(messages._list, "_messages_via_lease", _spy)
     try:
         async with _client(app) as client:
             cases["lease_200_gzip"], _ = await _wire_request(

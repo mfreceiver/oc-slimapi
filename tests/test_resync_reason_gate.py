@@ -321,8 +321,8 @@ def test_pending_resync_queue_appends_only_in_enqueue_gate():
     to ``_pending_session_resinks`` lives inside ``_enqueue_session_resync``
     (itself an enumerated, gated callee). If a second writer appears, the
     passthrough acceptance in the scanner must be re-audited."""
-    hub = SRC_ROOT / "sse" / "tokenstream" / "hub.py"
-    tree = ast.parse(hub.read_text(encoding="utf-8"), filename=str(hub))
+    flush_engine = SRC_ROOT / "sse" / "tokenstream" / "flush_engine.py"
+    tree = ast.parse(flush_engine.read_text(encoding="utf-8"), filename=str(flush_engine))
 
     class _FuncVisitor(ast.NodeVisitor):
         def __init__(self) -> None:

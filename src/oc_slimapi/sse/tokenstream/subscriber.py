@@ -17,6 +17,7 @@ from ...config import (
     TOKEN_HANDSHAKE_ITEMS,
 )
 from .frames import STOP, _resync_frame
+from ..hub_types import RESYNC_SUBSCRIBER_BACKPRESSURE
 from ..replay_wire import V4_RESYNC_REASONS
 from .models import _TokenMetrics
 
@@ -446,7 +447,7 @@ class TokenSubscriber:
         # observable signal; recovery = Last-Event-ID reconnect +
         # ReplayLog replay). v3 keeps the frozen resync + STOP pair,
         # byte-identical.
-        reason = "subscriber_backpressure"
+        reason = RESYNC_SUBSCRIBER_BACKPRESSURE
         if self.wire_v4 and reason not in V4_RESYNC_REASONS:
             self.queue.put_runtime_terminal(STOP)
             return False

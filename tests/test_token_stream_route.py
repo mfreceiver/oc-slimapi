@@ -1333,8 +1333,8 @@ class TestNBC1MultiSeedEviction:
         never sees this (no delta appended) — _start_part must run the same
         LRU while-evict, never evicting the key being admitted."""
         # Per-part cap large (so each seed is legal); global cap small.
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_PART_MAX_BYTES", 10 ** 9)
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_LIVEPARTS_MAX_BYTES", 24)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_PART_MAX_BYTES", 10 ** 9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_LIVEPARTS_MAX_BYTES", 24)
         th = TokenStreamHub()
         sub_frames: list[bytes] = []
 
@@ -1383,8 +1383,8 @@ class TestNBC1MultiSeedEviction:
     def test_never_evicts_current_key_on_seed_admission(self, monkeypatch):
         """The admitted key is never evicted by its own seed (mirrors _reserve
         'never evict current key')."""
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_PART_MAX_BYTES", 10 ** 9)
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_LIVEPARTS_MAX_BYTES", 8)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_PART_MAX_BYTES", 10 ** 9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_LIVEPARTS_MAX_BYTES", 8)
         th = TokenStreamHub()
         # First part with a seed equal to the cap — admitted, nothing to evict.
         th.on_part_updated(_updated_props("s1", "m1", "p1", text="AAAAAAAA"))  # 8 == cap
@@ -1394,8 +1394,8 @@ class TestNBC1MultiSeedEviction:
     def test_single_seed_over_per_part_cap_truncates(self, monkeypatch):
         """Regression guard: the pre-existing single-seed > per-part cap path
         still truncates (NB-C1 did not remove it)."""
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_PART_MAX_BYTES", 4)
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_LIVEPARTS_MAX_BYTES", 10 ** 9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_PART_MAX_BYTES", 4)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_LIVEPARTS_MAX_BYTES", 10 ** 9)
         th = TokenStreamHub()
         th.on_part_updated(_updated_props("s1", "m1", "p1", text="ABCDEFGH"))  # 8 > 4
         assert ("s1", "m1", "p1") not in th.live_parts

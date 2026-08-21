@@ -30,7 +30,7 @@ from oc_slimapi.config import Settings
 from oc_slimapi.errors import register_error_handlers
 from oc_slimapi.singleflight import LeasedSingleFlight
 from oc_slimapi.proxy import install_proxy
-from oc_slimapi.routes import permissions, questions
+from oc_slimapi.routes import _aggregate_fanout, permissions, questions
 from oc_slimapi.transform import TransformConfig, TransformPool
 
 HDR = {"X-Slimapi-Version": "2"}
@@ -409,7 +409,11 @@ async def test_c2_2_directories_derived_while_lease_held(
     registry = app.state.raw_fetch_registry
     probe: dict = {}
 
-    real = questions._directories_from_sessions
+    # F-304 patch-target migration: the discovery parse + directory
+    # derivation moved from questions.py into the shared skeleton
+    # (routes/_aggregate_fanout.py) — the spy patches the namespace where
+    # the binding is actually consumed.
+    real = _aggregate_fanout._directories_from_sessions
 
     def _spy(payload):
         for key, entries in registry.snapshot().items():
@@ -418,7 +422,7 @@ async def test_c2_2_directories_derived_while_lease_held(
                 probe["state_at_derive"] = entries[0][3]
         return real(payload)
 
-    monkeypatch.setattr(questions, "_directories_from_sessions", _spy)
+    monkeypatch.setattr(_aggregate_fanout, "_directories_from_sessions", _spy)
     try:
         async with _client(app) as client:
             response = await client.get("/slimapi/questions", headers=HDR)
@@ -467,10 +471,12 @@ async def test_c2_3_expanded_graph_dropped_after_lease_release(
         refs.append(weakref.ref(out))
         return out
 
-    # namespace swap: questions.py's `orjson.loads` resolves to the probe
-    # (dumps is still the real one for the envelope pack worker)
+    # namespace swap: the shared aggregation skeleton's `orjson.loads`
+    # resolves to the probe (F-304 moved the discovery + per-dir parses
+    # from questions.py into routes/_aggregate_fanout.py; the envelope pack
+    # worker's dumps is still the real one — the route module is untouched)
     monkeypatch.setattr(
-        questions, "orjson",
+        _aggregate_fanout, "orjson",
         types.SimpleNamespace(loads=_loads, dumps=orjson.dumps),
     )
     try:
@@ -555,8 +561,10 @@ async def test_c2_5_permissions_discovery_invariants_mirror(
         refs.append(weakref.ref(out))
         return out
 
+    # F-304: the permissions route's parses also live in the shared
+    # skeleton now (discovery + per-dir) — patch that namespace.
     monkeypatch.setattr(
-        permissions, "orjson",
+        _aggregate_fanout, "orjson",
         types.SimpleNamespace(loads=_loads, dumps=orjson.dumps),
     )
     try:
@@ -614,7 +622,13 @@ async def _blocked_fanout_probe(
     holder: dict = {}
     probe: dict = {}
 
-    real_raw = route_module.fetch_global_root_sessions_raw
+    # F-304 patch-target migration: the discovery fetch + directory
+    # derivation are consumed inside the shared skeleton
+    # (routes/_aggregate_fanout.py), so those two patches target it; the
+    # scheduler is still resolved through the ROUTE module's imported
+    # binding (route body global lookup), so the blocked-collect patch
+    # stays on route_module.
+    real_raw = _aggregate_fanout.fetch_global_root_sessions_raw
 
     async def _wrapped_raw(upstream_client, request, *, limit):
         body, complete = await real_raw(upstream_client, request, limit=limit)
@@ -629,9 +643,9 @@ async def _blocked_fanout_probe(
         return body, complete
 
     monkeypatch.setattr(
-        route_module, "fetch_global_root_sessions_raw", _wrapped_raw)
+        _aggregate_fanout, "fetch_global_root_sessions_raw", _wrapped_raw)
 
-    real_derive = route_module._directories_from_sessions
+    real_derive = _aggregate_fanout._directories_from_sessions
 
     def _derive_spy(payload):
         # contrast: pre-release the body is referenced (lease held + route
@@ -641,7 +655,7 @@ async def _blocked_fanout_probe(
         return real_derive(payload)
 
     monkeypatch.setattr(
-        route_module, "_directories_from_sessions", _derive_spy)
+        _aggregate_fanout, "_directories_from_sessions", _derive_spy)
 
     async def _blocked_collect(*args, **kwargs):
         entered.set()  # lease already released before Step 3 starts
@@ -649,7 +663,7 @@ async def _blocked_fanout_probe(
         return [], [], [], False  # empty fan-out result
 
     monkeypatch.setattr(
-        route_module, "_collect_with_byte_budget", _blocked_collect)
+        route_module, "collect_with_byte_budget", _blocked_collect)
 
     async with _client(app) as client:
         task = asyncio.create_task(client.get(route_path, headers=HDR))

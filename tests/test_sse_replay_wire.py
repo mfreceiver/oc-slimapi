@@ -725,7 +725,7 @@ async def test_token_truncated_frame_v3_only_never_logged(monkeypatch):
     semantics) but never enter the ReplayLog nor consume a v4 seq."""
     log = ReplayLog(epoch=EPOCH)
     th = TokenStreamHub(replay_log=log)
-    monkeypatch.setattr(tokenstream_hub_module, "TOKEN_PART_MAX_BYTES", 4)
+    monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_PART_MAX_BYTES", 4)
     sub = TokenSubscriber(session_id=SID, metrics=th._metrics)
     th.attach_subscriber(SID, sub)  # v3 subscriber (wire_v4=False)
     try:
@@ -756,7 +756,7 @@ async def test_token_truncated_frame_never_reaches_v4_sub(monkeypatch):
     wire, live or otherwise."""
     log = ReplayLog(epoch=EPOCH)
     th = TokenStreamHub(replay_log=log)
-    monkeypatch.setattr(tokenstream_hub_module, "TOKEN_PART_MAX_BYTES", 4)
+    monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_PART_MAX_BYTES", 4)
     sub = TokenSubscriber(session_id=SID, metrics=th._metrics)
     th.attach_subscriber(SID, sub, wire_v4=True)
     try:
@@ -1438,7 +1438,7 @@ async def test_cross_version_pollution_replay_clean(monkeypatch):
     Also anchors the v3 side on the same real stack: the v3 subscriber
     still receives both snapshot variants byte-semantically (handshake
     prefill untouched)."""
-    monkeypatch.setattr(tokenstream_hub_module, "TOKEN_PART_MAX_BYTES", 4)
+    monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_PART_MAX_BYTES", 4)
     s = _RealStack()
     try:
         # leg 1 — v3 subscriber sees the classic frames (incl. both
@@ -1646,7 +1646,7 @@ async def test_r3_token_memory_eviction_v4_terminates_v3_resyncs(monkeypatch):
     delta cannot fit → A is evicted → the sid's subscribers get the
     resync. v4: terminated (STOP only). v3: legacy
     ``resync{token_memory_limit, sessionID}``."""
-    monkeypatch.setattr(tokenstream_hub_module, "TOKEN_LIVEPARTS_MAX_BYTES", 1)
+    monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_LIVEPARTS_MAX_BYTES", 1)
     log = ReplayLog(epoch=EPOCH)
     s = _RealStack(log=log)
     sid2 = "s2"
@@ -1887,7 +1887,7 @@ async def test_r4_memory_eviction_after_real_consumption_barrier(monkeypatch):
     barrier watermark=1（A 的 delta 在 flush_sid 后落下）→ conn2 cursor 1
     → resync；conn3 cursor 2（B 的 delta，B 状态完好）→ 正常 up-to-date
     ——barrier 不越过失效边界。"""
-    monkeypatch.setattr(tokenstream_hub_module, "TOKEN_LIVEPARTS_MAX_BYTES", 1)
+    monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_LIVEPARTS_MAX_BYTES", 1)
     log = ReplayLog(epoch=EPOCH)
     s = _RealStack(log=log)
     try:

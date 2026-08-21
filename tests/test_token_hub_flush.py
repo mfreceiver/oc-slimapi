@@ -319,7 +319,7 @@ class TestFlush:
     def test_4kib_threshold_early_flush(self, monkeypatch):
         """§5.4: accumulator crossing TOKEN_FLUSH_BYTES drains immediately
         (does not wait for the 100ms tick). Low-volume deltas stay pending."""
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_FLUSH_BYTES", 10)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.ingest.TOKEN_FLUSH_BYTES", 10)
         th = TokenStreamHub()
         sub = _attach(th, "s1")
         sub.frames.clear()
@@ -400,7 +400,7 @@ class TestFlushLoop:
         # Tighten the tick interval to make this test fast: patch the
         # module-level _TTL_TICK_INTERVAL down to 2 (drain every 2 ticks).
         monkeypatch.setattr(
-            "oc_slimapi.sse.tokenstream.hub._TTL_TICK_INTERVAL", 2
+            "oc_slimapi.sse.tokenstream.flush_engine._TTL_TICK_INTERVAL", 2
         )
         # Speed up the sleep cadence WITHOUT recursion: capture the real
         # sleep first, then patch the module-global asyncio.sleep used by
@@ -411,7 +411,7 @@ class TestFlushLoop:
         async def _fast(_):
             await real_sleep(0)
 
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.asyncio.sleep", _fast)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.flush_engine.asyncio.sleep", _fast)
 
         th = TokenStreamHub()
         calls: list[int] = []
@@ -435,7 +435,7 @@ class TestFlushLoop:
     async def test_flush_loop_schedules_heartbeat(self, monkeypatch):
         """§5.6 frame 6: heartbeat fans every ~15s (patched interval for speed)."""
         monkeypatch.setattr(
-            "oc_slimapi.sse.tokenstream.hub._HEARTBEAT_TICK_INTERVAL", 2
+            "oc_slimapi.sse.tokenstream.flush_engine._HEARTBEAT_TICK_INTERVAL", 2
         )
 
         real_sleep = asyncio.sleep
@@ -443,7 +443,7 @@ class TestFlushLoop:
         async def _fast(_):
             await real_sleep(0)
 
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.asyncio.sleep", _fast)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.flush_engine.asyncio.sleep", _fast)
 
         th = TokenStreamHub()
         sub = _attach(th, "s1")
@@ -673,7 +673,7 @@ class TestSafePutAndTruncate:
 class TestReserve:
     def test_per_part_cap_truncates(self, monkeypatch):
         """Exceeding TOKEN_PART_MAX_BYTES → truncate + drop_part."""
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_PART_MAX_BYTES", 10)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_PART_MAX_BYTES", 10)
         th = TokenStreamHub()
         sub = _attach(th, "s1")
         sub.frames.clear()
@@ -693,8 +693,8 @@ class TestReserve:
     def test_global_byte_cap_evicts_oldest(self, monkeypatch):
         """Exceeding TOKEN_LIVEPARTS_MAX_BYTES → LRU-evict oldest part."""
         # Small global cap so we can trigger eviction with small deltas.
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_LIVEPARTS_MAX_BYTES", 15)
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_PART_MAX_BYTES", 10**9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_LIVEPARTS_MAX_BYTES", 15)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_PART_MAX_BYTES", 10**9)
         th = TokenStreamHub()
         th.on_part_updated(_updated_props("s1", "m1", "p1", text=""))
         th.on_part_updated(_updated_props("s1", "m1", "p2", text=""))
@@ -719,7 +719,7 @@ class TestReserve:
 
     def test_global_count_cap_evicts_oldest(self, monkeypatch):
         """Exceeding TOKEN_LIVE_PARTS_MAX → LRU-evict oldest before creating."""
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_LIVE_PARTS_MAX", 2)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_LIVE_PARTS_MAX", 2)
         th = TokenStreamHub()
         th.on_part_updated(_updated_props("s1", "m1", "p1", text=""))
         th.live_parts[("s1", "m1", "p1")].last_delta_ms = _now_ms() - 10000
@@ -734,8 +734,8 @@ class TestReserve:
 
     def test_never_evicts_current_key(self, monkeypatch):
         """_reserve never evicts the part it's reserving FOR (would corrupt)."""
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_LIVEPARTS_MAX_BYTES", 5)
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_PART_MAX_BYTES", 10**9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_LIVEPARTS_MAX_BYTES", 5)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_PART_MAX_BYTES", 10**9)
         th = TokenStreamHub()
         # One part only. Append a delta that exceeds the global cap (5 bytes).
         th.on_part_updated(_updated_props(text=""))
@@ -750,8 +750,8 @@ class TestReserve:
 
     def test_eviction_disables_late_deltas(self, monkeypatch):
         """After memory-eviction, late deltas hit _disabled (silent drop)."""
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_LIVEPARTS_MAX_BYTES", 15)
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_PART_MAX_BYTES", 10**9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_LIVEPARTS_MAX_BYTES", 15)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_PART_MAX_BYTES", 10**9)
         th = TokenStreamHub()
         th.on_part_updated(_updated_props("s1", "m1", "p1", text=""))
         th.live_parts[("s1", "m1", "p1")].last_delta_ms = _now_ms() - 10000
@@ -773,10 +773,10 @@ class TestReserve:
         and pending double-count is prevented."""
         # Use large caps so the only budget pressure comes from the explicit
         # _evict_part_for_memory call (not from delta overflow).
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_LIVEPARTS_MAX_BYTES", 10**9)
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_PART_MAX_BYTES", 10**9)
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_PENDING_MAX_BYTES", 10**9)
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_FLUSH_BYTES", 10**9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_LIVEPARTS_MAX_BYTES", 10**9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_PART_MAX_BYTES", 10**9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_PENDING_MAX_BYTES", 10**9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.ingest.TOKEN_FLUSH_BYTES", 10**9)
         th = TokenStreamHub()
         # Create two live parts on the same sid: p1 and p2.
         th.on_part_updated(_updated_props("s1", "m1", "p1", text=""))
@@ -844,8 +844,8 @@ class TestReserve:
         ``max_frame_bytes=64``)."""
         # Per-part cap huge (K may exceed max_frame_bytes without per-part
         # truncate); global LIVE cap small (K+A overflows → evict A).
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_PART_MAX_BYTES", 10 ** 9)
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_LIVEPARTS_MAX_BYTES", 200)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_PART_MAX_BYTES", 10 ** 9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_LIVEPARTS_MAX_BYTES", 200)
         th = TokenStreamHub(max_frame_bytes=64)  # tiny cap → K's snapshot WOULD truncate
         sub = _attach(th, "s1")  # handshake first: server.connected only (no live parts yet)
         sub.frames.clear()
@@ -897,8 +897,8 @@ class TestReserve:
         ``max_frame_bytes``, it receives a real ``snapshot{done:false}`` with
         full text (animation preserved) — not truncated."""
         # Small global LIVE cap so the delta triggers eviction.
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_PART_MAX_BYTES", 10 ** 9)
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_LIVEPARTS_MAX_BYTES", 48)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_PART_MAX_BYTES", 10 ** 9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_LIVEPARTS_MAX_BYTES", 48)
         # Use the default (large) max_frame_bytes so K's snapshot fits.
         th = TokenStreamHub()  # max_frame_bytes = DEFAULT_TOKEN_MAX_FRAME_BYTES (1 MiB)
         sub = _attach(th, "s1")
@@ -949,8 +949,8 @@ class TestReserve:
         (``truncated:true``) on eviction re-snapshot. K stays in
         ``live_parts``, NOT in ``_disabled_parts``; ``truncated_snapshots_total``
         reflects the per-sub count."""
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_PART_MAX_BYTES", 10 ** 9)
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_LIVEPARTS_MAX_BYTES", 200)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_PART_MAX_BYTES", 10 ** 9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_LIVEPARTS_MAX_BYTES", 200)
         th = TokenStreamHub(max_frame_bytes=64)
         sub = _attach(th, "s1")
         sub.frames.clear()
@@ -982,8 +982,8 @@ class TestReserve:
         truncated frame to EACH attached subscriber, and
         ``truncated_snapshots_total`` counts per-sub (== number of subs) —
         distinct from ``_truncate_part_for_all``'s per-drop (==1) count."""
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_PART_MAX_BYTES", 10 ** 9)
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_LIVEPARTS_MAX_BYTES", 200)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_PART_MAX_BYTES", 10 ** 9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_LIVEPARTS_MAX_BYTES", 200)
         th = TokenStreamHub(max_frame_bytes=64)
         sub1 = _attach(th, "s1")
         sub2 = _attach(th, "s1")
@@ -1021,10 +1021,10 @@ class TestReserve:
         unchanged for non-skip_key parts). The current key K is also
         truncated (114-byte frame > 64 max_frame_bytes) but stays in
         ``live_parts`` (nodrop path)."""
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_PART_MAX_BYTES", 10 ** 9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_PART_MAX_BYTES", 10 ** 9)
         # Live parts after seed: K=5, A=40, B=150 → total=195.
         # Set cap to 195 so the 1-byte delta triggers eviction.
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_LIVEPARTS_MAX_BYTES", 195)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_LIVEPARTS_MAX_BYTES", 195)
         th = TokenStreamHub(max_frame_bytes=64)
         sub = _attach(th, "s1")
         sub.frames.clear()
@@ -1268,7 +1268,7 @@ class TestPendingSessionResyncs:
     def test_queue_bounded_drops_oldest(self, monkeypatch):
         """NB-B2: queue cap drops oldest entries when exceeded."""
         monkeypatch.setattr(
-            "oc_slimapi.sse.tokenstream.hub.TOKEN_RESYNC_QUEUE_CAP", 3
+            "oc_slimapi.sse.tokenstream.flush_engine.TOKEN_RESYNC_QUEUE_CAP", 3
         )
         th = TokenStreamHub()
         for i in range(5):
@@ -1386,10 +1386,10 @@ class TestPendingBudget:
     def test_pending_overflow_force_flushes_to_subscribers(self, monkeypatch):
         """With subscribers attached, pending overflow → force-flush: subs
         receive delta frames, _total_pending_bytes drops to 0, no eviction."""
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_PENDING_MAX_BYTES", 10)
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_PART_MAX_BYTES", 10 ** 9)
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_LIVEPARTS_MAX_BYTES", 10 ** 9)
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_FLUSH_BYTES", 10 ** 9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_PENDING_MAX_BYTES", 10)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_PART_MAX_BYTES", 10 ** 9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_LIVEPARTS_MAX_BYTES", 10 ** 9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.ingest.TOKEN_FLUSH_BYTES", 10 ** 9)
         th = TokenStreamHub()
         sub = _attach(th, "s1")
         sub.frames.clear()
@@ -1419,10 +1419,10 @@ class TestPendingBudget:
         """No subscribers + pending overflow → force-flush (deltas dropped)
         THEN LRU-evict the oldest LivePart + resync{token_memory_limit}.
         The eviction metric is bumped; the current key is NEVER evicted."""
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_PENDING_MAX_BYTES", 10)
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_PART_MAX_BYTES", 10 ** 9)
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_LIVEPARTS_MAX_BYTES", 10 ** 9)
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_FLUSH_BYTES", 10 ** 9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_PENDING_MAX_BYTES", 10)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_PART_MAX_BYTES", 10 ** 9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_LIVEPARTS_MAX_BYTES", 10 ** 9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.ingest.TOKEN_FLUSH_BYTES", 10 ** 9)
         th = TokenStreamHub()
         # NO subscribers attached.
         # Two parts; backdate p1 so it is the LRU eviction target.
@@ -1447,10 +1447,10 @@ class TestPendingBudget:
     def test_pending_overflow_never_evicts_current_key(self, monkeypatch):
         """Even with no subs, the current key (the one receiving the delta
         that triggered overflow) is NEVER evicted — mirrors _reserve."""
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_PENDING_MAX_BYTES", 5)
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_PART_MAX_BYTES", 10 ** 9)
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_LIVEPARTS_MAX_BYTES", 10 ** 9)
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_FLUSH_BYTES", 10 ** 9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_PENDING_MAX_BYTES", 5)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_PART_MAX_BYTES", 10 ** 9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_LIVEPARTS_MAX_BYTES", 10 ** 9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.ingest.TOKEN_FLUSH_BYTES", 10 ** 9)
         th = TokenStreamHub()
         # Only ONE part (the current key). No other candidates to evict.
         th.on_part_updated(_updated_props("s1", "m1", "p1", text=""))
@@ -1468,10 +1468,10 @@ class TestPendingBudget:
         (when subs are attached)."""
         # --- Scenario A: tight LIVE cap, loose PENDING cap ---
         # cap=12 so p2 survives after p1 eviction (p2 total = 5+7 = 12).
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_LIVEPARTS_MAX_BYTES", 12)
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_PART_MAX_BYTES", 10 ** 9)
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_PENDING_MAX_BYTES", 10 ** 9)
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_FLUSH_BYTES", 10 ** 9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_LIVEPARTS_MAX_BYTES", 12)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_PART_MAX_BYTES", 10 ** 9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_PENDING_MAX_BYTES", 10 ** 9)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.ingest.TOKEN_FLUSH_BYTES", 10 ** 9)
         th = TokenStreamHub()
         sub = _attach(th, "s1")
         sub.frames.clear()
@@ -1555,7 +1555,7 @@ class TestPendingBudget:
     def test_4kib_early_flush_decrements_pending_gauge(self, monkeypatch):
         """The per-key TOKEN_FLUSH_BYTES early-flush path also decrements
         _total_pending_bytes (not just flush()/finish_part)."""
-        monkeypatch.setattr("oc_slimapi.sse.tokenstream.hub.TOKEN_FLUSH_BYTES", 10)
+        monkeypatch.setattr("oc_slimapi.sse.tokenstream.ingest.TOKEN_FLUSH_BYTES", 10)
         th = TokenStreamHub()
         _attach(th, "s1")
         th.on_part_updated(_updated_props(text=""))
@@ -1583,7 +1583,7 @@ class TestDebugBudgetOverrides:
     settings) is a no-op."""
 
     def test_apply_lowers_live_budget_and_leaves_none_fields_at_code_default(self):
-        import oc_slimapi.sse.tokenstream.hub as hubmod
+        import oc_slimapi.sse.tokenstream.budgets as hubmod
         orig_live = hubmod.TOKEN_LIVEPARTS_MAX_BYTES
         try:
             s = types.SimpleNamespace(
@@ -1601,7 +1601,7 @@ class TestDebugBudgetOverrides:
             hubmod.TOKEN_LIVEPARTS_MAX_BYTES = orig_live
 
     def test_apply_all_none_is_noop(self):
-        import oc_slimapi.sse.tokenstream.hub as hubmod
+        import oc_slimapi.sse.tokenstream.budgets as hubmod
         orig_live = hubmod.TOKEN_LIVEPARTS_MAX_BYTES
         orig_part = hubmod.TOKEN_PART_MAX_BYTES
         orig_count = hubmod.TOKEN_LIVE_PARTS_MAX
@@ -1624,7 +1624,7 @@ class TestDebugBudgetOverrides:
         """End-to-end: a lowered debug live budget → a small delta triggers
         ``_reserve`` eviction (the 联调 use-case for MB-P-S1). Restores the
         mutated globals afterward (test isolation)."""
-        import oc_slimapi.sse.tokenstream.hub as hubmod
+        import oc_slimapi.sse.tokenstream.budgets as hubmod
         orig_live = hubmod.TOKEN_LIVEPARTS_MAX_BYTES
         orig_part = hubmod.TOKEN_PART_MAX_BYTES
         try:

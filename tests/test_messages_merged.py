@@ -928,7 +928,9 @@ async def test_merged_read_chunk_overshoot_bounded(upstream_factory, monkeypatch
     })
     full_calls = {"n": 0}
     reads: list[tuple[int, int]] = []  # (max_bytes, total) per read_with_cap
-    orig_read_with_cap = messages.read_with_cap
+    # W3-2 (F-302): this test exercises the FULL-fetch path — the chunked
+    # read must reach the _full_merge submodule's namespace.
+    orig_read_with_cap = messages._full_merge.read_with_cap
 
     async def _chunked_read(response, max_bytes, **kwargs):
         kwargs["chunk_size"] = 1024  # inject a small, observable chunk
@@ -936,7 +938,7 @@ async def test_merged_read_chunk_overshoot_bounded(upstream_factory, monkeypatch
         reads.append((max_bytes, total))
         return body, total
 
-    monkeypatch.setattr(messages, "read_with_cap", _chunked_read)
+    monkeypatch.setattr(messages._full_merge, "read_with_cap", _chunked_read)
 
     async def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -1093,7 +1095,10 @@ async def test_direct_full_falls_back_after_consecutive_truncation_joins(
             raise messages._CapExceeded(self.cap)
 
     stub = _AlwaysJoinedTruncated(2000)
-    monkeypatch.setattr(messages, "fulls", stub)
+    # W3-2 (F-302): ``fulls`` is consumed by _fetch_full_shared inside the
+    # _full_merge submodule — the stub must replace THAT namespace binding
+    # (patching the package re-export never reaches the consumer).
+    monkeypatch.setattr(messages._full_merge, "fulls", stub)
     try:
         direct = Request({"type": "http", "headers": [], "app": app})
         result = await messages._fetch_full_shared(

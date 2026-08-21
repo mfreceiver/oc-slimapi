@@ -305,7 +305,9 @@ async def test_health_stays_responsive_during_slow_transform(app_and_client, mon
     delay and measure health latency while the skeleton request is in flight."""
     app, _ = app_and_client
 
-    import oc_slimapi.routes.messages as msgs_mod
+    # W3-2 (F-302): the list-family worker lives in the package's _list
+    # submodule — patch THERE so the stand-in reaches the route's lookup.
+    import oc_slimapi.routes.messages._list as msgs_mod
 
     original_pack = msgs_mod._project_list_sorted_and_pack
     slow_packs_started = asyncio.Event()

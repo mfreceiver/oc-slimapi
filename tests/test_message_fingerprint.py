@@ -375,7 +375,10 @@ class TestMergedSpliceRecompute:
             calls.append(msg["info"].get("id", "?"))
             return recompute_fingerprint(msg)
 
-        monkeypatch.setattr(messages_mod, "recompute_fingerprint", spy)
+        # W3-2 (F-302): the sole consumer (_merge_fulls_and_pack) lives in
+        # the _full_merge submodule — spy on THAT namespace binding.
+        monkeypatch.setattr(
+            messages_mod._full_merge, "recompute_fingerprint", spy)
         upstream = upstream_factory(_messages_handler())
         app = _build_app(_settings(), upstream)
         try:
@@ -444,7 +447,9 @@ class TestMergedDegradePathsNoRecompute:
             calls.append(msg["info"].get("id", "?"))
             return recompute_fingerprint(msg)
 
-        monkeypatch.setattr(messages_mod, "recompute_fingerprint", spy)
+        # W3-2 (F-302): consumer in the _full_merge submodule (see above).
+        monkeypatch.setattr(
+            messages_mod._full_merge, "recompute_fingerprint", spy)
         upstream = upstream_factory(_messages_handler(state))
         overrides = {}
         if merged_max_bytes is not None:

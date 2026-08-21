@@ -467,14 +467,15 @@ async def test_ledger_bounded_shared_reserve_slow_projection(
     app = _build_app(settings, upstream)
     registry = app.state.raw_fetch_registry
 
-    real = messages._project_list_sorted_and_pack
+    # W3-2 (F-302): worker now resolves from the _list submodule namespace.
+    real = messages._list._project_list_sorted_and_pack
 
     def slow(*args, **kwargs):
         import time
         time.sleep(0.08)  # admission queue forms behind the pool
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(messages, "_project_list_sorted_and_pack", slow)
+    monkeypatch.setattr(messages._list, "_project_list_sorted_and_pack", slow)
 
     samples: list[int] = []
     stop = asyncio.Event()
@@ -618,14 +619,15 @@ async def test_projection_admission_busy_semantics_unchanged(
     app = _build_app(settings, upstream)
     registry = app.state.raw_fetch_registry
 
-    real = messages._project_list_sorted_and_pack
+    # W3-2 (F-302): worker now resolves from the _list submodule namespace.
+    real = messages._list._project_list_sorted_and_pack
 
     def slow(*args, **kwargs):
         import time
         time.sleep(0.15)
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(messages, "_project_list_sorted_and_pack", slow)
+    monkeypatch.setattr(messages._list, "_project_list_sorted_and_pack", slow)
     try:
         async with _client(app) as client:
             responses = await _get_many(

@@ -1,78 +1,34 @@
 from __future__ import annotations
 
-import asyncio
-
-import httpx
 import orjson
 from fastapi import APIRouter, Request
 from starlette.responses import Response
 
-from ..discovery import (
-    _DISCOVERY_LIMIT,
-    fetch_global_root_sessions,
-    fetch_global_root_sessions_raw,
-)
+from ..discovery import _DISCOVERY_LIMIT
 from ..gzip_util import compress_if_beneficial
-from ..traffic import stash_up_in
-from ..transform import read_with_cap
-from ..upstream import forward_directory_headers
-from ..upstream_errors import (
-    UPSTREAM_UNAVAILABLE,
-    raise_upstream_unavailable,
-    upstream_error_code_for_status,
+from ._aggregate_fanout import (
+    _MAX_AGGREGATE_ITEMS,
+    collect_with_byte_budget,
+    discover_directories,
+    fetch_items_for_dir,
 )
 
 router = APIRouter(prefix="/slimapi", tags=["questions"])
 
-
-class _DirFetchFailure(Exception):
-    """Per-dir upstream failure raised INSIDE a shared flight factory
-    (traffic plan Batch 1 / A4) so the flight FAILS — immediate budget
-    refund, never grace-retained (no negative caching) — while every joiner
-    re-raises the same instance and isolates its ``code`` into its own
-    envelope ``errors[]`` (per-dir errors never abort the request)."""
-
-    __slots__ = ("code",)
-
-    def __init__(self, code: str) -> None:
-        super().__init__(code)
-        self.code = code
-
-# P1-28: aggregate item budget (second-layer cap, T5-C10). Each per-dir
-# /question response is capped by per_dir_cap, but items.extend() across all
-# dirs can accumulate far beyond a single dir's cap. Once the merged item
-# count exceeds this safety limit (or the byte budget), the envelope is marked
-# ``truncated: true`` and remaining dirs are cancelled. The sliding window
-# scheduler passes this as ``item_cap``.
-_MAX_AGGREGATE_ITEMS = 10_000
-
-# Discovery page size for GET /experimental/session?roots=true — imported
-# from ..discovery (single source of truth; see fetch_global_root_sessions).
-# Referenced by name (not inlined) so tests can monkeypatch this binding to
-# exercise the discovery-truncation path without building 10k sessions.
+# Shared aggregation skeleton (F-304): discovery input assembly, the
+# semaphore-bounded per-dir fetch, and the byte/item-budget sliding-window
+# scheduler live in routes/_aggregate_fanout.py. This file keeps the route,
+# the /question field mapping, and the envelope packer. ``_DISCOVERY_LIMIT``
+# and ``_MAX_AGGREGATE_ITEMS`` are re-bound here (read by name inside the
+# route body) so tests can keep monkeypatching THIS module's bindings.
 
 
-def _directories_from_sessions(sessions_payload: list) -> list[str]:
-    """Step 2 helper: derive the DISTINCT set of workdir directories
-    (first-seen order) from each session's REAL ``directory`` field.
-
-    Unlike /project's ``worktree`` (which normalizes non-git workdirs to
-    "/" and must be skipped), the session ``directory`` is always a real
-    path — no synthetic-global skip is needed. Skip non-string/empty
-    defensively.
-
-    Returns a caller-owned list of strings, so the (transient) expanded
-    session graph can be dropped as soon as this returns — in the coalesced
-    path it is called INSIDE the discovery lease and the graph is ``del``'d
-    before the lease releases (final review B1 fix, 2026-08-16).
-    """
-    return list(dict.fromkeys(
-        s["directory"]
-        for s in sessions_payload
-        if isinstance(s, dict)
-           and isinstance(s.get("directory"), str)
-           and s["directory"]
-    ))
+def _project_question_entry(entry: dict) -> dict:
+    """Field mapping for /question items: the upstream entry is passed
+    through verbatim — the shared fetch skeleton stamps ``directory`` after
+    this projection (field order: id, sessionID, questions, tool, then
+    directory)."""
+    return entry
 
 
 @router.get("/questions")
@@ -146,95 +102,48 @@ async def questions(request: Request):
 
     # ------------------------------------------------------------------
     # Step 1: discover directories via GET /experimental/session?roots=true
-    # [&archived=true] (see long note below). Coalescing LEVEL 1 (plan A4):
-    # the discovery GET is single-flighted under a FIXED key — concurrent
-    # /questions bursts (and concurrent /permissions, which shares the key)
-    # all join ONE discovery flight. The shared flight value is the CAPPED
-    # RAW BODY (≤ max_response_bytes == the flight's reserve_bytes), never
-    # the expanded session graph: each joiner parses INSIDE its lease
-    # window, derives its OWN copy of the directory strings, and drops the
-    # expanded graph + raw body BEFORE releasing the lease — budget
-    # ownership covers the caller's entire consumption of the shared GET
-    # (plan §3.x GET→caller-consumption invariant; final review B1 fix,
-    # 2026-08-16; mirrors sessions.py's parse-inside-lease pattern).
-    # Concurrent joiner transient parses are bounded by the concurrent-
-    # request count — the same per-request memory profile as the direct
-    # non-coalesced path; coalescing removes the duplicated upstream GETs
-    # and the duplicated RETAINED graphs, not each caller's transient parse.
-    #
-    # status>=400 / RequestError / bad JSON / non-list / cap-exceeded →
-    # 503 upstream_unavailable (total failure, contract §7 discovery
-    # exception — do NOT leak upstream status). ``limit`` is read by name
-    # from this module so tests can monkeypatch the binding.
+    # [&archived=true] — shared skeleton (discover_directories in
+    # routes/_aggregate_fanout.py): coalescing LEVEL 1 single-flight under
+    # the FIXED ("discovery", id(upstream), limit) key (concurrent
+    # /questions AND /permissions bursts join ONE flight), raw-bytes lease
+    # value, parse-inside-lease, graph dropped before lease release.
+    # ``limit`` is read by name from this module so tests can monkeypatch
+    # the binding.
     # ------------------------------------------------------------------
-    if coalesce:
-        async def _discovery_factory():
-            return await fetch_global_root_sessions_raw(
-                upstream_client, request, limit=_DISCOVERY_LIMIT,
-            )
+    directories, discovery_complete = await discover_directories(
+        upstream_client, request,
+        limit=_DISCOVERY_LIMIT,
+        registry=registry if coalesce else None,
+        reserve_bytes=config.max_response_bytes,
+    )
 
-        lease = await registry.fetch_or_bypass(
-            ("discovery", id(upstream_client), _DISCOVERY_LIMIT),
-            _discovery_factory,
-            reserve_bytes=config.max_response_bytes,
-        )
-        if lease is not None:
-            async with lease:
-                raw_body, discovery_complete = lease.body
-                # leader validated list shape before the flight succeeded;
-                # this defensive guard keeps the §7 mapping if it ever fails
-                try:
-                    sessions_payload = orjson.loads(raw_body)
-                except (orjson.JSONDecodeError, ValueError) as exc:
-                    raise_upstream_unavailable(exc)
-                if not isinstance(sessions_payload, list):
-                    raise_upstream_unavailable()
-                directories = _directories_from_sessions(sessions_payload)
-                # drop the expanded graph + shared raw bytes inside the
-                # lease — only the caller-owned directory strings survive
-                del sessions_payload, raw_body
-            # Defense-in-depth (final review rev-1): the registry-level
-            # release already severs Lease→body/_entry; dropping the local
-            # handle keeps this route free of ANY post-release flight state
-            # across the fan-out awaits below.
-            del lease
-        else:  # budget full → direct discovery fetch (caller-private)
-            sessions_payload, discovery_complete = (
-                await fetch_global_root_sessions(
-                    upstream_client, request, limit=_DISCOVERY_LIMIT,
-                )
-            )
-            directories = _directories_from_sessions(sessions_payload)
-            del sessions_payload
-    else:
-        sessions_payload, discovery_complete = await fetch_global_root_sessions(
-            upstream_client, request, limit=_DISCOVERY_LIMIT,
-        )
-        directories = _directories_from_sessions(sessions_payload)
-        del sessions_payload
-
-    # (Step 2 — directory derivation — happened inside the discovery block
-    # above: `directories` is a caller-owned list of strings.)
+    # (Step 2 — directory derivation — happened inside the shared discovery
+    # call: `directories` is a caller-owned list of strings.)
     shadow = getattr(request.app.state, "qp_sweep", None)
     if shadow is not None:
         shadow.record_request_activity(directories)
 
     # ------------------------------------------------------------------
     # Step 3: sliding-window fan-out with per-dir byte cap, aggregate byte
-    # budget, and aggregate item cap. Replaces the former asyncio.gather
-    # approach. The semaphore (app.state.questions_semaphore) limits cross-
-    # request /question concurrency globally. Coalescing LEVEL 2 (plan A4):
-    # each per-dir GET may be shared with concurrent requests through the
-    # registry (see _fetch_questions_for_dir); the aggregation itself stays
-    # per-caller.
+    # budget, and aggregate item cap (shared scheduler: collect_with_byte_
+    # budget in routes/_aggregate_fanout.py). The semaphore
+    # (app.state.questions_semaphore) limits cross-request /question
+    # concurrency globally. Coalescing LEVEL 2 (plan A4): each per-dir GET
+    # may be shared with concurrent requests through the registry (see
+    # _fetch_questions_for_dir); the aggregation itself stays per-caller.
     # ------------------------------------------------------------------
-    items, errors, succeeded, truncated = await _collect_with_byte_budget(
-        upstream_client, request, directories,
+    async def _worker(directory: str):
+        return await _fetch_questions_for_dir(
+            upstream_client, request, directory,
+            cap=config.questions_max_response_bytes,
+            registry=registry if coalesce else None,
+        )
+
+    items, errors, succeeded, truncated = await collect_with_byte_budget(
+        directories, _worker,
         concurrency=config.questions_fanout_concurrency,
-        per_dir_cap=config.questions_max_response_bytes,
         aggregate_cap=config.questions_max_aggregate_bytes,
         item_cap=_MAX_AGGREGATE_ITEMS,
-        registry=registry if coalesce else None,
     )
 
     # ------------------------------------------------------------------
@@ -287,218 +196,33 @@ def _pack_questions_envelope(
 
 
 async def _fetch_questions_for_dir(
-    upstream_client: httpx.AsyncClient,
+    upstream_client,
     request: Request,
     directory: str,
     *,
     cap: int,
     registry=None,
 ) -> tuple[list[dict], str | None, int]:
-    """Fetch pending questions for a single directory.
+    """Fetch pending questions for a single directory (thin route binding
+    over the shared skeleton :func:`fetch_items_for_dir` in
+    routes/_aggregate_fanout.py — F-304).
 
-    Returns ``(items, error_code, body_bytes)``. On success ``error_code`` is
-    ``None``, ``items`` is a list of upstream question entries each stamped
-    with the ``directory`` they came from, and ``body_bytes`` is the raw body
-    byte count (from ``read_with_cap`` — used for aggregate budget accounting).
-    On failure ``items`` is empty, ``error_code`` is the contract §7 code
-    string, and ``body_bytes`` is 0 (does not occupy the accepted aggregate).
-
-    The upstream GET is bounded by ``request.app.state.questions_semaphore``
-    (cross-request global /question concurrency cap) and by ``cap`` (per-dir
-    byte ceiling via ``read_with_cap``).
-
-    Coalescing LEVEL 2 (traffic plan Batch 1 / A4): when ``registry`` is
-    given, the raw GET + cap-read runs through ``fetch_or_bypass`` keyed
+    Route parameters: item path ``/question``, semaphore
+    ``app.state.questions_semaphore`` (cross-request global /question
+    concurrency cap), coalescing LEVEL 2 flight key
     ``("question-dir", id(upstream), directory)`` — concurrent requests
-    aggregating the same directory share ONE upstream GET. Only the RAW
-    body is shared: the parse + ``directory`` stamping + budget accounting
-    stay per-caller, so the envelope is byte-identical to the direct path.
-    Upstream failures raise ``_DirFetchFailure`` inside the factory (flight
-    fails — immediate refund, never retained), re-raised to every joiner as
-    the same instance and isolated per-caller into ``errors[]``. A budget
-    bypass (``None`` lease) falls back to this function's direct path.
-
-    Never raises for upstream/network failures — the caller isolates per-dir
-    errors into the envelope's ``errors[]``. ``asyncio.CancelledError``
-    propagates (it is a ``BaseException`` subclass, so the ``except`` clauses
-    below never swallow it).
+    aggregating the same directory share ONE upstream GET, with only the
+    RAW body shared (parse + projection + budget accounting per-caller, so
+    the envelope is byte-identical to the direct path). Entries pass
+    through :func:`_project_question_entry` (verbatim) and get
+    ``directory`` stamped by the shared skeleton.
     """
-    config = request.app.state.config
-
-    async def _raw() -> tuple[bytes, int]:
-        async with request.app.state.questions_semaphore:
-            try:
-                response = await upstream_client.send(
-                    upstream_client.build_request(
-                        "GET", "/question",
-                        headers=forward_directory_headers(directory),
-                    ),
-                    stream=True,
-                )
-            except httpx.RequestError:
-                raise _DirFetchFailure(UPSTREAM_UNAVAILABLE)
-            try:
-                status = response.status_code
-                if status >= 400:
-                    # 4xx (incl. unlikely 404) → upstream_http_N; 5xx →
-                    # upstream_unavailable (per-dir, do NOT raise — isolated
-                    # into the envelope errors[]). Bounded drain via
-                    # read_with_cap (NOT unbounded aread).
-                    await read_with_cap(
-                        response, cap,
-                        on_read=lambda n: stash_up_in(request, n),
-                    )
-                    raise _DirFetchFailure(
-                        upstream_error_code_for_status(status))
-                body, total = await read_with_cap(
-                    response, cap,
-                    on_read=lambda n: stash_up_in(request, n),
-                )
-                # per-dir cap exceeded / read failure → error + body_bytes=0.
-                # Read bytes are still counted via stash_up_in (traffic), but
-                # do NOT occupy the accepted aggregate budget.
-                if body is None:
-                    raise _DirFetchFailure(UPSTREAM_UNAVAILABLE)
-                return body, total
-            except httpx.RequestError:
-                raise _DirFetchFailure(UPSTREAM_UNAVAILABLE)
-            finally:
-                await response.aclose()
-
-    body: bytes
-    total: int
-    if registry is not None:
-        try:
-            lease = await registry.fetch_or_bypass(
-                ("question-dir", id(upstream_client), directory),
-                _raw,
-                reserve_bytes=config.max_response_bytes,
-            )
-        except _DirFetchFailure as exc:
-            return [], exc.code, 0
-        if lease is not None:
-            async with lease:
-                body, total = lease.body
-        else:  # budget full → direct fetch (unchanged behaviour)
-            try:
-                body, total = await _raw()
-            except _DirFetchFailure as exc:
-                return [], exc.code, 0
-    else:
-        try:
-            body, total = await _raw()
-        except _DirFetchFailure as exc:
-            return [], exc.code, 0
-
-    try:
-        payload = orjson.loads(body)
-    except (orjson.JSONDecodeError, ValueError):
-        return [], UPSTREAM_UNAVAILABLE, 0
-    if not isinstance(payload, list):
-        return [], UPSTREAM_UNAVAILABLE, 0
-    items = [
-        {**entry, "directory": directory}
-        for entry in payload if isinstance(entry, dict)
-    ]
-    return items, None, total
-
-
-async def _collect_with_byte_budget(
-    upstream_client, request, directories, *,
-    concurrency: int, per_dir_cap: int, aggregate_cap: int, item_cap: int,
-    registry=None,
-) -> tuple[list[dict], list[dict], list[str], bool]:
-    """Sliding-window fan-out scheduler for cross-directory question aggregation.
-
-    Replaces the former ``asyncio.gather`` approach with a sliding-window that:
-    * Launches at most ``concurrency`` tasks at any time.
-    * Consumes results in **strict index order** (original directory order).
-    * Tracks aggregate **raw body bytes** (``body_bytes`` from the worker) and
-      **item count** (``_MAX_AGGREGATE_ITEMS``).
-    * On either cap being exceeded: marks ``truncated=True``, cancels all
-      unconsumed tasks (index > current), awaits their cancellation (so the
-      worker's ``finally: response.aclose()`` runs), and breaks.
-    * Errors (per-dir failure / cap overflow) record only consumed-and-failed
-      directories in ``errors[]``. Cancelled / un-started dirs are NOT in
-      ``errors[]`` — the presence of ``truncated=True`` + partial
-      ``authoritativeDirectories`` communicates the gap.
-
-    Returns ``(items, errors, succeeded, truncated)``.
-    """
-    tasks: dict[int, asyncio.Task] = {}
-    next_to_launch = 0             # next directory index to launch
-    consume_index = 0              # next index to consume (strict order)
-    used_bytes = 0
-    used_items = 0
-    truncated = False
-    items: list[dict] = []
-    errors: list[dict] = []
-    succeeded: list[str] = []
-
-    def launch(index: int) -> None:
-        tasks[index] = asyncio.create_task(
-            _fetch_questions_for_dir(
-                upstream_client, request, directories[index],
-                cap=per_dir_cap, registry=registry,
-            )
-        )
-
-    # Initial window: at most concurrency tasks
-    while next_to_launch < len(directories) and next_to_launch < concurrency:
-        launch(next_to_launch)
-        next_to_launch += 1
-
-    try:
-        while consume_index < len(directories):
-            task = tasks.get(consume_index)
-            if task is None:        # not launched (should not happen after truncation)
-                break
-            try:
-                outcome = await task   # each index consumed/charged exactly once
-            except asyncio.CancelledError:
-                raise                 # self-cancelled → finally handles cleanup
-            except Exception as exc:
-                outcome = exc         # regular exceptions → treat as dir failure
-
-            if isinstance(outcome, Exception):
-                errors.append({
-                    "directory": directories[consume_index],
-                    "code": UPSTREAM_UNAVAILABLE,
-                })
-            else:
-                dir_items, error_code, body_bytes = outcome
-                if error_code is not None:
-                    # per-dir cap exceeded / upstream error: body_bytes=0
-                    errors.append({
-                        "directory": directories[consume_index],
-                        "code": error_code,
-                    })
-                elif (used_bytes + body_bytes > aggregate_cap
-                      or used_items + len(dir_items) > item_cap):
-                    # Budget triggered: current dir NOT added to items/succeeded
-                    truncated = True
-                    for idx, t in tasks.items():
-                        if idx > consume_index:
-                            t.cancel()
-                    await asyncio.gather(*tasks.values(), return_exceptions=True)
-                    break
-                else:
-                    items.extend(dir_items)
-                    succeeded.append(directories[consume_index])
-                    used_bytes += body_bytes
-                    used_items += len(dir_items)
-
-            # After consuming index i, launch next (window ≤ concurrency)
-            if next_to_launch < len(directories):
-                launch(next_to_launch)
-                next_to_launch += 1
-            consume_index += 1
-    finally:
-        # Cleanup: cancel + await any unconsumed tasks (ensures aclose runs)
-        pending = [t for idx, t in tasks.items() if idx > consume_index]
-        for t in pending:
-            t.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-
-    return items, errors, succeeded, truncated
+    return await fetch_items_for_dir(
+        upstream_client, request, directory,
+        cap=cap,
+        item_path="/question",
+        semaphore=request.app.state.questions_semaphore,
+        flight_key_prefix="question-dir",
+        project_entry=_project_question_entry,
+        registry=registry,
+    )

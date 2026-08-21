@@ -205,17 +205,33 @@ def _aggregate_upstream(item_path: str, item: dict, *,
     )
 
 
+def _iter_api_routes(routes):
+    """Flatten the app's route list: modern Starlette wraps every
+    ``include_router`` in a lazy ``_IncludedRouter`` whose own ``methods``
+    are absent — without flattening, the digest would only ever see the
+    catch-all (the rev1 weakness, restored post-Phase-A with the route
+    table proven unchanged by check_routes_doc 54==54)."""
+    for route in routes:
+        original = getattr(route, "original_router", None)
+        if original is not None:
+            yield from _iter_api_routes(original.routes)
+        else:
+            yield route
+
+
 async def _scenario_route_table(cases: dict[str, str]) -> None:
     """Full production (method, path) route set — the W3-2 package split and
     W3-1/W3-3 refactors must not move a single route."""
     from oc_slimapi.app import app as production_app
 
     rows = []
-    for route in production_app.routes:
+    for route in _iter_api_routes(production_app.routes):
         methods = sorted(getattr(route, "methods", None) or [])
         path = getattr(route, "path", None) or getattr(route, "path_regex", "")
         if methods:
             rows.append(",".join(methods) + " " + path)
+    assert len(rows) > 50, (
+        f"route table enumerator degenerated ({len(rows)} rows)")
     cases["route_table"] = hashlib.sha256(
         "\n".join(sorted(rows)).encode(),
     ).hexdigest()

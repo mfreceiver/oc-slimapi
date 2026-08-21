@@ -31,9 +31,10 @@ method 但漏更文档时 check.sh 失败。
    B0（2026-08-17）：纯设计批，无新增 /slimapi 路由，SEMANTIC_CHECKS 白名单
    未动（新增路由语义白名单属 B3a/B4 批）。
 
-**已知局限**：代码侧只扫 ``routes/*.py`` 里静态声明的 ``@router.<method>``。
+**已知局限**：代码侧只扫 ``routes/`` 树（含子包，``rglob``——W3-2 起 messages
+拆为 ``routes/messages/`` 包）里静态声明的 ``@router.<method>``。
 若某 ``/slimapi`` 路由在别处动态注册（``app.add_api_route`` 等），本脚本看不到。
-当前项目所有 ``/slimapi`` 路由都在 ``routes/*.py`` 静态声明，故无遗漏；改用
+当前项目所有 ``/slimapi`` 路由都在 ``routes/`` 树静态声明，故无遗漏；改用
 ``app.routes`` 运行时遍历会引入 import 副作用（lifespan / 配置 / 上游连接），
 收益不抵风险，故保留静态扫描。
 
@@ -159,9 +160,23 @@ def collect_routes() -> list[tuple[str, str, str]]:
     ``api_route``'s ``methods=`` keyword).
     """
     out: list[tuple[str, str, str]] = []
-    for f in sorted(ROUTES_DIR.glob("*.py")):
+    # rglob: routes/ may contain route sub-packages (routes/messages/ since
+    # the F-302 split) — a flat glob would silently drop their routes.
+    # Sub-package modules decorate a SHARED router declared in their
+    # package's _router.py — when the module itself declares no router,
+    # fall back to the same-directory _router.py prefix.
+    dir_prefix: dict[Path, str | None] = {}
+    for f in sorted(ROUTES_DIR.rglob("*.py")):
         text = f.read_text(encoding="utf-8")
         prefix = _router_prefix(text)
+        if prefix is None and f.name != "_router.py":
+            if f.parent not in dir_prefix:
+                router_py = f.parent / "_router.py"
+                dir_prefix[f.parent] = (
+                    _router_prefix(router_py.read_text(encoding="utf-8"))
+                    if router_py.is_file() else None
+                )
+            prefix = dir_prefix[f.parent]
         if prefix is None:
             continue  # 无 router 定义（如 __init__）
         try:
