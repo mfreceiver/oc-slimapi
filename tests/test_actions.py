@@ -419,20 +419,20 @@ async def test_semaphore_busy_service_level(tmp_path):
 
 async def test_timeout_kills_process_group(tmp_path):
     reg = _registry(
-        tmp_path, {"run": _base_exec(argv=["/bin/sh", "-c", "sleep 300 & sleep 300"], timeout_s=1)}
+        tmp_path, {"run": _base_exec(argv=["/bin/sh", "-c", "sleep 300.5 & sleep 300.5"], timeout_s=1)}
     )
     with pytest.raises(ActionTimeout) as ei:
         await reg.invoke("run", confirmed=False)
     assert ei.value.timeout_s == 1
     assert ei.value.status_code == 504
-    # killpg must have taken down the shell AND both `sleep 300` children.
-    out = subprocess.run(["pgrep", "-f", "sleep 300"], capture_output=True, text=True)
+    # killpg must have taken down the shell AND both `sleep 300.5` children.
+    out = subprocess.run(["pgrep", "-f", "sleep 300.5"], capture_output=True, text=True)
     assert out.stdout.strip() == ""
 
 
 async def test_timeout_killpg_survives_child_early_exit(tmp_path):
     """Bug-A regression: the child (shell) answers SIGTERM within grace (its
-    ``trap 'exit 0' TERM`` exits immediately), but a backgrounded ``sleep 300``
+    ``trap 'exit 0' TERM`` exits immediately), but a backgrounded ``sleep 300.5``
     grandchild keeps running in the same process group — i.e. the grandchild
     outlives the child.  killpg must run UNCONDITIONALLY after terminate: the
     pre-fix code returned early from the grace wait and leaked the grandchild."""
@@ -440,7 +440,7 @@ async def test_timeout_killpg_survives_child_early_exit(tmp_path):
         tmp_path,
         {
             "run": _base_exec(
-                argv=["/bin/sh", "-c", "trap 'exit 0' TERM; sleep 300 & wait"],
+                argv=["/bin/sh", "-c", "trap 'exit 0' TERM; sleep 300.5 & wait"],
                 timeout_s=1,
             )
         },
@@ -449,9 +449,9 @@ async def test_timeout_killpg_survives_child_early_exit(tmp_path):
         await reg.invoke("run", confirmed=False)
     assert ei.value.timeout_s == 1
     assert ei.value.status_code == 504
-    # The shell died on SIGTERM well inside grace; the backgrounded `sleep 300`
+    # The shell died on SIGTERM well inside grace; the backgrounded `sleep 300.5`
     # outlived it.  killpg(pgid=SIGKILL) must have taken the sleep down too.
-    out = subprocess.run(["pgrep", "-f", "sleep 300"], capture_output=True, text=True)
+    out = subprocess.run(["pgrep", "-f", "sleep 300.5"], capture_output=True, text=True)
     assert out.stdout.strip() == ""
 
 
@@ -601,7 +601,7 @@ async def test_audit_success(tmp_path, audit_capture):
 
 
 async def test_audit_timeout(tmp_path, audit_capture):
-    reg = _registry(tmp_path, {"run": _base_exec(argv=["/bin/sh", "-c", "sleep 300 & sleep 300"], timeout_s=1)})
+    reg = _registry(tmp_path, {"run": _base_exec(argv=["/bin/sh", "-c", "sleep 300.5 & sleep 300.5"], timeout_s=1)})
     with pytest.raises(ActionTimeout):
         await reg.invoke("run", confirmed=False)
     recs = _audit_records(audit_capture)
@@ -620,7 +620,7 @@ async def test_audit_timeout_confirms_flag(tmp_path, audit_capture):
         tmp_path,
         {
             "run": _base_exec(
-                argv=["/bin/sh", "-c", "sleep 300 & sleep 300"],
+                argv=["/bin/sh", "-c", "sleep 300.5 & sleep 300.5"],
                 timeout_s=1,
                 require_confirm=True,
             )
@@ -661,7 +661,7 @@ async def test_audit_throttle(tmp_path, audit_capture):
 
 
 async def test_audit_disconnect(tmp_path, audit_capture):
-    reg = _registry(tmp_path, {"run": _base_exec(argv=["/bin/sh", "-c", "sleep 300 & sleep 300"], timeout_s=60)})
+    reg = _registry(tmp_path, {"run": _base_exec(argv=["/bin/sh", "-c", "sleep 300.5 & sleep 300.5"], timeout_s=60)})
     task = asyncio.create_task(reg.invoke("run", confirmed=False))
     await asyncio.sleep(0.3)  # let it spawn before cancelling
     task.cancel()
@@ -674,7 +674,7 @@ async def test_audit_disconnect(tmp_path, audit_capture):
         for r in recs
     )
     # Cleanup must have killed the process group (no orphaned children).
-    out = subprocess.run(["pgrep", "-f", "sleep 300"], capture_output=True, text=True)
+    out = subprocess.run(["pgrep", "-f", "sleep 300.5"], capture_output=True, text=True)
     assert out.stdout.strip() == ""
 
 
@@ -753,7 +753,7 @@ async def test_stderr_cap_query_body_unaffected(tmp_path, app_log_capture):
 
 async def test_drain_hang_grandchild_holding_pipe(tmp_path):
     """Bug C regression: the child (sh) exits immediately but a backgrounded
-    ``sleep 300`` grandchild keeps the stdout pipe write end open in the same
+    ``sleep 300.5`` grandchild keeps the stdout pipe write end open in the same
     process group.  Pre-rev-13 the success path hung indefinitely (asyncio's
     ``Process.wait`` only resolves once the pipes ALSO disconnect, and the
     post-exit drain was unbounded).  Now: exit detection polls ``returncode``
@@ -761,14 +761,14 @@ async def test_drain_hang_grandchild_holding_pipe(tmp_path):
     invoke completes well inside a generous bound."""
     reg = _registry(
         tmp_path,
-        {"run": _base_query(argv=["/bin/sh", "-c", "sleep 300 &"], timeout_s=30)},
+        {"run": _base_query(argv=["/bin/sh", "-c", "sleep 300.5 &"], timeout_s=30)},
     )
     res = await asyncio.wait_for(reg.invoke("run", confirmed=False), timeout=15)
     assert res.ok is True
     assert res.exit_code == 0
     assert res.markdown == ""
     # killpg must have taken the grandchild down (no orphan).
-    out = subprocess.run(["pgrep", "-f", "sleep 300"], capture_output=True, text=True)
+    out = subprocess.run(["pgrep", "-f", "sleep 300.5"], capture_output=True, text=True)
     assert out.stdout.strip() == ""
 
 
@@ -913,7 +913,7 @@ async def test_spawn_cancelled_during_spawn_cleans_child(tmp_path, audit_capture
         for r in recs
     )
     # ...and the spawned process group must be gone (no orphaned children).
-    out = subprocess.run(["pgrep", "-f", "sleep 31"], capture_output=True, text=True)
+    out = subprocess.run(["pgrep", "-f", "^sleep 31$"], capture_output=True, text=True)
     assert out.stdout.strip() == ""
 
 
@@ -947,7 +947,9 @@ async def test_drain_deadline_preserves_partial_output(tmp_path, monkeypatch):
     assert res.truncated is True
     assert res.markdown == "partial-data-here"
     await asyncio.sleep(4.0)  # the escaped grandchild self-terminates
-    out = subprocess.run(["pgrep", "-f", "sleep 4"], capture_output=True, text=True)
+    # anchored: a bare `-f "sleep 4"` substring-matches unrelated long-lived
+    # processes (e.g. an external `sleep 420` monitor from a parallel session).
+    out = subprocess.run(["pgrep", "-f", "^sleep 4$"], capture_output=True, text=True)
     assert out.stdout.strip() == ""
 
 
