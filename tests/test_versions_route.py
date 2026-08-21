@@ -32,9 +32,10 @@ async def test_versions_shape_exact():
         assert list(body.keys()) == [
             "current", "available", "capabilities", "sidecarVersion",
         ]
-        # Dual-version window (v4-contract §3.1): current=4, available=[3, 4]
+        # v4-only window (2026-08-21 narrowing, v4-contract §3.1 revision):
+        # current=4, available=[4]
         assert body["current"] == 4
-        assert body["available"] == [3, 4]
+        assert body["available"] == [4]
         # current ∈ available; available unique ascending
         assert body["current"] in body["available"]
         assert body["available"] == sorted(set(body["available"]))
@@ -44,7 +45,9 @@ async def test_versions_capabilities_map():
     async with _client(_build_app()) as client:
         body = (await client.get("/slimapi/versions")).json()
         caps = body["capabilities"]
-        assert set(caps.keys()) == {"3", "4"}
+        # 2026-08-21 narrowing: the capability map is the v4-only face —
+        # the "3" key left with the version window.
+        assert set(caps.keys()) == {"4"}
         # B3b-5 + 2026-08-19 revision §3.3: capabilities["4"] carries the
         # four STATIC keys — B3a's globalSessions/auxiliaryFilters plus the
         # same-batch-advertised sseReplay (n1 frozen timing: B3a shipped "4"
@@ -64,15 +67,6 @@ async def test_versions_capabilities_map():
             "globalSessions", "auxiliaryFilters",
             "sseReplay", "qpImmediateFull", "readiness", "expand",
         }
-        # v3 caps regression: the "3" face is frozen verbatim.
-        assert caps["3"]["envelope"] == ["messages", "sessions"]
-        assert caps["3"]["directoryQuery"] is True
-        assert caps["3"]["versionHeaderOptional"] is True
-        assert caps["3"]["writeRoutes"] is True
-        assert caps["3"]["readRoutes"] == [
-            "file", "vcs", "find", "providers",
-            "sessionSingle", "activeSessions", "globalHealth",
-        ]
 
 
 async def test_versions_caps4_meta_lane_same_source():
@@ -113,8 +107,7 @@ async def test_versions_caps4_static_face_no_runtime_keys():
     literal boolean True — replay-log configuration or DB state must not
     bleed into the advertisement. (2026-08-19 revision: the face also
     carries the module-constant-derived readiness gate and — since the
-    4.2.0 close-out, messages.expand.v4 satisfied — the §14 expand block,
-    same-source as the "3" face's block.)"""
+    4.2.0 close-out, messages.expand.v4 satisfied — the §14 expand block.)"""
     async with _client(_build_app()) as client:
         caps = (await client.get("/slimapi/versions")).json()["capabilities"]
         for key in ("globalSessions", "auxiliaryFilters", "sseReplay",
@@ -124,7 +117,6 @@ async def test_versions_caps4_static_face_no_runtime_keys():
             "globalSessions", "auxiliaryFilters",
             "sseReplay", "qpImmediateFull", "readiness", "expand",
         }
-        assert caps["4"]["expand"] == caps["3"]["expand"]
 
 
 async def test_versions_sidecar_version_is_package_version():
@@ -169,4 +161,4 @@ async def test_versions_unknown_fields_tolerated_by_consumer():
     async with _client(_build_app()) as client:
         body = (await client.get("/slimapi/versions")).json()
         assert body["current"] == 4
-        assert body["available"] == [3, 4]
+        assert body["available"] == [4]

@@ -96,7 +96,7 @@ async def test_retired_paths_are_404_never_forwarded(upstream_factory, path):
 @pytest.mark.parametrize("path", [
     "/slimapi/does/not/exist",
     "/slimapi/session",                 # route miss (list lives at /sessions)
-    "/slimapi/does-not-exist?v=3",
+    "/slimapi/does-not-exist?v=4",
     "/slimapi",
 ])
 async def test_slimapi_route_miss_returns_thin_route_not_found(

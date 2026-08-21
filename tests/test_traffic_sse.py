@@ -324,7 +324,9 @@ async def test_sse_end_to_end_traffic_saving(upstream_factory):
         frames = _parse_sse_frames(bytes(body))
         frame_events = {e for e, _ in frames}
         assert "slimapi.meta" in frame_events, "missing terminal meta frame"
-        assert "server.connected" in frame_events, "missing welcome frame"
+        # V2b default flip: this selector-less stack now runs the v4 SSE
+        # pipeline, which suppresses the v3 server.connected welcome frame.
+        assert "server.connected" not in frame_events
         assert "session.digest" in frame_events, "missing digest frame(s)"
 
         # Ratio < 1.0 for single subscriber

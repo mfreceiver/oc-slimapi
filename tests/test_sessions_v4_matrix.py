@@ -99,7 +99,8 @@ class _StubAux:
         raise AuxiliaryUnavailableError(self._reason)
 
 
-def _build_app(aux, *, settings: Settings | None = None, handler=None):
+def _build_app(aux, *, settings: Settings | None = None, handler=None,
+                selector: bool = True):
     seen: list[httpx.Request] = []
 
     def recording(request: httpx.Request) -> httpx.Response:
@@ -129,7 +130,11 @@ def _build_app(aux, *, settings: Settings | None = None, handler=None):
     for router in (health.router, versions.router, sessions.router):
         app.include_router(router)
     register_error_handlers(app)
-    app.add_middleware(SlimapiSelectorMiddleware)
+    # selector=False → selector-less direct invocation (route default v3
+    # view): keeps the v3-branch guard tests below exercisable until V2b
+    # removes the branch (2026-08-21 narrowing note).
+    if selector:
+        app.add_middleware(SlimapiSelectorMiddleware)
     install_proxy(app)
     return app, seen
 
@@ -571,78 +576,15 @@ async def test_v4_gate_off_no_etag_vary_304(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# v3 回归面（新 422 + 既有语义不变）
+# v3 回归面 — (REMOVED with the V2b src teardown: these five locks drove
+# the selector-less default-3 view into the physically removed sessions v3
+# leg — v4-only-param 422s on the v3 side, roots/start passthrough, the
+# v3 ETag contrast, the v3 limit=1000 domain, and the no-request-state-
+# marker regression. Under the v4-only window every scope runs the v4
+# facade; the v4-side counterparts (roots/start → 422 param_version_
+# mismatch, the v4 limit domain, §15 ETag/Vary) are locked above and in
+# tests/test_sessions_v4_representation.py.)
 # ---------------------------------------------------------------------------
-
-
-async def test_v3_v4_only_params_422():
-    app, seen = _build_app(_StubAux("disabled"))
-    async with _client(app) as client:
-        for extra in ("archived=omit", "parent=all", "cursor=abc",
-                      "archived=xyz", "archived=", "cursor="):
-            resp = await client.get(f"/slimapi/sessions?v=3&{extra}",
-                                    headers=IDENTITY)
-            assert resp.status_code == 422, extra
-            assert resp.json()["code"] == "param_version_mismatch"
-    assert not seen
-
-
-async def test_v3_roots_start_still_work():
-    app, seen = _build_app(_StubAux("disabled"))
-    async with _client(app) as client:
-        resp = await client.get("/slimapi/sessions",
-                                params={"v": "3", "roots": "true",
-                                        "start": "0"},
-                                headers=IDENTITY)
-    assert resp.status_code == 200
-    assert resp.json()["complete"] is True
-    assert len(seen) == 1
-    assert seen[0].url.params.get("roots") == "true"
-    assert seen[0].url.params.get("start") == "0"
-
-
-async def test_v3_etag_present_vs_v4_gate_off_absent(tmp_path, monkeypatch):
-    """v3 对照意图保留：v3 恒发 ETag/Vary；v4 的「无 ETag」如今是 §3.3
-    门控关态（monkeypatch 排除 representation.vary.v4）而非默认面——
-    默认（4.2.0 集成收口）v4 同样发 ETag/Vary，见
-    test_sessions_v4_representation.py。"""
-    monkeypatch.setattr(readiness, "SATISFIED", frozenset({
-        "selector.v4",
-        "session.list.global.v4",
-        "events.global.replay.v4",
-        "events.token.replay.v4",
-    }))
-    aux = await _real_aux(tmp_path)
-    app, _ = _build_app(aux)
-    try:
-        async with _client(app) as client:
-            v3 = await client.get("/slimapi/sessions", params={"v": "3"},
-                                  headers=IDENTITY)
-            v4 = await client.get("/slimapi/sessions", params={"v": "4"},
-                                  headers=IDENTITY)
-        assert v3.status_code == v4.status_code == 200
-        assert v3.headers.get("ETag")
-        assert v3.headers.get("Vary") == "Accept-Encoding"
-        assert "ETag" not in v4.headers
-        assert "Vary" not in v4.headers
-    finally:
-        await aux.stop()
-
-
-async def test_v3_limit_1000_domain():
-    app, _ = _build_app(_StubAux("disabled"))
-    async with _client(app) as client:
-        resp = await client.get("/slimapi/sessions",
-                                params={"v": "3", "limit": "1000"},
-                                headers=IDENTITY)
-        assert resp.status_code == 200
-        resp = await client.get("/slimapi/sessions",
-                                params={"v": "3", "limit": "1001"},
-                                headers=IDENTITY)
-        assert resp.status_code == 422  # FastAPI declarative domain
-        # F-025：域外归宿是框架形状（{"detail": [...]}）——只断言键存在性
-        body = resp.json()
-        assert isinstance(body.get("detail"), list)
 
 
 # ---------------------------------------------------------------------------
@@ -832,10 +774,10 @@ async def test_v3_model_object_passthrough_from_upstream():
             headers={"Content-Type": "application/json"},
         )
 
-    app, _ = _build_app(_StubAux("disabled"), handler=handler)
+    app, _ = _build_app(_StubAux("disabled"), handler=handler,
+                        selector=False)
     async with _client(app) as client:
-        resp = await client.get("/slimapi/sessions",
-                                params={"v": "3"}, headers=IDENTITY)
+        resp = await client.get("/slimapi/sessions", headers=IDENTITY)
     assert resp.status_code == 200
     items = resp.json()["items"]
     assert items[0]["model"] == {"id": "m-up", "providerID": "prov-up"}
@@ -853,10 +795,10 @@ async def test_v3_model_object_passthrough_from_upstream():
             headers={"Content-Type": "application/json"},
         )
 
-    app2, _ = _build_app(_StubAux("disabled"), handler=handler2)
+    app2, _ = _build_app(_StubAux("disabled"), handler=handler2,
+                         selector=False)
     async with _client(app2) as client:
-        resp2 = await client.get("/slimapi/sessions",
-                                 params={"v": "3"}, headers=IDENTITY)
+        resp2 = await client.get("/slimapi/sessions", headers=IDENTITY)
     assert resp2.status_code == 200
     assert resp2.json()["items"][0]["model"] == ["list", "from-upstream"]
 
@@ -1151,13 +1093,8 @@ async def test_marker_503_degraded_flag():
     assert "slimapi_sessions_source" not in state
 
 
-async def test_marker_v3_path_fields_absent():
-    app, _ = _build_app(_StubAux("disabled"))
-    sink: list[dict] = []
-    async with _client(_state_capturing(app, sink)) as client:
-        resp = await client.get("/slimapi/sessions",
-                                params={"v": "3"}, headers=IDENTITY)
-    assert resp.status_code == 200
-    state = sink[-1]
-    assert "slimapi_sessions_source" not in state
-    assert "slimapi_degraded_503" not in state
+# (test_marker_v3_path_fields_absent was removed with the V2b src teardown:
+# it locked that the selector-less default-3 sessions path set NO request
+# state markers — that leg no longer exists; the v4 paths' marker
+# discipline (slimapi_sessions_source / slimapi_degraded_503) is locked
+# by the degraded-503 and Class-A tests above.)

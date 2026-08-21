@@ -62,10 +62,13 @@ COMMANDS_BODY = orjson.dumps([
     {"name": "cmd", "description": "c", "agent": None, "hints": {}},
 ])
 SESSIONS_BODY = orjson.dumps([
-    {"id": f"s{n}", "title": f"session {n}",
+    {"id": f"s{n}", "title": f"session {n}", "directory": "w",
      "time": {"created": 1000 + n, "updated": 1000 + n}}
     for n in range(3)
 ])
+# (V2b note: ``directory`` added so the items stay representable under the
+# v4 canonical projector — every scope runs the v4 sessions facade under
+# the v4-only window and a directory-less item is fail-closed 503, §13.2a.)
 
 # A skeleton-collapsed message (single empty text part → thin_placeholder
 # marker) plus its merged full body — merged C2 uses two full variants.

@@ -63,7 +63,7 @@ from oc_slimapi.transform import TransformConfig, TransformPool
 
 HDR = {"X-Slimapi-Version": "2"}
 IDENTITY = {"Accept-Encoding": "identity"}
-V3 = "?v=3"
+V4 = "?v=4"
 DIRECTORY_HEADER = "X-Opencode-Directory"
 
 # §2.2 table order — part of the wire contract (validCategories replay).
@@ -127,7 +127,7 @@ async def _test_client(upstream_factory, handler, **overrides):
 @asynccontextmanager
 async def _selector_client(upstream_factory, handler, **overrides):
     """App WITH SlimapiSelectorMiddleware — selector semantics require the
-    ?v=3 selector; directory consumption is handled by the middleware."""
+    ?v=4 selector; directory consumption is handled by the middleware."""
     upstream = upstream_factory(handler)
     app = _build_app(upstream, _settings(**overrides))
     app.add_middleware(SlimapiSelectorMiddleware)
@@ -223,7 +223,7 @@ def _cleanup_global_singleflight():
 
 
 # ---------------------------------------------------------------------------
-# 1) Selector / directory (SlimapiSelectorMiddleware + ?v=3)
+# 1) Selector / directory (SlimapiSelectorMiddleware + ?v=4)
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
@@ -261,7 +261,7 @@ async def test_selector_missing_v_400(upstream_factory):
             "/slimapi/messages/s1/expand/part_text/m1/p_text",
             headers=IDENTITY)
     assert r.status_code == 400
-    assert _json(r) == {"code": "unsupported_version", "supported": [3, 4]}
+    assert _json(r) == {"code": "unsupported_version", "supported": [4]}
     assert r.headers.get("Vary") == "Accept-Encoding"
 
 
@@ -271,7 +271,7 @@ async def test_selector_v2_unsupported(upstream_factory):
             "/slimapi/messages/s1/expand/part_text/m1/p_text?v=2",
             headers=IDENTITY)
     assert r.status_code == 400
-    assert _json(r) == {"code": "unsupported_version", "supported": [3, 4]}
+    assert _json(r) == {"code": "unsupported_version", "supported": [4]}
     assert r.headers.get("Vary") == "Accept-Encoding"
 
 
@@ -289,7 +289,7 @@ async def test_selector_multi_directory_400(upstream_factory):
     async with _selector_client(upstream_factory, _message_handler(FULL_MESSAGE)) as client:
         r = await client.get(
             "/slimapi/messages/s1/expand/part_text/m1/p_text"
-            "?v=3&directory=/a&directory=/b",
+            "?v=4&directory=/a&directory=/b",
             headers=IDENTITY)
     assert r.status_code == 400
     assert _json(r) == {"code": "invalid_directory_selector"}
@@ -301,7 +301,7 @@ async def test_selector_header_residue_400(upstream_factory):
     directory_header_retired even on the expand routes."""
     async with _selector_client(upstream_factory, _message_handler(FULL_MESSAGE)) as client:
         r = await client.get(
-            "/slimapi/messages/s1/expand/part_text/m1/p_text?v=3",
+            "/slimapi/messages/s1/expand/part_text/m1/p_text?v=4",
             headers={**IDENTITY, DIRECTORY_HEADER: "/w"})
     assert r.status_code == 400
     assert _json(r) == {"code": "directory_header_retired"}
@@ -321,10 +321,10 @@ async def test_selector_directory_consumed_and_forwarded(upstream_factory):
 
     async with _selector_client(upstream_factory, handler) as client:
         r1 = await client.get(
-            "/slimapi/messages/s1/expand/part_text/m1/p_text?v=3&directory=/w",
+            "/slimapi/messages/s1/expand/part_text/m1/p_text?v=4&directory=/w",
             headers=IDENTITY)
         r2 = await client.get(
-            "/slimapi/messages/s1/expand/info_summary_diffs/m2?v=3&directory=/w",
+            "/slimapi/messages/s1/expand/info_summary_diffs/m2?v=4&directory=/w",
             headers=IDENTITY)
     assert r1.status_code == 200
     assert r2.status_code == 200
@@ -341,7 +341,7 @@ async def test_selector_error_preempts_category_error(upstream_factory):
         r = await client.get(
             "/slimapi/messages/s1/expand/not_a_category/m1?v=2", headers=IDENTITY)
     assert r.status_code == 400
-    assert _json(r) == {"code": "unsupported_version", "supported": [3, 4]}
+    assert _json(r) == {"code": "unsupported_version", "supported": [4]}
     assert r.headers.get("Vary") == "Accept-Encoding"
 
 
@@ -1180,9 +1180,11 @@ async def test_merged_diffs_stay_null_with_expand_refs(upstream_factory):
     item = _json(r)["items"][0]
     assert item["info"]["summary"]["diffs"] is None
     refs = item["info"]["expandRefs"]
+    # Selector-less stack: wire_view_from_scope is constant 4 (V2b default
+    # flip) -> the v4 href face.
     assert refs == [{
         "category": "info_summary_diffs", "messageID": "m_ph",
-        "href": "/slimapi/messages/s1/expand/info_summary_diffs/m_ph?v=3",
+        "href": "/slimapi/messages/s1/expand/info_summary_diffs/m_ph?v=4",
     }]
 
 

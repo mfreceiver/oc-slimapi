@@ -117,7 +117,7 @@ v4 从消费集**仅移除一条**：`^/slimapi/sessions$`（全局会话列表�
 
 - `selectorResult` 枚举增 `v4`（`SELECTOR_V4 = "v4"`；历史值 absent/v2 保留不产出的口径不变）——产出条件与 v3 对称：`?v=4` 词法合法且 ∈ 支持集。
 - `wireVersion` 维度增 "4"（access log / traffic snapshot / SSE active 维度 `SSE_RESULT_DIMS` 同步扩 `"v4"`）。
-- 兼容性：维度取值集扩大，schema 形状不变——旧快照/旧日志行可继续解读（新值仅在新请求出现）。v3 流量退役判据（P4，v2.2 行 248）以 `wireVersion` 维度聚合：v3 归零 + SSE active 无 v3 连接 → 5.0.0 (4,4)。
+- 兼容性：维度取值集扩大，schema 形状不变——旧快照/旧日志行可继续解读（新值仅在新请求出现）。v3 流量退役判据（P4，v2.2 行 248）以 `wireVersion` 维度聚合：v3 归零 + SSE active 无 v3 连接 → 4.8.0 (4,4)。
 
 ---
 

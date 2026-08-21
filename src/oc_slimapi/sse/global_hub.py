@@ -46,6 +46,7 @@ from .hub_types import (
     record_qp_activity,
     sse_frame,
 )
+from .provider_errors import classify_provider_error
 from .replay_log import GLOBAL_DOMAIN
 from .replay_wire import sse_id_line
 
@@ -872,12 +873,16 @@ class GlobalHub:
             name = name if isinstance(name, str) else None
             if name == ABORT_NAME:
                 return  # abort silently dropped
-            raw_msg = (
-                (err.get("data") or {}).get("message")
-                if isinstance(err.get("data"), dict)
-                else None
-            )
+            err_data = err.get("data") if isinstance(err.get("data"), dict) else None
+            raw_msg = (err_data or {}).get("message")
             message = _sanitize_error_message(raw_msg, name)
+            # Structured provider-error classification. Classify on the RAW
+            # (pre-sanitize) message: _sanitize_error_message truncates to
+            # 512 chars and rewrites segments (<path>/<redacted>), which
+            # could cut a trailing "retry after Ns" clause — the classifier
+            # only emits enum codes + whitelisted validated fields, never
+            # raw text, so classifying pre-sanitize leaks nothing.
+            extra = classify_provider_error(name, raw_msg, err_data)
             at = _now_ms()
             sid = props.get("sessionID") if isinstance(props, dict) else None
             if isinstance(sid, str) and sid:
@@ -896,6 +901,7 @@ class GlobalHub:
                     "message": message,
                     "at": at,
                 }
+                last_error_obj |= extra
                 entry.last_error = last_error_obj
                 self.sticky_last_error[sid] = last_error_obj
                 self.sticky_last_error.move_to_end(sid)
@@ -910,6 +916,7 @@ class GlobalHub:
                     "message": message,
                     "at": at,
                 }
+                frame_payload |= extra
                 if directory:
                     frame_payload["directory"] = directory
                 frame = sse_frame(frame_payload, event="session.error")

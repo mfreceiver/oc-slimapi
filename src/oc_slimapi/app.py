@@ -757,14 +757,15 @@ register_error_handlers(app)
 # Dual-version window (4.0.0, B3a-A) — the version selector (the retired
 # Batch-A gate was removed with the v2 pipeline) sits at this position in
 # the stack.
-# Version selector — dual-version window: ?v=3 runs the unchanged v3
-# pipeline, ?v=4 the v4 differential face (scope-state marked with the wire
-# view; `v` stripped; directory consumed per §5.1/§5.2 — v4 additionally
-# retires directory on the global sessions list). Every other /slimapi/**
-# version form is a 400; GET /slimapi/versions is unconditionally exempt
-# (non-GET there → 405 + Allow: GET, first priority). Catch-all (non
-# /slimapi) requests pass through untouched (and are answered 404 by the
-# closed proxy).
+# Version selector — v4-only window (2026-08-21 narrowing): only ``?v=4``
+# is admitted (scope-state marked with the wire view; `v` stripped;
+# directory consumed per §5.1/§5.2 — v4 additionally retires directory on
+# the global sessions list). Every other /slimapi/** version form —
+# including the retired ``?v=3`` — is a 400; GET /slimapi/versions is
+# unconditionally exempt (non-GET there → 405 + Allow: GET, first
+# priority). Catch-all (non /slimapi) requests pass through untouched (and
+# are answered 404 by the closed proxy). (Historical: the 4.0.0 (3, 4)
+# dual window also admitted ?v=3 onto the unchanged v3 pipeline.)
 app.add_middleware(SlimapiSelectorMiddleware)
 # Traffic-accounting middleware. Added AFTER the version gate so it is the
 # OUTERMOST middleware — it wraps every HTTP route including the version

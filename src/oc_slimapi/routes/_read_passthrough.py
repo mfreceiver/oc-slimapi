@@ -232,6 +232,11 @@ async def read_passthrough_get(
     config = request.app.state.config
     accept_encoding = request.headers.get("accept-encoding")
     if_none_match = request.headers.get("if-none-match")
+    # (V2b note: the historical wire_view=3 literal is KEPT deliberately —
+    # the passthrough ETag domain (REP_VERSION marker "wire=v3") is frozen
+    # into tests/golden/offload-baseline-v1.json (vcs_* cases); flipping the
+    # marker would change observable ETag bytes. It is a domain label, not
+    # a v3 flow: this stack never consults wire_view_from_scope.)
     rep_version = etag_mod.response_rep_version(config, wire_view=3)
     # §6.2 terminal: single-value Vary on every route.
     vary = etag_mod.merged_vary("Accept-Encoding")

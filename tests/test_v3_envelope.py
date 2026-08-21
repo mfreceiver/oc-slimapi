@@ -4,21 +4,19 @@ B12 (2026-08-21) three-way split: the messages-envelope family and the
 sessions-status map passthrough were rewritten to the ``?v=4`` face —
 v4-contract §10 freezes messages as byte-identical to v3 (envelope shape,
 nextCursor splice, 304 header set) and §12 marks /sessions/status 零 v4
-分叉. The sessions-list envelope functions stay on the v3 face (the v4
-global list is a different DB-projection pipeline) as the Phase 4
-guardian net, as do the retired-v2-form rejection checks.
+分叉. V2b (2026-08-21 Phase-4 guard teardown) deleted the sessions-list
+envelope guardian net (the v3 list face is rejected; the v4 global-list
+envelope is locked in test_sessions_v4_matrix / test_terminal_matrix) and
+the retired-v2-form rejection guards (version-window 400 coverage lives
+in the selector test-suite).
 
 Covers:
 
-* ``GET /slimapi/messages/{sid}`` v3 — ``{"items":[<v2 bare array bytes>],
+* ``GET /slimapi/messages/{sid}`` — ``{"items":[<v2 bare array bytes>],
   "nextCursor":<string|null>}`` (byte-verbatim splice) + no ``X-Next-Cursor``
   header on 200 or 304.
-* ``GET /slimapi/sessions`` v3 — ``{"items":[...],"complete":<bool>}`` both
-  complete states + no ``X-Complete`` header on 200 or 304.
-* ``GET /slimapi/sessions/status`` v3 — NOT enveloped (map passthrough).
+* ``GET /slimapi/sessions/status`` — NOT enveloped (map passthrough).
 * Edge cases — error responses not enveloped; 304 has no body (§6.4).
-* v2 regression — no ``v`` AND explicit ``?v=2`` keep the exact v2 wire
-  shape (bare array + pagination headers).
 """
 
 from __future__ import annotations
@@ -35,7 +33,6 @@ from oc_slimapi.selector import SlimapiSelectorMiddleware
 from oc_slimapi.transform import TransformConfig, TransformPool
 
 IDENTITY = {"Accept-Encoding": "identity"}  # strong ETags, byte-verbatim bodies
-V2_HEADERS = {"X-Slimapi-Version": "2", **IDENTITY}
 
 
 def _settings(**overrides) -> Settings:
@@ -173,23 +170,6 @@ async def test_messages_v4_envelope_non_null_cursor(client_factory):
         await client.aclose()
 
 
-async def test_messages_retired_v2_forms_rejected(client_factory):
-    """Terminal §2: implicit and explicit v2 requests are both rejected with
-    unsupported_version — the bare-array wire shape no longer exists."""
-    link = '</session/s1/message?limit=40&before=CURSOR123>; rel="next"'
-    client = await client_factory(_message_handler(link=link))
-    try:
-        implicit = await client.get("/slimapi/messages/s1", headers=V2_HEADERS)
-        explicit = await client.get(
-            "/slimapi/messages/s1?v=2", headers=V2_HEADERS)
-        assert implicit.status_code == explicit.status_code == 400
-        expected = {"code": "unsupported_version", "supported": [3, 4]}
-        assert orjson.loads(implicit.content) == expected
-        assert orjson.loads(explicit.content) == expected
-    finally:
-        await client.aclose()
-
-
 async def test_messages_v4_error_response_not_enveloped(client_factory):
     """§4.4 (B12 ①: v4 messages ≡ v3, §10 zero difference): error bodies
     keep the v2 shape (code, no items)."""
@@ -233,80 +213,9 @@ async def test_messages_v4_304_empty_body_no_aux_headers(client_factory):
         await client.aclose()
 
 
-async def test_messages_retired_v2_304_form_rejected(client_factory):
-    """Terminal: no v2 pipeline → no v2 304 aux headers exist; the retired
-    form is rejected before any validator is consulted."""
-    link = '</session/s1/message?limit=40&before=CURSOR123>; rel="next"'
-    client = await client_factory(_message_handler(link=link))
-    try:
-        first = await client.get("/slimapi/messages/s1?v=3", headers=IDENTITY)
-        etag = first.headers["ETag"]
-        reval = await client.get(
-            "/slimapi/messages/s1",
-            headers={**V2_HEADERS, "If-None-Match": etag},
-        )
-        assert reval.status_code == 400
-        assert orjson.loads(reval.content)["code"] == "unsupported_version"
-    finally:
-        await client.aclose()
-
-
 # ---------------------------------------------------------------------------
 # sessions envelope
 # ---------------------------------------------------------------------------
-
-async def test_sessions_v3_envelope_complete_true(client_factory):
-    """Terminal §4: the sessions list body is the
-    {"items":…,"complete":true} envelope; X-Complete is never produced."""
-    client = await client_factory(_message_handler())
-    try:
-        v3 = await client.get("/slimapi/sessions?v=3", headers=IDENTITY)
-        assert v3.status_code == 200
-        assert v3.content.startswith(b'{"items":')
-        body = orjson.loads(v3.content)
-        assert list(body.keys()) == ["items", "complete"]
-        assert body["complete"] is True
-        assert body["items"] == [{"id": "s1", "title": "one"},
-                                 {"id": "s2", "title": "two"}]
-        assert "nextCursor" not in body
-        assert "x-complete" not in v3.headers
-    finally:
-        await client.aclose()
-
-
-async def test_sessions_v3_envelope_complete_false(client_factory):
-    """?limit=1 with a 2-item upstream page → complete=false in the envelope."""
-    client = await client_factory(_message_handler())
-    try:
-        response = await client.get(
-            "/slimapi/sessions?v=3&limit=1", headers=IDENTITY)
-        assert response.status_code == 200
-        body = orjson.loads(response.content)
-        assert body["complete"] is False
-        assert len(body["items"]) == 2
-        assert "x-complete" not in response.headers
-    finally:
-        await client.aclose()
-
-
-async def test_sessions_v3_304_no_x_complete_header(client_factory):
-    """§6.4: the 304 carries no X-Complete (the client reads ``complete``
-    from the cached envelope)."""
-    client = await client_factory(_message_handler())
-    try:
-        v3_first = await client.get("/slimapi/sessions?v=3", headers=IDENTITY)
-        etag = v3_first.headers["ETag"]
-        v3_reval = await client.get(
-            "/slimapi/sessions?v=3",
-            headers={**IDENTITY, "If-None-Match": etag},
-        )
-        assert v3_reval.status_code == 304
-        assert v3_reval.content == b""
-        assert "x-complete" not in v3_reval.headers
-        assert "X-Complete" not in v3_reval.headers
-    finally:
-        await client.aclose()
-
 
 async def test_sessions_status_v4_not_enveloped(client_factory):
     """§4.3 (B12 ①: /sessions/status is 零 v4 分叉, v4-contract §12):
@@ -320,21 +229,5 @@ async def test_sessions_status_v4_not_enveloped(client_factory):
         assert "items" not in body
         assert "complete" not in body
         assert body == {"s1": {"type": "idle"}}
-    finally:
-        await client.aclose()
-
-
-async def test_sessions_error_response_not_enveloped(client_factory):
-    """§4.4: upstream failure → v2 error shape under v3 too."""
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(500, content=b"boom")
-
-    client = await client_factory(handler)
-    try:
-        response = await client.get("/slimapi/sessions?v=3", headers=IDENTITY)
-        assert response.status_code == 503  # upstream 5xx → upstream_unavailable
-        body = orjson.loads(response.content)
-        assert "items" not in body
-        assert "code" in body
     finally:
         await client.aclose()

@@ -34,7 +34,7 @@ from oc_slimapi.skeleton import (
 from oc_slimapi.transform import TransformConfig, TransformPool
 
 SID = "ses_s"
-V3 = "?v=3"
+V3 = "?v=3"  # default-view (selector-less) projection href face; V2b retargets to v4
 HDR = {"X-Slimapi-Version": "2"}
 
 

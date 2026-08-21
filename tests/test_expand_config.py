@@ -8,7 +8,7 @@ Covers (design-expand v5, §3.2 / §6 / §11 P4 / §12):
   ``max(max_response_bytes, max_expand_response_bytes) × max_transforms`` —
   an expand cap ABOVE the plain response cap combined with the product over
   512 MiB must fail startup.
-* ``GET /slimapi/versions`` capabilities["3"]["expand"]: the 12 §2.2
+* ``GET /slimapi/versions`` capabilities["4"]["expand"]: the 12 §2.2
   categories in verbatim table order + ``fragmentMaxBytes`` live-linked to
   the running Settings (nothing hardcoded).
 * Expand metrics: ``TrafficLedger.record_expand`` (category × status +
@@ -143,7 +143,7 @@ def test_env_non_integer_expand_cap_is_named_runtime_error(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 3. versions capabilities["3"]["expand"] (§6)
+# 3. versions capabilities["4"]["expand"] (§6)
 # ---------------------------------------------------------------------------
 
 EXPECTED_CATEGORIES = [
@@ -182,8 +182,8 @@ async def test_versions_capabilities_include_expand():
     ) as client:
         body = (await client.get("/slimapi/versions")).json()
     caps = body["capabilities"]
-    assert set(caps.keys()) == {"3", "4"}
-    expand = caps["3"]["expand"]
+    assert set(caps.keys()) == {"4"}  # (4,4) window: v3 face retired
+    expand = caps["4"]["expand"]
     assert expand["categories"] == EXPECTED_CATEGORIES
     # fragmentMaxBytes reflects the running Settings (default 8 MiB unset).
     assert expand["fragmentMaxBytes"] == 8 * 1024 * 1024
@@ -202,7 +202,7 @@ async def test_versions_fragment_max_bytes_follows_config(monkeypatch):
         transport=ASGITransport(_build_app()), base_url="http://test"
     ) as client:
         body = (await client.get("/slimapi/versions")).json()
-    expand = body["capabilities"]["3"]["expand"]
+    expand = body["capabilities"]["4"]["expand"]
     assert expand["fragmentMaxBytes"] == 2 * 1024 * 1024
 
 

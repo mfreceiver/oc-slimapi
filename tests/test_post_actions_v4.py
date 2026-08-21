@@ -544,16 +544,15 @@ async def test_archive_directory_stash_forwarded(make_app, gate_on):
 
 @pytest.mark.parametrize("path", POST_ACTION_PATHS)
 async def test_v3_returns_thin_route_not_found(make_app, path):
-    """v3 冻结基线：三组合 → 404 ``thin_route_not_found``（与 4.0.0
-    catch-all 答案逐字节一致——gzip 协商 + Vary，无 Allow、无
-    cache-control）；零上游 IO。"""
+    """v3 冻结基线（2026-08-21 收窄临时翻转，V2b 删）：三组合在 v3 曾 →
+    404 ``thin_route_not_found``；版本窗收窄后 ``?v=3`` 一律 400
+    ``unsupported_version``（supported:[4]）。零上游 IO 的守护点保留。"""
     app, seen = make_app(_canned)          # full-stack：真实 selector + catch-all
     async with _client(app) as client:
         r = await client.post(f"{path}?v=3", content=b"{}", headers=IDENTITY)
-    assert r.status_code == 404
-    assert orjson.loads(r.content) == {"code": "thin_route_not_found"}
-    assert "allow" not in r.headers
-    assert "cache-control" not in r.headers
+    assert r.status_code == 400
+    assert orjson.loads(r.content) == {"code": "unsupported_version",
+                                       "supported": [4]}
     assert seen == []
 
 

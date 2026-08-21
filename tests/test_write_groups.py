@@ -171,7 +171,7 @@ def _send(client, label: str, path: str, method: str, *, v3: bool = True,
     if content_type is not None:
         h.setdefault("Content-Type", content_type)
     h.setdefault("Accept-Encoding", "identity")
-    url = f"/slimapi{path}" + ("?v=3" if v3 else "")
+    url = f"/slimapi{path}" + ("?v=4" if v3 else "")
     return client.request(method, url, content=content, headers=h)
 
 
@@ -253,7 +253,7 @@ async def test_write_directory_v3_query_consumed_and_forwarded(
     body_bytes = BODIES[label][0] or b""
     ct = {"Content-Type": "application/json"} if BODIES[label][1] else {}
     resp = await client.request(
-        method, f"/slimapi{path}?v=3&directory=/w",
+        method, f"/slimapi{path}?v=4&directory=/w",
         content=body_bytes, headers=IDENTITY | ct,
     )
     assert resp.status_code < 500
@@ -269,7 +269,7 @@ async def test_write_directory_v3_invalid_query_400(stack, label, path, method,
     app, seen = _build_app(_ok)
     async with _client(app) as client:
         resp = await client.request(
-            method, f"/slimapi{path}?v=3&directory=../etc",
+            method, f"/slimapi{path}?v=4&directory=../etc",
             content=BODIES[label][0] or b"",
             headers={**IDENTITY, **({"Content-Type": "application/json"} if BODIES[label][1] else {})})
     assert resp.status_code == 400
@@ -286,7 +286,7 @@ async def test_write_directory_v2_query_values_unsupported():
             headers=V2_HEADERS)
     assert resp.status_code == 400
     assert orjson.loads(resp.content) == {
-        "code": "unsupported_version", "supported": [3, 4]}
+        "code": "unsupported_version", "supported": [4]}
     assert not seen
 
 
@@ -307,7 +307,7 @@ async def test_write_directory_conflict_dual_present():
     app, seen = _build_app(_ok)
     async with _client(app) as client:
         resp = await client.request(
-            "POST", "/slimapi/session/s1/abort?v=3&directory=/w",
+            "POST", "/slimapi/session/s1/abort?v=4&directory=/w",
             headers={**IDENTITY, DIRECTORY_HEADER: "/other"})
     assert resp.status_code == 400
     assert orjson.loads(resp.content)["code"] == "directory_conflict"
@@ -318,7 +318,7 @@ async def test_write_directory_multi_value_400():
     app, seen = _build_app(_ok)
     async with _client(app) as client:
         resp = await client.request(
-            "POST", "/slimapi/session/s1/abort?v=3&directory=/w&directory=/x",
+            "POST", "/slimapi/session/s1/abort?v=4&directory=/w&directory=/x",
             headers=IDENTITY)
     assert resp.status_code == 400
     assert orjson.loads(resp.content)["code"] == "invalid_directory_selector"
@@ -389,7 +389,7 @@ async def test_write_request_body_over_cap_413():
     big = b"x" * 32
     async with _client(app) as client:
         resp = await client.request(
-            "POST", "/slimapi/session?v=3", content=big,
+            "POST", "/slimapi/session?v=4", content=big,
             headers={"Content-Type": "application/json", **IDENTITY})
     assert resp.status_code == 413
     assert orjson.loads(resp.content)["code"] == "request_too_large"
@@ -413,7 +413,7 @@ async def test_write_query_verbatim_unknown_and_repeats():
     async with _client(app) as client:
         resp = await client.request(
             "POST",
-            "/slimapi/session/s1/abort?v=3&zz=a%20b&zz=c&x=1&x=2",
+            "/slimapi/session/s1/abort?v=4&zz=a%20b&zz=c&x=1&x=2",
             headers=IDENTITY)
     assert resp.status_code == 200
     assert seen[0].url.query.decode("latin-1") == "zz=a%20b&zz=c&x=1&x=2"
@@ -424,7 +424,7 @@ async def test_write_v3_strips_v_and_directory_only():
     app, seen = _build_app(_ok)
     async with _client(app) as client:
         resp = await client.request(
-            "POST", "/slimapi/session/s1/abort?v=3&directory=/w&zz=%2Fkeep",
+            "POST", "/slimapi/session/s1/abort?v=4&directory=/w&zz=%2Fkeep",
             headers=IDENTITY)
     assert resp.status_code == 200
     assert seen[0].url.query.decode("latin-1") == "zz=%2Fkeep"
@@ -530,7 +530,7 @@ async def test_write_request_cap_zero_upstream_calls():
     app, seen = _build_app(_ok, settings=_settings(max_message_bytes=8))
     async with _client(app) as client:
         resp = await client.request(
-            "POST", "/slimapi/session?v=3", content=b"123456789",
+            "POST", "/slimapi/session?v=4", content=b"123456789",
             headers={"Content-Type": "application/json", **IDENTITY})
     assert resp.status_code == 413
     assert orjson.loads(resp.content)["code"] == "request_too_large"
@@ -547,7 +547,7 @@ async def test_write_success_gzip_reencode():
                  "Content-Encoding": "br"}))  # upstream coding: dropped
     async with _client(app) as client:
         resp = await client.request(
-            "POST", "/slimapi/session?v=3", content=b"{}",
+            "POST", "/slimapi/session?v=4", content=b"{}",
             headers={"Content-Type": "application/json",
                      "Accept-Encoding": "gzip"})
     assert resp.status_code == 201

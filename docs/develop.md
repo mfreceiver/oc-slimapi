@@ -20,8 +20,8 @@ python -m venv .venv
 | `OC_SLIMAPI_UPSTREAM` | `http://127.0.0.1:4096` | 固定 loopback upstream（无论 host 如何，upstream 必须保持 loopback HTTP） |
 | `OC_SLIMAPI_MAX_MESSAGE_BYTES` | `33554432` | 单消息上限 |
 | `OC_SLIMAPI_SMOKE_SESSION_ID` | 无 | 启动字段漂移 smoke 的已知 sid |
-| `OC_SLIMAPI_SERVER_API_VERSION`（**已弃用**） | `4` | 服务端当前整数 API 版本（4.0.0 起 =4，(3,4) 双版本窗口）；设非默认值仅记 warning 后忽略，版本窗钉死于代码不可配 |
-| `OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS`（**已弃用**） | `3,4` | 接受的客户端版本闭区间（4.0.0 起 (3,4)）；设非 (3,4) 值启动期 RuntimeError（fail-closed，不可用它改版本窗） |
+| `OC_SLIMAPI_SERVER_API_VERSION`（**已弃用**） | `4` | 服务端当前整数 API 版本（=4）；设非默认值仅记 warning 后忽略，版本窗钉死于代码不可配 |
+| `OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS`（**已弃用**） | `4,4` | 接受的客户端版本闭区间（4.8.0 起 (4,4) v4-only）；设非 (4,4) 值启动期 RuntimeError（fail-closed，不可用它改版本窗） |
 | `OC_SLIMAPI_SKELETON_INLINE_OUTPUT_MAX_BYTES` | `4096` | 骨架投影单字段 inline 字节上限（超阈值则降级为引用占位） |
 | `OC_SLIMAPI_TRAFFIC_METRICS_ENABLED` | `1` | 双向字节账本总开关；`0` 时 traffic 账本快照（嵌入 `/slimapi/metrics` 响应的 `traffic` 块）与 ledger 全 no-op |
 | `OC_SLIMAPI_ACCESS_LOG_DIR` | `logs` | access log 目录（按天文件 `access-YYYY-MM-DD.jsonl`）；生产 systemd 覆盖为 `%S/oc-slimapi/logs` |
@@ -63,7 +63,7 @@ journalctl --user -u oc-slimapi -f      # 实时日志
 
 > 应用日志走 journald；**access log（`logs/access-YYYY-MM-DD.jsonl`）与流量快照（`logs/traffic-snapshot-YYYY-MM-DD.jsonl`）落盘**到 `access_log_dir`（systemd 下为 `StateDirectory` `~/.local/state/oc-slimapi/logs`）。理由与查询手册见 `operations.md` §5。
 
-所有 `/slimapi/**` 请求（包括 `/slimapi/events` SSE）必须带查询参数 `?v=3` 或 `?v=4`（4.0.0 起 (3,4) 双版本窗口，v4 差异面见 `docs/specs/v4-contract.md`）：缺 `v` / `v=2` / 不支持值 → 400 `unsupported_version supported=[3,4]`（SSE 在开流前拒）；`X-Slimapi-Version` 头已删除、出现不解读；词法非法的 `v` → 400 `invalid_version_selector`。**唯一豁免：`GET /slimapi/versions`（发现端点，无条件免 selector、免版本头）**。非 `/slimapi/**` 路径已随 catch-all 关闭统一 404 `thin_route_not_found`（§8.2）。
+所有 `/slimapi/**` 请求（包括 `/slimapi/events` SSE）必须带查询参数 `?v=4`（4.8.0 起 v4-only 单版本窗口，契约见 `docs/specs/v4-contract.md`）：缺 `v` / `v=3` / 其他不支持值 → 400 `unsupported_version supported=[4]`（SSE 在开流前拒）；`X-Slimapi-Version` 头已删除、出现不解读；词法非法的 `v` → 400 `invalid_version_selector`。**唯一豁免：`GET /slimapi/versions`（发现端点，无条件免 selector、免版本头）**。非 `/slimapi/**` 路径已随 catch-all 关闭统一 404 `thin_route_not_found`（§8.2）。
 
 ## 测试 / 质量门禁
 
@@ -83,6 +83,6 @@ journalctl --user -u oc-slimapi -f      # 实时日志
 gzip 检查：
 
 ```bash
-curl -sS --compressed -D- 'http://127.0.0.1:4097/slimapi/messages/SID?limit=40&v=3' -o /dev/null
-curl -sS -H 'Accept-Encoding: identity' -D- 'http://127.0.0.1:4097/slimapi/messages/SID?limit=40&v=3' -o /dev/null
+curl -sS --compressed -D- 'http://127.0.0.1:4097/slimapi/messages/SID?limit=40&v=4' -o /dev/null
+curl -sS -H 'Accept-Encoding: identity' -D- 'http://127.0.0.1:4097/slimapi/messages/SID?limit=40&v=4' -o /dev/null
 ```

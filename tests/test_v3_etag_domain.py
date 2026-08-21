@@ -4,22 +4,22 @@ B12 (2026-08-21) three-way split: the two messages-route ETag behavioural
 checks (same request → same validator; envelope-content change rotates it)
 were rewritten to the ``?v=4`` face — v4 messages ≡ v3 (§10) with the
 validator keyed to the REP wire=v4 domain (§15), so the behaviour holds
-per-view. The wire-marker unit locks (b"wire=v3" fingerprints, the
-default-view-3 terminal) and the sessions-route checks stay on the v3
-face — the v4 global sessions list carries no ETag at all (§4), so its
-v3 304/Vary shape is Phase 4 guardian material.
+per-view.
 
-Covers:
+V2b (2026-08-21 Phase-4 guard teardown) deleted the v3-face guardian net:
+the wire-marker unit locks (b"wire=v3" fingerprints, the default-view-3
+terminal — the src lane re-locks the wire=v4 fingerprint/default when the
+physical v3 removal lands), the retired-v2-form validator rejection
+guards, and the v3 sessions 304 shape lock (the v4 global sessions list
+carries no ETag at all, §4; its representation is locked in
+test_sessions_v4_representation / test_vary_directory_unconditional).
 
-* §6.1 — ``representation_version`` carries a wire-view marker: v2 and v3
-  validators never match each other (unit + both integration directions:
-  a v2 ETag sent to a v3 request → 200, and vice versa).
+Covers (all on the admitted ``?v=4`` face):
+
 * §6.3 — envelope routes' canonical ETag input is the envelope body (same
   request → same ETag; envelope content change → different ETag).
-* §6.4 — v3 304 header set is exactly ETag + Vary + Cache-Control:no-store.
-* Vary keeps ``X-Opencode-Directory`` on the four directory-sensitive
-  routes during the parallel period (checked on messages/sessions);
-  ``?v=``/``?directory=`` are URI inputs and never join Vary.
+* §6.2 — Vary never names ``?v=``/``?directory=`` (URI inputs, not
+  representation dimensions).
 """
 
 from __future__ import annotations
@@ -31,13 +31,11 @@ from fastapi import FastAPI
 
 from oc_slimapi.config import Settings
 from oc_slimapi.errors import register_error_handlers
-from oc_slimapi.etag import representation_version, response_rep_version
 from oc_slimapi.routes import messages, sessions
 from oc_slimapi.selector import SlimapiSelectorMiddleware
 from oc_slimapi.transform import TransformConfig, TransformPool
 
 IDENTITY = {"Accept-Encoding": "identity"}
-V2_HEADERS = {"X-Slimapi-Version": "2", **IDENTITY}
 
 
 def _settings(**overrides) -> Settings:
@@ -103,70 +101,6 @@ async def client_factory():
         await app.state.upstream.aclose()
 
 
-def test_representation_version_wire_marker_unit():
-    """§6.1: the fingerprint carries a per-view wire marker — distinct
-    bytes per view (the domain-isolation MECHANISM; the v2 form is only a
-    mechanism demonstration — v2 traffic no longer exists in M3)."""
-    settings = _settings()
-    v2_rep = representation_version(settings, wire_view=2)
-    v3_rep = representation_version(settings, wire_view=3)
-    assert v2_rep != v3_rep
-    assert b"wire=v2" in v2_rep
-    assert b"wire=v3" in v3_rep
-
-
-def test_representation_version_terminal_default_is_v3():
-    """M3-5 (structural terminal enforcement): the DEFAULT view is 3 —
-    a caller that omits ``wire_view`` gets the v3 domain, never the
-    retired v2 one."""
-    settings = _settings()
-    v3_rep = representation_version(settings, wire_view=3)
-    assert representation_version(settings) == v3_rep
-    assert b"wire=v3" in v3_rep
-    assert response_rep_version(settings) == v3_rep
-
-
-async def test_retired_v2_request_never_issues_validator(client_factory):
-    """Terminal: a v2 request is rejected — it can neither issue nor
-    present a validator; only the v3 envelope domain remains."""
-    client = await client_factory(lambda req: httpx.Response(
-        200, content=_message_payload(),
-        headers={"Content-Type": "application/json"}))
-    try:
-        v2 = await client.get("/slimapi/messages/s1", headers=V2_HEADERS)
-        assert v2.status_code == 400
-        assert "etag" not in v2.headers
-        v3 = await client.get(
-            "/slimapi/messages/s1?v=3", headers=IDENTITY)
-        assert v3.status_code == 200
-        reval = await client.get(
-            "/slimapi/messages/s1?v=3",
-            headers={**IDENTITY, "If-None-Match": v3.headers["ETag"]},
-        )
-        assert reval.status_code == 304
-    finally:
-        await client.aclose()
-
-
-async def test_v3_validator_on_retired_v2_form_rejected(client_factory):
-    """Terminal: a v3 validator presented on the retired v2 form is
-    rejected before any ETag judgement."""
-    client = await client_factory(lambda req: httpx.Response(
-        200, content=_message_payload(),
-        headers={"Content-Type": "application/json"}))
-    try:
-        v3 = await client.get("/slimapi/messages/s1?v=3", headers=IDENTITY)
-        v3_etag = v3.headers["ETag"]
-        v2 = await client.get(
-            "/slimapi/messages/s1",
-            headers={**V2_HEADERS, "If-None-Match": v3_etag},
-        )
-        assert v2.status_code == 400
-        assert orjson.loads(v2.content)["code"] == "unsupported_version"
-    finally:
-        await client.aclose()
-
-
 async def test_v4_etag_same_request_stable_and_own_view_304(client_factory):
     """§6.3 (B12 ①: v4 messages ≡ v3, §10 + §15 wire=v4 REP domain): same
     v4 request → same ETag; re-sent on the v4 view → 304."""
@@ -216,33 +150,6 @@ async def test_v4_etag_changes_with_envelope_content(client_factory):
         await client.aclose()
 
 
-async def test_v3_304_header_set_exact_sessions(client_factory):
-    """§6.4 on the sessions route: 304 carries ETag + Vary + no-store and
-    nothing pagination-related; Vary keeps the directory dimension."""
-    client = await client_factory(lambda req: httpx.Response(
-        200, content=_sessions_payload(),
-        headers={"Content-Type": "application/json"}))
-    try:
-        first = await client.get("/slimapi/sessions?v=3", headers=IDENTITY)
-        etag = first.headers["ETag"]
-        # §6.2 terminal: Vary shrinks to the single Accept-Encoding value.
-        assert first.headers["Vary"] == "Accept-Encoding"
-        reval = await client.get(
-            "/slimapi/sessions?v=3",
-            headers={**IDENTITY, "If-None-Match": etag},
-        )
-        assert reval.status_code == 304
-        assert reval.content == b""
-        assert reval.headers["ETag"] == etag
-        assert reval.headers["Cache-Control"] == "no-store"
-        assert reval.headers["Vary"] == first.headers["Vary"]
-        assert "x-complete" not in reval.headers
-        assert "X-Complete" not in reval.headers
-        assert "x-next-cursor" not in reval.headers
-    finally:
-        await client.aclose()
-
-
 async def test_vary_never_mentions_v_or_directory_params(client_factory):
     """§6.2: ``?v=``/``?directory=`` are URI inputs — Vary never names
     them (only the HEADER dimension X-Opencode-Directory may appear)."""
@@ -250,8 +157,10 @@ async def test_vary_never_mentions_v_or_directory_params(client_factory):
         200, content=_sessions_payload(),
         headers={"Content-Type": "application/json"}))
     try:
+        # 2026-08-21 narrowing: run on a consuming non-retired route
+        # (messages; sessions retires directory in v4).
         response = await client.get(
-            "/slimapi/sessions?v=3&directory=/w", headers=IDENTITY)
+            "/slimapi/messages/s1?v=4&directory=/w", headers=IDENTITY)
         assert response.status_code == 200
         vary = response.headers["Vary"]
         # §6.2 terminal: single value — neither v, directory, nor the

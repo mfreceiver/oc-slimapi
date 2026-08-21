@@ -1322,6 +1322,192 @@ async def test_g1_publish_non_string_error_name_does_not_crash(fresh_hub):
 
 
 # ---------------------------------------------------------------------------
+# G1: structured provider-error classification (provider_errors.py wiring)
+# ---------------------------------------------------------------------------
+
+async def test_g1_a_last_error_carries_structured_code_and_retry_after(fresh_hub):
+    """G1-A digest lastError carries additive classification fields:
+    code + retryAfter (text-extracted) + provider/model (data passthrough).
+    name/message/at keep their original semantics."""
+    hub, subscriber = fresh_hub
+
+    hub.publish(make_global_event("/proj", "session.error", {
+        "sessionID": "s1",
+        "error": {
+            "name": "RateLimitError",
+            "data": {
+                "message": "rate limit reached, retry after 30s",
+                "provider": "openai",
+                "model": "gpt-4o-mini",
+            },
+        },
+    }))
+    frames = await drain_queue(subscriber)
+    digests = [
+        data for event, data in (parse_event(f) for f in frames)
+        if event == "session.digest"
+    ]
+    le = next(d["lastError"] for d in digests if "lastError" in d)
+    assert le["name"] == "RateLimitError"
+    assert le["message"] == "rate limit reached, retry after 30s"
+    assert isinstance(le.get("at"), int)
+    # Additive structured fields.
+    assert le["code"] == "provider_rate_limited"
+    assert le["retryAfter"] == 30
+    assert le["provider"] == "openai"
+    assert le["model"] == "gpt-4o-mini"
+    # Whitelist only — the raw data dict is not echoed.
+    for key in le:
+        assert key in {
+            "name", "message", "at", "code", "provider", "model",
+            "retryAfter", "quotaResetAt",
+        }
+
+
+async def test_g1_b_frame_carries_structured_fields(fresh_hub):
+    """G1-B session-less direct frame carries the same additive fields."""
+    hub, subscriber = fresh_hub
+
+    hub.publish(make_global_event("/proj", "session.error", {
+        "error": {
+            "name": "QuotaError",
+            "data": {
+                "message": "exceeded quota, please retry after 30s",
+                "retry_after": 45,  # structural beats text → 45
+                "quota_reset_at": 1755302400000,
+            },
+        },
+    }))
+    frames = await drain_queue(subscriber)
+    err_frames = [
+        data for event, data in (parse_event(f) for f in frames)
+        if event == "session.error"
+    ]
+    assert len(err_frames) == 1
+    frame = err_frames[0]
+    # Order-sensitive: quota beats rate despite "retry after" in the text.
+    assert frame["code"] == "provider_quota_exceeded"
+    assert frame["retryAfter"] == 45
+    assert frame["quotaResetAt"] == 1755302400000
+    # camelCase normalization — snake_case never reaches the wire.
+    assert "retry_after" not in frame
+    assert "quota_reset_at" not in frame
+
+
+async def test_g1_classification_uses_raw_pre_sanitize_message(fresh_hub):
+    """Locks the raw-vs-sanitized decision: a retry-after clause sitting
+    beyond the 512-char sanitize truncation point still classifies — the
+    digest lastError.message is the truncated sanitized text while
+    retryAfter comes from the raw message."""
+    hub, subscriber = fresh_hub
+
+    long_msg = "rate limit reached " + "x" * 600 + " retry after 45s"
+    hub.publish(make_global_event("/proj", "session.error", {
+        "sessionID": "s1",
+        "error": {"name": "RateLimitError", "data": {"message": long_msg}},
+    }))
+    frames = await drain_queue(subscriber)
+    le = next(
+        d["lastError"] for event, d in (parse_event(f) for f in frames)
+        if event == "session.digest" and "lastError" in d
+    )
+    assert len(le["message"]) <= 512  # wire message stays sanitized/truncated
+    assert "retry after 45" not in le["message"]
+    assert le["code"] == "provider_rate_limited"
+    assert le["retryAfter"] == 45  # extracted from the RAW message
+
+
+async def test_g1_abort_still_filtered_with_classifiable_message(fresh_hub):
+    """MessageAbortedError stays filtered even when its message would
+    classify (no frame, no digest lastError, no structured fields)."""
+    hub, subscriber = fresh_hub
+
+    hub.publish(make_global_event("/proj", "session.error", {
+        "sessionID": "s1",
+        "error": {
+            "name": "MessageAbortedError",
+            "data": {"message": "429 rate limit retry after 30s"},
+        },
+    }))
+    frames = await drain_queue(subscriber)
+    parsed = [parse_event(f) for f in frames]
+    assert not any(event == "session.error" for event, _ in parsed)
+    assert not any(
+        event == "session.digest" and "lastError" in data
+        for event, data in parsed
+    )
+
+
+async def test_g1_non_str_name_still_classifies_via_message(fresh_hub):
+    """Non-str error.name (already coerced to None) must still produce a
+    classified code from the message — and never crash either path."""
+    hub, subscriber = fresh_hub
+
+    hub.publish(make_global_event("/proj", "session.error", {
+        "sessionID": "s1",
+        "error": {"name": 42, "data": {"message": "429 too many requests"}},
+    }))
+    frames = await drain_queue(subscriber)
+    le = next(
+        d["lastError"] for event, d in (parse_event(f) for f in frames)
+        if event == "session.digest" and "lastError" in d
+    )
+    assert le["code"] == "provider_rate_limited"
+
+
+async def test_g1_b_out_of_int64_quota_reset_dropped_before_orjson(fresh_hub):
+    """P1 integration: quota_reset_at=10**400 must be DROPPED by the
+    classifier — carrying it through would make sse_frame's orjson.dumps
+    raise ``TypeError: Integer exceeds 64-bit range`` inside publish
+    (global_hub.py G1-B direct-frame path), killing the subscriber. The
+    frame must still be emitted, just without the quotaResetAt key."""
+    hub, subscriber = fresh_hub
+
+    hub.publish(make_global_event("/proj", "session.error", {
+        "error": {
+            "name": "QuotaError",
+            "data": {
+                "message": "exceeded quota",
+                "quota_reset_at": 10**400,
+                "retry_after": 30,
+            },
+        },
+    }))
+    frames = await drain_queue(subscriber)
+    err_frames = [
+        data for event, data in (parse_event(f) for f in frames)
+        if event == "session.error"
+    ]
+    assert len(err_frames) == 1
+    frame = err_frames[0]
+    assert frame["code"] == "provider_quota_exceeded"
+    assert "quotaResetAt" not in frame  # dropped, not carried, not raised
+    assert frame["retryAfter"] == 30    # siblings unaffected
+
+
+async def test_g1_a_in_range_quota_reset_survives_wire(fresh_hub):
+    """P1 counterpart: an in-range (2**62) epoch passes the gate and lands
+    verbatim-int in the digest lastError — proves the gate is a range
+    check, not a blanket drop."""
+    hub, subscriber = fresh_hub
+
+    hub.publish(make_global_event("/proj", "session.error", {
+        "sessionID": "s1",
+        "error": {
+            "name": "QuotaError",
+            "data": {"message": "exceeded quota", "quota_reset_at": 2**62},
+        },
+    }))
+    frames = await drain_queue(subscriber)
+    le = next(
+        d["lastError"] for event, d in (parse_event(f) for f in frames)
+        if event == "session.digest" and "lastError" in d
+    )
+    assert le["quotaResetAt"] == 2**62
+    assert type(le["quotaResetAt"]) is int
+
+
+# ---------------------------------------------------------------------------
 # Config: sse_queue_items must be >= 2 (overflow enqueues resync + STOP)
 # ---------------------------------------------------------------------------
 

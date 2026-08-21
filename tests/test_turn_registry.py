@@ -466,7 +466,7 @@ def _passthrough_handler():
 
 
 async def test_write_route_bumps_turn_on_prompt_async(upstream_factory):
-    """POST /slimapi/session/{sid}/prompt_async?v=3 bumps turn (terminal:
+    """POST /slimapi/session/{sid}/prompt_async?v=4 bumps turn (terminal:
     the bump moved from the retired catch-all forwarder into the annexed
     write pipeline — S2 bump-before-send semantics preserved)."""
     upstream = upstream_factory(_passthrough_handler())
@@ -477,17 +477,17 @@ async def test_write_route_bumps_turn_on_prompt_async(upstream_factory):
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(
-            "/slimapi/session/ses_abc/prompt_async?v=3")
+            "/slimapi/session/ses_abc/prompt_async?v=4")
     assert response.status_code == 200
     assert reg.snapshot("ses_abc") == (4, 1)
     # Second prompt_async is monotonic.
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        await client.post("/slimapi/session/ses_abc/prompt_async?v=3")
+        await client.post("/slimapi/session/ses_abc/prompt_async?v=4")
     assert reg.snapshot("ses_abc") == (4, 2)
 
 
 async def test_write_route_bumps_turn_on_abort(upstream_factory):
-    """POST /slimapi/session/{sid}/abort?v=3 bumps (contract §3.y.3)."""
+    """POST /slimapi/session/{sid}/abort?v=4 bumps (contract §3.y.3)."""
     upstream = upstream_factory(_passthrough_handler())
     app = _build_app(_settings(), upstream)
     reg = TurnRegistry(incarnation=1)
@@ -496,7 +496,7 @@ async def test_write_route_bumps_turn_on_abort(upstream_factory):
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(
-            "/slimapi/session/ses_abc/abort?v=3")
+            "/slimapi/session/ses_abc/abort?v=4")
     assert response.status_code == 200
     assert reg.snapshot("ses_abc") == (1, 1)
 
@@ -533,7 +533,7 @@ async def test_write_route_does_not_bump_on_non_post_method(upstream_factory):
     assert response.status_code == 404
     assert reg.snapshot("ses_abc") == (2, 0)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        await client.post("/slimapi/session/ses_abc/prompt_async?v=3")
+        await client.post("/slimapi/session/ses_abc/prompt_async?v=4")
     assert reg.snapshot("ses_abc") == (2, 1)
 
 
@@ -565,7 +565,7 @@ async def test_write_route_no_turn_registry_in_state_still_works(upstream_factor
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(
-            "/slimapi/session/ses_abc/prompt_async?v=3")
+            "/slimapi/session/ses_abc/prompt_async?v=4")
     assert response.status_code == 200
 
 

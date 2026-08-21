@@ -52,7 +52,6 @@ from oc_slimapi.transform import TransformConfig, TransformPool
 from v4_fixture import DATASET, FIXED_NOW_MS, build_fixture_db
 
 IDENTITY = {"Accept-Encoding": "identity"}
-V3 = {"v": "3"}
 V4 = {"v": "4"}
 
 # §13.1 canonical item 冻结字段全集（presence 双向校验用——缺任一键即违约）。
@@ -149,7 +148,8 @@ class _RacedAux:
         raise AuxiliaryUnavailableError("raced disable")
 
 
-def _build_app(aux, *, settings: Settings | None = None, handler=None):
+def _build_app(aux, *, settings: Settings | None = None, handler=None,
+                 selector: bool = True):
     seen: list[httpx.Request] = []
 
     def recording(request: httpx.Request) -> httpx.Response:
@@ -180,7 +180,11 @@ def _build_app(aux, *, settings: Settings | None = None, handler=None):
                    read_groups.router):
         app.include_router(router)
     register_error_handlers(app)
-    app.add_middleware(SlimapiSelectorMiddleware)
+    # selector=False → selector-less direct invocation (route default view 3);
+    # used by the v3-branch regression lock below (V2b removes it with the
+    # v3-branch teardown).
+    if selector:
+        app.add_middleware(SlimapiSelectorMiddleware)
     install_proxy(app)
     return app, seen
 
@@ -1210,20 +1214,11 @@ async def test_gate_off_list_fallback_sparse_degraded(gate_off):
 # v3 回归 / selector-less
 # ---------------------------------------------------------------------------
 
-async def test_v3_regression_skeleton_shape():
-    app, seen = _build_app(_StubAux("disabled"))
-    async with _client(app) as client:
-        resp = await client.get("/slimapi/session/h1",
-                                params=V3, headers=IDENTITY)
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body == skeleton_session(UPSTREAM_SINGLE)
-    for key in ("tokens_input", "tokens_output", "tokens_reasoning",
-                "tokens_cache_read", "tokens_cache_write", "project",
-                "partial", "degraded"):
-        assert key not in body
-    assert len(seen) == 1
-    assert seen[0].url.path == "/session/h1"
+# V2b teardown note: test_v3_regression_skeleton_shape (selector-less lock
+# asserting the frozen v3 skeleton from the session_single v3 branch) was
+# removed with the branch itself — wire_view_from_scope is constant 4 and
+# the selector-less direct invocation now runs the v4 session_single
+# pipeline. The v4 shape itself is locked by the projection tests above.
 
 
 async def test_selectorless_never_routes_v4():
@@ -1234,5 +1229,5 @@ async def test_selectorless_never_routes_v4():
     assert resp.status_code == 400
     body = resp.json()
     assert body["code"] == "unsupported_version"
-    assert body["supported"] == [3, 4]
+    assert body["supported"] == [4]
     assert seen == []

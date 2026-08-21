@@ -21,7 +21,7 @@ ocdroid (Android)
 
 - **两个 :4097 入口**（明文）：
   - **`127.0.0.1:4097`**（默认，loopback）：仅供本机 + stunnel mTLS（:14097）终结后转发的推荐路径。
-  - **`0.0.0.0:4097`**（opt-in，默认关闭；2026-08-21 起默认回环）：显式开启后允许通过 Tailscale 地址直接访问，**不强制 mTLS**。**安全模型**：远程暴露需依赖 Tailscale ACL / 主机防火墙隔离；该入口**无**应用层鉴权（thin routes 自身不验证客户端身份），版本选择器（`?v=3` 终态门禁）仍生效。
+  - **`0.0.0.0:4097`**（opt-in，默认关闭；2026-08-21 起默认回环）：显式开启后允许通过 Tailscale 地址直接访问，**不强制 mTLS**。**安全模型**：远程暴露需依赖 Tailscale ACL / 主机防火墙隔离；该入口**无**应用层鉴权（thin routes 自身不验证客户端身份），版本选择器（`?v=4` 终态门禁）仍生效。
 - **:14097 仍为推荐的 mTLS 入口**；明文直连仅为 Tailscale 内网/运维便利，不应在不可信网络暴露。
 - upstream 固定 `http://127.0.0.1:4096`（opencode legacy HTTP API）——**无论 host 如何**，`config.validate()` 始终强制 upstream 必须是 fixed loopback HTTP（SSRF guard 不放松）。
 - **单进程单 worker**：多 worker 会为同一 directory 重复建立 upstream SSE，禁止。
@@ -56,7 +56,7 @@ systemctl --user restart oc-slimapi
 验证：
 
 ```bash
-curl -s 'http://127.0.0.1:4097/slimapi/health?v=3'
+curl -s 'http://127.0.0.1:4097/slimapi/health?v=4'
 # 期望 sidecar.version 与 pyproject.toml / 刚发的 tag 一致
 ```
 
@@ -172,12 +172,14 @@ sudo loginctl enable-linger "$USER"
 
 代码升级 / 发版后部署流程（**三步缺一不可**）：
 
+> **分支纪律（batch3 v4 分支，B6）**：本机部署**仅允许 main 分支 HEAD 且已发版 tag**——部署前先 `git branch --show-current`（必须 `main`）+ `git describe --tags --exact-match`（必须命中 tag）。`v4` 分支**拒绝部署**（merge gate 未通过；merge 回 main 并 `release.sh minor` 之后才可在 main 部署——owner 2026-08-21 裁定收窄发 minor）。`scripts/release.sh` 对 v4 分支已内置同样的非零退出防线。
+
 ```bash
 cd /home/mar/personal_projects/oc-slimapi
 git pull                                          # 1. 拉代码（含 pyproject version）
 .venv/bin/pip install -e '.[test]'                # 2. 刷新 editable dist-info（否则 health.version 滞后）
 systemctl --user restart oc-slimapi               # 3. 重启进程加载新代码 + 新 __version__
-curl -s 'http://127.0.0.1:4097/slimapi/health?v=3'
+curl -s 'http://127.0.0.1:4097/slimapi/health?v=4'
 # 确认 sidecar.ok=true 且 sidecar.version 与 tag 一致
 ```
 
@@ -433,32 +435,33 @@ systemctl --user is-enabled oc-slimapi   # enabled
 
 ```bash
 # 必须带版本头
-curl -s 'http://127.0.0.1:4097/slimapi/health?v=3' | jq .
+curl -s 'http://127.0.0.1:4097/slimapi/health?v=4' | jq .
 ```
 
-期望响应（v3 视图，`?v=3`；4.0.0 起 `(3,4)` 双版本窗口，`?v=4` 视图另见下一条 bullet）：
+期望响应（v4-only 视图，`?v=4`；4.8.0 起单版本窗口——4.0.0–4.7.0 曾为 (3,4) 双版本、v3 视图已退役）：
 
 ```json
 {
-  "slimapi_contract": 3,
+  "slimapi_contract": 4,
   "sidecar": { "ok": true, "version": "<包版本，读 dist-info>" },
-  "server":  { "api_version": 4, "accepted_client_versions": [3, 4] },
+  "server":  { "api_version": 4, "accepted_client_versions": [4] },
   "schema":  { "degraded": false, "version": 3, "clientMin": 3, "clientMax": 4 },
-  "features": { "tokenStream": true, "thresholdedSkeleton": true, "skeletonInlineOutputMaxBytes": 4096, "allowlist": { "enabled": false } }
+  "features": { "tokenStream": true, "thresholdedSkeleton": true, "skeletonInlineOutputMaxBytes": 4096, "allowlist": { "enabled": false } },
+  "auxiliary": { "available": true, "mode": "ro" }
 }
 ```
 
-- `slimapi_contract` = 当前请求生效的 wire 视图（v3 请求恒 3）。该值是 `src/oc_slimapi/routes/health.py` 内的 `WIRE_VIEW` 常量（v4 请求时另加根级 `auxiliary` 与 `features.allowlist` 详情，双视图语义见 v4-contract §3.2）；权威契约 = `docs/specs/v3-contract.md` + `docs/specs/v4-contract.md`。
+- `slimapi_contract` = 当前请求生效的 wire 视图（4.8.0 起恒 4——`routes/health.py` 单一视图源 `wire_view_from_scope`；恒带根级 `auxiliary`，语义见 v4-contract §3.2）；权威契约 = `docs/specs/v4-contract.md`。
 - `sidecar.version` = `pyproject.toml` 的版本（示例勿照抄——以部署版本为准；editable install 升级后须 reinstall 刷新，见 §4）。
-- `server.api_version` = 4；`accepted_client_versions` = `[3, 4]`（4.0.0 起 (3,4) 双版本窗口：`?v=3`/`?v=4` 均合法，缺 `v`/不支持值被 `400 unsupported_version supported:[3,4]` 拒绝——`X-Slimapi-Version` 头已删除）。
+- `server.api_version` = 4；`accepted_client_versions` = `[4]`（4.8.0 起 (4,4) v4-only 窗口：`?v=4` 唯一合法，缺 `v`/`v=3`/不支持值被 `400 unsupported_version supported:[4]` 拒绝——`X-Slimapi-Version` 头已删除）。
 - `features.allowlist` = [3.3.0] 起的 allowlist 机制回演（`enabled` 反映 `OC_SLIMAPI_DIRECTORY_ALLOWLIST` 三态，未配置=false；可达时另有 `droppedEvents` 计数，见 §5.5.1）。
 - `schema.degraded=true` → 启动 smoke 探针发现 opencode 响应字段漂移，需查上游是否升级/改了 schema。
-- 不带 `?v=3` → `400 unsupported_version`（版本选择器终态门禁，符合契约）。
+- 不带 `?v=4` → `400 unsupported_version`（版本选择器终态门禁，符合契约）。
 
 ### 6.3 ready 检查（轻量）
 
 ```bash
-curl -s 'http://127.0.0.1:4097/slimapi/ready?v=3'
+curl -s 'http://127.0.0.1:4097/slimapi/ready?v=4'
 ```
 
 ---
@@ -554,9 +557,9 @@ ocdroid 客户端**不直接操作** sidecar 进程，只通过 stunnel mTLS 接
 | 经 sidecar mTLS 入口（推荐） | stunnel `:14097` → sidecar `127.0.0.1:4097` |
 | 经 sidecar 明文直连入口（Tailscale 等） | Tailscale 地址`:4097` → sidecar `0.0.0.0:4097`（依赖 Tailscale ACL / 防火墙；无 mTLS）（opt-in 非默认；2026-08-21 起默认回环） |
 | 直连回退（不经 sidecar） | stunnel `:14096` → opencode `127.0.0.1:4096` |
-| 所有 `/slimapi/**` 请求必带 query | `?v=3`（4.0.0 起 `?v=4` 亦合法——(3,4) 双版本窗口；无 `v`/`v=2`/不支持值 → `400 unsupported_version supported:[3,4]`；`X-Slimapi-Version` 头已删除不解读） |
+| 所有 `/slimapi/**` 请求必带 query | `?v=4`（4.8.0 起 v4-only 单版本窗口；无 `v`/`v=3`/不支持值 → `400 unsupported_version supported:[4]`；`X-Slimapi-Version` 头已删除不解读） |
 | 非 `/slimapi/**` | **3.0.0 已关闭**——未收编路径 404 `thin_route_not_found`（2.x 为透明反代，历史行为见 CHANGELOG） |
-| 健康自检（客户端侧） | `GET /slimapi/health?v=3` 读 `server.api_version` / `accepted_client_versions` 做运行时兼容判断 |
+| 健康自检（客户端侧） | `GET /slimapi/health?v=4` 读 `server.api_version` / `accepted_client_versions` 做运行时兼容判断 |
 | Wire 行为变更来源 | 本仓 [`CHANGELOG.md`](../CHANGELOG.md)（路径/头/错误码以本仓 + [`v3-contract.md`](specs/v3-contract.md) 为准） |
 | 客户端配套改动清单 | [`CLIENT_CHANGES.md`](specs/CLIENT_CHANGES.md) |
 
@@ -570,8 +573,8 @@ sidecar 进程的启停、日志、升级由 **服务端运维** 负责，ocdroi
 |---|---|
 | 服务起不来 | `journalctl --user -u oc-slimapi -n 50`；多半是 upstream / host 校验失败 |
 | `schema.degraded=true` | opencode 升级了；查 `opencode-src/current/` 对照字段，或临时设 `OC_SLIMAPI_SMOKE_SESSION_ID` 跳过随机探针 |
-| 客户端连上但 400 | 无 `?v=3` / `v=2` / 不支持值 → `unsupported_version`；directory 相关 → `invalid_directory_selector`/`directory_conflict`/`directory_header_retired`（消费集头通道已退役，用 `?directory=`） |
-| SSE 卡顿/断 | `journalctl --user -u oc-slimapi \| rg 'backpressure\|resync\|503'`；查 `/slimapi/metrics?v=3` 的订阅者计数（**metrics 探针自身须带 `?v=3`**，否则 400） |
+| 客户端连上但 400 | 无 `?v=4` / `v=3` / 不支持值 → `unsupported_version`；directory 相关 → `invalid_directory_selector`/`directory_conflict`/`directory_header_retired`（消费集头通道已退役，用 `?directory=`） |
+| SSE 卡顿/断 | `journalctl --user -u oc-slimapi \| rg 'backpressure\|resync\|503'`；查 `/slimapi/metrics?v=4` 的订阅者计数（**metrics 探针自身须带 `?v=4`**，否则 400） |
 | SSE 订阅被 400 拒 | 订阅数触顶：digest 面 `MAX_SUBSCRIBERS_PER_DIRECTORY`（8）/`MAX_TOTAL_SUBSCRIBERS`（16），token stream 面 `TOKEN_STREAM_MAX_SUBSCRIBERS`（8）；按 §5.5 表调 env 后重启 |
 | `transform_busy` 503 持续 | transform 池拥塞（非 dbaux 降级，`degraded503` 不置位）：先看 `OC_SLIMAPI_MAX_TRANSFORMS`/`TRANSFORM_ABSORB_BUDGET_SECONDS`（默认吸收 2.5s）与上游延迟；偶发属预期，持续才调参 |
 | questions/permissions 结果缺目录 | envelope `errors[]`（该目录 `upstream_unavailable` 等）与 `truncated:true`（聚合预算触顶）——降级字段观察法，非故障 |
@@ -633,7 +636,7 @@ curl -v https://opencode.vectory.cn:14097/slimapi/health
 curl http://opencode.vectory.cn:4097/slimapi/health
 
 # 本机 loopback 验证（明文可达——此路径应被边界阻止，但本机不受限）
-curl -s 'http://127.0.0.1:4097/slimapi/health?v=3'
+curl -s 'http://127.0.0.1:4097/slimapi/health?v=4'
 
 # mTLS 回环（须带客户端证书；本机可用 stunnel 自签名测试）
 curl -s --cert client-cert.pem --key client-key.pem \
@@ -646,7 +649,7 @@ curl -s --cert client-cert.pem --key client-key.pem \
 
 ```bash
 # sidecar 健康（本机 loopback 明文）
-curl -s 'http://127.0.0.1:4097/slimapi/health?v=3'
+curl -s 'http://127.0.0.1:4097/slimapi/health?v=4'
 
 # mTLS 回环（须带客户端证书）
 curl -s --cert client-cert.pem --key client-key.pem \
@@ -680,7 +683,7 @@ curl -s --cert client-cert.pem --key client-key.pem \
 
 运维须明确接受本功能与既有 catch-all 相同的风险类：
 
-- **明文 `:4097` 可达**：能访问 `:4097` 的任何设备均可触发 manifest 中声明的任意动作。版本选择器（`?v=3`；`X-Slimapi-Version` 头已删除）≠ 鉴权，`confirm` ≠ 授权，`X-Client-Id` 不可信。
+- **明文 `:4097` 可达**：能访问 `:4097` 的任何设备均可触发 manifest 中声明的任意动作。版本选择器（`?v=4`；`X-Slimapi-Version` 头已删除）≠ 鉴权，`confirm` ≠ 授权，`X-Client-Id` 不可信。
 - **不做 token、不加 loopback 闸门**：本功能延续既有安全模型，不引入额外鉴权层。
 - **缓解措施**（已纳入，非授权替代）：
   - 默认空 manifest（功能 opt-in，默认禁用）

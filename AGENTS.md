@@ -18,8 +18,8 @@ ocdroid ──(stunnel mTLS 14096)──▶ opencode :4096   # 直连回退，�
 ```
 
 - **只**通过 HTTP 调 opencode **legacy** `/session/**`（及 `/global/event` 等），并经只读投影源读 opencode SQLite（4.0.0 起生产启用，`mode=ro` 的 v4 DB 投影通道；**绝无写入**——写域约束见硬规则「SQLite 写域」）。
-- 为 ocdroid 提供：消息 skeleton 投影、策展 SSE（`session.digest` + q/p 直推 + `slimapi.meta` 首帧）、T3 资源限制、`/slimapi/**` `?v=` 选择器（4.0.0 起 (3,4) 双版本窗口：`?v=3`/`?v=4`；catch-all 反代已于 3.0.0 关闭）。
-- **权威契约**：[`docs/specs/v3-contract.md`](docs/specs/v3-contract.md)（v3 wire 基准；4.0.0 起 (3,4) 双版本窗口，v4 差异面见 [`docs/specs/v4-contract.md`](docs/specs/v4-contract.md)；与 design / INTERFACE_MAP 冲突时以契约为准）。[`docs/specs/v2-contract.md`](docs/specs/v2-contract.md) 为 ≤2.x 历史契约（v2 语义已于 3.0.0 退役）。
+- 为 ocdroid 提供：消息 skeleton 投影、策展 SSE（`session.digest` + q/p 直推 + `slimapi.meta` 首帧）、T3 资源限制、`/slimapi/**` `?v=` 选择器（4.8.0 起 v4-only 单版本窗口：`?v=4` 唯一合法；4.0.0–4.7.0 曾为 (3,4) 双版本；catch-all 反代已于 3.0.0 关闭）。
+- **权威契约**：[`docs/specs/v4-contract.md`](docs/specs/v4-contract.md)（**现行契约权威**，4.8.0 起 v4-only 自包含；与 design / INTERFACE_MAP 冲突时以契约为准）。[`docs/specs/v3-contract.md`](docs/specs/v3-contract.md) 为 ≤4.7.0 历史存档（v3 wire 版本已退役）；[`docs/specs/v2-contract.md`](docs/specs/v2-contract.md) 为 ≤2.x 历史契约（v2 语义已于 3.0.0 退役）。
 - **设计 / 接口追踪**：[`docs/specs/design-v2.md`](docs/specs/design-v2.md)、[`docs/specs/INTERFACE_MAP.md`](docs/specs/INTERFACE_MAP.md)。
 - **客户端配套说明**：[`docs/specs/CLIENT_CHANGES.md`](docs/specs/CLIENT_CHANGES.md)（给 ocdroid 开发者的改动清单）。
 
@@ -75,7 +75,7 @@ ocdroid ──(stunnel mTLS 14096)──▶ opencode :4096   # 直连回退，�
 - **SQLite 写域**：禁止写入/修改上游 opencode SQLite 业务数据；sidecar 代码路径零 DDL/DML/PRAGMA 写；索引建立属显式运维动作（含定义校验），不在 sidecar 内。wire contract 只冻结可观察语义（参数/错误/降级/degraded），**不冻结 SQLite 实现手段**；实现边界进本文件 / 架构设计文档 / `docs/operations.md`。
 - **版本双轨**：
   - **包版本**（semver，git tag `vX.Y.Z` + `pyproject.toml`）：产品/发版版本。
-  - **Wire API 版本**（整数，`versioning.py` 中 `ACCEPTED_CLIENT_VERSIONS`，当前 `(3,4)`——4.0.0 起 (3,4) 双版本窗口）：协商经 `?v=` selector + `/slimapi/versions` 发现端点；`X-Slimapi-Version` 请求头已于 3.0.0 删除（出现不解读）。
+  - **Wire API 版本**（整数，`versioning.py` 中 `ACCEPTED_CLIENT_VERSIONS`，当前 `(4,4)`——4.8.0 起 v4-only 单版本窗口）：协商经 `?v=` selector + `/slimapi/versions` 发现端点；`X-Slimapi-Version` 请求头已于 3.0.0 删除（出现不解读）。
 - **Git 分支**：主线 `main`；发版在 `main` 上打 tag。
 - **禁止**：手写随意 tag 跳过 `release.sh`；在未更新 `CHANGELOG.md` 的情况下发布 wire 行为变更；把 secret / `.venv` / 本机路径密钥提交进仓。
 - **写域纪律**：多 agent 并行时严守文件归属；`docs/specs/v3-contract.md` 非用户明确要求不要改。

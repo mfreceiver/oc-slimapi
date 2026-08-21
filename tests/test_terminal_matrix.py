@@ -1,11 +1,13 @@
 """v3-contract **terminal state** (sidecar 3.0.0 / M3) wire matrix —
-dual-version window update (4.0.0 / B3a): supported set is now [3, 4].
+version-window narrowing update (2026-08-21, shipped 4.8.0): supported set
+is now [4] only (``?v=3`` answers the unsupported-version 400).
 
 The v2 pipeline is deleted. Frozen terminal clauses under test:
 
-* §2 退役后: no ``v`` / ``v=2`` → 400 ``{"code":"unsupported_version",
-  "supported":[3, 4]}`` (endpoint exists, version retired — never a silent
-  404). ``v=3`` unchanged. Lexical garbage → ``invalid_version_selector``.
+* §2 退役后: no ``v`` / ``v=2`` / ``v=3`` → 400
+  ``{"code":"unsupported_version","supported":[4]}`` (endpoint exists,
+  version retired — never a silent 404). Lexical garbage →
+  ``invalid_version_selector``.
 * §1 header retirement: ``X-Slimapi-Version`` is never read (any value,
   any presence); ``X-Opencode-Directory`` on a §5.3 consuming route →
   400 ``directory_header_retired`` (§5.7).
@@ -13,8 +15,8 @@ The v2 pipeline is deleted. Frozen terminal clauses under test:
   (multi-value → dual-present conflict → retired header) → ④404.
 * §8.2 catch-all closed: every uncollected path → 404
   ``thin_route_not_found`` (no upstream call, no consumption).
-* §3/§3a: ``available:[3]``, capabilities keyed "3" only; health single
-  v3 view (contract/api_version/schema.version == 3, accepted [3,3]).
+* §3/§3a: ``available:[4]``, capabilities keyed "4" only; health single
+  v4 view (contract/api_version/schema.version == 4, accepted [4,4]).
 * §4 envelope always (messages/sessions lists); ``X-Next-Cursor`` /
   ``X-Complete`` never produced (§1).
 * §6.2 Vary shrink: every JSON route ``Vary: Accept-Encoding`` only.
@@ -70,7 +72,13 @@ def _message_payload() -> bytes:
 
 
 def _sessions_payload() -> bytes:
-    return orjson.dumps([{"id": "s1", "title": "one"}])
+    # 2026-08-21 narrowing: the (only) admitted v4 face projects sessions
+    # through the canonical projector — the fixture must be representable
+    # (id/time/directory present), else the whole response fail-closes 503.
+    return orjson.dumps([{
+        "id": "s1", "title": "one",
+        "time": {"created": 1, "updated": 1}, "directory": "/w",
+    }])
 
 
 def _build_app(handler, *, settings: Settings | None = None):
@@ -120,7 +128,7 @@ async def test_no_v_is_unsupported_version():
         resp = await client.get("/slimapi/sessions", headers=IDENTITY)
         assert resp.status_code == 400
         assert resp.json() == {"code": "unsupported_version",
-                               "supported": [3, 4]}
+                               "supported": [4]}
     assert seen == []  # never forwarded
 
 
@@ -133,7 +141,7 @@ async def test_v2_explicit_is_unsupported_version():
                                 params={"v": "2"}, headers=IDENTITY)
         assert resp.status_code == 400
         assert resp.json() == {"code": "unsupported_version",
-                               "supported": [3, 4]}
+                               "supported": [4]}
     assert seen == []
 
 
@@ -146,7 +154,7 @@ async def test_version_header_never_read():
     async with _client(app) as client:
         for header_value in ("2", "3", "9", "garbage"):
             resp = await client.get(
-                "/slimapi/sessions", params={"v": "3"},
+                "/slimapi/sessions", params={"v": "4"},
                 headers={**IDENTITY, VERSION_HEADER: header_value})
             assert resp.status_code == 200, header_value
         # header alone (no v) still 400 — the header cannot substitute v.
@@ -173,7 +181,7 @@ async def test_unsupported_v_reports_supported_3(unsupported):
                                 headers=IDENTITY)
         assert resp.status_code == 400
         assert resp.json() == {"code": "unsupported_version",
-                               "supported": [3, 4]}
+                               "supported": [4]}
 
 
 async def test_multi_value_same_folds_v3():
@@ -181,7 +189,7 @@ async def test_multi_value_same_folds_v3():
         200, content=_sessions_payload(),
         headers={"Content-Type": "application/json"}))
     async with _client(app) as client:
-        resp = await client.get("/slimapi/sessions?v=3&v=3", headers=IDENTITY)
+        resp = await client.get("/slimapi/sessions?v=4&v=4", headers=IDENTITY)
         assert resp.status_code == 200
     assert "v=" not in seen[0].url.query.decode("latin-1")  # v consumed
 
@@ -232,20 +240,23 @@ async def test_priority_selector_over_directory():
         assert resp.json()["code"] == "unsupported_version"
 
 
-async def test_priority_directory_chain_within_v3():
+async def test_priority_directory_chain_within_v4():
     """③ directory chain (§8.3): multi-value → dual-present conflict →
-    retired header — each evaluated only after the previous passes."""
+    retired header — each evaluated only after the previous passes. On a
+    NON-retired consuming route (messages; the global sessions list is the
+    §5.2 v4 retirement table and answers directory_retired_in_v4 for any
+    directory input instead)."""
     app, _ = _build_app(lambda r: httpx.Response(200, content=b"[]"))
     async with _client(app) as client:
         # multi-value different wins over conflict/retired co-presence
         resp = await client.get(
-            "/slimapi/sessions",
-            params={"v": "3", "directory": ["/a", "/b"]},
+            "/slimapi/messages/s1",
+            params={"v": "4", "directory": ["/a", "/b"]},
             headers={**IDENTITY, DIRECTORY_HEADER: "/c"})
         assert resp.json()["code"] == "invalid_directory_selector"
         # dual-present different → directory_conflict (before retired)
         resp = await client.get(
-            "/slimapi/sessions", params={"v": "3", "directory": "/a"},
+            "/slimapi/messages/s1", params={"v": "4", "directory": "/a"},
             headers={**IDENTITY, DIRECTORY_HEADER: "/b"})
         assert resp.status_code == 400
         body = resp.json()
@@ -254,13 +265,13 @@ async def test_priority_directory_chain_within_v3():
         assert body["headerDirectory"] == "/b"
         # header alone → retired
         resp = await client.get(
-            "/slimapi/sessions", params={"v": "3"},
+            "/slimapi/messages/s1", params={"v": "4"},
             headers={**IDENTITY, DIRECTORY_HEADER: "/w"})
         assert resp.status_code == 400
         assert resp.json() == {"code": "directory_header_retired"}
         # dual-present normalized SAME → still retired (header presence)
         resp = await client.get(
-            "/slimapi/sessions", params={"v": "3", "directory": "/w"},
+            "/slimapi/messages/s1", params={"v": "4", "directory": "/w"},
             headers={**IDENTITY, DIRECTORY_HEADER: "/w"})
         assert resp.json() == {"code": "directory_header_retired"}
 
@@ -273,7 +284,7 @@ async def test_blank_directory_header_is_retired():
     async with _client(app) as client:
         for blank_value in ("", "   ", "\t "):
             resp = await client.get(
-                "/slimapi/sessions", params={"v": "3"},
+                "/slimapi/messages/s1", params={"v": "4"},
                 headers={**IDENTITY, DIRECTORY_HEADER: blank_value})
             assert resp.status_code == 400, blank_value
             assert resp.json() == {"code": "directory_header_retired"}, (
@@ -289,7 +300,7 @@ async def test_priority_selector_over_route_miss():
         assert resp.status_code == 400
         assert resp.json()["code"] == "unsupported_version"
         resp = await client.get("/slimapi/does/not/exist",
-                                params={"v": "3"}, headers=IDENTITY)
+                                params={"v": "4"}, headers=IDENTITY)
         assert resp.status_code == 404
         assert resp.json() == {"code": "thin_route_not_found"}
 
@@ -305,25 +316,33 @@ async def test_directory_header_retired_on_consuming_routes():
         200, content=_sessions_payload(),
         headers={"Content-Type": "application/json"}))
     async with _client(app) as client:
-        for path in ("/slimapi/sessions", "/slimapi/messages/s1",
+        for path in ("/slimapi/messages/s1",
                      "/slimapi/agent", "/slimapi/file",
                      "/slimapi/vcs", "/slimapi/session/s1",
                      "/slimapi/session/s1/command"):
             resp = await client.get(
-                path, params={"v": "3"},
+                path, params={"v": "4"},
                 headers={**IDENTITY, DIRECTORY_HEADER: "/w"})
             assert resp.status_code == 400, path
             assert resp.json() == {"code": "directory_header_retired"}, path
+        # §5.2 v4 retirement table: the global sessions list answers the
+        # uniform retirement error for ANY directory input instead.
+        resp = await client.get(
+            "/slimapi/sessions", params={"v": "4"},
+            headers={**IDENTITY, DIRECTORY_HEADER: "/w"})
+        assert resp.status_code == 400
+        assert resp.json()["code"] == "directory_retired_in_v4"
 
 
 async def test_directory_query_still_works_and_strips():
-    """The canonical ?directory= channel is unchanged under v3."""
+    """The canonical ?directory= channel is unchanged on the consuming set
+    (agent; the global sessions list retires directory in v4 — §5.2)."""
     app, seen = _build_app(lambda r: httpx.Response(
         200, content=_sessions_payload(),
         headers={"Content-Type": "application/json"}))
     async with _client(app) as client:
         resp = await client.get(
-            "/slimapi/sessions", params={"v": "3", "directory": "/w"},
+            "/slimapi/agent", params={"v": "4", "directory": "/w"},
             headers=IDENTITY)
         assert resp.status_code == 200
     assert seen[0].headers.get(DIRECTORY_HEADER) == "/w"
@@ -338,7 +357,7 @@ async def test_directory_tolerant_routes_ignore_header():
         headers={"Content-Type": "application/json"}))
     async with _client(app) as client:
         resp = await client.get(
-            "/slimapi/global/health", params={"v": "3"},
+            "/slimapi/global/health", params={"v": "4"},
             headers={**IDENTITY, DIRECTORY_HEADER: "/w"})
         assert resp.status_code == 200
         assert seen[0].headers.get(DIRECTORY_HEADER) is None
@@ -352,7 +371,7 @@ async def test_stream_directory_terminal():
     app, _ = _build_app(lambda r: httpx.Response(200, content=b"[]"))
     async with _client(app) as client:
         resp = await client.get(
-            "/slimapi/sessions/s1/stream", params={"v": "3"},
+            "/slimapi/sessions/s1/stream", params={"v": "4"},
             headers={**IDENTITY, DIRECTORY_HEADER: "/w"})
         assert resp.status_code == 400
         assert resp.json() == {"code": "directory_header_retired"}
@@ -399,11 +418,10 @@ async def test_versions_terminal_shape():
         resp = await client.get("/slimapi/versions", headers=IDENTITY)
         assert resp.status_code == 200
         body = resp.json()
-        # dual-version window: current=4, available=[3, 4] (v4-contract §3.1)
+        # v4-only window (2026-08-21 narrowing): current=4, available=[4]
         assert body["current"] == 4
-        assert body["available"] == [3, 4]
-        assert set(body["capabilities"].keys()) == {"3", "4"}
-        assert body["capabilities"]["3"]["directoryQuery"] is True
+        assert body["available"] == [4]
+        assert set(body["capabilities"].keys()) == {"4"}
         # four static §3.1 keys by value + the additive §3.3 readiness key
         # and §14 expand block (2026-08-19 revision / 4.2.0 close-out;
         # payload shapes locked in test_versions_readiness.py)
@@ -417,22 +435,27 @@ async def test_versions_terminal_shape():
         }
 
 
-async def test_health_single_v3_view():
+async def test_health_single_v4_view():
     app, _ = _build_app(lambda r: httpx.Response(200, content=b"[]"))
     async with _client(app) as client:
         resp = await client.get("/slimapi/health",
-                                params={"v": "3"}, headers=IDENTITY)
+                                params={"v": "4"}, headers=IDENTITY)
         assert resp.status_code == 200
         body = resp.json()
-        # v3 view: view values 3 byte-identical to the 3.x terminal shape;
-        # accepted range is config-driven (dual window: [3, 4]).
-        assert body["slimapi_contract"] == 3
-        assert body["server"]["api_version"] == 3
-        assert body["schema"]["version"] == 3
-        assert body["server"]["accepted_client_versions"] == [3, 4]
-        assert body["schema"]["clientMin"] == 3
+        # v4 view (the only admitted face since the 2026-08-21 narrowing):
+        # view values 4; accepted range is config-driven (window: [4, 4]).
+        assert body["slimapi_contract"] == 4
+        assert body["server"]["api_version"] == 4
+        assert body["schema"]["version"] == 4
+        assert body["server"]["accepted_client_versions"] == [4, 4]
+        assert body["schema"]["clientMin"] == 4
         assert body["schema"]["clientMax"] == 4
-        assert "auxiliary" not in body
+        assert "auxiliary" in body  # v4 transient field (§3.2)
+        # v3 is retired: 400 unsupported_version (supported:[4])
+        resp = await client.get("/slimapi/health",
+                                params={"v": "3"}, headers=IDENTITY)
+        assert resp.status_code == 400
+        assert resp.json() == {"code": "unsupported_version", "supported": [4]}
         # no v → 400 (health is on the /slimapi surface)
         resp = await client.get("/slimapi/health", headers=IDENTITY)
         assert resp.status_code == 400
@@ -450,7 +473,7 @@ async def test_messages_envelope_always_no_cursor_header():
                  "Link": '</session/s1/message?before=m1>; rel="next"'}))
     async with _client(app) as client:
         resp = await client.get("/slimapi/messages/s1",
-                                params={"v": "3"}, headers=IDENTITY)
+                                params={"v": "4"}, headers=IDENTITY)
         assert resp.status_code == 200
         body = resp.json()
         assert set(body.keys()) == {"items", "nextCursor"}
@@ -464,11 +487,15 @@ async def test_sessions_envelope_always_no_complete_header():
         headers={"Content-Type": "application/json"}))
     async with _client(app) as client:
         resp = await client.get("/slimapi/sessions",
-                                params={"v": "3"}, headers=IDENTITY)
+                                params={"v": "4"}, headers=IDENTITY)
         assert resp.status_code == 200
         body = resp.json()
-        assert set(body.keys()) == {"items", "complete"}
+        # v4 global-list envelope (native fallback → degraded:true).
+        assert set(body.keys()) == {"items", "nextCursor", "complete",
+                                    "degraded"}
         assert body["complete"] is True
+        assert body["nextCursor"] is None
+        assert body["degraded"] is True
         assert "x-complete" not in resp.headers
 
 
@@ -483,7 +510,7 @@ async def test_vary_single_value_on_directory_consuming_routes():
     async with _client(app) as client:
         for path in ("/slimapi/sessions", "/slimapi/messages/s1",
                      "/slimapi/agent", "/slimapi/vcs"):
-            resp = await client.get(path, params={"v": "3"},
+            resp = await client.get(path, params={"v": "4"},
                                     headers=IDENTITY)
             assert resp.status_code == 200, path
             vary = resp.headers.get("vary", "")

@@ -14,7 +14,7 @@
 ocdroid 对接时：
 
 1. 读本文件了解**行为**变更；
-2. 读 `docs/specs/v3-contract.md`（v3 视图契约权威）+ `docs/specs/v4-contract.md`（(3,4) 双版本窗口的 v4 差异层）了解**当前完整契约**；
+2. 读 `docs/specs/v4-contract.md`（**现行契约权威**，4.8.0 起 v4-only 自包含）了解**当前完整契约**；`docs/specs/v3-contract.md` 为 ≤4.x 历史存档（v3 视图已退役）；
 3. 用 `/slimapi/health` 的 `server.api_version` / `accepted_client_versions` 做运行时兼容自检。
 
 ### 维护规约
@@ -25,6 +25,20 @@ ocdroid 对接时：
 - 发版时由 `./scripts/release.sh` 校验本文件含有目标版本标题（见 `docs/release.md`）。
 
 ---
+
+## [Unreleased] — 版本窗收窄 + v3 退役（v4 分支，目标 4.8.0 minor；owner 2026-08-21 裁定 major 只跟协议大版本走）
+
+### Changed
+
+- **版本窗收窄为 v4-only（v4-contract §0 修订，2026-08-21）**：`ACCEPTED_CLIENT_VERSIONS (3,4) → (4,4)`。`?v=3`、无 `v`、其他非 4 版本 → 400 `unsupported_version` `supported:[4]`。原 (3,4) 永久双版本裁决被覆盖；v3-contract 标记为历史存档。
+- **v3 面物理拆除（src 活性流转清零）**：selector v3 管线与 `wire_view_from_scope` 恒返 4、SSE v3 半区（tokens=1 retired / blanket resync / replay 条件化）、sessions v3 list envelope/lease/coalesce 腿、providers v3 passthrough、health v3 视图分叉、versions `caps["3"]` 面等删除。**保留项**（非 v3 流转，均注记冻结理由）：hub-API 双栈投递机制（fanout/subscriber，被 wire 层 v4 订阅语义锁定复用）、观测枚举 `v3` 冻结命名（traffic/snapshot/access_log/SSE_RESULT_DIMS，§9 冻结不改名）、expand 端点 ETag `wire=v3` 域标签（金样冻结的可观察字节）。
+- **测试清理**：v3 守护网与结构性死亡锁删除/改写（`test_access_log_v3_fields` ×4、`test_sse_replay_wire` v3 半区、B12 白名单 ② 类 10 文件、selector-less 直达与默认视图断言 v4 化、B5 204/301 → 503 fail-closed 化）。
+- **契约同步**：`v4-contract.md` 现行规范段全量 v4-only 化（§0 版本窗/§2 selector 状态表/§3.1 available/§14 expand 生效注记等 32+ 处，历史裁决以注记保留）；`v3-contract.md` 头部加退役存档章（正文零改动）；`INTERFACE_MAP.md` 全局头更新为 v4-only。
+- **金样重录**：W2/N6 双金样测试请求改 `?v=4` 后重录，ETag wire=v4 域标记。
+
+### Added
+
+- **digest `lastError` 与 G1-B `session.error` 直推帧增补可选结构化字段 `code`/`provider`/`model`/`retryAfter`/`quotaResetAt`（加性，wire 版本不 bump；2026-08-21 评审整改后口径）**：`GET /slimapi/events` 策展 SSE 中，digest `lastError` 对象（有 sid）与 session-less `event: session.error` 直推帧（无 sid）在既有 `{name,message,at}` 基线上同步增补——`code` 恒有（枚举：`provider_rate_limited` / `provider_quota_exceeded` / `provider_model_overloaded` / `provider_context_length_exceeded` / `provider_unauthorized` / `provider_model_not_found` / `provider_error` 兜底）；`provider`/`model`（≤64 字符、字符集 `[A-Za-z0-9._\-/:]`，另设两道凭据形态防线：已知凭据前缀黑名单 `sk-`/`ghp_`/`xoxb-`/`AKIA`/`AIza`/`eyJ` 等 + 连续字母数字段 ≥32 高熵丢弃）；`retryAfter`（int 秒——两来源：上游结构化字段 / `message` 文本提取 regex v3 `(?i)(?:retry|try again)\s+(?:in|after)\s+(\d+(?:\.\d+)?)(?:[ \t]*(?:seconds?|secs?|s)(?![A-Za-z0-9])|(?![A-Za-z0-9.])(?![ \t]*[A-Za-z]))`——两分支：单位分支（同行空白 + 完整单位词 seconds?/secs?/s，后卫仅拒字母数字，句号/逗号/续句合法）与无单位分支（拒紧邻字母数字点 `30ms`/`1e3s`/`30.5.5s` + 拒同行空格后字母 `30 ms`/`30 minutes`，不跨行；`30 seconds.`/`30 seconds before retrying`/`30, please wait`→30，`30 ms`/`30 minutes` 拒）；任意来源值一律向上取整（ceil）后 clamp 1..86400，纯整数部分 >9 位或总长 >15 的天文数字直接 clamp 86400（不做浮点转换），非数字结构化值丢弃）；`quotaResetAt`（仅上游结构化数据提供；仅接受 number 或 ≤64 字符可 ISO-8601 解析字符串，int 值仅在 [-2^63, 2^63-1]（64-bit 有符号整数范围）内原样输出、超范围安全缺省（丢弃），float 仅要求有限（isfinite），其余类型安全降级为缺省，绝不原样透传任意上游值）均仅可推导时出现。分类两级（冻结）：结构化 `error.data` 优先——`code` 等于枚举值直用 > `type` 白名单映射（`rate_limit_error`/`overloaded_error`/`authentication_error`/`insufficient_quota`）> `status` 映射（401/429/402），未命中落文本模式（name+原始 message 小写子串，优先级 unauthorized→model_not_found→context_length→quota→rate_limited→overloaded→兜底，`401`/`429` 数字边界匹配）。sticky / `busy` 显式 `null` 清除 / `session.deleted` 弹出三态语义零变化；**老客户端忽略未知键即可，零影响、零必改点**。安全承诺：sidecar 只输出白名单字段 + 已脱敏 `message`，绝不透传上游原始响应体 / 内部堆栈；provider/model = 白名单+字符集+长度+凭据形态多重防线，覆盖常见凭据形态。写路径（`prompt_async` 4xx verbatim / 5xx→503 立返 202）不变。字段表与分类优先级见 `docs/specs/v4-contract.md` §7.6。
 
 ## [4.7.0] - 2026-08-21 — 审计整改批次三 Wave 3：大拆分 + B12 测试字面化（包版本 minor；wire 版本**不变**，仍 (3,4)；**纯重构零 wire 变更**——N6+W2 双金样 46 case 回放逐字节全等 + 全量测试兜底；实施设计 docs/ocmar/reviews/2026-08-21-wave3-refactor-design.md，独立评审门 8.1→8.6→9.5 PASS）
 
@@ -196,7 +210,7 @@ ocdroid 对接时：
 ### Changed（内部重构，wire 零变化）
 
 - **SingleFlight 双实现合并为单一实现**：`leased_singleflight.py`（LeasedSingleFlight，439 行）与 `sse/singleflight.py`（SingleFlight，329 行）合并为新单一模块 `src/oc_slimapi/singleflight.py`（统一 SingleFlight 类，plain/leased 双 profile，别名 `LeasedSingleFlight` 保留）；两旧文件删除，全仓 import 迁移。合并的价值定位是**统一实现所有权与公共控制流**——失败信封、三分支取消机、shield-join 循环、lead/失败路径、grace 定时器、关停收敛去重为单一实现，profile 仅在 admission/保留记账上分叉；跨 profile 构造参数误用与 API 误用即早拒绝（TypeError/RuntimeError，零调用方受影响）。两调用方（/full+expand+catalog 的 plain profile；列表路由 coalesce 的 leased profile）行为逐项等价：并发去重、预算 admission/bypass、lease exactly-once 释放、grace 超时、三分支取消、关停收敛语义均由既有测试锁定，全量回归通过（2979）。
-- **组件账目同步（计账修正 17→16，singleflight 合并 −1）**：owner 终态裁决 2026-08-18——协议封顶 4 系，(3,4) 永久双版本，5.0.0 与 B6-2（sticky/三形状退役）取消。与 v2.2 §5 原账目差异说明：v2.2 phase-aware 预测「P3=18 → B6 后 17」为计划口径（含 B6 全量前提）；实际按 4.0.0 组件清点为 17，B6-1 合并后 16。B6-3 全面复核随 owner 裁决取消，账目以本节为准。
+- **组件账目同步（计账修正 17→16，singleflight 合并 −1）**：owner 终态裁决 2026-08-18——协议封顶 4 系，(3,4) 永久双版本，4.8.0 与 B6-2（sticky/三形状退役）取消。与 v2.2 §5 原账目差异说明：v2.2 phase-aware 预测「P3=18 → B6 后 17」为计划口径（含 B6 全量前提）；实际按 4.0.0 组件清点为 17，B6-1 合并后 16。B6-3 全面复核随 owner 裁决取消，账目以本节为准。
 
 ---
 

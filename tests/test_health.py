@@ -117,9 +117,10 @@ async def test_health_with_accept_encoding_gzip_returns_gzip(upstream_factory):
     # Decoding the (already decompressed) content must match a fresh gzip round-trip.
     body = orjson.loads(response.content)
     assert body["sidecar"]["ok"] is True
-    assert body["server"]["accepted_client_versions"] == [3, 4]
+    assert body["server"]["accepted_client_versions"] == [4, 4]
     assert body["schema"]["degraded"] is False
-    assert body["slimapi_contract"] == 3
+    # (V2b default flip: the selector-less stack runs the v4 view.)
+    assert body["slimapi_contract"] == 4
 
 
 async def test_health_without_accept_encoding_is_not_gzipped(upstream_factory):
@@ -224,7 +225,8 @@ async def test_health_ignores_retired_version_header(upstream_factory):
                                     headers={"X-Slimapi-Version": "9"})
 
     assert response.status_code == 200
-    assert response.json()["slimapi_contract"] == 3
+    # (V2b default flip: the selector-less stack runs the v4 view.)
+    assert response.json()["slimapi_contract"] == 4
 
 
 # ---------------------------------------------------------------------------
@@ -325,17 +327,18 @@ async def test_health_schema_includes_version_and_client_range(upstream_factory)
     assert response.status_code == 200
     body = response.json()
     # New keys exist and are read from config (not hard-coded).
+    # (V2b default flip: the selector-less stack runs the v4 view.)
     assert body["schema"] == {
         "degraded": False,
-        "version": 3,
-        "clientMin": 3,
+        "version": 4,
+        "clientMin": 4,
         "clientMax": 4,
     }
     # Old ``server.*`` keys still there for back-compat.
-    assert body["server"]["api_version"] == 3
-    assert body["server"]["accepted_client_versions"] == [3, 4]
+    assert body["server"]["api_version"] == 4
+    assert body["server"]["accepted_client_versions"] == [4, 4]
     # lite-v2: static contract revision.
-    assert body["slimapi_contract"] == 3
+    assert body["slimapi_contract"] == 4
 
 
 async def test_health_schema_reflects_non_default_config(upstream_factory):
@@ -368,7 +371,7 @@ async def test_ready_schema_includes_version_and_client_range(upstream_factory):
     assert body["schema"] == {
         "degraded": False,
         "version": 3,
-        "clientMin": 3,
+        "clientMin": 4,
         "clientMax": 4,
     }
 
@@ -387,7 +390,7 @@ async def test_ready_503_path_preserves_schema_fields(upstream_factory):
     body = response.json()
     assert body["schema"]["version"] == 3
     assert body["server"]["api_version"] == 3
-    assert body["server"]["accepted_client_versions"] == [3, 4]
+    assert body["server"]["accepted_client_versions"] == [4, 4]
 
 
 async def test_health_schema_reflects_schema_degraded_state(upstream_factory):
@@ -400,8 +403,8 @@ async def test_health_schema_reflects_schema_degraded_state(upstream_factory):
     assert response.status_code == 200
     body = response.json()
     assert body["schema"]["degraded"] is True
-    # Other keys still present.
-    assert body["schema"]["version"] == 3
+    # Other keys still present. (V2b default flip: v4 view.)
+    assert body["schema"]["version"] == 4
 
 
 # ---------------------------------------------------------------------------

@@ -18,7 +18,9 @@ ETag / 无 Vary / INM 不判定）。本文件两个方向都锁：
   * Class A 降级 200（degraded:true）同样发 ETag/Vary（§15 无降级例外
     条款——canonical = 降级 envelope body），ETag 管线不短路（条件请求
     照常执行上游回退）；
-  * v3 表示层零改动（门控翻转前后 ?v=3 响应逐字节相同）。
+  * validator 域隔离（REP_VERSION 含 wire=v4 标记；跨域 validator 永不
+    误 304——v3 wire 面已随 (4,4) 窗退役，异域 validator 经 etag 模块
+    本地构造）。
 """
 
 from __future__ import annotations
@@ -327,35 +329,33 @@ async def test_304_hit_miss_star_weak_both_directions(
 # ---------------------------------------------------------------------------
 
 
-async def test_v3_v4_validator_domain_isolation(
+async def test_v4_validator_domain_isolated_from_foreign_rep(
         tmp_path, representation_revision):
+    """跨域 validator 隔离（v4-only wire）：wire 标记（``wire=v4``）进入
+    REP_VERSION hash 输入——异域 validator（``wire=v3`` rep version，经
+    etag 模块本地构造；(4,4) 窗下已无 v3 wire 请求）对同一 body 必产生
+    不同 validator，打到 v4 视图 → 保守 200（不误 304）。"""
     settings = _settings()
     aux = await _real_aux(tmp_path)
     app, _ = _build_app(aux, settings=settings)
     try:
         async with _client(app) as client:
-            rv3 = await client.get(ROUTE, params={"v": "3"}, headers=IDENTITY)
-            v3tag = rv3.headers["ETag"]
-            assert v3tag  # v3 表示层照旧
+            r4 = await client.get(ROUTE, params={"v": "4"}, headers=IDENTITY)
+            v4tag = r4.headers["ETag"]
+            assert v4tag
 
-            # v3 validator 打到 v4 → 保守 200（不误 304）
-            r41 = await client.get(
+            # 异域 validator 打到 v4 → 保守 200（不误 304）
+            rep3 = etag_mod.response_rep_version(settings, wire_view=3)
+            rep4 = etag_mod.response_rep_version(settings, wire_view=4)
+            foreign = etag_mod.compute_etag(r4.content, "identity", rep3)
+            assert foreign != v4tag
+            cross = await client.get(
                 ROUTE, params={"v": "4"},
-                headers={**IDENTITY, "If-None-Match": v3tag})
-            assert r41.status_code == 200
-            v4tag = r41.headers["ETag"]
-            assert v4tag != v3tag
-
-            # v4 validator 打到 v3 → 保守 200
-            r32 = await client.get(
-                ROUTE, params={"v": "3"},
-                headers={**IDENTITY, "If-None-Match": v4tag})
-            assert r32.status_code == 200
+                headers={**IDENTITY, "If-None-Match": foreign})
+            assert cross.status_code == 200
 
             # 同体控制：wire 标记进入 hash 输入（rep3 ≠ rep4 → validator
             # 必不同，即使 body 完全一致）
-            rep3 = etag_mod.response_rep_version(settings, wire_view=3)
-            rep4 = etag_mod.response_rep_version(settings, wire_view=4)
             assert rep3 != rep4
             assert b"wire=v3" in rep3 and b"wire=v4" in rep4
             same_body = b'{"items":[],"nextCursor":null,"complete":true}'
@@ -435,42 +435,6 @@ async def test_degraded_class_a_etag_vary_304_pipeline_not_shortcircuited(
         assert hit.headers["Cache-Control"] == "no-store"
         # ETag 管线不短路：条件请求照常执行上游回退（fresh 计算后判 304）
         assert len(calls) == upstream_before + 1
-
-
-# ---------------------------------------------------------------------------
-# v3 零改动：门控翻转前后 ?v=3 表示逐字节相同
-# ---------------------------------------------------------------------------
-
-
-async def test_v3_representation_unchanged_by_revision_flip(tmp_path):
-    aux = await _real_aux(tmp_path)
-    app, _ = _build_app(aux)
-    original = readiness.SATISFIED
-    try:
-        async with _client(app) as client:
-            before = await client.get(ROUTE, params={"v": "3"},
-                                      headers=IDENTITY)
-            readiness.SATISFIED = SATISFIED_WITH_REPRESENTATION
-            after = await client.get(ROUTE, params={"v": "3"},
-                                     headers=IDENTITY)
-            cond = await client.get(
-                ROUTE, params={"v": "3"},
-                headers={**IDENTITY,
-                         "If-None-Match": after.headers["ETag"]})
-    finally:
-        readiness.SATISFIED = original
-        await aux.stop()
-    # v3 已发布表示层锁定：翻转 representation.vary.v4 不影响 ?v=3
-    assert before.status_code == after.status_code == 200
-    assert before.content == after.content
-    assert dict(before.headers) == dict(after.headers)
-    assert before.headers.get("ETag")
-    assert before.headers["Vary"] == "Accept-Encoding"
-    # v3 sessions 200 冻结形态：无 Cache-Control（与 v4 §15 新增不同）
-    assert "Cache-Control" not in before.headers
-    # v3 条件请求照旧 304
-    assert cond.status_code == 304
-    assert cond.headers["ETag"] == after.headers["ETag"]
 
 
 # ---------------------------------------------------------------------------

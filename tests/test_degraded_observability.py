@@ -408,15 +408,19 @@ async def test_mixed_degradation_counters_split(capture_logger):
 # ---------------------------------------------------------------------------
 
 
-async def test_v3_request_fields_absent(capture_logger):
+async def test_rejected_request_fields_absent(capture_logger):
+    """Unsupported-version request on the sessions route (?v=3 → 400 in the
+    (4,4) window): the selector rejects before the route — the row carries
+    no marker fields, no v4 ledger section, zero counters."""
     ledger = TrafficLedger()
     app = _build_app(_StubAux("disabled"), logger=capture_logger, ledger=ledger)
     async with _client(app) as client:
         resp = await client.get("/slimapi/sessions",
                                 params={"v": "3"}, headers=IDENTITY)
-    assert resp.status_code == 200
+    assert resp.status_code == 400
     row = _rows(capture_logger)[-1]
-    assert row["wireVersion"] == "3"
+    assert row["selectorResult"] == "rejected"
+    assert row["wireVersion"] is None
     assert "sessionsSource" not in row
     assert "degraded503" not in row
     assert "v4" not in ledger.snapshot()
@@ -428,7 +432,7 @@ async def test_other_route_fields_absent(capture_logger):
     app = _build_app(_StubAux("disabled"), logger=capture_logger, ledger=ledger)
     async with _client(app) as client:
         resp = await client.get("/slimapi/health",
-                                params={"v": "3"}, headers=IDENTITY)
+                                params={"v": "4"}, headers=IDENTITY)
     assert resp.status_code == 200
     row = _rows(capture_logger)[-1]
     assert row["bucket"] == "health"
@@ -485,7 +489,7 @@ async def test_metrics_sessions_degraded_block(capture_logger):
                 "/slimapi/sessions",
                 params={"v": "4", "parent": "only"}, headers=IDENTITY)
         resp = await client.get("/slimapi/metrics",
-                                params={"v": "3"}, headers=IDENTITY)
+                                params={"v": "4"}, headers=IDENTITY)
     assert resp.status_code == 200
     body = resp.json()
     assert body["sessionsDegraded"] == {
@@ -498,15 +502,15 @@ async def test_metrics_zero_state_on_fresh_app():
     async with _client(app) as client:
         # metrics handler 先于中间件 _record 执行 → 首个 GET 尚无块。
         resp = await client.get("/slimapi/metrics",
-                                params={"v": "3"}, headers=IDENTITY)
+                                params={"v": "4"}, headers=IDENTITY)
         assert resp.status_code == 200
         assert "sessionsDegraded" not in resp.json()
         # 任一请求过后（此处为普通探活路由），零值块出现。
-        resp = await client.get("/slimapi/health", params={"v": "3"},
+        resp = await client.get("/slimapi/health", params={"v": "4"},
                                 headers=IDENTITY)
         assert resp.status_code == 200
         resp = await client.get("/slimapi/metrics",
-                                params={"v": "3"}, headers=IDENTITY)
+                                params={"v": "4"}, headers=IDENTITY)
     assert resp.status_code == 200
     assert resp.json()["sessionsDegraded"] == {
         "degraded_200": 0, "fail_closed_503": 0}
@@ -687,15 +691,17 @@ async def test_real_writer_fail_closed_503(capture_logger):
     assert _counters(app) == {"degraded_200": 0, "fail_closed_503": 1}
 
 
-async def test_real_writer_v3_path_markers_absent(capture_logger):
-    """真实 v3 路径两字段恒缺席（回归锚）。"""
+async def test_real_writer_rejected_request_markers_absent(capture_logger):
+    """Unsupported-version request on the REAL stack (?v=3 → 400, no marker
+    simulator): the route never runs — no marker fields ever written."""
     app = _build_real_app(_StubAux("disabled"), logger=capture_logger)
     async with _client(app) as client:
         resp = await client.get("/slimapi/sessions",
                                 params={"v": "3"}, headers=IDENTITY)
-    assert resp.status_code == 200
+    assert resp.status_code == 400
     row = _rows(capture_logger)[-1]
-    assert row["wireVersion"] == "3"
+    assert row["selectorResult"] == "rejected"
+    assert row["wireVersion"] is None
     assert "sessionsSource" not in row
     assert "degraded503" not in row
     assert _counters(app) == {"degraded_200": 0, "fail_closed_503": 0}

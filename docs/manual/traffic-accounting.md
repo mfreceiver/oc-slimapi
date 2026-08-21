@@ -4,7 +4,7 @@
 > 特性版本：**v0.7.0+**（`/slimapi/metrics` 响应的 `traffic` 块 + access log）；**2026-07-29**（按天切分 + client 标识字段 + traffic snapshot）；**2026-08-01**（turn-token fence scope 简化为仅 sid；移除 serverGroupFp 字段）；**2026-08-16**（v3 Batch A 加性观测字段：`wireVersion`/`selectorResult`/`directoryForm`/`recordType`/`lifecycleId` + SSE 开关行 + snapshot `v3` 节 + `aggregate_v3_observability`，见 §5.1/§9.4）；**2026-08-18**（4.0.0 双版本期：`wireVersion` 增 `"4"`、`selectorResult` 增 `v4` 取值 + `/slimapi/metrics` 新增 `dbaux` 观测块，见 §5.1）。
 >
 > **术语澄清**：本手册中出现的 `/slimapi/metrics.traffic` / `/metrics.traffic` 等写法，**不是**独立 HTTP 路由——代码里只有 `GET /slimapi/metrics`（`src/oc_slimapi/routes/metrics.py`），流量账本是该响应 JSON 的 `traffic` 子键。下文为简洁起见用 "`metrics.traffic`" 作为该数据块的简称。
-> 性质：**加性 ops 可观测面**（3.0.0 起请求头通道删除、`?v=` selector 为唯一版本通道；4.0.0 起 (3,4) 双版本窗口）；ocdroid 对接无变化（`/slimapi/metrics` 为 T3 ops 端点，非客户端契约）。
+> 性质：**加性 ops 可观测面**（3.0.0 起请求头通道删除、`?v=` selector 为唯一版本通道；4.8.0 起 v4-only 单版本窗口）；ocdroid 对接无变化（`/slimapi/metrics` 为 T3 ops 端点，非客户端契约）。
 > 实现：`src/oc_slimapi/traffic.py`、`src/oc_slimapi/traffic_snapshot.py`、`src/oc_slimapi/middleware/traffic_accounting.py`、`src/oc_slimapi/access_log.py`。
 
 ---
@@ -31,12 +31,12 @@ sidecar 是 ocdroid 与 opencode 之间的字节中继。账本按**路由桶**�
 
 ## 2. 快速查询
 
-`/slimapi/**` 端点须带查询参数 `?v=3` 或 `?v=4`（4.0.0 起 (3,4) 双版本窗口：缺 `v` / `v=2` / 不支持值 → 400 `unsupported_version supported=[3,4]`；`X-Slimapi-Version` 头已删除、出现不解读；详见契约 `docs/specs/v3-contract.md` §2 与 `docs/specs/v4-contract.md` §0）。`GET /slimapi/versions` 无条件豁免。
+`/slimapi/**` 端点须带查询参数 `?v=4`（4.8.0 起 v4-only 单版本窗口：缺 `v` / `v=3` / 不支持值 → 400 `unsupported_version supported=[4]`；`X-Slimapi-Version` 头已删除、出现不解读；详见契约 `docs/specs/v4-contract.md` §0。历史：4.0.0–4.7.0 为 (3,4) 双版本窗口）。`GET /slimapi/versions` 无条件豁免。
 
 ```bash
 # 本机 loopback（服务默认绑 0.0.0.0:4097）
 BASE=http://127.0.0.1:4097
-V="v=3"
+V="v=4"
 
 # 整个 traffic 块
 curl -s "$BASE/slimapi/metrics?$V" | jq '.traffic'

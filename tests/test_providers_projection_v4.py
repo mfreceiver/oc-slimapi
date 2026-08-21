@@ -18,9 +18,10 @@
   parse; permit AFTER body cap so network wait never holds it;
   transform_busy BEFORE malformed);
 * §12.6 ETag (canonical bytes = wire body, identity strong / gzip
-  weak, Vary: Accept-Encoding, 304 via If-None-Match, v3/v4 validator
-  isolation);
-* ?v=3 / no-selector byte-identical passthrough regression.
+  weak, Vary: Accept-Encoding, 304 via If-None-Match; a foreign
+  validator never 304s the v4 view);
+* no-selector byte-identical passthrough (selector-less stack keeps the
+  frozen default-view passthrough).
 """
 
 from __future__ import annotations
@@ -528,16 +529,6 @@ async def test_v4_limit_subkey_nested_object_or_array_omitted():
         {"output": 4096}
 
 
-async def test_v3_raw_limit_verbatim_passthrough_regression():
-    # v3 raw 透传原样含 limit（修订三不触 v3 任何行为）。
-    payload = _canonical(_rich_doc())
-    async with _stack(_ok(payload)) as (client, _app, _s):
-        r = await client.get(f"{ROUTE}?v=3", headers=IDENTITY)
-    assert r.status_code == 200
-    assert r.content == payload
-    assert b'"limit":{"context":8192}' in r.content
-
-
 # --- §12.1 malformed matrix ------------------------------------------------
 
 
@@ -938,16 +929,6 @@ async def test_v4_304_via_if_none_match():
     assert rmiss.status_code == 200
 
 
-async def test_v4_validator_domain_isolated_from_v3():
-    async with _stack(_ok(_canonical(_rich_doc()))) as (client, _app, _s):
-        r3 = await client.get(f"{ROUTE}?v=3", headers=IDENTITY)
-        r4 = await client.get(f"{ROUTE}?v=4", headers=IDENTITY)
-        cross = await client.get(f"{ROUTE}?v=4", headers={
-            **IDENTITY, "If-None-Match": r3.headers["etag"]})
-    assert r3.headers["etag"] != r4.headers["etag"]
-    assert cross.status_code == 200  # v3 validator never 304s the v4 view
-
-
 async def test_v4_etag_disabled_still_varies():
     settings = _settings(etag_enabled=False)
     async with _stack(_ok(_canonical(_rich_doc())), settings=settings) as (
@@ -961,22 +942,14 @@ async def test_v4_etag_disabled_still_varies():
     assert r304.status_code == 200  # no validator → no 304
 
 
-# --- ?v=3 / selector-less regression (byte-identical passthrough) ----------
-
-
-async def test_v3_passthrough_byte_identical_regression():
-    payload = _canonical(_rich_doc())
-    async with _stack(_ok(payload)) as (client, _app, seen):
-        r = await client.get(f"{ROUTE}?v=3", headers=IDENTITY)
-    assert r.status_code == 200
-    assert r.content == payload  # verbatim upstream bytes, no projection
-    # upstream query had v stripped, no projection params added
-    assert seen[0].url.params.get("v") is None
+# --- selector-less regression (byte-identical passthrough) -------------------
 
 
 async def test_selector_less_stack_defaults_to_v3_passthrough():
-    # wire_view_from_scope defaults to 3 without the selector stash —
-    # direct route invocation keeps the frozen v3 passthrough.
+    # (V2b default flip: wire_view_from_scope is constant 4 — the
+    # selector-less direct invocation now runs the §12 safe-projection
+    # pipeline, same as the ?v=4 face; the frozen v3 byte-identical
+    # passthrough face no longer exists.)
     payload = _canonical(_rich_doc())
     handler = _ok(payload)
     seen: list[httpx.Request] = []
@@ -1003,16 +976,7 @@ async def test_selector_less_stack_defaults_to_v3_passthrough():
                                  base_url="http://slimapi") as client:
         r = await client.get(ROUTE, headers=IDENTITY)
     assert r.status_code == 200
-    assert r.content == payload
-
-
-async def test_v3_4xx_verbatim_passthrough_regression():
-    body = b'{"error": {"code": "X"}}'
-    async with _stack(
-            lambda req: _raw(400, body)) as (client, _app, _s):
-        r = await client.get(f"{ROUTE}?v=3", headers=IDENTITY)
-    assert r.status_code == 400
-    assert r.content == body
+    assert r.content == _canonical(_rich_projected())
 
 
 # --- directory consumption (②) ---------------------------------------------

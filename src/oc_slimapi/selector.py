@@ -1,19 +1,18 @@
-"""Wire-contract version selector — **dual-version window (3, 4)** (v4-contract §2).
+"""Wire-contract version selector — **v4-only window (4, 4)** (v4-contract §2,
+2026-08-21 narrowing revision).
 
 A pure-ASGI dispatch layer that decides — for ``/slimapi/**`` requests only —
 which wire pipeline a request runs:
 
-* **``?v=3``** → the v3 pipeline, byte-identical to the 3.x terminal state
-  (marked ``v3`` in ASGI scope state, ``wire="3"``).
-* **``?v=4``** → the v4 differential face (marked ``v4``, ``wire="4"``).
-  v4 is entered ONLY through this explicit selector — selector-less stacks
-  (direct route invocation in tests) always observe the default v3 view.
-* **no ``v`` / lexically valid but not in {3,4}** → 400
-  ``{"code":"unsupported_version","supported":[3,4]}`` — the endpoint
+* **``?v=4``** → the v4 pipeline (marked ``v4`` in ASGI scope state,
+  ``wire="4"``). Since the 2026-08-21 version-window narrowing (target
+  4.8.0) this is the ONLY admitted wire version.
+* **``?v=3``** / **no ``v``** / **lexically valid but not in {4}** → 400
+  ``{"code":"unsupported_version","supported":[4]}`` — the endpoint
   exists, the protocol version is unsupported; never a silent 404.
 * **lexically invalid** (``0``, ``03``, ``+3``, `` 3``, ``3.0``, empty, …) or
   **conflicting multi-value** (``?v=3&v=4``) → 400
-  ``{"code":"invalid_version_selector"}``; same-value repeats (``?v=3&v=3``)
+  ``{"code":"invalid_version_selector"}``; same-value repeats (``?v=4&v=4``)
   fold to one.
 * **consumption (§5.2)**: every ``v`` parameter pair is stripped from the
   downstream query string on ALL forwarded ``/slimapi/**`` requests — ``v``
@@ -34,7 +33,8 @@ one of the three deferred POST combos answers the coded 405
 ① versions 405 → ② version 400s → method 405 → ③ directory 400s — the
 method judgement reads no query parameter):
 
-**v3** (§5.1 — unchanged terminal semantics):
+**directory ladder** (§5.1 — unchanged terminal semantics, identical for
+every admitted request since the window collapsed to v4-only):
 
 1. ``?directory=`` multi-value distinct (normalised) → 400
    ``invalid_directory_selector``;
@@ -47,27 +47,29 @@ method judgement reads no query parameter):
 4. query-only single value → consumed: validated, stashed for the route,
    and stripped from the downstream query (§5.2).
 
-**v4** (§5.2 — consuming-set fork): the fork removes ONLY the global
-sessions list (``^/slimapi/sessions$``) from the v3 consuming set. Every
-other route keeps the v3 consumption semantics above verbatim. A v4
+**v4 consuming-set fork (§5.2)**: the fork removes ONLY the global
+sessions list (``^/slimapi/sessions$``) from the baseline consuming set.
+Every other route keeps the consumption semantics above verbatim. A v4
 request on the retired route carrying ``directory`` in ANY form (query
 single / query multi / header any / query+header mixed) → 400
 ``directory_retired_in_v4`` (uniform body + hint, no directory-existence
-leak), and the retirement error takes priority over the v3 multi-value /
+leak), and the retirement error takes priority over the multi-value /
 conflict / header validation ladder. A v4 sessions request WITHOUT any
 directory input forwards untouched (global facade, nothing to consume).
 
 The stream route (``/slimapi/sessions/{sid}/stream``) keeps its §5.6
-exception for the LAST v3 case only: a single-valued query-only directory is
+exception for the LAST case only: a single-valued query-only directory is
 accepted as a no-op (not consumed, not stripped, forwarded verbatim); the
 three error cases above apply unchanged. Tolerant (§5.5) routes never
 consume and never error.
 
 Observability (§9.1, enum frozen): the selector stashes ``selectorResult``
-(v3|v4|rejected|exempt|not_applicable — the ``absent``/``v2`` dims no
-longer occur by construction), ``wireVersion`` ("3"|"4"|None) and
-``directoryForm`` (query|header|both|absent|None) into ``scope["state"]``
-under :data:`SELECTOR_STATE_KEY` / :data:`DIRECTORY_FORM_STATE_KEY` where
+(v3|v4|rejected|exempt|not_applicable — the ``v3`` dim no longer occurs
+by construction since the narrowing; the historical ``absent``/``v2``
+dims never occur either, keeping old access-log rows interpretable),
+``wireVersion`` ("3"|"4"|None) and ``directoryForm``
+(query|header|both|absent|None) into ``scope["state"]`` under
+:data:`SELECTOR_STATE_KEY` / :data:`DIRECTORY_FORM_STATE_KEY` where
 the traffic-accounting middleware (which wraps this one) reads them at
 request end. A non-``/slimapi`` request is stashed ``not_applicable``.
 Routes read the per-request view back via :func:`wire_view_from_scope`
@@ -92,10 +94,11 @@ from .versioning import ACCEPTED_CLIENT_VERSIONS, _is_slimapi_path
 SELECTOR_STATE_KEY = "slimapi_selector"
 DIRECTORY_FORM_STATE_KEY = "slimapi_directory_form"
 
-# §9.1 selectorResult enum (frozen — v3/v4/rejected/exempt/not_applicable are
-# the producible values; the historical absent/v2 dims live on only as
-# sseActive literals below, keeping old access-log rows interpretable).
-SELECTOR_V3 = "v3"
+# §9.1 selectorResult enum (frozen — v4/rejected/exempt/not_applicable are
+# the producible values under the v4-only (4, 4) window; the v3 producer was
+# removed with the 2026-08-21 narrowing — the "v3" dim lives on in
+# SSE_RESULT_DIMS below, and the historical absent/v2 dims live on only as
+# sseActive literals, keeping old access-log rows interpretable).
 SELECTOR_V4 = "v4"
 SELECTOR_REJECTED = "rejected"
 SELECTOR_EXEMPT = "exempt"
@@ -128,8 +131,9 @@ _SELECTOR_LEXICAL_RE = re.compile(r"^[1-9][0-9]*$")
 # parity: routing still sees the raw path; only these decisions normalise).
 _SLASH_RE = re.compile(r"/+")
 
-# The admitted wire versions, ascending (v4-contract §2: [3, 4] during the
-# dual-version window; single source of truth = versioning pin).
+# The admitted wire versions, ascending (v4-contract §2, 2026-08-21
+# narrowing: [4] — the window collapsed to v4-only; single source of
+# truth = versioning pin).
 SUPPORTED_WIRE_VERSIONS: tuple[int, ...] = tuple(
     range(ACCEPTED_CLIENT_VERSIONS[0], ACCEPTED_CLIENT_VERSIONS[1] + 1)
 )
@@ -293,15 +297,17 @@ def _is_v4_directory_retired(normalized_path: str) -> bool:
     )
 
 
-def _directory_consuming_for(normalized_path: str, wire_version: int) -> bool:
-    """§5.2 version-forked consuming-set membership.
+def _directory_consuming_for(normalized_path: str) -> bool:
+    """§5.2 consuming-set membership under the v4-only window.
 
-    v4 = v3 set − the retirement table (only the global sessions list
-    leaves); v3 and every lower view see the full v3 set. Callers must
-    still handle the retired route SEPARATELY (any directory input on it
-    is a 400 ``directory_retired_in_v4``, not tolerant passthrough).
+    v4 = the historical v3 set − the retirement table (only the global
+    sessions list leaves); callers must still handle the retired route
+    SEPARATELY (any directory input on it is a 400
+    ``directory_retired_in_v4``, not tolerant passthrough). (The
+    ``wire_version`` parameter of the (3, 4) dual-window era was removed
+    with the 2026-08-21 narrowing — only the v4 set remains.)
     """
-    if wire_version >= 4 and _is_v4_directory_retired(normalized_path):
+    if _is_v4_directory_retired(normalized_path):
         return False
     return _is_directory_consuming(normalized_path)
 
@@ -364,26 +370,22 @@ def selector_info_from_scope(scope: Scope) -> dict[str, Any]:
 
 
 def wire_view_from_scope(scope: Scope) -> int:
-    """§2/S-B04: the wire view this request runs — read from the selector
-    stash ("3" | "4"), defaulting to 3.
+    """§2/S-B04: the wire view this request runs — 4 (the only live view).
 
-    The selector is the ONLY way a request enters the v4 face, so:
-
-    * selector-admitted ``?v=3`` / ``?v=4`` → the stash's wire value
-      (same source the selectorResult was recorded from);
-    * rejected / exempt / not-applicable or selector-less stacks (direct
-      route invocation in tests) → the DEFAULT v3 view — every existing
-      test and route keeps observing 3 unless it explicitly sent ``?v=4``
-      through the selector.
+    The selector stashes ``"4"`` for admitted ``?v=4`` requests; every
+    other scope — rejected / exempt / not-applicable (which never reach
+    routes) and selector-less direct invocation in tests — ALSO observes
+    4: the historical default-3 fallback was the v3-face teardown surface
+    and was flipped to 4 with the 2026-08-21 V2b narrowing teardown (the
+    stash-read mechanism is retained for a future widened window; under
+    the (4, 4) window every leg resolves to 4, so the value is returned
+    directly).
 
     Kept as a function so the call sites stay explicit about where the
     view comes from (health/versions/routes must all read THIS value —
-    mismatched 3/4 combinations are structurally impossible, S-B04).
+    mismatched view combinations are structurally impossible, S-B04).
     """
-    info = selector_info_from_scope(scope)
-    if info.get("wire") == "4":
-        return 4
-    return 3
+    return 4
 
 
 def _has_directory_query_pair(query_string: bytes) -> bool:
@@ -498,9 +500,9 @@ def _strip_v_segments(query_string: bytes) -> bytes:
 
 
 class SlimapiSelectorMiddleware:
-    """v4-contract §2 selector — dual-version window: ``?v=3`` runs the
-    unchanged v3 pipeline, ``?v=4`` the v4 differential face; every other
-    ``/slimapi/**`` version form is a 400."""
+    """v4-contract §2 selector (2026-08-21 narrowing): ``?v=4`` is the
+    only admitted wire version; every other ``/slimapi/**`` version form
+    (including ``?v=3``) is a 400 ``unsupported_version``."""
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
@@ -569,12 +571,14 @@ class SlimapiSelectorMiddleware:
             await self._reject_version(scope, receive, send)
             return
 
-        # Admitted: mark the wire view (§2 request-scope wireVersion — v3
-        # and v4 stashed symmetrically; routes/health read it back via
-        # wire_view_from_scope) and run the version-forked directory
-        # consumption (§5.1/§5.2/§8.3 ③).
+        # Admitted: mark the wire view (§2 request-scope wireVersion — under
+        # the v4-only (4, 4) window only SELECTOR_V4 can be stashed here;
+        # routes/health read it back via wire_view_from_scope) and run the
+        # version-forked directory consumption (§5.1/§5.2/§8.3 ③).
+        # (Historical: the 4.0.0 (3, 4) dual window stashed SELECTOR_V3
+        # here for ?v=3 — removed by the 2026-08-21 narrowing.)
         wire = values[0]
-        _stash(scope, SELECTOR_V3 if wire == "3" else SELECTOR_V4, wire)
+        _stash(scope, SELECTOR_V4, wire)
 
         # §8.3/§16.1: the method 405 slots between ② (the version-family
         # 400s above) and ③ (directory consumption below). v4 face +
@@ -606,7 +610,7 @@ class SlimapiSelectorMiddleware:
                 )(scope, receive, send)
                 return
 
-        error = self._consume_directory(scope, normalized, int(wire))
+        error = self._consume_directory(scope, normalized)
         if error is not None:
             _stash(scope, SELECTOR_REJECTED, None)
             await json_response(
@@ -620,7 +624,7 @@ class SlimapiSelectorMiddleware:
     async def _reject_version(
         self, scope: Scope, receive: Receive, send: Send
     ) -> None:
-        """400 ``unsupported_version`` with the admitted set ([3, 4])."""
+        """400 ``unsupported_version`` with the admitted set ([4])."""
         _stash(scope, SELECTOR_REJECTED, None)
         await json_response(
             {
@@ -632,7 +636,7 @@ class SlimapiSelectorMiddleware:
         )(scope, receive, send)
 
     def _consume_directory(
-        self, scope: Scope, normalized_path: str, wire_version: int,
+        self, scope: Scope, normalized_path: str,
     ) -> dict[str, Any] | None:
         """§5.1/§5.2/§8.3 ③ directory consumption for an admitted request.
 
@@ -663,13 +667,13 @@ class SlimapiSelectorMiddleware:
         accepted no-op (no stash, no strip — the query flows to the route
         verbatim). Header-form errors (cases 2/3) apply to it unchanged.
         """
-        if wire_version >= 4 and _is_v4_directory_retired(normalized_path):
+        if _is_v4_directory_retired(normalized_path):
             if _has_directory_query_pair(
                 scope.get("query_string", b"") or b""
             ) or _has_directory_header(scope):
                 return dict(_DIRECTORY_RETIRED_IN_V4_BODY)
             return None
-        if not _directory_consuming_for(normalized_path, wire_version):
+        if not _directory_consuming_for(normalized_path):
             # §5.5 tolerant-ignore set: any form accepted, no consumption,
             # no strip, no error.
             return None

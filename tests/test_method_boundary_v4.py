@@ -219,20 +219,15 @@ async def test_non_v4_views_keep_pre_revision_behaviour(path, query, boundary_ap
     app, seen = boundary_app(_canned)
     async with _client(app) as client:
         r = await client.post(f"{path}{query}", content=b"{}", headers=IDENTITY)
-    if query == "?v=3":
-        # 现状基线：catch-all coded 404 thin_route_not_found，无 Allow 头。
-        assert r.status_code == 404
-        assert orjson.loads(r.content) == {"code": "thin_route_not_found"}
-        assert "allow" not in r.headers
-        assert "cache-control" not in r.headers
-    else:
-        # selector 族 400（中间件层，先于路由）：无 selector=unsupported_version，
-        # v=5=unsupported_version，?v=4&v=3=invalid_version_selector。
-        assert r.status_code == 400
-        body = orjson.loads(r.content)
-        assert body["code"] in {"unsupported_version", "invalid_version_selector"}
-        if body["code"] == "unsupported_version":
-            assert body["supported"] == [3, 4]
+    # 2026-08-21 收窄：v3 加入 selector 族 400（中间件层，先于路由）——
+    # v3=unsupported_version（临时翻转，V2b 删）、无 selector=unsupported_version、
+    # v=5=unsupported_version，?v=4&v=3=invalid_version_selector；绝无
+    # ``method_not_applicable``。
+    assert r.status_code == 400
+    body = orjson.loads(r.content)
+    assert body["code"] in {"unsupported_version", "invalid_version_selector"}
+    if body["code"] == "unsupported_version":
+        assert body["supported"] == [4]
     assert seen == []
 
 
@@ -279,8 +274,14 @@ async def test_no_new_405_semantics_elsewhere(method, path, query, boundary_app)
     app, seen = boundary_app(_canned)
     async with _client(app) as client:
         r = await client.request(method, f"{path}{query}", headers=IDENTITY)
-    assert r.status_code == 404
-    assert orjson.loads(r.content) == {"code": "thin_route_not_found"}
+    if query == "?v=3":
+        # 2026-08-21 收窄（临时翻转，V2b 删）：v3 → 400 unsupported_version。
+        assert r.status_code == 400
+        assert orjson.loads(r.content) == {"code": "unsupported_version",
+                                           "supported": [4]}
+    else:
+        assert r.status_code == 404
+        assert orjson.loads(r.content) == {"code": "thin_route_not_found"}
     assert seen == []
 
 
@@ -308,6 +309,13 @@ async def test_patch_session_regression(query, boundary_app):
     async with _client(app) as client:
         r = await client.patch(f"/slimapi/session/s1{query}", json={"title": "x"},
                                headers=IDENTITY)
+    if query == "?v=3":
+        # 2026-08-21 收窄（临时翻转，V2b 删）。
+        assert r.status_code == 400
+        assert orjson.loads(r.content) == {"code": "unsupported_version",
+                                           "supported": [4]}
+        assert seen == []
+        return
     assert r.status_code == 200
     assert orjson.loads(r.content)["id"] == "s1"
     assert r.headers.get("cache-control") == "no-store"
@@ -321,6 +329,13 @@ async def test_delete_session_regression(query, boundary_app):
     app, seen = boundary_app(_canned)
     async with _client(app) as client:
         r = await client.delete(f"/slimapi/session/s1{query}", headers=IDENTITY)
+    if query == "?v=3":
+        # 2026-08-21 收窄（临时翻转，V2b 删）。
+        assert r.status_code == 400
+        assert orjson.loads(r.content) == {"code": "unsupported_version",
+                                           "supported": [4]}
+        assert seen == []
+        return
     assert r.status_code == 204
     assert len(seen) == 1
     assert seen[0].method == "DELETE"
@@ -402,9 +417,11 @@ async def test_v3_directory_ladder_unchanged(path, allow_header, allow_array,
     async with _client(app) as client:
         for kind, url, headers in cases:
             r = await client.post(url, content=b"{}", headers=headers)
-            status, code = _V3_DIRECTORY_EXPECT[(path, kind)]
-            assert r.status_code == status, (path, kind, r.status_code, r.text)
-            assert orjson.loads(r.content)["code"] == code
+            # 2026-08-21 收窄（临时翻转，V2b 删整个 v3 梯子守护）：?v=3 一律
+            # 版本族 400 unsupported_version（supported:[4]），先于 directory 梯子。
+            assert r.status_code == 400, (path, kind, r.status_code, r.text)
+            assert orjson.loads(r.content) == {"code": "unsupported_version",
+                                               "supported": [4]}
             assert r.headers.get("allow") is None
     assert seen == []
 
@@ -521,10 +538,12 @@ async def test_activation_does_not_leak_to_v3_or_selectorless(
         r = await client.post(f"/slimapi/session/s1{query}",
                               content=b"{}", headers=IDENTITY)
     if query == "?v=3":
-        assert r.status_code == 404
+        # 2026-08-21 收窄（临时翻转，V2b 删）：v3 → 400 unsupported_version，
+        # 仍绝无 method_not_applicable。
+        assert r.status_code == 400
         assert b"method_not_applicable" not in r.content
     else:
         assert r.status_code == 400
         body = orjson.loads(r.content)
         assert body["code"] == "unsupported_version"
-        assert body["supported"] == [3, 4]
+        assert body["supported"] == [4]

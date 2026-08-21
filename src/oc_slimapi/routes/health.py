@@ -11,11 +11,12 @@ from ..upstream import forward_upstream_headers, request_id_from_scope
 
 router = APIRouter(prefix="/slimapi", tags=["health"])
 
-# v4-contract §3.2: /health is DUAL-VIEW — the wire view comes from the
-# selector stash of the running request (?v=3 → 3, ?v=4 → 4; selector-less
-# direct invocation defaults to 3). /ready is NOT version-forked (contract
-# §12 route table: 零 v4 差异) — shape AND values stay the terminal v3 ones
-# regardless of the requested wire version.
+# v4-contract §3.2: under the v4-only (4, 4) window /health runs the v4
+# view unconditionally — the selector stashes "4" for admitted ``?v=4``
+# requests and every other scope observes the V2b-flipped default 4
+# (wire_view_from_scope is constant 4). /ready is NOT version-forked
+# (contract §12 route table: 零 v4 差异) — shape AND values stay the
+# terminal v3 ones (READY_VIEW below), frozen by contract.
 READY_VIEW = 3
 
 
@@ -26,7 +27,7 @@ async def health(request: Request):
     # impossible (S-B04: the value is the selector stash itself, the single
     # source the request was dispatched on).
     # accepted_client_versions / clientMin / clientMax stay config-driven
-    # (dual window: [3, 4]).
+    # (window collapsed to [4, 4] — the inclusive (min, max) pair).
     view = wire_view_from_scope(request.scope)
     resp = {
         # lite-v2: expose the slim API contract revision as a top-level
@@ -72,17 +73,18 @@ async def health(request: Request):
             "skeletonInlineOutputMaxBytes": request.app.state.config.skeleton_inline_output_max_bytes,
         },
     }
-    if view >= 4:
-        # v4-contract §3.2: v4 view adds the TRANSIENT auxiliary field —
-        # availability of the DB auxiliary source (B3a-B1 dbaux). Reads the
-        # same-source lifecycle state; absent attribute (test apps without
-        # dbaux wired) degrades to the disabled/http placeholder — the v3
-        # view carries NO auxiliary key (byte-identical terminal shape).
-        dbaux = getattr(request.app.state, "dbaux", None)
-        if dbaux is not None:
-            resp["auxiliary"] = dbaux.status().auxiliary_view()
-        else:
-            resp["auxiliary"] = {"available": False, "mode": "http"}
+    # v4-contract §3.2: the v4 view carries the TRANSIENT auxiliary field —
+    # availability of the DB auxiliary source (B3a-B1 dbaux). Reads the
+    # same-source lifecycle state; absent attribute (test apps without
+    # dbaux wired) degrades to the disabled/http placeholder. (The
+    # historical ``if view >= 4`` dual-view guard was removed with the V2b
+    # src teardown — under the v4-only window the auxiliary is always
+    # present; the v3-view shape that omitted the key no longer exists.)
+    dbaux = getattr(request.app.state, "dbaux", None)
+    if dbaux is not None:
+        resp["auxiliary"] = dbaux.status().auxiliary_view()
+    else:
+        resp["auxiliary"] = {"available": False, "mode": "http"}
     # S-E: optional deployment revision, omitted when None
     rev = request.app.state.deployment_revision
     if rev is not None:

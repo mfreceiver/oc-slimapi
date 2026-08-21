@@ -1,8 +1,8 @@
-> **Aligned with v3-contract.md + v4-contract.md（4.0.0 起 (3,4) 双版本窗口）+ CHANGELOG.md**
+> **Aligned with v4-contract.md（4.8.0 起 v4-only 单版本窗口的现行契约权威）+ CHANGELOG.md**
 >
 > This document reflects the current wire surface. All endpoints not listed
-> here have been deleted and return 404. 权威规范见 `docs/specs/v3-contract.md`（v3 基准）
-> 与 `docs/specs/v4-contract.md`（v4 差异面）；`v2-contract.md` 为 ≤2.x 历史存档——本文早期章节中的
+> here have been deleted and return 404. 权威规范见 `docs/specs/v4-contract.md`
+> （现行契约）；`v3-contract.md` 为 ≤4.7.0 历史存档（v3 wire 版本已于 4.8.0 退役）；`v2-contract.md` 为 ≤2.x 历史存档——本文早期章节中的
 > `X-Slimapi-Version` 头 / `X-Next-Cursor`·`X-Complete` 头 / token stream gzip 例外等表述已于 3.0.0 废止
 > （见各处行内废止注记）。**v4 迁移指南见本文 §「v4 迁移指南（wire v3 → v4）」**。
 
@@ -52,9 +52,9 @@
 
 ## v4 迁移指南（wire v3 → v4，2026-08-21）
 
-> **双轨现状**：wire 版本窗口 = **(3,4) 永久双版本**（owner 终态裁决，v4-contract §0.3；CHANGELOG [4.1.0]）。**ocdroid 现锁 `?v=3`，oc-webui 已迁 `?v=4`**。`?v=3` 全部语义逐字节冻结不变——本指南为**可选迁移路径**，不升级则零改动。版本协商唯一机制 = `?v=` selector + `GET /slimapi/versions` 发现端点（`X-Slimapi-Version` 头已删除，出现不解读）。
+> **现状（4.8.0 起）**：wire 版本窗口 = **(4,4) v4-only**（2026-08-21 版本窗收窄修订；原 (3,4) 永久双版本裁决被覆盖）。`?v=3`/无 `v` → 400 `unsupported_version supported:[4]`——**本指南由「可选迁移路径」变为仍锁 `?v=3` 的旧客户端的必改清单**；已迁 `?v=4` 的客户端零改动。版本协商唯一机制 = `?v=` selector + `GET /slimapi/versions` 发现端点（`X-Slimapi-Version` 头已删除，出现不解读）。
 >
-> 素材基线：包版本 v4.5.0（wire (3,4)，readiness 10/10 satisfied / ready:true）。权威契约：v3 视图 = `docs/specs/v3-contract.md`；v4 差异层 = `docs/specs/v4-contract.md`。迁移完整评估面（16 项 checklist A1–A16）另见审计交付 `docs/audits/2026-08-20/04-final/v3-retirement-plan.md` §2。
+> 素材基线：包版本 v4.8.0（wire (4,4) v4-only）。权威契约：`docs/specs/v4-contract.md`（现行）。迁移完整评估面（16 项 checklist A1–A16）另见审计交付 `docs/audits/2026-08-20/04-final/v3-retirement-plan.md` §2。下表历史行动项（[4.0.0] 起各版本）为迁移期记录，保留供旧客户端对照。
 
 ### 1. 迁移 checklist（CHANGELOG [4.0.0]–[4.5.0] 消费者行动项整合）
 
@@ -228,7 +228,7 @@
 
 ### 错误码（thin 路由统一 `{"code":"..."}`）
 
-`400 version_required`/`version_incompatible`（**3.0.0 废止**：两码已随 `X-Slimapi-Version` 头删除而不再存在——现行版本错误 = 400 `unsupported_version supported:[3,4]` / `invalid_version_selector`，v3-contract §2）、`404 thin_route_not_found`（旧 sidecar，回退信号）、`503 upstream_unavailable`（发现调用 total failure，无 envelope）。per-dir `/question` 失败 isolated 进 `errors[]`（非 HTTP 错误码，不中断整体）。
+`400 version_required`/`version_incompatible`（**3.0.0 废止**：两码已随 `X-Slimapi-Version` 头删除而不再存在——现行版本错误 = 400 `unsupported_version supported:[4]` / `invalid_version_selector`，v4-contract §2）、`404 thin_route_not_found`（旧 sidecar，回退信号）、`503 upstream_unavailable`（发现调用 total failure，无 envelope）。per-dir `/question` 失败 isolated 进 `errors[]`（非 HTTP 错误码，不中断整体）。
 
 ## Catalog skeleton（command / agent，加性 — 2026-08-05）
 
@@ -236,7 +236,7 @@
 
 两个 catalog 读接口走 slim skeleton 投影（实测省流 command ~97.6% / agent ~95.8% raw）：
 
-- **`GET /slimapi/command`**：须带 `?v=3`（4.0.0 起 `?v=4` 亦合法——(3,4) 双版本窗口；`X-Slimapi-Version` 头已于 3.0.0 删除。建议 `Accept-Encoding: gzip`）；query `directory?`（可选，仅作 `X-Opencode-Directory` 头转发，catalog 全局）。200 返回裸数组，每项白名单 `{name, description, agent?, hints?}`（agent/hints 可选，缺则不出现）；**已丢弃** `template`(~97.7%)/`source`/`model`/`subtask`。
+- **`GET /slimapi/command`**：须带 `?v=4`（**4.8.0 起 v4-only**；`?v=3`/无 `v`→400 `unsupported_version supported:[4]`；`X-Slimapi-Version` 头已于 3.0.0 删除。建议 `Accept-Encoding: gzip`）；query `directory?`（可选，仅作 `X-Opencode-Directory` 头转发，catalog 全局）。200 返回裸数组，每项白名单 `{name, description, agent?, hints?}`（agent/hints 可选，缺则不出现）；**已丢弃** `template`(~97.7%)/`source`/`model`/`subtask`。
 - **`GET /slimapi/agent`**：同上头与 directory 语义。200 返回裸数组，每项白名单 `{name, description, mode, hidden?, native?}`（hidden/native 可选，可能为 null/false）；**已丢弃** `prompt`(~34.7%)/`permission`(~61.2%，`Permission.Ruleset` 规则集——**非** pending permission card)/`topP`/`temperature`/`color`/`variant`/`options`/`steps`/`model`。
 
 ### 客户端必须
@@ -248,7 +248,7 @@
 
 ### 错误码（thin 路由统一 `{"code":"..."}`）
 
-`400 version_required`/`version_incompatible`（**3.0.0 废止**——现行版本错误 = 400 `unsupported_version supported:[3,4]` / `invalid_version_selector`）、`400 invalid_directory`、`404 thin_route_not_found`（旧 sidecar，回退信号）、`413 response_too_large`、`502 upstream_http_N`、`503 upstream_unavailable`、`503 transform_busy`(+`Retry-After:2`)、`422`。catalog 非 session 级，无 `session_not_found`。catalog 条目**无** `hasFull`/`omitted`（那是 message part 概念）。
+`400 version_required`/`version_incompatible`（**3.0.0 废止**——现行版本错误 = 400 `unsupported_version supported:[4]` / `invalid_version_selector`）、`400 invalid_directory`、`404 thin_route_not_found`（旧 sidecar，回退信号）、`413 response_too_large`、`502 upstream_http_N`、`503 upstream_unavailable`、`503 transform_busy`(+`Retry-After:2`)、`422`。catalog 非 session 级，无 `session_not_found`。catalog 条目**无** `hasFull`/`omitted`（那是 message part 概念）。
 
 ### 监控
 
@@ -281,7 +281,7 @@
 
 ### 错误码（thin 路由统一 `{"code":"..."}`）
 
-`400 version_required`/`version_incompatible`（**3.0.0 废止**——现行版本错误 = 400 `unsupported_version supported:[3,4]` / `invalid_version_selector`）、`404 thin_route_not_found`（旧 sidecar，回退信号）、`503 upstream_unavailable`（发现调用 total failure / 严格 schema 守卫失败 / 超响应 cap / 网络 5xx，无 envelope）、`503 transform_busy`(+`Retry-After:2`)、`422`。directories 非 session 级，无 `session_not_found`。**注意**：discovery 4xx 也映射为 `upstream_unavailable`（不泄漏 upstream status——experimental 端点 4xx 意 opencode 不支持）。
+`400 version_required`/`version_incompatible`（**3.0.0 废止**——现行版本错误 = 400 `unsupported_version supported:[4]` / `invalid_version_selector`）、`404 thin_route_not_found`（旧 sidecar，回退信号）、`503 upstream_unavailable`（发现调用 total failure / 严格 schema 守卫失败 / 超响应 cap / 网络 5xx，无 envelope）、`503 transform_busy`(+`Retry-After:2`)、`422`。directories 非 session 级，无 `session_not_found`。**注意**：discovery 4xx 也映射为 `upstream_unavailable`（不泄漏 upstream status——experimental 端点 4xx 意 opencode 不支持）。
 
 ### 监控
 
@@ -340,7 +340,7 @@
 
 ### 错误码（thin 路由统一 `{"code":"..."}`）
 
-`400 version_required`/`version_incompatible`（**3.0.0 废止**——现行版本错误 = 400 `unsupported_version supported:[3,4]` / `invalid_version_selector`；[4.6.1] 起另补录 422 `invalid_request_body`，POST body 畸形）、`404 thin_route_not_found`（旧 sidecar，回退信号）、`404 action_not_found`、`409 action_confirm_required`、`413 request_too_large`、`429 action_throttled`+`Retry-After`、`503 actions_disabled`/`action_unavailable`/`action_busy`+`Retry-After:2`、`504 action_timeout`+`timeout_s`、`422`。
+`400 version_required`/`version_incompatible`（**3.0.0 废止**——现行版本错误 = 400 `unsupported_version supported:[4]` / `invalid_version_selector`；[4.6.1] 起另补录 422 `invalid_request_body`，POST body 畸形）、`404 thin_route_not_found`（旧 sidecar，回退信号）、`404 action_not_found`、`409 action_confirm_required`、`413 request_too_large`、`429 action_throttled`+`Retry-After`、`503 actions_disabled`/`action_unavailable`/`action_busy`+`Retry-After:2`、`504 action_timeout`+`timeout_s`、`422`。
 
 ### slim-fail-open 授权（入口常驻 + 空状态 = 透明回退合规，omni 裁决 SSOT）
 
@@ -468,6 +468,7 @@ ocdroid 可在每个请求（含 SSE）**可选**附加三个 request header：
 - **连接建立期 coalescing**：带 `Last-Event-ID` 重连时同连接可能先 `resync` 再 `server.connected`（既有）。客户端 **SHOULD** 对同一连接建立期 cold-start 触发帧做 once-latch（至多一次 reconcile）。
 - **`server.heartbeat` ≠ 上游健康**：仅证 sidecar + 订阅存活；outage 探测用 `/slimapi/ready` 或自然 fetch/write 失败。sidecar 重启后重连收 `server.connected` → **应** cold-start。
 - digest `lastError`：sticky 跨窗口，`status=busy` 清除（显式 `null` 帧）；客户端据此显隐 session 错误 banner。`MessageAbortedError` 被 sidecar 过滤，不下发。
+- **`lastError` / `session.error` 增补字段（加性）**：错误对象在 `{name,message,at}` 基线上另含 `code`（恒有，枚举与约束见 `v4-contract.md` §7.6）+ 可选 `provider` / `model` / `retryAfter`（int 秒，clamp 1..86400）/ `quotaResetAt`，digest `lastError` 与无 sid 直推帧两处同步生效。ocdroid/webui 建议：解析 `code` 渲染差异化文案——`provider_rate_limited` 可配 `retryAfter` 倒计时（值为向上取整（ceil）后的整数秒；到点前禁用重发），`provider_quota_exceeded` 可用 `quotaResetAt`（如有）提示恢复时间，`provider_context_length_exceeded` / `provider_unauthorized` 勿自动重试；未知 `code` 回退展示脱敏 `message`。老客户端忽略未知键零影响。
 - 客户端所有 `/slimapi/**` 请求（含 SSE）须带查询参数 `?v=3`（4.0.0 起 `?v=4` 亦合法——(3,4) 双版本窗口；`X-Slimapi-Version` 头已于 3.0.0 删除，出现不解读）；连接时读 `/slimapi/health?v=3` 自检（见下 schema 三键）。
 - **仍推送帧类型（仅作观察信号）**：`question.asked` / `v2.asked`、`permission.asked` / `resolved` / `v2.asked` / `v2.resolved`——这些帧仍通过 SSE 直推，但 v2 已删除 q/p 写端点与 routeToken；客户端应答 q/p 走 catch-all + `X-Opencode-Directory`（写路径现以 v3-contract §10 为准；v2-contract §2 为历史出处）。帧的 wire 形态不变。
 - **已移除帧类型**：`server.reconfigured`（对应 discovery 数据流整体下线）。
@@ -485,7 +486,7 @@ ocdroid 可在每个请求（含 SSE）**可选**附加三个 request header：
 ### capability 探测（必须）
 
 - `/slimapi/health` 根级 **`features.tokenStream === true`** 才启用 stream 客户端；缺字段 / 404 / 405 → 降级为既有「完成后整条出现」（`/slimapi/messages/{sid}` 重拉权威全文），**不得**尝试连 stream 端点。
-- 路径与版本以**本仓库** `docs/specs/v3-contract.md` + `CHANGELOG.md` 为准（端点 `GET /slimapi/sessions/{sid}/stream`，须带 `?v=3`，**不 bump**——`X-Slimapi-Version` 头已于 3.0.0 删除）。
+- 路径与版本以**本仓库** `docs/specs/v4-contract.md` + `CHANGELOG.md` 为准（端点 `GET /slimapi/sessions/{sid}/stream`，须带 `?v=4`（4.8.0 起 v4-only），**不 bump**——`X-Slimapi-Version` 头已于 3.0.0 删除）。
 
 ### stream 客户端生命周期（必须）
 
@@ -610,7 +611,7 @@ ocdroid 可在每个请求（含 SSE）**可选**附加三个 request header：
 ### 前置条件（退役前必须完成，均为 ocdroid 侧改动）
 
 - **C1 — 图片走 catch-all `GET /file`**：`HttpImageHolder`（消息图片加载）从直连 opencode 改为走 sidecar catch-all（带 `X-Opencode-Directory` 头，`GET /file` 经反代透传）——图片加载不再依赖 `:14096` 直连。
-- **C3 — 连接自检改打 `/slimapi/health`**：`checkHealthFor`（连接/健康自检）从直连 health 改为 `GET /slimapi/health?v=3`（读 `sidecar.ok`/`server.api_version`/`schema.version`——`X-Slimapi-Version` 头已于 3.0.0 删除）——健康检查不再依赖 `:14096` 直连。
+- **C3 — 连接自检改打 `/slimapi/health`**：`checkHealthFor`（连接/健康自检）从直连 health 改为 `GET /slimapi/health?v=4`（读 `sidecar.ok`/`server.api_version`/`schema.version`——`X-Slimapi-Version` 头已于 3.0.0 删除；4.8.0 起 v4-only）——健康检查不再依赖 `:14096` 直连。
 
 ### 退役范围（L2 四能力落地后执行）
 

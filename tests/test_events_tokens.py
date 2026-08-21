@@ -343,81 +343,49 @@ async def test_tokens_non_literal_direct_call_400():
 
 async def test_default_events_builds_stream_meta_then_connected():
     """Default (no tokens) builds the stream; slimapi.meta is the FIRST
-    frame and server.connected follows (terminal §7.2 + A-C1 order)."""
+    frame. (V2b default flip: the selector-less stack now runs the v4
+    view, which SUPPRESSES the connection-local ``server.connected``
+    welcome frame — only meta is guaranteed.)"""
     app = _build_app(_settings())
     try:
         status, _, body = await _drive_stream(app, "/slimapi/events", _headers())
         assert status == 200
         frames = list(_sse_frames(body))
-        assert frames, "expected at least the handshake frames"
+        assert frames, "expected at least the meta frame"
         assert frames[0][0] == "slimapi.meta", (
             f"slimapi.meta must be first, got {frames[0]!r}"
         )
         assert frames[0][1]["tokens"] is False
-        assert frames[1][0] == "server.connected", (
-            f"server.connected must follow meta, got {frames[1]!r}"
+        assert all(ev != "server.connected" for ev, _ in frames), (
+            "v4 view suppresses the connection-local welcome frame"
         )
     finally:
         await _close_app(app)
 
 
 async def test_tokens_one_builds_stream_meta_tokens_true():
-    """``?tokens=1`` builds the stream; slimapi.meta first with
-    tokens=true, server.connected follows (the tokens=1 path must not
-    reorder the handshake)."""
+    """``?tokens=1`` is RETIRED on the v4-only face: flat 400
+    ``tokens_stream_retired_in_v4`` before any stream opens (§7.3).
+    (The V2b default flip routed the selector-less stack onto the v4
+    view; the former tokens=1 attach path was removed with it.)"""
     app = _build_app(_settings())
     try:
         status, _, body = await _drive_stream(
             app, "/slimapi/events?tokens=1", _headers())
-        assert status == 200
-        frames = list(_sse_frames(body))
-        assert frames, "expected at least the handshake frames"
-        assert frames[0][0] == "slimapi.meta", (
-            f"slimapi.meta must be first, got {frames[0]!r}"
-        )
-        assert frames[0][1]["tokens"] is True
-        assert frames[1][0] == "server.connected", (
-            f"server.connected must follow meta, got {frames[1]!r}"
-        )
+        assert status == 400
+        payload = json.loads(body)
+        assert payload["code"] == "tokens_stream_retired_in_v4"
     finally:
         await _close_app(app)
 
 
 # ===========================================================================
 # A-C2 — coalescing: 2 deltas, one (sid, mid, pid) window → single token frame
+# (the end-to-end variant via ``/slimapi/events?tokens=1`` was removed with
+# the V2b src teardown — tokens=1 is a flat 400 on the v4-only face; the
+# coalescing mechanism itself stays covered by the registry-unit test below
+# and the per-session token-stream route tests)
 # ===========================================================================
-
-async def test_tokens_one_coalesces_two_deltas_into_single_frame():
-    """End-to-end: two ``message.part.delta`` (same key) coalesce in one ~100ms
-    flush window → exactly ONE ``{type:"token", sessionID, messageID, partID,
-    delta:"Hello"}`` frame on the stream (A-C2)."""
-    app = _build_app(_settings())
-    try:
-        global_hub = app.state.hubs.get_global()
-        # Both deltas land in the SAME pending window: published synchronously
-        # before the flush loop (started by the route's tap attach) ticks.
-        global_hub.publish(make_global_event("/p", "message.part.updated",
-                                             _updated_props(text="")))
-        global_hub.publish(make_global_event("/p", "message.part.delta",
-                                             _delta_props(delta="Hel")))
-        global_hub.publish(make_global_event("/p", "message.part.delta",
-                                             _delta_props(delta="lo")))
-        status, _, body = await _drive_stream(
-            app, "/slimapi/events?tokens=1", _headers(), park_timeout=0.6)
-        assert status == 200
-        frames = list(_sse_frames(body))
-        tokens = [data for ev, data in frames if data.get("type") == "token"]
-        assert len(tokens) == 1, f"expected 1 coalesced token frame, got {len(tokens)}"
-        assert tokens[0] == {
-            "type": "token",
-            "sessionID": "s1",
-            "messageID": "m1",
-            "partID": "p1",
-            "delta": "Hello",
-        }
-    finally:
-        await _close_app(app)
-
 
 async def test_token_frame_shape_via_flush_direct():
     """Registry-unit: attach events subscriber, updated + 2 deltas, manual
@@ -475,7 +443,9 @@ async def test_default_events_emits_no_token_frames_while_deltas_flow():
                 app, "/slimapi/events", _headers(), park_timeout=0.6)
             assert status == 200
             frames = list(_sse_frames(body))
-            assert any(ev == "server.connected" for ev, _ in frames)
+            # (V2b default flip: v4 view suppresses the connection-local
+            # ``server.connected`` welcome frame.)
+            assert all(ev != "server.connected" for ev, _ in frames)
             assert all(data.get("type") != "token" for _, data in frames), (
                 "default events stream must not emit token frames"
             )

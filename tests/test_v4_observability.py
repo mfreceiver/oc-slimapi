@@ -6,11 +6,12 @@ and the SSE active dims. The compatibility iron-rule: shapes stay
 identical — old rows / snapshots remain interpretable (new values only
 appear for new requests). DB-auxiliary metrics are NOT here (B5 lane).
 
-B12（2026-08-21 v4 自包含 golden 化清点）：本文件**无**「先发 ?v=3 求
-期望再比 v4」形态——维度常量与逐行断言本就内联字面；v3 行/lifecycle
-测试（test_access_log_row_v3_request_unchanged、
-test_sse_lifecycle_v3_scope_unchanged）为 v3 守护网（三分处置②，
-Phase 4 v3 面拆除前保留）。
+V2b（2026-08-21 Phase-4 守护锁拆除）：活流量 v3 面（?v=3 请求行/
+矩阵 key）测试已删——版本窗 v4-only (4,4) 后 ?v=3 是 400 rejected，
+不再产生 v3 行。保留下列 v3 **字面**断言是 §9 冻结观测命名，非 v3 流
+转：矩阵/快照的 schema 名 "v3"（ledger.snapshot()["v3"]）、SSE 维度
+枚举含 "v3"、聚合器对历史 v3 行（合成行 selectorResult="v3"）的
+可解释性（铁律：旧日志行零破坏）。
 """
 from __future__ import annotations
 
@@ -105,7 +106,11 @@ def _build_app(logger, *, ledger: TrafficLedger | None = None) -> FastAPI:
 
 def test_sse_dims_widened_and_in_sync():
     """Both copies of the sseActive dim value set carry "v4" — and nothing
-    else changed (the old four survive, ordering is stable)."""
+    else changed (the old four survive, ordering is stable).
+
+    NB: "v3" here is §9 frozen observability schema NAMING (a dim bucket
+    for historical rows), not a live v3 stream — the admitted wire is
+    always 4 under the v4-only (4,4) window."""
     assert SSE_RESULT_DIMS == ("v2", "v3", "v4", "absent", "not_applicable")
     assert _SSE_DIMS == ("v2", "v3", "v4", "absent", "not_applicable")
     assert SSE_RESULT_DIMS == _SSE_DIMS
@@ -135,18 +140,6 @@ async def test_access_log_row_v4_request(capture_logger):
     # health is a non-consuming route (§5.3 static table) → directoryForm
     # null, not "absent" — same as the pre-widening v3 rows.
     assert rows[0]["directoryForm"] is None
-
-
-async def test_access_log_row_v3_request_unchanged(capture_logger):
-    app = _build_app(capture_logger)
-    transport = ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
-        r = await c.get("/slimapi/health", params={"v": "3"}, headers=IDENTITY)
-    assert r.status_code == 200
-    rows = [r_ for r_ in _rows(capture_logger) if r_.get("recordType", "request") == "request"]
-    assert len(rows) == 1
-    assert rows[0]["selectorResult"] == "v3"
-    assert rows[0]["wireVersion"] == "3"
 
 
 async def test_access_log_row_rejected_v5_null_wire(capture_logger):
@@ -203,15 +196,17 @@ async def test_access_log_row_v4_directory_retired_counts_4xx(capture_logger):
 # ---------------------------------------------------------------------------
 
 async def test_ledger_matrix_v4_key(capture_logger):
+    """The only admitted wire (4) lands under the FROZEN "v3" schema name
+    (§9 observability naming — snapshot()["v3"]) as v4|…|4 matrix keys;
+    no live v3 row is produced anymore (?v=3 is a rejected 400 under the
+    v4-only (4,4) window)."""
     ledger = TrafficLedger(enabled=True)
     app = _build_app(capture_logger, ledger=ledger)
     transport = ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         await c.get("/slimapi/health", params={"v": "4"}, headers=IDENTITY)
-        await c.get("/slimapi/health", params={"v": "3"}, headers=IDENTITY)
     matrix = ledger.snapshot()["v3"]["matrix"]
     assert any(k.startswith("v4|4|") for k in matrix)
-    assert any(k.startswith("v3|3|") for k in matrix)
     # Flat-key arity unchanged: 6 segments (schema shape frozen).
     for key in matrix:
         assert len(key.split("|")) == 6

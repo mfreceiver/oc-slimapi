@@ -85,7 +85,7 @@ async def test_no_v_is_unsupported_version():
     async with _client(app) as client:
         resp = await client.get("/slimapi/health")
         assert resp.status_code == 400
-        assert resp.json() == {"code": "unsupported_version", "supported": [3, 4]}
+        assert resp.json() == {"code": "unsupported_version", "supported": [4]}
 
 
 async def test_no_v_with_header_still_unsupported():
@@ -97,7 +97,7 @@ async def test_no_v_with_header_still_unsupported():
             resp = await client.get("/slimapi/health", headers=headers)
             assert resp.status_code == 400, headers
             assert resp.json() == {"code": "unsupported_version",
-                                   "supported": [3, 4]}
+                                   "supported": [4]}
 
 
 async def test_v2_explicit_is_unsupported_version():
@@ -105,7 +105,7 @@ async def test_v2_explicit_is_unsupported_version():
     async with _client(app) as client:
         resp = await client.get("/slimapi/health", params={"v": "2"})
         assert resp.status_code == 400
-        assert resp.json() == {"code": "unsupported_version", "supported": [3, 4]}
+        assert resp.json() == {"code": "unsupported_version", "supported": [4]}
 
 
 async def test_v2_with_header_also_unsupported():
@@ -114,33 +114,35 @@ async def test_v2_with_header_also_unsupported():
         resp = await client.get("/slimapi/health", params={"v": "2"},
                                 headers=VERSION_HEADER)
         assert resp.status_code == 400
-        assert resp.json() == {"code": "unsupported_version", "supported": [3, 4]}
+        assert resp.json() == {"code": "unsupported_version", "supported": [4]}
 
 
 # ---------------------------------------------------------------------------
-# v3 admitted
+# v3 retired (2026-08-21 narrowing) — the former admission half of the
+# dual-view matrix now answers the unsupported-version 400 face. V2b scope:
+# consolidate/delete the v3 half once the guard net goes.
 # ---------------------------------------------------------------------------
 
 async def test_v3_without_header_ok():
+    """v3 was the 3.x terminal admission view; since the 2026-08-21 window
+    narrowing (shipped 4.8.0) it answers the unsupported-version 400."""
     app = _build_app()
     async with _client(app) as client:
         resp = await client.get("/slimapi/health", params={"v": "3"})
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["slimapi_contract"] == 3
-        assert body["server"]["api_version"] == 3
-        assert body["schema"]["version"] == 3
+        assert resp.status_code == 400
+        assert resp.json() == {"code": "unsupported_version", "supported": [4]}
 
 
 async def test_v3_with_any_header_ignored():
-    """§1: the retired header is not read — any value alongside v=3 is fine."""
+    """§1: the retired header is not read — it cannot rescue a ?v=3 request
+    across the window narrowing either."""
     app = _build_app()
     async with _client(app) as client:
         for value in ("2", "3", "9", "garbage"):
             resp = await client.get("/slimapi/health", params={"v": "3"},
                                     headers={"X-Slimapi-Version": value})
-            assert resp.status_code == 200, value
-            assert resp.json()["slimapi_contract"] == 3
+            assert resp.status_code == 400, value
+            assert resp.json() == {"code": "unsupported_version", "supported": [4]}
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +179,7 @@ async def test_lexically_invalid_rejected_even_with_header():
 async def test_multi_same_value_folds():
     app = _build_app()
     async with _client(app) as client:
-        resp = await client.get("/slimapi/health?v=3&v=3")
+        resp = await client.get("/slimapi/health?v=4&v=4")
         assert resp.status_code == 200
 
 
@@ -201,25 +203,25 @@ async def test_multi_one_lexically_invalid_rejected():
 # unsupported versions
 # ---------------------------------------------------------------------------
 
-# Dual-version window (B3a-A2): 4 is now admitted; the unsupported set is
-# everything outside {3, 4}.
-@pytest.mark.parametrize("v", ["1", "2", "5", "10", "999999"])
+# Version-window narrowing (2026-08-21): 4 is the only admitted version;
+# the unsupported set is everything outside {4} — including the retired 3.
+@pytest.mark.parametrize("v", ["1", "2", "3", "5", "10", "999999"])
 async def test_unsupported_version_rejected(v):
     app = _build_app()
     async with _client(app) as client:
         resp = await client.get(f"/slimapi/health?v={v}")
         assert resp.status_code == 400
-        assert resp.json() == {"code": "unsupported_version", "supported": [3, 4]}
+        assert resp.json() == {"code": "unsupported_version", "supported": [4]}
 
 
 async def test_unsupported_multi_same_rejects():
-    # v=4&v=4 now folds + routes (dual window) — the unsupported-same-repeat
-    # semantics are pinned with a value outside {3, 4}.
+    # v=4&v=4 folds + routes (v4-only window) — the unsupported-same-repeat
+    # semantics are pinned with a value outside {4}.
     app = _build_app()
     async with _client(app) as client:
         resp = await client.get("/slimapi/health?v=5&v=5")
         assert resp.status_code == 400
-        assert resp.json() == {"code": "unsupported_version", "supported": [3, 4]}
+        assert resp.json() == {"code": "unsupported_version", "supported": [4]}
 
 
 async def test_unsupported_rejected_even_with_valid_header():
@@ -228,7 +230,7 @@ async def test_unsupported_rejected_even_with_valid_header():
         resp = await client.get("/slimapi/health?v=5",
                                 headers={"X-Slimapi-Version": "3"})
         assert resp.status_code == 400
-        assert resp.json() == {"code": "unsupported_version", "supported": [3, 4]}
+        assert resp.json() == {"code": "unsupported_version", "supported": [4]}
 
 
 # ---------------------------------------------------------------------------
@@ -241,7 +243,7 @@ async def test_versions_get_exempt_from_selector():
         resp = await client.get("/slimapi/versions")
         assert resp.status_code == 200
         body = resp.json()
-        assert body["available"] == [3, 4]
+        assert body["available"] == [4]
         assert body["current"] == 4
 
 
@@ -250,7 +252,7 @@ async def test_versions_get_exempt_with_bad_selector():
     async with _client(app) as client:
         resp = await client.get("/slimapi/versions?v=0")
         assert resp.status_code == 200
-        assert resp.json()["available"] == [3, 4]
+        assert resp.json()["available"] == [4]
 
 
 async def test_versions_get_exempt_with_bad_header():
@@ -313,8 +315,8 @@ async def test_double_slash_health_still_judged():
     async with _client(app) as client:
         resp = await client.get("http://t//slimapi/health")
         assert resp.status_code == 400
-        assert resp.json() == {"code": "unsupported_version", "supported": [3, 4]}
-        resp = await client.get("http://t//slimapi/health?v=3")
+        assert resp.json() == {"code": "unsupported_version", "supported": [4]}
+        resp = await client.get("http://t//slimapi/health?v=4")
         # The selector ADMITTED the request (no 400) — routing in this
         # minimal stack has no catch-all, so the un-normalised // path is a
         # route miss (404). The point under test: the selector judged the
