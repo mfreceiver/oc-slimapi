@@ -48,6 +48,131 @@
 - expand 请求 404 `thin_route_not_found`（旧 sidecar 无此路由）→ 回退 `/full/{mid}` 整条拉取。
 - **不降级触发条件**：除 404 `thin_route_not_found` 外（503/413/timeout/版本错误/鉴权错误）一律重试/刷新——走 `/full` 会让流量翻倍 + 掩盖问题（沿用全局 fallback 规则）。
 
+## v4 迁移指南（wire v3 → v4，2026-08-21）
+
+> **双轨现状**：wire 版本窗口 = **(3,4) 永久双版本**（owner 终态裁决，v4-contract §0.3；CHANGELOG [4.1.0]）。**ocdroid 现锁 `?v=3`，oc-webui 已迁 `?v=4`**。`?v=3` 全部语义逐字节冻结不变——本指南为**可选迁移路径**，不升级则零改动。版本协商唯一机制 = `?v=` selector + `GET /slimapi/versions` 发现端点（`X-Slimapi-Version` 头已删除，出现不解读）。
+>
+> 素材基线：包版本 v4.5.0（wire (3,4)，readiness 10/10 satisfied / ready:true）。权威契约：v3 视图 = `docs/specs/v3-contract.md`；v4 差异层 = `docs/specs/v4-contract.md`。迁移完整评估面（16 项 checklist A1–A16）另见审计交付 `docs/audits/2026-08-20/04-final/v3-retirement-plan.md` §2。
+
+### 1. 迁移 checklist（CHANGELOG [4.0.0]–[4.5.0] 消费者行动项整合）
+
+按版本号升序，逐项为消费者（ocdroid / oc-webui / 其它 HTTP 客户端）行动项；未列出版本无消费者行动项：
+
+| 版本 | 消费者行动项 |
+|---|---|
+| **[4.0.0]**（wire 3 → (3,4)） | ① **升级前置**：先经 `GET /slimapi/versions` 能力探测（`available:[3,4]`、`capabilities["4"]`）再启用 `?v=4`。② **sessions 列表参数轴换轨**：移除 `directory`（v4 四形态一律 400 `directory_retired_in_v4`）；移除 `roots`/`start`（v4 携带 → 422 `param_version_mismatch`；反向：v3 请求带 `archived`/`parent`/`cursor` 同样 422）；改用 `archived`（omit/only/all）/`parent`（all/none/only/`<sid>`）/`search`/`cursor`；`limit` 域 1–500（v3 为 1–1000，超 → 422）。③ **降级面**：dbaux 不可用时按降级矩阵 503 `auxiliary_unavailable` + `Retry-After: 30`（**不自动回退 v3**）或 200 + `degraded:true`。④ **SSE（可选启用）**：`Last-Event-ID` 断线重连（meta 帧 `epoch`/`seqBase` 为基线；收到 `resync` 后走 HTTP 全量对齐——**服务端永不发 snapshot 帧**）。⑤ **token 统一流退役**：`?v=4` 下 `GET /slimapi/events?tokens=1` → 400 `tokens_stream_retired_in_v4`；token 唯一通道 = `GET /slimapi/sessions/{sid}/stream`（独立 `id:` 序列）。⑥ **不升级**：维持 `?v=3` 全部行为零改动。 |
+| **[4.1.0]** | 无（singleflight 双实现合并，纯内部重构，v3/v4 响应逐字节不变，ocdroid 零感知）。 |
+| **[4.2.0]** | **ocdroid 必改点：无**（v3 视图逐字节不变）。v4 修订面按 readiness 逐 feature opt-in，探测公式：`optIn(F) = localFlag && (4 ∈ available) && (F ∈ readiness.satisfied)`（`GET /slimapi/versions` 的 `capabilities["4"].readiness`）。已生效五面：providers 安全投影（§12）、session 单查 parity（§13）、expand href 闭环（§14——**不得缓存跨版本 href**，v4 响应的 expandRefs 指向 `?v=4`）、表示层恒 `Vary: Accept-Encoding` + v4 ETag（§15——validator 域隔离，**迁移后需重新初始化 ETag 缓存**，跨视图不互配）、method 边界 405（§16 过渡态，后被 [4.3.0] 激活取代）。 |
+| **[4.3.0]** | **POST 等效动作族**（仅 `?v=4`，加性**可选**采用）：`POST /slimapi/session/{sid}` ≡ PATCH（同一 PatchPayload 逐字节等效）、`POST …/delete` ≡ DELETE、`POST …/archive`（空 body 自动合成 `{"time":{"archived":<ms>}}`）。PATCH/DELETE 主路径 v3/v4 继续可用**不退役**；`?v=3` 下三条 POST → 404 `thin_route_not_found` 不变。**non-goal 收紧**：cascade 编排层（级联删除聚合/重试/部分失败可见性）与 cross-session search 升**永久 non-goal**（§17）——勿期待服务端补齐。 |
+| **[4.4.0]** | providers v4 `ModelEntry` 恢复 optional `limit`（嵌套 `limit.{context,input,output}`，子键白名单恰好三键，逐子键 int-else-omit，任何响应绝无 `"limit": null` / `"limit": {}`）。oc-webui 零改动恢复精确上下文分母（`model.limit?.context`）；ocdroid（v3）无影响（`?v=3` raw 透传含 limit 逐字节不变）。表示域投影指纹 bump（`providers-projection-v1` → `v2`）：升级后旧 v4 ETag 全部自然失效重拉。 |
+| **[4.5.0]** | ① **SSE 决议帧拼写纠正**（F-001）：真实帧名 = `permission.replied` / `permission.v2.replied`（旧 `.resolved` 拼写为幽灵名，从未有真实帧上 wire——**消费方零迁移**）；修复后权限决议帧真实到达，收到即关闭对应权限卡片（详见本文件 §4）。② **FastAPI 默认文档路由关闭**（F-137）：`GET /docs`、`/redoc`、`/openapi.json`、`/docs/oauth2-redirect`（含 HEAD）→ 404 `thin_route_not_found`——勿依赖这些路径。③ merged 模式预算按候选数均分修复（F-006，契约内行为修复，客户端无需改动）。 |
+
+**锚点清单（小节 1）**
+
+| 锚点 | 内容 |
+|---|---|
+| `CHANGELOG.md:29` | [4.5.0] 审计整改批次一（F-001/F-137/F-006） |
+| `CHANGELOG.md:59` | [4.4.0] providers limit 恢复（修订三） |
+| `CHANGELOG.md:77` | [4.3.0] POST 等效动作族（修订二） |
+| `CHANGELOG.md:101` | [4.2.0] readiness 门禁 + 五项修订面 |
+| `CHANGELOG.md:134` | [4.1.0] singleflight 合并（零感知） |
+| `CHANGELOG.md:145` | [4.0.0] wire 双版本 (3,4) 开窗 |
+| `CHANGELOG.md:179-183` | [4.0.0] 消费者行动项原文段 |
+
+### 2. 字段差集对照表（providers / sessions）
+
+迁移前必做**消费字段差集全量 diff**——生产实证：oc-webui 迁 v4 即踩 providers 投影丢 `limit`（上下文使用百分比失去分母，[4.4.0] 修复）；教训 = 逐字段核对自身消费字段与 v4 白名单。
+
+**providers（`GET /slimapi/config/providers`，v3 raw 透传 → v4 安全投影 §12.1）**
+
+| 字段（v3 透传存在） | v4 去向 | 备注 |
+|---|---|---|
+| provider `id` / `name` / `source` | **保留**（required/required/optional） | `source` 非 string → 省略键不报错 |
+| provider `env` / `key` / `options` | **确定性丢弃** | 安全投影（§12.1 丢弃清单） |
+| 顶层多余/缺失 key | **malformed**（502 `provider_upstream_malformed`） | 顶层恰好 `providers` + `default` 两 key |
+| model `id` / `name` / `providerID` / `status` / `variants` | **保留** | map key == `Model.id`；`variants` = map key 排序数组 |
+| model `api` / `capabilities` / `cost` / `options` / `headers` / `release_date` | **确定性丢弃** | §12.1 丢弃清单 |
+| model `limit`（v3 顶层透传） | **转嵌套** `limit.{context,input,output}`（[4.4.0] 修订三恢复） | 曾列丢弃清单；现 optional 投影，int-else-omit |
+| variant 内 `name` / `status` 等一切 | **丢弃** | wire 仅 map key 字符串数组 |
+| 未知 provider/model 字段 | **递归丢弃**（不报错） | 嵌套规则冻结 |
+
+附带差异：新错误码 502 `provider_upstream_malformed` / 413 `provider_projection_limit`（四限额 256 providers / 1024 models / 64 variants / 8 MiB body，无静默截断）；canonical 键序 = UTF-8 字节序；ETag 表示域 `providers-projection-v2`（跨视图/跨版本互不误 304）。
+
+**sessions（`GET /slimapi/sessions` 列表 + `GET /slimapi/session/{sid}` 单查，v3 投影 → v4 canonical §13.1）**
+
+| 维度 | v3（现 ocdroid 所在视图） | v4 |
+|---|---|---|
+| 列表响应形状 | `Session[]` 裸数组 + `X-Complete` 头 | envelope `{items, nextCursor, complete, degraded}`（`degraded` 为 required 布尔） |
+| item 形状 | v3 投影（`id/directory/parentID/projectID/title/agent/model/time/summary/revert`） | `SessionSkeletonV4` = v3 投影 + `project` 对象 + tokens 五列平铺 + `partial`/`degraded` 标记 |
+| `project` | 无（仅 `projectID` 标量） | `project: {id, name?, worktree} \| null`；**absent ⇔ `projectID == null`**；join 失败 → `null` + `partial:true, degraded:true`（两种 wire 形态不得混同） |
+| tokens 用量 | 无（v3 投影丢弃） | `tokens_input`/`tokens_output`/`tokens_reasoning`/`tokens_cache_read`/`tokens_cache_write`（`null` = 无计量，业务合法 null 不 partial） |
+| 列表参数 | `directory`/`roots`/`start`/`limit` 1–1000/`search` | `archived`/`parent`/`search`/`cursor`/`limit` 1–500（互斥违规 → 422 `param_version_mismatch`） |
+| 排序 | 上游序 | 冻结 `(time_updated DESC, id DESC)` |
+| ETag | v3 validator 域 | v4 validator 域隔离（REP 含 `wire=v4`）——跨视图 `If-None-Match` 保守 200，迁移后重建 ETag 缓存 |
+| 单查 | v3 skeleton 投影（与列表逐字同投影） | 裸 `SessionSkeletonV4` 对象（无 envelope；与列表 item 同一 canonical projector） |
+| 失败语义 | 上游 HTTP 错误映射（502/503 族） | required 不可 null 字段不可得 → **整响应 503**（§13.2a，不发明占位值）；可 null 字段三态（§13.2b：业务 null 不 partial vs 来源不可得 null + partial） |
+
+**锚点清单（小节 2）**
+
+| 锚点 | 内容 |
+|---|---|
+| `docs/specs/v4-contract.md:391` | §12.1 wire schema 与字段策略（providers） |
+| `docs/specs/v4-contract.md:425` | §12.1 确定性丢弃清单（env/key/options/api/capabilities/cost/headers/release_date） |
+| `docs/specs/v4-contract.md:427` | §12.1 `limit` optional 省略策略（修订三） |
+| `docs/specs/v4-contract.md:539` | §13.1 canonical 形状（`SessionSkeletonV4` / `SessionsV4`） |
+| `docs/specs/v4-contract.md:572` | §13.2 字段真值表（requiredness / null / absent） |
+| `docs/specs/v4-contract.md:590-594` | §13.2a 整响应失败规则 / §13.2b 三态 / §13.2c item 边界 |
+| `docs/specs/v4-contract.md:612` | §13.5 project join 不变量 |
+
+### 3. per-directory 列表的客户端补偿模式（F-121）
+
+**缺口**：v4 sessions 列表为全局 DB 投影面，directory 整体移出参数域——`?v=4` 的 `GET /slimapi/sessions` 携带 directory（query 单值/多值、header、query+header 混合，四形态）一律 **400 `directory_retired_in_v4`**（selector 层前置拦截）。服务端补齐路径被三重封堵（**永久**）：§4.6 `search` 仅 title 字面子串（无 directory 轴）；§4.5 cursor 指纹 `f` 仅含 archived/parent/search-hash/allowlist-rev（无 directory 谓词）；§17 cross-session search 为永久 non-goal（owner 裁决 q3，再启用须推翻正式修订）。v3 的 per-workspace 列表（`?directory=X` → 上游 `X-Opencode-Directory` 服务端过滤）在 v4 **无服务端等价物**（F-121，迁移评估期确认的能力缺口，非当前缺陷——v3 面不受影响）。
+
+**标准补偿模式**（多工作目录客户端，如 ocdroid）：
+
+1. **目录发现**：`GET /slimapi/directories`（保留不退役；envelope `{items:[{directory,title,lastUpdated,…}],discoveryComplete}`——渲染项目切换器，见本文件「全局 directory catalog」章节）。
+2. **全局分页**：`GET /slimapi/sessions?v=4&limit=<N>`，沿 `nextCursor` 翻页（cursor 仅在同一过滤参数组合下有效）。
+3. **客户端过滤**：按 `item.directory` 过滤——`SessionSkeletonV4.directory` 为 required 非空字符串，是客户端过滤唯一数据来源。
+
+**翻页预算与终止条件建议**：
+
+- `limit` 建议 = min(500, max(100, 目录数 × 每目录期望会话数))——v4 limit 域上限 500。
+- **终止条件**：`nextCursor == null`（全局列表完备）。注意 v4 `complete` 仅表**全局分页窗口**完备；「该目录列表已完备」的 v3 语义无对应，per-directory 完备性只能由全局翻页耗尽佐证。
+- 目标 workdir 会话稀疏时：cursor 在全局序 `(time_updated DESC, id DESC)` 上推进需遍历多页无关行——无服务端效率等价物。UI 建议：先渲染已过滤结果、后台续页（渐进式）；或维护全局列表缓存 + digest `changed:[sid]` 定向精拉做增量维护，避免每次切换目录全量翻页。
+- 翻页期间**不得**变更过滤参数组合（`archived`/`parent`/`search`）——cursor 指纹不匹配 → 400 `invalid_cursor`，需清 cursor 重拉。
+- 降级面：带 cursor / `search` 含通配符 / allowlist 非空 / Class B 参数时 dbaux 不可用 → 503 `auxiliary_unavailable` + `Retry-After: 30`；保留状态重试，不自动回退 v3。
+
+**锚点清单（小节 3）**
+
+| 锚点 | 内容 |
+|---|---|
+| `docs/audits/2026-08-20/02-findings/F-121.md:1` | F-121 finding（confirmed，P2 gap，多工作目录能力缺口） |
+| `docs/audits/2026-08-20/02-findings/F-121.md:9` | selector 层 400 `directory_retired_in_v4` 证据（selector.py:668-673） |
+| `docs/audits/2026-08-20/02-findings/F-121.md:18-22` | 四点影响面（客户端过滤/complete 不可判定/无检索轴/缓解面） |
+| `docs/audits/2026-08-20/04-final/v3-retirement-plan.md:35` | v3-retirement-plan §2（16 项迁移 checklist，A3 = 本缺口） |
+| `docs/audits/2026-08-20/04-final/v3-retirement-plan.md:64-75` | §2.2 专节：directory 能力缺口展开（补偿模式与封堵边界） |
+
+### 4. SSE 新帧消费指引（question/permission 决议族直推）
+
+`GET /slimapi/events` 策展 SSE 中，question/permission 族上游事件走 **IMMEDIATE 直推**（不进 digest 合并）。决议帧消费指引：
+
+- **`permission.replied` / `permission.v2.replied`（[4.5.0] 已上 wire）**：真实权限决议帧（F-001 修复——此前 sidecar 订阅的 `.resolved` 拼写为幽灵名，真实决议帧被 catch-all 静默丢弃，`permission.asked` 秒推而 replied 永失）。**消费模式：收到即关闭对应权限卡片**（按帧内 request id / sessionID 关联）。依赖旧拼写 `.resolved` 的代码不存在迁移问题——幽灵名从未有真实帧上 wire（上游全树零发布点实证）。
+- **`question.replied` / `question.rejected`（含 `question.v2.replied` / `question.v2.rejected`，R-4 裁决 2026-08-21，随 4.6.0 发版生效）**：提问决议帧直推（此前 `question.*` 决议族不透传——决议后其余客户端的提问卡片只能靠超时/轮询消失）。**消费模式：收到即关闭对应提问卡片**（replied = 已答复；rejected = 被拒绝，均终态）。
+
+**兼容性依据（未适配消费方零迁移）**：
+
+- 决议帧为原帧转发，`data` JSON 含上游 `type` 字段、**无 `event:` 头**——与既有 token 帧同一分发面。本仓先例：INTERFACE_MAP `/slimapi/events` 行 token 帧约定「帧无 `event:` 头（客户端按 `data.type=="token"` 分发，镜像 raw 直推风格）」——决议帧沿用该模式，客户端分发器继续按 `data.type` 分发。
+- 客户端分发 switch 为**非穷尽**（未识别 `data.type` 忽略不 crash）——token 帧接入时即按此模式实现。未适配决议帧的客户端自动走「未知类型忽略」分支 → 行为不变；显式消费则获得卡片实时关闭能力。**加性演进，无 bump、无破坏**。
+- v4 注记：v4 下 IMMEDIATE 业务帧带 `id: g:<epoch>:<seq>`（参与重放序列，v4-contract §7）；v3 面帧形不变。
+
+**锚点清单（小节 4）**
+
+| 锚点 | 内容 |
+|---|---|
+| `docs/specs/INTERFACE_MAP.md:81` | `/slimapi/events` 行：token 帧「客户端按 `data.type=="token"` 分发」先例 + q/p IMMEDIATE 上游类型清单 |
+| `CHANGELOG.md:33` | [4.5.0] F-001 拼写纠正（`permission.replied`/`permission.v2.replied` 上 wire） |
+| `docs/ocmar/plans/2026-08-21-batch2-decision-rollout.md` | R-4 裁决（2026-08-21：`question.*` 决议族直推，随 4.6.0 发版） |
+
 ## 模型
 
 - `Part` 增加 `hasFull: Boolean? = null`、`omitted: List<String>? = null`。

@@ -79,6 +79,17 @@ DEFAULT_SSE_MAX_FRAME_BYTES = 256 * 1024     # 256 KiB per frame
 # audit finding for the exact names).
 IMMEDIATE = frozenset({
     "question.asked", "question.v2.asked",
+    # R-4 (owner ruling 2026-08-21): the question RESOLUTION family joins
+    # IMMEDIATE. Upstream opencode v1.18.18 really publishes
+    # ``question.replied`` / ``question.rejected`` (packages/schema/src/v1)
+    # and ``question.v2.replied`` / ``question.v2.rejected`` — same
+    # constructed defect the 4.5.0 permission fix closed: ``asked`` was
+    # forwarded instantly but every reply/reject fell through the
+    # catch-all drop, so question cards on other clients never
+    # disappeared. Clients dispatch on ``data.type``; unknown types are
+    # ignore-type additive for unadapted consumers.
+    "question.replied", "question.rejected",
+    "question.v2.replied", "question.v2.rejected",
     "permission.asked", "permission.replied",
     "permission.v2.asked", "permission.v2.replied",
 })

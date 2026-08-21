@@ -876,12 +876,17 @@ async def test_snapshot_metrics_matches_contract_shape():
         # hubs sub-array
         assert len(sse["hubs"]) == 1
         hub_entry = sse["hubs"][0]
+        # shape 加性演进：droppedEventsByType（2026-08-21 R-5 裁决，取代
+        # 4.5.0 内部-only 决定）——纯加性键，既有五键零改动。
         assert set(hub_entry) == {
             "subscribers", "upstreamConnected",
             "upstreamEventsTotal", "emittedFramesTotal", "reconnectsTotal",
+            "droppedEventsByType",
         }
         assert hub_entry["subscribers"] == 1
         assert hub_entry["upstreamConnected"] is False
+        # Fresh hub, zero catch-all drops → always-published empty dict.
+        assert hub_entry["droppedEventsByType"] == {}
         # Welcome frame is per-subscriber, not fanned out from publish/flush;
         # the counters track fan-out only, so they read zero immediately
         # after subscribe().

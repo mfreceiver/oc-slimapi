@@ -56,6 +56,27 @@ ocdroid 对接时：
 
 ---
 
+## [4.6.0] - 2026-08-21 — 批次二：六项 owner 裁决落地（包版本 minor；wire 版本**不变**，仍 (3,4)；实施计划经 rev-cgpt 三轮门控 7.3→8.8→9.1 PASS）
+
+### Added（wire，SSE 加性）
+
+- **q/p IMMEDIATE 集新增 `question.replied` / `question.rejected` / `question.v2.replied` / `question.v2.rejected` 直推**（owner R-4 裁决 2026-08-21）。上游 v1.18.18 实际发布这四型（question 决议事件），此前被 catch-all 静默丢弃——任何客户端答复 question 后，其余客户端（webui 提问卡片）永远收不到决议帧。与 [4.5.0] `permission.replied` 修复同构：修复 webui「其他客户端处理后提问卡片不消失」痛点（根因是服务端从未推送，非 webui 消费缺陷）。未适配客户端按未知 `data.type` 忽略，零迁移；`qp_last_activity` 联动自动覆盖。
+
+### Added（观测，metrics 加性）
+
+- **`/slimapi/metrics` hubs[] 新增 `droppedEventsByType`**（owner R-5 裁决）：per-type 有界丢弃计数（基数 ≤257 含 `__other__`；空表恒发布 `{}`；快照浅拷贝与内部表解耦）——上游事件集漂移可经探针常态化检测（取代 4.5.0「内部-only」决定）；既有键零改动；v3/v4 契约 §9 同句记载。
+
+### Changed（部署默认）
+
+- **deploy 模板 `OC_SLIMAPI_HOST` 默认 `0.0.0.0`→`127.0.0.1`**（owner R-1a 裁决 2026-08-21：确认无 Tailscale 直连消费方，E-II 明文无认证面收敛）。`0.0.0.0` 保留为显式 opt-in（validate 白名单不变，须自担网络层隔离——见 deploy 注释与 operations.md §11 opt-in runbook）；operations.md 全量同步（11 处 0.0.0.0 站点改 opt-in/历史标注语义）。
+
+### Docs（评估与指引，零行为变更）
+
+- **CLIENT_CHANGES.md 新增「v4 迁移指南」章节**（owner R-3 裁决）：迁移 checklist（[4.0.0]-[4.5.0] 消费者行动项整合）+ providers/sessions 字段差集对照表 + per-directory 列表客户端补偿模式（F-121）+ SSE 新帧消费指引。
+- **两份评估文档**（docs/ocmar/reviews/）：`2026-08-21-allowlist-global-gate-impact.md`（R-1b——allowlist 提升全局门三路径评估，推荐观测先行；含新发现 `/slimapi/directories` 契约-实现漂移）、`2026-08-21-v3-retirement-reassessment.md`（R-6——v3 退役五阶段路线图重估；「owner 推进 v3 全面废弃」记录为待转化规划基线，(3,4) 契约冻结在正式 major 前仍生效）。
+
+---
+
 ## [4.4.0] - 2026-08-20 — v4 wire 正式修订三落地：providers 投影恢复 optional limit（包版本 minor；wire 版本**不变**，仍 (3,4)）
 
 > 动因：oc-webui 反馈 v4 投影剥掉 `limit`（模型规格参数非敏感，v3 raw 透传时代本就存在），上下文使用百分比失去分母；消费方已确认嵌套 `limit.context` 形状零改动兼容。纯加性 schema 演进，`providers.redacted.v4` 面内；实施经 rev-cgpt 发版门控评审（**9.2 FAIL→P1 修复→9.8 PASS**，门禁 9.5）。

@@ -7,8 +7,10 @@ fall-through):
 1. Per-type counting: every event that falls through ALL curated branches
    increments ``upstream_dropped_events_total[type]`` exactly once.
 2. Curated events never reach the counter (IMMEDIATE q/p, session.*,
-   message.* all return early) — and the /slimapi/metrics wire shape stays
-   frozen (the new table is deliberately NOT surfaced).
+   message.* all return early). The table is exposed on /slimapi/metrics
+   as the additive ``droppedEventsByType`` hubs[] key (2026-08-21 R-5
+   ruling, superseding the 4.5.0 internal-only decision — wire tests in
+   tests/test_metrics_dropped_events.py).
 3. Cardinality bound: beyond ``_DROPPED_TYPES_MAX`` distinct types, new
    types fold into the ``__other__`` bucket; a missing/non-string payload
    ``type`` also lands there instead of crashing.
@@ -53,8 +55,8 @@ def test_curated_events_are_not_counted_as_dropped():
     )  # MESSAGE_EVENTS
     assert hub.upstream_dropped_events_total == {}
 
-    # Wire-freeze lock (acceptance C5): the registry snapshot must NOT
-    # surface the new internal table — /slimapi/metrics shape unchanged.
+    # shape 加性演进：droppedEventsByType（2026-08-21 R-5 裁决，取代 4.5.0
+    # 内部-only 决定）——hubs[] 条目现在暴露该表（浅拷贝），既有键零改动。
     registry = HubRegistry(None)
     registry.get_global().publish(ev(None, "todo.updated"))
     hub_entry = registry.snapshot_metrics()["sse"]["hubs"][0]
@@ -64,7 +66,9 @@ def test_curated_events_are_not_counted_as_dropped():
         "upstreamEventsTotal",
         "emittedFramesTotal",
         "reconnectsTotal",
+        "droppedEventsByType",
     }
+    assert hub_entry["droppedEventsByType"] == {"todo.updated": 1}
     assert registry.get_global().upstream_dropped_events_total == {"todo.updated": 1}
 
 

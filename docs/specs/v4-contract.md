@@ -317,6 +317,7 @@ allowlist 403 族（`directory_not_allowed`，B4-4）与版本/directory 400 族
 - access log / traffic snapshot：`selectorResult` 增 `v4`；`wireVersion` 增 "4"；SSE active 维度同步扩。
 - DB 辅助指标（B3a-B5）：查询延迟（P50/P99）、降级计数、熔断计数、重探事件、inode swap 事件。
 - replay 指标（B3b）：hit/miss/gap/resync 计数。
+- **[4.6.0] 追加：`/slimapi/metrics` hubs[] 条目加性键 `droppedEventsByType`**——per-type 上游事件丢弃计数（有界，类型基数 ≤257 含 `__other__` 兜底桶；快照为浅拷贝、空表恒发布 `{}`）；既有键零改动（2026-08-21 owner R-5 裁决；沿 v3-contract §9 同句，两视图共享该 metrics 形状）。
 
 ### §9.2 bucket
 

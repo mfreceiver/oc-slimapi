@@ -379,11 +379,22 @@ class HubRegistry:
             {"sse": {"subscribers": {current, limit, rejectedTotal},
                      "hubs":        [{subscribers, upstreamConnected,
                                       upstreamEventsTotal, emittedFramesTotal,
-                                      reconnectsTotal}],
+                                      reconnectsTotal,
+                                      droppedEventsByType}],
                      "clients":     [{subscriberId, queueItems, bufferBytes,
                                       droppedFramesTotal,
                                       forcedDisconnectsTotal}]},
              "skeleton": {activeTransforms, waitingTransforms, cacheEnabled}}
+
+        ``droppedEventsByType`` (R-5, owner ruling 2026-08-21 — additive,
+        superseding the 4.5.0 internal-only decision): per-type catch-all
+        drop counts from ``GlobalHub.upstream_dropped_events_total``,
+        shallow-copied per snapshot so the returned dict is decoupled from
+        later hub mutations. Cardinality bounded ≤257 keys (256 types +
+        the ``__other__`` overflow bucket); empty table publishes as
+        ``{}`` — the key is always present, never optional. Per-type (not
+        an aggregate total) so event-set drift after an upstream upgrade
+        is chartable; the 60s sampled log remains a low-cost corroboration.
         """
         hub = self._global
         clients: list[dict[str, Any]] = []
@@ -395,6 +406,11 @@ class HubRegistry:
                 "upstreamEventsTotal": hub.upstream_events_total,
                 "emittedFramesTotal": hub.emitted_frames_total,
                 "reconnectsTotal": hub.reconnects_total,
+                # Shallow copy guards against concurrent iteration between
+                # snapshot and hub mutation (publish runs inline on the
+                # loop, but the response may be serialized after further
+                # publishes; the copy decouples the two).
+                "droppedEventsByType": dict(hub.upstream_dropped_events_total),
             })
             for sub in hub.subscribers:
                 clients.append({

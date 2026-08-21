@@ -21,7 +21,7 @@ ocdroid (Android)
 
 - **两个 :4097 入口**（明文）：
   - **`127.0.0.1:4097`**（默认，loopback）：仅供本机 + stunnel mTLS（:14097）终结后转发的推荐路径。
-  - **`0.0.0.0:4097`**（可选，明文直连入口）：允许通过 Tailscale 地址直接访问，**不强制 mTLS**。**安全模型**：远程暴露需依赖 Tailscale ACL / 主机防火墙隔离；该入口**无**应用层鉴权（thin routes 自身不验证客户端身份），版本选择器（`?v=3` 终态门禁）仍生效。
+  - **`0.0.0.0:4097`**（opt-in，默认关闭；2026-08-21 起默认回环）：显式开启后允许通过 Tailscale 地址直接访问，**不强制 mTLS**。**安全模型**：远程暴露需依赖 Tailscale ACL / 主机防火墙隔离；该入口**无**应用层鉴权（thin routes 自身不验证客户端身份），版本选择器（`?v=3` 终态门禁）仍生效。
 - **:14097 仍为推荐的 mTLS 入口**；明文直连仅为 Tailscale 内网/运维便利，不应在不可信网络暴露。
 - upstream 固定 `http://127.0.0.1:4096`（opencode legacy HTTP API）——**无论 host 如何**，`config.validate()` 始终强制 upstream 必须是 fixed loopback HTTP（SSRF guard 不放松）。
 - **单进程单 worker**：多 worker 会为同一 directory 重复建立 upstream SSE，禁止。
@@ -85,7 +85,7 @@ ExecStart=/home/mar/personal_projects/oc-slimapi/.venv/bin/python -m oc_slimapi.
 Restart=on-failure
 RestartSec=5
 
-Environment=OC_SLIMAPI_HOST=0.0.0.0   # 或 127.0.0.1（仅 loopback，更保守）
+Environment=OC_SLIMAPI_HOST=127.0.0.1   # 默认回环；0.0.0.0 为 opt-in（须自担网络层隔离，见 §11）
 Environment=OC_SLIMAPI_PORT=4097
 Environment=OC_SLIMAPI_UPSTREAM=http://127.0.0.1:4096
 Environment=OC_SLIMAPI_MAX_MESSAGE_BYTES=33554432
@@ -323,12 +323,12 @@ systemd[...]: Started oc-slimapi.service ...
 oc-slimapi[...]: INFO: Started server process [PID]
 oc-slimapi[...]: INFO: Waiting for application startup.
 oc-slimapi[...]: INFO: Application startup complete.
-oc-slimapi[...]: INFO: Uvicorn running on http://0.0.0.0:4097 (Press CTRL+C to quit)
+oc-slimapi[...]: INFO: Uvicorn running on http://127.0.0.1:4097 (Press CTRL+C to quit)
 ```
 
 > 若 `OC_SLIMAPI_HOST=127.0.0.1`，则日志显示 `http://127.0.0.1:4097`。
 
-启动失败常见原因：upstream 不可达、`OC_SLIMAPI_HOST` 非 loopback 且非 `0.0.0.0`、`OC_SLIMAPI_UPSTREAM` 非 loopback HTTP。
+启动失败常见原因：upstream 不可达、`OC_SLIMAPI_HOST` 非 loopback 且非 `0.0.0.0`（validate 白名单事实——`0.0.0.0` 为 opt-in 选项，非默认）、`OC_SLIMAPI_UPSTREAM` 非 loopback HTTP。
 
 ---
 
@@ -453,7 +453,7 @@ ocdroid 客户端**不直接操作** sidecar 进程，只通过 stunnel mTLS 接
 | 项 | 值 |
 |---|---|
 | 经 sidecar mTLS 入口（推荐） | stunnel `:14097` → sidecar `127.0.0.1:4097` |
-| 经 sidecar 明文直连入口（Tailscale 等） | Tailscale 地址`:4097` → sidecar `0.0.0.0:4097`（依赖 Tailscale ACL / 防火墙；无 mTLS） |
+| 经 sidecar 明文直连入口（Tailscale 等） | Tailscale 地址`:4097` → sidecar `0.0.0.0:4097`（依赖 Tailscale ACL / 防火墙；无 mTLS）（opt-in 非默认；2026-08-21 起默认回环） |
 | 直连回退（不经 sidecar） | stunnel `:14096` → opencode `127.0.0.1:4096` |
 | 所有 `/slimapi/**` 请求必带 query | `?v=3`（无 `v`/`v=2`/不支持值 → `400 unsupported_version supported:[3]`；`X-Slimapi-Version` 头已删除不解读） |
 | 非 `/slimapi/**` | **3.0.0 已关闭**——未收编路径 404 `thin_route_not_found`（2.x 为透明反代，历史行为见 CHANGELOG） |
@@ -489,12 +489,14 @@ sidecar 进程的启停、日志、升级由 **服务端运维** 负责，ocdroi
 | [`../AGENTS.md`](../AGENTS.md) | Agent 入口索引 |
 
 ---
-## 11. G-ACL 部署姿态与边界验证（0.0.0.0:4097 + 14097 mTLS 隧道）
+## 11. G-ACL 部署姿态与边界验证（历史 0.0.0.0:4097 + 14097 mTLS 隧道；2026-08-21 起默认回环，本节为 opt-in 部署 runbook）
 
 > **参照**：`docs/ocmar/reports/2026-07-21-g-acl-ops-evidence.md`（本日证据报告）  
-> **部署姿态**：用户最终接受 `0.0.0.0:4097` 明文监听 + `:14097` mTLS 隧道（stunnel `requireCert=yes verifyChain=yes`，复用既有证书）作为 steady-state。以下为 ops 维护的边界验证 runbook。
+> **历史部署姿态（2026-08-20 前 steady-state）**：`0.0.0.0:4097` 明文监听 + `:14097` mTLS 隧道（stunnel `requireCert=yes verifyChain=yes`，复用既有证书）作为 steady-state；**2026-08-21 起（R-1a 裁决）默认部署为回环 `127.0.0.1`，直连入口默认关闭**，本节保留为 opt-in 部署的边界验证 runbook。
 
-### 10.1 稳态拓扑
+### 10.1 opt-in 部署拓扑（历史稳态同构）
+
+> 下图为 opt-in（`0.0.0.0`）部署的历史稳态拓扑；默认部署中 sidecar 绑定 `127.0.0.1`，stunnel（:14097）转发目标 `127.0.0.1:4097` 不变。
 
 ```
 ocdroid ──(stunnel mTLS 14097)──▶ oc-slimapi 0.0.0.0:4097 (plaintext, all interfaces)
@@ -502,10 +504,10 @@ ocdroid ──(stunnel mTLS 14097)──▶ oc-slimapi 0.0.0.0:4097 (plaintext, 
                     ╰──(Tailscale 明文直连 :4097)──▶ oc-slimapi 0.0.0.0:4097 (plaintext; Tailscale ACL 受限)
 ```
 
-- **`:4097`（sidecar 明文端口）**：绑定 `0.0.0.0`（所有接口），**用户接受的稳态**。直接 `:4097` 的明文访问**必须**被网络边界（主机防火墙 / Tailscale ACL）阻塞，外部客户端须经 `:14097` mTLS 隧道。
+- **`:4097`（sidecar 明文端口）**：绑定 `0.0.0.0`（所有接口），**opt-in 部署的稳态（历史）**。直接 `:4097` 的明文访问**必须**被网络边界（主机防火墙 / Tailscale ACL）阻塞，外部客户端须经 `:14097` mTLS 隧道。
 - **`:14097`（mTLS 入口）**：stunnel 终结后转发至 `127.0.0.1:4097`，公网唯一可达入口。任何未持有有效 CA 签名客户端证书的连接在 TLS 层即被拒绝。
-- **安全边界关键**：`0.0.0.0` 本身不提供接入控制——**依赖**网络边缘（防火墙 / Tailscale ACL）阻断公共/LAN 对 `:4097` 的直接明文 TCP。这就是使 `0.0.0.0` 可接受的安全约束。
-- **loopback-only（`127.0.0.1:4097`）** 属于更严格的替代姿态（代码支持 `config.validate()` 允许），但**不是**当前部署选择。
+- **安全边界关键**：`0.0.0.0` 本身不提供接入控制——**依赖**网络边缘（防火墙 / Tailscale ACL）阻断公共/LAN 对 `:4097` 的直接明文 TCP。这就是使 opt-in `0.0.0.0` 部署可接受的安全约束。
+- **loopback-only（`127.0.0.1:4097`）**：**2026-08-21 起（R-1a 裁决）为默认部署姿态**（代码 `config.validate()` 支持）；`0.0.0.0` 为 opt-in（见本节头部声明）。
 
 ### 10.2 负向探针（边界验证）
 

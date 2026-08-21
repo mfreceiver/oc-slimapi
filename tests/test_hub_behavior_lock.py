@@ -948,6 +948,47 @@ class TestImmediateForwarding:
             "permission.replied", "permission.v2.replied",
         ]
 
+    async def test_question_resolution_family_forwarded(self, pair):
+        """R-4：question.replied/rejected/v2.replied/v2.rejected 四型必须
+        IMMEDIATE 直推（真实上游名——答复后其他客户端卡片可消失）。
+
+        逐型注入 → 断言订阅者收到原帧；并断言
+        ``hub.qp_last_activity[directory]`` 被刷新（N1：锁 IMMEDIATE 分支
+        ``startswith("question.")`` 联动不漂移）；反向：注入拼写错误名
+        （如 "question.resolved"）→ 不产生直推帧（落 catch-all 计数）。
+        """
+        import time as _time
+
+        hub, sub = pair
+        resolution_types = [
+            "question.replied", "question.rejected",
+            "question.v2.replied", "question.v2.rejected",
+        ]
+        for event_type in resolution_types:
+            directory = f"/q-{event_type}"
+            before = _time.time()
+            hub.publish(ev(directory, event_type, {"id": "q1"}))
+            # N1 lock: every question.* IMMEDIATE member refreshes the
+            # shared q/p activity table (the startswith("question.")
+            # gate inside the IMMEDIATE branch covers the new members
+            # with zero branch changes — pinned here so the coupling
+            # cannot silently drift).
+            assert directory in hub.qp_last_activity
+            assert before <= hub.qp_last_activity[directory] <= _time.time()
+
+        frames = await drain(sub, timeout=0.1)
+        assert [parse(f)[1]["type"] for f in frames] == resolution_types
+
+        # Reverse: a misspelled resolution name must NOT be forwarded —
+        # it falls through to the catch-all drop counter (L1-2/F-216).
+        # join construction, same constant-folding avoidance as above.
+        typo = "".join(("question.", "resolved"))
+        hub.publish(ev("/q-typo", typo, {"id": "q1"}))
+        assert hub.upstream_dropped_events_total.get(typo) == 1
+        frames_after = await drain(sub, timeout=0.1)
+        assert frames_after == []
+        assert "/q-typo" not in hub.qp_last_activity
+
     async def test_immediate_event_directory_passed_through(self, pair):
         hub, sub = pair
         hub.publish(ev("/custom/dir", "question.asked", {"id": "q1"}))
@@ -1551,10 +1592,14 @@ class TestMetrics:
 
             assert len(sse["hubs"]) == 1
             hub_entry = sse["hubs"][0]
+            # shape 加性演进：droppedEventsByType（2026-08-21 R-5 裁决，
+            # 取代 4.5.0 内部-only 决定）——纯加性键，既有五键零改动。
             assert set(hub_entry) == {
                 "subscribers", "upstreamConnected",
                 "upstreamEventsTotal", "emittedFramesTotal", "reconnectsTotal",
+                "droppedEventsByType",
             }
+            assert hub_entry["droppedEventsByType"] == {}
 
             assert len(sse["clients"]) == 1
             client_entry = sse["clients"][0]

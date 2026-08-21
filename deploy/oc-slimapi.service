@@ -23,9 +23,12 @@ RestartSec=5
 # active SSE connections before the 90s SIGKILL default kicks in.
 TimeoutStopSec=15
 
-# OC_SLIMAPI_HOST=0.0.0.0 允许 Tailscale 直连；如仅 loopback（stunnel 本机转发）改 127.0.0.1。
+# OC_SLIMAPI_HOST 默认回环 127.0.0.1（R-1a，2026-08-21 起的安全默认姿态；
+# ocdroid stunnel :14097 与本机 curl 均经 loopback，E-I/E-III 均可工作）。
+# 0.0.0.0 为显式 opt-in：须自担网络层隔离（Tailscale ACL / 主机防火墙），
+# 当前部署不使用（owner 2026-08-21 裁决：无 Tailscale 直连消费方）。
 # :4097 为明文，远程暴露必须靠 stunnel mTLS / Tailscale ACL 隔离。
-Environment=OC_SLIMAPI_HOST=0.0.0.0
+Environment=OC_SLIMAPI_HOST=127.0.0.1
 Environment=OC_SLIMAPI_PORT=4097
 Environment=OC_SLIMAPI_UPSTREAM=http://127.0.0.1:4096
 Environment=OC_SLIMAPI_MAX_MESSAGE_BYTES=33554432

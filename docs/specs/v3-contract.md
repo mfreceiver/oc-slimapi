@@ -210,6 +210,7 @@ GET /slimapi/versions → 200
    - ③ `directoryForm ∈ {header, both}` 成功请求为 0（含写路径）；
    - ④ **`selectorResult == "not_applicable"`（catch-all/passthrough）**：每日 `sseActive(not_applicable) == 0` **且**窗口内该维度 `sse_open` 为 0 **且**其成功 REST 为 0——全部流量已收敛 `/slimapi`；
    - ⑤ webui 生产流量全 `v=3`；⑥ ocdroid 组书面确认。
+4. **[4.6.0] 追加：`/slimapi/metrics` hubs[] 条目加性键 `droppedEventsByType`**——per-type 上游事件丢弃计数（有界，类型基数 ≤257 含 `__other__` 兜底桶；快照为浅拷贝、空表恒发布 `{}`）；既有键零改动（2026-08-21 owner R-5 裁决，取代 4.5.0 内部-only 观测决定）。
 
 ## §10 路由收编全集 [冻结]（读 **9** 组 + 写 **17** 端点；ocdroid StandardApi 全量 + 实测基线；**读组计数 7→8 [3.1.0]、8→9 + 写 12→17 [3.3.0] B4 加性**）
 
