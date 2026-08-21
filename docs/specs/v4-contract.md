@@ -745,7 +745,7 @@ envelope.degraded == (任一 item.degraded == true) ∨ (本响应采用 native 
 
 ## §14 expand 端点全文语义与能力闭环 [2026-08-19 修订冻结]
 
-> **当前状态**：现行 expandRefs href 硬编码 `?v=3`（`skeleton.py` `_expand_ref`）——`?v=4` 响应亦发 `v=3` href（§3.1/§10 发布态注载）；`capabilities["4"]` 无 `expand` 键。本节为冻结目标——当 feature `messages.expand.v4` 进入 `satisfied`（§3.3 门控）时生效。
+> **当前状态（2026-08-21 版本窗收窄更新）**：feature `messages.expand.v4` 已 `satisfied`（§3.3 门控全集点亮）——**本节语义已生效**。href 按解析后 selector 生成（`skeleton.py` `_expand_ref` 收 `wire_view`；v4-only 窗下恒 `?v=4`）；`capabilities["4"].expand` 已广告（§3.1）。历史状态（4.0.0–4.7.0）：href 硬编码 `?v=3`、`capabilities["4"]` 无 `expand` 键——该形态随 5.0.0 版本窗收窄一并移除。
 
 - **12 类目有序清单（冻结）**：`info_summary_diffs` → `part_text` → `part_reasoning` → `part_state_output` → `part_state_error` → `part_state_input_full` → `part_state_metadata_full` → `part_state_attachments` → `part_url` → `part_source` → `part_snapshot` → `compaction_full`（单一事实源 `src/oc_slimapi/traffic.py::EXPAND_CATEGORIES` 表序延续；versions 广告与流量记账同源；类目级别/适用 part 类型/返回 `data` 形状见 §14.2）。
 - **`fragmentMaxBytes` = `OC_SLIMAPI_MAX_EXPAND_RESPONSE_BYTES` 运行时值**（缺省 **8388608**，界 **1024..33554432** 含边界；非法值启动 RuntimeError——config.py 既有冻结）。capability 广告 `capabilities["4"].expand = {categories, fragmentMaxBytes}` 与历史键 `capabilities["3"].expand`（§3.1——4.0.0–4.7.0 形状锚点，v4-only 窗下该键已随版本窗移除）形状同构（categories = 12 类目有序数组 + fragmentMaxBytes = 数值）；**仅当全部 12 类目在 v4 视图闭环（href/响应/错误）才广告**（§3.3 批次闭合）。

@@ -14,7 +14,7 @@
 ocdroid 对接时：
 
 1. 读本文件了解**行为**变更；
-2. 读 `docs/specs/v3-contract.md`（v3 视图契约权威）+ `docs/specs/v4-contract.md`（(3,4) 双版本窗口的 v4 差异层）了解**当前完整契约**；
+2. 读 `docs/specs/v4-contract.md`（**现行契约权威**，5.0.0 起 v4-only 自包含）了解**当前完整契约**；`docs/specs/v3-contract.md` 为 ≤4.x 历史存档（v3 视图已退役）；
 3. 用 `/slimapi/health` 的 `server.api_version` / `accepted_client_versions` 做运行时兼容自检。
 
 ### 维护规约
@@ -31,9 +31,9 @@ ocdroid 对接时：
 ### Changed
 
 - **版本窗收窄为 v4-only（v4-contract §0 修订，2026-08-21）**：`ACCEPTED_CLIENT_VERSIONS (3,4) → (4,4)`。`?v=3`、无 `v`、其他非 4 版本 → 400 `unsupported_version` `supported:[4]`。原 (3,4) 永久双版本裁决被覆盖；v3-contract 标记为历史存档。
-- **v3 面物理拆除**：selector v3 管线、providers v3 passthrough、SSE v3 半区、`routes/versions.py` `caps["3"]` 面等删除。`rg "v=3|\"3\"" src/` 只余历史注记类。
-- **测试清理**：v3 守护网文件（`test_access_log_v3_fields` ×4、`test_sse_replay_wire` ×13）随 v3 半区删除/改写；B12 白名单 ② 类文件随拆；全仓 `rg -l 'v=3|"3"' tests/` 零命中。
-- **契约同步**：`v4-contract.md` §0.3/§9.4/§2 状态表/§0.1 等窗口表述全量修订为 v4-only；`v3-contract.md` 头部加退役存档章（正文零改动）；`INTERFACE_MAP.md` 全局头更新为 v4-only。
+- **v3 面物理拆除（src 活性流转清零）**：selector v3 管线与 `wire_view_from_scope` 恒返 4、SSE v3 半区（tokens=1 retired / blanket resync / replay 条件化）、sessions v3 list envelope/lease/coalesce 腿、providers v3 passthrough、health v3 视图分叉、versions `caps["3"]` 面等删除。**保留项**（非 v3 流转，均注记冻结理由）：hub-API 双栈投递机制（fanout/subscriber，被 wire 层 v4 订阅语义锁定复用）、观测枚举 `v3` 冻结命名（traffic/snapshot/access_log/SSE_RESULT_DIMS，§9 冻结不改名）、expand 端点 ETag `wire=v3` 域标签（金样冻结的可观察字节）。
+- **测试清理**：v3 守护网与结构性死亡锁删除/改写（`test_access_log_v3_fields` ×4、`test_sse_replay_wire` v3 半区、B12 白名单 ② 类 10 文件、selector-less 直达与默认视图断言 v4 化、B5 204/301 → 503 fail-closed 化）。
+- **契约同步**：`v4-contract.md` 现行规范段全量 v4-only 化（§0 版本窗/§2 selector 状态表/§3.1 available/§14 expand 生效注记等 32+ 处，历史裁决以注记保留）；`v3-contract.md` 头部加退役存档章（正文零改动）；`INTERFACE_MAP.md` 全局头更新为 v4-only。
 - **金样重录**：W2/N6 双金样测试请求改 `?v=4` 后重录，ETag wire=v4 域标记。
 
 ### Added
