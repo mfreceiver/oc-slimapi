@@ -214,7 +214,8 @@ def _catalog_handler(state: dict | None = None):
             return httpx.Response(200, content=body)
         if path == "/command":
             return httpx.Response(200, content=COMMANDS_BODY)
-        if path == "/session":
+        if path == "/experimental/session":
+            # D2-A: /slimapi/sessions 降级上游端点已从 /session 置换
             return httpx.Response(200, content=SESSIONS_BODY)
         if path == "/session/s1/message/msg_1":
             return httpx.Response(
@@ -1055,7 +1056,9 @@ async def test_b1_1r_incompressible_body_labels_actual_coding(upstream_factory, 
         return httpx.Response(200, content=b"[]")
 
     settings = _settings()
-    rep = etag_mod.representation_version(settings, wire_view=3)
+    # D6 owner 裁决 2026-08-22：messages ETag 域标签统一为窗口版本 4
+    # （route 侧 wire_view=4；一次性 validator 轮换）。
+    rep = etag_mod.representation_version(settings, wire_view=4)
     enveloped = messages_envelope_bytes(identity, None)
     strong_tag = etag_mod.compute_etag(enveloped, "identity", rep)
     weak_tag = etag_mod.compute_etag(enveloped, "gzip", rep)
@@ -1119,7 +1122,8 @@ async def test_b1_1r_rev5_case_matrix(upstream_factory, monkeypatch):
         return httpx.Response(200, content=b"[]")
 
     settings = _settings()
-    rep = etag_mod.representation_version(settings, wire_view=3)
+    # D6 owner 裁决 2026-08-22：域标签统一为窗口版本 4（同上）。
+    rep = etag_mod.representation_version(settings, wire_view=4)
 
     def tag(body: bytes, coding: str) -> str:
         # the route envelopes the pack worker's output before judging
@@ -1232,7 +1236,8 @@ async def test_b1_1r_identity_only_request_excludes_gzip_validator(upstream_fact
         return httpx.Response(200, content=b"[]")
 
     settings = _settings()
-    rep = etag_mod.representation_version(settings, wire_view=3)
+    # D6 owner 裁决 2026-08-22：域标签统一为窗口版本 4（同上）。
+    rep = etag_mod.representation_version(settings, wire_view=4)
     weak_tag = etag_mod.compute_etag(identity, "gzip", rep)
 
     upstream = upstream_factory(handler)

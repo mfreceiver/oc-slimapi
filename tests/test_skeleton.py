@@ -1098,16 +1098,57 @@ def test_patch_files_cap_eleven_gets_files_total():
 
 
 def test_patch_files_total_counts_source_including_invalid():
-    """filesTotal = len(源数组) including non-str/dict garbage entries that
-    the normalization itself skips."""
+    """filesTotal 触发口径 = 有效映射条目数（P2-25 / §10.2 修订四）；
+    触发时 filesTotal 的值 = len(源数组)（含被跳过的非 str/dict 条目）。
+
+    源 12 条仅 2 条无效 → 有效映射 10 ≤ cap → 不截断、不附 filesTotal
+    （回归钉：旧口径按源长度触发，此处曾错附 filesTotal=12）。"""
     out = _patch_out(["a.ts", 42, None, {"path": "b.ts"}])
     assert out["files"] == [{"path": "a.ts"}, {"path": "b.ts"}]
     assert "filesTotal" not in out             # 4 ≤ 10 → no hint
     files = ["f.ts", 42, None] + [f"g{i}.ts" for i in range(9)]
     out = _patch_out(files)
-    # 12 source entries (2 invalid) → normalized 10, filesTotal = 12
-    assert out["filesTotal"] == 12
+    # 12 source entries (2 invalid) → valid mapped 10 ≤ cap → no hint
+    assert "filesTotal" not in out
     assert len(out["files"]) == 10
+
+
+def test_patch_files_trigger_is_valid_mapped_count():
+    """P2-25 边界三态（§10.2 修订四：有效映射条目超 10 才截断+附计数，
+    未超限不附；附时值 = 源计数）。
+
+    ① 源 15 条畸形混合仅 8 条合法 → 映射 8 ≤ 10：不截断、不附
+       filesTotal（旧口径按源长度 15 触发——回归钉）；
+    ② 源 15 条全合法 → 截为前 10 + filesTotal = 15（值 = 源计数）；
+    ③ 源 8 条全合法 → 8 条全发、无 filesTotal。
+    """
+    # ① mixed-malformed: 8 valid (6 str + 2 dict) + 7 invalid entries
+    files = [f"src/f{i}.ts" for i in range(6)] \
+        + [42, None, True, 3.5, [1], [2], [3]] \
+        + [{"path": f"d{i}.ts"} for i in range(2)]
+    assert len(files) == 15
+    out = _patch_out(files)
+    assert len(out["files"]) == 8               # no truncation (8 ≤ cap)
+    assert out["files"][-2:] == [{"path": "d0.ts"}, {"path": "d1.ts"}]
+    assert "filesTotal" not in out              # valid mapped 8 ≤ 10
+    # ② all-valid 15 → capped 10 + source-count filesTotal
+    out = _patch_out([f"src/f{i}.ts" for i in range(15)])
+    assert len(out["files"]) == 10
+    assert out["filesTotal"] == 15
+    # ③ all-valid 8 → no hint
+    out = _patch_out([f"src/f{i}.ts" for i in range(8)])
+    assert len(out["files"]) == 8
+    assert "filesTotal" not in out
+
+
+def test_patch_files_overflow_mixed_keeps_source_count_value():
+    """源 15 条（11 合法 + 4 畸形）→ 有效映射 11 超 cap：截前 10，
+    filesTotal = 源计数 15（含畸形条目——true breadth，非有效数 11）。"""
+    files = [f"src/f{i}.ts" for i in range(11)] + [42, None, True, [1]]
+    assert len(files) == 15
+    out = _patch_out(files)
+    assert len(out["files"]) == 10
+    assert out["filesTotal"] == 15
 
 
 def test_patch_files_malformed_counts_no_exception():
@@ -1235,6 +1276,37 @@ def test_tool_metadata_files_all_malformed_keeps_ref_alive():
                and r["partID"] == "p1" for r in out["expandRefs"])
     # no valid counts anywhere → no diffStats either
     assert "diffStats" not in out["state"].get("metadata", {})
+
+
+def test_tool_metadata_files_trigger_is_valid_mapped_count():
+    """P2-25（§10.2 修订四）metadata 侧同款口径：触发条件 = 有效映射
+    条目数（dict 条目）超 cap，非源数组长度；附时值 = 源计数。
+
+    ① 源 15 条（8 dict + 7 非 dict 畸形）→ 映射 8 ≤ 10：不截断、
+       不附 filesTotal（旧口径按源长度 15 触发——回归钉）；
+    ② 源 15 条（12 dict + 3 畸形）→ 截前 10 + filesTotal = 15。
+    """
+    malformed = [42, None, "str", True, [1], [2], [3]]  # non-dict entries
+    files = [_apply_patch_files_entry(f"f{i}.ts", additions=1)
+             for i in range(8)] + malformed
+    assert len(files) == 15
+    out = skeleton_messages([_tool_msg({"files": files})],
+                            sid="ses_s")[0]["parts"][0]
+    thin_meta = out["state"]["metadata"]
+    assert len(thin_meta["files"]) == 8          # no truncation (8 ≤ cap)
+    assert "filesTotal" not in thin_meta         # valid mapped 8 ≤ 10
+    # source files non-empty → metadata_full ref alive (P2-N1 源值判定)
+    assert any(r["category"] == "part_state_metadata_full"
+               and r["partID"] == "p1" for r in out["expandRefs"])
+
+    files = [_apply_patch_files_entry(f"f{i}.ts", additions=1)
+             for i in range(12)] + [42, None, [1]]
+    assert len(files) == 15
+    out = skeleton_messages([_tool_msg({"files": files})],
+                            sid="ses_s")[0]["parts"][0]
+    thin_meta = out["state"]["metadata"]
+    assert len(thin_meta["files"]) == 10         # capped at 10
+    assert thin_meta["filesTotal"] == 15         # value = SOURCE count
 
 
 def test_tool_metadata_mixed_malformed_counts_no_exception():
@@ -1681,3 +1753,70 @@ def test_derived_fields_naturally_enter_fingerprint():
     assert out_a.get(FINGERPRINT_FIELD) != out_c.get(FINGERPRINT_FIELD)
     assert out_c["parts"][0]["state"]["metadata"]["diffStats"] == {
         "additions": 2, "deletions": 1, "files": 1}
+
+
+# ---------------------------------------------------------------------------
+# Q7-P3-20 — 混合 NULL summary 行形状统一：canonical projector 与
+# project_rows_to_v4_skeletons（gate 关遗留稀疏路径）同输入同形状。
+# 契约 §13.1/:744 冻结 summary 为 {additions,deletions,files:number}|null
+# （:777「对象时三子键均为数值」）→ 含 null 子值对象不合法，统一 null；
+# 不模仿上游 fromRow（session.ts:59-68）的 ?? 0 填充——sidecar compact
+# 语义不伪造计数。
+# ---------------------------------------------------------------------------
+
+from oc_slimapi.skeleton import (  # noqa: E402  (分区 import，同文件风格)
+    canonical_session_skeleton_v4,
+    project_rows_to_v4_skeletons,
+)
+
+
+def _summary_row(additions, deletions, files):
+    """两路径通吃的 DB 记录形态（列恒在场，None = 业务 null）。"""
+    return {
+        "id": "ses_sum", "directory": "/foo", "parent_id": None,
+        "project_id": None, "title": "t", "agent": None,
+        "model": None, "time_created": 1, "time_updated": 2,
+        "time_archived": None,
+        "summary_additions": additions, "summary_deletions": deletions,
+        "summary_files": files,
+        "tokens_input": 10, "tokens_output": 20, "tokens_reasoning": 0,
+        "tokens_cache_read": 0, "tokens_cache_write": 0, "revert": None,
+    }
+
+
+def test_summary_mixed_null_rows_unified_null_both_paths():
+    """混合 NULL 行（部分列 NULL 部分有值）：两路径 summary 均为 null。
+    canonical 另置 partial:true（§13.2b 来源不完整）；稀疏路径无
+    partial 标记键（4.0.0 形态），summary 值形状一致即达成统一。"""
+    for additions, deletions, files in (
+        (5, None, 2),          # deletions NULL
+        (None, 7, None),       # additions/files NULL
+        (0, 3, None),          # 真实 0 与 NULL 混合
+    ):
+        row = _summary_row(additions, deletions, files)
+        single = canonical_session_skeleton_v4(row)
+        assert single is not None
+        assert single["summary"] is None           # 禁发含 null 子值对象
+        assert single["partial"] is True
+        assert single["degraded"] is True
+        [sparse] = project_rows_to_v4_skeletons([row])
+        assert sparse["summary"] is None           # 两路径同形状
+        assert "partial" not in sparse             # 稀疏形态无标记键
+
+
+def test_summary_all_null_and_full_object_shapes_match():
+    """全 NULL = 业务合法 null（两路径 null，canonical 不 partial）；
+    三列全数值 = 完整对象（两路径同发三子键对象）。"""
+    row = _summary_row(None, None, None)
+    single = canonical_session_skeleton_v4(row)
+    assert single["summary"] is None
+    assert single["partial"] is False              # 业务 null ≠ 来源缺失
+    [sparse] = project_rows_to_v4_skeletons([row])
+    assert sparse["summary"] is None               # 旧代码发全 null 子值对象
+
+    row = _summary_row(4, 9, 2)
+    single = canonical_session_skeleton_v4(row)
+    assert single["summary"] == {"additions": 4, "deletions": 9, "files": 2}
+    assert single["partial"] is False
+    [sparse] = project_rows_to_v4_skeletons([row])
+    assert sparse["summary"] == {"additions": 4, "deletions": 9, "files": 2}

@@ -138,6 +138,44 @@ class TestBucketize:
         assert bucketize("GET", "/slimapi/ses_x/stream") == "other"
         assert bucketize("GET", "/slimapi/ses_x/children") == "other"
 
+    # ---- Q6 (2026-08-22) discovery-bucket additions ----
+    # 8h production-log evidence: GET /slimapi/permissions (x140), GET
+    # /slimapi/versions (x53), GET /slimapi/actions (x7) + POST
+    # /slimapi/actions/{id} (x5) all leaked into ``other``.
+
+    def test_q6_read_buckets_exact(self):
+        """GET-exact hits: permissions / versions / actions get their own
+        buckets (health exact-match precedent)."""
+        assert bucketize("GET", "/slimapi/permissions") == "permissions"
+        assert bucketize("GET", "/slimapi/versions") == "versions"
+        assert bucketize("GET", "/slimapi/actions") == "actions"
+
+    def test_q6_read_buckets_subpaths_are_other(self):
+        """Sub-paths keep falling to ``other`` (mirrors the health
+        exact-not-prefix semantics)."""
+        assert bucketize("GET", "/slimapi/permissions/x") == "other"
+        assert bucketize("GET", "/slimapi/versions/x") == "other"
+        assert bucketize("GET", "/slimapi/actions/x") == "other"
+
+    def test_q6_read_buckets_wrong_methods_are_other(self):
+        """Non-GET on the GET-only discovery endpoints is a FastAPI 405 and
+        must not count as bucket traffic (write_question C2-gate mirror)."""
+        for method in ("POST", "PUT", "DELETE", "PATCH"):
+            assert bucketize(method, "/slimapi/permissions") == "other"
+            assert bucketize(method, "/slimapi/versions") == "other"
+            assert bucketize(method, "/slimapi/actions") == "other"
+
+    def test_q6_write_actions_bucket(self):
+        """POST /slimapi/actions/{name} (manifest action invocation) gets the
+        write_actions bucket — write_* naming per write_session /
+        write_question."""
+        assert bucketize("POST", "/slimapi/actions/compact") == "write_actions"
+        # wrong method on the invocation sub-path is a 405 -> other
+        assert bucketize("GET", "/slimapi/actions/compact") == "other"
+        assert bucketize("DELETE", "/slimapi/actions/compact") == "other"
+        # bare POST /slimapi/actions is not an invocation route -> other
+        assert bucketize("POST", "/slimapi/actions") == "other"
+
 
 # ---------------------------------------------------------------------------
 # record_downstream

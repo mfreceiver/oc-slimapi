@@ -21,7 +21,6 @@ from __future__ import annotations
 import glob
 import os
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Mapping
 
 # §3.1: sidecar 自有显式配置 env（最高优先）。
@@ -154,5 +153,4 @@ __all__ = [
     "ResolvedPath",
     "resolve_db_path",
     "stat_inode_marker",
-    "Path",
 ]

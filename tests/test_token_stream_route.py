@@ -892,8 +892,14 @@ class TestTokenStreamHandshake:
             await _close_app(app)
 
     async def test_no_sse_id_field_in_frames(self):
-        """Contract: token stream NEVER emits an SSE ``id:`` field (no replay
-        buffer; clients must not rely on id for resumption)."""
+        """Handshake emits no SSE ``id:`` field. (Q2-era docstring fix
+        2026-08-22: the old "token stream NEVER emits id:" claim was the
+        v2/v3 shape — under the v4 wire view live-fanout business frames
+        DO carry ``id: t:<sid>:<epoch>:<seq>`` prefixes, §7.1/§7.2 replay
+        domain; subscriber.wire_v4 stamping. This bare connect carries no
+        business frames, so it pins the handshake-half invariant: the
+        no-prefill join's connection-local frame (slimapi.meta) and any
+        control frames must never be id-stamped.)"""
         app = _build_app(_settings())
         try:
             _status, _headers, body = await _drive_stream(

@@ -178,7 +178,7 @@ class TestConstants:
 
     def test_timing_constants_unchanged(self):
         assert DEBOUNCE_SECONDS == 0.25
-        assert HEARTBEAT_SECONDS == 10.0
+        assert HEARTBEAT_SECONDS == 15.0  # Q3 2026-08-22: unified w/ token stream
         assert GRACE_SECONDS == 30.0
 
     def test_t3_default_caps_match_contract_section_6(self):

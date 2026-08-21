@@ -4,6 +4,7 @@ import orjson
 from fastapi import APIRouter, Request
 from starlette.responses import Response
 
+from ..config import allowlist_roots, candidate_canonical, match_allowlist
 from ..directory import normalize_directory
 from ..discovery import _DISCOVERY_LIMIT, fetch_global_root_sessions
 from ..gzip_util import compress_if_beneficial
@@ -64,6 +65,21 @@ async def directories(request: Request):
     - ``discoveryComplete``: ``true`` unless the discovery page filled
       exactly at ``_DISCOVERY_LIMIT`` (possible truncation).
 
+    **Allowlist overlay (owner ruling D1-A; v4-contract §4.6 + §5.2
+    "allowlist 作用域全覆盖")**: with a NON-EMPTY directory allowlist,
+    sessions whose ``directory`` lies outside the allowlisted subtrees
+    are dropped BEFORE aggregation — only allowlisted directories
+    appear as rows, and each row's title / counts reflect only its
+    allowlisted sessions (a directory with zero surviving sessions
+    leaves no row at all). Matching reuses the canonical helpers from
+    ``config.py`` (boundary-aligned canonical prefix; ``/`` root
+    matches every non-empty absolute path; relative candidates fail
+    closed). Three-state mirrors the sessions-list family: unset
+    (``None``) and explicit-empty (``[]``) both mean "no allowlist
+    axis" → no filtering. ``discoveryComplete`` is deliberately NOT
+    recomputed — it reports upstream discovery-page completeness,
+    independent of the post-filter survivor count.
+
     Total failure (cannot list top-level sessions): HTTP 503
     ``{"code": "upstream_unavailable"}`` (no envelope).
 
@@ -93,6 +109,33 @@ async def directories(request: Request):
                 d = s.get("directory")
                 if not isinstance(d, str) or not d:
                     raise_upstream_unavailable()
+
+            # D1-A allowlist overlay (owner ruling; v4-contract §4.6 +
+            # §5.2 "allowlist 作用域全覆盖"): with a NON-EMPTY allowlist,
+            # sessions outside the allowlisted subtrees are dropped BEFORE
+            # aggregation so row titles/counts reflect only allowlisted
+            # sessions and a directory with zero survivors leaves no row.
+            # Three-state mirrors the sessions-list family (sessions.py
+            # `_v4_allowlist_entries` / GlobalHub._directory_allowed):
+            # None (unset) and [] (explicit empty) both mean "no allowlist
+            # axis" → no filtering (NOT the /slimapi/file** reject-all
+            # semantics); empty-string entries are config noise, dropped.
+            # Canonical matching reuses config.py helpers — cached canonical
+            # ROOTS vs REALTIME candidate canonicalisation (rev-sgpt
+            # MAJOR-1 → rev-2); `/` root matches every non-empty ABSOLUTE
+            # path; relative candidates fail closed (sub-2). The guard
+            # above already ensured every directory is a non-empty str.
+            # `discoveryComplete` is deliberately NOT recomputed here: it
+            # reports upstream discovery-page completeness (pre-filter),
+            # independent of the post-filter survivor count.
+            allowlist = request.app.state.config.directory_allowlist
+            entries = [e for e in allowlist if e] if allowlist else []
+            if entries:
+                roots = allowlist_roots(entries)
+                sessions_payload = [
+                    s for s in sessions_payload
+                    if match_allowlist(roots, candidate_canonical(s["directory"]))
+                ]
             # Aggregate + serialize + gzip offloaded to the worker so a
             # large aggregation's orjson.dumps + gzip does not block the
             # event loop (SSE heartbeats, other light async work).

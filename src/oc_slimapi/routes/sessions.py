@@ -177,12 +177,18 @@ def _fail_closed_503(request: Request) -> CodedHTTPException:
 
 
 def _http_session_to_v4(item: dict) -> dict:
-    """Upstream ``/session`` JSON (SessionInfo camelCase) → SessionSkeletonV4.
+    """Upstream session JSON (SessionInfo camelCase) → SessionSkeletonV4.
 
-    Degraded-path projection (§4.2 Class A): the upstream HTTP shape has
-    no project join → ``project: null`` (the wire type is object|null;
-    the weakness is flagged by ``degraded: true``). Tokens map from the
-    nested HTTP shape to the flat real-DB column names (R2 freeze).
+    Degraded-path projection (§4.2 Class A). Since D2-A the upstream call
+    targets ``/experimental/session`` (sessions.listGlobal), whose rows DO
+    carry a ``project`` join — but ``project`` stays frozen to ``None``:
+    the gate-closed 4.0.0 published degraded item form is preserved
+    byte-for-byte (the weakness is flagged by ``degraded: true``; the
+    gate-open canonical projection ``native_session_to_record`` remains
+    the schema authority). The listGlobal row is a superset of the legacy
+    ``/session`` row, so the pick-list parser needs no shape adaptation.
+    Tokens map from the nested HTTP shape to the flat real-DB column
+    names (R2 freeze).
     """
     def _pick(source: dict, *keys: str):
         return {key: source[key] for key in keys if key in source}
@@ -360,23 +366,38 @@ async def _sessions_v4(
     if not class_a:
         raise _fail_closed_503(request)
 
-    # ---- Class A 200 + degraded:true（HTTP 降级，v3 调用形态复制） -----
+    # ---- Class A 200 + degraded:true（HTTP 降级） -----
+    # 上游端点 = GET /experimental/session（契约 §4.2 指定的 schema 权威
+    # 与降级路径）。此前误用 /session：上游该路由走 listByProject——恒含
+    # eq(project_id) 且无 time_archived 过滤，降级响应会混入 archived
+    # 会话、范围塌缩到单一 project，违约「过滤语义永不降级」。
+    # /experimental/session 走 sessions.listGlobal：archived 参数缺省
+    # （= omit）即追加 isNull(time_archived)，orderBy (time_updated DESC,
+    # id DESC)，全局范围——降级响应与 DB 常态投影的过滤/排序语义一致。
     params: dict[str, object] = {"limit": limit}
     if parent_state == "none":
         params["roots"] = "true"  # §4.2: parent=none → roots=true 透传
+    # archived 按状态透传（D2-A + rev-sgpt 终审补丁 2026-08-22）：
+    # omit（默认态）→ 不传参——listGlobal 缺省追加 isNull(time_archived)
+    # 即契约过滤语义；all → 显式 archived=true——上游仅在真值时包含
+    # archived（session.ts:564 `if (!input?.archived)`），缺参必然排除，
+    # 故 all 必须传真值（初版漏传致 all 退化 omit，违约「过滤语义永不
+    # 降级」§4.2）。only 态在 class_a 判定已 fail-closed，不可达此。
+    if archived_state == "all":
+        params["archived"] = "true"
     if normalized is not None:
         params["search"] = normalized  # 第四消费点：降级传 normalized
     config = request.app.state.config
     try:
         async with request.app.state.transforms as pool:
             try:
-                response = await request.app.state.upstream.send(
-                    request.app.state.upstream.build_request(
-                        "GET", "/session",
-                        params=params, headers=forward_directory_headers(None),
-                    ),
-                    stream=True,
-                )
+                    response = await request.app.state.upstream.send(
+                        request.app.state.upstream.build_request(
+                            "GET", "/experimental/session",
+                            params=params, headers=forward_directory_headers(None),
+                        ),
+                        stream=True,
+                    )
             except httpx.RequestError as exc:
                 raise_upstream_unavailable(exc)
             try:

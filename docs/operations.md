@@ -95,8 +95,8 @@ Environment=OC_SLIMAPI_HOST=127.0.0.1   # 默认回环；0.0.0.0 为 opt-in（�
 Environment=OC_SLIMAPI_PORT=4097
 Environment=OC_SLIMAPI_UPSTREAM=http://127.0.0.1:4096
 Environment=OC_SLIMAPI_MAX_MESSAGE_BYTES=33554432
-# OC_SLIMAPI_SERVER_API_VERSION / OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS 已弃用：版本窗自 4.0.0 起
-# 由代码钉死 (3,4) fail-closed——ACCEPTED_CLIENT_VERSIONS 设非 (3,4) 启动即 RuntimeError 拒绝；
+# OC_SLIMAPI_SERVER_API_VERSION / OC_SLIMAPI_ACCEPTED_CLIENT_VERSIONS 已弃用：版本窗自 4.0.0 起由代码钉死
+# （4.8.0 起 (4,4) v4-only）fail-closed——ACCEPTED_CLIENT_VERSIONS 设非 (4,4) 启动即 RuntimeError 拒绝；
 # SERVER_API_VERSION 设置仅产生启动 warning 并被忽略。deploy 模板已同款清理，版本 env 不可配置。
 Environment=PYTHONUNBUFFERED=1
 
@@ -214,7 +214,7 @@ oc-slimapi 有两类日志输出，**分别处理**：
 
 ### 5.2.1 incarnation 状态文件（与 access logs 分离，T9/P1-4）
 
-> T9（P1-4）起，incarnation 状态文件与 access logs **分离**到独立目录。这是**运维行为变更**，不涉及 wire（历史注：该变更发生于 v2 时代、未 bump 版本头；3.0.0 起请求头通道删除，wire 版本由 `?v=` selector 唯一表达——4.0.0 起 (3,4) 双版本窗口）。
+> T9（P1-4）起，incarnation 状态文件与 access logs **分离**到独立目录。这是**运维行为变更**，不涉及 wire（历史注：该变更发生于 v2 时代、未 bump 版本头；3.0.0 起请求头通道删除，wire 版本由 `?v=` selector 唯一表达——4.8.0 起 (4,4) v4-only 单版本窗口（4.0.0–4.7.0 曾为 (3,4) 双版本）。
 
 | 路径 | 来源 |
 |---|---|
@@ -259,7 +259,7 @@ oc-slimapi 有两类日志输出，**分别处理**：
 | `OC_SLIMAPI_QUESTIONS_MAX_AGGREGATE_BYTES` | 16 MiB | >= per_dir, <= 128 MiB | 跨目录聚合的累积字节预算。超过时 envelope 标记 `truncated: true`，取消后续未消费的目录。 |
 | `OC_SLIMAPI_QUESTIONS_FANOUT_CONCURRENCY` | 8 | 1–16 | 跨请求全局 `/question` 并发上限。单次 `/slimapi/questions` 请求的 fan-out 不超过此值。 |
 
-触发任一预算上限时，envelope 复用既有的加性字段 `truncated`（`true`）和 `authoritativeDirectories`（降级为已成功目录列表，非 null）（历史注：该行为加入时未 bump 版本头；3.0.0 起请求头通道删除，`?v=` selector 为唯一版本通道——4.0.0 起 (3,4) 双版本窗口）。详见 [`../CHANGELOG.md`](../CHANGELOG.md) Unreleased 与 [`docs/specs/INTERFACE_MAP.md`](specs/INTERFACE_MAP.md) questions 行。
+触发任一预算上限时，envelope 复用既有的加性字段 `truncated`（`true`）和 `authoritativeDirectories`（降级为已成功目录列表，非 null）（历史注：该行为加入时未 bump 版本头；3.0.0 起请求头通道删除，`?v=` selector 为唯一版本通道——4.8.0 起 (4,4) v4-only 单版本窗口（4.0.0–4.7.0 曾为 (3,4) 双版本）。详见 [`../CHANGELOG.md`](../CHANGELOG.md) Unreleased 与 [`docs/specs/INTERFACE_MAP.md`](specs/INTERFACE_MAP.md) questions 行。
 
 **Permissions（`/slimapi/permissions`，2026-08-15 起；语义与 questions 同款）**
 
@@ -434,7 +434,7 @@ systemctl --user is-enabled oc-slimapi   # enabled
 ### 6.2 应用级
 
 ```bash
-# 必须带版本头
+# 必须带版本参数 ?v=4（X-Slimapi-Version 头已删除）
 curl -s 'http://127.0.0.1:4097/slimapi/health?v=4' | jq .
 ```
 
@@ -445,9 +445,9 @@ curl -s 'http://127.0.0.1:4097/slimapi/health?v=4' | jq .
   "slimapi_contract": 4,
   "sidecar": { "ok": true, "version": "<包版本，读 dist-info>" },
   "server":  { "api_version": 4, "accepted_client_versions": [4] },
-  "schema":  { "degraded": false, "version": 3, "clientMin": 3, "clientMax": 4 },
+  "schema":  { "degraded": false, "version": 4, "clientMin": 4, "clientMax": 4 },
   "features": { "tokenStream": true, "thresholdedSkeleton": true, "skeletonInlineOutputMaxBytes": 4096, "allowlist": { "enabled": false } },
-  "auxiliary": { "available": true, "mode": "ro" }
+  "auxiliary": { "available": true, "mode": "db" }
 }
 ```
 
@@ -560,7 +560,7 @@ ocdroid 客户端**不直接操作** sidecar 进程，只通过 stunnel mTLS 接
 | 所有 `/slimapi/**` 请求必带 query | `?v=4`（4.8.0 起 v4-only 单版本窗口；无 `v`/`v=3`/不支持值 → `400 unsupported_version supported:[4]`；`X-Slimapi-Version` 头已删除不解读） |
 | 非 `/slimapi/**` | **3.0.0 已关闭**——未收编路径 404 `thin_route_not_found`（2.x 为透明反代，历史行为见 CHANGELOG） |
 | 健康自检（客户端侧） | `GET /slimapi/health?v=4` 读 `server.api_version` / `accepted_client_versions` 做运行时兼容判断 |
-| Wire 行为变更来源 | 本仓 [`CHANGELOG.md`](../CHANGELOG.md)（路径/头/错误码以本仓 + [`v3-contract.md`](specs/v3-contract.md) 为准） |
+| Wire 行为变更来源 | 本仓 [`CHANGELOG.md`](../CHANGELOG.md)（路径/头/错误码以本仓 + [`v4-contract.md`](specs/v4-contract.md) 为准） |
 | 客户端配套改动清单 | [`CLIENT_CHANGES.md`](specs/CLIENT_CHANGES.md) |
 
 sidecar 进程的启停、日志、升级由 **服务端运维** 负责，ocdroid 侧无需介入；但理解拓扑有助于排障（例如 sidecar 重启时 SSE 会断、客户端应收 `resync` 重连）。
@@ -578,7 +578,7 @@ sidecar 进程的启停、日志、升级由 **服务端运维** 负责，ocdroi
 | SSE 订阅被 400 拒 | 订阅数触顶：digest 面 `MAX_SUBSCRIBERS_PER_DIRECTORY`（8）/`MAX_TOTAL_SUBSCRIBERS`（16），token stream 面 `TOKEN_STREAM_MAX_SUBSCRIBERS`（8）；按 §5.5 表调 env 后重启 |
 | `transform_busy` 503 持续 | transform 池拥塞（非 dbaux 降级，`degraded503` 不置位）：先看 `OC_SLIMAPI_MAX_TRANSFORMS`/`TRANSFORM_ABSORB_BUDGET_SECONDS`（默认吸收 2.5s）与上游延迟；偶发属预期，持续才调参 |
 | questions/permissions 结果缺目录 | envelope `errors[]`（该目录 `upstream_unavailable` 等）与 `truncated:true`（聚合预算触顶）——降级字段观察法，非故障 |
-| crash-loop（反复重启） | `systemctl --user status oc-slimapi` 看 Restart 计数 + `journalctl` 找启动即崩原因：端口占用、预算校验 `RuntimeError`（如 `ACCEPTED_CLIENT_VERSIONS` 非 (3,4)）、state dir 不可写；unit 层加固参考 `deploy/oc-slimapi.service`（`Restart=on-failure` + `RestartSec=5` + `TimeoutStopSec=60`） |
+| crash-loop（反复重启） | `systemctl --user status oc-slimapi` 看 Restart 计数 + `journalctl` 找启动即崩原因：端口占用、预算校验 `RuntimeError`（如 `ACCEPTED_CLIENT_VERSIONS` 非 (4,4)）、state dir 不可写；unit 层加固参考 `deploy/oc-slimapi.service`（`Restart=on-failure` + `RestartSec=5` + `TimeoutStopSec=60`） |
 | `systemctl stop` 后快照缺终帧 / journal 见 SIGKILL | 核对 unit `TimeoutStopSec` 是否 ≥ 关停链合计（5+30+10+5s，见 §4 shutdown 语义，F-010/F-214）；维护 gzip 卡死场景查 `~/.local/state/oc-slimapi/logs/` 残留 tmp 与启动日志 `_cleanup_leftover_tmp` 兜底 |
 | 观测面自身健康 | access log 当天文件（`~/.local/state/oc-slimapi/logs/access-$(date +%F).jsonl`）在增长；snapshot 每周期（默认 300s）有新帧——**journal 关键词 `snapshot` + `inactive`**（首帧失败即停不重试，须重启恢复，见 traffic-accounting.md §9.1） |
 | 升级后行为变化 | 先看 [`CHANGELOG.md`](../CHANGELOG.md) 对应版本节 |
@@ -589,8 +589,8 @@ sidecar 进程的启停、日志、升级由 **服务端运维** 负责，ocdroi
 
 | 文件 | 用途 |
 |---|---|---|
-| [`v3-contract.md`](specs/v3-contract.md) | Wire 契约权威（v3 基准；4.0.0 起 (3,4) 双版本窗口） |
-| [`v4-contract.md`](specs/v4-contract.md) | v4 wire 契约（4.0.0 实施基线 + 2026-08-19 修订冻结） |
+| [`v3-contract.md`](specs/v3-contract.md) | ≤4.7.0 历史契约存档（v3 wire 版本已退役） |
+| [`v4-contract.md`](specs/v4-contract.md) | **Wire 契约权威**（4.0.0 实施基线 + 2026-08-19 修订冻结；4.8.0 起 v4-only 自包含） |
 | [`v2-contract.md`](specs/v2-contract.md) | v2 契约（已于 3.0.0 退役，历史参考） |
 | [`release.md`](release.md) | 发版流程 |
 | [`../CHANGELOG.md`](../CHANGELOG.md) | 接口行为变更记录 |
@@ -670,7 +670,7 @@ curl -s --cert client-cert.pem --key client-key.pem \
 
 ## 12. actions 管理功能
 
-> 本节记录 `/slimapi/actions` 的运维注意事项。功能详见 `docs/specs/v2-contract.md` §2「`/slimapi/actions` API」。
+> 本节记录 `/slimapi/actions` 的运维注意事项。功能详见 `docs/specs/INTERFACE_MAP.md` §2「Actions 本地端点」（历史形状存档：`v2-contract.md` §2）。
 
 ### 12.1 安全风险声明
 

@@ -160,7 +160,10 @@ MESSAGE_EVENTS = frozenset({
 })
 
 DEBOUNCE_SECONDS = 0.25
-HEARTBEAT_SECONDS = 10.0
+# Q3 owner ruling 2026-08-22: unified with TOKEN_HEARTBEAT_SECONDS (config.py,
+# 15s) — one keepalive cadence across control-plane /events and token streams
+# (both well under common stunnel/proxy idle thresholds). Was 10.0 pre-Q3.
+HEARTBEAT_SECONDS = 15.0
 GRACE_SECONDS = 30.0
 
 # F-015 (audit 2026-08-20): hard cap for the shared q/p activity table.

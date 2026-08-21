@@ -2,7 +2,7 @@
 
 `oc-slimapi` 是 **ocdroid**（Android 客户端）与 **opencode**（上游 server）之间的 **Python 省流 sidecar**。它通过 HTTP 调 opencode legacy API，并经只读投影源（SQLite `mode=ro`，4.0.0 起）为 v4 会话全局面提供 DB 投影数据（**绝无写入**）；对历史消息生成 skeleton 投影，向手机提供策展 SSE + 消息骨架，并提供流量记账、token stream、资源限制等 T3 能力。
 
-权威 wire 契约为 [`docs/specs/v3-contract.md`](docs/specs/v3-contract.md)（v3 基准）与 [`docs/specs/v4-contract.md`](docs/specs/v4-contract.md)（4.0.0 起 (3,4) 双版本窗口的 v4 面）；[`docs/specs/v2-contract.md`](docs/specs/v2-contract.md) 为 ≤2.x 历史契约存档（`v1-contract.md` 已废弃移除）。Agent / 开发入口索引见 [`AGENTS.md`](AGENTS.md)。
+权威 wire 契约为 [`docs/specs/v4-contract.md`](docs/specs/v4-contract.md)（**现行契约权威**，4.8.0 起 v4-only 自包含）；[`docs/specs/v3-contract.md`](docs/specs/v3-contract.md) 为 ≤4.7.0 历史存档（v3 wire 版本已退役），[`docs/specs/v2-contract.md`](docs/specs/v2-contract.md) 为 ≤2.x 历史契约（v2 语义已于 3.0.0 退役；`v1-contract.md` 已废弃移除）。Agent / 开发入口索引见 [`AGENTS.md`](AGENTS.md)。
 
 ## 拓扑
 
@@ -53,10 +53,10 @@ curl --fail 'http://127.0.0.1:4097/slimapi/health?v=4'
 
 | 文件 | 用途 |
 |---|---|
-| [`docs/specs/v3-contract.md`](docs/specs/v3-contract.md) | Wire 契约权威（v3 基准） |
-| [`docs/specs/v4-contract.md`](docs/specs/v4-contract.md) | v4 wire 契约（4.0.0 实施基线 + 修订冻结） |
+| [`docs/specs/v3-contract.md`](docs/specs/v3-contract.md) | ≤4.7.0 历史契约存档（v3 wire 版本已退役） |
+| [`docs/specs/v4-contract.md`](docs/specs/v4-contract.md) | **Wire 契约权威**（4.0.0 实施基线 + 修订冻结；4.8.0 起 v4-only 自包含） |
 | [`docs/specs/v2-contract.md`](docs/specs/v2-contract.md) | ≤2.x 历史契约存档 |
-| [`docs/specs/design-v2.md`](docs/specs/design-v2.md) | v2 时代设计（历史；现行态以 v3/v4 契约为准） |
+| [`docs/specs/design-v2.md`](docs/specs/design-v2.md) | v2 时代设计（历史；现行态以 v4 契约 + operations.md 为准） |
 | [`docs/specs/INTERFACE_MAP.md`](docs/specs/INTERFACE_MAP.md) | 端点级实现追踪 |
 | [`docs/specs/CLIENT_CHANGES.md`](docs/specs/CLIENT_CHANGES.md) | ocdroid 侧配套改动清单 |
 | [`docs/operations.md`](docs/operations.md) | 部署 / 运维 / 日志 |

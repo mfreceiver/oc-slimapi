@@ -26,23 +26,24 @@ from oc_slimapi.transform import TransformConfig, TransformPool
 VERSION_HEADERS = {"X-Slimapi-Version": "2"}
 
 
-def _settings() -> Settings:
+def _settings(**overrides) -> Settings:
     return Settings(
         host="127.0.0.1", port=4097, upstream="http://127.0.0.1:4096",
         max_message_bytes=32 * 1024 * 1024,
         max_transforms=1, transform_wait_seconds=0.5, max_response_bytes=64 * 1024,
         smoke_session_id=None,
+        **overrides,
     )
 
 
-def _build_app(upstream: httpx.AsyncClient) -> FastAPI:
+def _build_app(upstream: httpx.AsyncClient, settings: Settings | None = None) -> FastAPI:
     """Construct a fresh FastAPI app with the directories router wired up.
 
     Mirrors the real app: version middleware → directories router (before
     catch-all) → catch-all proxy → coded-exception handler.
     """
     app = FastAPI(title="oc-slimapi-directories-test")
-    settings = _settings()
+    settings = _settings() if settings is None else settings
     app.state.config = settings
     app.state.upstream = upstream
     app.state.schema_degraded = False
@@ -94,8 +95,8 @@ def _discovery_handler(*sessions: dict):
     return handler
 
 
-async def _get(upstream, **client_headers) -> httpx.Response:
-    app = _build_app(upstream)
+async def _get(upstream, settings: Settings | None = None, **client_headers) -> httpx.Response:
+    app = _build_app(upstream, settings=settings)
     transport = httpx.ASGITransport(app=app)
     headers = {**VERSION_HEADERS, **client_headers}
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -536,3 +537,75 @@ async def test_directory_query_param_ignored_no_filter(upstream_factory):
     # Both dirs returned — the bogus ?directory= did not filter.
     assert "/a" in by_dir
     assert "/b" in by_dir
+
+
+# ---------------------------------------------------------------------------
+# 16. Allowlist overlay (owner ruling D1-A): three states + canonical match
+# ---------------------------------------------------------------------------
+
+
+async def test_allowlist_nonempty_filters_rows_and_counts(upstream_factory):
+    """Non-empty allowlist ["/a"]: /a (2 sessions) and /a/sub (1) survive;
+    boundary trap /ab (lexical prefix, NOT a subtree) and unrelated /c
+    vanish entirely. Row counts/titles reflect ONLY allowlisted sessions."""
+    upstream = upstream_factory(_discovery_handler(
+        _session("/a", sid="a1", updated=10, title="winner-a"),
+        _session("/a", sid="a2", updated=5),
+        _session("/a/sub", sid="s1", updated=30, title="winner-sub"),
+        _session("/ab", sid="ab1", updated=99, title="must-not-appear"),
+        _session("/c", sid="c1", updated=40),
+    ))
+    response = await _get(upstream, settings=_settings(directory_allowlist=["/a"]))
+    assert response.status_code == 200
+    body = response.json()
+    by_dir = {it["directory"]: it for it in body["items"]}
+    assert set(by_dir) == {"/a", "/a/sub"}
+    assert by_dir["/a"]["rootSessionCount"] == 2
+    assert by_dir["/a"]["title"] == "winner-a"
+    assert by_dir["/a/sub"]["rootSessionCount"] == 1
+    assert by_dir["/a/sub"]["title"] == "winner-sub"
+    # discoveryComplete is NOT recomputed by the filter (upstream page was
+    # not full → still true even though rows were filtered away).
+    assert body["discoveryComplete"] is True
+
+
+async def test_allowlist_unset_no_filtering(upstream_factory):
+    """None (unset) → "no allowlist axis" → zero behavior change (golden)."""
+    upstream = upstream_factory(_discovery_handler(
+        _session("/a", sid="a1", updated=10),
+        _session("/b", sid="b1", updated=20),
+    ))
+    response = await _get(upstream, settings=_settings(directory_allowlist=None))
+    assert response.status_code == 200
+    assert {it["directory"] for it in response.json()["items"]} == {"/a", "/b"}
+
+
+async def test_allowlist_explicit_empty_no_filtering(upstream_factory):
+    """[] (explicit empty) mirrors the sessions-list family: "no allowlist
+    axis" → no filtering (NOT the /slimapi/file** reject-all semantics).
+    Also pins the config-noise rule: [""] drops to no axis as well."""
+    upstream = upstream_factory(_discovery_handler(
+        _session("/a", sid="a1", updated=10),
+        _session("/b", sid="b1", updated=20),
+    ))
+    response = await _get(upstream, settings=_settings(directory_allowlist=[]))
+    assert response.status_code == 200
+    assert {it["directory"] for it in response.json()["items"]} == {"/a", "/b"}
+
+    response_noise = await _get(upstream, settings=_settings(directory_allowlist=[""]))
+    assert response_noise.status_code == 200
+    assert {it["directory"] for it in response_noise.json()["items"]} == {"/a", "/b"}
+
+
+async def test_allowlist_root_slash_matches_all_absolute(upstream_factory):
+    """/ root special case: matches every non-empty ABSOLUTE path; a
+    relative directory fails closed (rev-2 sub-2) and leaves no row."""
+    upstream = upstream_factory(_discovery_handler(
+        _session("/a", sid="a1", updated=10),
+        _session("/deep/nested/dir", sid="n1", updated=20),
+        _session("relative/dir", sid="r1", updated=30),
+    ))
+    response = await _get(upstream, settings=_settings(directory_allowlist=["/"]))
+    assert response.status_code == 200
+    dirs = {it["directory"] for it in response.json()["items"]}
+    assert dirs == {"/a", "/deep/nested/dir"}

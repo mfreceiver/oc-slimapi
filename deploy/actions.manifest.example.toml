@@ -1,7 +1,7 @@
 # oc-slimapi actions manifest — reference example (deploy/actions.manifest.example.toml)
 #
 # Canonical 4-action manifest matching the live deployment on this host.
-# Wire contract: docs/specs/v2-contract.md §2.  Ops notes: docs/operations.md §11.
+# Wire contract: docs/specs/INTERFACE_MAP.md §2.  Ops notes: docs/operations.md §12.
 #
 # DEPLOY: copy to a machine-local path (e.g. ~/.config/oc-slimapi/actions.toml),
 #   chmod 0600, and point OC_SLIMAPI_ACTIONS_FILE at it in the systemd unit

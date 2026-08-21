@@ -360,15 +360,6 @@ def _stash(scope: Scope, result: str, wire: str | None) -> None:
         state[SELECTOR_STATE_KEY] = {"result": result, "wire": wire}
 
 
-def selector_info_from_scope(scope: Scope) -> dict[str, Any]:
-    """Read the stashed selector info ({} when the selector did not run)."""
-    state = scope.get("state")
-    if not isinstance(state, dict):
-        return {}
-    info = state.get(SELECTOR_STATE_KEY)
-    return info if isinstance(info, dict) else {}
-
-
 def wire_view_from_scope(scope: Scope) -> int:
     """§2/S-B04: the wire view this request runs — 4 (the only live view).
 

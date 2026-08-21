@@ -14,10 +14,13 @@ router = APIRouter(prefix="/slimapi", tags=["health"])
 # v4-contract §3.2: under the v4-only (4, 4) window /health runs the v4
 # view unconditionally — the selector stashes "4" for admitted ``?v=4``
 # requests and every other scope observes the V2b-flipped default 4
-# (wire_view_from_scope is constant 4). /ready is NOT version-forked
-# (contract §12 route table: 零 v4 差异) — shape AND values stay the
-# terminal v3 ones (READY_VIEW below), frozen by contract.
-READY_VIEW = 3
+# (wire_view_from_scope is constant 4). /ready remains NOT version-forked
+# (contract §3.2 "ready 端点形状不变" + §10 route table: 零 v4 差异) — the
+# SHAPE stays the frozen ready-only one (no slimapi_contract/features/
+# auxiliary blocks). The api_version VALUE tracks the window: 2026-08-22
+# owner ruling D3 flipped READY_VIEW 3 → 4 (a missed V2b window-narrowing
+# change) so /ready, /health and /versions now all report 4 under (4, 4).
+READY_VIEW = 4
 
 
 @router.get("/health")
@@ -106,8 +109,10 @@ async def health(request: Request):
 
 @router.get("/ready")
 async def ready(request: Request):
-    # v4-contract §3.2/§12: ready is 零 v4 差异 — shape AND values frozen to
-    # the terminal v3 view; no contract field on this endpoint.
+    # v4-contract §3.2/§10: ready is 零 v4 差异 — shape stays the frozen
+    # ready-only one (no contract field on this endpoint); the version
+    # value = READY_VIEW (4, 2026-08-22 D3 owner ruling: aligned with the
+    # v4-only (4, 4) window, same value as /health and /versions).
     view = READY_VIEW
     started = time.monotonic()
     try:

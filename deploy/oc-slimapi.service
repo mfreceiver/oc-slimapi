@@ -39,7 +39,7 @@ Environment=OC_SLIMAPI_HOST=127.0.0.1
 Environment=OC_SLIMAPI_PORT=4097
 Environment=OC_SLIMAPI_UPSTREAM=http://127.0.0.1:4096
 Environment=OC_SLIMAPI_MAX_MESSAGE_BYTES=33554432
-# 版本窗自 4.0.0 起由代码钉死 (3,4)（config.validate fail-closed）——勿设置版本相关 env
+# 版本窗由代码钉死（4.8.0 起 (4,4) v4-only；config.validate fail-closed）——勿设置版本相关 env
 Environment=PYTHONUNBUFFERED=1
 
 # v1.0.0: access log + traffic snapshot 落 StateDirectory（systemd 自动建
@@ -66,7 +66,7 @@ Environment=OC_SLIMAPI_STATE_DIR=%S/oc-slimapi
 # /slimapi/actions manifest (opt-in; unset = feature disabled).
 # Manifest must be a regular file, owner-only-write (chmod 0600), owned by the
 # runtime user. Reference: deploy/actions.manifest.example.toml. Spec/ops:
-# docs/specs/v2-contract.md §2 + docs/operations.md §11.
+# docs/specs/INTERFACE_MAP.md §2（actions 端点行）+ docs/operations.md §12.
 #Environment=OC_SLIMAPI_ACTIONS_FILE=%h/.config/oc-slimapi/actions.toml
 
 StandardOutput=journal

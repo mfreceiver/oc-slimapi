@@ -11,6 +11,10 @@ dependencies = [
   "fastapi>=0.115,<1",
   "httpx>=0.28,<1",
   "orjson>=3.10,<4",
+  # starlette is imported directly (responses/types across 18 src modules);
+  # lower bound mirrors the range FastAPI itself pulls in (fastapi 0.139.2
+  # requires starlette>=0.46.0) — kept conservative, no extra upper cap.
+  "starlette>=0.46",
   "uvicorn>=0.34,<1",
 ]
 

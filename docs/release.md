@@ -42,9 +42,9 @@ Tag 格式：**`v` + semver**（例：`v0.1.0`），与 ocdroid 一致。
 ### 1.2 Wire API 版本（`?v=` selector + 发现端点）
 
 - 版本协商 = **`?v=` selector** + **`GET /slimapi/versions`** 发现端点；请求头通道已于 3.0.0 删除（出现不解读）。
-- 当前接受区间：见 `src/oc_slimapi/versioning.py`（`ACCEPTED_CLIENT_VERSIONS`）与 `docs/specs/v3-contract.md` §1/§2 + `docs/specs/v4-contract.md` §0（权威契约，(3,4) 双版本窗口）。
+- 当前接受区间：见 `src/oc_slimapi/versioning.py`（`ACCEPTED_CLIENT_VERSIONS`，现为 (4,4)）与 `docs/specs/v4-contract.md` §0（权威契约，4.8.0 起 (4,4) v4-only 单版本窗口；`v3-contract.md` §1/§2 为 ≤4.7.0 历史存档）。
 - **仅破坏性**变更 bump；加性变更 **同版本**。
-- Bump 时必须同步：`versioning.py`、`docs/specs/v3-contract.md`、`docs/specs/v4-contract.md`（(3,4) 窗口下版本窗相关变更两契约同时触及）、`CHANGELOG.md`（写明客户端必改点）。
+- Bump 时必须同步：`versioning.py`、`docs/specs/v4-contract.md`（v4-only 窗下版本窗相关变更仅触及 v4 契约；`v3-contract.md` 已为历史存档，不再同步修订）、`CHANGELOG.md`（写明客户端必改点）。
 
 ### 1.3 双版本期（wire (3,4)）说明
 
@@ -60,7 +60,7 @@ Tag 格式：**`v` + semver**（例：`v0.1.0`），与 ocdroid 一致。
 
 1. **行为变更**是否已写入 `CHANGELOG.md` 的 `[Unreleased]` 或目标版本节？  
    - 路径、状态码、头字段、SSE 帧、错误 `code`、gzip/SSE 行为、资源限制默认值。
-2. 若破坏性：契约 + wire 版本协商（`src/oc_slimapi/versioning.py` / `docs/specs/v3-contract.md` §1/§2 / `docs/specs/v4-contract.md` §0）是否已按 §1.2 处理？
+2. 若破坏性：契约 + wire 版本协商（`src/oc_slimapi/versioning.py` / `docs/specs/v4-contract.md` §0）是否已按 §1.2 处理？
 3. `main` 已包含全部要发的提交；本地 `./scripts/check.sh` 绿。
 4. （可选）对照 ocdroid `docs/slim-mode-api-routing.md`：客户端文档是否需同步（由 ocdroid 仓维护；本仓以 CHANGELOG 通知）。
 5. **directory allowlist 部署状态确认（[3.3.0] 起，B4-4b 联合门槛）**：发版时记录生产环境 `OC_SLIMAPI_DIRECTORY_ALLOWLIST` 三态结论——
@@ -136,7 +136,7 @@ git push origin main && git push origin vX.Y.Z
    git pull
    .venv/bin/pip install -e '.[test]'   # 刷新 dist-info；否则 health.sidecar.version 仍报旧版
 systemctl --user restart oc-slimapi
-   curl -s 'http://127.0.0.1:4097/slimapi/health?v=3'
+   curl -s 'http://127.0.0.1:4097/slimapi/health?v=4'
    # 期望 sidecar.version == X.Y.Z
    ```
    原因：`__version__` 读自已安装包的 dist-info（`importlib.metadata`），不是运行时读 `pyproject.toml`。详见 [`operations.md`](operations.md) §2 / §4。

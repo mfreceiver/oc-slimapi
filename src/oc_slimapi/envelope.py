@@ -29,20 +29,6 @@ def messages_envelope_bytes(items_bytes: bytes, next_cursor: str | None) -> byte
     return b'{"items":' + items_bytes + b',"nextCursor":' + cursor + b"}"
 
 
-def sessions_envelope_payload(
-    sessions: list[dict], complete: bool,
-) -> dict[str, object]:
-    """``{"items":[...],"complete":<bool>}`` (§4.2).
-
-    The payload dict preserves the contract key order (items, complete);
-    ``complete`` inherits the v2 ``X-Complete`` semantics verbatim,
-    including its non-authoritative nature (never a statement about the
-    authoritative full set). Serialized with the route's normal
-    ``json_response`` so gzip / Vary behave exactly like the v2 path.
-    """
-    return {"items": sessions, "complete": complete}
-
-
 def sessions_envelope_v4(
     items: list[dict],
     next_cursor: str | None,

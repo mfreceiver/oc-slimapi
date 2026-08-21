@@ -67,11 +67,15 @@ def _session_single_revision_gate_off(monkeypatch):
 
 
 HTTP_SESSIONS_BODY = orjson.dumps([
+    # D2-A: /experimental/session 走 sessions.listGlobal，行形如
+    # {...fromRow(row), project: projects.get(row.project_id) ?? null}，
+    # 即每行附带 project join（或 null）。mock 忠实复现该形状。
     {"id": "h1", "title": "up one", "directory": "/any",
      "time": {"created": 1, "updated": 2},
      "tokens": {"input": 9, "output": 8, "reasoning": 0,
-                "cache": {"read": 1, "write": 2}}},
-    {"id": "h2", "title": "up two", "directory": "/any"},
+                "cache": {"read": 1, "write": 2}},
+     "project": {"id": "p1", "name": "proj", "worktree": None}},
+    {"id": "h2", "title": "up two", "directory": "/any", "project": None},
 ])
 
 
@@ -346,6 +350,8 @@ async def test_search_literal_class_a_degraded_passthrough():
     assert resp.status_code == 200, resp.text
     assert resp.json()["degraded"] is True
     assert len(seen) == 1
+    # D2-A: 降级端点锚定（search 参数走 /experimental/session）
+    assert seen[0].url.path == "/experimental/session"
     assert seen[0].url.params.get("search") == "plain"  # trimmed
 
 
@@ -804,17 +810,37 @@ async def test_v3_model_object_passthrough_from_upstream():
 
 
 async def test_v4_degraded_upstream_param_mapping():
-    # parent=none → roots=true；parent=all → 无 roots；archived 不透传
-    for parent, expect_roots in (("none", "true"), ("all", None)):
+    # parent=none → roots=true；parent=all → 无 roots。
+    # archived=omit → 不透传；archived=all → archived=true（rev-sgpt 终审
+    # 补丁 2026-08-22：上游仅在真值时含 archived，session.ts:564
+    # `if (!input?.archived)`——缺参必然排除，all 漏传即退化 omit）。
+    # D2-A 端点锚定：Class A 降级必须打 /experimental/session（契约 §4.2
+    # schema 权威/降级路径；/session 走 listByProject 会混入 archived 且
+    # 塌缩到单一 project）。旧断言只锚参数不锚端点，漏掉了这一分歧——
+    # mock 曾对两者都应答，端点换错时测试照常绿。
+    cases = (
+        # (parent, archived, expect_roots, expect_archived)
+        ("none", "omit", "true", None),
+        ("all", "omit", None, None),
+        ("none", "all", "true", "true"),
+        ("all", "all", None, "true"),
+    )
+    for parent, archived, expect_roots, expect_archived in cases:
         app, seen = _build_app(_StubAux("disabled"))
         async with _client(app) as client:
             resp = await client.get("/slimapi/sessions", params={
-                "v": "4", "parent": parent}, headers=IDENTITY)
+                "v": "4", "parent": parent, "archived": archived},
+                headers=IDENTITY)
         assert resp.status_code == 200
         assert resp.json()["degraded"] is True
         assert len(seen) == 1
+        # 端点锚定 + 旧端点守卫（不再调用 /session）
+        assert seen[0].url.path == "/experimental/session"
+        assert seen[0].method == "GET"
+        assert seen[0].url.path != "/session"
+        assert seen[0].url.params.get("limit") == "100"
         assert seen[0].url.params.get("roots") == expect_roots
-        assert "archived" not in str(seen[0].url.params)
+        assert seen[0].url.params.get("archived") == expect_archived
         assert "directory" not in str(seen[0].url.params)
 
 
@@ -828,6 +854,8 @@ async def test_v4_degraded_items_projection_shape():
     assert body["nextCursor"] is None
     item = body["items"][0]
     assert item["id"] == "h1"
+    # D2-A: 上游行现带 project join（见 HTTP_SESSIONS_BODY），门控关的
+    # 4.0.0 已发布降级 item 形态仍冻结 project=None（degraded:true 标记）
     assert item["project"] is None
     assert item["tokens_input"] == 9 and item["tokens_output"] == 8
     assert item["tokens_cache_read"] == 1 and item["tokens_cache_write"] == 2

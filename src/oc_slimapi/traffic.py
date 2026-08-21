@@ -137,6 +137,24 @@ def bucketize(method: str, path: str) -> str:
         # Global directory catalog endpoint (additive catalog style).
         if path == "/slimapi/directories" or path.startswith("/slimapi/directories/"):
             return "directories"
+        # Q6 (2026-08-22) read buckets — exact path AND method-aware (GET
+        # only), mirroring the health exact-match precedent plus the
+        # write_question C2 gate: these routes are registered GET-only, so a
+        # non-GET is a FastAPI 405 and must not count as bucket traffic
+        # (falls to "other"). Sub-paths likewise stay "other".
+        if path == "/slimapi/permissions" and method.upper() == "GET":
+            return "permissions"
+        if path == "/slimapi/versions" and method.upper() == "GET":
+            return "versions"
+        if path == "/slimapi/actions" and method.upper() == "GET":
+            return "actions"
+        # Q6 write bucket: POST /slimapi/actions/{name} is the manifest
+        # action invocation endpoint (routes/actions.py spec §5) — write_*
+        # naming per the write_session / write_question convention; the
+        # method gate mirrors write_question (POST-only, GET/other methods
+        # are 405s → "other").
+        if path.startswith("/slimapi/actions/") and method.upper() == "POST":
+            return "write_actions"
         # Generic /slimapi/sessions/**.
         if path.startswith("/slimapi/sessions"):
             return "sessions"

@@ -370,7 +370,7 @@ async def test_ready_schema_includes_version_and_client_range(upstream_factory):
     body = response.json()
     assert body["schema"] == {
         "degraded": False,
-        "version": 3,
+        "version": 4,
         "clientMin": 4,
         "clientMax": 4,
     }
@@ -388,8 +388,8 @@ async def test_ready_503_path_preserves_schema_fields(upstream_factory):
     response = await _get(app, "/slimapi/ready")
     assert response.status_code == 503
     body = response.json()
-    assert body["schema"]["version"] == 3
-    assert body["server"]["api_version"] == 3
+    assert body["schema"]["version"] == 4
+    assert body["server"]["api_version"] == 4
     assert body["server"]["accepted_client_versions"] == [4, 4]
 
 

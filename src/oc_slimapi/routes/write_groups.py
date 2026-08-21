@@ -78,7 +78,6 @@ from ..selector import (
     DIRECTORY_QUERY_PARAM,
     _strip_query_keys,
     resolve_route_directory,
-    wire_view_from_scope,
 )
 from ..traffic import stash_up_in, stash_up_out
 from ..transform import read_with_cap
@@ -301,14 +300,18 @@ _POST_ACTIONS_FEATURE = "session.post-actions.v4"
 
 
 def _post_actions_admitted(scope: dict) -> bool:
-    """§16.2 handler-side admission: v4 wire view ∧ gate open.
+    """§16.2 handler-side admission: gate open (the v4 leg is structural).
 
     The gate reads ``readiness.SATISFIED`` dynamically at request time
     (same convention as the selector's boundary gate) — a flip batch
     reassigns the set and this predicate changes with zero edits here.
+    (V2b: the historical ``wire_view_from_scope(scope) >= 4`` conjunct
+    died with the 2026-08-21 narrowing — under the (4, 4) v4-only window
+    ``wire_view_from_scope`` is constant 4 for every scope, so the
+    comparison was vacuously true and admission reduces to the gate
+    check; see selector.wire_view_from_scope.)
     """
-    return (wire_view_from_scope(scope) >= 4
-            and _POST_ACTIONS_FEATURE in readiness_mod.SATISFIED)
+    return _POST_ACTIONS_FEATURE in readiness_mod.SATISFIED
 
 
 def _pre_revision_404(request: Request) -> Response:

@@ -1166,7 +1166,39 @@ ocdroid 对接时：
 - **终态错误优先级链（§8.3）**：① 非 GET `/slimapi/versions` → 405 → ② selector 400（`invalid_version_selector`/`unsupported_version`）→ ③ directory 400（多值 `invalid_directory_selector` → 双现异值 `directory_conflict` → 消费集头 `directory_header_retired`）→ ④ 路由未命中 404 `thin_route_not_found`。
 - **观测不变式**：access log/snapshot 字段与枚举（`selectorResult` 六值、`sseActive` 四维）**不变**——`absent`/`v2` 维度自然归零是预期（不再有 v2 语义请求）。
 
-## [Unreleased]
+## [4.9.1] - 2026-08-22 — 审计整改批：契约缺陷收敛（D1/D2/D3/D5/D6/Q1/Q7）+ 一致性统一（Q2/Q3/Q6）+ v4-only 文档对齐与机械清理（包版本 patch——owner 载具例外，见下方注记；wire 版本维持 (4,4)；rev-sgpt 终审门控两轮 BLOCK 清零）
+
+> **包版本载具例外（owner 裁决 2026-08-22）**：本批虽含 D3/D5/D6/Q1 的可观察 wire 值、href、validator 与字段缺席态变化，以及 Q6 traffic bucket 枚举加性，但均属已冻结 v4 契约的缺陷收敛、一次性 validator 轮换或观测维度增补；owner 明确批准随 4.9.x **patch** 发布，wire 版本维持 4、接受窗口维持 `(4,4)`。客户端注意：`ready.api_version` 应接受 4；旧 messages ETag 将自然失效并重拉一次；SSE 空闲超时建议不低于 30s（心跳统一 15s）；traffic bucket 消费方须接受新增枚举；不得依赖旧 `?v=3` href 或畸形输入下旧 `filesTotal` 缺席态。
+
+### Fixed（wire）
+
+- **`/slimapi/directories` 补齐 allowlist 过滤（D1-A，owner 裁决 2026-08-22；P0-1 契约违约修正——契约 §16 早已承诺、实现缺失）**：`OC_SLIMAPI_DIRECTORY_ALLOWLIST` 非空时，目录列表在聚合前按 canonical 匹配过滤 sessions——仅白名单内目录成行，行的 title/会话计数只反映白名单内会话，白名单外目录整行消失（修复信息泄露面）；匹配语义与 sessions 列表族/SSE 帧过滤同源（`/foo` 匹配 `/foo` 与 `/foo/**`、根 `/` 匹配全部绝对路径、relative 候选 fail-closed 排除）。三态：未配置/显式空 = 不过滤（同族「无轴」语义，`/file/**` 的显式空 reject-all 语义不变、不受影响）；`discoveryComplete` 语义不变（反映上游发现页完整度，与过滤无关）。**未配置 allowlist 的部署零行为变化**。
+- **sessions Class A 降级路径上游端点违约修正（D2-A，owner 裁决 2026-08-22；权威 = `docs/specs/v4-contract.md` §4.2:163「过滤语义永不降级」；rev-sgpt 终审补丁补齐 archived=all 透传）**：DB 投影不可用（degraded）且 allowlist 空、Class A 参数时的上游调用由 `/session`（上游 listByProject——恒含单 project 过滤、无 archived 过滤、单键排序）改为契约指定的 `/experimental/session`（上游 listGlobal——全局范围 + `(time_updated, id)` 复合排序）。**archived 状态透传**：`omit`（默认）→ 不传参（上游缺省追加 `isNull(time_archived)`，排除 archived）；`all` → 显式 `archived=true`（上游仅在真值时包含 archived，`session.ts:564`——初版漏传致 all 退化 omit，已修复并补 omit/all×parent 两态测试钉死）。**行为变化（仅降级响应内容修正）**：降级列表不再混入 archived 会话（omit 态）、不再塌缩到单一 project；all 态正确返回含 archived 全集。客户端可见 envelope 形状不变（`project: None` 冻结保留，listGlobal 行新增 `project` join 键被解析层自然忽略）。正常（非降级）路径零变化。测试 MockTransport 已锚定上游端点路径（旧测试不查 path 导致本违约漏检）。
+- **`/slimapi/ready` `server.api_version` 3 → 4（D3，owner 裁决 2026-08-22）**：v4-only 窗口 (4,4) 下与 `/health`、`/versions` 三端点一致（4.8.0 窗口收窄时的漏改清账；`schema.version` 同步为 4）。响应形状不变，仅值变化。客户端若存在 `ready.api_version == 3` 硬断言需放宽（预期无——运行时兼容自检以 `/health` 为准）。
+- **messages 排序键防御性兼容有限浮点 epoch（Q7-P3-19，owner 裁决 2026-08-22）**：`_created_sort_key` 合法判定由仅 int 放宽为 int/finite float（bool 显式前置排除、nan/inf 维持 malformed）——浮点时间戳行此前被误判 malformed 排到页首，破坏 `info.time.created` ASC 契约。上游实践只写 int epoch-ms（本修为防御性对齐，生产行为零变化）；orjson 解析层已拒 nan/inf，判定式为纵深防御。
+- **filesTotal 触发口径按契约修正（Q1 / P2-25，owner 裁决 2026-08-22；4.9.0 已带病发版的契约↔实现分歧收口）**：metadata/patch 侧触发条件由「源数组长度 > 10」改为「**有效映射条目数** > 10」（契约 §10.2 修订四原文口径）；触发时 `filesTotal` **值**仍 = 源计数（含无效条目）。分歧场景（源 15 条仅 8 条合法的畸形混合列表）：旧代码错附 `filesTotal=15`，现按契约不附（映射 8 ≤ 10 未截断）。纯生产数据（全字符串合法条目）两口径等价——生产行为零变化，仅边界缺陷收口。edit 合成侧经核对语义已合规（parsed 集即有效映射集）。
+- **混合 NULL summary 行形状两路径统一（Q7-P3-20，owner 裁决 2026-08-22）**：canonical 路径（`summary:null` + `partial:true`）与 4.0.0 稀疏投影路径（曾模仿上游 fromRow 的 `?? 0` 填充）统一到契约 §13.1 冻结形态——三子键全数值才构对象，否则 `null`（稀疏路径无 partial 标记键，值形状达成一致）；不伪造 0 计数（0 与真实 0 增删混淆）。触发条件极罕见（上游实际仅写完整对象或全 NULL）。
+
+### Changed（wire）
+
+- **messages expandRefs href 门控关闭态 `?v=3` → `?v=4`（D5，owner 裁决 2026-08-22）**：readiness 门控（`messages.expand.v4`）未 satisfied 时，v4 响应中 expandRefs href 此前自产 `?v=3`——被 v4-only selector 400 拒绝的自产自拒死链（休眠缺陷：当前门控十项全亮）；现双态统一恒 `?v=4`（契约 §14 href canonical 冻结款本就要求「`?v=4` 请求的响应 → `v=4`」，本改为实现向契约收敛）。门控语义仅剩 `GET /slimapi/versions` capabilities 的 `expand` 发射面。`contentFingerprint` 随 href 翻转自然变化（预期内一次性 ETag/指纹失效）。
+
+- **messages expand ETag 域标签 `wire=v3` → `wire=v4`（D6，owner 裁决 2026-08-22；一次性 validator 轮换，与 sessions 侧统一）**：`GET /slimapi/messages/{sid}` 及 expand 端点族 ETag validator 的表示域标签由 4.8.0 冻结保留的 `wire=3` 统一为窗口版本 `4`——同输入下新旧 validator 必然不同，客户端旧 v4 ETag 全部自然失效重拉（预期内一次性流量；与 4.9.0 REP_VERSION `skeleton-v2` 轮换同类、同批吸收）。`_read_passthrough.py` 的独立冻结 passthrough ETag 域不受影响（字节不变）。
+- **控制面 `/events` 心跳 10s → 15s（Q3，owner 裁决 2026-08-22）**：`HEARTBEAT_SECONDS` 与 token 流 `TOKEN_HEARTBEAT_SECONDS`（15s）统一——同一 sidecar 两个 SSE 端点单一节拍；15s 仍远低于常见 stunnel/proxy idle 阈值，keepalive 作用不变。空闲态心跳帧频率下降 1/3（每连接每分钟 6 → 4 帧）。客户端重连退避逻辑无需区分端点（若此前有按 10s 校准的空闲超时阈值，建议 ≥2×15s）。
+
+### Added（观测，traffic 桶增补）
+
+- **traffic bucketize 补 `permissions` / `versions` / `actions` / `write_actions` 四桶（Q6，owner 裁决 2026-08-22；观测加性，wire 版本不 bump）**：`GET /slimapi/permissions`、`GET /slimapi/versions`、`GET /slimapi/actions`（均精确匹配）分别落专属读桶；`POST /slimapi/actions/{name}` 落 `write_actions`（POST-only 门控）。子路径/其他方法落 `other` 不变。依据 8h 生产日志实证（`other` 残留 205 条中 permissions ×140、versions ×53、actions ×12——补齐后常规流量 `other` 归零，哨兵语义增强）。access log / snapshot 字段与格式零变化（桶名维度增补），手册 `docs/manual/traffic-accounting.md` §3.2/§3.3 同步。
+
+### Removed（内部死码/机械清理，零 wire 影响）
+
+- **审计机械清理批（2026-08-22）**：删零引用死符号 `envelope.py::sessions_envelope_payload`（v3 载荷构造器孤儿）、`selector.py::selector_info_from_scope`（消费者已恒返 4）、`dbaux/path_resolution.py` 的 `Path` 再导出；删 `routes/token_stream.py` gzip 死路径（`use_gzip` 恒假 → 压缩链恒等，docstring 同步 §7.2「SSE 恒 identity」终态）；`write_groups.py::_post_actions_admitted` 移除 V2b 收窄后恒真的 `wire_view_from_scope(scope) >= 4` 合取项（行为零变化，gate 仍动态读 readiness）；`pyproject.toml` 显式声明 `starlette>=0.46`（src 18 处直接 import，下限对齐 fastapi 实测约束）；`tests/v4_fixture.py` 本机绝对路径参数化（`OC_SLIMAPI_EQ_BINARY` env）。
+
+### Docs（零行为变更）
+
+- **契约按代码事实校正 + 第二批转录（Q2/Q4/Q5，owner 裁决 2026-08-22）**：**Q2**——v4-only 面 token 流握手抑制 `server.connected`（no-prefill join，首帧恒 `slimapi.meta`，tests/test_token_stream_route.py:861-888 白盒钉死）：§7.7 帧清单加 Q2 校正注记，CLIENT_CHANGES SSE 节五处 v2/v3 历史形态标注 + v4 现行口径（含 message.removed 握手期回放 = 历史形态、运行时 fan-out + v4 重放域为现行）。**Q4**——第二批正文化转录（语义零改动 + 历史演进注记纪律）：token T3 资源信封 → §7.7 末条（含 v2 76MiB worst-case 历史口径 vs v4 12MiB runtime 形态如实分注）、agent/command/sessions-status thin 行 → §10.1、CLIENT_CHANGES 契约锚 v3-contract §7 → v4-contract §7.7。**Q5**——「忽略未知键」总则正文化进 §1（sidecar 载荷加性增补可选字段不 bump wire 版本，客户端 MUST 忽略未知键；P3-13 health `reason` 键收编）。
+- **全仓 v4-only 口径文档对齐批（2026-08-22）**：README/AGENTS.md/release.md/operations.md/deploy/ 模板按 (4,4) v4-only 窗口统一（含 release.md 发版验证 curl `?v=3`→`?v=4` 修正、operations.md「必须带版本头」→「`?v=4` 参数」）；INTERFACE_MAP.md 排版修复（:14 code span 失衡、:71-75 actions 表断裂补节标题表头）+ token stream 契约锚 v2 §3.x→v4 §7.7；design-expand.md:196 死锚点→ v4-contract §10.2。审计所列「INTERFACE_MAP :81 缺事件端点行」经 54/54 路由装饰器核对不成立（快照过时），未造行。
+- **v4-contract 自包含化补全（D4-A，owner 裁决 2026-08-22；纯文档——语义零改动）**：digest 载荷字段集（§7.5 首条）、q/p 直推包装帧与帧名枚举（§7.4 首条）、token 流业务帧形（§7.7 新增）、§10.1 既有 thin 路由语义（todo/children/diff/questions/permissions）自已退役的 v2-contract 正文化转录，每处附历史演进注记；§7.2/§7.4 漂移代码行号锚点刷新至现行源码；文件头 :4 死链出处改为考证注记；`CLIENT_CHANGES.md` 契约锚 `v3-contract §7` → `v4-contract §7.7`。
 
 ## [4.9.0] - 2026-08-22 — 工具卡投影族：patch files 归一化 + metadata.files compact/diffStats 优先级链 + edit diff 合成 + compress title 合成 + outputBytes（owner 例外：wire 形状变更随 minor，wire 版本不变仍 (4,4)）
 

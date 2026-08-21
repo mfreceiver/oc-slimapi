@@ -295,7 +295,8 @@ async def test_sessions_cap_bail_stashes_upin(upstream_factory):
     oversize = b"x" * (200 * 1024)
 
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/session"
+        # D2-A: /slimapi/sessions 降级上游端点 = /experimental/session
+        assert request.url.path == "/experimental/session"
         return httpx.Response(200, content=oversize,
                               headers={"Content-Type": "application/json"})
 

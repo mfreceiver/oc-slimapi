@@ -1,13 +1,17 @@
 """v3-contract §3a — /slimapi/health + /slimapi/ready.
 
-B12 (2026-08-21) three-way split: /ready is 零 v4 分叉 (v4-contract §12 —
-shape AND values frozen to the terminal v3 view regardless of the
-requested wire version) and the deploymentRevision omission holds on both
-health views, so those three functions were rewritten to the ``?v=4``
-face. V2b (2026-08-21 Phase-4 teardown) removed the remaining v3-face
-guards (the ?v=3 view lock, the retired-header-next-to-?v=3 rejection and
-the header-only no-?v rejection) — version-window 400 coverage for the
-window itself lives in the selector test-suite.
+B12 (2026-08-21) three-way split: /ready is 零 v4 分叉 (v4-contract §3.2
+"ready 端点形状不变" + §10 route table — shape frozen to the ready-only
+one regardless of the requested wire version) and the deploymentRevision
+omission holds on both health views, so those three functions were
+rewritten to the ``?v=4`` face. V2b (2026-08-21 Phase-4 teardown) removed
+the remaining v3-face guards (the ?v=3 view lock, the retired-header-next-
+to-?v=3 rejection and the header-only no-?v rejection) — version-window
+400 coverage for the window itself lives in the selector test-suite.
+
+D3 (2026-08-22 owner ruling): READY_VIEW flipped 3 → 4 — a missed V2b
+window-narrowing change; /ready's api_version now matches /health and
+/versions under the v4-only (4, 4) window (shape unchanged).
 """
 from __future__ import annotations
 
@@ -62,17 +66,18 @@ def _upstream(ok: bool = True) -> httpx.AsyncClient:
 
 
 async def test_ready_v4_request_keeps_frozen_v3_view_no_contract_field():
-    """B12 ①: /ready is 零 v4 分叉 — even an admitted ``?v=4`` request is
-    answered with the frozen terminal-v3 view values and no contract
-    field."""
+    """B12 ① + D3: /ready is 零 v4 分叉 — even an admitted ``?v=4`` request
+    is answered with the frozen ready-only shape (no contract field);
+    api_version follows the v4-only window (READY_VIEW = 4, 2026-08-22
+    D3 owner ruling — consistent with /health and /versions)."""
     app = _build_app(_upstream())
     async with _client(app) as client:
         r = await client.get("/slimapi/ready?v=4")
         assert r.status_code == 200
         body = r.json()
         assert "slimapi_contract" not in body  # shape locked: no contract
-        assert body["server"]["api_version"] == 3
-        assert body["schema"]["version"] == 3
+        assert body["server"]["api_version"] == 4
+        assert body["schema"]["version"] == 4
         assert body["schema"]["clientMin"] == 4
         assert body["schema"]["clientMax"] == 4
         assert body["server"]["accepted_client_versions"] == [4, 4]

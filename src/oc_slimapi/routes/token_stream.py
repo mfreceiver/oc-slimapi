@@ -21,17 +21,17 @@ Stage-D scope (design-token-stream.md §5.1 / §5.5 / §5.6 / §7):
   four-way classification (① syntax / ② endpoint+sid / ③ epoch /
   ④ barrier→window→gap); meta / resync / heartbeat / handshake frames
   never carry an id.
-* **Lever 2 — streaming gzip (§7, the first SSE gzip exception)**: when the
-  client advertises ``Accept-Encoding: gzip`` the body is compressed with a
-  per-connection ``zlib`` deflater and **``Z_SYNC_FLUSH`` after every
-  complete SSE event block** (each yielded frame is a whole
-  ``event:…\\ndata:…\\n\\n``). Flush alignment to event boundaries is
-  critical: a half-event gzip flush would make the client's SSE parser see a
-  truncated ``data:`` line. The control-plane ``/slimapi/events`` is NOT
-  gzipped — this is the sole SSE exception (CHANGELOG note is Stage E).
-  (V2b note: the historical ``?v=3`` always-identity exception to this
-  exception was removed with the v3 face — the route is identity-only
-  because its frames are token-deltas, not because of a version fork.)
+* **Identity-only stream (§7.2 terminal, v4-contract §7 "SSE 恒
+  identity")**: the body is NEVER content-encoded — meta / handshake /
+  business / resync frames are yielded raw regardless of
+  ``Accept-Encoding`` — so the response emits no ``Vary`` header and
+  does not participate in Accept-Encoding negotiation (an
+  AE-independent representation needs no variance marker; the stream is
+  no-cache anyway). The historical Stage-D/E "Lever 2" streaming-gzip
+  exception (a per-connection ``zlib`` deflater with ``Z_SYNC_FLUSH``
+  after every event block) was retired with the v2 pipeline teardown —
+  the route is identity-only because its frames are token-deltas, not
+  because of a version fork.
 * Lifecycle: ``subscribe`` starts the flush loop on first-attach; the
   generator's ``finally`` detaches on disconnect / client-close, and the
   last-detach stops the loop (NB-C4). Idempotent and leak-free.
@@ -39,14 +39,12 @@ Stage-D scope (design-token-stream.md §5.1 / §5.5 / §5.6 / §7):
 
 from __future__ import annotations
 
-import zlib
-
 from fastapi import APIRouter, Request
 from starlette.responses import StreamingResponse
 
 from ..directory import validate_directory
 from ..errors import CodedHTTPException
-from ..gzip_util import accepts_gzip, json_response
+from ..gzip_util import json_response
 from ..sse.replay_log import (
     RESYNC_RECONNECT_NO_REPLAY,
     ReplayFrames,
@@ -65,10 +63,6 @@ from ..sse.token_hub import (
 from ..sse_observability import sse_close, sse_open
 
 router = APIRouter(prefix="/slimapi", tags=["token-stream"])
-
-
-def _accepts_gzip(request: Request) -> bool:
-    return accepts_gzip(request.headers.get("accept-encoding"))
 
 
 def _resolve_directory_conflict(request: Request, directory: str | None) -> None:
@@ -185,36 +179,17 @@ async def token_stream(request: Request, sid: str, directory: str | None = None)
     # frozen "SSE 流不做 content-encoding（帧字节原样）" clause — the
     # stream is ALWAYS identity regardless of Accept-Encoding
     # (meta/handshake/business/resync frames raw).
-    use_gzip = False
     # Pull the traffic ledger here so a missing / disabled ledger does not
     # crash the SSE path on the first yield.
     traffic_ledger = getattr(request.app.state, "traffic_ledger", None)
 
     async def generate():
-        # One deflater per connection. wbits = MAX_WBITS | 16 (31) emits a
-        # gzip stream (header on the first compress call). Z_SYNC_FLUSH after
-        # every complete SSE event block guarantees the client can decompress
-        # each flushed chunk into whole ``event:…\ndata:…\n\n`` frames.
-        compressor = (
-            zlib.compressobj(6, zlib.DEFLATED, zlib.MAX_WBITS | 16)
-            if use_gzip
-            else None
-        )
-
-        def encode(frame: bytes) -> bytes:
-            if compressor is None:
-                return frame
-            raw_n = len(frame)
-            out = compressor.compress(frame) + compressor.flush(zlib.Z_SYNC_FLUSH)
-            subscriber.metrics.gzip_raw_bytes_total += raw_n
-            subscriber.metrics.gzip_compressed_bytes_total += len(out)
-            return out
-
         def _account(out_bytes: bytes) -> None:
-            # Traffic accounting: the on-the-wire (post-gzip) frame bytes —
-            # the token_stream_sse ``downOut`` owner.
+            # Traffic accounting: the on-the-wire frame bytes — the
+            # token_stream_sse ``downOut`` owner.
             # Semantics: counts bytes handed to the ASGI ``send`` path
-            # (the yielded frame after gzip encoding). This is the same
+            # (the yielded frame — §7.2 terminal: the stream is identity,
+            # so wire bytes == frame bytes). This is the same
             #口径 as the middleware's ``downOut`` for non-SSE buckets: both
             # count bytes submitted to ASGI send, before any possible
             # send-failure from a client disconnect. If ASGI send fails
@@ -239,10 +214,10 @@ async def token_stream(request: Request, sid: str, directory: str | None = None)
             # subscribe() already enqueued AND the replay / Last-Event-ID
             # resync block below. ``tokens`` is frozen ``true`` on /stream
             # (a token stream always carries tokens). Identity stream —
-            # encode() is the passthrough selected above. v4 (§7.0②) extends
+            # frames are yielded raw (§7.2 terminal). v4 (§7.0②) extends
             # meta additively (capabilities/epoch/seqBase); the meta frame
             # itself never carries an id.
-            out = encode(meta_frame)
+            out = meta_frame
             _account(out)
             yield out
             if replay_plan is not None:
@@ -252,7 +227,7 @@ async def token_stream(request: Request, sid: str, directory: str | None = None)
                 # sends a snapshot frame (the client does an HTTP full
                 # fetch after resync).
                 if isinstance(replay_plan, ReplayResync):
-                    out = encode(_resync_frame(sid, replay_plan.reason))
+                    out = _resync_frame(sid, replay_plan.reason)
                     _account(out)
                     yield out
                 elif isinstance(replay_plan, ReplayFrames):
@@ -260,7 +235,7 @@ async def token_stream(request: Request, sid: str, directory: str | None = None)
                         frame = frame_with_id(
                             entry.payload, token_domain(sid), replay_epoch, entry.seq,
                         )
-                        out = encode(frame)
+                        out = frame
                         _account(out)
                         yield out
                 # ReplayIgnoreReset → first-connect semantics: nothing.
@@ -276,7 +251,7 @@ async def token_stream(request: Request, sid: str, directory: str | None = None)
                 # Mirror put(): only sized frames bump queued_bytes; STOP is a
                 # control sentinel never entered into the byte ledger.
                 subscriber.ack(item)
-                out = encode(item)
+                out = item
                 _account(out)
                 yield out
         finally:

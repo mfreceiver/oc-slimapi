@@ -23,7 +23,7 @@ ocdroid ──(stunnel mTLS 14096)──▶ opencode :4096   # 直连回退，�
 - **设计 / 接口追踪**：[`docs/specs/design-v2.md`](docs/specs/design-v2.md)、[`docs/specs/INTERFACE_MAP.md`](docs/specs/INTERFACE_MAP.md)。
 - **客户端配套说明**：[`docs/specs/CLIENT_CHANGES.md`](docs/specs/CLIENT_CHANGES.md)（给 ocdroid 开发者的改动清单）。
 
-本仓库 **不** 是 ocdroid 的子模块；与 ocdroid **并列** 开发、独立发版。ocdroid 侧对接规约见 ocdroid 仓库内 `docs/slim-mode-api-routing.md`（路径/版本以 **本仓库契约** 为准；若 ocdroid 文档滞后，以本仓库 `docs/specs/v3-contract.md` + `CHANGELOG.md` 为准）。
+本仓库 **不** 是 ocdroid 的子模块；与 ocdroid **并列** 开发、独立发版。ocdroid 侧对接规约见 ocdroid 仓库内 `docs/slim-mode-api-routing.md`（路径/版本以 **本仓库契约** 为准；若 ocdroid 文档滞后，以本仓库 `docs/specs/v4-contract.md` + `CHANGELOG.md` 为准）。
 
 ---
 
@@ -61,7 +61,7 @@ ocdroid ──(stunnel mTLS 14096)──▶ opencode :4096   # 直连回退，�
 | 改动后校验（必做） | `./scripts/check.sh` | 实际三项：pytest + **路由↔文档一致性**（[`scripts/check_routes_doc.py`](scripts/check_routes_doc.py)：每个 `/slimapi` 路由须在 INTERFACE_MAP 有记录，**防漂移**）+ `compileall src` 字节码编译；门禁细则见 [`docs/release.md`](docs/release.md) §质量门禁 与 [`docs/develop.md`](docs/develop.md) |
 | 发版（tag + changelog） | `./scripts/release.sh <patch\|minor\|major>` | **[`docs/release.md`](docs/release.md)**（发版规范权威） |
 | 接口行为变更记录 | 编辑 [`CHANGELOG.md`](CHANGELOG.md) | 每次**破坏/加性 wire 行为**变更必须记；ocdroid 对接以本文件为准 |
-| 契约 / 设计 | `docs/specs/v3-contract.md`、`docs/specs/design-v2.md`、`docs/specs/INTERFACE_MAP.md` | 版本协商 = `?v=` selector + `GET /slimapi/versions`（`X-Slimapi-Version` 头已于 3.0.0 删除）；破坏性变更走 major 发版 + 契约修订——**owner 例外**（2026-08-21，与 `docs/release.md:37-38/54-55` 裁定对齐）：wire 版本不变的破坏性 wire 形状变更，经 owner 批准可发 **minor**，须在权威契约修订头 + CHANGELOG Changed 显式记录例外与客户端必改点（首例：4.9.0 `v4-contract.md` §10.2 修订四 patch files 归一化） |
+| 契约 / 设计 | `docs/specs/v4-contract.md`（现行契约权威）、`docs/specs/design-v2.md`、`docs/specs/INTERFACE_MAP.md`（`v3-contract.md`/`v2-contract.md` 为历史存档） | 版本协商 = `?v=` selector + `GET /slimapi/versions`（`X-Slimapi-Version` 头已于 3.0.0 删除）；破坏性变更走 major 发版 + 契约修订——**owner 例外**（2026-08-21，与 `docs/release.md:37-38/54-55` 裁定对齐）：wire 版本不变的破坏性 wire 形状变更，经 owner 批准可发 **minor**，须在权威契约修订头 + CHANGELOG Changed 显式记录例外与客户端必改点（首例：4.9.0 `v4-contract.md` §10.2 修订四 patch files 归一化） |
 | 省流 / 路由审计（advisory） | access log `access-YYYY-MM-DD.jsonl`（按天）+ snapshot `traffic-snapshot-YYYY-MM-DD.jsonl` + [`docs/specs/INTERFACE_MAP.md`](docs/specs/INTERFACE_MAP.md) | 查“哪些请求未省流”：按 `bucket=="passthrough"` 过滤 access log、聚合 `method+path`，再对照 INTERFACE_MAP 看有无 `/slimapi` 等价省流路由。**3.0.0 终局注记**：catch-all 已关闭，`passthrough` 桶现为**哨兵桶**（只剩 404/405 拒绝，`upIn`/`upOut` 恒 0——任何 2xx 出现即意外穿透，见 traffic-accounting.md §3.2）；未省流分析现以 `other` 桶与 INTERFACE_MAP 对照为主。文件位置/查询见 [`docs/manual/traffic-accounting.md`](docs/manual/traffic-accounting.md)（生产落 `~/.local/state/oc-slimapi/logs/`，`RETAIN_DAYS=3` 自动清理）；新增 `/slimapi` 路由必须同步进 INTERFACE_MAP（否则 check.sh 失败） |
 
 > 任何 release / tag / 版本号 / changelog 写入，都不得由 agent 自由发挥命令，必须走 `scripts/release.sh` 或 `docs/release.md` 写明的步骤。
@@ -113,12 +113,12 @@ ls ~/.local/state/oc-slimapi/logs/           # access-YYYY-MM-DD.jsonl(.gz) + tr
 
 | 文件 | 用途 |
 |---|---|
-| [`docs/specs/v3-contract.md`](docs/specs/v3-contract.md) | **Wire 契约权威**（v3 基准 + (3,4) 双版本窗口；`v2-contract.md` 为 ≤2.x 历史契约） |
-| [`docs/specs/v4-contract.md`](docs/specs/v4-contract.md) | v4 wire 契约（4.0.0 实施基线 + 2026-08-19 正式修订冻结（修订二：POST 等效动作族）） |
-| [`docs/specs/design-v2.md`](docs/specs/design-v2.md) | v2 时代设计（历史；现行态以 v3/v4 契约 + operations.md 为准） |
+| [`docs/specs/v3-contract.md`](docs/specs/v3-contract.md) | ≤4.7.0 历史契约存档（v3 wire 版本已退役；`v2-contract.md` 为 ≤2.x 历史契约） |
+| [`docs/specs/v4-contract.md`](docs/specs/v4-contract.md) | **Wire 契约权威**（4.0.0 实施基线 + 2026-08-19 正式修订冻结（修订二：POST 等效动作族）；4.8.0 起 v4-only 自包含） |
+| [`docs/specs/design-v2.md`](docs/specs/design-v2.md) | v2 时代设计（历史；现行态以 v4 契约 + operations.md 为准） |
 | [`docs/specs/INTERFACE_MAP.md`](docs/specs/INTERFACE_MAP.md) | 端点级实现追踪 |
 | [`docs/specs/CLIENT_CHANGES.md`](docs/specs/CLIENT_CHANGES.md) | ocdroid 侧配套改动清单 |
-| [`docs/specs/design-token-stream.md`](docs/specs/design-token-stream.md) | Token stream 设计历史与 rationale（v4 设计稿；当前 wire 契约见 v3-contract.md §7） |
+| [`docs/specs/design-token-stream.md`](docs/specs/design-token-stream.md) | Token stream 设计历史与 rationale（v4 设计稿；当前 wire 契约见 v4-contract.md §7.7） |
 | [`CHANGELOG.md`](CHANGELOG.md) | **接口行为变更记录**（给 ocdroid / 运维） |
 | [`docs/release.md`](docs/release.md) | **发版流程规范**（本仓库权威） |
 | [`docs/operations.md`](docs/operations.md) | **部署 / 运维 / 日志**（systemd、journald、排障） |

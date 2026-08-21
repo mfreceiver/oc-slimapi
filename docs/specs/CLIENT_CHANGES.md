@@ -468,14 +468,14 @@ ocdroid 可在每个请求（含 SSE）**可选**附加三个 request header：
   - `session.digest`（debounce 250ms/session）：`{sessionID,directory,status?,messageID?,updatedAt?,archived?,deleted?,lastError?}`。
     - **`updatedAt`** = sidecar 收到事件时的 wall-clock epoch-ms（非上游时间戳）。
   - **`session.error`（立即直推，无 sid 时）**：`{directory?,name,message,at}`。客户端 UI：有 sid 已含在 digest 的 `lastError`（该 session banner）；无 sid → 全局 toast。
-  - `server.connected`（订阅即吐）、`server.heartbeat`（10s）、`resync`（重连 `{"reason":"reconnect_no_replay"}` / 背压 `{"reason":"subscriber_backpressure"}`，**无 replay**）。
+  - `server.connected`（订阅即吐——**v2/v3 历史形态**；**v4-only 面抑制该帧**，线上首帧恒 `slimapi.meta`，2026-08-22 Q2 校正，见 `v4-contract.md` §7.5/§7.7）、`server.heartbeat`（**15s——Q3 裁决 2026-08-22**：控制面与 token 流统一节拍，原 10s）、`resync`（重连 `{"reason":"reconnect_no_replay"}` / 背压 `{"reason":"subscriber_backpressure"}`，**无 replay**——v4 重放语义与 resync reason 扩展值域以 `v4-contract.md` §7.1/§7.2 为准）。
 - **`resync` 路径未改**：上游重连/掉线/背压/Last-Event-ID 仍发 `resync`。
-- **连接建立期 coalescing**：带 `Last-Event-ID` 重连时同连接可能先 `resync` 再 `server.connected`（既有）。客户端 **SHOULD** 对同一连接建立期 cold-start 触发帧做 once-latch（至多一次 reconcile）。
-- **`server.heartbeat` ≠ 上游健康**：仅证 sidecar + 订阅存活；outage 探测用 `/slimapi/ready` 或自然 fetch/write 失败。sidecar 重启后重连收 `server.connected` → **应** cold-start。
+- **连接建立期 coalescing**：带 `Last-Event-ID` 重连时同连接可能先 `resync` 再 `server.connected`（既有——**v2/v3 形态**；v4-only 面无 `server.connected`，首帧恒 `slimapi.meta`，Q2 校正）。客户端 **SHOULD** 对同一连接建立期 cold-start 触发帧做 once-latch（至多一次 reconcile）——该建议与帧名无关，v4 下对 `slimapi.meta` / `resync` 同样适用。
+- **`server.heartbeat` ≠ 上游健康**：仅证 sidecar + 订阅存活；outage 探测用 `/slimapi/ready` 或自然 fetch/write 失败。sidecar 重启后重连：v2/v3 收 `server.connected`、v4-only 面收 `slimapi.meta` 首帧（或 `resync{reason:"epoch_changed"}`）→ 均**应**视为 cold-start（Q2 校正）。
 - digest `lastError`：sticky 跨窗口，`status=busy` 清除（显式 `null` 帧）；客户端据此显隐 session 错误 banner。`MessageAbortedError` 被 sidecar 过滤，不下发。
 - **`lastError` / `session.error` 增补字段（加性）**：错误对象在 `{name,message,at}` 基线上另含 `code`（恒有，枚举与约束见 `v4-contract.md` §7.6）+ 可选 `provider` / `model` / `retryAfter`（int 秒，clamp 1..86400）/ `quotaResetAt`，digest `lastError` 与无 sid 直推帧两处同步生效。ocdroid/webui 建议：解析 `code` 渲染差异化文案——`provider_rate_limited` 可配 `retryAfter` 倒计时（值为向上取整（ceil）后的整数秒；到点前禁用重发），`provider_quota_exceeded` 可用 `quotaResetAt`（如有）提示恢复时间，`provider_context_length_exceeded` / `provider_unauthorized` 勿自动重试；未知 `code` 回退展示脱敏 `message`。老客户端忽略未知键零影响。
-- 客户端所有 `/slimapi/**` 请求（含 SSE）须带查询参数 `?v=3`（4.0.0 起 `?v=4` 亦合法——(3,4) 双版本窗口；`X-Slimapi-Version` 头已于 3.0.0 删除，出现不解读）；连接时读 `/slimapi/health?v=3` 自检（见下 schema 三键）。
-- **仍推送帧类型（仅作观察信号）**：`question.asked` / `v2.asked`、`permission.asked` / `resolved` / `v2.asked` / `v2.resolved`——这些帧仍通过 SSE 直推，但 v2 已删除 q/p 写端点与 routeToken；客户端应答 q/p 走 catch-all + `X-Opencode-Directory`（写路径现以 v3-contract §10 为准；v2-contract §2 为历史出处）。帧的 wire 形态不变。
+- 客户端所有 `/slimapi/**` 请求（含 SSE）须带查询参数 `?v=4`（**4.8.0 起 v4-only 单版本窗口，`?v=4` 唯一合法**；4.0.0–4.7.0 曾为 `?v=3`/`?v=4` (3,4) 双版本窗口，`?v=3` 已退役——现发 `?v=3` 一律 400 `unsupported_version`；`X-Slimapi-Version` 头已于 3.0.0 删除，出现不解读）；连接时读 `/slimapi/health?v=4` 自检（见下 schema 三键）。
+- **仍推送帧类型（仅作观察信号）**：`question.asked` / `v2.asked`、`permission.asked` / `resolved` / `v2.asked` / `v2.resolved`——这些帧仍通过 SSE 直推，但 v2 已删除 q/p 写端点与 routeToken；客户端应答 q/p 走写路由 #9-11（respondPermission / replyQuestion / rejectQuestion，**现行权威 = `v4-contract.md` §10.1 写路由表**；v2-contract §2 为历史出处，v3-contract §10 亦已存档）。帧的 wire 形态不变。
 - **已移除帧类型**：`server.reconfigured`（对应 discovery 数据流整体下线）。
 
 ## health schema 回显
@@ -503,7 +503,7 @@ ocdroid 可在每个请求（含 SSE）**可选**附加三个 request header：
 
 收到帧按 part（`(messageID, partID)`）维护本地「streamOwned」缓冲：
 
-- **`message.part.snapshot{done:false}`**（订阅首帧 / 握手锚点）→ **替换**该 part 本地缓冲为 `text`、标 `streamOwned=true`、未完成。
+- **`message.part.snapshot{done:false}`**（订阅首帧 / 握手锚点——**「握手锚点」为 v2/v3 历史形态**：v4-only 面 no-prefill join 握手**不下发** server-originated 锚点 snapshot，初始全文对齐 = resync 后 HTTP 拉取（Q2 校正，`tests/test_token_stream_route.py:861-888`；`v4-contract.md` §7.7））→ **替换**该 part 本地缓冲为 `text`、标 `streamOwned=true`、未完成（算法不变——v4 下 `done:false` snapshot 仍可能以 `truncated` 等形态出现，替换规则照常适用）。
 - **`message.part.delta{text}`** → 仅当该 part 已 `streamOwned` **且未完成**时 **append** `text`；否则丢弃（不应发生；若发生视为乱序，忽略）。
 - **`message.part.snapshot{done:true}`**（终态）→ **仅完成 marker，无 text**——客户端**不再从该帧取 text**；标**完成**。权威全文走 `/slimapi/messages/{sid}` skeleton 列表或 `/full/{mid}` 展开（持久化真值，幂等且**凌驾**所有 token 帧）。此后该 part 不再收 delta（违反则忽略）。
 - **`/slimapi/messages/{sid}` / `/full/{mid}`**：part 已 `streamOwned` 且**未完成** → **忽略**持久化拉取的该 part text（stream 为准）；part 已 `streamOwned` 且**已完成** → 仅允许 skeleton / full 覆盖（skeleton / full 是持久化真值，幂等且**凌驾**所有 token 帧）。
@@ -530,8 +530,8 @@ ocdroid 可在每个请求（含 SSE）**可选**附加三个 request header：
 
 ### `message.removed` 帧处理（必须）
 
-- `event: message.removed` payload `{sessionID,messageID}` 可在 token-stream 连接握手期（回放）或运行时（fan-out）收到。收到后应立即丢弃该 message 的所有 live 渲染态（streamOwned parts），该 message 已从上游 opencode 删除，后续 `/slimapi/messages/{sid}` 骨架列表中将不再出现该 message。**控制面 `session.digest` 的 `deleted=true` 是独立信号**，二者互不替代。
-- **握手期回放**：`server.connected` → 该 session 未过期 `message.removed` tombstones 按时间先于 snapshot 回放，客户端可在首次 snapshot 到达前清理已删除消息的状态。
+- `event: message.removed` payload `{sessionID,messageID}` 可在 token-stream 连接握手期（回放）或运行时（fan-out）收到——**Q2 校正（2026-08-22，按测试事实）**：「握手期回放」为 v2/v3 历史形态，v4-only 面 no-prefill join 无握手期回放，该帧经**运行时 fan-out**（及 v4 重放域，`v4-contract.md` §7.2）到达。收到后应立即丢弃该 message 的所有 live 渲染态（streamOwned parts），该 message 已从上游 opencode 删除，后续 `/slimapi/messages/{sid}` 骨架列表中将不再出现该 message。**控制面 `session.digest` 的 `deleted=true` 是独立信号**，二者互不替代。
+- **握手期回放（v2/v3 历史形态，v4 不适用）**：`server.connected` → 该 session 未过期 `message.removed` tombstones 按时间先于 snapshot 回放，客户端可在首次 snapshot 到达前清理已删除消息的状态——v4 no-prefill join 握手既无 `server.connected` 也无 tombstone/snapshot 预填（状态对齐 = resync 后客户端 HTTP full fetch，Q2 校正）；删除清理由上述运行时 `message.removed` 帧与 `/messages/{sid}` 重拉共同覆盖。
 - 该帧**不存在**于控制面 `/slimapi/events` 连接中。
 
 ### 客户端实现避坑（V2 token-stream，来自 ocdroid 升级实战）
@@ -543,7 +543,7 @@ ocdroid 可在每个请求（含 SSE）**可选**附加三个 request header：
 - **坑**：ocdroid D-wire 初版 `TokenStreamReducer` 在 `done:true` 时取 `frame.text ?: existing?.text ?: ""` 作为终态值——与契约冲突。
 - **正确**：`done:true` 帧仅用于 ① 标记该 part 渲染完成、② 触发权威 fetch；**不得从该帧取 text**。REST skeleton/full 的全文**凌驾所有 token 帧**（幂等覆盖；客户端可接受 digest 完成先于/晚于 token 终态帧）。
 
-#### 2. `partEventRevision` 必须 **strict `>` 去重**（非 no-op）+ 原子更新 + 生命周期回收（契约锚：v3-contract §7；v2 §3.x.2 为历史出处）
+#### 2. `partEventRevision` 必须 **strict `>` 去重**（非 no-op）+ 原子更新 + 生命周期回收（契约锚：v4-contract.md §7.7；v2 §3.x.2 为历史出处）
 - **契约**：token-stream 帧的 `partEventRevision` 由 token hub per-frame 维护（每帧唯一递增）；客户端按 **strict `>`** 去重。
 - **坑（ocdroid D-wire 初版两连）**：① 去重函数无条件 `return true`（**根本没去重**，no-op）；② 初版修复用非原子 get/check/put，存在 **TOCTOU 竞态**（并发 delta 帧竞争 last-revision）。
 - **正确实现要点**：
@@ -568,7 +568,7 @@ ocdroid 可在每个请求（含 SSE）**可选**附加三个 request header：
 
 ## 四能力接入（L1–L3 slim 整合，加性 — 2026-08-15）
 
-> **加性 / 向后兼容**：wire 版本未 bump（仍 2）。四能力各自经 `/slimapi/health` 根级 `features` 新 flag 门控（`tokenCoalesce` / `permissionEvents` / `serverMerge` / `transformAbsorb`）；flag 缺省/为 false → 对应能力走既有路径，**零回归**。能力探测结果缓存，勿每连接重复。权威 wire 见 `docs/specs/v3-contract.md`（v2-contract §2/§3/§5 为历史出处）。
+> **加性 / 向后兼容**：wire 版本未 bump（仍 2）。四能力各自经 `/slimapi/health` 根级 `features` 新 flag 门控（`tokenCoalesce` / `permissionEvents` / `serverMerge` / `transformAbsorb`）；flag 缺省/为 false → 对应能力走既有路径，**零回归**。能力探测结果缓存，勿每连接重复。权威 wire 见 `docs/specs/v4-contract.md`（tokenCoalesce 于 v4-only 窗已退役——`?v=4&tokens=1` → 400 `tokens_stream_retired_in_v4`，§7.3，本节 #1 为 v2/v3 历史接法；permissionEvents → §7.4 q/p 直推帧 + §10.1 thin 语义块 `/slimapi/permissions` 行；serverMerge（`mode=merged`）→ §10.2 第 5 条；transformAbsorb → `transform_busy` 503 形状见 §10.1/§14.5，预算吸收细则未入 v4 契约、v2-contract §5 为历史出处；v3-contract 为 ≤4.7.0 历史存档，v2-contract §2/§3/§5 为历史出处）。
 
 ### 1. tokenCoalesce（A）—— `/slimapi/events?tokens=1` 取代 per-session stream
 

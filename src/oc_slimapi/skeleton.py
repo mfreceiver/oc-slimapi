@@ -746,7 +746,11 @@ def _tool(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits:
                 compact_files = _compact_tool_files(source_files)
                 if compact_files:
                     thin_metadata["files"] = compact_files[:FILES_PROJECTION_CAP]
-                if len(source_files) > FILES_PROJECTION_CAP:
+                # P2-25：触发口径 = **有效映射条目数**超 cap（§10.2 修订四），
+                # 非 source 数组长度——源 15 条仅 8 条可映射时不截断、不附
+                # filesTotal；触发时 filesTotal 的**值**仍 = 源计数（含无效
+                # 条目，:len:`source_files`）。
+                if len(compact_files) > FILES_PROJECTION_CAP:
                     thin_metadata["filesTotal"] = len(source_files)
             if thin_metadata:
                 thin_state["metadata"] = thin_metadata
@@ -802,7 +806,10 @@ def _tool(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits:
             # §4d B2: edit synthetic ``metadata.files`` — ONLY when the
             # source metadata has no ``files`` of its own and the diff is
             # not truncated (same eligibility as the expand extractor);
-            # capped like §4b (filesTotal = parsed count on overflow).
+            # capped like §4b. P2-25 口径核对：``_files_from_diff_text``
+            # 每条返回均为有效映射条目（有效数 == parsed 数 == 本合成
+            # 路径的源计数），故 ``len(parsed_files) > CAP`` 的触发口径
+            # 与「有效映射条目超 10」天然一致，filesTotal 值 = parsed 数。
             if (part.get("tool") == "edit"
                     and "files" not in source_metadata
                     and source_metadata.get("truncated") is not True):
@@ -841,7 +848,11 @@ def _patch(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits
                 normalized.append(
                     _pick(item, {"path", "additions", "deletions", "status"}))
         result["files"] = normalized[:FILES_PROJECTION_CAP]
-        if len(files) > FILES_PROJECTION_CAP:
+        # P2-25：触发口径 = **有效映射条目数**超 cap（§10.2 修订四），
+        # 非 source 数组长度——被跳过的非 str/dict 条目不再单独触发
+        # filesTotal；触发时 filesTotal 的**值**仍 = 源计数（含被跳过
+        # 条目，:len:`files`）。
+        if len(normalized) > FILES_PROJECTION_CAP:
             result["filesTotal"] = len(files)
     metadata = part.get("metadata")
     if isinstance(metadata, dict) and "path" in metadata:
@@ -1251,6 +1262,37 @@ def project_rows_to_v4_skeletons(rows: list[dict[str, Any]]) -> list[dict[str, A
         sid = row.get("id")
         if sid is None:
             continue
+        # Q7-P3-20（owner 裁决）：混合 NULL summary 行形状统一。本路径
+        # 曾对 NULL 列无条件发含 null 子值的 summary 对象——与上游
+        # ``fromRow``（session.ts:59-68 的 ``?? 0`` 填充）同族的「伪造完
+        # 整对象」语义，和 canonical projector（:1559 起三态判定）分裂：
+        # 同一条混合 NULL 行，canonical 发 ``null`` + ``partial: true``，
+        # 本路径发 ``{additions: null, deletions: N, ...}``。契约 §13.1
+        # 冻结 ``summary`` 为 ``{additions, deletions, files: number} |
+        # null``——含 null 子值的对象不合法 → 统一到契约形态 ``null``
+        # （本路径为 4.0.0 稀疏形态、无 partial 标记键可置；canonical
+        # 路径同输入另附 ``partial: true``，summary 值形状两路径一致）。
+        # 不模仿上游 0 填充：sidecar compact 语义不伪造计数——0 会与真
+        # 实的 0 增删混淆，来源不完整就如实置 null。
+        summary_additions = row.get("summary_additions")
+        summary_deletions = row.get("summary_deletions")
+        summary_files = row.get("summary_files")
+        if (
+            _canonical_number(summary_additions)
+            and _canonical_number(summary_deletions)
+            and _canonical_number(summary_files)
+        ):
+            # 三列全为规范数值 → 完整对象
+            summary: dict[str, Any] | None = {
+                "additions": summary_additions,
+                "deletions": summary_deletions,
+                "files": summary_files,
+            }
+        else:
+            # 三列全 NULL = 业务合法 null（contract §13.2）；混合
+            # NULL/非数值 = 来源不完整 → 同置 null（canonical 路径
+            # 此时另置 partial:true）
+            summary = None
         item: dict[str, Any] = {
             "id": sid,
             "directory": row.get("directory"),
@@ -1264,11 +1306,7 @@ def project_rows_to_v4_skeletons(rows: list[dict[str, Any]]) -> list[dict[str, A
                 "updated": row.get("time_updated"),
                 "archived": row.get("time_archived"),
             },
-            "summary": {
-                "additions": row.get("summary_additions"),
-                "deletions": row.get("summary_deletions"),
-                "files": row.get("summary_files"),
-            },
+            "summary": summary,
             "tokens_input": row.get("tokens_input"),
             "tokens_output": row.get("tokens_output"),
             "tokens_reasoning": row.get("tokens_reasoning"),

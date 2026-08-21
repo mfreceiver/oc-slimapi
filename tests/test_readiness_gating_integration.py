@@ -6,7 +6,10 @@ ID 的修订语义当且仅当 ∈ satisfied 时生效；未 satisfied → 该�
 
 - 五个修订面 feature 各一用例：monkeypatch ``readiness.SATISFIED`` 排除
   该 ID → 对应 v4 面逐字节/逐头回退 4.0.0 已发布行为；恢复（全集）→
-  修订面生效（双态同测）。
+  修订面生效（双态同测）。**例外（D5，2026-08-22 owner 裁决）**：
+  ``messages.expand.v4`` 的 href 面双态恒 ``?v=4``——v4-only selector
+  下自产 ``?v=3`` href 构成 400 自产自拒死链，门控不再折叠 href view
+  （该 feature 的门控语义仅存 versions capabilities ``expand`` 发射）。
 - versions 端点双态：``capabilities["4"].expand`` iff
   ``messages.expand.v4 ∈ SATISFIED``（§14/§3.3 双向不变量）。
 
@@ -134,7 +137,7 @@ MESSAGES_LIST_OFF_GOLDEN = {
             "summary": {"diffs": None},
             "expandRefs": [{
                 "category": "info_summary_diffs", "messageID": "m1",
-                "href": "/slimapi/messages/s1/expand/info_summary_diffs/m1?v=3",
+                "href": "/slimapi/messages/s1/expand/info_summary_diffs/m1?v=4",
             }],
         },
         "parts": [{
@@ -142,11 +145,11 @@ MESSAGES_LIST_OFF_GOLDEN = {
             "text": None, "hasFull": True, "omitted": ["text"],
             "expandRefs": [{
                 "category": "part_reasoning", "messageID": "m1",
-                "href": "/slimapi/messages/s1/expand/part_reasoning/m1/prt?v=3",
+                "href": "/slimapi/messages/s1/expand/part_reasoning/m1/prt?v=4",
                 "partID": "prt",
             }],
         }],
-        "contentFingerprint": "v1:427c04d5d9553986a21c0fdaa169d44e42a51e863bd10a9419c19e789bb19051",
+        "contentFingerprint": "v1:9281436979e85d161551b0e55b4f2d680601b44c638e7ea540b406d0376458b6",
     }],
     "nextCursor": None,
 }
@@ -161,7 +164,8 @@ def _upstream_handler(request: httpx.Request) -> httpx.Response:
     if path == "/config/providers":
         return httpx.Response(200, content=PROVIDERS_RAW,
                               headers={"Content-Type": "application/json"})
-    if path == "/session" and request.method == "GET":
+    if path == "/experimental/session" and request.method == "GET":
+        # D2-A: /slimapi/sessions 降级上游端点已从 /session 置换
         return httpx.Response(200, content=SESSIONS_LIST_RAW,
                               headers={"Content-Type": "application/json"})
     if path == "/session/s1":
@@ -303,18 +307,21 @@ async def test_gate_session_single_projection(monkeypatch):
 async def test_gate_messages_expand_href(monkeypatch):
     app = _build_app()
     async with _client(app) as client:
-        # 关态：v4 的 expandRefs href 维持 ?v=3（4.0.0 已发布行为）——
-        # B12：v4 期望以 parsed golden 字面自包含（含 href 字面与
-        # contentFingerprint），另加字节向断言钉 ?v=3 方向。
+        # 关态：D5（2026-08-22 owner 裁决）后 href 面不再随门控折叠——
+        # v4 响应的 expandRefs href 恒 ?v=4（自产 ?v=3 会被 v4-only
+        # selector 400 拒绝，自产自拒死链已消灭）。B12：v4 期望以
+        # parsed golden 字面自包含（含 href 字面与 contentFingerprint），
+        # 另加字节向断言钉 ?v=4 方向。
         _gate_off(monkeypatch, "messages.expand.v4")
         v4 = await client.get("/slimapi/messages/s1",
                               params={"v": "4"}, headers=IDENTITY)
         assert v4.status_code == 200
         assert v4.json() == MESSAGES_LIST_OFF_GOLDEN
-        assert b"?v=3" in v4.content
-        assert b"?v=4" not in v4.content
+        assert b"?v=4" in v4.content
+        assert b"?v=3" not in v4.content
 
-        # 开态：§14 修订面生效——href 翻为 ?v=4。
+        # 开态：href 面不变（D5 双态恒 4）——门控翻转不得改变 messages
+        # 路由的 href 字节（门控语义仅存 versions capabilities 面）。
         _gate_on(monkeypatch)
         v4r = await client.get("/slimapi/messages/s1",
                                params={"v": "4"}, headers=IDENTITY)

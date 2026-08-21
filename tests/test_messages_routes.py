@@ -1338,7 +1338,7 @@ async def test_messages_list_skeleton_returns_created_ascending(upstream_factory
 
 async def test_messages_list_skeleton_malformed_created_sorts_safely(upstream_factory):
     """lite-v2 §8 edge cases: malformed ``time.created`` values MUST NOT
-    crash the sort. Items with missing/non-int ``created`` get sort key 0
+    crash the sort. Items with missing/non-numeric ``created`` get sort key 0
     and cluster at the front (before any real epoch > 0). Same-``created``
     items preserve upstream order (Python stable sort)."""
     items = [
@@ -1380,6 +1380,157 @@ async def test_messages_list_skeleton_malformed_created_sorts_safely(upstream_fa
         )
     finally:
         app.state.transforms.shutdown()
+
+
+async def test_messages_list_skeleton_float_created_sorts_numerically(upstream_factory):
+    """Q7-P3-19 (owner 2026-08-22) ①: finite FLOAT epochs are valid sort
+    keys — they sort by numeric value, NOT key-0 to the page head. Upstream
+    opencode only ever writes int epoch ms; float acceptance is purely
+    defensive alignment with the §8/§14 strict-ASC ordering contract."""
+    items = [
+        {"info": {"id": "late_int", "role": "user", "time": {"created": 9000}},
+         "parts": [{"id": "p1", "type": "text", "messageID": "late_int", "text": "x" * 200}]},
+        # 4000.5 sits BETWEEN the two ints: judged malformed it would get
+        # key 0 and sort to the page head (before 1000) — pin that it does not.
+        {"info": {"id": "mid_float", "role": "user", "time": {"created": 4000.5}},
+         "parts": [{"id": "p2", "type": "text", "messageID": "mid_float", "text": "x" * 200}]},
+        {"info": {"id": "early_int", "role": "user", "time": {"created": 1000}},
+         "parts": [{"id": "p3", "type": "text", "messageID": "early_int", "text": "x" * 200}]},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, content=orjson.dumps(items),
+            headers={"Content-Type": "application/json"},
+        )
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
+                "/slimapi/messages/s1?mode=skeleton", headers=VERSION_HEADERS,
+            )
+        assert response.status_code == 200
+        body = orjson.loads(response.content)["items"]
+        ids = [m["info"]["id"] for m in body]
+        assert ids == ["early_int", "mid_float", "late_int"], (
+            f"float epoch must sort by numeric value (not page head): {ids}"
+        )
+        # The float survives the skeleton projection verbatim (info is a
+        # deepcopy passthrough) — value identity, not just ordering.
+        assert body[1]["info"]["time"]["created"] == 4000.5
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_messages_list_skeleton_mixed_int_float_created_order(upstream_factory):
+    """Q7-P3-19 ②: int/float epochs interleave correctly across several
+    crossover points (Python compares int/float mixtures numerically)."""
+    shuffled = [
+        (5000, "e5"),
+        (1200.25, "f2"),
+        (3000, "e3"),
+        (900.5, "f1"),
+        (4750.75, "f3"),
+        (2000, "e2"),
+        (100, "e1"),
+    ]
+    items = [
+        {
+            "info": {"id": mid, "role": "user", "time": {"created": created}},
+            "parts": [{"id": f"p_{mid}", "type": "text", "messageID": mid, "text": "x" * 200}],
+        }
+        for created, mid in shuffled
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, content=orjson.dumps(items),
+            headers={"Content-Type": "application/json"},
+        )
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
+                "/slimapi/messages/s1?mode=skeleton", headers=VERSION_HEADERS,
+            )
+        assert response.status_code == 200
+        body = orjson.loads(response.content)["items"]
+        createds = [m["info"]["time"]["created"] for m in body]
+        assert createds == [100, 900.5, 1200.25, 2000, 3000, 4750.75, 5000], (
+            f"int/float mixed epochs must interleave numerically: {createds}"
+        )
+    finally:
+        app.state.transforms.shutdown()
+
+
+async def test_messages_list_skeleton_bool_created_still_malformed(upstream_factory):
+    """Q7-P3-19 ③(a): bool ``created`` (JSON ``true``) stays MALFORMED —
+    bool is an int subclass; its exclusion must survive the finite-float
+    widening. Sorts to the page head (key 0) like any other malformed row."""
+    items = [
+        {"info": {"id": "valid", "role": "user", "time": {"created": 2000}},
+         "parts": [{"id": "p1", "type": "text", "messageID": "valid", "text": "x" * 200}]},
+        {"info": {"id": "bool_created", "role": "user", "time": {"created": True}},
+         "parts": [{"id": "p2", "type": "text", "messageID": "bool_created", "text": "x" * 200}]},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, content=orjson.dumps(items),
+            headers={"Content-Type": "application/json"},
+        )
+
+    upstream = upstream_factory(handler)
+    app = _build_app(_settings(), upstream)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
+                "/slimapi/messages/s1?mode=skeleton", headers=VERSION_HEADERS,
+            )
+        assert response.status_code == 200
+        body = orjson.loads(response.content)["items"]
+        ids = [m["info"]["id"] for m in body]
+        assert ids == ["bool_created", "valid"], (
+            f"bool created must stay malformed (key 0, page head): {ids}"
+        )
+    finally:
+        app.state.transforms.shutdown()
+
+
+def test_created_sort_key_rejects_bool_nan_inf():
+    """Q7-P3-19 ③(b): unit-level pin — nan/inf floats stay malformed (the
+    widening must not overshoot). Route-level construction is impossible:
+    orjson rejects both at parse time (``NaN`` literals and ``1e999`` raise
+    JSONDecodeError; dumps maps them to ``null``), so the predicate is
+    pinned directly on ``_created_sort_key`` as defense-in-depth."""
+    from oc_slimapi.routes.messages._list import _created_sort_key
+
+    def msg(created):
+        return {"info": {"id": "x", "role": "user", "time": {"created": created}}}
+
+    # Malformed → key 0: bool (int subclass), non-finite floats, str, None.
+    assert _created_sort_key(msg(True)) == 0
+    assert _created_sort_key(msg(False)) == 0
+    assert _created_sort_key(msg(float("nan"))) == 0
+    assert _created_sort_key(msg(float("inf"))) == 0
+    assert _created_sort_key(msg(float("-inf"))) == 0
+    assert _created_sort_key(msg("1700000000")) == 0
+    assert _created_sort_key(msg(None)) == 0
+    # Valid → the numeric value itself (int and finite float alike).
+    assert _created_sort_key(msg(1700000000)) == 1700000000
+    assert _created_sort_key(msg(1700000000.5)) == 1700000000.5
+    assert _created_sort_key(msg(0.25)) == 0.25
+    # Missing containers → 0 (unchanged historical behaviour).
+    assert _created_sort_key({}) == 0
+    assert _created_sort_key({"info": None}) == 0
+    assert _created_sort_key({"info": {"time": None}}) == 0
 
 
 @pytest.mark.parametrize(

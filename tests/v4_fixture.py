@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import sqlite3
 import sys
 from datetime import datetime
@@ -493,7 +494,13 @@ def load_golden() -> dict[str, Any]:
 # 真实上游 golden（rev gate BLOCKER-1：权威源①真进程 HTTP handler 生成）
 # ---------------------------------------------------------------------------
 
-REAL_UPSTREAM_BINARY = "/home/mar/.opencode/bin/opencode"
+# 真实上游二进制定位：env 覆盖（与 test_equivalence_anchor._eq_binary 的
+# OC_SLIMAPI_EQ_BINARY 同名同义——那里是调用期重读，这里是 import 期缺省），
+# 缺省按用户 home 推导（去掉本机绝对路径硬编码，跨环境可复现）。
+REAL_UPSTREAM_BINARY = os.environ.get(
+    "OC_SLIMAPI_EQ_BINARY",
+    str(Path.home() / ".opencode" / "bin" / "opencode"),
+)
 REAL_UPSTREAM_VERSION = "1.18.18"
 REAL_GOLDEN_GENERATOR = f"real-upstream-http-{REAL_UPSTREAM_VERSION}"
 REAL_GOLDEN_PATH = GOLDEN_DIR / f"sessions-global-real-{ALIGNED_VERSION}.json"

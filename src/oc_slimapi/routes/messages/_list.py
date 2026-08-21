@@ -6,6 +6,7 @@ change — the merged fan-out splice comes from :mod:`._full_merge`).
 
 from __future__ import annotations
 
+import math
 import re
 from urllib.parse import urlparse
 
@@ -15,12 +16,11 @@ from fastapi import Query, Request
 from starlette.responses import Response
 
 from ... import etag as etag_mod
-from ... import readiness as readiness_mod
 from ...envelope import messages_envelope_bytes
 from ...gzip_util import compress_if_beneficial, error_response
 # (V2b: the ``wire_view_from_scope`` import was removed with the v4-only
-# teardown — the view is constant 4 and the §14 href face is decided by
-# the readiness gate alone; see ``_expand_wire_view`` above.)
+# teardown; D5 (2026-08-22) then made the §14 href face a constant 4 — see
+# ``_expand_wire_view`` below.)
 from ...skeleton import SkeletonLimits, skeleton_messages
 from ...transform import TransformBusy, read_with_cap
 from ...upstream import forward_directory_headers
@@ -29,26 +29,36 @@ from .._catalog_common import read_upstream_response
 from ._full_merge import _merge_fulls
 from ._router import _busy_response, _resolve_messages_directory, router
 
-# --- §3.3 per-feature gate (2026-08-19 integration close-out) ----------------
+# --- §3.3 per-feature gate → D5 adjudication (2026-08-22) -------------------
 #
-# ``messages.expand.v4 ∈ SATISFIED`` 时 §14 修订面生效：``?v=4`` 请求的
-# expandRefs href 用 ``?v=4``。门控关闭态：wire view 折回 3——v4 响应的
-# href 维持 ``?v=3``（4.0.0 已发布行为）。动态读法镜像
-# sessions.py::_v4_representation_revision_active（调用时读模块全局，
-# readiness 翻转/测试 monkeypatch 无需改本文件）。
+# 历史：``messages.expand.v4 ∈ SATISFIED`` 曾在此选择 §14 href view
+# （satisfied → ``?v=4``；否则折回 3——4.0.0 已发布 href 面）。v4-only
+# ``(4,4)`` selector 窗口下该折回自产自拒死链：v4 响应的 expandRefs
+# href 带 ``?v=3``，而 v4-only selector 恰好 400 拒绝 ``?v=3``。
+# 2026-08-22 owner 裁决（D5）：href wire view 双态恒 4，readiness 分支
+# 删除（其唯一消费方就是本返回值——href 生成路径）；该 feature ID 的
+# 门控语义仅存于 capabilities 面（versions.py ``expand`` block 发射）。
+#
+# ``_V4_EXPAND_FEATURE`` 保留：``messages/__init__.py`` 兼容 re-export
+# 仍在导入（F-302 迁移面），亦作为 feature ID 的谱系锚点。
 
 _V4_EXPAND_FEATURE = "messages.expand.v4"
 
 
 def _expand_wire_view(scope) -> int:
-    """§14 href view selector under the §3.3 gate: 4 iff the feature is
-    satisfied; else 3 (the 4.0.0-published href face). (V2b: the
-    wire-view fork guard was removed — wire_view_from_scope is constant 4
-    under the v4-only window, so the readiness gate alone decides; the
-    ``scope`` parameter is kept for the call sites' shape.)"""
-    if _V4_EXPAND_FEATURE in readiness_mod.SATISFIED:
-        return 4
-    return 3
+    """§14 href view selector: constant 4 in BOTH readiness gate states.
+
+    D5 adjudication (2026-08-22, owner): under the v4-only ``(4,4)``
+    selector window the historical gate-off fold to 3 minted
+    self-rejecting dead links — a v4 response's expandRefs href carried
+    ``?v=3`` and the selector middleware 400-rejects exactly that value.
+    The href face is therefore 4 regardless of
+    ``messages.expand.v4 ∈ SATISFIED`` (that gate now decides only the
+    capabilities face in versions.py). The readiness branch was removed:
+    its sole consumer was this return value, threaded into the projection
+    for href generation; the ``scope`` parameter is kept for the call
+    sites' shape."""
+    return 4
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +71,7 @@ def _expand_wire_view(scope) -> int:
 # even if opencode's ``orderBy`` ever changes; clients merging paginated
 # skeleton pages depend on the strict-ASC guarantee.
 
-def _created_sort_key(msg: dict) -> int:
+def _created_sort_key(msg: dict) -> int | float:
     """Sort key: ``info.time.created`` ASC.
 
     Defaults to ``0`` for missing / malformed fields so degenerate upstream
@@ -74,7 +84,20 @@ def _created_sort_key(msg: dict) -> int:
     if not isinstance(time_obj, dict):
         return 0
     raw = time_obj.get("created")
-    if isinstance(raw, int) and not isinstance(raw, bool):
+    # Q7-P3-19 (owner adjudication 2026-08-22): accept int OR finite float.
+    # Upstream practice only ever writes int epochs (ms) — this widening is
+    # purely defensive alignment with the §14 ordering contract: a JSON
+    # number is grammatically allowed to be fractional, and the old
+    # ``isinstance(raw, int)`` predicate judged a finite float epoch
+    # malformed (key 0 → page head), silently breaking strict-ASC for that
+    # row. int/float mixtures compare numerically natively. bool stays
+    # malformed (bool is an int subclass — exclusion carried over from the
+    # historical predicate); nan/inf floats stay malformed (nan breaks
+    # total ordering, inf would clamp to one end; note orjson already
+    # rejects both at parse time — defense-in-depth) as do str/None.
+    if isinstance(raw, bool):
+        return 0
+    if isinstance(raw, (int, float)) and math.isfinite(raw):
         return raw
     return 0
 
@@ -430,10 +453,10 @@ async def _messages_via_lease(
             message_bytes=config.skeleton_inline_output_max_message_bytes,
             fingerprint=config.message_fingerprint_enabled,
         )
-        # v4 §14: the request's selector view picks the expandRefs href
-        # ``?v=`` value (read on the event loop — the worker threads have
-        # no scope access). Selector-less stacks default to 3. §3.3 gate:
-        # unsatisfied → fold to 3 (4.0.0 published href face).
+        # v4 §14: the expandRefs href ``?v=`` value is read on the event
+        # loop (the worker threads have no scope access). D5 (2026-08-22):
+        # constant 4 in BOTH gate states — a self-minted ``?v=3`` href is
+        # 400-rejected by the v4-only selector.
         wire_view = _expand_wire_view(request.scope)
         projected: list[dict] | None = None
         identity: bytes | None = None
@@ -487,7 +510,12 @@ async def _messages_via_lease(
             # admission NOT held (a slot here would 503 requests that
             # already finished projecting; design §1.3).
             rep_version = etag_mod.response_rep_version(
-                config, wire_view=3)
+                config, wire_view=4)
+            # D6 owner 裁决 2026-08-22：messages ETag 域标签统一为窗口
+            # 版本 4（此前 wire_view=3 为金样冻结保留）；代价是一次性
+            # validator 轮换（客户端全量重拉一轮，与 4.9.0 REP_VERSION
+            # 轮换同类）。与 sessions 侧（sessions.py / _catalog_common.py）
+            # 域标签一致。
             # §6.2 (gate C3): directory-sensitive route — the directory
             # Vary dimension is unconditional (cache-correctness semantics,
             # NOT an ETag accessory; Batch 3 merge_directory_vary precedent).
@@ -615,9 +643,10 @@ async def messages(
                 # released (see _merge_fulls; oracle §C-2: the fan-out must
                 # not hold the slot across per-full network GETs).
                 #
-                # v4 §14: selector view read on the loop, threaded to the
-                # projection for view-correct expandRefs hrefs. §3.3 gate:
-                # unsatisfied → fold to 3 (4.0.0 published href face).
+                # v4 §14: view read on the loop, threaded to the projection
+                # for view-correct expandRefs hrefs. D5 (2026-08-22):
+                # constant 4 in BOTH gate states (self-minted ``?v=3``
+                # would be 400-rejected by the v4-only selector).
                 wire_view = _expand_wire_view(request.scope)
                 try:
                     if merged_mode:
@@ -668,7 +697,9 @@ async def messages(
         # ACTUALLY carries. Aux header value comes from THIS run.
         # F-201/F-271: same offloaded tail worker as the lease path.
         rep_version = etag_mod.response_rep_version(
-            config, wire_view=3)
+            config, wire_view=4)
+        # D6 owner 裁决 2026-08-22：域标签统一为窗口版本（同 lease 路径
+        # 注记），一次性 validator 轮换。
         # §6.2 (gate C3): unconditional directory Vary — same as the lease
         # tail; directory-sensitivity does not depend on validator support.
         vary_value = etag_mod.merged_vary("Accept-Encoding")

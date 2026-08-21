@@ -108,13 +108,18 @@ curl -s "$BASE/slimapi/metrics?$V" | jq '
 | `command` | `/slimapi/command`、`/slimapi/command/**` | **骨架投影**：catalog whitelist（`name/description/agent/hints`），丢 `template`（~97.7%） |
 | `agent` | `/slimapi/agent`、`/slimapi/agent/**` | **骨架投影**：catalog whitelist（`name/description/mode/hidden/native`），丢 `prompt`+`permission`（>96%） |
 | `questions` | `/slimapi/questions`（跨目录聚合，加性回归） | 聚合 envelope（envelope 透传，per-dir fan-out） |
-| `other` | `/slimapi/permissions`（跨目录 pending permission 聚合，加性回归）等 | **归 `other`**（bucketize 无独立 `permissions` 桶——见下「§3.3 permissions 聚合 bucket 口径」）；**非 passthrough** |
+| `permissions` | `GET /slimapi/permissions`（**精确匹配**，2026-08-22 Q6 增补） | 聚合 envelope（镜像 `questions`；见 §3.3 Q6 注记） |
+| `versions` | `GET /slimapi/versions`（**精确匹配**，2026-08-22 Q6 增补） | 版本发现端点（无上游 fan-out，`upIn` 常为 0） |
+| `actions` / `write_actions` | `GET /slimapi/actions`（**精确**）/ `POST /slimapi/actions/{name}`（2026-08-22 Q6 增补） | action catalog 发现 / manifest action 调用（write_* 命名随 `write_session`/`write_question` 惯例） |
+| `other` | 无专属桶的 `/slimapi/**` 残留（Q6 后仅剩子路径/错误方法 405 噪声等） | **非 passthrough**；Q6 前曾含 `permissions`/`versions`/`actions`——见 §3.3 Q6 注记 |
 | `passthrough` | catch-all `/**`（**3.0.0 起已关闭**——未收编路径 404 `thin_route_not_found`） | **哨兵桶（3.0.0 起教学口径）**：catch-all 关闭后不再有 200 透传；本桶只剩 404/405 拒绝噪声，`upIn`/`upOut` 恒 0——**任何 2xx 出现即意外穿透，应排查**（「基线 ≈1.0」口径仅适用 ≤2.x 历史日志） |
 | `health` / `metrics` / `other` | 各自端点 | 元数据/探活 |
 
 ### 3.3 新 bucket 口径（L1–L3 slim 整合，2026-08-15）
 
-**`/slimapi/permissions` 归 slim 侧（非 passthrough），但 bucketize 无独立 `permissions` 桶 → 落入 `other`**：
+**Q6 注记（2026-08-22，owner 裁决）**：8h 生产日志实证 `other` 桶残留——`GET /slimapi/permissions` ×140（最高频）、`GET /slimapi/versions` ×53、`GET /slimapi/actions` ×7 + `POST /slimapi/actions/{id}` ×5。`bucketize()`（`traffic.py`）据此增补四个桶：`permissions` / `versions` / `actions`（GET **精确匹配**，镜像 health 先例 + write_question 的方法门控——非 GET 是 FastAPI 405，落 `other`）与 `write_actions`（POST `/slimapi/actions/{name}`，`write_*` 命名惯例）。子路径/错误方法保持 `other`。**下述 2026-08-15 的「permissions 归 `other`」口径自此成为历史**（增量观测枚举，不 bump wire）：
+
+**（历史，≤ Q6 前）`/slimapi/permissions` 归 slim 侧（非 passthrough），但 bucketize 无独立 `permissions` 桶 → 落入 `other`**：
 
 - `GET /slimapi/permissions`（跨目录 pending permission 聚合，镜像 `/slimapi/questions`）在 `bucketize()`（`traffic.py`）中**未设独立桶**——`/slimapi/**` 前缀命中后无 `permissions` 分支，回落到 `return "other"`（`traffic.py` line 91）。因此该端点流量与其它无专属桶的 `/slimapi/**` 端点一起计入 **`other`** 桶，**不**进 `passthrough`（`passthrough` 仅 catch-all `/**`）。
 - **记账内容**：`upIn` = 聚合抓取的上游字节（发现 `/experimental/session` + 各 directory 的 `/permission` fan-out 成本，经 `stash_up_in` 计入）；`downOut` = 聚合 envelope 下发字节（白名单投影后）。

@@ -75,12 +75,12 @@ RETIREMENT_BODY = {
 
 _READY_GOLDEN = {
     "server": {
-        "api_version": 3,                    # READY_VIEW 恒 3（§12 零 v4 差异）
+        "api_version": 4,                    # READY_VIEW=4（D3 2026-08-22 owner 裁决：对齐 v4-only 窗口，与 /health、/versions 一致；形状仍零分叉）
         "accepted_client_versions": [4, 4],  # 2026-08-21 收窄后的窗口
     },
     "schema": {
         "degraded": False,                   # _build_app 的 schema_degraded
-        "version": 3,
+        "version": 4,
         "clientMin": 4,
         "clientMax": 4,
     },
@@ -565,9 +565,11 @@ async def test_health_allowlist_enabled_in_both_views():
 
 
 async def test_ready_zero_v4_difference():
-    """Contract §3.2/§12: ready is frozen — shape AND values stay the v3
-    terminal ones even for a v4 wire request (the v3-guard leg was removed
-    with the V2b Phase-4 teardown)."""
+    """Contract §3.2/§10: ready shape is frozen (no slimapi_contract/
+    features/auxiliary) even for a v4 wire request; the version values
+    follow the v4-only window — READY_VIEW = 4 since the 2026-08-22 D3
+    owner ruling (aligned with /health and /versions; the v3-guard leg
+    was removed with the V2b Phase-4 teardown)."""
     app = _build_ready_app()
     async with _client(app) as client:
         resp = await client.get("/slimapi/ready?v=4", headers=IDENTITY)
