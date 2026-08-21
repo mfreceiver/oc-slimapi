@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "oc-slimapi"
-version = "4.9.0"
+version = "4.9.1"
 description = "Loopback-only thin HTTP and curated SSE sidecar for opencode legacy APIs"
 requires-python = ">=3.11"
 dependencies = [
