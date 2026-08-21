@@ -61,33 +61,27 @@ def _upstream(ok: bool = True) -> httpx.AsyncClient:
 
 
 async def test_health_single_v3_view():
+    """v3 view lock (B12 ② guard net, temporarily flipped at the 2026-08-21
+    narrowing): ``?v=3`` used to answer the terminal v3 view triplet; it
+    now answers the unsupported-version 400 face. V2b deletes this guard
+    with the v3 view removal."""
     app = _build_app(_upstream())
     async with _client(app) as client:
         r = await client.get("/slimapi/health?v=3")
-        assert r.status_code == 200
-        body = r.json()
-        # The view triplet is one constant — a 3/2 combination is
-        # structurally impossible.
-        assert body["slimapi_contract"] == 3
-        assert body["server"]["api_version"] == 3
-        assert body["schema"]["version"] == 3
-        assert body["server"]["accepted_client_versions"] == [3, 4]
-        assert body["schema"]["clientMin"] == 3
-        assert body["schema"]["clientMax"] == 4
+        assert r.status_code == 400
+        assert r.json() == {"code": "unsupported_version", "supported": [4]}
 
 
 async def test_health_retired_header_cannot_change_view():
     """The retired X-Slimapi-Version header is not read — any value next to
-    a valid ?v=3 keeps the single view."""
+    a ?v=3 request cannot rescue it across the window narrowing."""
     app = _build_app(_upstream())
     async with _client(app) as client:
         for value in ("2", "3", "9"):
             r = await client.get("/slimapi/health?v=3",
                                  headers={"X-Slimapi-Version": value})
-            assert r.status_code == 200
-            body = r.json()
-            assert body["slimapi_contract"] == 3
-            assert body["schema"]["version"] == 3
+            assert r.status_code == 400
+            assert r.json() == {"code": "unsupported_version", "supported": [4]}
 
 
 async def test_health_no_v_rejected():
@@ -96,7 +90,7 @@ async def test_health_no_v_rejected():
         r = await client.get("/slimapi/health",
                              headers={"X-Slimapi-Version": "2"})
         assert r.status_code == 400
-        assert r.json() == {"code": "unsupported_version", "supported": [3, 4]}
+        assert r.json() == {"code": "unsupported_version", "supported": [4]}
 
 
 async def test_ready_v4_request_keeps_frozen_v3_view_no_contract_field():
@@ -111,9 +105,9 @@ async def test_ready_v4_request_keeps_frozen_v3_view_no_contract_field():
         assert "slimapi_contract" not in body  # shape locked: no contract
         assert body["server"]["api_version"] == 3
         assert body["schema"]["version"] == 3
-        assert body["schema"]["clientMin"] == 3
+        assert body["schema"]["clientMin"] == 4
         assert body["schema"]["clientMax"] == 4
-        assert body["server"]["accepted_client_versions"] == [3, 4]
+        assert body["server"]["accepted_client_versions"] == [4, 4]
 
 
 async def test_ready_upstream_down_503():

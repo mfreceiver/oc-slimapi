@@ -408,21 +408,21 @@ async def _scenario_readgroup(cases: dict[str, str]) -> None:
     try:
         async with _client(app) as client:
             cases["vcs_200_identity"], _ = await _wire_request(
-                client, "/slimapi/vcs?v=3", IDENTITY, 200)
+                client, "/slimapi/vcs?v=4", IDENTITY, 200)
             cases["vcs_200_gzip"], _ = await _wire_request(
-                client, "/slimapi/vcs?v=3", GZIP, 200)
+                client, "/slimapi/vcs?v=4", GZIP, 200)
 
-            a, b, _ = await _etag_flow(client, "/slimapi/vcs?v=3", GZIP)
+            a, b, _ = await _etag_flow(client, "/slimapi/vcs?v=4", GZIP)
             cases["vcs_etag_200"], cases["vcs_etag_304"] = a, b
 
             cases["session_single_200_gzip"], _ = await _wire_request(
-                client, "/slimapi/session/s1?v=3", GZIP, 200)
+                client, "/slimapi/session/s1?v=4", GZIP, 200)
 
             # The compressed wire body must be far below the ~1 MiB identity
             # (highly compressible "x" blob) — sanity-pins the coding before
             # the digest (the digest itself covers the exact gzip bytes).
             request = client.build_request(
-                "GET", "/slimapi/vcs/diff?v=3", headers=GZIP)
+                "GET", "/slimapi/vcs/diff?v=4", headers=GZIP)
             response = await client.send(request, stream=True)
             try:
                 raw = b"".join(
@@ -433,7 +433,7 @@ async def _scenario_readgroup(cases: dict[str, str]) -> None:
             finally:
                 await response.aclose()
             digest, _ = await _wire_request(
-                client, "/slimapi/vcs/diff?v=3", GZIP, 200)
+                client, "/slimapi/vcs/diff?v=4", GZIP, 200)
             cases["vcs_large_200_gzip"] = digest
     finally:
         _teardown(app)
@@ -597,11 +597,11 @@ async def test_readgroup_tail_to_thread_proof():
         )
         try:
             async with _client(app) as client:
-                small = await client.get("/slimapi/vcs?v=3", headers=GZIP)
+                small = await client.get("/slimapi/vcs?v=4", headers=GZIP)
                 assert small.status_code == 200
                 assert not calls, "small body must stay inline"
 
-                large = await client.get("/slimapi/vcs/diff?v=3",
+                large = await client.get("/slimapi/vcs/diff?v=4",
                                          headers=GZIP)
                 assert large.status_code == 200
                 assert _tail_encode in calls, (

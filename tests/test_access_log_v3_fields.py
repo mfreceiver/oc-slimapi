@@ -257,7 +257,7 @@ async def test_legacy_old_ocdroid_form_rejected(capture_logger):
     async with _client(app) as client:
         r = await client.get("/slimapi/health", headers=V2_HEADER)
         assert r.status_code == 400
-        assert r.json() == {"code": "unsupported_version", "supported": [3, 4]}
+        assert r.json() == {"code": "unsupported_version", "supported": [4]}
 
 
 # ---------------------------------------------------------------------------

@@ -84,7 +84,8 @@ def _read_payloads() -> dict[str, bytes]:
     }
 
 
-def _build_app(handler, *, settings: Settings | None = None):
+def _build_app(handler, *, settings: Settings | None = None,
+               selector: bool = True):
     seen: list[httpx.Request] = []
     payloads = _read_payloads()
 
@@ -110,7 +111,12 @@ def _build_app(handler, *, settings: Settings | None = None):
         max_response_bytes=settings.max_response_bytes))
     app.include_router(read_groups.router)
     register_error_handlers(app)
-    app.add_middleware(SlimapiSelectorMiddleware)
+    # selector=False → selector-less direct invocation (the route's default
+    # view). Used by the 2026-08-21 narrowing to keep the v3-branch shape
+    # locks (skeleton projection / verbatim passthrough / providers
+    # passthrough) exercisable until V2b removes the v3 branch.
+    if selector:
+        app.add_middleware(SlimapiSelectorMiddleware)
     return app, seen
 
 
@@ -138,7 +144,7 @@ async def stack():
 
 async def test_file_list_v3_happy_passthrough(stack):
     client, seen = stack
-    resp = await client.get("/slimapi/file?v=3&path=readme.md",
+    resp = await client.get("/slimapi/file?v=4&path=readme.md",
                             headers=IDENTITY)
     assert resp.status_code == 200
     assert resp.content == _read_payloads()["/file"]
@@ -159,7 +165,7 @@ async def test_file_v2_query_directory_form_is_unsupported(stack):
         "/slimapi/file?path=readme.md&directory=/w", headers=V2_HEADERS)
     assert resp.status_code == 400
     assert orjson.loads(resp.content) == {
-        "code": "unsupported_version", "supported": [3, 4]}
+        "code": "unsupported_version", "supported": [4]}
     assert seen == []
 
 
@@ -209,7 +215,7 @@ async def test_v2_unknown_duplicate_encoded_query_unsupported(stack):
 async def test_v3_unknown_duplicate_encoded_query_verbatim(stack):
     client, seen = stack
     resp = await client.get(
-        "/slimapi/file?v=3&path=r&a=1&a=2&b=%2F&c=a+b", headers=IDENTITY)
+        "/slimapi/file?v=4&path=r&a=1&a=2&b=%2F&c=a+b", headers=IDENTITY)
     assert resp.status_code == 200
     assert seen[0].url.query.decode("latin-1") == "path=r&a=1&a=2&b=%2F&c=a+b"
 
@@ -219,14 +225,14 @@ async def test_v2_explicit_selector_is_unsupported(stack):
     resp = await client.get("/slimapi/vcs?v=2&a=1", headers=V2_HEADERS)
     assert resp.status_code == 400
     assert orjson.loads(resp.content) == {
-        "code": "unsupported_version", "supported": [3, 4]}
+        "code": "unsupported_version", "supported": [4]}
     assert seen == []
 
 
 async def test_file_v3_directory_query_consumed_and_stripped(stack):
     client, seen = stack
     resp = await client.get(
-        "/slimapi/file?v=3&path=readme.md&directory=/w", headers=IDENTITY)
+        "/slimapi/file?v=4&path=readme.md&directory=/w", headers=IDENTITY)
     assert resp.status_code == 200
     upstream = seen[0]
     assert upstream.headers.get(DIRECTORY_HEADER) == "/w"
@@ -235,7 +241,7 @@ async def test_file_v3_directory_query_consumed_and_stripped(stack):
 
 async def test_file_content_happy(stack):
     client, seen = stack
-    resp = await client.get("/slimapi/file/content?v=3&path=readme.md",
+    resp = await client.get("/slimapi/file/content?v=4&path=readme.md",
                             headers=IDENTITY)
     assert resp.status_code == 200
     assert resp.content == _read_payloads()["/file/content"]
@@ -248,10 +254,10 @@ def upstream_path(seen):
 
 async def test_file_status_directory_two_states(stack):
     client, seen = stack
-    resp = await client.get("/slimapi/file/status?v=3", headers=IDENTITY)
+    resp = await client.get("/slimapi/file/status?v=4", headers=IDENTITY)
     assert resp.status_code == 200
     assert seen[0].headers.get(DIRECTORY_HEADER) is None
-    resp = await client.get("/slimapi/file/status?v=3&directory=/w",
+    resp = await client.get("/slimapi/file/status?v=4&directory=/w",
                             headers=IDENTITY)
     assert resp.status_code == 200
     assert seen[1].headers.get(DIRECTORY_HEADER) == "/w"
@@ -264,7 +270,7 @@ async def test_file_status_directory_two_states(stack):
 
 async def test_vcs_happy(stack):
     client, seen = stack
-    resp = await client.get("/slimapi/vcs?v=3&directory=/w", headers=IDENTITY)
+    resp = await client.get("/slimapi/vcs?v=4&directory=/w", headers=IDENTITY)
     assert resp.status_code == 200
     assert resp.content == _read_payloads()["/vcs"]
     assert seen[0].headers.get(DIRECTORY_HEADER) == "/w"
@@ -272,7 +278,7 @@ async def test_vcs_happy(stack):
 
 async def test_vcs_status_happy(stack):
     client, seen = stack
-    resp = await client.get("/slimapi/vcs/status?v=3", headers=IDENTITY)
+    resp = await client.get("/slimapi/vcs/status?v=4", headers=IDENTITY)
     assert resp.status_code == 200
     assert resp.content == _read_payloads()["/vcs/status"]
 
@@ -280,7 +286,7 @@ async def test_vcs_status_happy(stack):
 async def test_vcs_diff_forwards_mode_context(stack):
     client, seen = stack
     resp = await client.get(
-        "/slimapi/vcs/diff?v=3&mode=working&context=5", headers=IDENTITY)
+        "/slimapi/vcs/diff?v=4&mode=working&context=5", headers=IDENTITY)
     assert resp.status_code == 200
     assert resp.content == _read_payloads()["/vcs/diff"]
     params = seen[0].url.params
@@ -296,7 +302,7 @@ async def test_vcs_diff_forwards_mode_context(stack):
 async def test_find_file_forwards_query_params(stack):
     client, seen = stack
     resp = await client.get(
-        "/slimapi/find/file?v=3&query=readme&dirs=true&type=file&limit=10",
+        "/slimapi/find/file?v=4&query=readme&dirs=true&type=file&limit=10",
         headers=IDENTITY)
     assert resp.status_code == 200
     assert resp.content == _read_payloads()["/find/file"]
@@ -308,40 +314,62 @@ async def test_find_file_forwards_query_params(stack):
 
 
 async def test_providers_directory_sensitive(stack):
+    """Directory sensitivity of the providers route, on the (only) admitted
+    v4 face: the consumed ``?directory=`` reaches the upstream call as the
+    ``X-Opencode-Directory`` header (the v4 projection pipeline resolves
+    the same stash). The byte-identical controlled-proxy passthrough of the
+    frozen v3 branch is locked selector-lessly below; the v4 projection
+    body itself is locked in test_providers_projection_v4.py."""
     client, seen = stack
-    resp = await client.get("/slimapi/config/providers?v=3",
-                            headers=IDENTITY)
-    assert resp.status_code == 200
-    assert resp.content == _read_payloads()["/config/providers"]
-    assert resp.headers["vary"].lower() == "accept-encoding"  # §6.2 terminal
-    resp = await client.get("/slimapi/config/providers?v=3&directory=/w",
-                            headers=IDENTITY)
-    assert resp.status_code == 200
-    assert seen[1].headers.get(DIRECTORY_HEADER) == "/w"
+    await client.get("/slimapi/config/providers?v=4&directory=/w",
+                     headers=IDENTITY)
+    assert seen[0].headers.get(DIRECTORY_HEADER) == "/w"
+
+
+async def test_providers_v3_branch_passthrough_bytes():
+    """B12-②-style v3-branch lock (selector-less): the byte-identical
+    controlled-proxy passthrough of the frozen v3 providers face. V2b
+    removes the v3 branch (and this lock) with the physical teardown."""
+    app, _seen = _build_app(_default_handler, selector=False)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport,
+                                 base_url="http://t") as client:
+        resp = await client.get("/slimapi/config/providers",
+                                headers=IDENTITY)
+        assert resp.status_code == 200
+        assert resp.content == _read_payloads()["/config/providers"]
+        assert resp.headers["vary"].lower() == "accept-encoding"  # §6.2 terminal
 
 
 # ---------------------------------------------------------------------------
 # session single
 # ---------------------------------------------------------------------------
 
-async def test_session_single_skeleton_projection(stack):
-    client, _seen = stack
-    resp = await client.get("/slimapi/session/s1?v=3", headers=IDENTITY)
-    assert resp.status_code == 200
-    projected = orjson.loads(resp.content)
-    assert projected["id"] == "s1"
-    assert projected["title"] == "one"
-    assert projected["time"]["created"] == 1
-    assert projected["model"]["modelID"] == "m"
-    # Whitelist drops heavy/never-consumed fields (skeleton_session).
-    for dropped in ("cost", "tokens", "location", "subpath", "repoPath",
-                    "commit", "branch", "status", "version"):
-        assert dropped not in projected
+async def test_session_single_skeleton_projection():
+    """B12-②-style v3-branch lock (selector-less): the frozen v3 skeleton
+    projection shape. The v4 canonical projector face is locked in
+    test_session_single_v4.py; V2b removes the v3 branch with the
+    physical teardown."""
+    app, _seen = _build_app(_default_handler, selector=False)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport,
+                                 base_url="http://t") as client:
+        resp = await client.get("/slimapi/session/s1", headers=IDENTITY)
+        assert resp.status_code == 200
+        projected = orjson.loads(resp.content)
+        assert projected["id"] == "s1"
+        assert projected["title"] == "one"
+        assert projected["time"]["created"] == 1
+        assert projected["model"]["modelID"] == "m"
+        # Whitelist drops heavy/never-consumed fields (skeleton_session).
+        for dropped in ("cost", "tokens", "location", "subpath", "repoPath",
+                        "commit", "branch", "status", "version"):
+            assert dropped not in projected
 
 
 async def test_session_single_directory(stack):
     client, seen = stack
-    await client.get("/slimapi/session/s1?v=3&directory=/w", headers=IDENTITY)
+    await client.get("/slimapi/session/s1?v=4&directory=/w", headers=IDENTITY)
     assert seen[0].url.path == "/session/s1"
     assert seen[0].headers.get(DIRECTORY_HEADER) == "/w"
 
@@ -353,7 +381,7 @@ async def test_session_single_directory(stack):
 async def test_active_session_happy_and_directory_tolerant(stack):
     client, seen = stack
     resp = await client.get(
-        "/slimapi/api/session/active?v=3&directory=/w", headers=IDENTITY)
+        "/slimapi/api/session/active?v=4&directory=/w", headers=IDENTITY)
     assert resp.status_code == 200
     assert resp.content == _read_payloads()["/api/session/active"]
     assert seen[0].headers.get(DIRECTORY_HEADER) is None
@@ -368,7 +396,7 @@ async def test_active_session_happy_and_directory_tolerant(stack):
 async def test_global_health_happy_and_directory_tolerant(stack):
     client, seen = stack
     resp = await client.get(
-        "/slimapi/global/health?v=3&directory=/w", headers=IDENTITY)
+        "/slimapi/global/health?v=4&directory=/w", headers=IDENTITY)
     assert resp.status_code == 200
     assert resp.content == _read_payloads()["/global/health"]
     assert seen[0].headers.get(DIRECTORY_HEADER) is None
@@ -379,10 +407,10 @@ async def test_active_and_global_health_304_revalidation(stack):
     # §10.a ETag enablement covers the tolerant GETs too (§6.3 "全集").
     client, _ = stack
     for path in ("/slimapi/api/session/active", "/slimapi/global/health"):
-        first = await client.get(f"{path}?v=3", headers=IDENTITY)
+        first = await client.get(f"{path}?v=4", headers=IDENTITY)
         assert "etag" in first.headers, path
         second = await client.get(
-            f"{path}?v=3",
+            f"{path}?v=4",
             headers={**IDENTITY, "If-None-Match": first.headers["etag"]})
         assert second.status_code == 304, path
         assert second.content == b""
@@ -400,7 +428,7 @@ async def test_upstream_4xx_verbatim_passthrough():
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport,
                                  base_url="http://t") as client:
-        resp = await client.get("/slimapi/file?v=3&path=x", headers=IDENTITY)
+        resp = await client.get("/slimapi/file?v=4&path=x", headers=IDENTITY)
         assert resp.status_code == 400
         assert resp.content == b'{"error": {"code": "bad_path"}}'
         assert resp.headers["content-type"].startswith("application/json")
@@ -412,7 +440,7 @@ async def test_upstream_404_verbatim_on_session_single():
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport,
                                  base_url="http://t") as client:
-        resp = await client.get("/slimapi/session/s9?v=3", headers=IDENTITY)
+        resp = await client.get("/slimapi/session/s9?v=4", headers=IDENTITY)
         assert resp.status_code == 404
         assert resp.content == b'{"error": "not_found"}'
 
@@ -426,7 +454,7 @@ async def test_upstream_5xx_maps_to_503_upstream_unavailable():
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport,
                                      base_url="http://t") as client:
-            resp = await client.get(f"/slimapi{path}?v=3&path=x&query=q",
+            resp = await client.get(f"/slimapi{path}?v=4&path=x&query=q",
                                     headers=IDENTITY)
             assert resp.status_code == 503, path
             assert orjson.loads(resp.content)["code"] == "upstream_unavailable"
@@ -440,7 +468,7 @@ async def test_network_error_maps_to_503():
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport,
                                  base_url="http://t") as client:
-        resp = await client.get("/slimapi/vcs?v=3", headers=IDENTITY)
+        resp = await client.get("/slimapi/vcs?v=4", headers=IDENTITY)
         assert resp.status_code == 503
         assert orjson.loads(resp.content)["code"] == "upstream_unavailable"
 
@@ -451,11 +479,11 @@ async def test_network_error_maps_to_503():
 
 async def test_etag_present_and_304_revalidation(stack):
     client, _ = stack
-    first = await client.get("/slimapi/file?v=3&path=r", headers=IDENTITY)
+    first = await client.get("/slimapi/file?v=4&path=r", headers=IDENTITY)
     assert "etag" in first.headers
     etag = first.headers["etag"]
     second = await client.get(
-        "/slimapi/file?v=3&path=r",
+        "/slimapi/file?v=4&path=r",
         headers={**IDENTITY, "If-None-Match": etag})
     assert second.status_code == 304
     assert second.content == b""
@@ -474,10 +502,10 @@ async def test_etag_v2_v3_validator_isolation(stack):
     v2 = await client.get("/slimapi/file?path=r", headers=V2_HEADERS)
     assert v2.status_code == 400
     assert "etag" not in v2.headers
-    v3 = await client.get("/slimapi/file?v=3&path=r", headers=IDENTITY)
+    v3 = await client.get("/slimapi/file?v=4&path=r", headers=IDENTITY)
     assert "etag" in v3.headers
     reval = await client.get(
-        "/slimapi/file?v=3&path=r",
+        "/slimapi/file?v=4&path=r",
         headers={**IDENTITY, "If-None-Match": v3.headers["etag"]})
     assert reval.status_code == 304
 
@@ -487,7 +515,7 @@ async def test_etag_disabled_config_yields_no_etag():
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport,
                                  base_url="http://t") as client:
-        resp = await client.get("/slimapi/file?v=3&path=r", headers=IDENTITY)
+        resp = await client.get("/slimapi/file?v=4&path=r", headers=IDENTITY)
         assert resp.status_code == 200
         assert "etag" not in resp.headers
 
@@ -503,7 +531,7 @@ async def test_gzip_negotiation_weak_etag():
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport,
                                  base_url="http://t") as client:
-        resp = await client.get("/slimapi/vcs?v=3",
+        resp = await client.get("/slimapi/vcs?v=4",
                                 headers={"Accept-Encoding": "gzip"})
         assert resp.status_code == 200
         assert resp.headers.get("content-encoding") == "gzip"
@@ -526,7 +554,7 @@ async def test_response_cap_maps_to_413():
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport,
                                  base_url="http://t") as client:
-        resp = await client.get("/slimapi/file?v=3&path=r", headers=IDENTITY)
+        resp = await client.get("/slimapi/file?v=4&path=r", headers=IDENTITY)
         assert resp.status_code == 413
         assert orjson.loads(resp.content)["code"] == "response_too_large"
 
@@ -540,7 +568,7 @@ async def test_content_type_passthrough_non_json():
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport,
                                  base_url="http://t") as client:
-        resp = await client.get("/slimapi/file/content?v=3&path=r",
+        resp = await client.get("/slimapi/file/content?v=4&path=r",
                                 headers=IDENTITY)
         assert resp.status_code == 200
         assert resp.content == b"plain text body"
@@ -554,7 +582,7 @@ async def test_content_type_passthrough_non_json():
 async def test_v3_dual_present_conflict_400_directory_conflict(stack):
     client, _ = stack
     resp = await client.get(
-        "/slimapi/file?v=3&path=r&directory=/a",
+        "/slimapi/file?v=4&path=r&directory=/a",
         headers={**IDENTITY, DIRECTORY_HEADER: "/b"})
     assert resp.status_code == 400
     body = orjson.loads(resp.content)
@@ -568,7 +596,7 @@ async def test_v3_dual_present_same_value_retired(stack):
     the header channel itself is retired on consuming routes."""
     client, seen = stack
     resp = await client.get(
-        "/slimapi/file?v=3&path=r&directory=/w",
+        "/slimapi/file?v=4&path=r&directory=/w",
         headers={**IDENTITY, DIRECTORY_HEADER: "/w"})
     assert resp.status_code == 400
     assert orjson.loads(resp.content)["code"] == "directory_header_retired"
@@ -578,7 +606,7 @@ async def test_v3_dual_present_same_value_retired(stack):
 async def test_v3_multi_value_directory_conflict(stack):
     client, _ = stack
     resp = await client.get(
-        "/slimapi/file?v=3&path=r&directory=/a&directory=/b",
+        "/slimapi/file?v=4&path=r&directory=/a&directory=/b",
         headers=IDENTITY)
     assert resp.status_code == 400
     assert orjson.loads(resp.content)["code"] == "invalid_directory_selector"
@@ -587,7 +615,7 @@ async def test_v3_multi_value_directory_conflict(stack):
 async def test_v3_multi_value_same_directory_folds(stack):
     client, seen = stack
     resp = await client.get(
-        "/slimapi/vcs?v=3&directory=/w&directory=/w", headers=IDENTITY)
+        "/slimapi/vcs?v=4&directory=/w&directory=/w", headers=IDENTITY)
     assert resp.status_code == 200
     assert seen[0].headers.get(DIRECTORY_HEADER) == "/w"
 
@@ -596,7 +624,7 @@ async def test_v3_header_only_directory_retired(stack):
     """Terminal §5.7: the header-only channel is retired on consuming
     routes — the query channel (?directory=) is the canonical form."""
     client, seen = stack
-    resp = await client.get("/slimapi/vcs?v=3",
+    resp = await client.get("/slimapi/vcs?v=4",
                             headers={**IDENTITY, DIRECTORY_HEADER: "/w"})
     assert resp.status_code == 400
     assert orjson.loads(resp.content)["code"] == "directory_header_retired"
@@ -606,7 +634,7 @@ async def test_v3_header_only_directory_retired(stack):
 async def test_v3_invalid_directory_selector_on_find(stack):
     client, _ = stack
     resp = await client.get(
-        "/slimapi/find/file?v=3&query=q&directory=/a&directory=/b",
+        "/slimapi/find/file?v=4&query=q&directory=/a&directory=/b",
         headers=IDENTITY)
     assert resp.status_code == 400
     assert orjson.loads(resp.content)["code"] == "invalid_directory_selector"
@@ -617,7 +645,7 @@ async def test_v3_directory_not_stripped_on_tolerant_route(stack):
     # Non-consuming route: directory query survives (tolerant-ignore, no
     # consumption) and forwards upstream verbatim with the raw query.
     resp = await client.get(
-        "/slimapi/global/health?v=3&directory=/w", headers=IDENTITY)
+        "/slimapi/global/health?v=4&directory=/w", headers=IDENTITY)
     assert resp.status_code == 200
     assert seen[0].headers.get(DIRECTORY_HEADER) is None
     assert seen[0].url.query.decode("latin-1") == "directory=/w"
@@ -637,14 +665,14 @@ async def test_v3_missing_selector_on_read_route_gated(stack):
     resp = await client.get("/slimapi/file?path=r", headers=IDENTITY)
     assert resp.status_code == 400
     assert orjson.loads(resp.content) == {
-        "code": "unsupported_version", "supported": [3, 4]}
+        "code": "unsupported_version", "supported": [4]}
 
 
 async def test_missing_required_query_params_422(stack):
     client, _ = stack
-    resp = await client.get("/slimapi/file?v=3", headers=IDENTITY)
+    resp = await client.get("/slimapi/file?v=4", headers=IDENTITY)
     assert resp.status_code == 422
-    resp = await client.get("/slimapi/find/file?v=3", headers=IDENTITY)
+    resp = await client.get("/slimapi/find/file?v=4", headers=IDENTITY)
     assert resp.status_code == 422
 
 
@@ -667,7 +695,7 @@ async def test_2xx_frozen_header_passthrough_set():
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport,
                                  base_url="http://t") as client:
-        resp = await client.get("/slimapi/vcs?v=3", headers=IDENTITY)
+        resp = await client.get("/slimapi/vcs?v=4", headers=IDENTITY)
         assert resp.status_code == 200
         assert resp.headers["location"] == "https://upstream.example/next"
         assert resp.headers["retry-after"] == "3"
@@ -692,7 +720,7 @@ async def test_4xx_frozen_header_passthrough_set():
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport,
                                  base_url="http://t") as client:
-        resp = await client.get("/slimapi/vcs?v=3", headers=IDENTITY)
+        resp = await client.get("/slimapi/vcs?v=4", headers=IDENTITY)
         assert resp.status_code == 429
         assert resp.content == b'{"error": "slow_down"}'
         assert resp.headers["content-type"].startswith("application/json")
@@ -720,13 +748,13 @@ async def test_upstream_gzip_entity_decoded_recoded_not_passed_through():
         # httpx decoded the upstream entity; identity client ⇒ the sidecar
         # re-emits the decoded bytes with NO coding header (entity-byte
         # semantics — the upstream's own coding header never leaks).
-        resp = await client.get("/slimapi/vcs?v=3", headers=IDENTITY)
+        resp = await client.get("/slimapi/vcs?v=4", headers=IDENTITY)
         assert resp.status_code == 200
         assert resp.content == raw
         assert "content-encoding" not in resp.headers
         # gzip client ⇒ the sidecar re-compresses under its own gate with
         # its own weak validator (§6.1 sidecar-owned ETag domain).
-        resp2 = await client.get("/slimapi/vcs?v=3",
+        resp2 = await client.get("/slimapi/vcs?v=4",
                                  headers={"Accept-Encoding": "gzip"})
         assert resp2.headers.get("content-encoding") == "gzip"
         assert resp2.headers["etag"].startswith("W/")
@@ -749,7 +777,7 @@ async def test_upstream_success_status_and_body_verbatim(status):
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport,
                                  base_url="http://t") as client:
-        resp = await client.get("/slimapi/vcs?v=3", headers=IDENTITY)
+        resp = await client.get("/slimapi/vcs?v=4", headers=IDENTITY)
         assert resp.status_code == status
         assert resp.content == body
 
@@ -762,7 +790,7 @@ async def test_upstream_204_empty_body_no_etag_no_gzip():
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport,
                                  base_url="http://t") as client:
-        resp = await client.get("/slimapi/vcs?v=3", headers=IDENTITY)
+        resp = await client.get("/slimapi/vcs?v=4", headers=IDENTITY)
         assert resp.status_code == 204
         assert resp.content == b""
         # Empty body: gzip benefit gate skips coding; no entity → no ETag.
@@ -785,7 +813,7 @@ async def test_upstream_301_not_followed_location_passthrough():
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport,
                                  base_url="http://t") as client:
-        resp = await client.get("/slimapi/vcs?v=3", headers=IDENTITY)
+        resp = await client.get("/slimapi/vcs?v=4", headers=IDENTITY)
         assert resp.status_code == 301
         assert resp.content == b"moved"
         assert resp.headers["location"] == "/vcs/status"
@@ -858,7 +886,7 @@ async def test_v3_tolerant_route_invalid_directory_passthrough():
                                  base_url="http://t") as client:
         # §5.5 tolerant-ignore = no consumption, no validation: the raw
         # bytes pass through untouched (aligned with events etc.).
-        resp = await client.get("/slimapi/global/health?v=3&directory=../..",
+        resp = await client.get("/slimapi/global/health?v=4&directory=../..",
                                 headers=IDENTITY)
         assert resp.status_code == 200
         assert seen[0].url.query.decode("latin-1") == "directory=../.."
@@ -881,7 +909,7 @@ async def test_session_single_pool_saturation_transform_busy():
     async with httpx.AsyncClient(transport=transport,
                                  base_url="http://t") as client:
         async with app.state.transforms:  # occupy the single slot
-            resp = await client.get("/slimapi/session/s1?v=3",
+            resp = await client.get("/slimapi/session/s1?v=4",
                                     headers=IDENTITY)
         assert resp.status_code == 503
         assert resp.json()["code"] == "transform_busy"
@@ -903,7 +931,7 @@ async def test_raw_route_unaffected_by_pool_saturation():
     async with httpx.AsyncClient(transport=transport,
                                  base_url="http://t") as client:
         async with app.state.transforms:  # occupy the single slot
-            resp = await client.get("/slimapi/vcs?v=3", headers=IDENTITY)
+            resp = await client.get("/slimapi/vcs?v=4", headers=IDENTITY)
         assert resp.status_code == 200
         assert resp.content == payloads["/vcs"]
         assert len(seen) == 1
@@ -931,11 +959,11 @@ async def test_session_single_204_empty_body_verbatim_no_projection(monkeypatch)
         return httpx.Response(204,
                               headers={"Content-Type": "application/json"})
 
-    app, _ = _build_app(handler)
+    app, _ = _build_app(handler, selector=False)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport,
                                  base_url="http://t") as client:
-        resp = await client.get("/slimapi/session/s1?v=3", headers=IDENTITY)
+        resp = await client.get("/slimapi/session/s1", headers=IDENTITY)
         assert resp.status_code == 204
         assert resp.content == b""
         assert calls == []  # never projected
@@ -949,11 +977,11 @@ async def test_session_single_301_non_json_verbatim_no_projection(monkeypatch):
                               headers={"Location": "/session/s2",
                                        "Content-Type": "text/plain"})
 
-    app, _ = _build_app(handler)
+    app, _ = _build_app(handler, selector=False)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport,
                                  base_url="http://t") as client:
-        resp = await client.get("/slimapi/session/s1?v=3", headers=IDENTITY)
+        resp = await client.get("/slimapi/session/s1", headers=IDENTITY)
         assert resp.status_code == 301
         assert resp.content == b"moved"
         assert resp.headers["location"] == "/session/s2"
@@ -969,7 +997,7 @@ async def test_session_single_200_bad_json_503():
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport,
                                  base_url="http://t") as client:
-        resp = await client.get("/slimapi/session/s1?v=3", headers=IDENTITY)
+        resp = await client.get("/slimapi/session/s1?v=4", headers=IDENTITY)
         assert resp.status_code == 503
         assert resp.json()["code"] == "upstream_unavailable"
 
@@ -983,7 +1011,7 @@ async def test_session_single_200_non_dict_503():
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport,
                                  base_url="http://t") as client:
-        resp = await client.get("/slimapi/session/s1?v=3", headers=IDENTITY)
+        resp = await client.get("/slimapi/session/s1?v=4", headers=IDENTITY)
         assert resp.status_code == 503
         assert resp.json()["code"] == "upstream_unavailable"
 
@@ -1003,7 +1031,7 @@ async def test_upstream_4xx_oversize_error_body_degrades_503():
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport,
                                  base_url="http://t") as client:
-        resp = await client.get("/slimapi/vcs?v=3", headers=IDENTITY)
+        resp = await client.get("/slimapi/vcs?v=4", headers=IDENTITY)
         # Resource protection wins over the verbatim duty (§10.a frozen).
         assert resp.status_code == 503
         assert resp.json()["code"] == "upstream_unavailable"
@@ -1020,6 +1048,6 @@ async def test_upstream_5xx_oversize_error_body_degrades_503():
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport,
                                  base_url="http://t") as client:
-        resp = await client.get("/slimapi/vcs?v=3", headers=IDENTITY)
+        resp = await client.get("/slimapi/vcs?v=4", headers=IDENTITY)
         assert resp.status_code == 503
         assert resp.json()["code"] == "upstream_unavailable"

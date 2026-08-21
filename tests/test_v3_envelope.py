@@ -183,7 +183,7 @@ async def test_messages_retired_v2_forms_rejected(client_factory):
         explicit = await client.get(
             "/slimapi/messages/s1?v=2", headers=V2_HEADERS)
         assert implicit.status_code == explicit.status_code == 400
-        expected = {"code": "unsupported_version", "supported": [3, 4]}
+        expected = {"code": "unsupported_version", "supported": [4]}
         assert orjson.loads(implicit.content) == expected
         assert orjson.loads(explicit.content) == expected
     finally:
@@ -239,7 +239,7 @@ async def test_messages_retired_v2_304_form_rejected(client_factory):
     link = '</session/s1/message?limit=40&before=CURSOR123>; rel="next"'
     client = await client_factory(_message_handler(link=link))
     try:
-        first = await client.get("/slimapi/messages/s1?v=3", headers=IDENTITY)
+        first = await client.get("/slimapi/messages/s1?v=4", headers=IDENTITY)
         etag = first.headers["ETag"]
         reval = await client.get(
             "/slimapi/messages/s1",
@@ -256,54 +256,42 @@ async def test_messages_retired_v2_304_form_rejected(client_factory):
 # ---------------------------------------------------------------------------
 
 async def test_sessions_v3_envelope_complete_true(client_factory):
-    """Terminal §4: the sessions list body is the
-    {"items":…,"complete":true} envelope; X-Complete is never produced."""
+    """B12-② guard net, temporarily flipped at the 2026-08-21 narrowing
+    (V2b deletes; the v4 global-list envelope is locked in
+    test_sessions_v4_matrix / test_terminal_matrix)."""
     client = await client_factory(_message_handler())
     try:
         v3 = await client.get("/slimapi/sessions?v=3", headers=IDENTITY)
-        assert v3.status_code == 200
-        assert v3.content.startswith(b'{"items":')
-        body = orjson.loads(v3.content)
-        assert list(body.keys()) == ["items", "complete"]
-        assert body["complete"] is True
-        assert body["items"] == [{"id": "s1", "title": "one"},
-                                 {"id": "s2", "title": "two"}]
-        assert "nextCursor" not in body
-        assert "x-complete" not in v3.headers
+        assert v3.status_code == 400
+        assert orjson.loads(v3.content) == {
+            "code": "unsupported_version", "supported": [4]}
     finally:
         await client.aclose()
 
 
 async def test_sessions_v3_envelope_complete_false(client_factory):
-    """?limit=1 with a 2-item upstream page → complete=false in the envelope."""
+    """B12-② guard net, temporarily flipped at the 2026-08-21 narrowing
+    (V2b deletes)."""
     client = await client_factory(_message_handler())
     try:
         response = await client.get(
             "/slimapi/sessions?v=3&limit=1", headers=IDENTITY)
-        assert response.status_code == 200
-        body = orjson.loads(response.content)
-        assert body["complete"] is False
-        assert len(body["items"]) == 2
-        assert "x-complete" not in response.headers
+        assert response.status_code == 400
+        assert orjson.loads(response.content) == {
+            "code": "unsupported_version", "supported": [4]}
     finally:
         await client.aclose()
 
 
 async def test_sessions_v3_304_no_x_complete_header(client_factory):
-    """§6.4: the 304 carries no X-Complete (the client reads ``complete``
-    from the cached envelope)."""
+    """B12-② guard net, temporarily flipped at the 2026-08-21 narrowing
+    (V2b deletes)."""
     client = await client_factory(_message_handler())
     try:
         v3_first = await client.get("/slimapi/sessions?v=3", headers=IDENTITY)
-        etag = v3_first.headers["ETag"]
-        v3_reval = await client.get(
-            "/slimapi/sessions?v=3",
-            headers={**IDENTITY, "If-None-Match": etag},
-        )
-        assert v3_reval.status_code == 304
-        assert v3_reval.content == b""
-        assert "x-complete" not in v3_reval.headers
-        assert "X-Complete" not in v3_reval.headers
+        assert v3_first.status_code == 400
+        assert orjson.loads(v3_first.content) == {
+            "code": "unsupported_version", "supported": [4]}
     finally:
         await client.aclose()
 
@@ -331,8 +319,13 @@ async def test_sessions_error_response_not_enveloped(client_factory):
 
     client = await client_factory(handler)
     try:
+        # B12-② guard net, temporarily flipped at the 2026-08-21 narrowing
+        # (V2b deletes; the v4 5xx pipeline is locked in
+        # test_sessions_v4_matrix).
         response = await client.get("/slimapi/sessions?v=3", headers=IDENTITY)
-        assert response.status_code == 503  # upstream 5xx → upstream_unavailable
+        assert response.status_code == 400
+        assert orjson.loads(response.content) == {
+            "code": "unsupported_version", "supported": [4]}
         body = orjson.loads(response.content)
         assert "items" not in body
         assert "code" in body

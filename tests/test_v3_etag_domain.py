@@ -136,12 +136,12 @@ async def test_retired_v2_request_never_issues_validator(client_factory):
         v2 = await client.get("/slimapi/messages/s1", headers=V2_HEADERS)
         assert v2.status_code == 400
         assert "etag" not in v2.headers
-        v3 = await client.get(
-            "/slimapi/messages/s1?v=3", headers=IDENTITY)
-        assert v3.status_code == 200
+        v4 = await client.get(
+            "/slimapi/messages/s1?v=4", headers=IDENTITY)
+        assert v4.status_code == 200
         reval = await client.get(
-            "/slimapi/messages/s1?v=3",
-            headers={**IDENTITY, "If-None-Match": v3.headers["ETag"]},
+            "/slimapi/messages/s1?v=4",
+            headers={**IDENTITY, "If-None-Match": v4.headers["ETag"]},
         )
         assert reval.status_code == 304
     finally:
@@ -155,8 +155,8 @@ async def test_v3_validator_on_retired_v2_form_rejected(client_factory):
         200, content=_message_payload(),
         headers={"Content-Type": "application/json"}))
     try:
-        v3 = await client.get("/slimapi/messages/s1?v=3", headers=IDENTITY)
-        v3_etag = v3.headers["ETag"]
+        v4 = await client.get("/slimapi/messages/s1?v=4", headers=IDENTITY)
+        v3_etag = v4.headers["ETag"]
         v2 = await client.get(
             "/slimapi/messages/s1",
             headers={**V2_HEADERS, "If-None-Match": v3_etag},
@@ -217,28 +217,18 @@ async def test_v4_etag_changes_with_envelope_content(client_factory):
 
 
 async def test_v3_304_header_set_exact_sessions(client_factory):
-    """§6.4 on the sessions route: 304 carries ETag + Vary + no-store and
-    nothing pagination-related; Vary keeps the directory dimension."""
+    """B12-② guard net, temporarily flipped at the 2026-08-21 narrowing
+    (V2b deletes): the v3 sessions 304 face is now the unsupported-version
+    400 (the v4 global-list 304 face is locked in
+    test_vary_directory_unconditional / test_sessions_v4_representation)."""
     client = await client_factory(lambda req: httpx.Response(
         200, content=_sessions_payload(),
         headers={"Content-Type": "application/json"}))
     try:
         first = await client.get("/slimapi/sessions?v=3", headers=IDENTITY)
-        etag = first.headers["ETag"]
-        # §6.2 terminal: Vary shrinks to the single Accept-Encoding value.
-        assert first.headers["Vary"] == "Accept-Encoding"
-        reval = await client.get(
-            "/slimapi/sessions?v=3",
-            headers={**IDENTITY, "If-None-Match": etag},
-        )
-        assert reval.status_code == 304
-        assert reval.content == b""
-        assert reval.headers["ETag"] == etag
-        assert reval.headers["Cache-Control"] == "no-store"
-        assert reval.headers["Vary"] == first.headers["Vary"]
-        assert "x-complete" not in reval.headers
-        assert "X-Complete" not in reval.headers
-        assert "x-next-cursor" not in reval.headers
+        assert first.status_code == 400
+        assert orjson.loads(first.content) == {
+            "code": "unsupported_version", "supported": [4]}
     finally:
         await client.aclose()
 
@@ -250,8 +240,10 @@ async def test_vary_never_mentions_v_or_directory_params(client_factory):
         200, content=_sessions_payload(),
         headers={"Content-Type": "application/json"}))
     try:
+        # 2026-08-21 narrowing: run on a consuming non-retired route
+        # (messages; sessions retires directory in v4).
         response = await client.get(
-            "/slimapi/sessions?v=3&directory=/w", headers=IDENTITY)
+            "/slimapi/messages/s1?v=4&directory=/w", headers=IDENTITY)
         assert response.status_code == 200
         vary = response.headers["Vary"]
         # §6.2 terminal: single value — neither v, directory, nor the

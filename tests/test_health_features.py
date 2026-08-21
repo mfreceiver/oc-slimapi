@@ -12,7 +12,7 @@ async def test_health_features_advertise_four_new_capabilities():
     app.state.deployment_revision = None
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
-        r = await c.get("/slimapi/health?v=3", headers={"Accept-Encoding": "identity"})
+        r = await c.get("/slimapi/health?v=4", headers={"Accept-Encoding": "identity"})
         f = r.json()["features"]
         assert all(f[k] is True for k in
                    ("tokenCoalesce", "permissionEvents", "serverMerge", "transformAbsorb"))

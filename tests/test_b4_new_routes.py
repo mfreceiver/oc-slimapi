@@ -147,7 +147,7 @@ def _send(client, method: str, path: str, *, content=b"",
     if content_type is not None:
         h.setdefault("Content-Type", content_type)
     h.setdefault("Accept-Encoding", "identity")
-    url = f"/slimapi{path}?v=3{extra_query}"
+    url = f"/slimapi{path}?v=4{extra_query}"
     return client.request(method, url, content=content, headers=h)
 
 

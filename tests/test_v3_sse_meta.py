@@ -151,9 +151,14 @@ def _settings(**overrides) -> Settings:
 
 def _build_app(
     *, hubs: _FakeHubs | None = None, token_registry=None,
+    selector: bool = True,
 ) -> FastAPI:
     app = FastAPI(title="v3-sse-meta-test")
-    app.add_middleware(SlimapiSelectorMiddleware)
+    # 2026-08-21 narrowing: the v3 SSE guard net below runs selector-less
+    # (direct invocation → the route's default v3 view) — the v3 branch is
+    # still in src; V2b removes the branch together with these guards.
+    if selector:
+        app.add_middleware(SlimapiSelectorMiddleware)
     app.state.config = _settings()
     app.state.schema_degraded = False
     app.state.deployment_revision = None
@@ -234,8 +239,8 @@ def _assert_meta(frame, *, tokens: bool, subscriber_id: str | None = None):
 async def test_v3_events_meta_first_frame_default_tokens_false():
     hubs = _FakeHubs()
     _put_business_frame(hubs.sub)
-    app = _build_app(hubs=hubs)
-    response, body = await _read_stream(app, "/slimapi/events?v=3")
+    app = _build_app(hubs=hubs, selector=False)
+    response, body = await _read_stream(app, "/slimapi/events")
     assert response.status_code == 200
     frames = list(_frames(body))
     _assert_meta(frames[0], tokens=False, subscriber_id="sub_test")
@@ -246,8 +251,8 @@ async def test_v3_events_meta_first_frame_default_tokens_false():
 async def test_v3_events_meta_tokens_true_with_tokens_param():
     hubs = _FakeHubs()
     _put_business_frame(hubs.sub)
-    app = _build_app(hubs=hubs)
-    response, body = await _read_stream(app, "/slimapi/events?v=3&tokens=1")
+    app = _build_app(hubs=hubs, selector=False)
+    response, body = await _read_stream(app, "/slimapi/events?tokens=1")
     assert response.status_code == 200
     frames = list(_frames(body))
     _assert_meta(frames[0], tokens=True, subscriber_id="sub_test")
@@ -257,9 +262,9 @@ async def test_v3_events_meta_before_resync_replay():
     """meta precedes the Last-Event-ID reconnect_no_replay resync frame."""
     hubs = _FakeHubs()
     hubs.sub.queue.put_nowait(HUB_STOP)
-    app = _build_app(hubs=hubs)
+    app = _build_app(hubs=hubs, selector=False)
     response, body = await _read_stream(
-        app, "/slimapi/events?v=3", headers={"Last-Event-ID": "anything"},
+        app, "/slimapi/events", headers={"Last-Event-ID": "anything"},
     )
     assert response.status_code == 200
     frames = list(_frames(body))
@@ -272,7 +277,7 @@ async def test_v4_events_response_has_no_subscriber_id_header():
     never carries X-Slimapi-Subscriber-ID either."""
     hubs = _FakeHubs()
     _put_business_frame(hubs.sub)
-    app = _build_app(hubs=hubs)
+    app = _build_app(hubs=hubs, selector=False)
     response, _ = await _read_stream(app, "/slimapi/events?v=4")
     assert "x-slimapi-subscriber-id" not in response.headers
 
@@ -290,7 +295,7 @@ async def test_v2_events_form_rejected_before_stream():
     )
     assert response.status_code == 400
     assert orjson.loads(body) == {
-        "code": "unsupported_version", "supported": [3, 4]}
+        "code": "unsupported_version", "supported": [4]}
     assert "text/event-stream" not in response.headers.get(
         "content-type", "")
     assert "x-slimapi-subscriber-id" not in response.headers
@@ -315,9 +320,9 @@ async def test_v2_events_explicit_selector_rejected():
 async def test_v3_stream_meta_first_tokens_true():
     registry = _FakeTokenRegistry()
     _put_handshake(registry.sub)
-    app = _build_app(token_registry=registry)
+    app = _build_app(token_registry=registry, selector=False)
     response, body = await _read_stream(
-        app, f"/slimapi/sessions/{SID}/stream?v=3",
+        app, f"/slimapi/sessions/{SID}/stream",
     )
     assert response.status_code == 200
     frames = list(_frames(body))
@@ -329,9 +334,9 @@ async def test_v3_stream_meta_first_tokens_true():
 async def test_v3_stream_meta_before_resync_replay():
     registry = _FakeTokenRegistry()
     _put_handshake(registry.sub)
-    app = _build_app(token_registry=registry)
+    app = _build_app(token_registry=registry, selector=False)
     response, body = await _read_stream(
-        app, f"/slimapi/sessions/{SID}/stream?v=3",
+        app, f"/slimapi/sessions/{SID}/stream",
         headers={"Last-Event-ID": "anything"},
     )
     assert response.status_code == 200
@@ -346,7 +351,7 @@ async def test_v4_stream_response_has_no_subscriber_id_header():
     never carries X-Slimapi-Subscriber-ID either."""
     registry = _FakeTokenRegistry()
     _put_handshake(registry.sub)
-    app = _build_app(token_registry=registry)
+    app = _build_app(token_registry=registry, selector=False)
     response, _ = await _read_stream(
         app, f"/slimapi/sessions/{SID}/stream?v=4",
     )
@@ -361,9 +366,9 @@ async def test_v3_stream_identity_despite_gzip_accept():
     bytes (byte-exact meta + handshake sequence)."""
     registry = _FakeTokenRegistry()
     _put_handshake(registry.sub)
-    app = _build_app(token_registry=registry)
+    app = _build_app(token_registry=registry, selector=False)
     response, body = await _read_stream(
-        app, f"/slimapi/sessions/{SID}/stream?v=3",
+        app, f"/slimapi/sessions/{SID}/stream",
         headers={"Accept-Encoding": "gzip"},
     )
     assert response.status_code == 200
@@ -395,7 +400,7 @@ async def test_v2_stream_form_rejected_before_stream():
     )
     assert response.status_code == 400
     assert orjson.loads(body) == {
-        "code": "unsupported_version", "supported": [3, 4]}
+        "code": "unsupported_version", "supported": [4]}
     assert "text/event-stream" not in response.headers.get(
         "content-type", "")
     assert "x-slimapi-subscriber-id" not in response.headers
@@ -423,8 +428,8 @@ async def test_v3_events_close_after_meta_pairs_lifecycle(capture_logger, monkey
         sse_observability, "_access_logger", lambda: capture_logger)
     hubs = _FakeHubs()
     hubs.sub.queue.put_nowait(HUB_STOP)  # meta, then immediate end-of-stream
-    app = _build_app(hubs=hubs)
-    response, body = await _read_stream(app, "/slimapi/events?v=3")
+    app = _build_app(hubs=hubs, selector=False)
+    response, body = await _read_stream(app, "/slimapi/events")
     assert response.status_code == 200
     frames = list(_frames(body))
     _assert_meta(frames[0], tokens=False)  # the meta frame was delivered
@@ -436,7 +441,8 @@ async def test_v3_events_close_after_meta_pairs_lifecycle(capture_logger, monkey
     assert open_row["recordType"] == "sse_open"
     assert close_row["recordType"] == "sse_close"
     assert open_row["lifecycleId"] == close_row["lifecycleId"]
-    assert open_row["selectorResult"] == "v3"
+    # selector-less stack → no selector stash → the absent dim (row field None)
+    assert open_row["selectorResult"] is None
 
 
 async def test_v3_stream_close_after_meta_pairs_lifecycle(capture_logger, monkeypatch):
@@ -446,9 +452,9 @@ async def test_v3_stream_close_after_meta_pairs_lifecycle(capture_logger, monkey
         sse_observability, "_access_logger", lambda: capture_logger)
     registry = _FakeTokenRegistry()
     registry.sub.queue.put_nowait(TOKEN_STOP)
-    app = _build_app(token_registry=registry)
+    app = _build_app(token_registry=registry, selector=False)
     response, body = await _read_stream(
-        app, f"/slimapi/sessions/{SID}/stream?v=3",
+        app, f"/slimapi/sessions/{SID}/stream",
     )
     assert response.status_code == 200
     frames = list(_frames(body))
@@ -461,7 +467,8 @@ async def test_v3_stream_close_after_meta_pairs_lifecycle(capture_logger, monkey
     assert open_row["recordType"] == "sse_open"
     assert close_row["recordType"] == "sse_close"
     assert open_row["lifecycleId"] == close_row["lifecycleId"]
-    assert open_row["selectorResult"] == "v3"
+    # selector-less stack → no selector stash → the absent dim (row field None)
+    assert open_row["selectorResult"] is None
     assert open_row["bucket"] == "token_stream_sse"
 
 

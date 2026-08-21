@@ -72,33 +72,12 @@ BASELINE_HEALTH_V3_BODY = (
 # Revision-2 ACTIVATED state (integration close-out): readiness
 # {ready:true, required = satisfied = ten-ID normalized universe (incl.
 # session.post-actions.v4)} + the §14 expand block follow the four static
-# keys on the "4" face; the "3" face is byte-frozen. Regenerate:
+# keys on the "4" face. 2026-08-21 narrowing (intentional wire change,
+# v4-contract §0.3 revision): the "3" face key is GONE and available
+# collapsed to [4]. Regenerate:
 #   .venv/bin/python tests/test_v3_rawbody_regression.py --capture
 BASELINE_VERSIONS_BODY = (
-    b'{"current":4,"available":[3,4],"capabilities":{"3":{"envelope"'
-    b':["messages","sessions"],"directoryQuery":true,"versionHeaderO'
-    b'ptional":true,"writeRoutes":true,"readRoutes":["file","vcs","f'
-    b'ind","providers","sessionSingle","activeSessions","globalHealt'
-    b'h"],"expand":{"categories":["info_summary_diffs","part_text","'
-    b'part_reasoning","part_state_output","part_state_error","part_s'
-    b'tate_input_full","part_state_metadata_full","part_state_attach'
-    b'ments","part_url","part_source","part_snapshot","compaction_fu'
-    b'll"],"fragmentMaxBytes":8388608}},"4":{"globalSessions":true,"'
-    b'auxiliaryFilters":true,"sseReplay":true,"qpImmediateFull":true'
-    b',"readiness":{"ready":true,"required":["events.global.replay.v'
-    b'4","events.token.replay.v4","messages.expand.v4","method.bound'
-    b'ary.v4","providers.redacted.v4","representation.vary.v4","sele'
-    b'ctor.v4","session.list.global.v4","session.post-actions.v4","s'
-    b'ession.single.projection.v4"],"satisfied":["events.global.repl'
-    b'ay.v4","events.token.replay.v4","messages.expand.v4","method.b'
-    b'oundary.v4","providers.redacted.v4","representation.vary.v4","'
-    b'selector.v4","session.list.global.v4","session.post-actions.v4'
-    b'","session.single.projection.v4"]},"expand":{"categories":["in'
-    b'fo_summary_diffs","part_text","part_reasoning","part_state_out'
-    b'put","part_state_error","part_state_input_full","part_state_me'
-    b'tadata_full","part_state_attachments","part_url","part_source"'
-    b',"part_snapshot","compaction_full"],"fragmentMaxBytes":8388608'
-    b'}}},"sidecarVersion":"<SIDECAR_VERSION>"}'
+    b'{"current":4,"available":[4],"capabilities":{"4":{"globalSessions":true,"auxiliaryFilters":true,"sseReplay":true,"qpImmediateFull":true,"readiness":{"ready":true,"required":["events.global.replay.v4","events.token.replay.v4","messages.expand.v4","method.boundary.v4","providers.redacted.v4","representation.vary.v4","selector.v4","session.list.global.v4","session.post-actions.v4","session.single.projection.v4"],"satisfied":["events.global.replay.v4","events.token.replay.v4","messages.expand.v4","method.boundary.v4","providers.redacted.v4","representation.vary.v4","selector.v4","session.list.global.v4","session.post-actions.v4","session.single.projection.v4"]},"expand":{"categories":["info_summary_diffs","part_text","part_reasoning","part_state_output","part_state_error","part_state_input_full","part_state_metadata_full","part_state_attachments","part_url","part_source","part_snapshot","compaction_full"],"fragmentMaxBytes":8388608}}},"sidecarVersion":"<SIDECAR_VERSION>"}'
 )
 # ------------------------------------------------------------------------
 
@@ -196,24 +175,23 @@ def _fetch_pinned() -> dict:
 
 
 async def test_sessions_v3_raw_body_bytes():
+    """B12-② byte anchor, temporarily flipped at the 2026-08-21 narrowing
+    (V2b deletes): the v3 sessions raw-body face is now the
+    unsupported-version 400."""
     pinned = _fetch_pinned()["sessions"]
-    assert pinned["status"] == 200
-    assert pinned["content_type"] == "application/json"
-    assert pinned["vary"] == "Accept-Encoding"
-    assert bytes.fromhex(pinned["body_hex"]) == \
-        bytes.fromhex(BASELINE_SESSIONS_V3_BODY_HEX), (
-            "v3 sessions body 逐字节漂移（有意变更请 --capture 回填 + review）"
-        )
-    assert pinned["etag"] == BASELINE_SESSIONS_V3_ETAG
+    assert pinned["status"] == 400
+    assert orjson.loads(bytes.fromhex(pinned["body_hex"])) == {
+        "code": "unsupported_version", "supported": [4]}
 
 
 async def test_health_v3_raw_body_bytes():
+    """B12-② byte anchor, temporarily flipped at the 2026-08-21 narrowing
+    (V2b deletes): the v3 health raw-body face is now the
+    unsupported-version 400."""
     resp = (await _fetch_all())["health"]
-    assert resp.status_code == 200
-    assert resp.headers["content-type"] == "application/json"
-    live = _normalize_versioned(resp.content)
-    base = _normalize_versioned(BASELINE_HEALTH_V3_BODY)
-    assert live == base, "v3 health body 逐字节漂移"
+    assert resp.status_code == 400
+    assert orjson.loads(resp.content) == {
+        "code": "unsupported_version", "supported": [4]}
 
 
 async def test_versions_raw_body_bytes():
@@ -233,18 +211,13 @@ async def test_v3_sessions_key_order_nondeterminism_recorded():
     键序——本测试不失败地记录该事实（两者恰相同时也通过）。修复归属
     skeleton.py 写域（非本任务）；修复后本测试应升级为无条件逐字节。
     """
-    pinned_items = orjson.loads(
-        bytes.fromhex(_fetch_pinned()["sessions"]["body_hex"]))["items"]
-    live_resp = (await _fetch_all())["sessions"]
-    live_items = orjson.loads(live_resp.content)["items"]
-    # 语义等价恒成立；键序可能不同（记录性断言，不构成回归门槛）
-    assert [sorted(i) for i in pinned_items] == [sorted(i) for i in live_items]
-    # rev gate MINOR-2：dict == 忽略键序（恒真断言）——改为比较键**序列**
-    # （序列化字节等价：orjson 序列化按插入序输出键）。
-    pinned_key_seq = [list(i.keys()) for i in pinned_items]
-    live_key_seq = [list(i.keys()) for i in live_items]
-    same_order = pinned_key_seq == live_key_seq
-    print(f"v3 sessions item key order identical across seeds: {same_order}")
+    # 2026-08-21 收窄（临时翻转，V2b 删）：v3 sessions 两侧均为 400 错误体
+    #（不再有 items 键序可言）；保留发现锚壳，拆除期随本文件其余 v3 锚一并删。
+    pinned_body = orjson.loads(bytes.fromhex(_fetch_pinned()["sessions"]["body_hex"]))
+    live_body = orjson.loads((await _fetch_all())["sessions"].content)
+    assert pinned_body == live_body == {
+        "code": "unsupported_version", "supported": [4]}
+    print("v3 sessions item key order anchor retired with the v3 face")
 
 
 def _capture() -> int:  # pragma: no cover - 维护入口

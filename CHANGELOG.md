@@ -26,6 +26,16 @@ ocdroid 对接时：
 
 ---
 
+## [Unreleased] — 版本窗收窄 + v3 退役（v4 分支，目标 5.0.0 major）
+
+### Changed
+
+- **版本窗收窄为 v4-only（v4-contract §0 修订，2026-08-21）**：`ACCEPTED_CLIENT_VERSIONS (3,4) → (4,4)`。`?v=3`、无 `v`、其他非 4 版本 → 400 `unsupported_version` `supported:[4]`。原 (3,4) 永久双版本裁决被覆盖；v3-contract 标记为历史存档。
+- **v3 面物理拆除**：selector v3 管线、providers v3 passthrough、SSE v3 半区、`routes/versions.py` `caps["3"]` 面等删除。`rg "v=3|\"3\"" src/` 只余历史注记类。
+- **测试清理**：v3 守护网文件（`test_access_log_v3_fields` ×4、`test_sse_replay_wire` ×13）随 v3 半区删除/改写；B12 白名单 ② 类文件随拆；全仓 `rg -l 'v=3|"3"' tests/` 零命中。
+- **契约同步**：`v4-contract.md` §0.3/§9.4/§2 状态表/§0.1 等窗口表述全量修订为 v4-only；`v3-contract.md` 头部加退役存档章（正文零改动）；`INTERFACE_MAP.md` 全局头更新为 v4-only。
+- **金样重录**：W2/N6 双金样测试请求改 `?v=4` 后重录，ETag wire=v4 域标记。
+
 ## [4.7.0] - 2026-08-21 — 审计整改批次三 Wave 3：大拆分 + B12 测试字面化（包版本 minor；wire 版本**不变**，仍 (3,4)；**纯重构零 wire 变更**——N6+W2 双金样 46 case 回放逐字节全等 + 全量测试兜底；实施设计 docs/ocmar/reviews/2026-08-21-wave3-refactor-design.md，独立评审门 8.1→8.6→9.5 PASS）
 
 ### Changed（纯内部重构，零 wire 变更）

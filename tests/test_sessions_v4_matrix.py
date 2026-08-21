@@ -99,7 +99,8 @@ class _StubAux:
         raise AuxiliaryUnavailableError(self._reason)
 
 
-def _build_app(aux, *, settings: Settings | None = None, handler=None):
+def _build_app(aux, *, settings: Settings | None = None, handler=None,
+                selector: bool = True):
     seen: list[httpx.Request] = []
 
     def recording(request: httpx.Request) -> httpx.Response:
@@ -129,7 +130,11 @@ def _build_app(aux, *, settings: Settings | None = None, handler=None):
     for router in (health.router, versions.router, sessions.router):
         app.include_router(router)
     register_error_handlers(app)
-    app.add_middleware(SlimapiSelectorMiddleware)
+    # selector=False → selector-less direct invocation (route default v3
+    # view): keeps the v3-branch guard tests below exercisable until V2b
+    # removes the branch (2026-08-21 narrowing note).
+    if selector:
+        app.add_middleware(SlimapiSelectorMiddleware)
     install_proxy(app)
     return app, seen
 
@@ -576,7 +581,7 @@ async def test_v4_gate_off_no_etag_vary_304(tmp_path, monkeypatch):
 
 
 async def test_v3_v4_only_params_422():
-    app, seen = _build_app(_StubAux("disabled"))
+    app, seen = _build_app(_StubAux("disabled"), selector=False)
     async with _client(app) as client:
         for extra in ("archived=omit", "parent=all", "cursor=abc",
                       "archived=xyz", "archived=", "cursor="):
@@ -588,7 +593,7 @@ async def test_v3_v4_only_params_422():
 
 
 async def test_v3_roots_start_still_work():
-    app, seen = _build_app(_StubAux("disabled"))
+    app, seen = _build_app(_StubAux("disabled"), selector=False)
     async with _client(app) as client:
         resp = await client.get("/slimapi/sessions",
                                 params={"v": "3", "roots": "true",
@@ -613,11 +618,14 @@ async def test_v3_etag_present_vs_v4_gate_off_absent(tmp_path, monkeypatch):
         "events.token.replay.v4",
     }))
     aux = await _real_aux(tmp_path)
-    app, _ = _build_app(aux)
+    # 2026-08-21 narrowing: the v3 leg runs selector-less (default view);
+    # the v4 leg keeps the selector.
+    app3, _ = _build_app(aux, selector=False)
+    app4, _ = _build_app(aux)
     try:
-        async with _client(app) as client:
-            v3 = await client.get("/slimapi/sessions", params={"v": "3"},
-                                  headers=IDENTITY)
+        async with _client(app3) as client:
+            v3 = await client.get("/slimapi/sessions", headers=IDENTITY)
+        async with _client(app4) as client:
             v4 = await client.get("/slimapi/sessions", params={"v": "4"},
                                   headers=IDENTITY)
         assert v3.status_code == v4.status_code == 200
@@ -630,7 +638,7 @@ async def test_v3_etag_present_vs_v4_gate_off_absent(tmp_path, monkeypatch):
 
 
 async def test_v3_limit_1000_domain():
-    app, _ = _build_app(_StubAux("disabled"))
+    app, _ = _build_app(_StubAux("disabled"), selector=False)
     async with _client(app) as client:
         resp = await client.get("/slimapi/sessions",
                                 params={"v": "3", "limit": "1000"},
@@ -832,10 +840,10 @@ async def test_v3_model_object_passthrough_from_upstream():
             headers={"Content-Type": "application/json"},
         )
 
-    app, _ = _build_app(_StubAux("disabled"), handler=handler)
+    app, _ = _build_app(_StubAux("disabled"), handler=handler,
+                        selector=False)
     async with _client(app) as client:
-        resp = await client.get("/slimapi/sessions",
-                                params={"v": "3"}, headers=IDENTITY)
+        resp = await client.get("/slimapi/sessions", headers=IDENTITY)
     assert resp.status_code == 200
     items = resp.json()["items"]
     assert items[0]["model"] == {"id": "m-up", "providerID": "prov-up"}
@@ -853,10 +861,10 @@ async def test_v3_model_object_passthrough_from_upstream():
             headers={"Content-Type": "application/json"},
         )
 
-    app2, _ = _build_app(_StubAux("disabled"), handler=handler2)
+    app2, _ = _build_app(_StubAux("disabled"), handler=handler2,
+                         selector=False)
     async with _client(app2) as client:
-        resp2 = await client.get("/slimapi/sessions",
-                                 params={"v": "3"}, headers=IDENTITY)
+        resp2 = await client.get("/slimapi/sessions", headers=IDENTITY)
     assert resp2.status_code == 200
     assert resp2.json()["items"][0]["model"] == ["list", "from-upstream"]
 
@@ -1152,11 +1160,10 @@ async def test_marker_503_degraded_flag():
 
 
 async def test_marker_v3_path_fields_absent():
-    app, _ = _build_app(_StubAux("disabled"))
+    app, _ = _build_app(_StubAux("disabled"), selector=False)
     sink: list[dict] = []
     async with _client(_state_capturing(app, sink)) as client:
-        resp = await client.get("/slimapi/sessions",
-                                params={"v": "3"}, headers=IDENTITY)
+        resp = await client.get("/slimapi/sessions", headers=IDENTITY)
     assert resp.status_code == 200
     state = sink[-1]
     assert "slimapi_sessions_source" not in state

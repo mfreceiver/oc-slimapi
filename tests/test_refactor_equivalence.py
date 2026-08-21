@@ -61,7 +61,9 @@ _FROZEN_HEADERS = (
 )
 
 SESSIONS_BODY = orjson.dumps([
-    {"id": f"s{n}", "title": f"session {n}",
+    # v4 §13 canonical fallback 投影要求 directory/id/title/time.created/
+    # updated 全部可表示（缺席 → 整响应 503 fail-closed），mock 需带齐。
+    {"id": f"s{n}", "title": f"session {n}", "directory": f"/proj/{n}",
      "time": {"created": 1000 + n, "updated": 1000 + n}}
     for n in range(3)
 ])
@@ -243,11 +245,11 @@ async def _scenario_sessions_agent(cases: dict[str, str]) -> None:
     try:
         async with _client(app) as client:
             cases["sessions_200_gzip"] = await _wire_request(
-                client, "/slimapi/sessions?v=3", GZIP, 200)
+                client, "/slimapi/sessions?v=4", GZIP, 200)
             cases["sessions_200_identity"] = await _wire_request(
-                client, "/slimapi/sessions?v=3", IDENTITY, 200)
+                client, "/slimapi/sessions?v=4", IDENTITY, 200)
             cases["agent_200_gzip"] = await _wire_request(
-                client, "/slimapi/agent?v=3", GZIP, 200)
+                client, "/slimapi/agent?v=4", GZIP, 200)
     finally:
         _teardown(app)
 
@@ -269,7 +271,7 @@ async def _scenario_aggregate(cases: dict[str, str]) -> None:
             app = _app(_settings(), upstream, module.router)
             try:
                 async with _client(app) as client:
-                    path = f"/slimapi/{label}?v=3"
+                    path = f"/slimapi/{label}?v=4"
                     if flavour == "ok_identity":
                         headers = IDENTITY
                     else:
@@ -293,7 +295,7 @@ async def _scenario_aggregate(cases: dict[str, str]) -> None:
     try:
         async with _client(app) as client:
             cases["questions_discovery_5xx"] = await _wire_request(
-                client, "/slimapi/questions?v=3", GZIP, 503)
+                client, "/slimapi/questions?v=4", GZIP, 503)
     finally:
         _teardown(app)
 
@@ -304,7 +306,7 @@ async def _scenario_aggregate(cases: dict[str, str]) -> None:
     try:
         async with _client(app) as client:
             cases["questions_fanout_window12"] = await _wire_request(
-                client, "/slimapi/questions?v=3", GZIP, 200)
+                client, "/slimapi/questions?v=4", GZIP, 200)
     finally:
         _teardown(app)
 
@@ -321,11 +323,11 @@ async def _scenario_aggregate(cases: dict[str, str]) -> None:
     try:
         async with _client(app) as client:
             cases["questions_truncated"] = await _wire_request(
-                client, "/slimapi/questions?v=3", GZIP, 200)
+                client, "/slimapi/questions?v=4", GZIP, 200)
             # Guard the guard: the digest is only meaningful if this
             # envelope is genuinely the truncated branch (rev2 R-1 — a
             # silently-untriggered case pins the wrong bytes).
-            plain = await client.get("/slimapi/questions?v=3",
+            plain = await client.get("/slimapi/questions?v=4",
                                      headers=IDENTITY)
             assert plain.json().get("truncated") is True, (
                 "truncated case did not trigger truncation — budget "

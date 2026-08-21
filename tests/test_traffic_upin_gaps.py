@@ -234,7 +234,7 @@ async def test_write_route_stashes_upout(upstream_factory):
     async with httpx.AsyncClient(transport=transport,
                                  base_url="http://test") as client:
         response = await client.post(
-            "/slimapi/session/s1/command?v=3",
+            "/slimapi/session/s1/command?v=4",
             content=request_body,
         )
     assert response.status_code == 200

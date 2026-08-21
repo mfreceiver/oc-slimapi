@@ -116,7 +116,7 @@ async def test_unconfigured_file_route_is_byte_identical():
     app, seen = _build_file_app(_settings(), _file_ok)
     async with _client(app) as client:
         response = await client.get(
-            "/slimapi/file?v=3&path=foo&directory=/outside",
+            "/slimapi/file?v=4&path=foo&directory=/outside",
             headers={"Accept-Encoding": "identity"},
         )
     assert response.status_code == 200
@@ -129,7 +129,7 @@ async def test_unconfigured_file_route_is_byte_identical():
 async def test_empty_allowlist_blocks_all_file_routes(path, directory):
     app, seen = _build_file_app(_settings(directory_allowlist=[]), _file_ok)
     async with _client(app) as client:
-        query = "?v=3"
+        query = "?v=4"
         if directory is not None:
             query += "&directory=" + directory
         if path.endswith("/file") or path.endswith("/file/content"):
@@ -144,9 +144,9 @@ async def test_empty_allowlist_blocks_all_file_routes(path, directory):
 async def test_allowlist_file_route_allows_directory_subtree_and_blocks_prefix_trap():
     app, seen = _build_file_app(_settings(directory_allowlist=["/a", "/ab"]), _file_ok)
     async with _client(app) as client:
-        allowed = await client.get("/slimapi/file?v=3&path=foo&directory=/a/b")
-        exact = await client.get("/slimapi/file/status?v=3&directory=/ab")
-        blocked = await client.get("/slimapi/file/content?v=3&path=foo&directory=/abc")
+        allowed = await client.get("/slimapi/file?v=4&path=foo&directory=/a/b")
+        exact = await client.get("/slimapi/file/status?v=4&directory=/ab")
+        blocked = await client.get("/slimapi/file/content?v=4&path=foo&directory=/abc")
     assert allowed.status_code == 200
     assert exact.status_code == 200
     assert blocked.status_code == 403
@@ -258,7 +258,7 @@ async def test_symlink_escape_is_rejected_by_file_routes(tmp_path):
     )
     async with _client(app) as client:
         response = await client.get(
-            "/slimapi/file?v=3&path=foo&directory=" + str(allowed_root / "link"),
+            "/slimapi/file?v=4&path=foo&directory=" + str(allowed_root / "link"),
             headers={"Accept-Encoding": "identity"},
         )
     assert response.status_code == 403
@@ -280,7 +280,7 @@ async def test_symlink_chain_within_subtree_is_allowed(tmp_path):
     )
     async with _client(app) as client:
         response = await client.get(
-            "/slimapi/file?v=3&path=foo&directory=" + str(allowed_root / "link"),
+            "/slimapi/file?v=4&path=foo&directory=" + str(allowed_root / "link"),
             headers={"Accept-Encoding": "identity"},
         )
     assert response.status_code == 200
@@ -298,12 +298,12 @@ async def test_nonexistent_candidate_falls_back_to_lexical_subtree(tmp_path):
     )
     async with _client(app) as client:
         inside = await client.get(
-            "/slimapi/file?v=3&path=foo&directory="
+            "/slimapi/file?v=4&path=foo&directory="
             + str(allowed_root / "no" / "such" / "dir"),
             headers={"Accept-Encoding": "identity"},
         )
         outside = await client.get(
-            "/slimapi/file?v=3&path=foo&directory="
+            "/slimapi/file?v=4&path=foo&directory="
             + str(tmp_path / "elsewhere" / "missing"),
             headers={"Accept-Encoding": "identity"},
         )
@@ -365,7 +365,7 @@ async def test_candidate_created_as_escape_symlink_after_first_check(tmp_path):
     app, seen = _build_file_app(
         _settings(directory_allowlist=[str(allowed_root)]), _file_ok
     )
-    url = "/slimapi/file?v=3&path=foo&directory=" + str(future)
+    url = "/slimapi/file?v=4&path=foo&directory=" + str(future)
     async with _client(app) as client:
         first = await client.get(url, headers={"Accept-Encoding": "identity"})
         os.symlink(outside, future)  # becomes a symlink escaping the root
@@ -391,7 +391,7 @@ async def test_symlink_retarget_after_first_check_is_rejected(tmp_path):
     app, seen = _build_file_app(
         _settings(directory_allowlist=[str(allowed_root)]), _file_ok
     )
-    url = "/slimapi/file?v=3&path=foo&directory=" + str(link)
+    url = "/slimapi/file?v=4&path=foo&directory=" + str(link)
     async with _client(app) as client:
         first = await client.get(url, headers={"Accept-Encoding": "identity"})
         link.unlink()
@@ -419,7 +419,7 @@ async def test_relative_directory_rejected_even_when_cwd_inside_allowed_root(
     )
     async with _client(app) as client:
         response = await client.get(
-            "/slimapi/file?v=3&path=foo&directory=sessions/sub",
+            "/slimapi/file?v=4&path=foo&directory=sessions/sub",
             headers={"Accept-Encoding": "identity"},
         )
     assert response.status_code == 403
@@ -444,7 +444,7 @@ async def test_forwarded_directory_header_is_canonical_after_symlink_pass(
     )
     async with _client(app) as client:
         response = await client.get(
-            "/slimapi/file?v=3&path=foo&directory=" + str(allowed_root / "link"),
+            "/slimapi/file?v=4&path=foo&directory=" + str(allowed_root / "link"),
             headers={"Accept-Encoding": "identity"},
         )
     assert response.status_code == 200
@@ -499,7 +499,7 @@ async def test_root_retarget_reapply_same_settings_value_revalidates(tmp_path):
     app, _ = _build_file_app(settings, _file_ok)
     async with _client(app) as client:
         before = await client.get(
-            "/slimapi/file?v=3&path=foo&directory=" + str(old_root / "sub"),
+            "/slimapi/file?v=4&path=foo&directory=" + str(old_root / "sub"),
             headers={"Accept-Encoding": "identity"},
         )
     assert before.status_code == 200  # decision #1 populated the cache
@@ -512,11 +512,11 @@ async def test_root_retarget_reapply_same_settings_value_revalidates(tmp_path):
     app2, seen2 = _build_file_app(revalidated, _file_ok)
     async with _client(app2) as client:
         after_old = await client.get(
-            "/slimapi/file?v=3&path=foo&directory=" + str(old_root / "sub"),
+            "/slimapi/file?v=4&path=foo&directory=" + str(old_root / "sub"),
             headers={"Accept-Encoding": "identity"},
         )
         after_new = await client.get(
-            "/slimapi/file?v=3&path=foo&directory=" + str(new_root / "sub2"),
+            "/slimapi/file?v=4&path=foo&directory=" + str(new_root / "sub2"),
             headers={"Accept-Encoding": "identity"},
         )
     assert after_old.status_code == 403

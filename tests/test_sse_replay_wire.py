@@ -283,9 +283,14 @@ class _FakeTokenRegistry:
         pass
 
 
-def _fake_app(*, hubs=None, token_registry=None) -> FastAPI:
+def _fake_app(*, hubs=None, token_registry=None,
+              selector: bool = True) -> FastAPI:
     app = FastAPI(title="sse-replay-wire-fake")
-    app.add_middleware(SlimapiSelectorMiddleware)
+    # selector=False → selector-less direct invocation (route default v3
+    # view): keeps the v3 byte anchors below exercisable until V2b removes
+    # the v3 SSE branch (2026-08-21 narrowing note).
+    if selector:
+        app.add_middleware(SlimapiSelectorMiddleware)
     app.state.config = _settings()
     app.state.schema_degraded = False
     app.state.deployment_revision = None
@@ -382,6 +387,24 @@ async def _stop_token_stream(sub, sid=None) -> None:
     sub.put(TOKEN_STOP)
 
 
+def _bare_v3_app(stack: "_RealStack") -> FastAPI:
+    """Selector-less app sharing the stack's hubs/token registry/log — the
+    2026-08-21 narrowing way to drive a REAL v3 subscriber (default view)
+    alongside the selector-equipped v4 face on the same stack. V2b removes
+    the v3 branch (and this helper) with the physical teardown."""
+    app = FastAPI(title="sse-replay-wire-real-v3-bare")
+    app.state.config = _settings()
+    app.state.schema_degraded = False
+    app.state.deployment_revision = None
+    app.state.hubs = stack.hubs
+    app.state.token_registry = stack.token_registry
+    app.state.replay_log = stack.log
+    app.include_router(events_routes.router)
+    app.include_router(stream_routes.router)
+    register_error_handlers(app)
+    return app
+
+
 class _RealStack:
     """Real hub/token/replay stack wired onto a FastAPI app."""
 
@@ -390,6 +413,7 @@ class _RealStack:
         *,
         log: ReplayLog | None = None,
         token_queue_items: int | None = None,
+        selector: bool = True,
         **registry_kwargs,
     ) -> None:
         self.log = log if log is not None else ReplayLog(epoch=EPOCH)
@@ -411,7 +435,10 @@ class _RealStack:
             **token_kwargs,
         )
         self.app = FastAPI(title="sse-replay-wire-real")
-        self.app.add_middleware(SlimapiSelectorMiddleware)
+        # selector=False → selector-less direct invocation (default v3 view)
+        # for the v3 byte anchors (V2b removes them with the v3 branch).
+        if selector:
+            self.app.add_middleware(SlimapiSelectorMiddleware)
         self.app.state.config = _settings()
         self.app.state.schema_degraded = False
         self.app.state.deployment_revision = None
@@ -1113,7 +1140,13 @@ async def test_tokens_invalid_value_is_invalid_tokens_on_both_wires(version):
         ) as client:
             response = await client.get(f"/slimapi/events?v={version}&tokens=2")
         assert response.status_code == 400
-        assert orjson.loads(response.content) == {"code": "invalid_tokens"}
+        if version == "3":
+            # 2026-08-21 narrowing (temporary flip, V2b deletes): the v3 leg
+            # answers the version-family 400, not invalid_tokens.
+            assert orjson.loads(response.content) == {
+                "code": "unsupported_version", "supported": [4]}
+        else:
+            assert orjson.loads(response.content) == {"code": "invalid_tokens"}
     finally:
         await s.close()
 

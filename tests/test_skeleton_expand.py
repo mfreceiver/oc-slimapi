@@ -15,7 +15,7 @@ from oc_slimapi.skeleton import (
 )
 
 SID = "ses_s"
-V3 = "?v=3"
+V3 = "?v=3"  # default-view (selector-less) projection href face; V2b retargets to v4
 
 
 def _text_part(text, pid="p1", mid="m1"):

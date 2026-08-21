@@ -5,7 +5,7 @@
 never forwarded — while every remaining parameter keeps its original bytes
 (encoding, order, repeats, empty segments, trailing separators) verbatim.
 
-Terminal note: only ``?v=3`` forwards at all (every other form 400s before
+Terminal note: only ``?v=4`` forwards at all (every other form 400s before
 stripping matters); the strip tests below ride the admitted path.
 
 Scope (§2): stripping happens on ``/slimapi/**`` only — non-slim paths keep
@@ -57,7 +57,7 @@ async def _get(app, path, headers=None) -> dict:
 
 
 async def test_v3_strips_all_v_pairs_preserving_bytes():
-    out = await _get(_app(), "/slimapi/probe?v=3&a=1&v=3&b=%20x")
+    out = await _get(_app(), "/slimapi/probe?v=4&a=1&v=4&b=%20x")
     assert out["status"] == 200
     # duplicate v pairs both removed; a→b order, %20 encoding preserved.
     assert out["qs"] == "a=1&b=%20x"
@@ -81,7 +81,7 @@ async def test_versions_exemption_still_strips_v():
 
 
 async def test_lookalike_keys_not_stripped():
-    out = await _get(_app(), "/slimapi/probe?vv=1&av=9&v=3")
+    out = await _get(_app(), "/slimapi/probe?vv=1&av=9&v=4")
     assert out["status"] == 200
     assert out["qs"] == "vv=1&av=9"
 
@@ -89,19 +89,19 @@ async def test_lookalike_keys_not_stripped():
 async def test_percent_encoded_v_key_is_consumed_like_v():
     # parse_qsl (selector judgement) decodes %76 → "v"; the strip must agree,
     # else the judged parameter would leak downstream.
-    out = await _get(_app(), "/slimapi/probe?%76=3&a=1")
-    assert out["status"] == 200  # judged as v=3 → admitted
+    out = await _get(_app(), "/slimapi/probe?%76=4&a=1")
+    assert out["status"] == 200  # judged as v=4 → admitted
     assert out["qs"] == "a=1"
 
 
 async def test_plus_and_percent_values_untouched():
-    out = await _get(_app(), "/slimapi/probe?v=3&b=a+b&c=%2B1")
+    out = await _get(_app(), "/slimapi/probe?v=4&b=a+b&c=%2B1")
     assert out["status"] == 200
     assert out["qs"] == "b=a+b&c=%2B1"
 
 
 async def test_empty_segments_and_trailing_separator_preserved():
-    out = await _get(_app(), "/slimapi/probe?a=1&&b=2&v=3&")
+    out = await _get(_app(), "/slimapi/probe?a=1&&b=2&v=4&")
     assert out["status"] == 200
     assert out["qs"] == "a=1&&b=2&"
 
@@ -112,9 +112,9 @@ async def test_empty_segments_and_trailing_separator_preserved():
 
 
 async def test_catchall_query_untouched():
-    out = await _get(_app(), "/probe?v=3&a=1&v=2")
+    out = await _get(_app(), "/probe?v=4&a=1&v=2")
     assert out["status"] == 200
-    assert out["qs"] == "v=3&a=1&v=2"
+    assert out["qs"] == "v=4&a=1&v=2"
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +124,7 @@ async def test_catchall_query_untouched():
 
 @pytest.mark.parametrize(
     "query",
-    ["?v=3", "?v=3&x=1"],
+    ["?v=4", "?v=4&x=1"],
 )
 async def test_health_functional_with_v(query):
     # Real-route smoke: v is consumed; health answers the single v3 view and
@@ -136,4 +136,4 @@ async def test_health_functional_with_v(query):
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get(f"/slimapi/health{query}")
     assert response.status_code == 200
-    assert response.json()["slimapi_contract"] == 3
+    assert response.json()["slimapi_contract"] == 4

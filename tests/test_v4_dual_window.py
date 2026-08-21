@@ -1,4 +1,5 @@
-"""B3a-A dual-version window ((3, 4)) matrix — design-v4-selector §2/§3.
+"""B3a-A version-window matrix — design-v4-selector §2/§3; 2026-08-21
+narrowing update: the window collapsed to v4-only ((4, 4)).
 
 Covers the Phase-A core deltas:
 
@@ -75,12 +76,12 @@ RETIREMENT_BODY = {
 _READY_GOLDEN = {
     "server": {
         "api_version": 3,                    # READY_VIEW 恒 3（§12 零 v4 差异）
-        "accepted_client_versions": [3, 4],
+        "accepted_client_versions": [4, 4],  # 2026-08-21 收窄后的窗口
     },
     "schema": {
         "degraded": False,                   # _build_app 的 schema_degraded
         "version": 3,
-        "clientMin": 3,
+        "clientMin": 4,
         "clientMax": 4,
     },
     # "upstream": {"ok": ..., "latencyMs": ...} — 每次 ping 动态，测试侧 pop 后比较
@@ -109,23 +110,9 @@ _B12_EXPAND_CATEGORIES_TWELVE = (
 
 VERSIONS_PAYLOAD_GOLDEN = {
     "current": 4,
-    "available": [3, 4],
+    "available": [4],                         # 2026-08-21 收窄：v4-only 面
     "capabilities": {
-        "3": {                                # v3 terminal face（§0.5 冻结）
-            "envelope": ["messages", "sessions"],
-            "directoryQuery": True,
-            "versionHeaderOptional": True,
-            "writeRoutes": True,
-            "readRoutes": [
-                "file", "vcs", "find", "providers",
-                "sessionSingle", "activeSessions", "globalHealth",
-            ],
-            "expand": {
-                "categories": list(_B12_EXPAND_CATEGORIES_TWELVE),
-                "fragmentMaxBytes": settings.max_expand_response_bytes,
-            },
-        },
-        "4": {                                # v4 differential face（§3.1）
+        "4": {                                # v4 face（收窄后唯一面键）
             "globalSessions": True,
             "auxiliaryFilters": True,
             "sseReplay": True,
@@ -218,7 +205,7 @@ def _client(app: FastAPI) -> httpx.AsyncClient:
 
 def test_pinned_constants_dual_window():
     assert SERVER_API_VERSION == 4
-    assert ACCEPTED_CLIENT_VERSIONS == (3, 4)
+    assert ACCEPTED_CLIENT_VERSIONS == (4, 4)  # 2026-08-21 收窄
 
 
 def test_server_api_version_env_is_ignored_with_warning(monkeypatch, caplog):
@@ -256,14 +243,16 @@ def test_server_api_version_constant_without_env(monkeypatch):
 
 def test_validate_fail_closed_pin_blocks_widening():
     """The accepted-range pin survives the migration untouched: no
-    widening of (3, 4) via the accepted-versions knob."""
-    with pytest.raises(RuntimeError, match=r"must be \(3, 4\)"):
-        _settings(accepted_client_versions=(3, 5)).validate()
+    widening of (4, 4) via the accepted-versions knob."""
+    with pytest.raises(RuntimeError, match=r"must be \(4, 4\)"):
+        _settings(accepted_client_versions=(4, 5)).validate()
 
 
 def test_validate_fail_closed_pin_blocks_narrowing():
-    with pytest.raises(RuntimeError, match=r"must be \(3, 4\)"):
-        _settings(accepted_client_versions=(4, 4)).validate()
+    """The freshly retired (3, 4) dual window is equally rejected (exact-pin
+    posture, neither widen nor narrow)."""
+    with pytest.raises(RuntimeError, match=r"must be \(4, 4\)"):
+        _settings(accepted_client_versions=(3, 4)).validate()
 
 
 # ---------------------------------------------------------------------------
@@ -286,18 +275,13 @@ async def test_v4_health_dual_view():
 
 
 async def test_v3_health_view_regression_no_auxiliary():
+    """B12-② guard net, temporarily flipped at the 2026-08-21 narrowing
+    (V2b deletes): the former v3 view is now the unsupported-version 400."""
     app = _build_app()
     async with _client(app) as client:
         resp = await client.get("/slimapi/health?v=3", headers=IDENTITY)
-        assert resp.status_code == 200
-        body = resp.json()
-        # v3 view: byte-identical terminal shape — view triplet 3 and NO
-        # auxiliary key.
-        assert body["slimapi_contract"] == 3
-        assert body["server"]["api_version"] == 3
-        assert body["schema"]["version"] == 3
-        assert "auxiliary" not in body
-        assert body["features"]["allowlist"] == {"enabled": False}
+        assert resp.status_code == 400
+        assert resp.json() == {"code": "unsupported_version", "supported": [4]}
 
 
 async def test_v4_wire_stash():
@@ -313,13 +297,13 @@ async def test_v4_wire_stash():
 
 
 async def test_v3_wire_stash_unchanged():
+    """B12-② guard net, temporarily flipped at the 2026-08-21 narrowing
+    (V2b deletes): ``?v=3`` no longer admits/stashes a v3 wire view."""
     app = _build_app()
     async with _client(app) as client:
         resp = await client.get("/slimapi/sessions?v=3&x=1", headers=IDENTITY)
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["selector"] == {"result": "v3", "wire": "3"}
-        assert body["query"] == "x=1"
+        assert resp.status_code == 400
+        assert resp.json() == {"code": "unsupported_version", "supported": [4]}
 
 
 async def test_selector_less_stack_defaults_to_v3_view():
@@ -420,38 +404,22 @@ async def test_v4_sessions_no_directory_forwards_untouched():
 
 
 async def test_v3_sessions_directory_ladder_unchanged():
-    """v3 on the same route: the three frozen error codes + consumption —
-    byte-identical to the terminal semantics."""
+    """B12-② guard net, temporarily flipped at the 2026-08-21 narrowing
+    (V2b deletes the whole ladder guard): every former v3 ladder outcome is
+    pre-empted by the version-family 400 (priority ② before ③)."""
     app = _build_app()
     async with _client(app) as client:
-        # 1. multi-value distinct
-        resp = await client.get(
-            "/slimapi/sessions?v=3&directory=/a&directory=/b", headers=IDENTITY)
-        assert resp.status_code == 400
-        assert resp.json() == {"code": "invalid_directory_selector"}
-        # 2. dual-present different
-        resp = await client.get(
-            "/slimapi/sessions?v=3&directory=/a",
-            headers={**IDENTITY, DIRECTORY_HEADER: "/b"})
-        assert resp.status_code == 400
-        assert resp.json() == {
-            "code": "directory_conflict",
-            "queryDirectory": "/a",
-            "headerDirectory": "/b",
-        }
-        # 3. header-only
-        resp = await client.get(
-            "/slimapi/sessions?v=3",
-            headers={**IDENTITY, DIRECTORY_HEADER: "/w"})
-        assert resp.status_code == 400
-        assert resp.json() == {"code": "directory_header_retired"}
-        # 4. query-only single → consumed + stashed + stripped
-        resp = await client.get(
-            "/slimapi/sessions?v=3&directory=/w&cursor=c", headers=IDENTITY)
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["directory"] == "/w"
-        assert body["query"] == "cursor=c"
+        for url, headers in (
+            ("/slimapi/sessions?v=3&directory=/a&directory=/b", IDENTITY),
+            ("/slimapi/sessions?v=3&directory=/a",
+             {**IDENTITY, DIRECTORY_HEADER: "/b"}),
+            ("/slimapi/sessions?v=3", {**IDENTITY, DIRECTORY_HEADER: "/w"}),
+            ("/slimapi/sessions?v=3&directory=/w&cursor=c", IDENTITY),
+        ):
+            resp = await client.get(url, headers=headers)
+            assert resp.status_code == 400, url
+            assert resp.json() == {"code": "unsupported_version",
+                                   "supported": [4]}
 
 
 async def test_v4_non_retired_consuming_route_keeps_v3_semantics():
@@ -562,7 +530,7 @@ async def test_unsupported_v5_reports_dual_supported_set():
     async with _client(app) as client:
         resp = await client.get("/slimapi/sessions?v=5", headers=IDENTITY)
         assert resp.status_code == 400
-        assert resp.json() == {"code": "unsupported_version", "supported": [3, 4]}
+        assert resp.json() == {"code": "unsupported_version", "supported": [4]}
 
 
 async def test_versions_405_outranks_v4_directory_retirement():
@@ -590,7 +558,7 @@ async def test_versions_payload_dual_window():
             "current", "available", "capabilities", "sidecarVersion",
         ]
         assert body["current"] == 4
-        assert body["available"] == [3, 4]
+        assert body["available"] == [4]
 
 
 async def test_versions_v4_capabilities_four_static_keys():
@@ -598,7 +566,7 @@ async def test_versions_v4_capabilities_four_static_keys():
     async with _client(app) as client:
         body = (await client.get("/slimapi/versions", headers=IDENTITY)).json()
         caps = body["capabilities"]
-        assert set(caps.keys()) == {"3", "4"}
+        assert set(caps.keys()) == {"4"}
         # B3b-5: same-batch advertising (n1 frozen timing) — sseReplay and
         # qpImmediateFull landed WITH the B3b implementation; B3a's absence
         # assertions are superseded by the four-key face.
@@ -618,19 +586,12 @@ async def test_versions_v4_capabilities_four_static_keys():
 
 
 async def test_versions_v3_capabilities_shape_unchanged():
+    """2026-08-21 narrowing: the retired "3" face key is GONE from the
+    capability map (v4-only face)."""
     app = _build_app()
     async with _client(app) as client:
         body = (await client.get("/slimapi/versions", headers=IDENTITY)).json()
-        cap3 = body["capabilities"]["3"]
-        assert cap3["envelope"] == ["messages", "sessions"]
-        assert cap3["directoryQuery"] is True
-        assert cap3["versionHeaderOptional"] is True
-        assert cap3["writeRoutes"] is True
-        assert cap3["readRoutes"] == [
-            "file", "vcs", "find", "providers",
-            "sessionSingle", "activeSessions", "globalHealth",
-        ]
-        assert "expand" in cap3
+        assert "3" not in body["capabilities"]
 
 
 async def test_versions_payload_independent_of_wire_view():
@@ -657,15 +618,17 @@ async def test_health_allowlist_enabled_in_both_views():
     settings = _settings(directory_allowlist=["/w"])
     app = _build_app(settings)
     async with _client(app) as client:
-        for v, expected_view in (("3", 3), ("4", 4)):
-            resp = await client.get(
-                f"/slimapi/health?v={v}", headers=IDENTITY)
-            assert resp.status_code == 200
-            body = resp.json()
-            assert body["schema"]["version"] == expected_view
-            assert body["server"]["api_version"] == expected_view
-            assert body["slimapi_contract"] == expected_view
-            assert body["features"]["allowlist"]["enabled"] is True
+        resp = await client.get("/slimapi/health?v=4", headers=IDENTITY)
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["schema"]["version"] == 4
+        assert body["server"]["api_version"] == 4
+        assert body["slimapi_contract"] == 4
+        assert body["features"]["allowlist"]["enabled"] is True
+        # 2026-08-21 narrowing: the v3 leg is the unsupported-version 400.
+        resp = await client.get("/slimapi/health?v=3", headers=IDENTITY)
+        assert resp.status_code == 400
+        assert resp.json() == {"code": "unsupported_version", "supported": [4]}
 
 
 async def test_ready_zero_v4_difference():
@@ -687,10 +650,8 @@ async def test_ready_zero_v4_difference():
         body.pop("upstream")
         assert body == _READY_GOLDEN
 
-        # v3 守护网（Phase 4 拆除前保留）：v3 请求同落同一 frozen golden。
+        # v3 守护网临时翻转（2026-08-21 收窄，V2b 删）：?v=3 现为版本族 400
+        #（/ready 非 selector 豁免路由）。
         v3 = await client.get("/slimapi/ready?v=3", headers=IDENTITY)
-        assert v3.status_code == 200
-        v3_body = v3.json()
-        assert set(v3_body) == {"upstream", "server", "schema"}
-        v3_body.pop("upstream")
-        assert v3_body == _READY_GOLDEN
+        assert v3.status_code == 400
+        assert v3.json() == {"code": "unsupported_version", "supported": [4]}

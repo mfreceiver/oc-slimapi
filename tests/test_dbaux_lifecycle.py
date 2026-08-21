@@ -637,13 +637,17 @@ class _StubAux:
         return self._st
 
 
-def _health_app(aux) -> FastAPI:
+def _health_app(aux, *, selector: bool = True) -> FastAPI:
     app = FastAPI(title="dba-health")
     app.state.config = _settings()
     app.state.schema_degraded = False
     app.state.deployment_revision = None
     app.state.dbaux = aux
-    app.add_middleware(SlimapiSelectorMiddleware)
+    # selector=False → selector-less direct invocation (route default view
+    # 3); used by the v3-view shape lock in the placeholder test below
+    # (V2b removes that lock with the v3-view teardown).
+    if selector:
+        app.add_middleware(SlimapiSelectorMiddleware)
     app.include_router(health.router)
     register_error_handlers(app)
     return app
@@ -701,11 +705,19 @@ async def test_health_auxiliary_absent_dbaux_placeholder(good_db: Path):
     app.state.dbaux = None
     view = await _get_aux(app)
     assert view == {"available": False, "mode": "http"}
-    # v3 视图零 auxiliary 键（byte-identical terminal shape 保持）
+    # v4 视图（唯一准入面）：auxiliary 占位键在响应根级呈现
     transport = ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
-        r = await c.get("/slimapi/health", params={"v": "3"}, headers=IDENTITY)
-    assert "auxiliary" not in r.json()
+        r = await c.get("/slimapi/health", params={"v": "4"}, headers=IDENTITY)
+    assert r.json()["auxiliary"] == {"available": False, "mode": "http"}
+    # v3 视图零 auxiliary 键（byte-identical terminal shape 保持）——
+    # selector-less 直调锁（B12-②式；V2b 随 v3 视图拆除移除该锁）
+    app3 = _health_app(None, selector=False)
+    app3.state.dbaux = None
+    transport3 = ASGITransport(app=app3)
+    async with httpx.AsyncClient(transport=transport3, base_url="http://t") as c:
+        r3 = await c.get("/slimapi/health", headers=IDENTITY)
+    assert "auxiliary" not in r3.json()
 
 
 async def test_health_auxiliary_real_source_states(good_db: Path):

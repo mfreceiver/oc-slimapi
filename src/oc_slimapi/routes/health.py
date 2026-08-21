@@ -26,7 +26,7 @@ async def health(request: Request):
     # impossible (S-B04: the value is the selector stash itself, the single
     # source the request was dispatched on).
     # accepted_client_versions / clientMin / clientMax stay config-driven
-    # (dual window: [3, 4]).
+    # (window collapsed to [4, 4] — the inclusive (min, max) pair).
     view = wire_view_from_scope(request.scope)
     resp = {
         # lite-v2: expose the slim API contract revision as a top-level

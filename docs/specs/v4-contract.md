@@ -2,7 +2,8 @@
 
 > **状态**：**4.0.0 实施基线（2026-08-18，B3a+B3b 已落地）+ 2026-08-19 正式修订（owner 裁决：修订并入 v4——v4 尚无消费方，修订无破坏影响）**。B0 批冻结全部可观察语义（2026-08-17，rev-6 PASS-with-notes + S-B01 四项 owner 终裁全收敛）；wire 终态 = 4.0.0（`ACCEPTED_CLIENT_VERSIONS` (3,3)→(3,4)）。B3a 批（阶段 A selector 双版本 / B1 dbaux 连接生命周期 / B2 投影 SQL / B3 cursor / B4 路由分叉降级矩阵 / B5 观测）已按本契约落地并全量测试通过；B3b 批（SSE id:/重放、§7 全量、能力键 `sseReplay`/`qpImmediateFull` 广告）**已落地**。S-B01 四项（§7.0）**已全部 owner 终裁（2026-08-17）**；其余章节（含 DB 设计 R1/R2/R3/R6，已凭真库实证冻结——见 design-v4-dbaux §0.2）均为冻结语义。
 > **2026-08-19 正式修订范围**（各修订节带**当前状态注记**——现行已发布行为 → 修订后冻结目标，实现批次随后落地）：providers 安全投影（§12）/ session 单查 parity（§13）/ expand 闭环（§14）/ 表示层（§15）/ method 边界与修订 non-goals（§16-§17）/ readiness 门禁（§3.3）。修订仅作用 `?v=4` 视图，`?v=3` 零改动（v3 冻结）；无新 major、无版本窗变更（`ACCEPTED_CLIENT_VERSIONS` 仍 (3,4)）。设计出处：`docs/ocmar/plans/2026-08-19-v4-rebaseline.md` §4-§7（owner 终裁 2026-08-19）。
-> **自包含声明（2026-08-21 修订注记，F-126 契约自包含化）**：本文件为 v4 wire 契约的**自包含权威**——`?v=4` 视图的全部可观察语义（路由全集 §10.1、消息投影 §10.2、directory 消费 §5.1、SSE 帧名帧形 §7、ETag/Vary/304 与 judge 三态 §6、expand 端点 §14、资源上限、错误映射、gzip 族、指纹、token stream 帧形等）以**本文件**为规范源。历史演进：v4 于 4.0.0 由 v3 契约「全量继承 + 本文件逐条差异覆盖」演进而来（差异层 = 新增全局 sessions 面（DB 投影源）、SSE id:/重放、directory 于全局列表退役）；本修订将原继承基线条款（未提及语义逐字取自 v3 契约）**就地正文化**（被继承条款全文转录进 §1/§2/§5.1/§6/§10.1/§10.2/§14），**不再以 v3 契约为规范源**；历史/演进注记与「与 v3 不同」对比性、状态性说明按原样保留。§0.3/§9.4 的 (3,4) 双版本窗口表述归后续版本窗收窄修订（随 src 一并改），本修订不触碰。
+> **自包含声明（2026-08-21 修订注记，F-126 契约自包含化）**：本文件为 v4 wire 契约的**自包含权威**——`?v=4` 视图的全部可观察语义（路由全集 §10.1、消息投影 §10.2、directory 消费 §5.1、SSE 帧名帧形 §7、ETag/Vary/304 与 judge 三态 §6、expand 端点 §14、资源上限、错误映射、gzip 族、指纹、token stream 帧形等）以**本文件**为规范源。历史演进：v4 于 4.0.0 由 v3 契约「全量继承 + 本文件逐条差异覆盖」演进而来（差异层 = 新增全局 sessions 面（DB 投影源）、SSE id:/重放、directory 于全局列表退役）；本修订将原继承基线条款（未提及语义逐字取自 v3 契约）**就地正文化**（被继承条款全文转录进 §1/§2/§5.1/§6/§10.1/§10.2/§14），**不再以 v3 契约为规范源**；历史/演进注记与「与 v3 不同」对比性、状态性说明按原样保留。
+> **版本窗收窄修订（2026-08-21，本修订实施；owner 方向指令出处：`docs/ocmar/reviews/2026-08-21-v3-retirement-reassessment.md` §1）**：版本窗自 5.0.0 起收窄为 **v4-only**（`ACCEPTED_CLIENT_VERSIONS (4,4)`）。原 (3,4) 永久双版本裁决被本节覆盖——`?v=3` 请求自 5.0.0 起答复 400 `unsupported_version` `supported:[4]`。§0.3/§9.4 相应修订。
 > **裁决出处**：`docs/system-architecture-proposal-2026-08-17.md`（v2.2，权威基准，行号引用）；工程细化 `docs/refactor-plans/slimapi-refactor-plan.md`；设计文档 `design-v4-selector.md` / `design-v4-dbaux.md` / `design-v4-sse-replay.md` / `design-v4-qp-payload.md`。
 > **消费者**：ocdroid（B5a 探测 / B5b 适配）与 oc-webui 可**仅凭本文件**完成 v4 对接开发。
 
@@ -10,11 +11,11 @@
 
 ## §0 版本原则与并存退役规则 [冻结]
 
-1. **双版本期**：4.0.0 起 `ACCEPTED_CLIENT_VERSIONS = (3, 4)`（v2.2 行 245）。`?v=3` 语义**逐字节不变**（v3 管线原样）；`?v=4` 启用本契约差异面。无 `v` / `v=3` 以外旧版本 → 400 `unsupported_version`，`supported:[3,4]`（端点存在、不静默 404——不支持版本以显式 400 应答而非路由 404）。
-2. **major 与 wire 协议版本绑定**（release.md §1.1 铁律）：版本窗任何变更均为 major 发版（历史例：(3,3)→(3,4) 即 4.0.0 major）。
-3. **v3 退役判据（观测性判据，2026-08-19 owner 终态裁决改写）**：协议封顶 4 系、**(3,4) 永久双版本窗口**、原预定 major 退役发版已取消（见 CHANGELOG [4.1.0]）。若未来评估 v3 退役，判据为**纯观测性**：access log `wireVersion` 维度 v3 流量占比持续低于阈值 + SSE active 无 v3 连接（连续观察窗）方启动评估；**退役形式与版本号另行 owner 裁决，本契约不预设任何未来版本窗**。若裁决发生，收窄即 major，写入本节。
-4. **消费者回退语义**：503 族 = 显式错误，客户端**不自动回退 v3**（维持当前 wire 版本，按 Retry-After/手动重试处理）。v3 目录级浏览仅经**用户显式触发**的整体版本重协商（`available` 含 3 时覆写 selectedWireVersion=3，全端点一致），且是**功能降级非等价回退**——v4 的跨目录 parent/archived 过滤与全局 cursor 翻页在 v3 无对应语义，UX 按功能降级建模。
-5. **2026-08-19 正式修订 [冻结目标]**：owner 裁决修订直接落在 `?v=4` 视图（v4 尚无消费方，无破坏影响；无新 major、无版本窗变更）。修订语义 = §3.3 readiness 门禁（**按 feature ID 独立门控**）+ §12-§17。**契约先行冻结纪律**：各修订节描述冻结目标语义并载**当前状态注记**（现行 4.0.0/4.1.0 已发布行为 → 修订后目标）；实现批次随后落地——各修订面语义**当且仅当对应 feature ID ∈ `satisfied`**（§3.3 门控）方可达，落地前 `capabilities["4"]` 不含对应扩展键、readiness 对应 feature 不 satisfied。`?v=3` 零改动（v3 冻结）。
+1. **版本窗（5.0.0 起 v4-only）**：5.0.0 起 `ACCEPTED_CLIENT_VERSIONS = (4, 4)`（2026-08-21 版本窗收窄修订；owner 方向指令 `docs/ocmar/reviews/2026-08-21-v3-retirement-reassessment.md` §1）。`?v=4` 是唯一合法入口。`?v=3`、无 `v`、其他合法值 → 400 `unsupported_version`，`supported:[4]`（端点存在、不静默 404）。历史：4.0.0–4.7.0 曾为 (3,4) 双版本窗口；`?v=3` 在此时期语义逐字节不变。
+2. **major 与 wire 协议版本绑定**（release.md §1.1 铁律）：版本窗任何变更均为 major 发版（历史例：(3,3)→(3,4) 即 4.0.0 major；(3,4)→(4,4) 即 5.0.0 major）。
+3. **v3 退役（2026-08-21 版本窗收窄修订实施）**：5.0.0 起 v3 wire 版本已退役。`?v=3` 答复 400 `unsupported_version` `supported:[4]`。原 (3,4) 永久双版本裁决（2026-08-19 owner 终态裁决，CHANGELOG [4.1.0]）被本修订覆盖——退役形式为版本窗收窄至 v4-only（major 5.0.0），不再经观测判据评估。`?v=3` 管线在本分支（v4 分支）上不再可达。
+4. **消费者回退语义**：503 族 = 显式错误，客户端**不自动回退旧版本**（维持当前 wire 版本，按 Retry-After/手动重试处理）。v4-only 窗下 `available` 不再含 3，无版本回退路径。历史（4.0.0–4.7.0 双版本期）：v3 目录级浏览仅经**用户显式触发**的整体版本重协商（`available` 含 3 时覆写 selectedWireVersion=3，全端点一致），且是**功能降级非等价回退**——v4 的跨目录 parent/archived 过滤与全局 cursor 翻页在 v3 无对应语义，UX 按功能降级建模。
+5. **2026-08-19 正式修订 [冻结目标]**：owner 裁决修订直接落在 `?v=4` 视图（v4 尚无消费方，无破坏影响；无新 major、无版本窗变更——该"无版本窗变更"前提已被 2026-08-21 版本窗收窄修订覆盖）。修订语义 = §3.3 readiness 门禁（**按 feature ID 独立门控**）+ §12-§17。**契约先行冻结纪律**：各修订节描述冻结目标语义并载**当前状态注记**（现行 4.0.0/4.1.0 已发布行为 → 修订后目标）；实现批次随后落地——各修订面语义**当且仅当对应 feature ID ∈ `satisfied`**（§3.3 门控）方可达，落地前 `capabilities["4"]` 不含对应扩展键、readiness 对应 feature 不 satisfied。`?v=3` 零改动（v3 冻结）。
 
 ## §1 头与参数总则 [冻结]
 
@@ -28,9 +29,8 @@
 
 | 请求形态（`/slimapi/**`） | 判定 | 行为 |
 |---|---|---|
-| `v=3` | v3 | v3 管线逐字节不变（含 directory 消费 §5） |
-| `v=4` | v4 | v4 语义（本契约差异面）；directory 于 §5.2 退役集 → 400 `directory_retired_in_v4` |
-| 无 `v` / `v` 词法合法但 ∉{3,4} | 不支持 | 400 `{"code":"unsupported_version","supported":[3,4]}` |
+| `v=4` | v4 | v4 语义（本契约）；directory 于 §5.2 退役集 → 400 `directory_retired_in_v4` |
+| `v=3` / 无 `v` / `v` 词法合法但 ∉{4} | 不支持 | 400 `{"code":"unsupported_version","supported":[4]}` |
 | `v` 词法非法 / 多值不同 | 畸形 | 400 `invalid_version_selector`（词法 = §1 `^[1-9][0-9]*$`） |
 | `GET /slimapi/versions` | 豁免 | 无条件豁免 selector；非 GET → 405+`Allow: GET` 优先于一切（§8.3 总链 ①） |
 
@@ -344,9 +344,9 @@ v4 sessions 归入 sessions 桶既有记账；降级路径请求带 degraded 标
 
 `/slimapi/health` `auxiliary.available=false` = DB 辅助禁用/熔断（runbook 见 operations.md §7：升级 opencode 后第一步观察）。
 
-### §9.4 v3 退役判据（P4）
+### §9.4 v3 退役（P4，2026-08-21 版本窗收窄修订）
 
-**观测性判据（2026-08-19 owner 终态裁决）**：协议封顶 4 系、(3,4) 永久双版本、原预定 major 退役发版已取消（CHANGELOG [4.1.0]）——当前**无预定退役版本**。评估触发条件 = `wireVersion` 维度 v3 流量占比持续低于阈值 + SSE active 无 v3 连接（连续观察窗）；是否退役、退役形式与版本号届时另行 owner 裁决（§0.3）。
+**5.0.0 起 v3 wire 版本已退役**：`ACCEPTED_CLIENT_VERSIONS = (4,4)`，`?v=3` 答复 400 `unsupported_version` `supported:[4]`。原 (3,4) 永久双版本裁决（2026-08-19 owner 终态裁决）被本修订覆盖——退役通过版本窗收窄（major 5.0.0）直接实施，不经观测判据评估。历史观测数据（08-19 99.7% → 08-20 69.5% → 08-21 49.1%，SSE active v3=0 连续两日）为 merge 门佐证，非退役触发条件。
 
 ## §10 路由全集逐条（v4 差异列）[冻结]
 

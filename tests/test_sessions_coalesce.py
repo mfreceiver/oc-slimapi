@@ -313,7 +313,7 @@ async def test_status_lease_directory_header_only_upstream(upstream_factory):
     try:
         async with _client(app) as client:
             resp = await client.get(
-                "/slimapi/sessions/status?v=3&directory=/w")
+                "/slimapi/sessions/status?v=4&directory=/w")
         assert resp.status_code == 200
         # The lease path was taken (registry present + coalesce_enabled).
         assert app.state.raw_fetch_registry is not None

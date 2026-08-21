@@ -270,9 +270,11 @@ async def test_agent_matrix_invalid_value_rejected(stack):
 # Consuming set spot-checks (query-only consumption + strip + forward)
 # ---------------------------------------------------------------------------
 
+# 2026-08-21 narrowing: the (only) admitted v4 face drives the consumption
+# checks; the global sessions list row left with the v3 face (directory is
+# retired on it in v4 — locked in test_v4_dual_window.py).
 _CONSUMING_CASES = [
     ("/slimapi/messages/s1", "messages"),
-    ("/slimapi/sessions", "sessions"),
     ("/slimapi/sessions/status", "status"),
     ("/slimapi/sessions/s1/todo", "todo"),
     ("/slimapi/sessions/s1/children", "children"),
@@ -286,7 +288,7 @@ async def test_consuming_routes_v3_consume_strip_forward(stack, path, label):
     client, seen = await stack()
     try:
         response = await client.get(
-            f"{path}?v=3&directory=/w", headers=IDENTITY)
+            f"{path}?v=4&directory=/w", headers=IDENTITY)
         assert response.status_code == 200, label
         upstream = _last_upstream(seen)
         assert upstream.headers.get(DIRECTORY_HEADER) == "/w", label
@@ -374,15 +376,17 @@ async def test_v2_sessions_form_unsupported(stack):
 
 
 async def test_v3_sessions_header_only_upstream_query_clean(stack):
-    """v3 sessions canonical form: directory rides the header only."""
+    """B12-② guard net, temporarily flipped at the 2026-08-21 narrowing
+    (V2b deletes): the v3 sessions consumption face is now the
+    unsupported-version 400."""
     client, seen = await stack()
     try:
         response = await client.get(
             "/slimapi/sessions?v=3&directory=/w", headers=IDENTITY)
-        assert response.status_code == 200
-        upstream = _last_upstream(seen)
-        assert upstream.url.params.get("directory") is None
-        assert upstream.headers.get(DIRECTORY_HEADER) == "/w"
+        assert response.status_code == 400
+        assert orjson.loads(response.content) == {
+            "code": "unsupported_version", "supported": [4]}
+        assert not seen
     finally:
         await client.aclose()
 
@@ -552,8 +556,8 @@ async def test_tolerant_routes_ignore_any_directory_form(stack):
     client, seen = await stack()
     try:
         cases = [
-            "/slimapi/health?v=3&directory=../etc",
-            "/slimapi/health?v=3&directory=/w&directory=/p",
+            "/slimapi/health?v=4&directory=../etc",
+            "/slimapi/health?v=4&directory=/w&directory=/p",
             "/slimapi/versions?v=3&directory=x&directory=y",
             "/slimapi/versions?v=3&directory=/w",
         ]
@@ -562,9 +566,9 @@ async def test_tolerant_routes_ignore_any_directory_form(stack):
             assert response.status_code == 200, url
             body = orjson.loads(response.content)
             if "/health" in url:
-                assert body["slimapi_contract"] == 3  # v3 view, no 400
+                assert body["slimapi_contract"] == 4  # v4 view, no 400
             else:
-                assert body["current"] == 4  # versions: dual window
+                assert body["current"] == 4  # versions: selector-exempt
         # local tolerant routes never touched the upstream probe
         assert not seen
     finally:
@@ -650,10 +654,10 @@ async def test_directory_form_observable_values_v3(stack):
         # forms are rejected (400) but their directoryForm is still stashed
         # (the form is computed before the rejection); query/absent proceed.
         cases = [
-            ("query", 200, b"v=3&directory=/w", None),
-            ("header", 400, b"v=3", "/w"),
-            ("both", 400, b"v=3&directory=/w", "/w"),
-            ("absent", 200, b"v=3", None),
+            ("query", 200, b"v=4&directory=/w", None),
+            ("header", 400, b"v=4", "/w"),
+            ("both", 400, b"v=4&directory=/w", "/w"),
+            ("absent", 200, b"v=4", None),
         ]
         for expected, expected_status, query, header in cases:
             probe = _Probe()
@@ -712,7 +716,7 @@ async def test_directory_form_null_on_tolerant_route(stack):
         scope = {
             "type": "http", "http_version": "1.1", "method": "GET",
             "path": "/slimapi/health", "raw_path": b"/slimapi/health",
-            "query_string": b"v=3&directory=/w",
+            "query_string": b"v=4&directory=/w",
             "headers": [(b"x-opencode-directory", b"/w")],
             "client": ("127.0.0.1", 1), "server": ("t", 80), "state": {},
         }

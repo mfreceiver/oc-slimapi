@@ -77,7 +77,13 @@ def _single_message_payload() -> bytes:
 
 
 def _sessions_payload() -> bytes:
-    return orjson.dumps([{"id": "s1", "title": "one"}])
+    # 2026-08-21 narrowing: the (only) admitted v4 face projects sessions
+    # through the canonical projector — the fixture must be representable
+    # (id/time/directory present), else the whole response fail-closes 503.
+    return orjson.dumps([{
+        "id": "s1", "title": "one",
+        "time": {"created": 1, "updated": 1}, "directory": "/w",
+    }])
 
 
 def _default_handler(request: httpx.Request) -> httpx.Response:
@@ -172,7 +178,7 @@ async def test_full_message_vary_double_v3(stack):
     client = await stack()
     try:
         response = await client.get(
-            "/slimapi/messages/s1/full/m1?v=3", headers=IDENTITY)
+            "/slimapi/messages/s1/full/m1?v=4", headers=IDENTITY)
         assert response.status_code == 200
         assert _vary(response) == DOUBLE_VARY
     finally:
@@ -193,7 +199,7 @@ async def test_full_message_vary_double_with_directory_forwarded(stack):
     client = await stack(handler=handler)
     try:
         response = await client.get(
-            "/slimapi/messages/s1/full/m1?v=3&directory=/w",
+            "/slimapi/messages/s1/full/m1?v=4&directory=/w",
             headers=IDENTITY)
         assert response.status_code == 200
         assert _vary(response) == DOUBLE_VARY
@@ -211,12 +217,12 @@ async def test_messages_list_etag_off_vary_double_v3(stack):
     client = await stack(settings=_settings(etag_enabled=False))
     try:
         v2 = await client.get("/slimapi/messages/s1", headers=V2_HEADERS)
-        v3 = await client.get("/slimapi/messages/s1?v=3", headers=IDENTITY)
+        v4 = await client.get("/slimapi/messages/s1?v=4", headers=IDENTITY)
         assert v2.status_code == 400  # terminal: v2 form retired
-        assert v3.status_code == 200
-        assert _vary(v3) == DOUBLE_VARY
+        assert v4.status_code == 200
+        assert _vary(v4) == DOUBLE_VARY
         # ETag really is off (this is the degradation under repair).
-        assert "ETag" not in v3.headers
+        assert "ETag" not in v4.headers
     finally:
         await client.aclose()
 
@@ -225,11 +231,13 @@ async def test_sessions_list_etag_off_vary_double_v3(stack):
     client = await stack(settings=_settings(etag_enabled=False))
     try:
         v2 = await client.get("/slimapi/sessions", headers=V2_HEADERS)
-        v3 = await client.get("/slimapi/sessions?v=3", headers=IDENTITY)
+        v4 = await client.get("/slimapi/sessions?v=4", headers=IDENTITY)
         assert v2.status_code == 400  # terminal: v2 form retired
-        assert v3.status_code == 200
-        assert _vary(v3) == DOUBLE_VARY
-        assert "ETag" not in v3.headers
+        assert v4.status_code == 200
+        # v4 global list (§15): directory dimension retired — AE-only Vary
+        # is unconditional even with etag_enabled=false; no ETag here.
+        assert _vary(v4) == "Accept-Encoding"
+        assert "ETag" not in v4.headers
     finally:
         await client.aclose()
 
@@ -242,8 +250,8 @@ async def test_catalog_cached_etag_off_vary_double(stack, path):
                          max_bytes=16 * 1024 * 1024, max_entry_bytes=1024 * 1024)
     client = await stack(settings=_settings(etag_enabled=False), cache=cache)
     try:
-        miss = await client.get(f"{path}?v=3", headers=IDENTITY)
-        hit = await client.get(f"{path}?v=3", headers=IDENTITY)
+        miss = await client.get(f"{path}?v=4", headers=IDENTITY)
+        hit = await client.get(f"{path}?v=4", headers=IDENTITY)
         assert miss.status_code == hit.status_code == 200
         assert _vary(miss) == DOUBLE_VARY
         assert _vary(hit) == DOUBLE_VARY
@@ -258,7 +266,7 @@ async def test_catalog_uncached_etag_off_vary_double(stack, path):
     the path that already merged (Batch 3 precedent)."""
     client = await stack(settings=_settings(etag_enabled=False))
     try:
-        response = await client.get(f"{path}?v=3", headers=IDENTITY)
+        response = await client.get(f"{path}?v=4", headers=IDENTITY)
         assert response.status_code == 200
         assert _vary(response) == DOUBLE_VARY
     finally:
@@ -275,7 +283,7 @@ async def test_todo_children_diff_vary_double_regression(stack, path):
     must stay double (they are directory-sensitive too)."""
     client = await stack()
     try:
-        response = await client.get(f"{path}?v=3", headers=IDENTITY)
+        response = await client.get(f"{path}?v=4", headers=IDENTITY)
         assert response.status_code == 200
         assert _vary(response) == DOUBLE_VARY
     finally:
@@ -290,9 +298,9 @@ async def test_non_directory_routes_never_gain_dimension(stack):
     client = await stack(settings=_settings(etag_enabled=False))
     try:
         health_response = await client.get(
-            "/slimapi/health?v=3", headers=IDENTITY)
+            "/slimapi/health?v=4", headers=IDENTITY)
         versions_response = await client.get(
-            "/slimapi/versions?v=3", headers=IDENTITY)
+            "/slimapi/versions?v=4", headers=IDENTITY)
         for response in (health_response, versions_response):
             assert response.status_code == 200
             assert not _has_directory_dimension(response)
@@ -310,16 +318,17 @@ async def test_etag_on_regression_exact_vary_and_etag(stack):
     client = await stack()
     try:
         cases = [
-            ("/slimapi/messages/s1?v=3", "ETag"),
-            ("/slimapi/sessions?v=3", "ETag"),
-            ("/slimapi/agent?v=3", "ETag"),
-            ("/slimapi/command?v=3", "ETag"),
-            ("/slimapi/messages/s1/full/m1?v=3", None),  # /full never ETag
+            ("/slimapi/messages/s1?v=4", "ETag", DOUBLE_VARY),
+            # v4 global sessions list (§15): ETag on, AE-only Vary.
+            ("/slimapi/sessions?v=4", "ETag", "Accept-Encoding"),
+            ("/slimapi/agent?v=4", "ETag", DOUBLE_VARY),
+            ("/slimapi/command?v=4", "ETag", DOUBLE_VARY),
+            ("/slimapi/messages/s1/full/m1?v=4", None, DOUBLE_VARY),  # /full never ETag
         ]
-        for path, etag_key in cases:
+        for path, etag_key, vary in cases:
             response = await client.get(path, headers=IDENTITY)
             assert response.status_code == 200, path
-            assert _vary(response) == DOUBLE_VARY, path
+            assert _vary(response) == vary, path
             if etag_key:
                 assert etag_key in response.headers, path
             else:
@@ -331,11 +340,12 @@ async def test_etag_on_regression_exact_vary_and_etag(stack):
 async def test_etag_on_sessions_304_vary_exact(stack):
     client = await stack()
     try:
-        first = await client.get("/slimapi/sessions?v=3", headers=IDENTITY)
+        first = await client.get("/slimapi/sessions?v=4", headers=IDENTITY)
         reval = await client.get(
-            "/slimapi/sessions?v=3",
+            "/slimapi/sessions?v=4",
             headers={**IDENTITY, "If-None-Match": first.headers["ETag"]})
         assert reval.status_code == 304
-        assert _vary(reval) == DOUBLE_VARY
+        # v4 global list (§15): AE-only Vary on the 304 too.
+        assert _vary(reval) == "Accept-Encoding"
     finally:
         await client.aclose()
