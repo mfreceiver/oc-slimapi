@@ -44,13 +44,13 @@
 | 无 `v` | v2（缺省） | 现行 v2 管线，含 `X-Slimapi-Version` 头门禁（缺头 → `version_required`）。 |
 | `v=3` | v3 | v3 语义；版本头若同时出现被忽略不报错。 |
 | `v=2` | v2（显式） | 同缺省（含头门禁）；`v` 在 `/slimapi/**` 被消费（§5.2），不影响该路由其余参数的既有语义。 |
-| `v` 词法合法但不在支持集（4、5…） | 不支持 | 400 `{"code":"unsupported_version","supported":[2,3]}`（3.0.0 起 `[3]`）。 |
+| `v` 词法合法但不在支持集（4、5…） | 不支持 | 400 `{"code":"unsupported_version","supported":[2,3]}`（3.0.0 起 `[3]`）（2026-08-21 注：4.0.0 起 (3,4) 双版本窗口，supported=`[3,4]` 且 `v=4` 合法，见 v4-contract §0.1）。 |
 | `v` 词法非法（含 `0`）/ 多值不同 | 畸形 | 400 `{"code":"invalid_version_selector"}`。多值**同值**宽容折叠。 |
 | `GET /slimapi/versions`（归一化路径） | 无条件豁免 | 不经 selector、不经头门禁；**非 GET → 405 + `Allow: GET`，优先级高于一切**（§8.3）。 |
 
 SSE 两端点同表；畸形/不支持在**开流前** 400（普通 JSON 错误体）。
 
-**退役后（3.0.0）冻结行为**：无 `v` / `v=2` → 400 `{"code":"unsupported_version","supported":[3]}`（端点存在、协议版本已退役；不静默 404）。
+**退役后（3.0.0）冻结行为**：无 `v` / `v=2` → 400 `{"code":"unsupported_version","supported":[3]}`（端点存在、协议版本已退役；不静默 404）（2026-08-21 注：4.0.0 起 supported=`[3,4]`，见 v4-contract §0.1）。
 
 ## §3 发现端点 [冻结]
 
@@ -63,11 +63,11 @@ GET /slimapi/versions → 200
  "sidecarVersion": "2.0.0"}
 ```
 
-约束：`current ∈ available`；`available` 唯一升序；`capabilities` map（key=版本字符串）；消费方必须忽略未知字段；`sidecarVersion` = importlib 动态包版本；`Cache-Control: no-store`；无 ETag（收益取舍）；gzip 族 = `json_response` 无条件压缩族，`Vary: Accept-Encoding`。3.0.0 起 `available:[3]`。**`capabilities["3"]["expand"]` 形状冻结（[3.1.0]）**：`categories` = 12 类目数组（§4b.2 表序；单一事实源 `src/oc_slimapi/traffic.py::EXPAND_CATEGORIES`，versions 广告与流量记账同源）、`fragmentMaxBytes` = `OC_SLIMAPI_MAX_EXPAND_RESPONSE_BYTES` 运行时值（随配置变化，消费方每请求重读或容忍变化）。客户端以该 key 存在性作 expand 能力探测（勿用 `sidecarVersion` 字符串比较）。
+约束：`current ∈ available`；`available` 唯一升序；`capabilities` map（key=版本字符串）；消费方必须忽略未知字段；`sidecarVersion` = importlib 动态包版本；`Cache-Control: no-store`；无 ETag（收益取舍）；gzip 族 = `json_response` 无条件压缩族，`Vary: Accept-Encoding`。3.0.0 起 `available:[3]`（2026-08-21 注：4.0.0 起 `available:[3,4]`、`current=4`、capabilities 增 `"4"` 键，见 v4-contract §3.1）。**`capabilities["3"]["expand"]` 形状冻结（[3.1.0]）**：`categories` = 12 类目数组（§4b.2 表序；单一事实源 `src/oc_slimapi/traffic.py::EXPAND_CATEGORIES`，versions 广告与流量记账同源）、`fragmentMaxBytes` = `OC_SLIMAPI_MAX_EXPAND_RESPONSE_BYTES` 运行时值（随配置变化，消费方每请求重读或容忍变化）。客户端以该 key 存在性作 expand 能力探测（勿用 `sidecarVersion` 字符串比较）。
 
 ## §3a health 双视图 [冻结]
 
-- `/slimapi/health`：**根级** `slimapi_contract`（顶层字段，`health.py:24` 现状）。v2 语义请求 = 2；v3 = 3。`server.api_version` 同步（2/3），`accepted_client_versions` 2.0.0=`[2,3]`、3.0.0=`[3,3]`。
+- `/slimapi/health`：**根级** `slimapi_contract`（顶层字段，`health.py:24` 现状）。v2 语义请求 = 2；v3 = 3。`server.api_version` 同步（2/3），`accepted_client_versions` 2.0.0=`[2,3]`、3.0.0=`[3,3]`（2026-08-21 注：4.0.0 起 `[3,4]`、`server.api_version=4`，v4 视图差异见 v4-contract §3.2）。
 - **`schema.version` 双视图冻结**：与 `server.api_version` 同源同值（`health.py:37` 现状）——v2 视图 = 2、v3 视图 = 3，禁止 3/2 组合。`schema.clientMin/clientMax` 同步 accepted range。
 - `/slimapi/ready`：无 contract 标识字段（部署探针，`health.py:71-104` 现状）；`schema` 节三字段同源规则同上。
 - health/ready 属 `/slimapi` 表面：v2 语义请求照旧要求 `X-Slimapi-Version`；v3 免。`/slimapi/versions` 是唯一豁免端点。
@@ -199,6 +199,7 @@ GET /slimapi/versions → 200
    - 2.0.0：catch-all 照旧盲转——**零消费零剥离**（§2 作用域），一切 query（含 `?v=`/`?directory=`）逐字透传，**不因 `?v=3` 改变行为**；v3 消费者应使用 §10 收编路由，误经 catch-all 的请求按 v2 盲转处理（安全兜底，非 v3 语义）。
    - 3.0.0：catch-all **关闭**。未收编路径 → 404 `{"code":"thin_route_not_found"}`；**收编全集 = 既有读路由 + §10 读 7 组 + 写 12 端点 + `versions`/`health`/`ready`/`metrics`/`actions`/`directories`**（= ocdroid StandardApi 全量端点闭包 + 匿名消费方实测基线）。
 3. **终态错误优先级（3.0.0，高→低）**：① 非 GET `/versions` → 405；② selector 400（`invalid_version_selector`/`unsupported_version`）；③ directory 400（`invalid_directory_selector` 多值异值 → `directory_conflict` 双现 → `directory_header_retired` 头出现）；④ 路由匹配失败 → 404 `thin_route_not_found`。低优先级仅在更高优先级全部通过后评估。**expand 两路由（§4b）的 400/404/413/502/503 属路由内错误 [3.1.0]**，按 §4b.3 冻结求值序评估；本链的 selector/directory 层（②③）仍先于这些路由内错误。
+4. **[4.6.1] 追加：405 `method_not_allowed`（非 GET `/slimapi/versions`）、WS 501 `websocket_not_supported`、actions `invalid_request_body`（422 POST body 畸形）三码补录（历史实现现状固化）**——v4-contract §8 末尾镜像同句。
 
 ## §9 观测与移除判据 [冻结]
 
@@ -262,6 +263,8 @@ GET /slimapi/versions → 200
 
 ## §11 测试矩阵 [冻结]
 
+> **2.0.0 门控快照标注（2026-08-21）**：本矩阵为 2.0.0 `available:[2,3]` 公告门的冻结快照；部分条目的源码锚点与断言形态已随后续发版漂移（11.11/11.16 见行内勘误注记），矩阵主体仍作回归基线使用。
+
 `available:[2,3]` 公告前必须全部通过：
 1. selector 全状态（§2 表逐行，词法边界含 `0`/`03`/`+3`/` 3`/`3.0`/空/多值同值异值/405 优先级/**catch-all 携带 `?v=2/3` 逐字透传断言**）；
 2. directory 组合（无/仅 query/仅头/双现同值/双现冲突/非消费集忽略/questions-permissions 断言/**stream：query-only 接受 no-op、双现异值 directory_not_allowed、多值异值前置 invalid_directory_selector**）；
@@ -273,12 +276,12 @@ GET /slimapi/versions → 200
 8. 观测字段（null/exempt/not_applicable/recordType/lifecycleId/**sseActive 四维 `{v2,v3,absent,not_applicable}`：无-v 旧客户端 SSE 归 absent 断言、跨日 carry-in 对账 `sseActive[D+1,k] = sseActive[D,k] + sse_open[D,k] − matched_sse_close[D,k]`（k=维度；§9.2 孤儿 close 校正适用；测试序列必须含"当日新开跨日未关"与"跨日后关闭"两种）、open/close 生命周期配对**）；
 9. **既有 raw 读路由 7 组回归**（每组：happy 透传逐字节/上游 4xx 透传/上游 5xx→503/响应超限 413/directory query 转发断言/幂等 GET ETag 往返（启用子集））；
 10. **写路由 12 端点回归**（每端点：happy/4xx 透传/5xx→503/请求超限 413/directory 转发/PATCH 双 shape/fork messageID body 字段）；
-11. **catch-all raw-query 保序回归**（一切 query 含 `v`/`directory` 编码/顺序/重复项逐字透传——`proxy.py:182-203` 锁定，**无任何剥离**；携带 `?v=2/3` 断言同款）；
+11. **catch-all raw-query 保序回归**（一切 query 含 `v`/`directory` 编码/顺序/重复项逐字透传——`proxy.py:182-203` 锁定，**无任何剥离**；携带 `?v=2/3` 断言同款）（2026-08-21 勘误：`proxy.py:182-203` 已随 3.0.0 catch-all 关闭整体删除，该锚点不再存在；历史基线保留原文，现行 catch-all 行为=404 兜底，见 §8.2/INTERFACE_MAP §4）；
 12. 退役形态模拟（无 v/`v=2` → 400 `[3]`；头 → `directory_header_retired`；catch-all 404；**§8.3 优先级链逐级断言**）；
 13. 存量回归：旧 ocdroid 形态（无 v + header=2）逐字节不变。
 14. **expand 回归矩阵（[3.1.0]，design-expand §12 全集）**：selector/directory（缺 v / v=2 / 畸形 → 400 先于路由内错误；expand 消费 directory）；求值序全链（池满 503 先于 part 404；源超限 413 先于解码；sid 404 → `session_not_found`；超限且畸形 body → 413；错误码 JSON 精确断言——无独立 `part_missing`/`category_mismatch` 码）；级别匹配（消息级带 partID → 400；partID 未命中 → 404 + `reason:"part_missing"`；patch part 请求 state 类 → 400；step-finish 请求 `part_snapshot` → 200）；extractor（12 category 各正反例 + 类型错配矩阵；解码失败/顶层非 dict → 503 与解析成功后结构畸形 → 502 显式区分；缺失 vs 显式 null 双断言 → 200 + data 键 null；metadata 无 diagnostics 泄露；compaction_full 剥离 expandRefs）；双上限边界（源 1 字节 / 片段 8 MiB 两侧）；singleflight（同消息同/异 category 并发 1 次上游 GET、expand 与 /full 共享、1s grace 后重取）；skeleton/引用（阈值两侧、引用排序去重、可渲染、diffs 恒 null + ref、patch files verbatim）；merged（placeholder-first、预算外保留 null+refs、diffs 永不 batch 还原、交集去重）；配置（cap 超界 startup 拒绝、aggregate 信封超限拒绝）；capabilities 广告形状；check_routes_doc 语义关键词检查通过（12 category 数量一致）。
 15. **[3.3.0] B1a digest `changed`**：flush_sid 即时路径与批量 flush 逐帧路径均携带 `changed:[本帧sid]`；帧间列表对象非共享（零新增状态）；IMMEDIATE q/p 直推帧 / resync 帧 / heartbeat 帧 / `slimapi.meta` 帧零变化（无 changed）；sticky lastError merge 与 changed 共存。
-16. **[3.3.0] B2 兼容断言**：skeleton 与 merged 路径 `TextPart.text` 全量内联（任意字节原样、无阈值分支、无 `truncated` 字段）；折叠 omitted+expandRefs 规则不变；`truncated` 不入契约（grep 负向断言，作用域=代码层）。
+16. **[3.3.0] B2 兼容断言**：skeleton 与 merged 路径 `TextPart.text` 全量内联（任意字节原样、无阈值分支、无 `truncated` 字段）；折叠 omitted+expandRefs 规则不变；`truncated` 不入契约（grep 负向断言，作用域=代码层）（2026-08-21 勘误：grep 负向断言未实际落地；现行锁定形态 = `tests/test_b2_merged_text_compat.py` 行为测试族——`truncated` 字段确实未出现在任何 wire 路径）。
 17. **[3.3.0] B4 新路由回归**（§10.a 第 9 组 + §10.b #13-17）：六端点 happy 逐字（agent/model/clear/commit 204、stage/context 200）；上游 4xx 逐字 / 5xx+网络→503 / 请求超限 413；body+content-type 透传；`?directory=` 宽容剥离不转发（上游 URL/头零 directory 痕迹）且无效值不 400；三段式与既有单步 `/revert` 并存各自命中；traffic bucket（5 POST→`write_session`、GET context→`session_context`）。
 18. **[3.3.0] B4-4 allowlist 三态矩阵**（§5.7a）：未配置=现状逐字节零变化（/file happy、SSE 帧照常、health enabled:false）；显式空=/file 三端点 403 统一错误体（directory 有值/None 双断言、无清单泄露）+启动 warning、SSE 不过滤；非空=子树放行（相等/startswith+"/"，前缀陷阱 `/abc`↔`/ab`）+白名单外 403、SSE digest 与 IMMEDIATE 帧非白名单/无 directory 丢弃+droppedEvents 计数、白名单内帧字节不变（含 changed 共存）；env 解析（冒号分隔、normalize、空白条目 startup 拒绝）。
 

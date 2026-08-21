@@ -42,9 +42,9 @@ Tag 格式：**`v` + semver**（例：`v0.1.0`），与 ocdroid 一致。
 ### 1.2 Wire API 版本（`?v=` selector + 发现端点）
 
 - 版本协商 = **`?v=` selector** + **`GET /slimapi/versions`** 发现端点；请求头通道已于 3.0.0 删除（出现不解读）。
-- 当前接受区间：见 `src/oc_slimapi/versioning.py`（`ACCEPTED_CLIENT_VERSIONS`）与 `docs/specs/v3-contract.md` §1/§2（权威契约）。
+- 当前接受区间：见 `src/oc_slimapi/versioning.py`（`ACCEPTED_CLIENT_VERSIONS`）与 `docs/specs/v3-contract.md` §1/§2 + `docs/specs/v4-contract.md` §0（权威契约，(3,4) 双版本窗口）。
 - **仅破坏性**变更 bump；加性变更 **同版本**。
-- Bump 时必须同步：`versioning.py`、`docs/specs/v3-contract.md`、`CHANGELOG.md`（写明客户端必改点）。
+- Bump 时必须同步：`versioning.py`、`docs/specs/v3-contract.md`、`docs/specs/v4-contract.md`（(3,4) 窗口下版本窗相关变更两契约同时触及）、`CHANGELOG.md`（写明客户端必改点）。
 
 ### 1.3 双版本期（wire (3,4)）说明
 
@@ -60,7 +60,7 @@ Tag 格式：**`v` + semver**（例：`v0.1.0`），与 ocdroid 一致。
 
 1. **行为变更**是否已写入 `CHANGELOG.md` 的 `[Unreleased]` 或目标版本节？  
    - 路径、状态码、头字段、SSE 帧、错误 `code`、gzip/SSE 行为、资源限制默认值。
-2. 若破坏性：契约 + wire 版本协商（`src/oc_slimapi/versioning.py` / `docs/specs/v3-contract.md` §1/§2）是否已按 §1.2 处理？
+2. 若破坏性：契约 + wire 版本协商（`src/oc_slimapi/versioning.py` / `docs/specs/v3-contract.md` §1/§2 / `docs/specs/v4-contract.md` §0）是否已按 §1.2 处理？
 3. `main` 已包含全部要发的提交；本地 `./scripts/check.sh` 绿。
 4. （可选）对照 ocdroid `docs/slim-mode-api-routing.md`：客户端文档是否需同步（由 ocdroid 仓维护；本仓以 CHANGELOG 通知）。
 5. **directory allowlist 部署状态确认（[3.3.0] 起，B4-4b 联合门槛）**：发版时记录生产环境 `OC_SLIMAPI_DIRECTORY_ALLOWLIST` 三态结论——
@@ -195,7 +195,8 @@ systemctl --user restart oc-slimapi
 | [`scripts/check.sh`](../scripts/check.sh) | 质量门禁 |
 | [`scripts/release.sh`](../scripts/release.sh) | 发版唯一入口 |
 | [`pyproject.toml`](../pyproject.toml) | 包版本号源 |
-| [`docs/specs/v3-contract.md`](specs/v3-contract.md) | Wire 契约（权威；v2-contract.md 为 ≤2.x 历史） |
+| [`docs/specs/v3-contract.md`](specs/v3-contract.md) | Wire 契约（权威，v3 基准 + (3,4) 双版本窗口；`v2-contract.md` 为 ≤2.x 历史） |
+| [`docs/specs/v4-contract.md`](specs/v4-contract.md) | v4 wire 契约（4.0.0 实施基线 + 2026-08-19 修订冻结；版本窗相关变更必同步） |
 | `src/oc_slimapi/versioning.py` | Wire API 接受区间 |
 
 ---

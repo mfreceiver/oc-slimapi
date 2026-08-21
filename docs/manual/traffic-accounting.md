@@ -4,7 +4,7 @@
 > 特性版本：**v0.7.0+**（`/slimapi/metrics` 响应的 `traffic` 块 + access log）；**2026-07-29**（按天切分 + client 标识字段 + traffic snapshot）；**2026-08-01**（turn-token fence scope 简化为仅 sid；移除 serverGroupFp 字段）；**2026-08-16**（v3 Batch A 加性观测字段：`wireVersion`/`selectorResult`/`directoryForm`/`recordType`/`lifecycleId` + SSE 开关行 + snapshot `v3` 节 + `aggregate_v3_observability`，见 §5.1/§9.4）；**2026-08-18**（4.0.0 双版本期：`wireVersion` 增 `"4"`、`selectorResult` 增 `v4` 取值 + `/slimapi/metrics` 新增 `dbaux` 观测块，见 §5.1）。
 >
 > **术语澄清**：本手册中出现的 `/slimapi/metrics.traffic` / `/metrics.traffic` 等写法，**不是**独立 HTTP 路由——代码里只有 `GET /slimapi/metrics`（`src/oc_slimapi/routes/metrics.py`），流量账本是该响应 JSON 的 `traffic` 子键。下文为简洁起见用 "`metrics.traffic`" 作为该数据块的简称。
-> 性质：**加性 ops 可观测面**（v3-only 终态：`X-Slimapi-Version` 头已删除，不再有 bump 概念）；ocdroid 对接无变化（`/slimapi/metrics` 为 T3 ops 端点，非客户端契约）。
+> 性质：**加性 ops 可观测面**（3.0.0 起请求头通道删除、`?v=` selector 为唯一版本通道；4.0.0 起 (3,4) 双版本窗口）；ocdroid 对接无变化（`/slimapi/metrics` 为 T3 ops 端点，非客户端契约）。
 > 实现：`src/oc_slimapi/traffic.py`、`src/oc_slimapi/traffic_snapshot.py`、`src/oc_slimapi/middleware/traffic_accounting.py`、`src/oc_slimapi/access_log.py`。
 
 ---
@@ -31,7 +31,7 @@ sidecar 是 ocdroid 与 opencode 之间的字节中继。账本按**路由桶**�
 
 ## 2. 快速查询
 
-`/slimapi/**` 端点须带查询参数 `?v=3`（v3-only 终态：缺 `v` / `v=2` / 不支持值 → 400 `unsupported_version supported=[3]`；`X-Slimapi-Version` 头已删除、出现不解读；详见契约 `docs/specs/v3-contract.md` §2）。`GET /slimapi/versions` 无条件豁免。
+`/slimapi/**` 端点须带查询参数 `?v=3` 或 `?v=4`（4.0.0 起 (3,4) 双版本窗口：缺 `v` / `v=2` / 不支持值 → 400 `unsupported_version supported=[3,4]`；`X-Slimapi-Version` 头已删除、出现不解读；详见契约 `docs/specs/v3-contract.md` §2 与 `docs/specs/v4-contract.md` §0）。`GET /slimapi/versions` 无条件豁免。
 
 ```bash
 # 本机 loopback（服务默认绑 0.0.0.0:4097）
@@ -109,7 +109,7 @@ curl -s "$BASE/slimapi/metrics?$V" | jq '
 | `agent` | `/slimapi/agent`、`/slimapi/agent/**` | **骨架投影**：catalog whitelist（`name/description/mode/hidden/native`），丢 `prompt`+`permission`（>96%） |
 | `questions` | `/slimapi/questions`（跨目录聚合，加性回归） | 聚合 envelope（envelope 透传，per-dir fan-out） |
 | `other` | `/slimapi/permissions`（跨目录 pending permission 聚合，加性回归）等 | **归 `other`**（bucketize 无独立 `permissions` 桶——见下「§3.3 permissions 聚合 bucket 口径」）；**非 passthrough** |
-| `passthrough` | catch-all `/**`（发消息等写） | **不省流**，透传（基线，比值≈1） |
+| `passthrough` | catch-all `/**`（**3.0.0 起已关闭**——未收编路径 404 `thin_route_not_found`） | **哨兵桶（3.0.0 起教学口径）**：catch-all 关闭后不再有 200 透传；本桶只剩 404/405 拒绝噪声，`upIn`/`upOut` 恒 0——**任何 2xx 出现即意外穿透，应排查**（「基线 ≈1.0」口径仅适用 ≤2.x 历史日志） |
 | `health` / `metrics` / `other` | 各自端点 | 元数据/探活 |
 
 ### 3.3 新 bucket 口径（L1–L3 slim 整合，2026-08-15）
@@ -135,7 +135,7 @@ curl -s "$BASE/slimapi/metrics?$V" | jq '
 |---|---|---|
 | **历史对话拉取省了多少** | `ratios.messages.downOutOverUpIn` | 单值；如 `0.2` = 下发只有成本的 20%（省 80%） |
 | **SSE 策展省了多少** | `events_sse` 的 `upIn` vs `downOut` | 单订阅时 `downOut ≪ upIn`（digest 几百 B vs token 流几十 KB） |
-| **透传基线对照** | `ratios.passthrough` | 应 ≈ `1.0`（不省流，用来验证账本没系统性偏差） |
+| **passthrough 哨兵对照** | `ratios.passthrough` | 3.0.0 起 catch-all 关闭，该桶只剩 404/405 拒绝（`upIn`/`upOut` 恒 0、无有效比值）；**任何 2xx 出现即意外穿透告警点**。历史「透传基线 ≈1.0 验证账本无偏差」口径仅适用 ≤2.x 旧日志 |
 | **累计节省字节** | 各桶 `upIn - downOut` 之和，或 `totals.upIn - totals.downOut` | 绝对量 |
 
 ### ⚠️ SSE fanout 例外（务必先读）
@@ -270,7 +270,7 @@ access log 的 `downOut` 是 **wire 级**字节（中间件视角，含 SSE 连�
 - **SSE `requests`/`downIn` 在连接关闭时才落账**：长连接 SSE 活跃期间取快照会看到"有 `downOut` 但 `requests=0`"——连接断开才补记。
 - **SSE upstream 字节按 LF 行尾估算**：`+1` 假定 `\n`；若上游用 CRLF 每行少计 1 字节（**保守偏向**，让省流比看起来更少，不夸大）。opencode `/global/event` 预期为 LF。
 - **children-cache fetch 不入 per-bucket `upIn`**：single-flight coalescing 下归属不公（多请求共享一次 fetch），有意不计 → `sessions`/`children` 桶的省流比**略偏乐观**。要绝对上游总量需另加全局计数器（未来工作）。
-- **`totals` 跨桶字节口径异质**：`passthrough.upIn` 可能是 gzip wire 字节，curated 桶是解码后逻辑字节。`totals` 粗糙，**per-bucket `ratios` 比 `totals` 更有意义**。
+- **`totals` 跨桶字节口径异质**：curated 桶是解码后逻辑字节（≤2.x 旧日志的 `passthrough.upIn` 曾是 gzip wire 字节——3.0.0 起 catch-all 关闭后该桶不再产生流量，见 §3.2 哨兵口径）。`totals` 粗糙，**per-bucket `ratios` 比 `totals` 更有意义**。
 
 ---
 
@@ -352,16 +352,16 @@ jq -c '{ts, ratio: .ratios.messages.downOutOverUpIn}' /tmp/snap-all.jsonl
     "v2|2|null|request|2xx|sessions": 42,
     ...
   },
-  "sseLifecycle": {                 // 按 SSE 可达四维 {v2,v3,absent,not_applicable}
+  "sseLifecycle": {                 // 按 SSE 可达五维 {v2,v3,v4,absent,not_applicable}
     "v3": { "opens": 3, "closes": 2, "active": 1, "orphanCloses": 0 },
     ...
   },
-  "sseActive": { "v2": 0, "v3": 1, "absent": 0, "not_applicable": 0 }  // 当前活跃（= sseLifecycle[k].active）
+  "sseActive": { "v2": 0, "v3": 1, "v4": 0, "absent": 0, "not_applicable": 0 }  // 当前活跃（= sseLifecycle[k].active）
 }
 ```
 
 - **matrix** 维度 = 契约 v3 §9.2 的 `date × selectorResult × wireVersion × directoryForm × recordType × statusClass × bucket` 计数矩阵（内存视角无 date 维，跨日用 §9.4 末尾的离线聚合或按天 snapshot 帧对齐）；`statusClass` 形如 `"2xx"`，无 status 时 `"none"`。**3.0.0 终态：`v2`/`absent` 维度值已不可达（无 `v`/`?v=2` 一律 400 记 `rejected`）——矩阵保留全枚举维度供 ≤2.x 历史帧对账。**
-- **sseActive 语义**：`not_applicable` = catch-all 透传 SSE（≤2.x 历史维度：`/event`、`/global/event` 曾不经省流面但计入观测；**3.0.0 起 catch-all 关闭，该维度不再增长**）；`absent` = 无 `v` 参数的旧客户端 SSE。`rejected`/`exempt` 无 SSE 端点，恒不出现。**3.0.0 终态：`v2`/`absent` 维度自然归零（旧客户端开流前即 400）；四维枚举保留供历史帧对账与退役判据（§9.3）核验。**
+- **sseActive 语义**：`v4` = `?v=4` SSE（4.0.0 起维度，与 `selectorResult` 的 `v4` 取值同源）；`not_applicable` = catch-all 透传 SSE（≤2.x 历史维度：`/event`、`/global/event` 曾不经省流面但计入观测；**3.0.0 起 catch-all 关闭，该维度不再增长**）；`absent` = 无 `v` 参数的旧客户端 SSE。`rejected`/`exempt` 无 SSE 端点，恒不出现。**3.0.0 终态：`v2`/`absent` 维度自然归零（旧客户端开流前即 400）；五维枚举（4.0.0 起含 `v4`）保留供历史帧对账与退役判据（§9.3）核验。**
 - **离线对账**：跨日 carry-in 公式 `sseActive[D+1,k] = sseActive[D,k] + sse_open[D,k] − matched_sse_close[D,k]`（`sseActive[D,k]` 取 D 日首行时的窗口起点存量）。**matched/orphan 配对按 `lifecycleId`**（§11.8）：close 行的 `lifecycleId` 能配到先前未匹配 open（同 dim、跨日 carry）→ `matched_sse_close`（计入 close 当日，并从待配对集合移除）；配不到（open 早于数据窗口 / sidecar 重启后集合已空 / id 缺失）→ **孤儿 close**，只补记计数，**不冲减存量**（避免错误消耗他人活跃连接）。`traffic_snapshot.aggregate_v3_observability(records)` 提供该纯函数实现（输入按天 access log 解析出的记录列表，输出 `counts`/`countsByDate`/`sseActive`/`sseOpens`/`sseMatchedCloses`/`sseOrphanCloses`/`sseLive`），供运维脚本与测试对账复用。
 
 ---

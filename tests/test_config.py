@@ -295,6 +295,27 @@ def test_validate_rejects_oversize_max_message_bytes():
         settings.validate()
 
 
+# ---------------------------------------------------------------------------
+# B2-6: max_message_bytes lower bound (0/-1 would 413 every skeleton).
+# ---------------------------------------------------------------------------
+
+def test_validate_rejects_zero_max_message_bytes():
+    settings = _base(max_message_bytes=0)
+    with pytest.raises(RuntimeError, match=r"OC_SLIMAPI_MAX_MESSAGE_BYTES must be >= 1"):
+        settings.validate()
+
+
+def test_validate_rejects_negative_max_message_bytes():
+    settings = _base(max_message_bytes=-1)
+    with pytest.raises(RuntimeError, match=r"OC_SLIMAPI_MAX_MESSAGE_BYTES must be >= 1"):
+        settings.validate()
+
+
+def test_validate_accepts_one_byte_max_message_bytes():
+    """1 is the smallest meaningful cap — must pass the lower bound."""
+    _base(max_message_bytes=1).validate()
+
+
 def test_validate_accepts_boundary_byte_caps():
     """Exactly 256 MiB is the boundary — must pass (<= comparison)."""
     _base(max_response_bytes=256 * 1024 * 1024).validate()

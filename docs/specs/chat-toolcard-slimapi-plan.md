@@ -428,7 +428,7 @@ def test_skeleton_after_patch_complete_has_diffstats_in_state_metadata():
 
 > **Q1 限定条件**：Q1（slimapi 可保证）仅在"事件含可解析 sessionID 且 subscriber 存在"时成立（`_extract_session_id` 会拒绝 malformed event，见 `hub_types.py:305-328`）。
 
-**实测产出**: 一份事件序列 trace（类似 `design-token-stream.md` §11 的实测表），归档进 `docs/specs/chat-toolcard-investigation.md` §B.8。
+**实测产出**: 一份事件序列 trace（类似 `design-token-stream.md` §11 的实测表），归档进 ocdroid 仓 `docs/specs/chat-toolcard-investigation.md` §B.8（跨仓文件——本仓 `docs/specs/` 下无此路径）。
 
 ---
 

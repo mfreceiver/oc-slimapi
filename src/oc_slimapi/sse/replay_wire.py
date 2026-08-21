@@ -13,9 +13,9 @@ deliberately excluded:
 * the additive v4 ``slimapi.meta`` extension fields (B3b-4: capabilities
   summary + epoch + seqBase — the meta frame itself never carries an
   ``id:``);
-* the periodic replay-log maintenance loop (TTL GC + barrier GC +
-  expired-domain recycle — design §3.4/§3.6), wired in ``app.py`` on the
-  existing background-task pattern.
+* the periodic replay-log maintenance loop (TTL GC + barrier GC —
+  design §3.4/§3.6), wired in ``app.py`` on the existing background-task
+  pattern.
 
 Frozen behaviours (v4-contract §7.0/§7.1/§7.2):
 
@@ -35,6 +35,7 @@ import asyncio
 import re
 from typing import TYPE_CHECKING, Any
 
+from .hub_types import V4_RESYNC_REASONS
 from .replay_log import (
     GLOBAL_DOMAIN,
     ReplayOutcome,
@@ -58,23 +59,9 @@ __all__ = [
     "sse_id_line",
 ]
 
-# rev-gate R3 BLOCKER-1: the frozen v4 ``resync.reason`` value domain
-# (v4-contract §7.2 / design §4) — EXACTLY these four values may appear in
-# a ``resync`` frame on a v4 wire. Every other legacy v3 reason
-# (subscriber_backpressure / token_memory_limit / session_idle /
-# session_deleted …) takes the v4 termination route instead: the server
-# ends the connection (STOP) WITHOUT emitting an out-of-domain resync
-# frame — the disconnect itself is the observable signal, and the client's
-# recovery path is Last-Event-ID reconnect → ReplayLog replay (in window)
-# or a frozen-reason resync (out of window) → HTTP alignment. This is the
-# PRODUCTION allowlist (not a test-only oracle): the subscriber/hub v4
-# branches below key off it, and the wire tests import the same constant.
-V4_RESYNC_REASONS = frozenset({
-    RESYNC_EPOCH_CHANGED,
-    RESYNC_REPLAY_EXPIRED,
-    RESYNC_REPLAY_GAP,
-    RESYNC_RECONNECT_NO_REPLAY,
-})
+# V4_RESYNC_REASONS is defined in :mod:`.hub_types` (W1-D leaf anchor for
+# the resync reason value domain); re-exported here unchanged because the
+# subscriber/hub v4 branches and the wire tests import it from this module.
 
 # §7.1 syntax: epoch = exactly 16 lowercase hex chars; seq = decimal digits
 # (leading zeros tolerated — the value domain is the integer, the ID is a
@@ -95,9 +82,9 @@ _GLOBAL_SEGMENTS = 3
 # drift apart.
 META_CAPABILITY_KEYS: dict[str, bool] = {"sseReplay": True}
 
-# Periodic maintenance cadence for the replay log (TTL GC + barrier GC +
-# expired-domain recycle). Well below the 15-min default TTL so idle
-# domains converge without a request arriving.
+# Periodic maintenance cadence for the replay log (TTL GC + barrier GC).
+# Well below the 15-min default TTL so idle domains converge without a
+# request arriving.
 DEFAULT_SWEEP_INTERVAL_S = 60.0
 
 
@@ -236,18 +223,10 @@ async def replay_sweep_loop(
     process in ``app.py`` (same lifecycle pattern as the access-log
     maintenance loop / QpSweepShadow).
 
-    Each tick:
-
-    1. ``sweep()`` — TTL-evict expired frames in every domain + GC
-       barriers whose replay window has fully passed the watermark;
-    2. **expired-domain recycle policy** — for every token domain with no
-       retained frames left, ``recycle_domain`` drops the (already empty)
-       frame store while RETAINING the per-domain seq shell and any
-       barrier watermark (REPLAY-018 fail-safe: a later reconnect either
-       hits the retained watermark → ``reconnect_no_replay``, or continues
-       the unchanged seq line — a recycled domain NEVER releases
-       first-connect semantics for a cursor that saw frames). The global
-       domain is never recycled (its frames are the shared sequence).
+    Each tick: ``sweep()`` — TTL-evict expired frames in every domain +
+    GC barriers whose replay window has fully passed the watermark.
+    (Per-sid domain shells and their seq counters are never deleted within
+    the process epoch — REPLAY-018; the real GC is process restart.)
 
     Best-effort: a sweep failure warns and the loop continues; a closed
     log (``RuntimeError``) exits quietly — shutdown raced a tick.
@@ -270,11 +249,6 @@ async def replay_sweep_loop(
                 # Log closed (shutdown raced the tick) — exit quietly.
                 return
             replay.sweep()
-            for domain in tuple(replay.domain_keys()):
-                if domain == GLOBAL_DOMAIN:
-                    continue
-                if replay.domain_frame_count(domain) == 0:
-                    replay.recycle_domain(domain)
         except RuntimeError:
             # Log closed (shutdown raced the tick) — exit quietly.
             return

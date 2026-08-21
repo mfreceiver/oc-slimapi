@@ -81,7 +81,14 @@ from ...config import (
     TOKEN_RESYNC_QUEUE_CAP,
 )
 from ...logging_config import get_logger
-from ..hub_types import TOKEN_FRAME_TYPE, normalize_session_status
+from ..hub_types import (
+    RESYNC_RECONNECT_NO_REPLAY,
+    RESYNC_SESSION_DELETED,
+    RESYNC_SESSION_IDLE,
+    RESYNC_TOKEN_MEMORY_LIMIT,
+    TOKEN_FRAME_TYPE,
+    normalize_session_status,
+)
 from ..replay_log import (
     FRAME_KIND_BUSINESS,
     FRAME_KIND_TOMBSTONE,
@@ -235,10 +242,9 @@ class TokenStreamHub:
       copy) and ``DeltaAccumulator.chunks`` (transient pre-flush shadow),
       so each budget independently protects its OWN buffer — no double-count
       of a single memory region.
-    * ``_session_status`` — last known upstream status per sid (busy/idle);
-      drives the :meth:`ttl_sweep` busy-guard (§16-B NB#4).
-    * ``_busy_sids`` — O(1) busy lookup mirror of ``_session_status``.
-    * ``_pending_session_resinks`` — bounded queue of ``(sid, reason)``
+     * ``_session_status`` — last known upstream status per sid (busy/idle);
+       drives the :meth:`ttl_sweep` busy-guard (§16-B NB#4).
+     * ``_pending_session_resinks`` — bounded queue of ``(sid, reason)``
       turned into per-subscriber ``resync`` frames by the flush loop (NB-B2).
     * ``_subs_by_sid`` — Stage-C subscriber fanout bookkeeping. Stage D's
       ``TokenSubscriber`` HTTP class calls :meth:`attach_subscriber` /
@@ -280,7 +286,6 @@ class TokenStreamHub:
         # P1-21: bounded OrderedDicts with FIFO cap to prevent unbounded
         # growth across high-churn sessions.
         self._session_status: OrderedDict[str, str] = OrderedDict()
-        self._busy_sids: OrderedDict[str, None] = OrderedDict()
         # Pending resyncs for the flush loop to fan out (bounded, NB-B2).
         self._pending_session_resinks: list[tuple[str, str]] = []
         # Stage C subscriber fanout (§5.5 handshake). Stage D's TokenSubscriber
@@ -660,7 +665,11 @@ class TokenStreamHub:
         ``_retired_messages`` gate (no LivePart creation, no frame
         emission, no revision bump).
         """
-        # TODO(§13.2): confirm live wire key casing for properties.part.
+        # Settled (§13.2 / E8): the live wire envelope for
+        # message.part.updated uses camelCase keys — part.sessionID /
+        # part.messageID / part.id (opencode v1.18.18
+        # packages/schema/src/v1/session.ts part envelope). No snake_case
+        # variants are accepted.
         part = props.get("part")
         if not isinstance(part, dict):
             return
@@ -757,7 +766,11 @@ class TokenStreamHub:
         rev-ogpt CRITICAL 2: late delta for a removed message is dropped
         silently via the ``_retired_messages`` gate.
         """
-        # TODO(§13.2): confirm live wire key casing for properties fields.
+        # Settled (§13.2 / E8): the live wire envelope for
+        # message.part.updated carries camelCase top-level keys — field /
+        # sessionID / messageID / partID (opencode v1.18.18
+        # packages/schema/src/v1/session.ts text-delta event). No
+        # snake_case variants are accepted.
         if props.get("field") != "text":
             return
         sid = props.get("sessionID")
@@ -1053,12 +1066,8 @@ class TokenStreamHub:
         self._session_status.move_to_end(sid)
         self._prune_session_status()
         if status == "busy":
-            self._busy_sids[sid] = None
-            self._busy_sids.move_to_end(sid)
-            self._prune_busy_sids()
             return
         # idle
-        self._busy_sids.pop(sid, None)
         self._retire_session(sid)
         # rev-gate R4 BLOCKER-1: the retire above invalidates the
         # accumulator state for this sid. Write the token-domain replay
@@ -1066,8 +1075,8 @@ class TokenStreamHub:
         # case included) — a cursor-N reconnect must hit
         # resync{reconnect_no_replay}, never an up-to-date live entry on
         # a残缺 part.
-        self._write_replay_barrier(sid, "session_idle")
-        self._enqueue_session_resync(sid, "session_idle")
+        self._write_replay_barrier(sid, RESYNC_SESSION_IDLE)
+        self._enqueue_session_resync(sid, RESYNC_SESSION_IDLE)
 
     def on_session_deleted(self, sid: str) -> None:
         """Clear all state for a deleted session (§16-B) + terminate token
@@ -1089,7 +1098,7 @@ class TokenStreamHub:
         are delivered immediately in the correct order (resync THEN STOP),
         not deferred to the next flush tick where STOP could precede resync.
 
-        WHY also clear ``_session_status`` / ``_busy_sids`` here (but NOT
+        WHY also clear ``_session_status`` here (but NOT
         in ``_retire_session``): per spec ``_retire_session`` only owns
         the 4 part-state structures; the session's status record outlives
         a part-level retire. Deletion, however, is terminal for the whole
@@ -1110,7 +1119,6 @@ class TokenStreamHub:
         """
         self._retire_session(sid)
         self._session_status.pop(sid, None)
-        self._busy_sids.pop(sid, None)
         # rev-gate R4 核对结论：deletion 有独立 token 域退役逻辑
         # （_retire_session + deleted-sid gate + terminate），故与 idle/
         # eviction 同类——不写 barrier 的话，cursor < last_seq 的重连会把
@@ -1118,7 +1126,7 @@ class TokenStreamHub:
         # 则 up-to-date 挂在死流上。全局 session.digest 只覆盖订阅了全局
         # 流的客户端；token 流须独立保证旧 cursor 不恢复 → 写 barrier，
         # 重连走 resync{reconnect_no_replay} → HTTP 对齐（404/缺失确认删除）。
-        self._write_replay_barrier(sid, "session_deleted")
+        self._write_replay_barrier(sid, RESYNC_SESSION_DELETED)
         # CRITICAL 2 gate cleanup for this session.
         for key in [k for k in self._retired_messages if k[0] == sid]:
             self._retired_messages.discard(key)
@@ -1129,14 +1137,14 @@ class TokenStreamHub:
         # subscriber (resync{session_deleted} → STOP). Do NOT detach or
         # decrement; the generator's finally → unsubscribe handles that.
         for sub in tuple(self._subs_by_sid.get(sid, ())):
-            sub.terminate("session_deleted")
+            sub.terminate(RESYNC_SESSION_DELETED)
 
     def _retire_session(self, sid: str) -> None:
         """Clear the 4 part-state structures for a session (§16-B).
 
         Scope (per spec): ``live_parts`` / ``_pending`` / ``_nontext_parts``
-        / ``_disabled_parts`` only. ``_session_status`` / ``_busy_sids``
-        are NOT touched — they outlive a part-level retire so the TTL
+        / ``_disabled_parts`` only. ``_session_status``
+        is NOT touched — it outlives a part-level retire so the TTL
         busy-guard can still read the session's status for any
         late-arriving parts; only :meth:`on_session_deleted` and
         :meth:`on_upstream_reconnect` clear them.
@@ -1798,8 +1806,8 @@ class TokenStreamHub:
         # consumed them (cursor == last_seq) reconnects into
         # resync{reconnect_no_replay} instead of an up-to-date live mode
         # on a part the server can no longer complete.
-        self._write_replay_barrier(sid, "token_memory_limit")
-        self._fanout_resync(sid, "token_memory_limit")
+        self._write_replay_barrier(sid, RESYNC_TOKEN_MEMORY_LIMIT)
+        self._fanout_resync(sid, RESYNC_TOKEN_MEMORY_LIMIT)
         self._metrics.token_memory_limit_total += 1
         # Re-snapshot remaining live parts of this sid to existing subs.
         # MB-P-S1: include skip_key via nodrop path (no drop_part).
@@ -2053,11 +2061,6 @@ class TokenStreamHub:
         while len(self._session_status) > _SESSION_STATUS_MAX:
             self._session_status.popitem(last=False)
 
-    def _prune_busy_sids(self) -> None:
-        """P1-21: FIFO cap on ``_busy_sids`` to prevent unbounded growth."""
-        while len(self._busy_sids) > _SESSION_STATUS_MAX:
-            self._busy_sids.popitem(last=False)
-
     def _prune_removed_messages(self, now_ms: int) -> None:
         """Enforce FIFO cap + TTL on the ``_removed_messages`` replay queue.
 
@@ -2173,7 +2176,6 @@ class TokenStreamHub:
         # ``_part_revisions`` still bounds memory.
         # Session-routing state: clear wholesale (epoch reset).
         self._session_status.clear()
-        self._busy_sids.clear()
         self._pending_session_resinks.clear()
         # CRITICAL 2 gate: new epoch, no late events from the previous
         # epoch can arrive.
@@ -2187,4 +2189,4 @@ class TokenStreamHub:
         # (If subscribers themselves were torn down by the HTTP layer during
         # the reconnect, _subs_by_sid is already empty — no-op.)
         for sid in list(self._subs_by_sid.keys()):
-            self._fanout_resync(sid, "reconnect_no_replay")
+            self._fanout_resync(sid, RESYNC_RECONNECT_NO_REPLAY)

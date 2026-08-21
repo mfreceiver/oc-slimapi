@@ -5,7 +5,7 @@ Code was physically split (lite-v2 post-cleanup) into three modules:
 - :mod:`.hub_types` — sentinels, config defaults, event sets, timing
   constants, frame helpers, :class:`DigestFields`, :class:`Subscriber`,
   :class:`SubscriberCapacityError`, ``_extract_session_id``.
-- :mod:`.global_hub` — :class:`GlobalHub` and ``_LAST_UPDATED_AT_BY_SID_MAX``.
+- :mod:`.global_hub` — :class:`GlobalHub`.
 - :mod:`.registry` — :class:`HubRegistry`.
 
 This module re-exports every symbol that external code (app.py, routes,
@@ -14,7 +14,7 @@ unchanged.
 """
 from __future__ import annotations
 
-from .global_hub import GlobalHub, _LAST_UPDATED_AT_BY_SID_MAX
+from .global_hub import GlobalHub
 from .hub_types import (
     ABORT_NAME,
     DEFAULT_MAX_SUBSCRIBERS_PER_DIRECTORY,

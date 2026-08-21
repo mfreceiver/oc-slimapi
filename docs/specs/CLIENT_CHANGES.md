@@ -1,8 +1,10 @@
-> **Aligned with v2-contract.md (lite-v2 cleanup)**
+> **Aligned with v3-contract.md + v4-contract.md（4.0.0 起 (3,4) 双版本窗口）+ CHANGELOG.md**
 >
 > This document reflects the current wire surface. All endpoints not listed
-> here have been deleted and return 404. See v2-contract.md for authoritative
-> specification.
+> here have been deleted and return 404. 权威规范见 `docs/specs/v3-contract.md`（v3 基准）
+> 与 `docs/specs/v4-contract.md`（v4 差异面）；`v2-contract.md` 为 ≤2.x 历史存档——本文早期章节中的
+> `X-Slimapi-Version` 头 / `X-Next-Cursor`·`X-Complete` 头 / token stream gzip 例外等表述已于 3.0.0 废止
+> （见各处行内废止注记）。**v4 迁移指南见本文 §「v4 迁移指南（wire v3 → v4）」**。
 
 # ocdroid 客户端改动清单（仅文档，不修改 ocdroid）
 
@@ -179,7 +181,7 @@
 
 ## 消息加载与展开
 
-- 历史页走 `/slimapi/messages/{sid}?mode=skeleton`，翻页用 `X-Next-Cursor`
+- 历史页走 `/slimapi/messages/{sid}?mode=skeleton`，翻页用 `X-Next-Cursor`（**3.0.0 废止注记**：该头已删除——翻页改读 envelope 字段 `nextCursor`，v3-contract §4）
   （sidecar 从 opencode `Link` 头透传 opaque cursor，原样回传 `?before=`）。
 - 列表排序按 `created` 升序（oldest-first）。
 - `mode=full` 参数已删除（静默忽略），始终返回 skeleton 形态。
@@ -200,7 +202,7 @@
 ## sessions 列表完整性头
 
 - `GET /slimapi/sessions` 200 响应头：
-  - **`X-Complete`**：`"true"` = 本页 `len < limit`（未满）；`"false"` = 可能截断。**禁止**当「权威全集 / 权威空 / 结束冷启动」——上游无 total、无前向 cursor；`start` 是 epoch-ms 时间戳水位（`time_updated >= start`），**非 offset**。
+  - **`X-Complete`**：`"true"` = 本页 `len < limit`（未满）；`"false"` = 可能截断。**禁止**当「权威全集 / 权威空 / 结束冷启动」——上游无 total、无前向 cursor；`start` 是 epoch-ms 时间戳水位（`time_updated >= start`），**非 offset**。（**3.0.0 废止注记**：`X-Complete` 头已删除——完整性判断改读 envelope 字段 `complete`，语义同款继承，v3-contract §4。）
 - 错误路径（502/503）**不**带 `X-Complete` 头。
 - **`roots` 默认仍为 `false`**——客户端**应显式传** `roots=true` 以排除 subagent/task（ocdroid 已传）。
 - 推荐：`limit=500` 兜底可保留，但用 `X-Complete` 判断是否可能截断，勿盲猜全集。
@@ -208,7 +210,7 @@
 
 ## pending question 跨目录聚合（/slimapi/questions，加性 — 2026-08-05）
 
-> **加性 / 向后兼容**：wire 版本未 bump（仍 2）。旧 sidecar 无此路由 → 404 `thin_route_not_found`，客户端透明回退既有 SSE 直推 + catch-all 单目录 `GET /question`（行为不变）。权威 envelope 语义见 `docs/specs/v2-contract.md` §2「`/slimapi/questions` envelope」。
+> **加性 / 向后兼容**：wire 版本未 bump（仍 2）。旧 sidecar 无此路由 → 404 `thin_route_not_found`，客户端透明回退既有 SSE 直推 + catch-all 单目录 `GET /question`（行为不变）。权威 envelope 语义见 `docs/specs/v3-contract.md` §4（v2-contract §2「`/slimapi/questions` envelope」为历史出处）。
 
 `GET /slimapi/questions` 修复 slim-mode 冷启动看不到 `workdir ≠ process.cwd()` 目录 pending question 的 bug（上游 `GET /question` per-Location——按 `X-Opencode-Directory` 路由的 workdir instance，无 header 回落 `process.cwd()`）。**无参数**（sidecar 自发现目录）。
 
@@ -222,11 +224,11 @@
   - `discoveryComplete`：`true` 除非发现页填满 `_DISCOVERY_LIMIT`(=10000)（可能截断）；`roots=true` 只返顶层 session，实际恒 `true`；客户端可忽略。
 - **客户端契约（关键）**：`authoritativeDirectories==null` → 用本次 `items` 完整替换本地 pending question 集合（replace-all，不在 `items` 中的旧 question 视为已不再 pending）；为数组 → **仅**对数组所列 dir 做 replace，**不得**丢弃未覆盖 dir 的既有 pending question（否则丢失数据）。
 - **total failure**：发现调用失败 → 整体 503 `upstream_unavailable`（无 envelope）；客户端保留既有状态并重试，**不可**据此推断 pending question 集合为空。
-- **应答不经本端点**：pending question 的应答仍走 catch-all + `X-Opencode-Directory`（见 v2-contract §2 写路径）；本端点只读聚合。
+- **应答不经本端点**：pending question 的应答仍走 catch-all + `X-Opencode-Directory`（写路径见 v3-contract §10；v2-contract §2 为历史出处）；本端点只读聚合。
 
 ### 错误码（thin 路由统一 `{"code":"..."}`）
 
-`400 version_required`/`version_incompatible`、`404 thin_route_not_found`（旧 sidecar，回退信号）、`503 upstream_unavailable`（发现调用 total failure，无 envelope）。per-dir `/question` 失败 isolated 进 `errors[]`（非 HTTP 错误码，不中断整体）。
+`400 version_required`/`version_incompatible`（**3.0.0 废止**：两码已随 `X-Slimapi-Version` 头删除而不再存在——现行版本错误 = 400 `unsupported_version supported:[3,4]` / `invalid_version_selector`，v3-contract §2）、`404 thin_route_not_found`（旧 sidecar，回退信号）、`503 upstream_unavailable`（发现调用 total failure，无 envelope）。per-dir `/question` 失败 isolated 进 `errors[]`（非 HTTP 错误码，不中断整体）。
 
 ## Catalog skeleton（command / agent，加性 — 2026-08-05）
 
@@ -234,7 +236,7 @@
 
 两个 catalog 读接口走 slim skeleton 投影（实测省流 command ~97.6% / agent ~95.8% raw）：
 
-- **`GET /slimapi/command`**：须带 `X-Slimapi-Version: 2`（建议 `Accept-Encoding: gzip`）；query `directory?`（可选，仅作 `X-Opencode-Directory` 头转发，catalog 全局）。200 返回裸数组，每项白名单 `{name, description, agent?, hints?}`（agent/hints 可选，缺则不出现）；**已丢弃** `template`(~97.7%)/`source`/`model`/`subtask`。
+- **`GET /slimapi/command`**：须带 `?v=3`（4.0.0 起 `?v=4` 亦合法——(3,4) 双版本窗口；`X-Slimapi-Version` 头已于 3.0.0 删除。建议 `Accept-Encoding: gzip`）；query `directory?`（可选，仅作 `X-Opencode-Directory` 头转发，catalog 全局）。200 返回裸数组，每项白名单 `{name, description, agent?, hints?}`（agent/hints 可选，缺则不出现）；**已丢弃** `template`(~97.7%)/`source`/`model`/`subtask`。
 - **`GET /slimapi/agent`**：同上头与 directory 语义。200 返回裸数组，每项白名单 `{name, description, mode, hidden?, native?}`（hidden/native 可选，可能为 null/false）；**已丢弃** `prompt`(~34.7%)/`permission`(~61.2%，`Permission.Ruleset` 规则集——**非** pending permission card)/`topP`/`temperature`/`color`/`variant`/`options`/`steps`/`model`。
 
 ### 客户端必须
@@ -246,7 +248,7 @@
 
 ### 错误码（thin 路由统一 `{"code":"..."}`）
 
-`400 version_required`/`version_incompatible`、`400 invalid_directory`、`404 thin_route_not_found`（旧 sidecar，回退信号）、`413 response_too_large`、`502 upstream_http_N`、`503 upstream_unavailable`、`503 transform_busy`(+`Retry-After:2`)、`422`。catalog 非 session 级，无 `session_not_found`。catalog 条目**无** `hasFull`/`omitted`（那是 message part 概念）。
+`400 version_required`/`version_incompatible`（**3.0.0 废止**——现行版本错误 = 400 `unsupported_version supported:[3,4]` / `invalid_version_selector`）、`400 invalid_directory`、`404 thin_route_not_found`（旧 sidecar，回退信号）、`413 response_too_large`、`502 upstream_http_N`、`503 upstream_unavailable`、`503 transform_busy`(+`Retry-After:2`)、`422`。catalog 非 session 级，无 `session_not_found`。catalog 条目**无** `hasFull`/`omitted`（那是 message part 概念）。
 
 ### 监控
 
@@ -258,7 +260,7 @@
 
 ## 全局 directory catalog（/slimapi/directories，加性 — 2026-08-08）
 
-> **加性 / 向后兼容**：wire 版本未 bump（仍 2）。旧 sidecar 无此路由 → 404 `thin_route_not_found`，客户端透明回退（不渲染项目切换器，或用 `/slimapi/sessions` 兜底）。权威 envelope 语义见 `docs/specs/v2-contract.md` §2「`/slimapi/directories` envelope」。
+> **加性 / 向后兼容**：wire 版本未 bump（仍 2）。旧 sidecar 无此路由 → 404 `thin_route_not_found`，客户端透明回退（不渲染项目切换器，或用 `/slimapi/sessions` 兜底）。权威 envelope 语义见 `docs/specs/v3-contract.md` §4（v2-contract §2「`/slimapi/directories` envelope」为历史出处）。
 
 `GET /slimapi/directories` 列出 opencode 已知的工作目录（directory），供客户端渲染"项目切换器"。**无 query 参数**（全局发现语义，sidecar 自发现，客户端不传 directory）。发现源与 `/slimapi/questions` 共用 `GET /experimental/session?roots=true&archived=true`（每个 session 携带真实 `directory` 字段）。
 
@@ -279,7 +281,7 @@
 
 ### 错误码（thin 路由统一 `{"code":"..."}`）
 
-`400 version_required`/`version_incompatible`、`404 thin_route_not_found`（旧 sidecar，回退信号）、`503 upstream_unavailable`（发现调用 total failure / 严格 schema 守卫失败 / 超响应 cap / 网络 5xx，无 envelope）、`503 transform_busy`(+`Retry-After:2`)、`422`。directories 非 session 级，无 `session_not_found`。**注意**：discovery 4xx 也映射为 `upstream_unavailable`（不泄漏 upstream status——experimental 端点 4xx 意 opencode 不支持）。
+`400 version_required`/`version_incompatible`（**3.0.0 废止**——现行版本错误 = 400 `unsupported_version supported:[3,4]` / `invalid_version_selector`）、`404 thin_route_not_found`（旧 sidecar，回退信号）、`503 upstream_unavailable`（发现调用 total failure / 严格 schema 守卫失败 / 超响应 cap / 网络 5xx，无 envelope）、`503 transform_busy`(+`Retry-After:2`)、`422`。directories 非 session 级，无 `session_not_found`。**注意**：discovery 4xx 也映射为 `upstream_unavailable`（不泄漏 upstream status——experimental 端点 4xx 意 opencode 不支持）。
 
 ### 监控
 
@@ -338,7 +340,7 @@
 
 ### 错误码（thin 路由统一 `{"code":"..."}`）
 
-`400 version_required`/`version_incompatible`、`404 thin_route_not_found`（旧 sidecar，回退信号）、`404 action_not_found`、`409 action_confirm_required`、`413 request_too_large`、`429 action_throttled`+`Retry-After`、`503 actions_disabled`/`action_unavailable`/`action_busy`+`Retry-After:2`、`504 action_timeout`+`timeout_s`、`422`。
+`400 version_required`/`version_incompatible`（**3.0.0 废止**——现行版本错误 = 400 `unsupported_version supported:[3,4]` / `invalid_version_selector`；[4.6.1] 起另补录 422 `invalid_request_body`，POST body 畸形）、`404 thin_route_not_found`（旧 sidecar，回退信号）、`404 action_not_found`、`409 action_confirm_required`、`413 request_too_large`、`429 action_throttled`+`Retry-After`、`503 actions_disabled`/`action_unavailable`/`action_busy`+`Retry-After:2`、`504 action_timeout`+`timeout_s`、`422`。
 
 ### slim-fail-open 授权（入口常驻 + 空状态 = 透明回退合规，omni 裁决 SSOT）
 
@@ -359,7 +361,7 @@
 2. **OkHttp HTTP cache 不适用**：本仓全部响应 `Cache-Control: no-store`，OkHttp `Cache` 不会存储——验证器须在**应用层自存**（OkHttp 层配了也不生效，勿依赖）。
 3. **coding 固定建议**：同一 URL 的请求尽量固定同一 `Accept-Encoding`（identity 或 gzip）。验证器按 coding 派生（identity 强 tag / gzip 弱 tag），跨 coding 交叉必得保守 200（等于放弃命中）。
 4. **弱比较语义**：`If-None-Match` 为 RFC 9110 弱比较（服务端忽略 `W/` 前缀），回发原样字符串即可；`*` 匹配任意当前验证器。
-5. **辅助头照常读**：304 响应同样携带 `X-Next-Cursor` / `X-Complete`（值来自本次服务端管线计算），客户端分页/完整性逻辑无需因 304 特判。
+5. **辅助头照常读**：304 响应同样携带 `X-Next-Cursor` / `X-Complete`（值来自本次服务端管线计算），客户端分页/完整性逻辑无需因 304 特判。（**3.0.0 废止注记**：两头已删除——分页/完整性改读 envelope `nextCursor`/`complete` 字段，v3-contract §4；v3 路由的 304 不再携带任何分页/完整性头。）
 
 ## 内容指纹消费（建议随 B2 digest 驱动接入 — 2026-08-16，traffic Batch 4）
 
@@ -466,8 +468,8 @@ ocdroid 可在每个请求（含 SSE）**可选**附加三个 request header：
 - **连接建立期 coalescing**：带 `Last-Event-ID` 重连时同连接可能先 `resync` 再 `server.connected`（既有）。客户端 **SHOULD** 对同一连接建立期 cold-start 触发帧做 once-latch（至多一次 reconcile）。
 - **`server.heartbeat` ≠ 上游健康**：仅证 sidecar + 订阅存活；outage 探测用 `/slimapi/ready` 或自然 fetch/write 失败。sidecar 重启后重连收 `server.connected` → **应** cold-start。
 - digest `lastError`：sticky 跨窗口，`status=busy` 清除（显式 `null` 帧）；客户端据此显隐 session 错误 banner。`MessageAbortedError` 被 sidecar 过滤，不下发。
-- 客户端所有 `/slimapi/**` 请求（含 SSE）须带 `X-Slimapi-Version: 2`；连接时读 `/slimapi/health` 自检（见下 schema 三键）。
-- **仍推送帧类型（仅作观察信号）**：`question.asked` / `v2.asked`、`permission.asked` / `resolved` / `v2.asked` / `v2.resolved`——这些帧仍通过 SSE 直推，但 v2 已删除 q/p 写端点与 routeToken；客户端应答 q/p 走 catch-all + `X-Opencode-Directory`（见 v2-contract §2 写路径）。帧的 wire 形态不变。
+- 客户端所有 `/slimapi/**` 请求（含 SSE）须带查询参数 `?v=3`（4.0.0 起 `?v=4` 亦合法——(3,4) 双版本窗口；`X-Slimapi-Version` 头已于 3.0.0 删除，出现不解读）；连接时读 `/slimapi/health?v=3` 自检（见下 schema 三键）。
+- **仍推送帧类型（仅作观察信号）**：`question.asked` / `v2.asked`、`permission.asked` / `resolved` / `v2.asked` / `v2.resolved`——这些帧仍通过 SSE 直推，但 v2 已删除 q/p 写端点与 routeToken；客户端应答 q/p 走 catch-all + `X-Opencode-Directory`（写路径现以 v3-contract §10 为准；v2-contract §2 为历史出处）。帧的 wire 形态不变。
 - **已移除帧类型**：`server.reconfigured`（对应 discovery 数据流整体下线）。
 
 ## health schema 回显
@@ -478,17 +480,17 @@ ocdroid 可在每个请求（含 SSE）**可选**附加三个 request header：
 
 ## Token stream SSE（Stages A–E 落地，opt-in 实时流 — design-token-stream.md §9/§10）
 
-> **状态**：服务端 Stages A–E 已落地（A 地基 9.5 / B 生命周期 9.5 / C flush 9.5 / D 端点 9.6 / E 文档+预算 4+4）。未随当前发版出货前 `GET /slimapi/health` 根级 `features.tokenStream` 缺省，ocdroid 走既有「完成后整条出现」路径，**零回归**。本节是 ocdroid 侧改动清单（对应设计 §9 的 8 项 + §10 硬约束），供客户端预读。设计权威以 `docs/specs/design-token-stream.md` 为准；wire 以 `docs/specs/v2-contract.md` §3.x + §6.x 为准。
+> **状态**：服务端 Stages A–E 已落地（A 地基 9.5 / B 生命周期 9.5 / C flush 9.5 / D 端点 9.6 / E 文档+预算 4+4）。未随当前发版出货前 `GET /slimapi/health` 根级 `features.tokenStream` 缺省，ocdroid 走既有「完成后整条出现」路径，**零回归**。本节是 ocdroid 侧改动清单（对应设计 §9 的 8 项 + §10 硬约束），供客户端预读。设计权威以 `docs/specs/design-token-stream.md` 为准；wire 以 `docs/specs/v3-contract.md` §7 为准（v2-contract §3.x + §6.x 为历史出处）。
 
 ### capability 探测（必须）
 
 - `/slimapi/health` 根级 **`features.tokenStream === true`** 才启用 stream 客户端；缺字段 / 404 / 405 → 降级为既有「完成后整条出现」（`/slimapi/messages/{sid}` 重拉权威全文），**不得**尝试连 stream 端点。
-- 路径与版本头以**本仓库** `docs/specs/v2-contract.md` + `CHANGELOG.md` 为准（端点 `GET /slimapi/sessions/{sid}/stream`，仍带 `X-Slimapi-Version: 2`，**不 bump**）。
+- 路径与版本以**本仓库** `docs/specs/v3-contract.md` + `CHANGELOG.md` 为准（端点 `GET /slimapi/sessions/{sid}/stream`，须带 `?v=3`，**不 bump**——`X-Slimapi-Version` 头已于 3.0.0 删除）。
 
 ### stream 客户端生命周期（必须）
 
 - 前台 opt-in 连 `GET /slimapi/sessions/{sid}/stream`；切后台 / 换 session / 关页面 → **立即断开**（token 订阅独立 T3 账本，预算「同时最多 1 条前台 stream」）。
-- 连接独立于控制面 `/slimapi/events`——两条连接，互不替代。**gzip 三层语义（勿笼统说「SSE 都不 gzip」）**：(1) 控制面 `/slimapi/events` 恒 identity、不 gzip；(2) 本 token stream 是 SSE 但**允许 gzip**（按 `Accept-Encoding: gzip` 协商，流式 zlib `Z_SYNC_FLUSH`，首个 SSE gzip 例外）——建议带 `Accept-Encoding: gzip`；(3) 普通 JSON/catalog 响应按 `Accept-Encoding` 内容协商。即「SSE」≠「不 gzip」：控制面 SSE 不 gzip、token 面 SSE 可 gzip。
+- 连接独立于控制面 `/slimapi/events`——两条连接，互不替代。**gzip 三层语义（v3 终态修订——勿笼统说「SSE 都不 gzip」，但现在两条 SSE 面均恒 identity）**：(1) 控制面 `/slimapi/events` 恒 identity、不 gzip；(2) 本 token stream 亦**恒 identity、不 gzip**（**v3 终态**——lever2 压缩路径已随 3.0.0 移除；v2 时代「允许 gzip / 首个 SSE gzip 例外 / 建议 `Accept-Encoding: gzip`」表述**已废止**）；(3) 普通 JSON/catalog 响应按 `Accept-Encoding` 内容协商。即 v3 起两条 SSE 面统一恒 identity，仅 JSON 响应有 gzip 协商。
 - `Last-Event-ID` 可带但**值被忽略**，仅触发首帧 `resync{reason:"reconnect_no_replay",sessionID}`。stream **不发 SSE `id:`、无 replay buffer**——客户端不得依赖 `id:` 续传。
 
 ### streamOwned 渲染算法（必须）
@@ -502,7 +504,7 @@ ocdroid 可在每个请求（含 SSE）**可选**附加三个 request header：
 
 ### truncated / 降级（必须）
 
-- 收 **`message.part.snapshot{truncated:true}`**（`event: message.part.snapshot`，`done:false` 或 `done:true` 均可能，携带自身的 `partEventRevision`——该帧消费**自己**的 revision，严格大于该 part 上一帧，故用 strict `>` 比较的客户端可直接接受）→ 这是**单 part 级**截断（part 累计文本超 `token_stream_max_frame_bytes`≈1MiB，或 part 被服务端 drop_part）：清该 part `streamOwned`、停 append、走 `/slimapi/messages/{sid}` 重拉权威（可能被上游截断，但那是真值）。**不影响**该 session 其它 part；单 part >1MiB **不**走 resync，而是本路径。
+- 收 **`message.part.snapshot{truncated:true}`**（`event: message.part.snapshot`，`done:false` 或 `done:true` 均可能，携带自身的 `partEventRevision`——该帧消费**自己**的 revision，严格大于该 part 上一帧，故用 strict `>` 比较的客户端可直接接受）（2026-08-21 注：`partEventRevision` 语义在 v3 下延续，per-session token stream 帧仍携带；**events `?tokens=1` 的 lean token 帧无此字段**——勿跨面套用 strict `>` 去重）→ 这是**单 part 级**截断（part 累计文本超 `token_stream_max_frame_bytes`≈1MiB，或 part 被服务端 drop_part）：清该 part `streamOwned`、停 append、走 `/slimapi/messages/{sid}` 重拉权威（可能被上游截断，但那是真值）。**不影响**该 session 其它 part；单 part >1MiB **不**走 resync，而是本路径。
 
 ### resync 处理（必须）— 两档恢复
 
@@ -535,7 +537,7 @@ ocdroid 可在每个请求（含 SSE）**可选**附加三个 request header：
 - **坑**：ocdroid D-wire 初版 `TokenStreamReducer` 在 `done:true` 时取 `frame.text ?: existing?.text ?: ""` 作为终态值——与契约冲突。
 - **正确**：`done:true` 帧仅用于 ① 标记该 part 渲染完成、② 触发权威 fetch；**不得从该帧取 text**。REST skeleton/full 的全文**凌驾所有 token 帧**（幂等覆盖；客户端可接受 digest 完成先于/晚于 token 终态帧）。
 
-#### 2. `partEventRevision` 必须 **strict `>` 去重**（非 no-op）+ 原子更新 + 生命周期回收（契约 §3.x.2）
+#### 2. `partEventRevision` 必须 **strict `>` 去重**（非 no-op）+ 原子更新 + 生命周期回收（契约锚：v3-contract §7；v2 §3.x.2 为历史出处）
 - **契约**：token-stream 帧的 `partEventRevision` 由 token hub per-frame 维护（每帧唯一递增）；客户端按 **strict `>`** 去重。
 - **坑（ocdroid D-wire 初版两连）**：① 去重函数无条件 `return true`（**根本没去重**，no-op）；② 初版修复用非原子 get/check/put，存在 **TOCTOU 竞态**（并发 delta 帧竞争 last-revision）。
 - **正确实现要点**：
@@ -560,7 +562,7 @@ ocdroid 可在每个请求（含 SSE）**可选**附加三个 request header：
 
 ## 四能力接入（L1–L3 slim 整合，加性 — 2026-08-15）
 
-> **加性 / 向后兼容**：wire 版本未 bump（仍 2）。四能力各自经 `/slimapi/health` 根级 `features` 新 flag 门控（`tokenCoalesce` / `permissionEvents` / `serverMerge` / `transformAbsorb`）；flag 缺省/为 false → 对应能力走既有路径，**零回归**。能力探测结果缓存，勿每连接重复。权威 wire 见 `docs/specs/v2-contract.md` §2 / §3 / §5。
+> **加性 / 向后兼容**：wire 版本未 bump（仍 2）。四能力各自经 `/slimapi/health` 根级 `features` 新 flag 门控（`tokenCoalesce` / `permissionEvents` / `serverMerge` / `transformAbsorb`）；flag 缺省/为 false → 对应能力走既有路径，**零回归**。能力探测结果缓存，勿每连接重复。权威 wire 见 `docs/specs/v3-contract.md`（v2-contract §2/§3/§5 为历史出处）。
 
 ### 1. tokenCoalesce（A）—— `/slimapi/events?tokens=1` 取代 per-session stream
 
@@ -608,7 +610,7 @@ ocdroid 可在每个请求（含 SSE）**可选**附加三个 request header：
 ### 前置条件（退役前必须完成，均为 ocdroid 侧改动）
 
 - **C1 — 图片走 catch-all `GET /file`**：`HttpImageHolder`（消息图片加载）从直连 opencode 改为走 sidecar catch-all（带 `X-Opencode-Directory` 头，`GET /file` 经反代透传）——图片加载不再依赖 `:14096` 直连。
-- **C3 — 连接自检改打 `/slimapi/health`**：`checkHealthFor`（连接/健康自检）从直连 health 改为 `GET /slimapi/health`（带 `X-Slimapi-Version: 2`；读 `sidecar.ok`/`server.api_version`/`schema.version`）——健康检查不再依赖 `:14096` 直连。
+- **C3 — 连接自检改打 `/slimapi/health`**：`checkHealthFor`（连接/健康自检）从直连 health 改为 `GET /slimapi/health?v=3`（读 `sidecar.ok`/`server.api_version`/`schema.version`——`X-Slimapi-Version` 头已于 3.0.0 删除）——健康检查不再依赖 `:14096` 直连。
 
 ### 退役范围（L2 四能力落地后执行）
 

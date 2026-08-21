@@ -2412,9 +2412,9 @@ async def test_offline_token_domain_barrier_and_recycle_retention():
         await s.close()
 
 
-async def test_replay_sweep_loop_ttl_gc_and_domain_recycle():
-    """Sweep wiring: the periodic loop TTL-GCs frames and recycles
-    frame-less token domains while retaining barriers (fail-safe)."""
+async def test_replay_sweep_loop_ttl_gc_retains_domains_and_barriers():
+    """Sweep wiring: the periodic loop TTL-GCs frames while retaining the
+    per-sid domain shells and their barriers (fail-safe)."""
     fake_now = [1000.0]
     log = ReplayLog(epoch=EPOCH, ttl_s=0.05, clock=lambda: fake_now[0])
     log.append(GLOBAL_DOMAIN, b"g1")
@@ -2430,7 +2430,7 @@ async def test_replay_sweep_loop_ttl_gc_and_domain_recycle():
         fake_now[0] += 0.1  # everything past TTL
         await asyncio.sleep(0.09)
         assert log.frame_count() == 0
-        # expired token domain recycled by the loop's policy; global kept
+        # domain shells are never dropped by the sweep; their frames are
         assert token_domain(SID) in log.domain_keys()
         assert log.domain_frame_count(token_domain(SID)) == 0
         # barrier retained (fail-safe) even with an empty window

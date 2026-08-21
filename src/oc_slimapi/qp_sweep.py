@@ -43,7 +43,6 @@ class QpSweepShadow:
         *,
         activity: dict[str, float] | None = None,
         directories: Iterable[str] = (),
-        directory_source: Callable[[], Iterable[Any]] | None = None,
         interval_seconds: float = 1800.0,
         daily_budget: int = 100,
         enabled: bool = True,
@@ -59,12 +58,10 @@ class QpSweepShadow:
             raise ValueError("eviction_after_seconds must be > 0")
         self._activity = activity if activity is not None else {}
         # Monotonic within the process: a directory remains eligible for
-        # evaluation even after a transient source (for example, the hub's
-        # pending map) becomes empty.
+        # evaluation even after the shared activity table stops seeing it.
         self._known_dirs: set[str] = set()
         self._seen_at: dict[str, float] = {}
         self._next_run: dict[str, float] = {}
-        self._directory_source = directory_source
         self.interval_seconds = interval_seconds
         self.eviction_after_seconds = eviction_after_seconds
         self.daily_budget = daily_budget
@@ -130,14 +127,9 @@ class QpSweepShadow:
         for directory in directories:
             self.record_activity(directory, now=timestamp)
 
-    def _ingest_directory_source(self) -> None:
+    def _ingest_activity_directories(self) -> None:
         for directory, timestamp in self._activity.items():
             self.observe_directory(directory, now=timestamp)
-        if self._directory_source is None:
-            return
-        for item in self._directory_source():
-            directory = item if isinstance(item, str) else getattr(item, "directory", None)
-            self.observe_directory(directory)
 
     def next_delay(self) -> float:
         factor = min(1.2, max(0.8, float(self.jitter())))
@@ -191,7 +183,7 @@ class QpSweepShadow:
     def run_once(self, *, now: float | None = None) -> list[dict[str, Any]]:
         """Run one shadow round and return the markers emitted by that round."""
         timestamp = self._now() if now is None else now
-        self._ingest_directory_source()
+        self._ingest_activity_directories()
         self._evict_stale_directories(timestamp)
         self._reset_budget_if_needed(timestamp)
         emitted: list[dict[str, Any]] = []
@@ -236,12 +228,12 @@ class QpSweepShadow:
                 except asyncio.TimeoutError:
                     pass
             # F-007 (half): the scheduler loop must survive a run_once
-            # blow-up. A poisoned directory_source (or any bug in the
-            # shadow evaluation) previously killed the task for the rest
-            # of the process lifetime — silently stopping all shadow
-            # scheduling. Log-and-continue mirrors the app.py exit-stack
-            # isolation; CancelledError is a BaseException and still
-            # propagates so stop() keeps working.
+            # blow-up. Any bug in the shadow evaluation previously
+            # killed the task for the rest of the process lifetime —
+            # silently stopping all shadow scheduling. Log-and-continue
+            # mirrors the app.py exit-stack isolation; CancelledError is
+            # a BaseException and still propagates so stop() keeps
+            # working.
             try:
                 self.run_once()
             except Exception:

@@ -8,7 +8,6 @@ definition identically.
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Callable
@@ -34,6 +33,7 @@ from .hub_types import (
     HEARTBEAT_SECONDS,
     IMMEDIATE,
     MESSAGE_EVENTS,
+    RESYNC_RECONNECT_NO_REPLAY,
     SESSION_EVENTS,
     STOP,
     Subscriber,
@@ -822,7 +822,7 @@ class GlobalHub:
             # Stage B §16-B: PARALLEL route to the token hub. The digest
             # work above is the control-plane contract (unchanged); this
             # branch mirrors session.status / session.deleted into the
-            # token accumulator so it can maintain _busy_sids / retire
+            # token accumulator so it can maintain session status / retire
             # abandoned LiveParts. It MUST NOT touch entry/flush/subscribers.
             if self._token_hub is not None and event_type in (
                 "session.status", "session.deleted",
@@ -1048,7 +1048,7 @@ class GlobalHub:
         # to create fresh state once the new epoch's events arrive.
         self._retired_messages.clear()
         self._last_updated_at_by_sid.clear()
-        frame = sse_frame({"reason": "reconnect_no_replay"}, event="resync")
+        frame = sse_frame({"reason": RESYNC_RECONNECT_NO_REPLAY}, event="resync")
         for subscriber in tuple(self.subscribers):
             subscriber.put(frame)
         if self.subscribers:

@@ -1,8 +1,8 @@
 # oc-slimapi
 
-`oc-slimapi` 是 **ocdroid**（Android 客户端）与 **opencode**（上游 server）之间的 **Python 省流 sidecar**。它只通过 HTTP 调 opencode legacy API（不读 SQLite）；对历史消息生成 skeleton 投影，向手机提供策展 SSE + 消息骨架，并提供流量记账、token stream、资源限制等 T3 能力。
+`oc-slimapi` 是 **ocdroid**（Android 客户端）与 **opencode**（上游 server）之间的 **Python 省流 sidecar**。它通过 HTTP 调 opencode legacy API，并经只读投影源（SQLite `mode=ro`，4.0.0 起）为 v4 会话全局面提供 DB 投影数据（**绝无写入**）；对历史消息生成 skeleton 投影，向手机提供策展 SSE + 消息骨架，并提供流量记账、token stream、资源限制等 T3 能力。
 
-权威 wire 契约为 [`docs/specs/v2-contract.md`](docs/specs/v2-contract.md)（`v1-contract.md` 已废弃移除）。Agent / 开发入口索引见 [`AGENTS.md`](AGENTS.md)。
+权威 wire 契约为 [`docs/specs/v3-contract.md`](docs/specs/v3-contract.md)（v3 基准）与 [`docs/specs/v4-contract.md`](docs/specs/v4-contract.md)（4.0.0 起 (3,4) 双版本窗口的 v4 面）；[`docs/specs/v2-contract.md`](docs/specs/v2-contract.md) 为 ≤2.x 历史契约存档（`v1-contract.md` 已废弃移除）。Agent / 开发入口索引见 [`AGENTS.md`](AGENTS.md)。
 
 ## 拓扑
 
@@ -26,21 +26,21 @@ python -m venv .venv
 另一终端验证：
 
 ```bash
-curl --fail -H 'X-Slimapi-Version: 2' http://127.0.0.1:4097/slimapi/health
+curl --fail 'http://127.0.0.1:4097/slimapi/health?v=3'
 .venv/bin/python -m pytest tests/
 ```
 
 生产部署走 systemd **user** service（`deploy/oc-slimapi.service` 部署到 `~/.config/systemd/user/`），日志落 `StateDirectory`，详见 [`docs/operations.md`](docs/operations.md) §3。
 
-## 范围（v2 / wire `X-Slimapi-Version: 2`）
+## 范围（`?v=` selector；(3,4) 双版本窗口）
 
-- `/slimapi/**`：sessions / sessions/status / messages（list·full skeleton 投影）/ questions（跨目录聚合）/ permissions（跨目录聚合）/ command / agent（catalog skeleton）/ events（策展 SSE）/ token-stream / metrics / health。每个请求（含 SSE）必须带整数头 `X-Slimapi-Version: 2`；缺失、非整数或不在服务端接受区间返回 400。版本只在破坏性变更时递增，加性变更保持兼容。
-- 其他 HTTP path：流式反代至 `127.0.0.1:4096`（catch-all）。
+- `/slimapi/**`：sessions / sessions/status / messages（list·full skeleton 投影）/ questions（跨目录聚合）/ permissions（跨目录聚合）/ command / agent（catalog skeleton）/ events（策展 SSE）/ token-stream / metrics / health，以及 §10 收编的受控代理读/写路由（file/vcs/find/providers/session 单查等）。每个请求（含 SSE）必须带查询参数 `?v=3` 或 `?v=4`（4.0.0 起 (3,4) 双版本窗口；`GET /slimapi/versions` 无条件豁免）；缺失、`v=2` 或不支持值 → 400 `unsupported_version supported=[3,4]`。`X-Slimapi-Version` 请求头已删除（出现不解读）。版本只在破坏性变更时递增，加性变更保持兼容（见 [`docs/release.md`](docs/release.md)）。
+- 其他 HTTP path：catch-all 反代**已于 3.0.0 关闭**——未收编路径直接 404 `thin_route_not_found`（不再转发上游）。
 - WebSocket：501 语义，不支持 PTY；需要时在前方部署专用 HTTP/WS proxy。
 - REST 精简 JSON：按 `Accept-Encoding` 自 gzip 并返回 `Vary: Accept-Encoding`。
-- SSE：控制面 `/slimapi/events` 永不 gzip；token stream `/slimapi/sessions/{sid}/stream` **默认 gzip**（lever2，首个 SSE gzip 例外，按 `Accept-Encoding` 协商）。
+- SSE：控制面 `/slimapi/events` 与 token stream `/slimapi/sessions/{sid}/stream` 均恒 identity、不 gzip（lever2 压缩路径已随 v3 终态移除）。
 
-> v2 已移除 routeToken/route_secret，以及 projects / since / session children 等端点；`questions`（跨目录聚合）、`sessions/status` 与 `permissions`（跨目录聚合）已加性回归（详见 [`CHANGELOG.md`](CHANGELOG.md)）。
+> v2→v3 已移除 routeToken/route_secret、projects / since / session children 等端点及 catch-all 透传；`questions`（跨目录聚合）、`sessions/status`、`permissions`（跨目录聚合）、children/todo/diff 等已加性回归或收编（详见 [`CHANGELOG.md`](CHANGELOG.md)）。
 
 ## 流量记账与日志
 
@@ -53,8 +53,10 @@ curl --fail -H 'X-Slimapi-Version: 2' http://127.0.0.1:4097/slimapi/health
 
 | 文件 | 用途 |
 |---|---|
-| [`docs/specs/v2-contract.md`](docs/specs/v2-contract.md) | Wire 契约权威 |
-| [`docs/specs/design-v2.md`](docs/specs/design-v2.md) | 当前态设计 |
+| [`docs/specs/v3-contract.md`](docs/specs/v3-contract.md) | Wire 契约权威（v3 基准） |
+| [`docs/specs/v4-contract.md`](docs/specs/v4-contract.md) | v4 wire 契约（4.0.0 实施基线 + 修订冻结） |
+| [`docs/specs/v2-contract.md`](docs/specs/v2-contract.md) | ≤2.x 历史契约存档 |
+| [`docs/specs/design-v2.md`](docs/specs/design-v2.md) | v2 时代设计（历史；现行态以 v3/v4 契约为准） |
 | [`docs/specs/INTERFACE_MAP.md`](docs/specs/INTERFACE_MAP.md) | 端点级实现追踪 |
 | [`docs/specs/CLIENT_CHANGES.md`](docs/specs/CLIENT_CHANGES.md) | ocdroid 侧配套改动清单 |
 | [`docs/operations.md`](docs/operations.md) | 部署 / 运维 / 日志 |

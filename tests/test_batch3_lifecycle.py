@@ -398,7 +398,7 @@ class TestInv2GraceSerialEpochCleanup:
 
     async def test_grace_removal_clears_token_hub_old_epoch_state(self, monkeypatch):
         """grace removal fires → token_hub.on_upstream_reconnect() called →
-        live_parts / _session_status / _busy_sids / _retired_messages
+        live_parts / _session_status / _retired_messages
         cleared; _global nulled."""
         monkeypatch.setattr("oc_slimapi.sse.global_hub.GRACE_SECONDS", 0.0)
         monkeypatch.setattr("oc_slimapi.sse.registry.GRACE_SECONDS", 0.0)
@@ -406,7 +406,6 @@ class TestInv2GraceSerialEpochCleanup:
         th = TokenStreamHub()
         # Populate old-epoch state.
         th._session_status["s1"] = "busy"
-        th._busy_sids["s1"] = None
         th.live_parts[("s1", "m1", "p1")] = LivePart()
         th._retired_messages.add(("s1", "m1"))
 
@@ -425,7 +424,6 @@ class TestInv2GraceSerialEpochCleanup:
         assert registry._global is None
         # Token hub old-epoch state cleared by on_upstream_reconnect.
         assert len(th._session_status) == 0
-        assert len(th._busy_sids) == 0
         assert len(th.live_parts) == 0
         assert len(th._retired_messages) == 0
 
@@ -1111,7 +1109,7 @@ class TestInv6EofLossAndDoubleNotify:
 # ===========================================================================
 
 class TestP1_21SessionMetadataCap:
-    """_session_status / _busy_sids / sticky_last_error /
+    """_session_status / sticky_last_error /
     deleted_tombstones have FIFO caps to prevent unbounded growth."""
 
     def test_session_status_capped(self):
@@ -1123,15 +1121,6 @@ class TestP1_21SessionMetadataCap:
         assert len(th._session_status) <= _SESSION_STATUS_MAX
         assert "sid_0" not in th._session_status
         assert f"sid_{_SESSION_STATUS_MAX + 49}" in th._session_status
-
-    def test_busy_sids_capped(self):
-        """_busy_sids is bounded (FIFO cap)."""
-        from oc_slimapi.sse.tokenstream.hub import _SESSION_STATUS_MAX
-        th = TokenStreamHub()
-        for i in range(_SESSION_STATUS_MAX + 50):
-            th.on_session_status(f"sid_{i}", "busy")
-        assert len(th._busy_sids) <= _SESSION_STATUS_MAX
-        assert "sid_0" not in th._busy_sids
 
     def test_sticky_last_error_capped(self):
         """sticky_last_error is bounded (FIFO cap)."""

@@ -9,7 +9,6 @@ from starlette.responses import Response
 
 from ..dbaux import (
     AuxiliaryUnavailableError,
-    build_sessions_query,
     fetch_sessions_page,
     has_wildcard,
     normalized_search,
@@ -269,7 +268,6 @@ async def _status_via_lease(
 # ---------------------------------------------------------------------------
 
 _V4_ARCHIVED_STATES = ("omit", "only", "all")
-_V4_PARENT_RESERVED = ("all", "none", "only")
 _V4_LIMIT_MAX = 500  # §4.1 v4 domain (v3 keeps 1000)
 _AUX_RETRY_AFTER = "30"  # §4.2: same order as the breaker recovery probe
 

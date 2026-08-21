@@ -12,7 +12,7 @@ plain string. Consequences (root-caused on the live wire):
 * ``entry.status`` (digest ``status`` field) was only filled for
   ``isinstance(status, str)`` → never filled for the object envelope.
 * The token-hub mirror branch had the same ``isinstance(str)`` guard →
-  ``_busy_sids`` never updated from the object envelope.
+  ``_session_status`` never updated from the object envelope.
 
 These tests lock the normalized behavior: a single helper accepts BOTH
 the legacy string (``"busy"``) and the object envelope
@@ -323,13 +323,13 @@ class TestNoRebirthAfterClear:
 
 # ===========================================================================
 # Requirement 6 — token hub: both formats behave identically for
-# _busy_sids / session-status routing (no regression)
+# _session_status routing (no regression)
 # ===========================================================================
 
 class TestTokenHubMirror:
-    async def test_object_busy_idle_drive_busy_sids(self, pair):
+    async def test_object_busy_idle_drive_session_status(self, pair):
         """REQ 6: the publish() mirror feeds the token hub with the normalized
-        status — object envelope must drive _busy_sids exactly like the
+        status — object envelope must drive _session_status exactly like the
         legacy string."""
         hub, sub = pair
         th = TokenStreamHub()
@@ -338,17 +338,15 @@ class TestTokenHubMirror:
         hub.publish(ev("/proj", "session.status", {
             "sessionID": "s1", "status": {"type": "busy"},
         }))
-        assert "s1" in th._busy_sids
         assert th._session_status["s1"] == "busy"
 
         hub.publish(ev("/proj", "session.status", {
             "sessionID": "s1", "status": {"type": "idle"},
         }))
-        assert "s1" not in th._busy_sids
         assert th._session_status["s1"] == "idle"
         await drain(sub)
 
-    async def test_string_busy_idle_drive_busy_sids_regression(self, pair):
+    async def test_string_busy_idle_drive_session_status_regression(self, pair):
         """REQ 6 (regression): legacy string format unchanged through the mirror."""
         hub, sub = pair
         th = TokenStreamHub()
@@ -357,11 +355,11 @@ class TestTokenHubMirror:
         hub.publish(ev("/proj", "session.status", {
             "sessionID": "s1", "status": "busy",
         }))
-        assert "s1" in th._busy_sids
+        assert th._session_status["s1"] == "busy"
         hub.publish(ev("/proj", "session.status", {
             "sessionID": "s1", "status": "idle",
         }))
-        assert "s1" not in th._busy_sids
+        assert th._session_status["s1"] == "idle"
         await drain(sub)
 
     async def test_invalid_object_status_not_forwarded_as_busy(self, pair):
@@ -373,7 +371,7 @@ class TestTokenHubMirror:
         hub.publish(ev("/proj", "session.status", {
             "sessionID": "s1", "status": {"type": 7},
         }))
-        assert "s1" not in th._busy_sids
+        assert th._session_status.get("s1") != "busy"
         assert "s1" not in th._session_status
         await drain(sub)
 
@@ -382,14 +380,14 @@ class TestTokenHubMirror:
         parity — the shared normalizer is applied at the entry point)."""
         th = TokenStreamHub()
         th.on_session_status("s1", {"type": "busy"})
-        assert "s1" in th._busy_sids
+        assert th._session_status.get("s1") == "busy"
         th.on_session_status("s1", {"type": "idle"})
-        assert "s1" not in th._busy_sids
+        assert th._session_status.get("s1") != "busy"
 
     def test_on_session_status_direct_invalid_shapes(self):
         th = TokenStreamHub()
         th.on_session_status("s1", {})
         th.on_session_status("s1", {"type": None})
         th.on_session_status("s1", 3.14)
-        assert "s1" not in th._busy_sids
+        assert th._session_status.get("s1") != "busy"
         assert "s1" not in th._session_status

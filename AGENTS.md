@@ -17,9 +17,9 @@ ocdroid ──(stunnel mTLS 14096)──▶ opencode :4096   # 直连回退，�
                                                     # 目标态：ocdroid 完成 C1/C3 前置后此直连退役，仅服务匿名消费方（见 docs/specs/CLIENT_CHANGES.md「直连退役」）
 ```
 
-- **只**通过 HTTP 调 opencode **legacy** `/session/**`（及 `/global/event` 等），当前**不读** opencode SQLite（v4 起经只读投影源 `mode=ro` 读，**绝无写入**——写域约束见硬规则「SQLite 写域」）。
-- 为 ocdroid 提供：消息 skeleton 投影、策展 SSE（`session.digest` + q/p 直推 + `slimapi.meta` 首帧）、T3 资源限制、`/slimapi/**` v3-only 选择器（`?v=3`；catch-all 反代已于 3.0.0 关闭）。
-- **权威契约**：[`docs/specs/v3-contract.md`](docs/specs/v3-contract.md)（唯一 wire 基准，v3-only 终态；与 design / INTERFACE_MAP 冲突时以契约为准）。[`docs/specs/v2-contract.md`](docs/specs/v2-contract.md) 为 ≤2.x 历史契约（v2 语义已于 3.0.0 退役）。
+- **只**通过 HTTP 调 opencode **legacy** `/session/**`（及 `/global/event` 等），并经只读投影源读 opencode SQLite（4.0.0 起生产启用，`mode=ro` 的 v4 DB 投影通道；**绝无写入**——写域约束见硬规则「SQLite 写域」）。
+- 为 ocdroid 提供：消息 skeleton 投影、策展 SSE（`session.digest` + q/p 直推 + `slimapi.meta` 首帧）、T3 资源限制、`/slimapi/**` `?v=` 选择器（4.0.0 起 (3,4) 双版本窗口：`?v=3`/`?v=4`；catch-all 反代已于 3.0.0 关闭）。
+- **权威契约**：[`docs/specs/v3-contract.md`](docs/specs/v3-contract.md)（v3 wire 基准；4.0.0 起 (3,4) 双版本窗口，v4 差异面见 [`docs/specs/v4-contract.md`](docs/specs/v4-contract.md)；与 design / INTERFACE_MAP 冲突时以契约为准）。[`docs/specs/v2-contract.md`](docs/specs/v2-contract.md) 为 ≤2.x 历史契约（v2 语义已于 3.0.0 退役）。
 - **设计 / 接口追踪**：[`docs/specs/design-v2.md`](docs/specs/design-v2.md)、[`docs/specs/INTERFACE_MAP.md`](docs/specs/INTERFACE_MAP.md)。
 - **客户端配套说明**：[`docs/specs/CLIENT_CHANGES.md`](docs/specs/CLIENT_CHANGES.md)（给 ocdroid 开发者的改动清单）。
 
@@ -58,11 +58,11 @@ ocdroid ──(stunnel mTLS 14096)──▶ opencode :4096   # 直连回退，�
 
 | 任务 | 入口 | 规则 / 细节 |
 |---|---|---|
-| 改动后校验（必做） | `./scripts/check.sh` | pytest + **路由↔文档一致性**（[`scripts/check_routes_doc.py`](scripts/check_routes_doc.py)：每个 `/slimapi` 路由须在 INTERFACE_MAP 有记录，**防漂移**）+ [`docs/release.md`](docs/release.md) §质量门禁 |
+| 改动后校验（必做） | `./scripts/check.sh` | 实际三项：pytest + **路由↔文档一致性**（[`scripts/check_routes_doc.py`](scripts/check_routes_doc.py)：每个 `/slimapi` 路由须在 INTERFACE_MAP 有记录，**防漂移**）+ `compileall src` 字节码编译；门禁细则见 [`docs/release.md`](docs/release.md) §质量门禁 与 [`docs/develop.md`](docs/develop.md) |
 | 发版（tag + changelog） | `./scripts/release.sh <patch\|minor\|major>` | **[`docs/release.md`](docs/release.md)**（发版规范权威） |
 | 接口行为变更记录 | 编辑 [`CHANGELOG.md`](CHANGELOG.md) | 每次**破坏/加性 wire 行为**变更必须记；ocdroid 对接以本文件为准 |
 | 契约 / 设计 | `docs/specs/v3-contract.md`、`docs/specs/design-v2.md`、`docs/specs/INTERFACE_MAP.md` | 版本协商 = `?v=` selector + `GET /slimapi/versions`（`X-Slimapi-Version` 头已于 3.0.0 删除）；破坏性变更走 major 发版 + 契约修订 |
-| 省流 / 路由审计（advisory） | access log `access-YYYY-MM-DD.jsonl`（按天）+ snapshot `traffic-snapshot-YYYY-MM-DD.jsonl` + [`docs/specs/INTERFACE_MAP.md`](docs/specs/INTERFACE_MAP.md) | 查“哪些请求未省流”：按 `bucket=="passthrough"` 过滤 access log、聚合 `method+path`，再对照 INTERFACE_MAP 看有无 `/slimapi` 等价省流路由；文件位置/查询见 [`docs/manual/traffic-accounting.md`](docs/manual/traffic-accounting.md)（生产落 `~/.local/state/oc-slimapi/logs/`，`RETAIN_DAYS=3` 自动清理）；新增 `/slimapi` 路由必须同步进 INTERFACE_MAP（否则 check.sh 失败） |
+| 省流 / 路由审计（advisory） | access log `access-YYYY-MM-DD.jsonl`（按天）+ snapshot `traffic-snapshot-YYYY-MM-DD.jsonl` + [`docs/specs/INTERFACE_MAP.md`](docs/specs/INTERFACE_MAP.md) | 查“哪些请求未省流”：按 `bucket=="passthrough"` 过滤 access log、聚合 `method+path`，再对照 INTERFACE_MAP 看有无 `/slimapi` 等价省流路由。**3.0.0 终局注记**：catch-all 已关闭，`passthrough` 桶现为**哨兵桶**（只剩 404/405 拒绝，`upIn`/`upOut` 恒 0——任何 2xx 出现即意外穿透，见 traffic-accounting.md §3.2）；未省流分析现以 `other` 桶与 INTERFACE_MAP 对照为主。文件位置/查询见 [`docs/manual/traffic-accounting.md`](docs/manual/traffic-accounting.md)（生产落 `~/.local/state/oc-slimapi/logs/`，`RETAIN_DAYS=3` 自动清理）；新增 `/slimapi` 路由必须同步进 INTERFACE_MAP（否则 check.sh 失败） |
 
 > 任何 release / tag / 版本号 / changelog 写入，都不得由 agent 自由发挥命令，必须走 `scripts/release.sh` 或 `docs/release.md` 写明的步骤。
 
@@ -70,12 +70,12 @@ ocdroid ──(stunnel mTLS 14096)──▶ opencode :4096   # 直连回退，�
 
 ## 硬规则（不可违反）
 
-- **改动校验必做**：每次改 Python / 契约相关行为后，必须 `./scripts/check.sh` 通过才算改动完成（当前 = `pytest tests/`）。
+- **改动校验必做**：每次改 Python / 契约相关行为后，必须 `./scripts/check.sh` 通过才算改动完成（实际三项：`pytest tests/` + 路由↔文档一致性 gate + `compileall src`，见 `docs/develop.md`「测试 / 质量门禁」）。
 - **契约权威**：wire 行为以 `docs/specs/v3-contract.md` 为准；实现与契约冲突 → 先改实现或走正式契约修订（见 `docs/release.md`），**禁止**静默偏离契约。
 - **SQLite 写域**：禁止写入/修改上游 opencode SQLite 业务数据；sidecar 代码路径零 DDL/DML/PRAGMA 写；索引建立属显式运维动作（含定义校验），不在 sidecar 内。wire contract 只冻结可观察语义（参数/错误/降级/degraded），**不冻结 SQLite 实现手段**；实现边界进本文件 / 架构设计文档 / `docs/operations.md`。
 - **版本双轨**：
   - **包版本**（semver，git tag `vX.Y.Z` + `pyproject.toml`）：产品/发版版本。
-  - **Wire API 版本**（整数，`versioning.py` 中 `ACCEPTED_CLIENT_VERSIONS`，当前 `[3,3]`）：协商经 `?v=` selector + `/slimapi/versions` 发现端点；`X-Slimapi-Version` 请求头已于 3.0.0 删除（出现不解读）。
+  - **Wire API 版本**（整数，`versioning.py` 中 `ACCEPTED_CLIENT_VERSIONS`，当前 `(3,4)`——4.0.0 起 (3,4) 双版本窗口）：协商经 `?v=` selector + `/slimapi/versions` 发现端点；`X-Slimapi-Version` 请求头已于 3.0.0 删除（出现不解读）。
 - **Git 分支**：主线 `main`；发版在 `main` 上打 tag。
 - **禁止**：手写随意 tag 跳过 `release.sh`；在未更新 `CHANGELOG.md` 的情况下发布 wire 行为变更；把 secret / `.venv` / 本机路径密钥提交进仓。
 - **写域纪律**：多 agent 并行时严守文件归属；`docs/specs/v3-contract.md` 非用户明确要求不要改。
@@ -113,9 +113,9 @@ ls ~/.local/state/oc-slimapi/logs/           # access-YYYY-MM-DD.jsonl(.gz) + tr
 
 | 文件 | 用途 |
 |---|---|
-| [`docs/specs/v3-contract.md`](docs/specs/v3-contract.md) | **Wire 契约权威**（v3-only 终态；`v2-contract.md` 为 ≤2.x 历史契约） |
+| [`docs/specs/v3-contract.md`](docs/specs/v3-contract.md) | **Wire 契约权威**（v3 基准 + (3,4) 双版本窗口；`v2-contract.md` 为 ≤2.x 历史契约） |
 | [`docs/specs/v4-contract.md`](docs/specs/v4-contract.md) | v4 wire 契约（4.0.0 实施基线 + 2026-08-19 正式修订冻结（修订二：POST 等效动作族）） |
-| [`docs/specs/design-v2.md`](docs/specs/design-v2.md) | 当前态设计（接口/骨架/部署） |
+| [`docs/specs/design-v2.md`](docs/specs/design-v2.md) | v2 时代设计（历史；现行态以 v3/v4 契约 + operations.md 为准） |
 | [`docs/specs/INTERFACE_MAP.md`](docs/specs/INTERFACE_MAP.md) | 端点级实现追踪 |
 | [`docs/specs/CLIENT_CHANGES.md`](docs/specs/CLIENT_CHANGES.md) | ocdroid 侧配套改动清单 |
 | [`docs/specs/design-token-stream.md`](docs/specs/design-token-stream.md) | Token stream 设计历史与 rationale（v4 设计稿；当前 wire 契约见 v3-contract.md §7） |

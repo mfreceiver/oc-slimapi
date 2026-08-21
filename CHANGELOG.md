@@ -26,6 +26,47 @@ ocdroid 对接时：
 
 ---
 
+## [4.6.1] - 2026-08-21 — 审计整改批次三 Wave 1：机械清理与文档对齐（包版本 patch；wire 版本**不变**，仍 (3,4)；实施计划 docs/ocmar/plans/2026-08-21-batch3-full-rollout.md，经 rev-cgpt 两轮门控 5.8→9.4 PASS）
+
+### Removed（内部死码，零 wire 影响）
+
+- **死代码清扫（审计 F-024/F-138）**：删除 src 零消费者符号——`_busy_sids` 全链（token hub 白盒断言迁移至 `_session_status` 等价断言）、`replay_log.last_touch`（`_DomainState.now` 参数连带）、`recycle_domain` 的 sweep-loop 恒零迭代调用点（方法本体保留：公共 API + REPLAY-018 语义测试）、`qp_sweep.directory_source` 注入分支（方法更名 `_ingest_activity_directories`）、`upstream.strip_hop_by_hop` + hop-by-hop 常量组（`tests/test_upstream.py` 连测删除）、`routes/sessions.py` 的 `build_sessions_query` dead import、`_V4_PARENT_RESERVED`、`selector.SELECTOR_ABSENT/SELECTOR_V2`、`hub.py` shim 死 re-export、`global_hub` 死 `import logging`。审计误报一处如实保留：`hub_types.logger` 实际在用（Subscriber.put overflow 分支）。
+- **`respx` 测试依赖移除**（F-018）：pyproject `[test]` 删 `respx>=0.22`，全树零引用（无 lock 文件，重装即生效）。
+
+### Fixed（内部/运维）
+
+- **`OC_SLIMAPI_MAX_MESSAGE_BYTES` 下界校验**（backlog B2-6）：`0`/负值启动即 `RuntimeError`（`must be >= 1`），与 `max_transforms`/`max_response_bytes` 同族校验风格；新增 3 用例。
+- **resync reason 值域冻结（F-122 防线）**：`sse/hub_types.py` 新增 `RESYNC_*` 常量 + `V4_RESYNC_REASONS`/`SSE_RESYNC_REASONS` frozenset（v3∪v4 全集单一冻结源），`replay_wire` 改 re-export 消 import 环；`tokenstream/hub.py` 8 处字面量收敛；新增 AST 防线 `tests/test_resync_reason_gate.py`（全树扫描 resync 路径 reason 实参 ∈ 冻结集 + canary 负向用例）——未来新增 reason 必须显式进集，杜绝未定义 reason 上 wire。
+- **关停超时对齐（F-010/F-214）**：deploy 模板 `TimeoutStopSec` 15→60（覆盖最坏关停链 uvicorn 5s + 维护 30s + transform 10s + dbaux 5s ≈ 50s，附算术注释）；`app.py` 排水常量注释同步；operations.md §3.2/§4/§9 shutdown 语义全链重写 + 排障行。旧值 15s 只覆盖 uvicorn 段，SIGKILL 会截断链尾的终帧快照与 access-log flush。
+- **两处 TODO 解除（F-030）**：上游 part 信封 casing 定论 camelCase（opencode v1.18.18 `schema/v1/session.ts:81-85`/`:612-620`），本仓代码本就按 camelCase 读取——注释改已决陈述，零代码改动。
+
+### Docs（漂移对齐，零行为变更）
+
+- **文档批量对齐（F-339/F-123/F-125/F-151/F-156/F-020/F-139/F-157/F-124/F-346..F-353/F-152..F-155）**：operations.md env 全量覆盖（7 张旋钮表 + §5.5.1 directory allowlist 运维 + §7 503 场景矩阵 + §9 排障扩展）；INTERFACE_MAP/README/AGENTS/develop/release/traffic-accounting 统一 (3,4) 双版本窗口口径（v3-only 残留清零）；v3-contract 4 处行内勘误括注（严格前缀追加）+ §11 门控快照标注；v3/v4-contract §8 `[4.6.1] 追加`三错误码补录（405 `method_not_allowed` / WS 501 `websocket_not_supported` / actions `invalid_request_body`）；CLIENT_CHANGES 权威指针重锚 v3/v4 契约 + CHANGELOG；两设计稿标注 IMPLEMENTED 2026-08-16。历史归档（CHANGELOG 旧条目/审计卷宗）按不改写原则未动；src 内两处历史引用与 routes 层 3 处字面量归后续波次写域。
+
+---
+
+## [4.6.0] - 2026-08-21 — 批次二：六项 owner 裁决落地（包版本 minor；wire 版本**不变**，仍 (3,4)；实施计划经 rev-cgpt 三轮门控 7.3→8.8→9.1 PASS）
+
+### Added（wire，SSE 加性）
+
+- **q/p IMMEDIATE 集新增 `question.replied` / `question.rejected` / `question.v2.replied` / `question.v2.rejected` 直推**（owner R-4 裁决 2026-08-21）。上游 v1.18.18 实际发布这四型（question 决议事件），此前被 catch-all 静默丢弃——任何客户端答复 question 后，其余客户端（webui 提问卡片）永远收不到决议帧。与 [4.5.0] `permission.replied` 修复同构：修复 webui「其他客户端处理后提问卡片不消失」痛点（根因是服务端从未推送，非 webui 消费缺陷）。未适配客户端按未知 `data.type` 忽略，零迁移；`qp_last_activity` 联动自动覆盖。
+
+### Added（观测，metrics 加性）
+
+- **`/slimapi/metrics` hubs[] 新增 `droppedEventsByType`**（owner R-5 裁决）：per-type 有界丢弃计数（基数 ≤257 含 `__other__`；空表恒发布 `{}`；快照浅拷贝与内部表解耦）——上游事件集漂移可经探针常态化检测（取代 4.5.0「内部-only」决定）；既有键零改动；v3/v4 契约 §9 同句记载。
+
+### Changed（部署默认）
+
+- **deploy 模板 `OC_SLIMAPI_HOST` 默认 `0.0.0.0`→`127.0.0.1`**（owner R-1a 裁决 2026-08-21：确认无 Tailscale 直连消费方，E-II 明文无认证面收敛）。`0.0.0.0` 保留为显式 opt-in（validate 白名单不变，须自担网络层隔离——见 deploy 注释与 operations.md §11 opt-in runbook）；operations.md 全量同步（11 处 0.0.0.0 站点改 opt-in/历史标注语义）。
+
+### Docs（评估与指引，零行为变更）
+
+- **CLIENT_CHANGES.md 新增「v4 迁移指南」章节**（owner R-3 裁决）：迁移 checklist（[4.0.0]-[4.5.0] 消费者行动项整合）+ providers/sessions 字段差集对照表 + per-directory 列表客户端补偿模式（F-121）+ SSE 新帧消费指引。
+- **两份评估文档**（docs/ocmar/reviews/）：`2026-08-21-allowlist-global-gate-impact.md`（R-1b——allowlist 提升全局门三路径评估，推荐观测先行；含新发现 `/slimapi/directories` 契约-实现漂移）、`2026-08-21-v3-retirement-reassessment.md`（R-6——v3 退役五阶段路线图重估；「owner 推进 v3 全面废弃」记录为待转化规划基线，(3,4) 契约冻结在正式 major 前仍生效）。
+
+---
+
 ## [4.5.0] - 2026-08-21 — 审计整改批次一（包版本 minor；wire 版本**不变**，仍 (3,4)；2026-08-20 全面审计 docs/audits/2026-08-20/ 的 12 项发现：P1×3 + P2×8 + P3×1；实施计划经 rev-cgpt 四轮门控 5.5→7.6→8.7→9.2 PASS）
 
 ### Fixed（wire）
@@ -53,27 +94,6 @@ ocdroid 对接时：
 ### Docs（契约澄清，行为零改动）
 
 - **v4-contract §4.1/§4.3/§8.1 补全 sessions limit 域外/archived 非法/parent 空串错误归宿**（F-025，P2）：命名 code 字面量 `param_version_mismatch`；501..1000 → 422 coded body；>1000/≤0/非 int → 框架 422 `{"detail":[...]}`（只冻结状态码 + detail 数组存在 + 无 code 字段，不冻结框架文案）；测试锁定双形状现状（test_sessions_v4_matrix.py 新增 4 类断言）。
-
----
-
-## [4.6.0] - 2026-08-21 — 批次二：六项 owner 裁决落地（包版本 minor；wire 版本**不变**，仍 (3,4)；实施计划经 rev-cgpt 三轮门控 7.3→8.8→9.1 PASS）
-
-### Added（wire，SSE 加性）
-
-- **q/p IMMEDIATE 集新增 `question.replied` / `question.rejected` / `question.v2.replied` / `question.v2.rejected` 直推**（owner R-4 裁决 2026-08-21）。上游 v1.18.18 实际发布这四型（question 决议事件），此前被 catch-all 静默丢弃——任何客户端答复 question 后，其余客户端（webui 提问卡片）永远收不到决议帧。与 [4.5.0] `permission.replied` 修复同构：修复 webui「其他客户端处理后提问卡片不消失」痛点（根因是服务端从未推送，非 webui 消费缺陷）。未适配客户端按未知 `data.type` 忽略，零迁移；`qp_last_activity` 联动自动覆盖。
-
-### Added（观测，metrics 加性）
-
-- **`/slimapi/metrics` hubs[] 新增 `droppedEventsByType`**（owner R-5 裁决）：per-type 有界丢弃计数（基数 ≤257 含 `__other__`；空表恒发布 `{}`；快照浅拷贝与内部表解耦）——上游事件集漂移可经探针常态化检测（取代 4.5.0「内部-only」决定）；既有键零改动；v3/v4 契约 §9 同句记载。
-
-### Changed（部署默认）
-
-- **deploy 模板 `OC_SLIMAPI_HOST` 默认 `0.0.0.0`→`127.0.0.1`**（owner R-1a 裁决 2026-08-21：确认无 Tailscale 直连消费方，E-II 明文无认证面收敛）。`0.0.0.0` 保留为显式 opt-in（validate 白名单不变，须自担网络层隔离——见 deploy 注释与 operations.md §11 opt-in runbook）；operations.md 全量同步（11 处 0.0.0.0 站点改 opt-in/历史标注语义）。
-
-### Docs（评估与指引，零行为变更）
-
-- **CLIENT_CHANGES.md 新增「v4 迁移指南」章节**（owner R-3 裁决）：迁移 checklist（[4.0.0]-[4.5.0] 消费者行动项整合）+ providers/sessions 字段差集对照表 + per-directory 列表客户端补偿模式（F-121）+ SSE 新帧消费指引。
-- **两份评估文档**（docs/ocmar/reviews/）：`2026-08-21-allowlist-global-gate-impact.md`（R-1b——allowlist 提升全局门三路径评估，推荐观测先行；含新发现 `/slimapi/directories` 契约-实现漂移）、`2026-08-21-v3-retirement-reassessment.md`（R-6——v3 退役五阶段路线图重估；「owner 推进 v3 全面废弃」记录为待转化规划基线，(3,4) 契约冻结在正式 major 前仍生效）。
 
 ---
 

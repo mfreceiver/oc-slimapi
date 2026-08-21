@@ -213,16 +213,15 @@ class _DomainState:
 
     __slots__ = (
         "entries", "next_seq", "last_seq", "bytes",
-        "barrier_watermark", "last_touch",
+        "barrier_watermark",
     )
 
-    def __init__(self, now: float) -> None:
+    def __init__(self) -> None:
         self.entries: deque[ReplayEntry] = deque()
         self.next_seq = 1          # next seq to assign (seq starts at 1)
         self.last_seq = 0          # max published seq (never resets)
         self.bytes = 0             # summed entry sizes (this domain)
         self.barrier_watermark: int | None = None
-        self.last_touch = now
 
     @property
     def window_start(self) -> int | None:
@@ -368,7 +367,7 @@ class ReplayLog:
             raise ValueError("domain must be a non-empty string")
         state = self._domains.get(domain)
         if state is None:  # lazy creation (per-sid domains on first frame)
-            state = _DomainState(self._clock())
+            state = _DomainState()
             self._domains[domain] = state
         now = self._clock()
         self._ttl_evict_head(state, now)
@@ -389,7 +388,6 @@ class ReplayLog:
         state.entries.append(entry)
         state.bytes += size
         self.total_bytes += size
-        state.last_touch = now
         self._evict_for_count(state)
         self._evict_for_bytes()
         return entry
@@ -427,7 +425,6 @@ class ReplayLog:
         now = self._clock()
         if state is not None:
             self._ttl_evict_head(state, now)
-            state.last_touch = now
         # ④a barrier (upstream-loss low-watermark; watermark itself counts
         # as intercepted — rev-5 off-by-one勘误: <=, not <).
         watermark = state.barrier_watermark if state is not None else None
@@ -481,7 +478,6 @@ class ReplayLog:
         after the write are post-barrier domains — no watermark for them.
         Barriers are metadata: never evicted by count/bytes/TTL.
         """
-        now = self._clock()
         if domain is None:
             targets = list(self._domains.values())
         else:
@@ -490,7 +486,6 @@ class ReplayLog:
         for state in targets:
             if state.barrier_watermark is None or state.barrier_watermark < state.last_seq:
                 state.barrier_watermark = state.last_seq
-            state.last_touch = now
 
     def recycle_domain(self, domain: str) -> bool:
         """Recycle a per-sid domain (TTL expiry / long-no-subscribers hook).
@@ -507,7 +502,6 @@ class ReplayLog:
             return False
         while state.entries:
             self._drop_head(state)
-        state.last_touch = self._clock()
         return True
 
     def sweep(self, now: float | None = None) -> int:

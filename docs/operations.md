@@ -84,6 +84,12 @@ WorkingDirectory=/home/mar/personal_projects/oc-slimapi
 ExecStart=/home/mar/personal_projects/oc-slimapi/.venv/bin/python -m oc_slimapi.app
 Restart=on-failure
 RestartSec=5
+# F-010/F-214: SIGTERM 最坏关停链 = uvicorn 连接排水 5s（_GRACEFUL_SHUTDOWN_TIMEOUT）
+# + lifespan LIFO 清理：维护排水 30s（_MAINT_DRAIN_TIMEOUT）+ transform 池排水 10s
+# （_TRANSFORM_DRAIN_TIMEOUT）+ dbaux 排水 5s（_DBAUX_DRAIN_TIMEOUT）+ 中间回调秒级
+# ≈ 50s；60s 覆盖全链并留 ~10s 余量。改动 app.py 排水常量时须同步此值
+# （审计 docs/audits/2026-08-20/02-findings/F-010.md / F-214.md）。
+TimeoutStopSec=60
 
 Environment=OC_SLIMAPI_HOST=127.0.0.1   # 默认回环；0.0.0.0 为 opt-in（须自担网络层隔离，见 §11）
 Environment=OC_SLIMAPI_PORT=4097
@@ -103,6 +109,7 @@ StateDirectory=oc-slimapi
 Environment=OC_SLIMAPI_ACCESS_LOG_DIR=%S/oc-slimapi/logs
 Environment=OC_SLIMAPI_TRAFFIC_SNAPSHOT_PATH=%S/oc-slimapi/logs/traffic-snapshot.jsonl
 Environment=OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS=3
+Environment=OC_SLIMAPI_TRAFFIC_SNAPSHOT_RETAIN_DAYS=30
 Environment=OC_SLIMAPI_STATE_DIR=%S/oc-slimapi
 
 StandardOutput=journal
@@ -161,7 +168,7 @@ sudo loginctl enable-linger "$USER"
 | 关闭自启 | `systemctl --user disable oc-slimapi` |
 | 改了 unit 文件后 | `systemctl --user daemon-reload` 然后 `restart` |
 
-> **shutdown 语义**：`systemctl --user stop` / `restart` 发出 SIGTERM 后，uvicorn 给活跃连接（含 SSE 订阅者 drain）最多 5 秒宽限（`timeout_graceful_shutdown`）自然结束，再强制关闭未完成的连接。systemd 的 `TimeoutStopSec=15` 作为上限（高于 uvicorn 的 5s 窗口，覆盖默认 90s SIGKILL），避免连接残留导致长时间阻塞。若需调整，在 service unit `[Service]` 修改 `TimeoutStopSec=`（须 ≥ uvicorn 的 5s 宽限窗口）。
+> **shutdown 语义**：`systemctl --user stop` / `restart` 发出 SIGTERM 后，uvicorn 给活跃连接（含 SSE 订阅者 drain）最多 5 秒宽限（`timeout_graceful_shutdown`）自然结束；随后进程进入 lifespan 的 AsyncExitStack LIFO 清理链（access-log 维护排水 30s + transform 池排水 10s + dbaux 排水 5s + 中间回调秒级）。systemd 的 `TimeoutStopSec=60` 作为总上限覆盖整条最坏链（5+30+10+5+余量 ≈ 50s < 60s）。旧值 15s 只覆盖 uvicorn 一段，会让 SIGKILL 截断链尾的最终流量快照帧与 access-log flush（审计 F-010/F-214，`docs/audits/2026-08-20/02-findings/`）。若需调整，在 service unit `[Service]` 修改 `TimeoutStopSec=`（须 ≥ 全链最坏合计，且不低于 uvicorn 的 5s 宽限窗口），并同步 `deploy/oc-slimapi.service` 模板与本节算术。
 
 代码升级 / 发版后部署流程（**三步缺一不可**）：
 
@@ -205,7 +212,7 @@ oc-slimapi 有两类日志输出，**分别处理**：
 
 ### 5.2.1 incarnation 状态文件（与 access logs 分离，T9/P1-4）
 
-> T9（P1-4）起，incarnation 状态文件与 access logs **分离**到独立目录。这是**运维行为变更**，不涉及 wire（历史注：该变更发生于 v2 时代、未 bump 版本头；v3-only 终态下 `X-Slimapi-Version` 头已删除，wire 版本由 `?v=3` selector 唯一表达）。
+> T9（P1-4）起，incarnation 状态文件与 access logs **分离**到独立目录。这是**运维行为变更**，不涉及 wire（历史注：该变更发生于 v2 时代、未 bump 版本头；3.0.0 起请求头通道删除，wire 版本由 `?v=` selector 唯一表达——4.0.0 起 (3,4) 双版本窗口）。
 
 | 路径 | 来源 |
 |---|---|
@@ -250,7 +257,7 @@ oc-slimapi 有两类日志输出，**分别处理**：
 | `OC_SLIMAPI_QUESTIONS_MAX_AGGREGATE_BYTES` | 16 MiB | >= per_dir, <= 128 MiB | 跨目录聚合的累积字节预算。超过时 envelope 标记 `truncated: true`，取消后续未消费的目录。 |
 | `OC_SLIMAPI_QUESTIONS_FANOUT_CONCURRENCY` | 8 | 1–16 | 跨请求全局 `/question` 并发上限。单次 `/slimapi/questions` 请求的 fan-out 不超过此值。 |
 
-触发任一预算上限时，envelope 复用既有的加性字段 `truncated`（`true`）和 `authoritativeDirectories`（降级为已成功目录列表，非 null）（历史注：该行为加入时未 bump 版本头；v3-only 终态下 `X-Slimapi-Version` 已删除，`?v=3` selector 为唯一版本通道）。详见 [`../CHANGELOG.md`](../CHANGELOG.md) Unreleased 与 [`docs/specs/INTERFACE_MAP.md`](specs/INTERFACE_MAP.md) questions 行。
+触发任一预算上限时，envelope 复用既有的加性字段 `truncated`（`true`）和 `authoritativeDirectories`（降级为已成功目录列表，非 null）（历史注：该行为加入时未 bump 版本头；3.0.0 起请求头通道删除，`?v=` selector 为唯一版本通道——4.0.0 起 (3,4) 双版本窗口）。详见 [`../CHANGELOG.md`](../CHANGELOG.md) Unreleased 与 [`docs/specs/INTERFACE_MAP.md`](specs/INTERFACE_MAP.md) questions 行。
 
 **Permissions（`/slimapi/permissions`，2026-08-15 起；语义与 questions 同款）**
 
@@ -290,6 +297,87 @@ oc-slimapi 有两类日志输出，**分别处理**：
 | `OC_SLIMAPI_MESSAGE_FINGERPRINT_ENABLED` | true | bool | messages skeleton 加性字段 `contentFingerprint`（`"<vN>:<sha256hex>"`）开关。`false` = 不输出该字段（逐字节等价开关关闭前行为）。**注意**：开关状态参与 ETag `REP_VERSION`——关闭/重开会轮换全部 ETag 验证器（客户端 304 全部 miss 一次，属预期）。 |
 
 > **默认容量退化说明（重要）**：默认 `RAW_FETCH_MAX_BYTES=64 MiB` × `MAX_RESPONSE_BYTES=64 MiB` → **默认配置下同时只有 1 个去重 flight**；`RAW_FETCH_CONCURRENCY=4` 在默认预算下不可达（预算先到顶）。这是刻意的保守默认（内存证明优先）。**调优指引**：期望 N 个并行去重抓取时，设 `OC_SLIMAPI_RAW_FETCH_MAX_BYTES >= N × OC_SLIMAPI_MAX_RESPONSE_BYTES`；预算满时新 key 自动降级为现行直取路径（行为正确，只是不去重）。聚合内存校验：`RAW_FETCH_MAX_BYTES + MAX_TRANSFORMS × MAX_RESPONSE_BYTES <= 576 MiB`（两项预算并发峰值之和，超限启动失败）。
+
+**SSE 控制面资源限制（`/slimapi/events`）**
+
+| 变量 | 默认值 | 范围 | 说明 |
+|---|---|---|---|
+| `OC_SLIMAPI_MAX_SUBSCRIBERS_PER_DIRECTORY` | 8 | >= 1 | 单 directory 的 digest SSE 订阅上限；超出 → 400（订阅被拒，见 §9 排障行）。 |
+| `OC_SLIMAPI_MAX_TOTAL_SUBSCRIBERS` | 16 | >= per-directory | 进程级 SSE 订阅总量上限（须 >= 单 directory 上限，否则启动失败）。 |
+| `OC_SLIMAPI_SSE_QUEUE_ITEMS` | 256 | >= 2 | 每订阅者发送队列条目数；溢出触发背压 `resync{subscriber_backpressure}` + 断连。 |
+| `OC_SLIMAPI_SSE_BUFFER_BYTES` | 2 MiB | > 0 | 每订阅者发送队列字节预算（与条目数双限，先到先溢）。 |
+| `OC_SLIMAPI_SSE_MAX_FRAME_BYTES` | 256 KiB | > 0 | 单帧序列化上限；超限帧整帧丢弃（防单帧打爆队列）。 |
+
+**Token stream 资源限制（`/slimapi/sessions/{sid}/stream`）**
+
+| 变量 | 默认值 | 范围 | 说明 |
+|---|---|---|---|
+| `OC_SLIMAPI_TOKEN_STREAM_MAX_SUBSCRIBERS` | 8 | >= 1 | 单 sid 的 token stream 订阅上限（admission limit，超出拒绝）。 |
+| `OC_SLIMAPI_TOKEN_STREAM_QUEUE_ITEMS` | 64 | >= 2 | 每订阅者队列条目数。 |
+| `OC_SLIMAPI_TOKEN_STREAM_BUFFER_BYTES` | 512 KiB | > 0 | 每订阅者队列字节预算。 |
+| `OC_SLIMAPI_TOKEN_STREAM_MAX_FRAME_BYTES` | 1 MiB | > 0 | 单帧上限（契约 §7 帧上限的实现旋钮）。 |
+
+> `OC_SLIMAPI_TOKEN_STREAM_DEBUG_*`（`LIVE_BUDGET_BYTES`/`LIVE_PARTS_MAX`/`PART_MAX_BYTES`）为 **debug/联调-only** 覆盖，生产勿动（`config.py` 头注）。
+
+**SSE 断线重放（replay buffer）**
+
+| 变量 | 默认值 | 范围 | 说明 |
+|---|---|---|---|
+| `OC_SLIMAPI_REPLAY_COUNT` | 2048 | >= 1 | 重放缓冲最大帧数。 |
+| `OC_SLIMAPI_REPLAY_BYTES_KB` | 65536 | >= 1 | 重放缓冲字节预算。**单位是 KiB**（64 MiB）——env 名无 `MAX_` 前缀，勿与字节单位混淆。 |
+| `OC_SLIMAPI_REPLAY_TTL_S` | 900 | > 0 | 缓冲条目 TTL（秒）。 |
+
+**questions/permissions 后台巡检（qp sweep）**
+
+| 变量 | 默认值 | 范围 | 说明 |
+|---|---|---|---|
+| `OC_SLIMAPI_QP_SWEEP_ENABLED` | true | bool | 跨目录 questions/permissions 后台预取巡检总开关。 |
+| `OC_SLIMAPI_QP_SWEEP_INTERVAL_SECONDS` | 1800.0 | > 0 | 巡检周期（秒）。 |
+| `OC_SLIMAPI_QP_SWEEP_DAILY_BUDGET` | 100 | >= 0 | 每日巡检预算（上游 fan-out 次数上限，防后台流量失控）。 |
+
+**v4 DB 辅助源探测周期**
+
+| 变量 | 默认值 | 范围 | 说明 |
+|---|---|---|---|
+| `OC_SLIMAPI_DBAUX_PROBE_INTERVAL_S` | 30 | > 0 | dbaux 可用性重探周期（秒）——熔断后恢复探测的节奏（§7.3「恢复」）。 |
+
+**客户端标识 hash（隐私）**
+
+| 变量 | 默认值 | 范围 | 说明 |
+|---|---|---|---|
+| `OC_SLIMAPI_CLIENT_ID_HASH` | 1 | bool（fail-closed） | access log `clientId` 脱敏开关；读到 false 才落明文（fail-closed 默认 hash）。 |
+| `OC_SLIMAPI_CLIENT_ID_SALT` | None | 任意串 | HMAC salt（设非空时 `sha256`→`hmac_sha256`），防止彩虹表反查设备 id。 |
+
+**ETag 总开关**
+
+| 变量 | 默认值 | 范围 | 说明 |
+|---|---|---|---|
+| `OC_SLIMAPI_ETAG_ENABLED` | true | bool | 全部 `/slimapi` ETag 路由的 ETag/304 生成总开关。关闭的**副作用**是重开时轮换全部 ETag 验证器（客户端 304 全部 miss 一次，属预期）。 |
+
+**观测面开关（流量账本 / access log / snapshot）**
+
+| 变量 | 默认值 | 范围 | 说明 |
+|---|---|---|---|
+| `OC_SLIMAPI_TRAFFIC_METRICS_ENABLED` | 1 | bool | `0` 时 `/slimapi/metrics` 的 `traffic` 块退化为 `{enabled:false}`、ledger no-op——**排障时关闭它会让省流观测全部消失**（业务不受影响）。 |
+| `OC_SLIMAPI_ACCESS_LOG_ENABLED` | 1 | bool | `0` 时 access log 完全不落盘（snapshot 循环**不受此开关影响**，仍自持 prune）。 |
+| `OC_SLIMAPI_TRAFFIC_SNAPSHOT_ENABLED` | 1 | bool | `0` 时停止周期快照（历史趋势断档，access log 不受影响）。 |
+| `OC_SLIMAPI_ACCESS_LOG_COMPRESS_ON_STARTUP` | 1 | bool | 启动时把早于今天的 `.jsonl` 压缩为 `.gz`（后台 maintenance 周期默认 1h 亦做同款，见 §5.3）。 |
+
+**Directory allowlist（[3.3.0] 起）**
+
+| 变量 | 默认值 | 范围 | 说明 |
+|---|---|---|---|
+| `OC_SLIMAPI_DIRECTORY_ALLOWLIST` | 未配置 | 三态 | 键缺失 = 机制禁用（零行为变化）；显式空串 `""` = reject-all；非空 = 冒号分隔子树清单。详见 §5.5.1 运维节。 |
+
+**完整权威清单**：以上与 §5.5 各族 knob 的权威定义/默认值均在 `src/oc_slimapi/config.py` 的 `Settings`（本节为运维速查镜像）。
+
+### 5.5.1 directory allowlist 运维（[3.3.0] 起；现状边界声明）
+
+- **三态语义**（解析于 `src/oc_slimapi/config.py` 的 `_directory_allowlist_env`）：键缺失（默认）→ 机制禁用，一切行为零变化；显式空串 `""` → 机制启用 + **reject-all**（`/slimapi/file/**` 三端点全 403 `directory_not_allowed`）；非空 → 冒号分隔清单，canonical（realpath 双边）子树匹配。
+- **不对称语义（排障易踩）**：显式空清单（reject-all）下 `/slimapi/file/**` 全 403，但 **SSE hub 不过滤帧**（GlobalHub 帧过滤仅对**非空清单**生效）——勿以 SSE 行为反推 file 门状态。
+- **现状边界（重要——不是全局门）**：allowlist 门当前仅覆盖三处半——① `/slimapi/file`、`/file/content`、`/file/status` 三端点 403 门；② GlobalHub SSE 帧过滤（digest + q/p 直推，仅非空清单）；③ v4 全局 sessions 列表 DB 谓词 + 降级 fail-closed；③a health `features.allowlist` 回演（只读观测）。**vcs/find/providers/session 单查/messages 族/todo/children/diff/写族 17 端点/token stream/questions/permissions 均不经过 allowlist 判定**——把非空清单当作全局目录隔离会得到错误的安全感。逐条挂载点/未覆盖清单与扩面影响评估见 [`docs/ocmar/reviews/2026-08-21-allowlist-global-gate-impact.md`](ocmar/reviews/2026-08-21-allowlist-global-gate-impact.md)（R-1b 只读评审，结论=现状非全局门，扩面属未决 owner 决策）。
+- **生效时机**：清单 env 在进程启动时读取一次；改清单须 `systemctl --user restart oc-slimapi`。health `features.allowlist.enabled` 反映启动时三态结论（未配置=false）。
+- **故障模式联动**：allowlist 非空 × dbaux 不可用 → v4 全局 sessions 列表 **503 fail-closed**（`/slimapi/search` 通配 × db-down 同理，见 §7.3 场景矩阵）；SSE 丢帧观察 `features.allowlist.droppedEvents` 计数（不泄露清单内容）。
 
 ### 5.6 journald 查询手册（应用日志）
 
@@ -348,21 +436,22 @@ systemctl --user is-enabled oc-slimapi   # enabled
 curl -s 'http://127.0.0.1:4097/slimapi/health?v=3' | jq .
 ```
 
-期望响应：
+期望响应（v3 视图，`?v=3`；4.0.0 起 `(3,4)` 双版本窗口，`?v=4` 视图另见下一条 bullet）：
 
 ```json
 {
   "slimapi_contract": 3,
-  "sidecar": { "ok": true, "version": "1.1.1" },
-  "server":  { "api_version": 3, "accepted_client_versions": [3, 3] },
-  "schema":  { "degraded": false, "version": 3, "clientMin": 3, "clientMax": 3 },
-  "features": { "tokenStream": true, "thresholdedSkeleton": true, "skeletonInlineOutputMaxBytes": 4096 }
+  "sidecar": { "ok": true, "version": "<包版本，读 dist-info>" },
+  "server":  { "api_version": 4, "accepted_client_versions": [3, 4] },
+  "schema":  { "degraded": false, "version": 3, "clientMin": 3, "clientMax": 4 },
+  "features": { "tokenStream": true, "thresholdedSkeleton": true, "skeletonInlineOutputMaxBytes": 4096, "allowlist": { "enabled": false } }
 }
 ```
 
-- `slimapi_contract` = 当前 wire 契约版本（M3 v3-only 终态恒 3）。该值是 `src/oc_slimapi/routes/health.py` 内的 `WIRE_VIEW` 常量（与 `server.api_version`/`schema.version` 同源，3/2 组合结构性不存在）；权威契约= `docs/specs/v3-contract.md`。
-- `sidecar.version` = `pyproject.toml` 的版本。
-- `server.api_version` = 3；`accepted_client_versions` = `[3, 3]`（M3 v3-only 终态；无 `?v=3` 或 `v=2` 会被 `400 unsupported_version` 拒绝——`X-Slimapi-Version` 头已删除）。
+- `slimapi_contract` = 当前请求生效的 wire 视图（v3 请求恒 3）。该值是 `src/oc_slimapi/routes/health.py` 内的 `WIRE_VIEW` 常量（v4 请求时另加根级 `auxiliary` 与 `features.allowlist` 详情，双视图语义见 v4-contract §3.2）；权威契约 = `docs/specs/v3-contract.md` + `docs/specs/v4-contract.md`。
+- `sidecar.version` = `pyproject.toml` 的版本（示例勿照抄——以部署版本为准；editable install 升级后须 reinstall 刷新，见 §4）。
+- `server.api_version` = 4；`accepted_client_versions` = `[3, 4]`（4.0.0 起 (3,4) 双版本窗口：`?v=3`/`?v=4` 均合法，缺 `v`/不支持值被 `400 unsupported_version supported:[3,4]` 拒绝——`X-Slimapi-Version` 头已删除）。
+- `features.allowlist` = [3.3.0] 起的 allowlist 机制回演（`enabled` 反映 `OC_SLIMAPI_DIRECTORY_ALLOWLIST` 三态，未配置=false；可达时另有 `droppedEvents` 计数，见 §5.5.1）。
 - `schema.degraded=true` → 启动 smoke 探针发现 opencode 响应字段漂移，需查上游是否升级/改了 schema。
 - 不带 `?v=3` → `400 unsupported_version`（版本选择器终态门禁，符合契约）。
 
@@ -431,6 +520,16 @@ DB 辅助源熔断策略（proposal 行 100/106；护栏 7）：
   走降级矩阵，`degraded`/503 语义见 v4-contract §4）。
 - **观察**：`GET /slimapi/health` 的 `auxiliary: {available, mode}` 字段。
 
+**503 场景矩阵（v4 sessions 面；与 200 降级对照）**
+
+| 场景 | dbaux 状态 | allowlist | 结果 | 语义 |
+|---|---|---|---|---|
+| 常态 | 可用 | 任意 | 200（DB 投影） | v4 正常路径 |
+| Class A 降级 | 不可用/熔断 | **未配置/空外的默认态** | 200（HTTP 降级，`sessionsSource:"http"`） | 白名单 ⊆ 结果集可由上游保证时降级放行 |
+| **fail-closed（最严列）** | 不可用/熔断 | **非空** | **503**（`degraded503:true`） | 「白名单 ⊆ 结果集」不可保证时宁可 503（ora B-2 选②；见 §5.5.1） |
+| **search 通配 × db-down** | 不可用/熔断 | —（通配跨目录，语义同非空清单） | **503** | 通配搜索无法在 DB 层收敛目录集，db 不可用时 fail-closed |
+| TransformBusy | —（与 dbaux 无关） | 任意 | 503（`transform_busy`，`degraded503` **不置位**） | transform 池拥塞，非降级语义；排障见 §9 |
+
 ### 7.4 runbook：升级 opencode 后第一步（n6）
 
 升级 opencode 后，**第一步观察** `/slimapi/health` 的
@@ -455,7 +554,7 @@ ocdroid 客户端**不直接操作** sidecar 进程，只通过 stunnel mTLS 接
 | 经 sidecar mTLS 入口（推荐） | stunnel `:14097` → sidecar `127.0.0.1:4097` |
 | 经 sidecar 明文直连入口（Tailscale 等） | Tailscale 地址`:4097` → sidecar `0.0.0.0:4097`（依赖 Tailscale ACL / 防火墙；无 mTLS）（opt-in 非默认；2026-08-21 起默认回环） |
 | 直连回退（不经 sidecar） | stunnel `:14096` → opencode `127.0.0.1:4096` |
-| 所有 `/slimapi/**` 请求必带 query | `?v=3`（无 `v`/`v=2`/不支持值 → `400 unsupported_version supported:[3]`；`X-Slimapi-Version` 头已删除不解读） |
+| 所有 `/slimapi/**` 请求必带 query | `?v=3`（4.0.0 起 `?v=4` 亦合法——(3,4) 双版本窗口；无 `v`/`v=2`/不支持值 → `400 unsupported_version supported:[3,4]`；`X-Slimapi-Version` 头已删除不解读） |
 | 非 `/slimapi/**` | **3.0.0 已关闭**——未收编路径 404 `thin_route_not_found`（2.x 为透明反代，历史行为见 CHANGELOG） |
 | 健康自检（客户端侧） | `GET /slimapi/health?v=3` 读 `server.api_version` / `accepted_client_versions` 做运行时兼容判断 |
 | Wire 行为变更来源 | 本仓 [`CHANGELOG.md`](../CHANGELOG.md)（路径/头/错误码以本仓 + [`v3-contract.md`](specs/v3-contract.md) 为准） |
@@ -472,7 +571,13 @@ sidecar 进程的启停、日志、升级由 **服务端运维** 负责，ocdroi
 | 服务起不来 | `journalctl --user -u oc-slimapi -n 50`；多半是 upstream / host 校验失败 |
 | `schema.degraded=true` | opencode 升级了；查 `opencode-src/current/` 对照字段，或临时设 `OC_SLIMAPI_SMOKE_SESSION_ID` 跳过随机探针 |
 | 客户端连上但 400 | 无 `?v=3` / `v=2` / 不支持值 → `unsupported_version`；directory 相关 → `invalid_directory_selector`/`directory_conflict`/`directory_header_retired`（消费集头通道已退役，用 `?directory=`） |
-| SSE 卡顿/断 | `journalctl --user -u oc-slimapi \| rg 'backpressure\|resync\|503'`；查 `/slimapi/metrics` 的订阅者计数 |
+| SSE 卡顿/断 | `journalctl --user -u oc-slimapi \| rg 'backpressure\|resync\|503'`；查 `/slimapi/metrics?v=3` 的订阅者计数（**metrics 探针自身须带 `?v=3`**，否则 400） |
+| SSE 订阅被 400 拒 | 订阅数触顶：digest 面 `MAX_SUBSCRIBERS_PER_DIRECTORY`（8）/`MAX_TOTAL_SUBSCRIBERS`（16），token stream 面 `TOKEN_STREAM_MAX_SUBSCRIBERS`（8）；按 §5.5 表调 env 后重启 |
+| `transform_busy` 503 持续 | transform 池拥塞（非 dbaux 降级，`degraded503` 不置位）：先看 `OC_SLIMAPI_MAX_TRANSFORMS`/`TRANSFORM_ABSORB_BUDGET_SECONDS`（默认吸收 2.5s）与上游延迟；偶发属预期，持续才调参 |
+| questions/permissions 结果缺目录 | envelope `errors[]`（该目录 `upstream_unavailable` 等）与 `truncated:true`（聚合预算触顶）——降级字段观察法，非故障 |
+| crash-loop（反复重启） | `systemctl --user status oc-slimapi` 看 Restart 计数 + `journalctl` 找启动即崩原因：端口占用、预算校验 `RuntimeError`（如 `ACCEPTED_CLIENT_VERSIONS` 非 (3,4)）、state dir 不可写；unit 层加固参考 `deploy/oc-slimapi.service`（`Restart=on-failure` + `RestartSec=5` + `TimeoutStopSec=60`） |
+| `systemctl stop` 后快照缺终帧 / journal 见 SIGKILL | 核对 unit `TimeoutStopSec` 是否 ≥ 关停链合计（5+30+10+5s，见 §4 shutdown 语义，F-010/F-214）；维护 gzip 卡死场景查 `~/.local/state/oc-slimapi/logs/` 残留 tmp 与启动日志 `_cleanup_leftover_tmp` 兜底 |
+| 观测面自身健康 | access log 当天文件（`~/.local/state/oc-slimapi/logs/access-$(date +%F).jsonl`）在增长；snapshot 每周期（默认 300s）有新帧——**journal 关键词 `snapshot` + `inactive`**（首帧失败即停不重试，须重启恢复，见 traffic-accounting.md §9.1） |
 | 升级后行为变化 | 先看 [`CHANGELOG.md`](../CHANGELOG.md) 对应版本节 |
 
 ---
@@ -481,7 +586,8 @@ sidecar 进程的启停、日志、升级由 **服务端运维** 负责，ocdroi
 
 | 文件 | 用途 |
 |---|---|---|
-| [`v3-contract.md`](specs/v3-contract.md) | Wire 契约权威（v3-only 终态） |
+| [`v3-contract.md`](specs/v3-contract.md) | Wire 契约权威（v3 基准；4.0.0 起 (3,4) 双版本窗口） |
+| [`v4-contract.md`](specs/v4-contract.md) | v4 wire 契约（4.0.0 实施基线 + 2026-08-19 修订冻结） |
 | [`v2-contract.md`](specs/v2-contract.md) | v2 契约（已于 3.0.0 退役，历史参考） |
 | [`release.md`](release.md) | 发版流程 |
 | [`../CHANGELOG.md`](../CHANGELOG.md) | 接口行为变更记录 |
@@ -494,7 +600,7 @@ sidecar 进程的启停、日志、升级由 **服务端运维** 负责，ocdroi
 > **参照**：`docs/ocmar/reports/2026-07-21-g-acl-ops-evidence.md`（本日证据报告）  
 > **历史部署姿态（2026-08-20 前 steady-state）**：`0.0.0.0:4097` 明文监听 + `:14097` mTLS 隧道（stunnel `requireCert=yes verifyChain=yes`，复用既有证书）作为 steady-state；**2026-08-21 起（R-1a 裁决）默认部署为回环 `127.0.0.1`，直连入口默认关闭**，本节保留为 opt-in 部署的边界验证 runbook。
 
-### 10.1 opt-in 部署拓扑（历史稳态同构）
+### 11.1 opt-in 部署拓扑（历史稳态同构）
 
 > 下图为 opt-in（`0.0.0.0`）部署的历史稳态拓扑；默认部署中 sidecar 绑定 `127.0.0.1`，stunnel（:14097）转发目标 `127.0.0.1:4097` 不变。
 
@@ -509,7 +615,7 @@ ocdroid ──(stunnel mTLS 14097)──▶ oc-slimapi 0.0.0.0:4097 (plaintext, 
 - **安全边界关键**：`0.0.0.0` 本身不提供接入控制——**依赖**网络边缘（防火墙 / Tailscale ACL）阻断公共/LAN 对 `:4097` 的直接明文 TCP。这就是使 opt-in `0.0.0.0` 部署可接受的安全约束。
 - **loopback-only（`127.0.0.1:4097`）**：**2026-08-21 起（R-1a 裁决）为默认部署姿态**（代码 `config.validate()` 支持）；`0.0.0.0` 为 opt-in（见本节头部声明）。
 
-### 10.2 负向探针（边界验证）
+### 11.2 负向探针（边界验证）
 
 > **目的**：证实 `:14097` 仅可通过 mTLS（cert enforced）可达，且公共/LAN 不可直接到达 `:4097` 明文。
 
@@ -534,9 +640,9 @@ curl -s --cert client-cert.pem --key client-key.pem \
   https://127.0.0.1:14097/slimapi/health
 ```
 
-**负向探针结果写入**：`docs/ocmar/reports/2026-07-21-g-acl-ops-evidence.md` §3，由 ops 从外部 vantage 执行后填充。
+**负向探针结果写入**：`docs/ocmar/reports/2026-07-21-g-acl-ops-evidence.md` §3，由 ops 从外部 vantage 执行后填充。**注记**：该回填为外部人工动作，sidecar/仓库内无自动回填或提醒机制——重跑边界验证后须人工同步该报告（历史缺口，见审计 F-339 ⑲）。
 
-### 10.3 正向验证（本机）
+### 11.3 正向验证（本机）
 
 ```bash
 # sidecar 健康（本机 loopback 明文）
@@ -547,7 +653,7 @@ curl -s --cert client-cert.pem --key client-key.pem \
   https://127.0.0.1:14097/slimapi/health
 ```
 
-### 10.4 Cert 复用说明
+### 11.4 Cert 复用说明
 
 > **路径约定（通用模板 vs 本机实例）**：仓库内 `deploy/stunnel.conf` 用系统级路径 `/etc/stunnel/`（`cert`/`key`/`CAfile` 均指向 `/etc/stunnel/*.pem`），是**通用部署模板**的写法。本机实际部署把证书放在 `~/.config/stunnel/certs/`（user-space 实例，无需 root），本节下文以本机路径为准。两者是"通用模板 `/etc/stunnel/` ↔ 本机实例 `~/.config/stunnel/certs/`"的关系，**不是错误**——部署时按实际 stunnel 实例类型选择其一即可。
 
@@ -563,7 +669,7 @@ curl -s --cert client-cert.pem --key client-key.pem \
 
 > 本节记录 `/slimapi/actions` 的运维注意事项。功能详见 `docs/specs/v2-contract.md` §2「`/slimapi/actions` API」。
 
-### 11.1 安全风险声明
+### 12.1 安全风险声明
 
 > **这是风险接受声明，非安全保证。**
 
@@ -584,7 +690,7 @@ curl -s --cert client-cert.pem --key client-key.pem \
   - 动作名称仅作白名单字典键查找（无可变参数、无 shell=True）
   - 结构化审计日志（所有调用 WARNING 级写入 journald，不受 `OC_SLIMAPI_LOG_LEVEL` 影响）
 
-### 11.2 manifest 配置
+### 12.2 manifest 配置
 
 manifest 是一个 TOML 文件，路径由 `OC_SLIMAPI_ACTIONS_FILE` 指定。仓库内 [`deploy/actions.manifest.example.toml`](../deploy/actions.manifest.example.toml) 是与本机部署一致的 4-action 参考模板（复制到机器本地路径后改 argv[0]）。
 
@@ -635,7 +741,7 @@ require_confirm = true
 
 > **action 脚本来源**：`plan_limit.py` / `list_model.py` / `list_agent.py` 由 opencode 侧维护，位于 `~/.config/opencode/scripts/`。`list_model` 读 `http://127.0.0.1:4096/config/providers`，`list_agent` 读 opencode 配置 + `/agent` API，`plan_limit` 查询上游厂商订阅配额（均只读）。
 
-### 11.3 运维注意事项
+### 12.3 运维注意事项
 
 - **manifest 文件安全**：启动校验强制 manifest 必须是 regular file（拒绝 symlink）、owner-only-write（拒绝 group/other write 位）、owner 为 sidecar 运行用户。修改 manifest 后须重启 sidecar。
 - **action 脚本勿 daemonize**：脚本若 fork 子进程后父进程退出，sidecar 的 `killpg` 无法收回孤儿进程（进程组 ID 会变）。action 脚本应同步执行，不要后台化/daemonize。

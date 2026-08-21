@@ -530,7 +530,6 @@ class TestOnSessionStatus:
         th = TokenStreamHub()
         th.on_session_status("s1", "busy")
         assert th._session_status["s1"] == "busy"
-        assert "s1" in th._busy_sids
         assert th._pending_session_resinks == []
 
     def test_idle_discards_busy_sid(self):
@@ -538,7 +537,7 @@ class TestOnSessionStatus:
         th.on_session_status("s1", "busy")
         th.on_session_status("s1", "idle")
         assert th._session_status["s1"] == "idle"
-        assert "s1" not in th._busy_sids
+        assert th._session_status.get("s1") != "busy"
 
     def test_idle_retires_session_live_parts(self):
         th = TokenStreamHub()
@@ -589,7 +588,7 @@ class TestOnSessionDeleted:
         assert "s1" in th._session_status
         th.on_session_deleted("s1")
         assert "s1" not in th._session_status
-        assert "s1" not in th._busy_sids
+        assert th._session_status.get("s1") != "busy"
 
     def test_terminates_subscribers_on_session_deleted(self):
         """INV-4 (P0-3): on_session_deleted directly terminates subscribers
@@ -649,10 +648,9 @@ class TestRetireSession:
         assert all(k[0] != "s1" for k in th._nontext_parts)
         assert all(k[0] != "s1" for k in th._disabled_parts)
         assert th._total_live_bytes == 0
-        # Per spec: _session_status / _busy_sids outlive a part-level retire
-        # (only on_session_deleted / on_upstream_reconnect clear them).
+        # Per spec: _session_status outlives a part-level retire
+        # (only on_session_deleted / on_upstream_reconnect clear it).
         assert th._session_status.get("s1") == "busy"
-        assert "s1" in th._busy_sids
 
     def test_preserves_other_sids(self):
         th = TokenStreamHub()
@@ -708,7 +706,6 @@ class TestTtlSweep:
         th.on_part_updated(_updated_props("s1", "m1", "p1", text=""))
         key = ("s1", "m1", "p1")
         th._session_status["s1"] = "busy"
-        th._busy_sids["s1"] = None
         now = _now_ms()
         th.live_parts[key].last_delta_ms = now - TOKEN_ACC_IDLE_MS - 1
         retired = th.ttl_sweep(now)
@@ -752,7 +749,6 @@ class TestTtlSweep:
         # Expired busy.
         th.on_part_updated(_updated_props("s3", "m3", "p3", text=""))
         th._session_status["s3"] = "busy"
-        th._busy_sids["s3"] = None
 
         now = _now_ms()
         th.live_parts[("s1", "m1", "p1")].last_delta_ms = now - TOKEN_ACC_IDLE_MS - 1
@@ -785,7 +781,7 @@ class TestTtlSweep:
 
 class TestOnUpstreamReconnectStageB:
     def test_clears_session_routing_state(self):
-        """on_upstream_reconnect clears _session_status / _busy_sids /
+        """on_upstream_reconnect clears _session_status /
         _pending_session_resinks (Stage B extension to Stage A's clear).
 
         Test updated: previously used on_session_deleted to populate
@@ -798,12 +794,10 @@ class TestOnUpstreamReconnectStageB:
         th.on_session_status("s2", "idle")  # enqueues ("s2", "session_idle")
         th.on_part_updated(_updated_props("s3", "m3", "p3", text=""))
         assert th._session_status
-        assert th._busy_sids
         assert th._pending_session_resinks
         assert th.live_parts
         th.on_upstream_reconnect()
         assert th._session_status == {}
-        assert not th._busy_sids
         assert th._pending_session_resinks == []
         assert th.live_parts == {}
 
@@ -820,7 +814,6 @@ class TestPublishSessionRouting:
             "sessionID": "s1", "status": "busy",
         }))
         assert th._session_status.get("s1") == "busy"
-        assert "s1" in th._busy_sids
 
     async def test_session_status_idle_routes_and_retires(self, bare_hub):
         th = TokenStreamHub()

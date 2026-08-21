@@ -219,7 +219,7 @@ event: resync
 data: {"reason":"subscriber_backpressure|reconnect_no_replay|token_memory_limit|session_idle|session_deleted","sessionID":"…"}
 # 6) server.connected{sessionID} / server.heartbeat{}（15s）
 ```
-- 帧格式复用 `sse_frame()`（`hub.py:109`）。**不发 SSE `id:` 字段**、**无 replay buffer**；`Last-Event-ID` 仅触发首帧 resync，值忽略。
+- 帧格式复用 `sse_frame()`（现位于 `sse/hub_types.py:212` 与 `sse/tokenstream/frames.py:33`——2026-08-21 勘误：原 `hub.py:109` 锚点已随模块拆分漂移）。**不发 SSE `id:` 字段**、**无 replay buffer**；`Last-Event-ID` 仅触发首帧 resync，值忽略。
 - **终态顺序不变式（wire 强约束）**：对同一 `(sid,mid,pid)`，所有 `message.part.delta` 帧必先于对应 `snapshot{done:true}` 入队；`done:true` 后该 part 不许再发 delta。终态 `text` 取自 `message.part.updated` 的 `part.text`（text-end 插件可改写，不可用拼接 delta）。
 - **safe_put（C6/次要）**：所有 snapshot 下发前先 `len(frame)` 判定（含 SSE framing+JSON 开销，非仅 text 字节）；超 `token_stream_max_frame_bytes` → 发 `truncated:true` 帧（**绝不** `put` 超大帧触发静默 drop，`hub.py:229`）。
 - **backpressure resync 带 sessionID（次要）**：token 订阅者单 session；`Subscriber.put` 溢出帧（`hub.py:250`）无 sessionID——token 流子类化注入 sessionID，或客户端从连接推断（CLIENT_CHANGES 注明）。
@@ -319,7 +319,7 @@ TOKEN_ACC_IDLE_MS = 60_000; TOKEN_HEARTBEAT_SECONDS = 15
 | **B** | 生命周期：`has_consumers()` + run/stop/grace 改判 + token subscribe `ensure_upstream` + `on_upstream_reconnect()` + `finish_part` drain(C1) + `drop_part`(C4) + `_reserve` 全局内存(C5) + TTL | `sse/hub.py`, `sse/token_hub.py` | **fixer**（复杂） |
 | **C** | flush+wire：`flush_loop`(100ms/4KiB/sorted) + `DeltaAccumulator` + 订阅握手 flush-sid-then-snapshot(C2) + `sse_frame`(snapshot/delta/truncated/resync/heartbeat/server.connected) + `safe_put` | `sse/token_hub.py` | **fixer** |
 | **D** | 端点+admission：`routes/token_stream.py` + `TokenStreamRegistry`（独立 admission + sessionID 注入 Subscriber 子类）+ health 根级 `features.tokenStream`(Q1) + metrics | `routes/token_stream.py`(新), `routes/health.py`, `routes/metrics.py`, `app.py` | **fixer** |
-| **E** | 契约/文档+实测：v1-contract §3 L150 scope + §3.x + §6 addendum + §4 health + CHANGELOG/INTERFACE_MAP/CLIENT_CHANGES + 性能实测(§11) | `docs/*` | fixer-zlm |
+| **E** | 契约/文档+实测：v1-contract §3 L150 scope + §3.x + §6 addendum + §4 health + CHANGELOG/INTERFACE_MAP/CLIENT_CHANGES + 性能实测(§11)（2026-08-21 注：`docs/specs/v1-contract.md` 已于 v2 契约换代删除，见 v2-contract.md 头部墓碑注——此处为历史锚点） | `docs/*` | fixer-zlm |
 
 每 Stage：`./scripts/check.sh` 必过 → 单评委门控 9.5 → PASS 才进下一 Stage。
 门控评委：**rev-grok**（优先）→ 不可用 **rev-bgpt** → 仍不可用 **rev-gpt**；FAIL→修订→重评；同 Stage 重试 ≥2 升级 fixer。

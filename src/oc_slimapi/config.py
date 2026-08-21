@@ -840,6 +840,10 @@ class Settings:
             raise RuntimeError("OC_SLIMAPI_TRANSFORM_WAIT_SECONDS must be > 0")
         if self.max_response_bytes <= 0:
             raise RuntimeError("OC_SLIMAPI_MAX_RESPONSE_BYTES must be > 0")
+        # B2-6: a zero/negative message-byte cap would 413 every message
+        # skeleton — same lower-bound family as the byte guards above.
+        if self.max_message_bytes <= 0:
+            raise RuntimeError("OC_SLIMAPI_MAX_MESSAGE_BYTES must be >= 1")
         # Upper-bound sanity caps (P1-35): prevent accidentally configuring an
         # OOM-inducing buffer ceiling while still allowing generous headroom.
         if self.max_message_bytes > _MAX_MESSAGE_BYTES_CAP:

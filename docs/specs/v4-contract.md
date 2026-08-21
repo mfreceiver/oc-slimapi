@@ -64,7 +64,7 @@
 ### §3.2 `GET /slimapi/health` 双视图
 
 - 按请求 wireVersion 返回对应视图：v3 视图 `schema.version=3`/`server.api_version=3`；v4 视图双双 =4（同源同值，S-B04）。
-- v4 视图新增瞬态字段：`auxiliary: {available: bool, mode: "db"|"http"}`（v2.2 行 140；available=false 时 mode="http"）；`allowlist: {enabled: bool}`（机制是否启用，B4-4 落地，未配置=false；不泄露清单内容）。
+- v4 视图新增瞬态字段：`auxiliary: {available: bool, mode: "db"|"http"}`（v2.2 行 140；available=false 时 mode="http"；根级）；`features.allowlist: {enabled: bool}`（机制是否启用，B4-4 落地，未配置=false；不泄露清单内容——嵌套于 `features.allowlist`，沿 v3 §3a，非根级）。
 - `ready` 端点形状不变。
 
 ### §3.3 `capabilities["4"]` 扩展：readiness 就绪度门（2026-08-19 修订冻结）
@@ -309,6 +309,8 @@ allowlist 403 族（`directory_not_allowed`，B4-4）与版本/directory 400 族
 | `provider_projection_limit` | 413 | §12.4：四项投影限额任一超限；附 `limit`/`limitValue` |
 
 **复用既有码**（不重定义、不改语义）：`response_too_large`（providers 源 body 超限，§12.5.2 ④）、`upstream_http_<N>`（providers 3xx/4xx 转换路由映射）、`upstream_unavailable`、`transform_busy`、`auxiliary_unavailable`（§13 整响应失败复用——扩展触发面不改 status/body/`Retry-After` 形状）、`invalid_cursor`、`session_not_found`、`thin_route_not_found`、v3 §4b expand 错误族。`discovery contradiction`（§3.3）为客户端分类结局，非服务端错误码。**优先级插列**：修订生效后 §8.3 总链在「② selector version 族 400」与「③ selector directory 族 400」之间插列 method 405（§16——判定不依赖 query 参数）。
+
+**[4.6.1] 追加：405 `method_not_allowed`（非 GET `/slimapi/versions`）、WS 501 `websocket_not_supported`、actions `invalid_request_body`（422 POST body 畸形）三码补录（历史实现现状固化）**——v3-contract §8 末尾镜像同句。
 
 ## §9 观测 [冻结]
 

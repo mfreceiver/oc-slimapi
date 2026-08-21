@@ -22,9 +22,61 @@ import orjson
 
 from oc_slimapi.logging_config import get_logger
 
-from .replay_wire import V4_RESYNC_REASONS
+from .replay_log import (
+    RESYNC_EPOCH_CHANGED,
+    RESYNC_REPLAY_EXPIRED,
+    RESYNC_REPLAY_GAP,
+    RESYNC_RECONNECT_NO_REPLAY,
+)
 
 logger = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Resync reason value domain (W1-D / F-122): single frozen import source.
+# ---------------------------------------------------------------------------
+# rev-gate R3 BLOCKER-1: the frozen v4 ``resync.reason`` value domain
+# (v4-contract §7.2 / design §4) — EXACTLY these four values may appear in
+# a ``resync`` frame on a v4 wire. Every other legacy v3 reason
+# (subscriber_backpressure / token_memory_limit / session_idle /
+# session_deleted …) takes the v4 termination route instead: the server
+# ends the connection (STOP) WITHOUT emitting an out-of-domain resync
+# frame — the disconnect itself is the observable signal, and the client's
+# recovery path is Last-Event-ID reconnect → ReplayLog replay (in window)
+# or a frozen-reason resync (out of window) → HTTP alignment. This is the
+# PRODUCTION allowlist (not a test-only oracle): the subscriber/hub v4
+# branches key off it, and the wire tests import the same constant.
+#
+# This module is the leaf anchor of the reason constants (W1-D): the four
+# replay-domain values are imported from :mod:`.replay_log` (their data-
+# layer home), the v3-only values are defined here, and everything else
+# imports the frozen sets from HERE (``replay_wire`` re-exports
+# ``V4_RESYNC_REASONS`` for back-compat).
+RESYNC_SUBSCRIBER_BACKPRESSURE = "subscriber_backpressure"
+RESYNC_SESSION_IDLE = "session_idle"
+RESYNC_SESSION_DELETED = "session_deleted"
+RESYNC_TOKEN_MEMORY_LIMIT = "token_memory_limit"
+
+V4_RESYNC_REASONS = frozenset({
+    RESYNC_EPOCH_CHANGED,
+    RESYNC_REPLAY_EXPIRED,
+    RESYNC_REPLAY_GAP,
+    RESYNC_RECONNECT_NO_REPLAY,
+})
+
+# The COMPLETE value domain any ``resync`` frame ``reason`` may carry on
+# ANY wire version: the frozen v4 four plus the v3-only lifecycle reasons
+# (v4 expresses those via STOP-termination instead). This is the single
+# frozen oracle for tests/test_resync_reason_gate.py (N1 AST scan): a new
+# reason value must be added HERE — a visible, reviewable change — before
+# it can legally reach an ``sse_frame(..., event="resync")`` construction
+# point anywhere under src/.
+SSE_RESYNC_REASONS = frozenset(V4_RESYNC_REASONS) | frozenset({
+    RESYNC_SUBSCRIBER_BACKPRESSURE,
+    RESYNC_SESSION_IDLE,
+    RESYNC_SESSION_DELETED,
+    RESYNC_TOKEN_MEMORY_LIMIT,
+})
 
 
 STOP = object()
@@ -368,7 +420,7 @@ class Subscriber:
         # the observable signal; recovery = Last-Event-ID reconnect +
         # ReplayLog replay per REPLAY-007). v3 keeps the frozen
         # resync + STOP pair, byte-identical.
-        reason = "subscriber_backpressure"
+        reason = RESYNC_SUBSCRIBER_BACKPRESSURE
         if self.wire_v4 and reason not in V4_RESYNC_REASONS:
             with contextlib.suppress(asyncio.QueueFull):
                 self.queue.put_nowait(STOP)

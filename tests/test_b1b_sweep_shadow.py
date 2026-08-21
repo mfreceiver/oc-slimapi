@@ -365,25 +365,23 @@ def test_shadow_marker_path_has_sweep_traffic_bucket():
     assert bucketize("GET", "/slimapi/_shadow/sweep") == "sweep"
 
 
-def test_known_digest_directory_source_is_included():
-    pending = {"sid": SimpleNamespace(directory="/digest")}
-    shadow = QpSweepShadow(
-        interval_seconds=1.0,
-        directory_source=lambda: pending.values(),
-        now=lambda: 0.0,
-    )
+def test_known_digest_directory_is_included():
+    shadow = QpSweepShadow(interval_seconds=1.0, now=lambda: 0.0)
+    # A directory observed mid-flight (e.g. from the digest tap's
+    # observe_directory) joins the schedule just like constructor-seeded
+    # directories.
+    shadow.observe_directory("/digest", now=0.0)
     shadow.run_once(now=3.0)
     assert shadow.markers[0]["directory"] == "/digest"
 
 
-def test_empty_directory_source_does_not_forget_a_known_directory():
-    source = iter([[SimpleNamespace(directory="/retained")], []])
+def test_empty_round_does_not_forget_a_known_directory():
     shadow = QpSweepShadow(
         interval_seconds=1.0,
-        directory_source=lambda: next(source),
         now=lambda: 0.0,
         jitter=lambda: 1.0,
     )
+    shadow.observe_directory("/retained", now=0.0)
     shadow.run_once(now=0.0)
     assert shadow.run_once(now=1.0)[0]["directory"] == "/retained"
     assert shadow.snapshot()["known_directories"] == 1

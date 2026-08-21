@@ -92,11 +92,9 @@ from .versioning import ACCEPTED_CLIENT_VERSIONS, _is_slimapi_path
 SELECTOR_STATE_KEY = "slimapi_selector"
 DIRECTORY_FORM_STATE_KEY = "slimapi_directory_form"
 
-# §9.1 selectorResult enum (frozen — historical values kept so old access-log
-# rows and snapshot dims stay interpretable; absent/v2 are simply no longer
-# produced).
-SELECTOR_ABSENT = "absent"
-SELECTOR_V2 = "v2"
+# §9.1 selectorResult enum (frozen — v3/v4/rejected/exempt/not_applicable are
+# the producible values; the historical absent/v2 dims live on only as
+# sseActive literals below, keeping old access-log rows interpretable).
 SELECTOR_V3 = "v3"
 SELECTOR_V4 = "v4"
 SELECTOR_REJECTED = "rejected"

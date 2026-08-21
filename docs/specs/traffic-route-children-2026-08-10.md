@@ -5,7 +5,7 @@
 - **Baseline HEAD:** `6a4ca78fa9a8f2951f669d61170a32e216417896`
 - **Branch:** `bundle-slimapi-actions`
 - **Evidence source:** `docs/traffic-opportunity-report-2026-08-10.md` (T16 report, top table row #2)
-- **Status:** **PROPOSAL — NOT IMPLEMENTED.** No code, no contract, no INTERFACE_MAP, no
+- **Status:** **IMPLEMENTED 2026-08-16**（T17/T18，[1.5.0]；wire 规范见 v3-contract §10 / INTERFACE_MAP §1）。原始 proposal 状态行（历史）：**PROPOSAL — NOT IMPLEMENTED.** No code, no contract, no INTERFACE_MAP, no
   CHANGELOG change is produced by this document. See §Approval gate.
 
 > This is one of two T17 design docs. The sibling is

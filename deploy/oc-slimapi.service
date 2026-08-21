@@ -18,10 +18,17 @@ WorkingDirectory=/home/mar/personal_projects/oc-slimapi
 ExecStart=/home/mar/personal_projects/oc-slimapi/.venv/bin/python -m oc_slimapi.app
 Restart=on-failure
 RestartSec=5
-# P0-1: systemd 15s upper bound for SIGTERM graceful shutdown — sits above
-# uvicorn's 5s timeout_graceful_shutdown so the process has a chance to drain
-# active SSE connections before the 90s SIGKILL default kicks in.
-TimeoutStopSec=15
+# F-010/F-214: SIGTERM worst-case shutdown chain = uvicorn connection drain
+# 5s (timeout_graceful_shutdown, app.py _GRACEFUL_SHUTDOWN_TIMEOUT) → then
+# lifespan AsyncExitStack LIFO cleanups: access-log maintenance drain 30s
+# (_MAINT_DRAIN_TIMEOUT) + transform pool drain 10s (_TRANSFORM_DRAIN_TIMEOUT)
+# + dbaux drain 5s (_DBAUX_DRAIN_TIMEOUT) + seconds for the intermediate
+# callbacks ≈ 50s total. The old 15s bound only covered the uvicorn leg and
+# let systemd SIGKILL the chain tail (final traffic snapshot frame +
+# access-log flush). 60s covers the full chain with ~10s margin; keep in
+# sync with the app.py drain constants if they ever change.
+# Audits: docs/audits/2026-08-20/02-findings/F-010.md (P2) / F-214.md (P3).
+TimeoutStopSec=60
 
 # OC_SLIMAPI_HOST 默认回环 127.0.0.1（R-1a，2026-08-21 起的安全默认姿态；
 # ocdroid stunnel :14097 与本机 curl 均经 loopback，E-I/E-III 均可工作）。

@@ -90,8 +90,10 @@ _REPLAY_SWEEP_INTERVAL_S = 60.0
 
 # Graceful shutdown timeout for uvicorn's active-connection (SSE) drain
 # (P0-1). uvicorn waits this long for active connections to finish before
-# forcing close. systemd's TimeoutStopSec=15 sits above this value so the
-# unit's 90s SIGKILL default is overridden by a shorter, explicit bound.
+# forcing close. This is only the FIRST leg of the SIGTERM chain: the
+# lifespan AsyncExitStack LIFO cleanups after it need up to ~45s more
+# (see the drain constants above; F-010/F-214), which is why systemd's
+# TimeoutStopSec=60 in deploy/oc-slimapi.service covers the full chain.
 _GRACEFUL_SHUTDOWN_TIMEOUT = 5.0
 
 
