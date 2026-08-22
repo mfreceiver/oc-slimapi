@@ -26,6 +26,15 @@ ocdroid 对接时：
 
 ---
 
+## [4.10.1] - 2026-08-22 — 服务端新鲜度 + 观测（patch；**无 wire 变化**，客户端零感知）
+
+> 本版为 patch：B 是服务端缓存新鲜度改进、C 是纯日志观测，wire 面（路径/形状/错误码/版本）零改动，ocdroid 无必改点。
+
+### Changed
+
+- **catalog 缓存上游 epoch 失效挂钩**：SSE global hub 的 canonical once-per-epoch 上游丢失钩子现触发 `CatalogCache.invalidate()`——**hub 活跃（有 SSE/token 消费方）并观察到 epoch loss 时**，上游 opencode 重启后 `/slimapi/agent`、`/slimapi/command` 的缓存条目立即清空，stale 上限从「剩余 TTL（默认 300s）」收紧为「≤1 个 SSE 重连周期」；**无消费方窗口内重启则 hub 不跑、丢失观察不到，退化为 TTL 上界**。失效同时带 generation fence：失效时在途的旧 epoch refresh 结果只返回给当次调用方，不写回缓存。TTL 语义不变（默认仍 300s）；invalidate 不关 single-flight，缓存随后照常回填。回调 best-effort：异常仅 warning，不影响 resync / replay barrier 等既有丢失语义。
+- **503 burst 结构化 WARNING 观测**：60s 滑动窗内 ≥5 次 5xx 响应（fail-closed 503 / upstream 5xx 映射；4xx 不计）→ journal 恰一条 WARNING（`upstream_5xx_burst count=… window_s=60 codes={"503":5} paths={…}`，paths 最多 3 个），触发即重置窗口去抖。查询：`journalctl --user -u oc-slimapi -p warning | grep upstream_5xx_burst`（字段与阈值说明见 `docs/operations.md` §5.7）。纯日志，不改任何响应行为。
+
 ## [4.10.0] - 2026-08-22 — 批量 session 详情端点（v4 §18；加性 minor，wire 版本不变仍 (4,4)）
 
 ### Added

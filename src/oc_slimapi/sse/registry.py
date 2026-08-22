@@ -85,6 +85,11 @@ class HubRegistry:
         # _token_hub / _turn_registry wiring). ``None`` = v3-only stack.
         self._replay_log: Any | None = None
         self._removal_task: asyncio.Task | None = None
+        # 4.10.1 (B): best-effort epoch-invalidation callbacks (catalog
+        # cache invalidate). Stashed here and forwarded onto every
+        # lazily-created GlobalHub in get(), mirroring the _token_hub /
+        # _turn_registry wiring discipline.
+        self._upstream_loss_callbacks: list[Any] = []
 
     def set_transforms(self, pool: Any) -> None:
         """Wire the TransformPool so snapshot_metrics() can report active/waiting.
@@ -129,6 +134,20 @@ class HubRegistry:
         if self._global is not None:
             self._global.set_replay_log(replay_log)
 
+    def add_upstream_loss_callback(self, callback: Any) -> None:
+        """Register a best-effort epoch-invalidation callback (4.10.1 B).
+
+        Mirrors the set_* wiring discipline: app.py registers during
+        lifespan (typically BEFORE any hub exists); the callback is
+        stashed here and forwarded onto the lazily-created GlobalHub in
+        :meth:`get`, plus any already-live hub. Callbacks fire from
+        ``GlobalHub._notify_upstream_loss`` (once per upstream epoch
+        transition); exceptions are swallowed with a warning there.
+        """
+        self._upstream_loss_callbacks.append(callback)
+        if self._global is not None:
+            self._global.add_upstream_loss_callback(callback)
+
     def get(self, directory: str | None = None) -> GlobalHub:
         if self._global is None:
             self._global = GlobalHub(
@@ -141,6 +160,8 @@ class HubRegistry:
                 replay_log=self._replay_log,
             )
             self._global._token_hub = self._token_hub
+            for callback in self._upstream_loss_callbacks:
+                self._global.add_upstream_loss_callback(callback)
         return self._global
 
     def get_global(self) -> GlobalHub:

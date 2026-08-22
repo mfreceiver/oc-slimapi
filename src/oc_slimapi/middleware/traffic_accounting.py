@@ -56,6 +56,7 @@ import time
 from typing import Any, Awaitable, Callable
 
 from ..access_log import get_access_logger, hash_client_id, write_access_log
+from ..burst_watch import record_5xx
 from ..logging_config import get_logger
 from ..selector import DIRECTORY_FORM_STATE_KEY, SELECTOR_STATE_KEY
 from ..traffic import (
@@ -216,13 +217,18 @@ class TrafficAccountingMiddleware:
         except BaseException:
             # Always record best-effort before re-raising — disconnects / 500s
             # still count. ``status_code or 500`` matches the wire outcome on
-            # an unhandled exception.
+            # an unhandled exception. ``synthetic_5xx`` marks the case where
+            # the response never started (status_code == 0) and the 500 is
+            # purely an accounting artefact — such rows feed the access log /
+            # ledger but NOT the 5xx burst watcher (no actual 5xx response
+            # was emitted; rev 4.10.1 MINOR-2).
             _record(
                 scope=scope,
                 bucket=bucket,
                 method=method,
                 path=path,
                 status=status_code or 500,
+                synthetic_5xx=status_code == 0,
                 down_in=down_in,
                 down_out=down_out,
                 start_perf=start_perf,
@@ -259,6 +265,7 @@ def _record(
     is_sse: bool,
     content_type: str | None = None,
     logger: logging.Logger,
+    synthetic_5xx: bool = False,
 ) -> None:
     """Emit access log + record downstream/upstream into the ledger.
 
@@ -433,3 +440,18 @@ def _record(
                 counters.record_fail_closed_503()
     except Exception as exc:
         logger.warning("sessions degraded counters update failed", exc_info=exc)
+
+    # 4.10.1 (C): best-effort 5xx burst observability — every
+    # sidecar-emitted 5xx (fail-closed 503 / upstream 5xx mapped to 503)
+    # feeds the sliding-window watcher at the same wire-status point the
+    # ledger sees; a burst emits ONE warning catchable via
+    # ``journalctl --user -u oc-slimapi -p warning``. Purely observational:
+    # never affects the response or the accounting above.
+    # MINOR-2: synthetic 5xx (exception before response start, status 0
+    # recorded as 500) is EXCLUDED — no actual 5xx response reached the
+    # wire, so it must not count toward a burst.
+    try:
+        if 500 <= status < 600 and not synthetic_5xx:
+            record_5xx(status, path)
+    except Exception as exc:
+        logger.warning("burst watch record failed", exc_info=exc)

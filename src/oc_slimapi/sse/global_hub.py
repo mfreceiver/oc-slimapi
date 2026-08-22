@@ -141,6 +141,14 @@ class GlobalHub:
         # subscribers with redundant resync frames + re-clearing the token
         # hub on each retry. We want once-per-epoch-transition.
         self._upstream_loss_notified: bool = False
+        # 4.10.1 (B): best-effort epoch-invalidation callbacks (the catalog
+        # TTL cache today), fired from _notify_upstream_loss on every
+        # once-per-epoch upstream-loss transition. Attribute-injected from
+        # app.py via HubRegistry.add_upstream_loss_callback (mirrors
+        # set_token_hub / set_turn_registry wiring) — deliberately NOT a
+        # constructor dependency on catalog_cache, keeping the sse package
+        # free of any import of catalog_cache / routes / app (no cycle).
+        self._upstream_loss_callbacks: list[Callable[[], None]] = []
         # G1 sticky lastError: sid -> lastError dict (cleared = popped).
         # P1-21: bounded OrderedDict with FIFO cap to prevent unbounded
         # growth across high-churn sessions.
@@ -404,6 +412,20 @@ class GlobalHub:
         th = self._token_hub
         return th is not None and th.subscriber_count > 0
 
+    def add_upstream_loss_callback(self, callback: Callable[[], None]) -> None:
+        """Register a best-effort epoch-invalidation callback (4.10.1 B).
+
+        The callback fires synchronously from :meth:`_notify_upstream_loss`
+        — the canonical once-per-epoch upstream-loss hook this class
+        already centralizes — so caches keyed to the upstream process
+        lifetime (the catalog TTL cache) invalidate deterministically
+        instead of waiting out their TTL after an opencode restart.
+        Exceptions are swallowed with a warning (write_barrier best-effort
+        style): loss semantics (resync fanout / replay barrier / token-hub
+        clear) must never depend on side-effect observers.
+        """
+        self._upstream_loss_callbacks.append(callback)
+
     def _notify_upstream_loss(self) -> None:
         """Canonical upstream-loss hook (design §5.2 + §16-B backstop).
 
@@ -439,6 +461,16 @@ class GlobalHub:
                 logger.warning("replay barrier write failed", exc_info=True)
         if self._token_hub is not None:
             self._token_hub.on_upstream_reconnect()
+        # 4.10.1 (B): best-effort epoch-invalidation hooks (catalog TTL
+        # cache today), registered via add_upstream_loss_callback. Each
+        # failure degrades to a warning only — this hook's core loss
+        # semantics (resync fanout + replay barrier + token-hub clear)
+        # have already run above and must not depend on observers.
+        for callback in self._upstream_loss_callbacks:
+            try:
+                callback()
+            except Exception:
+                logger.warning("upstream loss callback failed", exc_info=True)
 
     async def stop_after_grace(self) -> None:
         """Grace timer used by ``unsubscribe`` / ``ensure_upstream``; exercised in tests."""

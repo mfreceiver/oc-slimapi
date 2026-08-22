@@ -492,6 +492,19 @@ async def lifespan(app: FastAPI):
         # subscribers get id-stamped deliveries) and confirmed upstream
         # loss writes cross-domain barriers (design-v4-sse-replay §3.4).
         app.state.hubs.set_replay_log(app.state.replay_log)
+        # 4.10.1 (B): deterministic catalog-cache invalidation on upstream
+        # epoch loss — the hub's canonical once-per-epoch upstream-loss hook
+        # (_notify_upstream_loss) fires this callback, so a restarted
+        # opencode does not serve stale catalog bodies for up to the
+        # remaining TTL (default 300s); staleness shrinks to ≤ one SSE
+        # reconnect period. Ordering: catalog_cache is constructed earlier
+        # in lifespan, so the bound method always exists before any hub
+        # run-loop can fire it. Best-effort: callback failure is swallowed
+        # with a warning in the hub; invalidate() keeps the cache fully
+        # operational (single-flight untouched, TTL unchanged).
+        app.state.hubs.add_upstream_loss_callback(
+            app.state.catalog_cache.invalidate
+        )
         app.state.hubs.get_global().set_directory_allowlist(
             settings.directory_allowlist
         )

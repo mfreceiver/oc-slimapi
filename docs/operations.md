@@ -420,6 +420,36 @@ oc-slimapi[...]: INFO: Uvicorn running on http://127.0.0.1:4097 (Press CTRL+C to
 
 启动失败常见原因：upstream 不可达、`OC_SLIMAPI_HOST` 非 loopback 且非 `0.0.0.0`（validate 白名单事实——`0.0.0.0` 为 opt-in 选项，非默认）、`OC_SLIMAPI_UPSTREAM` 非 loopback HTTP。
 
+### 5.7 503 burst WARNING 观测（[4.10.1] 起）
+
+背景：2026-08-21 观测到两簇自愈 503（01:24–01:37 连环 16 次、21:19–21:27 零星），此前无告警面可查。4.10.1 起 sidecar 对 5xx 突发输出结构化 WARNING，一条即可被 journald warning 级捕获：
+
+```bash
+journalctl --user -u oc-slimapi -p warning | grep upstream_5xx_burst
+```
+
+样本消息：
+
+```
+upstream_5xx_burst count=5 window_s=60 codes={"503":5} paths={"/slimapi/session/ses_a…":3,"/slimapi/sessions":2}
+```
+
+字段说明：
+
+| 字段 | 含义 |
+|---|---|
+| `count` | 触发窗口内 5xx 响应数（触发即第 5 次，恒 =5；更长突发会拆成多条 WARNING） |
+| `window_s` | 滑动窗口长度（秒），固定 60 |
+| `codes` | 窗口内 per-status 分布（fail-closed 503 / upstream 5xx 映射；4xx 不计） |
+| `paths` | 窗口内出现最多的 ≤3 个请求路径 |
+
+语义要点：
+
+- **只统计 sidecar 发出的 5xx**（fail-closed 503、upstream 5xx 映射为 503），不统计 4xx；也不含响应未开始即中断的合成 500（异常路径的记账占位，实际未向客户端发出 5xx 响应）。
+- **去抖**：触发一条 WARNING 即重置窗口；同一突发只出一条，下一条需新的完整窗口（≥5 次）。
+- 单进程内存态，无落盘、无 config 面；阈值常量出处 `src/oc_slimapi/burst_watch.py`（`_BURST_WINDOW_S=60`、`_BURST_THRESHOLD=5`，刻意硬编码）。
+- 与 `/slimapi/metrics.traffic` 的 fail-closed 计数（§6.2）互补：metrics 看累计，burst WARNING 看时间聚集。
+
 ---
 
 ## 6. 健康自检

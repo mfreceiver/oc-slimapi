@@ -68,6 +68,11 @@ class CatalogCache:
         # fetch order, so oldest-first eviction is plain iteration order.
         self._entries: dict[Hashable, tuple[bytes, float]] = {}
         self._retained_bytes = 0
+        # 4.10.1 (rev B-fix): epoch generation fence. Bumped by every
+        # invalidate(); an in-flight refresh that captured an older
+        # generation must NOT write its (dead-epoch) body back into the
+        # cleared cache. Event-loop-serial point — plain int, no lock.
+        self._generation = 0
         self._sf = refresh_singleflight if refresh_singleflight is not None else SingleFlight()
 
     # ------------------------------------------------------------------
@@ -117,6 +122,16 @@ class CatalogCache:
             return await factory(), None  # disabled → today's path, no label
 
         async def _fetch_and_store() -> bytes | None:
+            # Generation fence (4.10.1 rev B-fix): capture at leader entry
+            # (serial point, before the first await). If invalidate() fires
+            # while the factory is in flight, the generation moves on and
+            # the store below is skipped — a dead-epoch body must never
+            # repopulate the just-cleared cache with a fresh 300s TTL.
+            # Single-flight followers never run this coroutine; they join
+            # the leader's flight and receive its body unchanged (the
+            # fence gates the STORE, not the return value), so this
+            # caller still gets the body it asked for.
+            captured_generation = self._generation
             body = await factory()
             if body is None:
                 return body  # cap exceeded → never cached
@@ -128,6 +143,8 @@ class CatalogCache:
                 return body  # bad JSON → route maps 503; never cached
             if not isinstance(parsed, list):
                 return body  # malformed catalog payload → never cached
+            if captured_generation != self._generation:
+                return body  # epoch invalidated mid-flight → drop, don't store
             self._store(key, body)  # serial point: store + evict, no await
             return body
 
@@ -165,6 +182,39 @@ class CatalogCache:
         item = self._entries.pop(key, None)
         if item is not None:
             self._retained_bytes -= len(item[0])
+
+    # ------------------------------------------------------------------
+    # Epoch invalidation (4.10.1 B)
+    # ------------------------------------------------------------------
+
+    def invalidate(self) -> None:
+        """Drop every cached entry; the cache stays fully operational.
+
+        Epoch-loss hook (4.10.1 B): the SSE global hub's canonical
+        once-per-epoch upstream-loss notification fires this when the
+        upstream opencode process is detected restarted, so cached catalog
+        bodies never outlive the process that produced them (staleness
+        shrinks from "remaining TTL (default 300s)" to "≤ one SSE
+        reconnect period"). Lifecycle semantics deliberately differ from
+        :meth:`shutdown`: the refresh single-flight is NOT touched —
+        subsequent ``lookup`` calls simply miss and ``refresh`` calls keep
+        coalescing exactly as before. Synchronous serial point (no
+        ``await``), mirroring the eviction discipline above.
+
+        Generation fence: bumping ``_generation`` also fences OFF any
+        refresh that was already in flight when the epoch was lost — its
+        (dead-epoch) body is still returned to its caller but is NOT
+        written back into the cleared cache.
+
+        Mechanism boundary (rev MINOR-1): the epoch loss is only
+        observable while the hub is actually running — i.e. at least one
+        SSE / token consumer is subscribed. With zero consumers the hub
+        loop is idle, no loss is observed, and staleness degrades back to
+        the plain TTL upper bound.
+        """
+        self._entries.clear()
+        self._retained_bytes = 0
+        self._generation += 1
 
     # ------------------------------------------------------------------
     # Teardown
