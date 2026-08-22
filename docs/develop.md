@@ -28,6 +28,11 @@ python -m venv .venv
 | `OC_SLIMAPI_ACCESS_LOG_RETAIN_DAYS` | `0` | prune 早于 N 天的 `access-YYYY-MM-DD.jsonl(.gz)`（**代码默认 `0`=不删**；生产 unit 配 `3`） |
 | `OC_SLIMAPI_TRAFFIC_SNAPSHOT_ENABLED` | `1` | 内存账本周期快照开关（按天 `traffic-snapshot-YYYY-MM-DD.jsonl`） |
 | `OC_SLIMAPI_TRAFFIC_SNAPSHOT_PATH` | `logs/traffic-snapshot.jsonl` | 快照文件名 stem；生产 systemd 覆盖为 `%S/oc-slimapi/logs/traffic-snapshot.jsonl` |
+| `OC_SLIMAPI_SINCE_CACHE_ENABLED` | `true` | [4.11.0] P1 `?since=` 差分投影缓存开关；`false` 时旁路（差分退化为每次 reset 全量，无错误面） |
+| `OC_SLIMAPI_SINCE_CACHE_MAX_ENTRIES` | `256` | since 缓存 LRU 条目上限（键 = (session, cursor)） |
+| `OC_SLIMAPI_SINCE_CACHE_MAX_BYTES` | `67108864` | since 缓存总字节预算 |
+| `OC_SLIMAPI_SINCE_CACHE_MAX_ENTRY_BYTES` | `1048576` | 单条目字节上限（超限该条不缓存，后续请求 reset 全量） |
+| `OC_SLIMAPI_FILE_RAW_MAX_ENVELOPE_BYTES` | `33554432` | [4.11.0] `/slimapi/file/raw` 单请求上游信封字节上限（生效值 = 与 `OC_SLIMAPI_MAX_RESPONSE_BYTES` 的 min，默认 32 MiB；参与启动内存预算校验，见 `operations.md` §13.2） |
 
 > 上表为**速查**（高频运维 knob）。**完整权威清单与默认值见 [`src/oc_slimapi/config.py`](../src/oc_slimapi/config.py) 的 `Settings` dataclass**（含 T3/SSE 上限、token-stream 预算、transform 池、deployment revision、client-id hash 等，共 35+ 项）。落盘日志/流量查询手册见 [`manual/traffic-accounting.md`](manual/traffic-accounting.md)。
 

@@ -592,6 +592,7 @@ ocdroid 客户端**不直接操作** sidecar 进程，只通过 stunnel mTLS 接
 | 健康自检（客户端侧） | `GET /slimapi/health?v=4` 读 `server.api_version` / `accepted_client_versions` 做运行时兼容判断 |
 | Wire 行为变更来源 | 本仓 [`CHANGELOG.md`](../CHANGELOG.md)（路径/头/错误码以本仓 + [`v4-contract.md`](specs/v4-contract.md) 为准） |
 | 客户端配套改动清单 | [`CLIENT_CHANGES.md`](specs/CLIENT_CHANGES.md) |
+| 4.11.0 能力交接简报（webui/ocdroid 组） | [`specs/HANDOVER-4.11.0.md`](specs/HANDOVER-4.11.0.md)（新接口/变动/推荐用法一页总览） |
 
 sidecar 进程的启停、日志、升级由 **服务端运维** 负责，ocdroid 侧无需介入；但理解拓扑有助于排障（例如 sidecar 重启时 SSE 会断、客户端应收 `resync` 重连）。
 
@@ -783,3 +784,41 @@ require_confirm = true
 - **子进程环境（P2-2 fail-closed allowlist）**：action 子进程**不**继承 sidecar 全量环境，而是只继承固定 allowlist：`PATH`/`HOME`/`LANG`/`LC_ALL`/`LC_CTYPE`/`TMPDIR`/`XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS`，以 sidecar 运行用户（`mar`）身份执行，可读 `~/.config/opencode/` 凭证。这是有意设计（systemctl/plan_limit 需 `DBUS_SESSION_BUS_ADDRESS`/`XDG_RUNTIME_DIR`）。sidecar 自身的 `OC_SLIMAPI_*` 等配置变量（upstream URL、路径、版本门禁、salt……）被 **fail-closed 剔除**，绝不泄漏进 action 环境——无模糊的「name contains secret」规则，纯 allowlist 白名单。
 - **审计**：所有 action 调用（含 timeout/spawn-fail/disconnect/throttle）以 WARNING 级别写入 journald，不受 `OC_SLIMAPI_LOG_LEVEL` 影响。查询审计：`journalctl --user -u oc-slimapi -p warning | rg action`。
 - **进程重启 = 限频归零**：min_interval 限频是内存态（`time.monotonic()`），sidecar 进程重启后清零。这是有意设计（启动后各 action 均可立即调用一次）。
+
+---
+
+## 13. 4.11.0 流量优化族运维面（P1 since 缓存 / P5 file·raw）
+
+> 客户端消费指引见 `specs/CLIENT_CHANGES.md` §4.11.0；权威契约 `specs/v4-contract.md` 修订五（§10.3/§19）。本节只讲服务端运维视角。
+
+### 13.1 P1 since 差分缓存（`src/oc_slimapi/since_cache.py`）
+
+- 内存有界 LRU（默认 256 条 / 总 64 MiB / 单条 1 MiB；env 见 `develop.md` 配置表 `OC_SLIMAPI_SINCE_CACHE_*`）。键 = (session, cursor)；缓存的是**投影快照**用于差分，不是上游响应缓存——每次请求仍实时拉上游（新鲜度语义不变，§10.3 修订五）。
+- **逐出 ≠ 故障**：LRU 逐出 / 单条超限 / `OC_SLIMAPI_SINCE_CACHE_ENABLED=false` 旁路，客户端下一轮差分收到**全量 reset**（正常路径，非错误）。观测口径：access log 中 messages 路由响应体骤增即 reset，频率高 → 考虑调大 `MAX_ENTRIES`/`MAX_BYTES`。
+- token 属**进程域**（含启动随机 epoch）：sidecar 重启后客户端首轮差分必然 reset 全量，属设计内行为。
+- 关停面：`OC_SLIMAPI_SINCE_CACHE_ENABLED=false` 后差分请求退化为恒 reset（响应仍 200 合法），无错误面——可用于紧急回退。
+
+### 13.2 P5 `/slimapi/file/raw` 信封预算
+
+- 单请求上游信封上限：生效值 = `min(OC_SLIMAPI_MAX_RESPONSE_BYTES, OC_SLIMAPI_FILE_RAW_MAX_ENVELOPE_BYTES)`（默认 min(64 MiB, 32 MiB) = 32 MiB）；超限 → 413（客户端 verbatim 收到）。
+- 启动校验（fail-closed）：`transform_bound = max(既有 transform 预算, (A_AMP+1) × W × file_raw 生效 cap)`，与 raw_fetch 预留相加 ≤ 576 MiB，否则启动期 `RuntimeError`（`src/oc_slimapi/config.py` `validate()`）。调小 `OC_SLIMAPI_MAX_TRANSFORMS`（W，默认 1）或 envelope cap 可解。
+- 流量记账归 `file` 桶（与 `/slimapi/file` 组同桶，`traffic.py` 前缀归并）。
+
+### 13.3 效果观测（上线后）
+
+```bash
+# messages 桶字节应显著下降（webui 迁移差分后预期 -70%+）
+ls ~/.local/state/oc-slimapi/logs/ && zcat -f ~/.local/state/oc-slimapi/logs/access-$(date +%F).jsonl* 2>/dev/null | python3 -c "
+import json,sys
+from collections import defaultdict
+b=defaultdict(lambda:[0,0,0])
+for line in sys.stdin:
+    try: r=json.loads(line)
+    except: continue
+    if r.get('recordType')!='request': continue
+    x=b[r['bucket']]; x[0]+=1; x[1]+=r.get('upIn',0); x[2]+=r.get('downOut',0)
+for k,v in sorted(b.items(),key=lambda x:-x[1][1]): print(k, *v)"
+```
+
+- thin 路由 304 生效率：access log 中 todo/children/diff 行状态码分布（304 占比）。
+- file/raw 采用率：`file` 桶请求数变化。

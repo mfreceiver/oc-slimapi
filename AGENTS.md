@@ -118,6 +118,7 @@ ls ~/.local/state/oc-slimapi/logs/           # access-YYYY-MM-DD.jsonl(.gz) + tr
 | [`docs/specs/design-v2.md`](docs/specs/design-v2.md) | v2 时代设计（历史；现行态以 v4 契约 + operations.md 为准） |
 | [`docs/specs/INTERFACE_MAP.md`](docs/specs/INTERFACE_MAP.md) | 端点级实现追踪 |
 | [`docs/specs/CLIENT_CHANGES.md`](docs/specs/CLIENT_CHANGES.md) | ocdroid 侧配套改动清单 |
+| [`docs/specs/HANDOVER-4.11.0.md`](docs/specs/HANDOVER-4.11.0.md) | 4.11.0 流量优化族交接简报（给 webui/ocdroid 组的新接口/变动/推荐用法总览） |
 | [`docs/specs/design-token-stream.md`](docs/specs/design-token-stream.md) | Token stream 设计历史与 rationale（v4 设计稿；当前 wire 契约见 v4-contract.md §7.7） |
 | [`CHANGELOG.md`](CHANGELOG.md) | **接口行为变更记录**（给 ocdroid / 运维） |
 | [`docs/release.md`](docs/release.md) | **发版流程规范**（本仓库权威） |
