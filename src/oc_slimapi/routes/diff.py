@@ -77,11 +77,15 @@ async def session_diff(request: Request, sid: str,
     404 ``thin_route_not_found`` from the catch-all and the client falls
     back to the passthrough ``GET /session/{sid}/diff``.
 
-    Mirrors todo/children (rev-6 B1/C2): opts OUT of the Batch 2 ETag
-    wiring (``enable_etag=False``): no ``ETag`` header, any
-    ``If-None-Match`` is ignored (always 200). The directory variance is
-    still real, so ``Vary`` keeps the merged form; the tiny-body gzip
-    benefit gate applies (empty ``[]`` → identity).
+    Mirrors todo/children (4.11.0 Phase A / A2): opts INTO the Batch 2
+    ETag wiring (``enable_etag=True``): per-coding validators + 304 on a
+    matching ``If-None-Match``; ``Cache-Control: no-store`` stays on
+    every response (200 and 304 — revalidate every time, the validator
+    only saves the transport body). The directory variance is still
+    real, so ``Vary`` keeps the merged form; the tiny-body gzip benefit
+    gate applies (empty ``[]`` → identity) and decides the served coding
+    BEFORE the validator is derived, so the judged coding always equals
+    the served coding.
     """
     # v3 (§5, Batch B): a consumed ``?directory=`` was validated + stripped
     # at dispatch — the stash replaces the (absent) query param here.
@@ -101,7 +105,7 @@ async def session_diff(request: Request, sid: str,
             err_label="diff",
             read_timeout=None,
             sid=sid,
-            enable_etag=False,
+            enable_etag=True,
             merge_directory_vary=True,
             min_gzip_bytes=MIN_GZIP_BYTES,
             upstream_params=upstream_params,

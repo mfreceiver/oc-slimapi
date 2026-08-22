@@ -128,8 +128,13 @@ def _fresh_hub() -> tuple[GlobalHub, Subscriber]:
     return hub, subscriber
 
 
-async def test_digest_merges_status_and_message_into_one_frame(fresh_hub):
+async def test_digest_merges_status_and_message_into_one_frame(
+        fresh_hub, monkeypatch):
     hub, subscriber = fresh_hub
+    # 4.11.0 A3: messagesRevision is a process-global monotonic counter —
+    # pin it for the exact-shape lock (restored by monkeypatch).
+    monkeypatch.setattr(
+        "oc_slimapi.sse.global_hub._message_revision_seq", 0)
 
     hub.publish(make_global_event("/proj", "session.status", {
         "sessionID": "s1", "status": "busy",
@@ -158,6 +163,8 @@ async def test_digest_merges_status_and_message_into_one_frame(fresh_hub):
         "updatedAt": data["updatedAt"],
         # B1a: every digest frame carries changed: [<this frame's sid>].
         "changed": ["s1"],
+        # 4.11.0 A3: the message window carries the post-bump revision.
+        "messagesRevision": 1,
     }
 
 
@@ -1653,7 +1660,9 @@ async def test_digest_fields_converged(fresh_hub):
     payload = digests[0]
 
     allowed = {"sessionID", "directory", "status", "messageID",
-               "updatedAt", "archived", "deleted", "lastError", "changed"}
+               "updatedAt", "archived", "deleted", "lastError", "changed",
+               # 4.11.0 A3: conditional on message windows.
+               "messagesRevision"}
     assert set(payload) <= allowed, f"Unexpected keys: {set(payload) - allowed}"
     assert "contentRevisions" not in payload
     assert "childrenVersion" not in payload

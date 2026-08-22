@@ -87,7 +87,7 @@ _READY_GOLDEN = {
     # "upstream": {"ok": ..., "latencyMs": ...} — 每次 ping 动态，测试侧 pop 后比较
 }
 
-_B12_NORMALIZED_TEN = (
+_B12_NORMALIZED_UNIVERSE = (
     "events.global.replay.v4",
     "events.token.replay.v4",
     "messages.expand.v4",
@@ -98,6 +98,9 @@ _B12_NORMALIZED_TEN = (
     "session.list.global.v4",
     "session.post-actions.v4",
     "session.single.projection.v4",
+    # 4.11.0 Phase A / A1: eleventh ID (sessions.* sorts after every
+    # session.* — byte 8 '.' < 's').
+    "sessions.details.v4",
 )
 
 _B12_EXPAND_CATEGORIES_TWELVE = (
@@ -119,8 +122,8 @@ VERSIONS_PAYLOAD_GOLDEN = {
             "qpImmediateFull": True,
             "readiness": {
                 "ready": True,
-                "required": list(_B12_NORMALIZED_TEN),
-                "satisfied": list(_B12_NORMALIZED_TEN),
+                "required": list(_B12_NORMALIZED_UNIVERSE),
+                "satisfied": list(_B12_NORMALIZED_UNIVERSE),
             },
             "expand": {
                 "categories": list(_B12_EXPAND_CATEGORIES_TWELVE),
@@ -398,7 +401,7 @@ def test_directory_fork_is_set_difference():
     retired = [p.pattern for p in sel._DIRECTORY_V4_RETIRED_PATTERNS]
     assert retired == [r"^/slimapi/sessions$"]
     total = len(sel._DIRECTORY_CONSUMING_PATTERNS)
-    assert total == 25  # shared pattern source of truth
+    assert total == 26  # shared pattern source of truth (file/raw joined P5)
     # Kept list below instantiates every remaining pattern family.
     kept = [
         "/slimapi/messages/s1",
@@ -415,6 +418,7 @@ def test_directory_fork_is_set_difference():
         "/slimapi/file",
         "/slimapi/file/content",
         "/slimapi/file/status",
+        "/slimapi/file/raw",
         "/slimapi/vcs",
         "/slimapi/vcs/status",
         "/slimapi/vcs/diff",

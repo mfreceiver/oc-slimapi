@@ -8,6 +8,42 @@
 
 # ocdroid 客户端改动清单（仅文档，不修改 ocdroid）
 
+## 4.11.0 流量优化族消费指引（修订五 P1/P2/P4/P5/P6 — 2026-08-22，全部加性，客户端零必改）
+
+> **权威规范**：`docs/specs/v4-contract.md` 修订五（§10.3 since 差分 / §6.4 thin ETag / §7.5 messagesRevision / §19 file/raw / §3.3 readiness 第 11 ID）。以下为消费侧要点；全部能力**可选接入**，不接入则维持既有行为。
+
+### P1 — messages `?since=` 前向差分（§10.3，核心省流项）
+
+- 首次全量 `GET /slimapi/messages/{sid}?v=4` → 响应 envelope 多出 `nextSince`（无 `since` 请求仅可能多此一键）；持久化该 token。
+- 后续刷新 `GET …?since=<token>&v=4` → envelope `items` = **changed 投影数组**（窗口内新增/fingerprint 变化），条件键 `removed` = 差分窗口外推消失的 mid 列表。
+- **reset 识别（无显式标记键）**：响应 200 且 `items` 呈全量形状（无基线可差分）+ 携带新 `nextSince` → 按 reset 处理——**全量替换本地视图**。触发场景：服务重启/503 后、limit/directory/mode 变化、缓存逐出。token 属**进程域**，跨重启必然 reset，属正常路径非错误。
+- **`nextSince` 缺席**（键不存在）= 并发竞争降级（CAS loser differing）或 `before` 响应——丢弃旧 token，下次走全量重新拿 token；**不要**用旧 token 重试差分（会 reset，安全但浪费一轮）。
+- 错误面：`since`+`before` 同现→400；token 语法损坏/sid 失配→400（修客户端 bug）；其余失效一律 reset 不报错。
+- **removed 无假阳性**是契约级不变量；漏报（保守分支）可能发生——见 P4 对账兜底。
+- 消费姿势：`digest` 帧（见 P4）触发 `?since=` 差分拉取；`removed` 逐 mid 删除本地条目；reset 全量替换。
+
+### P2 — thin 路由 ETag（todo/children/diff，§6.4）
+
+- 4.11.0 起三路由入 ETag 全集：携带上次响应的 `ETag` 于 `If-None-Match` 重放 → 命中 **304**（≤4.10.x 恒 200）。头集/Vary/`Cache-Control: no-store` 不变。
+- 客户端缓存这三路由响应并回发 validator 即可（与既有 ETag 接入 §「ETag 接入」同构）；不接入则行为不变（恒 200）。
+
+### P4 — digest `messagesRevision`（§7.5，变化信号）
+
+- message 域 digest 帧新增 `messagesRevision: <int>`（进程级单调；session-only digest 无此键）。
+- 用途 = **变化信号**：revision 变化 → 触发 P1 since 差分或 If-None-Match 精拉。**不得跨进程比较**（重启清零；SSE 重连/upstream resync 后可比较——resync 帧后收到更小 revision 属正常，以进程内最新值为准）。不承载 per-sid 语义、非序号承诺。
+
+### P5 — `/slimapi/file/raw` 裸二进制直读（§19，收编 HttpImageHolder）
+
+- `GET /slimapi/file/raw?path=<必填>&v=4[&directory=]`：上游 `type=binary` 信封解码为**裸 bytes**（省 base64 的 4/3 膨胀），`Content-Type` 保真（非法 MIME 回退 `application/octet-stream`）；`type=text` → `text/plain; charset=utf-8`。
+- binary 恒 identity（收 `Accept-Encoding: gzip` 也不 gzip）+ 强 ETag/304；text 常规 gzip 协商。`Cache-Control: no-store`。
+- 错误面：信封畸形→502 `raw_decode_failed`；超 cap→413；上游 4xx verbatim；5xx/网络→503。directory 语义/allowlist 同 `/slimapi/file` 组。
+- 切换建议：图片/附件渲染从直连（或 `/slimapi/file`）迁至本端点；404/失败降级路径维持既有兜底。
+
+### P6 — `/slimapi/health` auxiliary 消费（§3.2/§4.2）
+
+- health 的 `auxiliary`（dbaux 投影源）状态块**早已发布**（4.10.0 前已实现）；本版仅文档指引：客户端探测 DB 投影可用性时读 `health.auxiliary`，`degraded` 时 sessions/messages 系可能降级（`auxiliary_unavailable` 503 附 `Retry-After: 30`）——按 503 语义退避，不解析错误体内部细节。
+- readiness：`capabilities["4"].readiness.required` 扩为**十一项**（新增第 11 ID `sessions.details.v4`，retroactive 正名——面已于 4.10.0 生效）；仅识别十项的旧客户端会误判 contradiction，随 4.11.0 同步全集。
+
 ## text 正文永远全量内联（3.2.0 — 包版本 minor，wire 仍 v3，2026-08-17）
 
 > **放宽性变更，客户端零必改**：sidecar skeleton 投影中 `TextPart.text` 不再有任何字节阈值——**无论 UTF-8 字节数多少一律原样内联**，不再出现 `text:null + omitted + hasFull + part_text ref` 形态的 text part（3.1.x 曾按 >2048 折叠）。`ReasoningPart.text`（>2048 折叠为 `part_reasoning`）与其余折叠类目（tool state 5 类、`part_url`/`part_source`/`part_snapshot`/`info_summary_diffs`/`compaction_full`）**全部维持 3.1.0 规则不变**。expand 12 类目端点全部保留（`part_text` 端点留存，服务历史缓存响应与降级场景）。对已按 3.1.0 容忍/展开适配的客户端：全量内联是折叠的超集，双形态（3.1.x / 3.2.0）均正常。skeleton 字节变化 → `contentFingerprint`/ETag 自动失效旧缓存。

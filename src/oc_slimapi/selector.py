@@ -171,6 +171,11 @@ _DIRECTORY_CONSUMING_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         r"^/slimapi/file$",
         r"^/slimapi/file/content$",
         r"^/slimapi/file/status$",
+        # file_raw (4.11.0 Phase D integration): the raw-file projection
+        # route takes the same FileQuery/WorkspaceRoutingQuery shape as the
+        # file read group — ``?directory=`` is a consuming query parameter
+        # there, so it joins the file siblings above.
+        r"^/slimapi/file/raw$",
         r"^/slimapi/vcs$",
         r"^/slimapi/vcs/status$",
         r"^/slimapi/vcs/diff$",

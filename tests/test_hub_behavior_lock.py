@@ -202,8 +202,13 @@ class TestDigestAccumulation:
     """session.digest merges status / messageID / updatedAt / archived / deleted
     within one debounce window per session (contract §3)."""
 
-    async def test_status_and_message_merge_into_single_digest(self, pair):
+    async def test_status_and_message_merge_into_single_digest(
+            self, pair, monkeypatch):
         hub, sub = pair
+        # 4.11.0 A3: pin the process-global revision counter for the
+        # exact-shape lock (restored by monkeypatch).
+        monkeypatch.setattr(
+            "oc_slimapi.sse.global_hub._message_revision_seq", 0)
         hub.publish(ev("/proj", "session.status", {"sessionID": "s1", "status": "busy"}))
         hub.publish(ev("/proj", "message.updated", {
             "sessionID": "s1",
@@ -224,6 +229,8 @@ class TestDigestAccumulation:
             "updatedAt": digests[0]["updatedAt"],
             # B1a additive: every digest frame carries changed: [<sid>].
             "changed": ["s1"],
+            # 4.11.0 A3: the message window carries the post-bump revision.
+            "messagesRevision": 1,
         }
 
     async def test_two_separate_windows_produce_two_digests(self, pair):

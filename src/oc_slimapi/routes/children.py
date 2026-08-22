@@ -15,8 +15,8 @@ machinery stays deleted): NO ``X-Children-Version`` header, NO
 ``childrenComplete`` list hints, NO per-key cache / single-flight /
 SSE-driven invalidation.
 
-Not wired into: Batch 1 coalescing (YAGNI per plan §5) or Batch 2 ETag
-(follow-up).
+Not wired into: Batch 1 coalescing (YAGNI per plan §5). The Batch 2 ETag
+wiring is enabled (4.11.0 Phase A / A2 — see below).
 """
 from __future__ import annotations
 
@@ -62,10 +62,14 @@ async def session_children(request: Request, sid: str,
     answer 404 ``thin_route_not_found`` from the catch-all and the client
     falls back to the passthrough ``GET /session/{sid}/children``.
 
-    rev-6 B1/C2: opts OUT of the Batch 2 ETag wiring (``enable_etag=False``
-    — plan §5): no ``ETag``, any ``If-None-Match`` ignored (always 200);
-    merged ``Vary`` kept (directory variance is real); tiny-body gzip
-    benefit gate applies (empty ``[]`` → identity).
+    4.11.0 Phase A / A2: opts INTO the Batch 2 ETag wiring
+    (``enable_etag=True``): per-coding validators + 304 on a matching
+    ``If-None-Match``; ``Cache-Control: no-store`` stays on every
+    response (200 and 304 — revalidate every time, the validator only
+    saves the transport body). Merged ``Vary`` kept (directory variance
+    is real); tiny-body gzip benefit gate applies (empty ``[]`` →
+    identity) and decides the served coding BEFORE the validator is
+    derived, so the judged coding always equals the served coding.
     """
     # v3 (§5, Batch B): a consumed ``?directory=`` was validated + stripped
     # at dispatch — the stash replaces the (absent) query param here.
@@ -82,7 +86,7 @@ async def session_children(request: Request, sid: str,
             err_label="children",
             read_timeout=None,
             sid=sid,
-            enable_etag=False,
+            enable_etag=True,
             merge_directory_vary=True,
             min_gzip_bytes=MIN_GZIP_BYTES,
         )

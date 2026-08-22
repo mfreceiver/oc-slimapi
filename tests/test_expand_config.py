@@ -114,11 +114,14 @@ def test_validate_rejects_envelope_when_expand_cap_is_winning_term():
 
 
 def test_validate_accepts_expand_cap_at_envelope_boundary():
-    """16 × max(16 MiB, 32 MiB) = 512 MiB == the exact cap (<= comparison) →
-    OK; the expand cap is the winning term and still fits."""
+    """16 × max(6 MiB, 32 MiB) = 512 MiB == the exact P1-30 cap (<= comparison)
+    → OK; the expand cap is the winning term and still fits. 4.11.0 Phase A /
+    A4: the aggregate now includes the file-raw bound (5 × 16 × 6 MiB =
+    480 MiB); transform bound = max(512, 480) = 512 MiB and the aggregate
+    64 + 512 = 576 MiB sits exactly at its boundary — accepted (<=)."""
     _base(
         max_transforms=16,
-        max_response_bytes=16 * 1024 * 1024,
+        max_response_bytes=6 * 1024 * 1024,
         max_expand_response_bytes=32 * 1024 * 1024,
     ).validate()
 

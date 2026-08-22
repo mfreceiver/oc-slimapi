@@ -324,3 +324,57 @@ class TransformPool:
         )
         watcher.start()
         done.wait(timeout=wait_seconds)
+
+    async def offload_strict(self, func: Callable[..., Any], /,
+                             *args: Any, **kwargs: Any) -> Any:
+        """Run work while transferring an acquired permit's ownership.
+
+        Unlike :meth:`offload`, this primitive is for callers that acquired a
+        permit explicitly and must keep it until the executor future has
+        actually terminated.  Request-task cancellation is deliberately not
+        allowed to release the permit while the worker is still running (or
+        queued): ``shield`` protects the future, and the cancellation path
+        releases synchronously only when it is already done or installs one
+        completion callback otherwise.
+
+        The caller must have a matching successful :meth:`acquire` before
+        invoking this method.  Ownership of that permit transfers to this
+        method exactly once when submission starts; callers must not release it
+        afterwards.
+        """
+        loop = asyncio.get_running_loop()
+        try:
+            if kwargs:
+                future = loop.run_in_executor(
+                    self._executor, functools.partial(func, *args, **kwargs),
+                )
+            else:
+                future = loop.run_in_executor(self._executor, func, *args)
+        except BaseException:
+            # Submission failed before a future could own the permit.
+            self.release()
+            raise
+
+        released = False
+
+        def release_once(_future: asyncio.Future[Any]) -> None:
+            nonlocal released
+            if released:
+                return
+            released = True
+            self.release()
+
+        try:
+            result = await asyncio.shield(future)
+        except asyncio.CancelledError:
+            if future.done():
+                release_once(future)
+            else:
+                future.add_done_callback(release_once)
+            raise
+        except BaseException:
+            release_once(future)
+            raise
+        else:
+            release_once(future)
+            return result

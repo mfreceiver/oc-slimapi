@@ -26,6 +26,26 @@ ocdroid 对接时：
 
 ---
 
+## [4.11.0] - 2026-08-22 — 修订五：流量优化族 P1–P6（minor；wire 仍 v4，全部加性）
+
+> **客户端零必改**；P1/P2/P4/P5 为可选接入的省流能力，消费指引见 `docs/specs/CLIENT_CHANGES.md` §4.11.0，权威规范见 `docs/specs/v4-contract.md` 修订五。
+
+### Added
+
+- **messages `?since=` 前向差分**（v4-contract §10.3，P1 阶段 1）：`GET /slimapi/messages/{sid}` 新增 `since` 参数与响应条件键 `nextSince`/`removed`；token `{v:1,epoch,sid,cq_hash,gen}` 进程域；CAS 并发语义（loser differing → `nextSince` omit）；失效分类：真错误（语法/sid 失配/超长/`since`+`before` 同现）→ 400，其余（gen 过期/epoch 失配/逐出/查询轴变化）→ 安全 reset 全量。**消费者应迁移：digest 触发 `?since=` 差分刷新，替代全量重拉**（12h 窗口最大流量驱动项，预期省 70–90%）。
+- **digest `messagesRevision`**（v4-contract §7.5，P4）：message 域 digest 帧加性字段，进程级单调变化信号，驱动 since 差分/If-None-Match 精拉；不跨进程比较。
+- **`GET /slimapi/file/raw` 裸二进制直读**（v4-contract §19，P5）：上游 `LegacyContent` binary 信封解码为裸 bytes 下发（省 base64 4/3 膨胀）；MIME 保真、强 ETag/304、no-store；畸形信封 502 `raw_decode_failed`。收编 `HttpImageHolder` 直连图片拉取。
+- **readiness 第 11 ID `sessions.details.v4`**（v4-contract §3.3，P3）：retroactive 正名——§18 批量详情面已于 4.10.0 生效；`required` 扩为十一项，客户端需同步全集。
+
+### Changed
+
+- **thin 路由 todo/children/diff 入 ETag 全集**（v4-contract §6.4，P2）：携带命中 validator 的 `If-None-Match` 重放由恒 200 变为可能 **304**（≤4.10.x 忽略 validator）；头集/Vary/no-store 语义不变。缓存该三路由响应的客户端自动受益，无需改动。
+- messages ETag 域标签统一为窗口版本 4（D6 裁定，一次性 validator 轮换，客户端全量重拉一轮）。
+
+### Fixed
+
+- selector directory consuming 表纳入 `/slimapi/file/raw`（随 §19 集成）；catalog epoch 失效 fence 与 503 burst 观测为 4.10.1 既有能力，本版无变更。
+
 ## [4.10.1] - 2026-08-22 — 服务端新鲜度 + 观测（patch；**无 wire 变化**，客户端零感知）
 
 > 本版为 patch：B 是服务端缓存新鲜度改进、C 是纯日志观测，wire 面（路径/形状/错误码/版本）零改动，ocdroid 无必改点。

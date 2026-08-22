@@ -287,6 +287,16 @@ class DigestFields:
     # default stays None and ``to_payload`` omits the key for any digest
     # caller that does not opt in.
     changed: list[str] | None = None
+    # 4.11.0 Phase A / A3 (P4): messagesRevision — the process-wide
+    # monotonic message-universe revision stamped onto MESSAGE windows
+    # only (a digest entry that includes message.updated/appended/removed).
+    # Session-only digests leave it None → ``to_payload`` omits the key.
+    # Lifecycle = the PROCESS: a restart zeroes the counter, so clients
+    # MUST NOT compare revisions across processes; upstream resync does
+    # NOT reset it (comparable within one process lifetime). Stamped at
+    # ingest (overwritten per relevant event — a multi-event debounce
+    # window flushes the window-END value).
+    messages_revision: int | None = None
 
     def to_payload(self, session_id: str) -> dict[str, Any]:
         payload: dict[str, Any] = {"sessionID": session_id}
@@ -317,6 +327,10 @@ class DigestFields:
         # other optional digest field (non-None → present).
         if self.changed is not None:
             payload["changed"] = self.changed
+        # 4.11.0 Phase A / A3: messagesRevision — message windows only;
+        # conditionally emitted exactly like every other optional field.
+        if self.messages_revision is not None:
+            payload["messagesRevision"] = self.messages_revision
         return payload
 
 

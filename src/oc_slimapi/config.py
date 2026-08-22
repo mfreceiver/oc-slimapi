@@ -118,6 +118,13 @@ _MAX_TRANSFORM_TOTAL_BYTES = 512 * 1024 * 1024  # 512 MiB
 _MAX_RAW_PLUS_TRANSFORM_TOTAL_BYTES = (
     _MAX_TRANSFORM_TOTAL_BYTES + 64 * 1024 * 1024
 )  # 576 MiB
+# 4.11.0 Phase A / P1+P6 (plan §4.1): per-permit amplification constant for
+# the file-raw transform worker (Phase C consumer). One admitted file-raw
+# permit transiently holds up to (A_AMP + 1) × effective_cap bytes: the raw
+# envelope plus A_AMP further copies — parsed/decoded object, response
+# body, gzip candidate, and one staging buffer. effective_cap =
+# min(max_response_bytes, file_raw_max_envelope_bytes); see validate().
+A_AMP = 4
 # Expand fragment cap (design-expand §3.2): the per-fragment serialised
 # response bound of the messages expand endpoints. Startup window is
 # [1 KiB, 32 MiB] — below 1 KiB even a small fragment could never be
@@ -374,6 +381,20 @@ class Settings:
     max_expand_response_bytes: int = _int_env(
         "OC_SLIMAPI_MAX_EXPAND_RESPONSE_BYTES", 8 * 1024 * 1024
     )
+    # 4.11.0 Phase A / A4 (P6 预置, Phase C 消费): file-raw envelope cap —
+    # the byte ceiling a single raw file-envelope fetch may occupy per
+    # transform permit (admission BEFORE the upstream GET, mirroring the
+    # pool discipline). Deliberately NOT hard-constrained against
+    # max_response_bytes here: the effective per-permit cap is
+    # min(max_response_bytes, file_raw_max_envelope_bytes), computed at the
+    # Phase C consumer; this knob only feeds that min() and the startup
+    # memory-budget bound in validate() ((A_AMP + 1) × W × effective_cap).
+    file_raw_max_envelope_bytes: int = int(
+        os.getenv(
+            "OC_SLIMAPI_FILE_RAW_MAX_ENVELOPE_BYTES",
+            str(32 * 1024 * 1024),
+        )
+    )
     # Catalog TTL cache (traffic plan Batch 1 / A1): successful upstream
     # catalog bodies (/slimapi/agent, /slimapi/command) are cached for a TTL
     # window so repeat catalog GETs stop hitting upstream. Only successful
@@ -390,6 +411,24 @@ class Settings:
     )
     catalog_cache_max_entry_bytes: int = int(
         os.getenv("OC_SLIMAPI_CATALOG_CACHE_MAX_ENTRY_BYTES", str(1024 * 1024))
+    )
+    # 4.11.0 Phase A / A4 (P1 预置, Phase B 消费): ``since`` cursor cache —
+    # a bounded LRU mapping (session, since-cursor) → serialized projection
+    # used to serve ``since``-based incremental messages windows without
+    # refetching upstream. Preset here (defaults frozen) so Phase B lands
+    # consumer-only; ``since_cache_enabled=false`` bypasses the cache
+    # entirely (byte-identical to the uncached path, Phase B semantics).
+    since_cache_enabled: bool = os.getenv(
+        "OC_SLIMAPI_SINCE_CACHE_ENABLED", "true"
+    ).lower() in ("1", "true", "yes", "on")
+    since_cache_max_entries: int = int(
+        os.getenv("OC_SLIMAPI_SINCE_CACHE_MAX_ENTRIES", "256")
+    )
+    since_cache_max_bytes: int = int(
+        os.getenv("OC_SLIMAPI_SINCE_CACHE_MAX_BYTES", str(64 * 1024 * 1024))
+    )
+    since_cache_max_entry_bytes: int = int(
+        os.getenv("OC_SLIMAPI_SINCE_CACHE_MAX_ENTRY_BYTES", str(1024 * 1024))
     )
     # Upstream-fetch coalescing (traffic plan Batch 1 / A2-A4): a per-app
     # ``LeasedSingleFlight`` registry dedupes identical upstream GETs (list
@@ -914,14 +953,32 @@ class Settings:
             raise RuntimeError("OC_SLIMAPI_RAW_FETCH_CONCURRENCY must be >= 1")
         if self.raw_fetch_max_bytes <= 0:
             raise RuntimeError("OC_SLIMAPI_RAW_FETCH_MAX_BYTES must be > 0")
-        _raw_plus_transform = self.raw_fetch_max_bytes + _transform_total_bytes
+        # 4.11.0 Phase A / A4 (plan §4.1, formula frozen): the file-raw
+        # transform worker (Phase C) shares the SAME W transform permits,
+        # so its per-permit bound joins the transform-side budget via
+        # max() — never a double addition. Per permit the file-raw path
+        # transiently holds (A_AMP + 1) × effective_cap bytes (raw envelope
+        # + A_AMP copies: parsed/decoded, response, gzip candidate, staging).
+        _effective_cap = min(
+            self.max_response_bytes, self.file_raw_max_envelope_bytes
+        )
+        _file_raw_bound = (A_AMP + 1) * self.max_transforms * _effective_cap
+        _transform_bound = max(_transform_total_bytes, _file_raw_bound)
+        _raw_plus_transform = self.raw_fetch_max_bytes + _transform_bound
         if _raw_plus_transform > _MAX_RAW_PLUS_TRANSFORM_TOTAL_BYTES:
             raise RuntimeError(
                 f"OC_SLIMAPI_RAW_FETCH_MAX_BYTES ({self.raw_fetch_max_bytes}) "
-                f"+ OC_SLIMAPI_MAX_TRANSFORMS ({self.max_transforms}) × "
+                f"+ transform bound max("
+                f"OC_SLIMAPI_MAX_TRANSFORMS ({self.max_transforms}) × "
                 f"max(OC_SLIMAPI_MAX_RESPONSE_BYTES ({self.max_response_bytes}), "
                 f"OC_SLIMAPI_MAX_EXPAND_RESPONSE_BYTES "
-                f"({self.max_expand_response_bytes})) "
+                f"({self.max_expand_response_bytes})), "
+                f"(A_AMP + 1) × OC_SLIMAPI_MAX_TRANSFORMS × min("
+                f"OC_SLIMAPI_MAX_RESPONSE_BYTES, "
+                f"OC_SLIMAPI_FILE_RAW_MAX_ENVELOPE_BYTES "
+                f"({self.file_raw_max_envelope_bytes})) = {A_AMP + 1} × "
+                f"{self.max_transforms} × {_effective_cap}"
+                f") = {_transform_bound} "
                 f"= {_raw_plus_transform} bytes exceeds "
                 f"{_MAX_RAW_PLUS_TRANSFORM_TOTAL_BYTES // (1024 * 1024)} MiB "
                 f"— raw-fetch and transform budgets peak concurrently; "
@@ -956,6 +1013,21 @@ class Settings:
                 "OC_SLIMAPI_CATALOG_CACHE_MAX_ENTRY_BYTES must be <= "
                 "OC_SLIMAPI_CATALOG_CACHE_MAX_BYTES (an oversize entry could "
                 "never be stored)"
+            )
+        # 4.11.0 Phase A / A4 knob guards (Phase B/C consumers): positive /
+        # lower-bound checks only — budget interplay lives above (the
+        # aggregate memory bound) or at the consumer (effective_cap min()).
+        if self.since_cache_max_entries < 1:
+            raise RuntimeError("OC_SLIMAPI_SINCE_CACHE_MAX_ENTRIES must be >= 1")
+        if self.since_cache_max_bytes <= 0:
+            raise RuntimeError("OC_SLIMAPI_SINCE_CACHE_MAX_BYTES must be > 0")
+        if self.since_cache_max_entry_bytes <= 0:
+            raise RuntimeError(
+                "OC_SLIMAPI_SINCE_CACHE_MAX_ENTRY_BYTES must be > 0"
+            )
+        if self.file_raw_max_envelope_bytes <= 0:
+            raise RuntimeError(
+                "OC_SLIMAPI_FILE_RAW_MAX_ENVELOPE_BYTES must be > 0"
             )
         # Skeleton projection inline caps: per-field and per-message.
         if self.skeleton_inline_output_max_bytes <= 0:

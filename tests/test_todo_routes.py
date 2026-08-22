@@ -160,36 +160,45 @@ async def test_todo_empty_array_skips_gzip(upstream_factory):
 
 
 # ---------------------------------------------------------------------------
-# rev-6 B1 — ETag explicitly disabled on this route (plan §5: Batch 3 does
-# not wire ETag — the route opts out of the catalog chain's rep_version)
+# 4.11.0 Phase A / A2 — ETag now ENABLED on this route
+# (enable_etag=True; full matrix in tests/test_thin_etag.py)
 # ---------------------------------------------------------------------------
 
-async def test_todo_no_etag_and_inm_always_200(upstream_factory):
-    """B1: ① happy responses carry NO ``ETag`` header; ② any
-    ``If-None-Match`` (wildcard or opaque tag) is ignored — always 200 with
-    the full body (never 304)."""
+async def test_todo_etag_enabled_inm_304(upstream_factory):
+    """A2: ① happy responses carry a strong ``ETag`` (identity coding,
+    pinned) + ``Vary: Accept-Encoding`` + ``Cache-Control: no-store``;
+    ② ``If-None-Match: *`` / a matching validator → 304 (no body);
+    ③ a stale opaque tag → 200 with the full body."""
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=TODO_BODY)
 
     upstream = upstream_factory(handler)
     app = _build_app(_settings(), upstream)
     async with _client(app) as client:
-        r = await client.get("/slimapi/sessions/s1/todo",
-                             headers=VERSION_HEADERS)
+        hdr = {**VERSION_HEADERS, "Accept-Encoding": "identity"}
+        r = await client.get("/slimapi/sessions/s1/todo", headers=hdr)
         assert r.status_code == 200
-        assert "etag" not in r.headers
+        etag = r.headers["ETag"]
+        assert etag.startswith('"')
+        assert r.headers["Vary"] == "Accept-Encoding"
+        assert r.headers["Cache-Control"] == "no-store"
+
+        r_replay = await client.get(
+            "/slimapi/sessions/s1/todo",
+            headers={**hdr, "If-None-Match": etag})
+        assert r_replay.status_code == 304
+        assert r_replay.content == b""
+        assert r_replay.headers["ETag"] == etag
+        assert r_replay.headers["Cache-Control"] == "no-store"
 
         r_star = await client.get(
             "/slimapi/sessions/s1/todo",
-            headers={**VERSION_HEADERS, "If-None-Match": "*"})
-        assert r_star.status_code == 200
-        assert r_star.json() == orjson.loads(TODO_BODY)
+            headers={**hdr, "If-None-Match": "*"})
+        assert r_star.status_code == 304
 
         r_tag = await client.get(
             "/slimapi/sessions/s1/todo",
-            headers={**VERSION_HEADERS,
-                     "If-None-Match": '"deadbeef"',
-                     "Accept-Encoding": "gzip"})
+            headers={**hdr, "If-None-Match": '"deadbeef"'})
         assert r_tag.status_code == 200
         assert r_tag.json() == orjson.loads(TODO_BODY)
 

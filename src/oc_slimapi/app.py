@@ -24,9 +24,10 @@ from .middleware.request_id import RequestIdMiddleware
 from .middleware.traffic_accounting import TrafficAccountingMiddleware
 from .proxy import install_proxy
 from .qp_sweep import QpSweepShadow
-from .routes import actions, agent, children, command, directories, events, health, messages, metrics, permissions, questions, read_groups, sessions, todo, token_stream, versions, write_groups
+from .routes import actions, agent, children, command, directories, events, file_raw, health, messages, metrics, permissions, questions, read_groups, sessions, todo, token_stream, versions, write_groups
 from .routes import diff as diff_routes
 from .selector import SlimapiSelectorMiddleware
+from .since_cache import SinceCache
 from .singleflight import LeasedSingleFlight, fulls
 from .sse.hub import HubRegistry
 from .sse.replay_log import ReplayLog, new_epoch
@@ -367,6 +368,17 @@ async def lifespan(app: FastAPI):
             max_entries=settings.catalog_cache_max_entries,
             max_bytes=settings.catalog_cache_max_bytes,
             max_entry_bytes=settings.catalog_cache_max_entry_bytes,
+        )
+
+        # Phase B: process-local single-snapshot lineage for messages
+        # ``?since=``.  The cache is deliberately independent from the raw
+        # fetch registry: since projection/diff work remains per request after
+        # a shared upstream flight completes.
+        app.state.since_cache = SinceCache(
+            enabled=settings.since_cache_enabled,
+            max_entries=settings.since_cache_max_entries,
+            max_bytes=settings.since_cache_max_bytes,
+            max_entry_bytes=settings.since_cache_max_entry_bytes,
         )
 
         def _shutdown_catalog_cache():
@@ -792,7 +804,7 @@ app.add_middleware(RequestIdMiddleware)
 # install_proxy's catch-all (design §5.1: route must precede the reverse
 # proxy). Its path ``/slimapi/sessions/{sid}/stream`` does not shadow
 # ``/{sid}/status`` or ``/{sid}/children`` (different literal suffixes).
-for router in (health.router, versions.router, actions.router, agent.router, command.router, sessions.router, children.router, todo.router, diff_routes.router, messages.router, events.router, metrics.router, questions.router, permissions.router, directories.router, token_stream.router, read_groups.router, write_groups.router):
+for router in (health.router, versions.router, actions.router, agent.router, command.router, sessions.router, children.router, todo.router, diff_routes.router, messages.router, events.router, metrics.router, questions.router, permissions.router, directories.router, token_stream.router, read_groups.router, write_groups.router, file_raw.router):
     app.include_router(router)
 install_proxy(app)
 

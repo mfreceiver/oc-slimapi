@@ -1,5 +1,5 @@
 """v4-contract §3.3 — ``capabilities["4"].readiness`` gate (2026-08-19 revision).
-Ten-feature readiness gate for the v4 formal revision: each revision-face
+Eleven-feature readiness gate for the v4 formal revision: each revision-face
 feature (the §12-§17 semantics) is independently gated by its feature ID —
 a feature's revised semantics are reachable **iff its ID ∈ SATISFIED**.
 The aggregate ``ready`` boolean is a derived summary indicator, never a
@@ -25,7 +25,9 @@ principle of §3.1 intact.
 
 Server-side invariants (§3.3, frozen):
 
-* ``REQUIRED ≡ U`` — the server always emits the full ten-ID universe;
+* ``REQUIRED ≡ U`` — the server always emits the full universe (ten IDs
+  through 4.10.x; eleven since 4.11.0 Phase A / P3 appended
+  ``sessions.details.v4``);
   the deferred / non-goal boundaries of later sections are encoded by
   absence from the satisfied array, never by omitting IDs here.
 * ``SATISFIED ⊆ REQUIRED`` must hold unconditionally — unknown IDs are
@@ -54,7 +56,10 @@ from typing import Iterable
 # Contract §3.3 frozen enumeration order of the universe U (the numbered
 # list; the wire form additionally normalizes via f()). Revision 2
 # appended the 10th ID — session.post-actions.v4 (POST equivalence family)
-# — immediately after method.boundary.v4.
+# — immediately after method.boundary.v4. 4.11.0 Phase A (P3) appended
+# the 11th ID — sessions.details.v4 (session-details thin face) — right
+# after session.post-actions.v4: additive, satisfied in the same batch,
+# NO new dependency implication.
 REQUIRED: tuple[str, ...] = (
     "selector.v4",
     "session.list.global.v4",
@@ -66,6 +71,7 @@ REQUIRED: tuple[str, ...] = (
     "representation.vary.v4",
     "method.boundary.v4",
     "session.post-actions.v4",
+    "sessions.details.v4",
 )
 
 REQUIRED_SET: frozenset[str] = frozenset(REQUIRED)

@@ -2,9 +2,12 @@
 
 Contract anchors (docs/specs/v4-contract.md):
 
-* **§3.3** — ten-feature ID universe U in frozen enumeration order
+* **§3.3** — eleven-feature ID universe U in frozen enumeration order
   (revision 2 expanded U 9→10 additively with the 10th ID
-  ``session.post-actions.v4``, slotted after ``method.boundary.v4``);
+  ``session.post-actions.v4``, slotted after ``method.boundary.v4``;
+  4.11.0 Phase A / P3 expanded 10→11 with ``sessions.details.v4`` slotted
+  after ``session.post-actions.v4`` — additive, satisfied by default, no
+  new dependency implication);
   normalization ``f(A)`` = dedupe → UTF-8 byte-order sort (both wire arrays
   are emitted normalized); ``ready ⇔ f(required) ⊆ f(satisfied)`` derived
   both directions (never flipped alone); unknown IDs (∉ U) rejected, never
@@ -13,7 +16,9 @@ Contract anchors (docs/specs/v4-contract.md):
   integration close-out flipped the remaining five of the original nine.
   **Revision-2 activation (post-integration-batch default): the
   implementation batch lit ``session.post-actions.v4`` — SATISFIED now
-  carries the full ten-ID universe and the derived ``ready`` is True again.
+  carries the full ten-ID universe and the derived ``ready`` is True again
+  (4.11.0 Phase A / P3 extended the universe to eleven IDs — SATISFIED
+  still carries the full set).
   The transitional nine-of-ten shape (ready:false) is preserved as a
   construction-level lock below (explicit set, no global-state dependency).**
 * **§3.3 revision-2 dependency implication (contradiction ⑦)** —
@@ -60,7 +65,10 @@ from oc_slimapi.selector import SlimapiSelectorMiddleware
 from oc_slimapi.traffic import EXPAND_CATEGORIES
 
 # §3.3 frozen enumeration order of the universe U (contract numbered list;
-# revision 2 appended the 10th ID after method.boundary.v4).
+# revision 2 appended the 10th ID after method.boundary.v4; 4.11.0 Phase A
+# (P3) appended the 11th ID ``sessions.details.v4`` after
+# session.post-actions.v4 — additive, satisfied by default, no new
+# dependency implication).
 CONTRACT_REQUIRED_ORDER = (
     "selector.v4",
     "session.list.global.v4",
@@ -72,9 +80,12 @@ CONTRACT_REQUIRED_ORDER = (
     "representation.vary.v4",
     "method.boundary.v4",
     "session.post-actions.v4",
+    "sessions.details.v4",
 )
 
 # §3.3 normalization f(): dedupe → UTF-8 byte-order sort of U.
+# ``sessions.details.v4`` sorts LAST: at the 8th byte, ``.`` (0x2E) of the
+# ``session.*`` family sorts before ``s`` (0x73) of ``sessions``.
 CONTRACT_REQUIRED_NORMALIZED = (
     "events.global.replay.v4",
     "events.token.replay.v4",
@@ -86,16 +97,19 @@ CONTRACT_REQUIRED_NORMALIZED = (
     "session.list.global.v4",
     "session.post-actions.v4",
     "session.single.projection.v4",
+    "sessions.details.v4",
 )
 
 # Revision-2 pair (§3.3 implication / §16.3 combination priority).
 CONTRACT_POST_ACTIONS_FEATURE = "session.post-actions.v4"
 CONTRACT_BOUNDARY_FEATURE = "method.boundary.v4"
 
-# The transitional SATISFIED (revision 2, §3.3 current-state note): the
-# original nine IDs — U minus the 10th — in normalized wire form. Kept as
-# the construction-level transitional lock (the integration batch has since
-# lit the 10th; the global default is the full activated universe).
+# The transitional SATISFIED (revision 2, §3.3 current-state note): U minus
+# the 10th ID (session.post-actions.v4) in normalized wire form. Kept as the
+# construction-level transitional lock (the integration batch has since lit
+# the 10th; the global default is the full activated universe). 4.11.0
+# Phase A / A1: U grew to eleven IDs, so the constructed transitional set
+# now also carries sessions.details.v4 (byte-order last).
 TRANSITIONAL_SATISFIED_NORMALIZED = (
     "events.global.replay.v4",
     "events.token.replay.v4",
@@ -106,6 +120,7 @@ TRANSITIONAL_SATISFIED_NORMALIZED = (
     "selector.v4",
     "session.list.global.v4",
     "session.single.projection.v4",
+    "sessions.details.v4",
 )
 
 # The four IDs satisfied at first readiness advertisement (4.0.0 behavior).
@@ -187,7 +202,8 @@ async def _get_caps() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# §3.3 — universe U: ten IDs, frozen enumeration order (revision 2: 9→10)
+# §3.3 — universe U: eleven IDs, frozen enumeration order (rev 2: 9→10;
+# 4.11.0 Phase A / P3: 10→11, sessions.details.v4 appended additively)
 # ---------------------------------------------------------------------------
 
 
@@ -195,15 +211,18 @@ def test_required_universe_ten_ids_frozen_order():
     """REQUIRED ≡ U in the contract's numbered enumeration order (§3.3);
     revision 2 appends ``session.post-actions.v4`` as the 10th ID,
     slotted right after ``method.boundary.v4`` (the implication /
-    combination-priority pair travels together)."""
+    combination-priority pair travels together); 4.11.0 Phase A (P3)
+    appends ``sessions.details.v4`` as the 11th, right after
+    ``session.post-actions.v4``."""
     assert readiness.REQUIRED == CONTRACT_REQUIRED_ORDER
-    assert len(readiness.REQUIRED) == 10
+    assert len(readiness.REQUIRED) == 11
     assert readiness.REQUIRED[9] == CONTRACT_POST_ACTIONS_FEATURE
     assert readiness.REQUIRED[8] == CONTRACT_BOUNDARY_FEATURE
+    assert readiness.REQUIRED[10] == "sessions.details.v4"
 
 
 def test_required_universe_unique_strings():
-    assert len(set(readiness.REQUIRED)) == 10
+    assert len(set(readiness.REQUIRED)) == 11
     assert all(isinstance(i, str) and i for i in readiness.REQUIRED)
     assert readiness.REQUIRED_SET == frozenset(CONTRACT_REQUIRED_ORDER)
 
@@ -249,8 +268,8 @@ def test_normalize_empty():
 
 def test_satisfied_current_state_activated_full_ten():
     """§3.3 revision-2 close-out: the implementation batch lit
-    ``session.post-actions.v4`` — SATISFIED now carries the FULL ten-ID
-    universe and the derived ``ready`` is True (activation is the shipped
+    ``session.post-actions.v4`` — SATISFIED now carries the FULL universe
+    (ten IDs then; eleven since 4.11.0 Phase A / P3) and the derived ``ready`` is True (activation is the shipped
     default; flips only ever ADD, so the 4.2.0 nine and the historical
     4.0.0 four remain ⊆ SATISFIED)."""
     assert readiness.SATISFIED == readiness.REQUIRED_SET
@@ -266,7 +285,7 @@ def test_module_invariant_satisfied_subset_of_required():
     proves the initial set passes the guard."""
     assert readiness.SATISFIED <= readiness.REQUIRED_SET
     # The guard itself accepts every legal subset...
-    for k in range(10):
+    for k in range(len(readiness.REQUIRED) + 1):
         for subset in combinations(readiness.REQUIRED, k):
             readiness.validate(frozenset(subset))  # no raise
     # ...and rejects anything outside U, naming the offender.
@@ -291,7 +310,7 @@ def test_validate_rejects_non_string_elements():
 def test_validate_dependencies_accepts_legal_combinations():
     """§3.3 implication (frozen): post-actions ∈ satisfied ⇒ boundary ∈
     satisfied. Every combination consistent with that implication passes
-    construction: the full ten-ID set (post∈∧boundary∈), the transitional
+    construction: the full universe set (post∈∧boundary∈), the transitional
     default (post∉, boundary either), both-out, the 4.0.0-era subsets, and
     the empty set."""
     legal_sets = [
@@ -376,8 +395,9 @@ def test_ready_true_only_when_all_ten_satisfied():
 
 
 def test_ready_derivation_exhaustive_all_subsets():
-    """Both directions of the frozen formula, exhausted over all 2^10
-    subsets of U (payload-level: the wire `ready` equals the subset
+    """Both directions of the frozen formula, exhausted over all 2^N
+    subsets of U (N = |REQUIRED|; 2^11 since the 4.11.0 Phase A eleventh
+    ID — payload-level: the wire `ready` equals the subset
     judgement for every LEGAL satisfied set; ⑦-violating subsets are
     refused at construction — they never reach a payload)."""
     universe = readiness.REQUIRED
@@ -410,8 +430,9 @@ def test_ready_explicit_required_argument():
 
 
 def test_readiness_payload_shape_current_state():
-    """Activated wire shape (revision-2 close-out): required = satisfied =
-    the full ten-ID normalized universe, ready = True (derived)."""
+    """Activated wire shape (revision-2 close-out, 4.11.0 extension):
+    required = satisfied = the full normalized universe (eleven IDs),
+    ready = True (derived)."""
     payload = readiness.readiness_payload()
     assert list(payload.keys()) == ["ready", "required", "satisfied"]
     assert payload["ready"] is True

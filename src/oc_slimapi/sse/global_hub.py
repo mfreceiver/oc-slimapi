@@ -73,6 +73,15 @@ _DROPPED_TYPES_MAX = 256
 # this into a log flood).
 _DROPPED_LOG_INTERVAL_SECONDS = 60.0
 
+# 4.11.0 Phase A / A3 (P4): process-wide monotonic counter for the digest
+# ``messagesRevision`` field. Bumped by every RELEVANT message event
+# (message.updated / message.appended / message.removed) — nothing else.
+# Lifecycle = the process: initial 0, zeroed only by a restart (clients must
+# not compare revisions across processes); upstream resync does NOT reset it.
+# Independent of subscribers: the bump happens in publish() regardless of
+# fan-out, so the value is observable on the next subscribed digest.
+_message_revision_seq: int = 0
+
 
 class GlobalHub:
     """One process-wide upstream subscription fanning out curated frames."""
@@ -889,6 +898,14 @@ class GlobalHub:
             # ensures strict monotonicity within the debounce window.
             # lite-v2-dev (🟠-2): now per-session cross-debounce monotonic.
             self._bump_updated_at(session_id, entry)
+            # 4.11.0 Phase A / A3: relevant message event → bump the
+            # process-wide revision and stamp the window. Overwrite (not
+            # max/first) so a multi-event debounce window flushes the
+            # WINDOW-END value. Frozen at ingest, mirroring the turn-fence
+            # stamping discipline.
+            global _message_revision_seq
+            _message_revision_seq += 1
+            entry.messages_revision = _message_revision_seq
             return
 
         # G1: session.error — immediate digest (with sid) or session.error frame (session-less).
@@ -1059,6 +1076,20 @@ class GlobalHub:
                     # replay.
                     if self._token_hub is not None:
                         self._token_hub.on_message_removed(psid, pmid)
+                    # 4.11.0 Phase A / A3: message.removed is a relevant
+                    # event — the bump is deliberately LAST in this branch's
+                    # semantic sequence (retired-gate write → cap/TTL prune
+                    # → token hub → bump) so the gate/prune/tombstone work
+                    # above completes first. A removal does not fabricate a
+                    # digest entry by itself; an already-pending entry for
+                    # this sid is stamped with the post-removal window-end
+                    # value. (Single `global` declaration lives in the
+                    # MESSAGE_EVENTS branch above — a second one after any
+                    # use is a SyntaxError.)
+                    _message_revision_seq += 1
+                    entry = self.pending.get(psid)
+                    if entry is not None:
+                        entry.messages_revision = _message_revision_seq
                 return
             # message.part.delta, OR message.part.updated with a missing
             # / malformed ``part`` dict → original Stage-A token-hub route

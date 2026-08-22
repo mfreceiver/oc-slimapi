@@ -35,16 +35,17 @@ from oc_slimapi.transform import TransformConfig, TransformPool
 
 IDENTITY = {"Accept-Encoding": "identity"}
 
-# --- 基线（2026-08-18 固化；--capture 再生成） -------------------------------
+# --- 基线（2026-08-18 固化；--capture 再生成；4.11.0 Phase A/A1 更新） --------
 # Revision-2 ACTIVATED state (integration close-out): readiness
-# {ready:true, required = satisfied = ten-ID normalized universe (incl.
-# session.post-actions.v4)} + the §14 expand block follow the four static
-# keys on the "4" face. 2026-08-21 narrowing (intentional wire change,
-# v4-contract §0.3 revision): the "3" face key is GONE and available
-# collapsed to [4]. Regenerate:
+# {ready:true, required = satisfied = normalized universe} + the §14 expand
+# block follow the four static keys on the "4" face. 2026-08-21 narrowing
+# (intentional wire change, v4-contract §0.3 revision): the "3" face key is
+# GONE and available collapsed to [4]. 4.11.0 Phase A / A1 (P3): the
+# universe grows additively 10 → 11 IDs (sessions.details.v4 appended —
+# byte-order last). Regenerate:
 #   .venv/bin/python tests/test_v3_rawbody_regression.py --capture
 BASELINE_VERSIONS_BODY = (
-    b'{"current":4,"available":[4],"capabilities":{"4":{"globalSessions":true,"auxiliaryFilters":true,"sseReplay":true,"qpImmediateFull":true,"readiness":{"ready":true,"required":["events.global.replay.v4","events.token.replay.v4","messages.expand.v4","method.boundary.v4","providers.redacted.v4","representation.vary.v4","selector.v4","session.list.global.v4","session.post-actions.v4","session.single.projection.v4"],"satisfied":["events.global.replay.v4","events.token.replay.v4","messages.expand.v4","method.boundary.v4","providers.redacted.v4","representation.vary.v4","selector.v4","session.list.global.v4","session.post-actions.v4","session.single.projection.v4"]},"expand":{"categories":["info_summary_diffs","part_text","part_reasoning","part_state_output","part_state_error","part_state_input_full","part_state_metadata_full","part_state_attachments","part_url","part_source","part_snapshot","compaction_full"],"fragmentMaxBytes":8388608}}},"sidecarVersion":"<SIDECAR_VERSION>"}'
+    b'{"current":4,"available":[4],"capabilities":{"4":{"globalSessions":true,"auxiliaryFilters":true,"sseReplay":true,"qpImmediateFull":true,"readiness":{"ready":true,"required":["events.global.replay.v4","events.token.replay.v4","messages.expand.v4","method.boundary.v4","providers.redacted.v4","representation.vary.v4","selector.v4","session.list.global.v4","session.post-actions.v4","session.single.projection.v4","sessions.details.v4"],"satisfied":["events.global.replay.v4","events.token.replay.v4","messages.expand.v4","method.boundary.v4","providers.redacted.v4","representation.vary.v4","selector.v4","session.list.global.v4","session.post-actions.v4","session.single.projection.v4","sessions.details.v4"]},"expand":{"categories":["info_summary_diffs","part_text","part_reasoning","part_state_output","part_state_error","part_state_input_full","part_state_metadata_full","part_state_attachments","part_url","part_source","part_snapshot","compaction_full"],"fragmentMaxBytes":8388608}}},"sidecarVersion":"<SIDECAR_VERSION>"}'
 )
 # ------------------------------------------------------------------------
 

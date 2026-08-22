@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import math
 import re
+from dataclasses import dataclass
+from hashlib import sha256
 from urllib.parse import urlparse
 
 import orjson
@@ -22,6 +24,7 @@ from ...gzip_util import compress_if_beneficial, error_response
 # teardown; D5 (2026-08-22) then made the §14 href face a constant 4 — see
 # ``_expand_wire_view`` below.)
 from ...skeleton import SkeletonLimits, skeleton_messages
+from ...since_cache import CacheEntry, CommitResult, ObservedSnapshot, SinceCache
 from ...transform import TransformBusy, read_with_cap
 from ...upstream import forward_directory_headers
 from ...upstream_errors import raise_upstream_unavailable
@@ -387,6 +390,263 @@ def _messages_list_key(
     )
 
 
+def _since_cq_hash(limit: int, directory: str | None, mode: str | None) -> str:
+    """Canonical query identity frozen by Phase B §3.2/§3.3."""
+    effective_directory = directory or ""
+    normalized_mode = "merged" if mode == "merged" else "baseline"
+    return f"v1:{limit}:{effective_directory}:{normalized_mode}"
+
+
+def _invalid_since_params() -> None:
+    from ...errors import CodedHTTPException
+
+    raise CodedHTTPException(400, code="invalid_params")
+
+
+@dataclass(frozen=True)
+class _SinceRequest:
+    cache: SinceCache | None
+    key: tuple[str, str] | None
+    observed: ObservedSnapshot | None
+    baseline: CacheEntry | None
+    since: str | None
+    before_present: bool
+
+    @property
+    def requested(self) -> bool:
+        return self.since is not None
+
+    @property
+    def needs_artifact(self) -> bool:
+        return self.requested or (
+            self.cache is not None
+            and self.cache.enabled
+            and not self.before_present
+        )
+
+
+def _since_request_state(
+    request: Request,
+    sid: str,
+    directory: str | None,
+    limit: int,
+    before: str | None,
+    mode: str | None,
+    since: str | None,
+) -> _SinceRequest:
+    """Validate since/before multiplicity and capture the CAS lineage."""
+    since_values = request.query_params.getlist("since")
+    before_values = request.query_params.getlist("before")
+    if len(since_values) > 1 or len(before_values) > 1:
+        _invalid_since_params()
+    if since_values:
+        since = since_values[0]
+    before_present = bool(before_values) or before is not None
+    if since is not None and before_present:
+        _invalid_since_params()
+
+    cache = getattr(request.app.state, "since_cache", None)
+    if since is not None and not isinstance(cache, SinceCache):
+        _invalid_since_params()
+    if cache is None:
+        return _SinceRequest(None, None, None, None, since, before_present)
+
+    cq_hash = _since_cq_hash(limit, directory, mode)
+    key = (sid, cq_hash)
+    # observed_snapshot is deliberately captured for every no-before request,
+    # including a request without since, and before any upstream await.
+    observed = None if before_present else cache.observe(key)
+    baseline = None
+    if since is not None:
+        check = cache.check_token(since, sid=sid, cq_hash=cq_hash)
+        # v6.1 adjudication (2026-08-22): ``invalid`` (400) covers only
+        # syntax/shape/version/length errors and a sid mismatch.  A cq_hash
+        # mismatch (limit/directory/mode axis change) classifies as ``reset``
+        # — the request falls through with no baseline, so the response is
+        # the full projection and commit() issues a fresh nextSince token.
+        if check.kind == "invalid":
+            _invalid_since_params()
+        if (
+            check.kind == "valid"
+            and observed is not None
+            and observed.entry is not None
+            and observed.generation == check.generation
+        ):
+            baseline = observed.entry
+    return _SinceRequest(cache, key, observed, baseline, since, before_present)
+
+
+@dataclass(frozen=True)
+class _ProjectionArtifact:
+    array_bytes: bytes
+    canonical_items: bytes
+    changed_bytes: bytes
+    fingerprints: dict[str, str]
+    changed: list[dict]
+    removed: list[str]
+    cacheable: bool
+
+
+def _message_id(item: dict) -> str | None:
+    info = item.get("info")
+    mid = info.get("id") if isinstance(info, dict) else None
+    return mid if isinstance(mid, str) and mid else None
+
+
+def _boundary_key(item: dict, mid: str | None) -> tuple[int | float, str] | None:
+    if mid is None:
+        return None
+    return (_created_sort_key(item), mid)
+
+
+def _artifact_from_array_bytes(
+    array_bytes: bytes,
+    *,
+    baseline: CacheEntry | None,
+    next_cursor: str | None,
+    before_present: bool,
+) -> _ProjectionArtifact:
+    """Build canonical cache material and the since diff in a worker."""
+    items = orjson.loads(array_bytes)
+    if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
+        raise ValueError("projected message body is not a list of objects")
+
+    fingerprints: dict[str, str] = {}
+    fresh_mids: set[str] = set()
+    cacheable = True
+    for item in items:
+        canonical_item = orjson.dumps(item, option=orjson.OPT_SORT_KEYS)
+        mid = _message_id(item)
+        if mid is None or mid in fingerprints:
+            cacheable = False
+            continue
+        fresh_mids.add(mid)
+        fingerprints[mid] = sha256(canonical_item).hexdigest()
+    canonical_items = orjson.dumps(items, option=orjson.OPT_SORT_KEYS)
+
+    changed = list(items)
+    removed: list[str] = []
+    if baseline is not None:
+        changed = [
+            item for item in items
+            if (
+                _message_id(item) is None
+                or _message_id(item) not in baseline.fingerprints
+                or fingerprints.get(_message_id(item))
+                != baseline.fingerprints.get(_message_id(item))
+            )
+        ]
+        fresh_oldest = items[0] if items else None
+        fresh_oldest_key = _boundary_key(fresh_oldest, _message_id(fresh_oldest)) if fresh_oldest else None
+        window_exhausted = not before_present and next_cursor is None
+        baseline_items = orjson.loads(baseline.canonical_items)
+        baseline_by_mid = {
+            _message_id(item): item
+            for item in baseline_items
+            if isinstance(item, dict) and _message_id(item) is not None
+        }
+        for mid in baseline.fingerprints:
+            if mid in fresh_mids:
+                continue
+            newer = False
+            if not window_exhausted and fresh_oldest_key is not None:
+                old_key = _boundary_key(baseline_by_mid.get(mid, {}), mid)
+                newer = old_key is not None and old_key > fresh_oldest_key
+            if window_exhausted or newer:
+                removed.append(mid)
+
+    return _ProjectionArtifact(
+        array_bytes=array_bytes,
+        canonical_items=canonical_items,
+        changed_bytes=orjson.dumps(changed),
+        fingerprints=fingerprints,
+        changed=changed,
+        removed=removed,
+        cacheable=cacheable,
+    )
+
+
+def _project_list_artifact(
+    body: bytes,
+    *,
+    accept_encoding: str | None,
+    limits: SkeletonLimits,
+    sid: str | None,
+    wire_view: int,
+    baseline: CacheEntry | None,
+    next_cursor: str | None,
+    before_present: bool,
+) -> _ProjectionArtifact:
+    """Existing projection seam plus cache/diff admission work."""
+    array_bytes = _project_list_sorted_and_pack(
+        body, accept_encoding=accept_encoding, limits=limits,
+        sid=sid, wire_view=wire_view,
+    )
+    return _artifact_from_array_bytes(
+        array_bytes, baseline=baseline, next_cursor=next_cursor,
+        before_present=before_present,
+    )
+
+
+_ENVELOPE_MISSING = object()
+
+
+def _messages_envelope_with_since(
+    items_bytes: bytes,
+    next_cursor: str | None,
+    *,
+    removed: list[str] | object = _ENVELOPE_MISSING,
+    next_since: str | object = _ENVELOPE_MISSING,
+) -> bytes:
+    """Append Phase B fields without changing the existing envelope helper."""
+    identity = messages_envelope_bytes(items_bytes, next_cursor)
+    extras: list[bytes] = []
+    if removed is not _ENVELOPE_MISSING:
+        extras.append(b'"removed":' + orjson.dumps(removed))
+    if next_since is not _ENVELOPE_MISSING:
+        extras.append(b'"nextSince":' + orjson.dumps(next_since))
+    if not extras:
+        return identity
+    return identity[:-1] + b"," + b",".join(extras) + b"}"
+
+
+def _publish_since(
+    state: _SinceRequest,
+    artifact: _ProjectionArtifact | None,
+) -> CommitResult | None:
+    if (
+        state.cache is None
+        or state.key is None
+        or state.observed is None
+        or artifact is None
+    ):
+        return None
+    return state.cache.commit(
+        state.key,
+        state.observed,
+        artifact.canonical_items,
+        artifact.fingerprints,
+        cacheable=artifact.cacheable,
+    )
+
+
+def _next_since_for(
+    state: _SinceRequest,
+    result: CommitResult | None,
+) -> str | None:
+    if (
+        state.cache is None
+        or result is None
+        or result.entry is None
+        or result.omitted
+        or state.key is None
+        or state.before_present
+    ):
+        return None
+    sid, cq_hash = state.key
+    return state.cache.issue_token(sid, cq_hash, result.entry.generation)
+
+
 async def _fetch_list_raw(
     request: Request, sid: str, params: dict, directory: str | None,
     *, cap: int,
@@ -415,6 +675,7 @@ async def _messages_via_lease(
     request: Request, registry, pool, config, sid: str,
     directory: str | None, params: dict,
     limit: int, before: str | None, mode: str | None,
+    since_state: _SinceRequest,
     *, merged_mode: bool,
 ) -> Response | None:
     """Join-first lease path (plan §3.x): fetch the raw list body through
@@ -460,6 +721,7 @@ async def _messages_via_lease(
         wire_view = _expand_wire_view(request.scope)
         projected: list[dict] | None = None
         identity: bytes | None = None
+        artifact: _ProjectionArtifact | None = None
         try:
             # The caller's own admission + offload — the same
             # admission-before-projection discipline (and the same
@@ -473,12 +735,24 @@ async def _messages_via_lease(
                             sid=sid, wire_view=wire_view,
                         )
                     else:
-                        identity = await pool.offload(
-                            _project_list_sorted_and_pack, body,
-                            accept_encoding=accept_encoding,
-                            limits=limits, sid=sid,
-                            wire_view=wire_view,
-                        )
+                        if since_state.needs_artifact:
+                            artifact = await pool.offload(
+                                _project_list_artifact, body,
+                                accept_encoding=accept_encoding,
+                                limits=limits, sid=sid,
+                                wire_view=wire_view,
+                                baseline=since_state.baseline,
+                                next_cursor=next_cursor,
+                                before_present=since_state.before_present,
+                            )
+                            identity = artifact.array_bytes
+                        else:
+                            identity = await pool.offload(
+                                _project_list_sorted_and_pack, body,
+                                accept_encoding=accept_encoding,
+                                limits=limits, sid=sid,
+                                wire_view=wire_view,
+                            )
                 except (orjson.JSONDecodeError, ValueError, TypeError, AttributeError) as exc:
                     raise_upstream_unavailable(exc)
             if projected is not None:
@@ -490,12 +764,39 @@ async def _messages_via_lease(
                     accept_encoding=accept_encoding,
                     fingerprint=config.message_fingerprint_enabled,
                 )
+            if since_state.needs_artifact and artifact is None:
+                async with pool:
+                    artifact = await pool.offload(
+                        _artifact_from_array_bytes, identity,
+                        baseline=since_state.baseline,
+                        next_cursor=next_cursor,
+                        before_present=since_state.before_present,
+                    )
+            result = _publish_since(since_state, artifact)
+            response_items = (
+                artifact.changed_bytes
+                if since_state.requested and artifact is not None
+                else identity
+            )
+            next_since = _next_since_for(since_state, result)
             # §4.1 terminal (v3-only): the packed bare array is spliced
             # into the envelope verbatim BEFORE any validator work — the
             # envelope bytes ARE the canonical ETag input (§6.3). The
             # X-Next-Cursor header is retired (§1): the client reads
             # ``nextCursor`` from the cached envelope (§6.4).
-            identity = messages_envelope_bytes(identity, next_cursor)
+            identity = _messages_envelope_with_since(
+                response_items, next_cursor,
+                # Gate-MAJOR-1 (§10.3 freeze): ``removed`` appears ONLY on a
+                # genuine diff response — i.e. this request carried a since
+                # AND resolved a valid diff baseline. Every reset family
+                # (cq_hash/epoch mismatch, miss, LRU eviction) runs with
+                # baseline=None, so the key must stay ABSENT there, not
+                # ``[]``.
+                removed=(artifact.removed if artifact is not None else [])
+                if since_state.requested and since_state.baseline is not None
+                else _ENVELOPE_MISSING,
+                next_since=next_since if next_since is not None else _ENVELOPE_MISSING,
+            )
             base_headers: dict[str, str] = {"Cache-Control": "no-store"}
             # Batch 2 / B1-1R (rev-5): coding-specific SINGLE-candidate 304
             # judgment, pre-compression (plan §4 :222-229 — a validator hit
@@ -552,6 +853,7 @@ async def messages(
     before: str | None = None,
     directory: str | None = None,
     mode: str | None = None,
+    since: str | None = Query(None),
 ):
     """Skeleton projection of upstream opencode's message listing.
 
@@ -576,6 +878,9 @@ async def messages(
     ``_project_list_sorted_and_pack``.
     """
     directory = await _resolve_messages_directory(request, directory)
+    since_state = _since_request_state(
+        request, sid, directory, limit, before, mode, since,
+    )
     params = {"limit": limit}
     if before:
         # `before` is opencode's opaque base64url pagination cursor (a
@@ -594,12 +899,14 @@ async def messages(
     if registry is not None and config.coalesce_enabled:
         leased = await _messages_via_lease(
             request, registry, pool, config, sid, directory, params,
-            limit, before, mode, merged_mode=merged_mode,
+            limit, before, mode, since_state, merged_mode=merged_mode,
         )
         if leased is not None:
             return leased
     projected: list[dict] | None = None
     identity: bytes | None = None
+    artifact: _ProjectionArtifact | None = None
+    next_cursor: str | None = None
     try:
         # Admission BEFORE the upstream GET: this is the key fix. The prior
         # code buffered the entire upstream body and only then tried to
@@ -609,7 +916,6 @@ async def messages(
             response = await _stream_upstream(
                 request, f"/session/{sid}/message", params, directory,
             )
-            next_cursor: str | None = None
             try:
                 # Shared drain-or-cap-read skeleton (status mapping with sid +
                 # read_with_cap + mid-stream RequestError → 503).
@@ -660,16 +966,27 @@ async def messages(
                             sid=sid, wire_view=wire_view,
                         )
                     else:
-                        identity = await pool.offload(
-                            _project_list_sorted_and_pack, body,
-                            accept_encoding=request.headers.get("accept-encoding"),
-                            limits=SkeletonLimits(
-                                field_bytes=config.skeleton_inline_output_max_bytes,
-                                message_bytes=config.skeleton_inline_output_max_message_bytes,
-                                fingerprint=config.message_fingerprint_enabled,
-                            ),
-                            sid=sid, wire_view=wire_view,
+                        limits = SkeletonLimits(
+                            field_bytes=config.skeleton_inline_output_max_bytes,
+                            message_bytes=config.skeleton_inline_output_max_message_bytes,
+                            fingerprint=config.message_fingerprint_enabled,
                         )
+                        if since_state.needs_artifact:
+                            artifact = await pool.offload(
+                                _project_list_artifact, body,
+                                accept_encoding=request.headers.get("accept-encoding"),
+                                limits=limits, sid=sid, wire_view=wire_view,
+                                baseline=since_state.baseline,
+                                next_cursor=next_cursor,
+                                before_present=since_state.before_present,
+                            )
+                            identity = artifact.array_bytes
+                        else:
+                            identity = await pool.offload(
+                                _project_list_sorted_and_pack, body,
+                                accept_encoding=request.headers.get("accept-encoding"),
+                                limits=limits, sid=sid, wire_view=wire_view,
+                            )
                 except (orjson.JSONDecodeError, ValueError, TypeError, AttributeError) as exc:
                     raise_upstream_unavailable(exc)
             finally:
@@ -682,11 +999,36 @@ async def messages(
                 accept_encoding=request.headers.get("accept-encoding"),
                 fingerprint=config.message_fingerprint_enabled,
             )
+        if since_state.needs_artifact and artifact is None:
+            async with pool:
+                artifact = await pool.offload(
+                    _artifact_from_array_bytes, identity,
+                    baseline=since_state.baseline,
+                    next_cursor=next_cursor,
+                    before_present=since_state.before_present,
+                )
+        result = _publish_since(since_state, artifact)
+        response_items = (
+            artifact.changed_bytes
+            if since_state.requested and artifact is not None
+            else identity
+        )
+        next_since = _next_since_for(since_state, result)
         # §4.1 terminal (v3-only — same tail as the lease path above):
         # envelope splice before validator work; X-Next-Cursor retired
         # (§1) — the client reads ``nextCursor`` from the cached envelope
         # (§6.4).
-        identity = messages_envelope_bytes(identity, next_cursor)
+        identity = _messages_envelope_with_since(
+            response_items, next_cursor,
+            # Gate-MAJOR-1 (§10.3 freeze, same as the lease tail): the
+            # ``removed`` key exists only on a genuine diff response — a
+            # since request that resolved a valid baseline. Reset families
+            # run with baseline=None and must NOT carry the key.
+            removed=(artifact.removed if artifact is not None else [])
+            if since_state.requested and since_state.baseline is not None
+            else _ENVELOPE_MISSING,
+            next_since=next_since if next_since is not None else _ENVELOPE_MISSING,
+        )
         base_headers: dict[str, str] = {"Cache-Control": "no-store"}
         # Batch 2 / B1-1R (rev-5, same tail as the lease path): coding-
         # specific SINGLE-candidate pre-compression judgment (identity-only
