@@ -966,6 +966,71 @@ envelope.degraded == (任一 item.degraded == true) ∨ (本响应采用 native 
 
 ---
 
+## §18 POST /slimapi/sessions/details（批量 session 详情）[2026-08-22 新增；4.10.0]
+
+> **动机**：oc-webui 逐 session 轮询 `GET /slimapi/session/{sid}`（12h 观测 6.2k 次）；一次 POST 拿多个 session 的 skeleton 详情。纯加性（v4-only 窗口内的 minor），客户端必改点：**无**。
+
+### 18.1 请求
+
+`POST /slimapi/sessions/details?v=4`，body：`{"sids": ["ses_...", ...]}`。
+
+- `sids` **缺失** / body **非 JSON 对象** / `sids` **非字符串数组** / **空数组** / **含非字符串元素** / **含非法字符的 sid** / malformed JSON / 超请求体 raw cap（256 KiB）→ 400 `invalid_body`；
+- **sid 字符集白名单**（rev 8.8 整改 MAJOR-1 引入；rev 8.9 MAJOR-2 裁定依据修正）：每个 sid 必须匹配 `^[A-Za-z0-9_-]{1,128}$`，不匹配 → 400 `invalid_body`（hint 说明字符集约束）。**这是 sidecar 显式产品裁定，不是上游 schema 推论**——上游 `packages/schema/src/session-id.ts` 实际接受任意 `ses` 前缀字符串（自定义/历史/迁移 ID 可宽于本模式）；本端点有意收窄到生成器产物域（`ses_` + 26 位：12 小写 hex + 14 base62，`schema/identifier.ts`；fixture / DB 内 sid 同落该模式），收窄理由：① 输入域严格窄于 §13 单查——单查 sid 是**路径参数**，Starlette `{sid}` 仅结构性排除 `/`（点号/冒号/Unicode/超长值仍可达单查，`?`/`#` 不达路由），本白名单把批量 body 输入收窄到生成器产物域（比单查 de facto 域更严，非等价）；② 拒绝 `/`、`?`、`#`（拼上游 URL 时会被重解释为路径/query/fragment）与控制字符（上游 `build_request` 抛 `InvalidURL` → 裸 500 面）；③ 已知消费方（ocdroid / oc-webui）只出现生成器形态。若未来需要 schema 完整域，属加性契约修订（放宽白名单 + URL 编码处理），可逆。非法输入在**入口**拒绝 → dbaux / native 两路径语义天然一致；
+- `sids` **去重后 > 50** → 400 `too_many_sids`（去重先于计数：60 个原始 sid 含 10 重复 = 50 唯一 → 合法）；
+- **重复 sid 静默去重**；响应 `sessions` item 顺序 = 请求（首现）顺序，`missing` 同序；
+- `?directory=`：**tolerant-ignore**（读后丢弃，不校验不转发——B4 惯例，同 §13.4）；`X-Opencode-Directory` 头同样忽略，**无冲突检查**；
+- `?v=` selector 语义同全局面（v4-only 窗口，缺 `?v=4` → 400 `unsupported_version`）。
+
+### 18.2 响应 200
+
+```json
+{"sessions": [<SessionSkeletonV4>, ...], "missing": ["ses_...", ...]}
+```
+
+- `sessions`：查到的 sid 的 **§13 同一 canonical projector**（`canonical_session_skeleton_v4`）产出项，按请求顺序重排（`dict` by sid 映射）；
+- `missing`：未查到的 sid（按请求顺序）；**全 404 合法**（`sessions: []`）；
+- 头：`Cache-Control: no-store`；gzip 协商 + `Vary: Accept-Encoding` 走 `json_response` 全局惯例。
+
+### 18.3 两级路径（同 §13.4 哲学）
+
+| # | 条件 | 行为 |
+|---|---|---|
+| A | dbaux available | **点查优先**：`WHERE s.id IN (?,?,...)` 动态占位符（参数化，无注入），SQL 形状同 §13 `_SESSION_SINGLE_SQL`（SELECT/JOIN 不变）；**不施加 allowlist**（点查先例：sid 已知即放行，allowlist 只管 §4 列表发现面）。逐 record 过 canonical projector（`degraded:false`） |
+| B | dbaux 不可用 / 竞态禁用（`AuxiliaryUnavailableError`） | **native fan-out 回退**：对每个 sid 上游 `GET /session/{sid}`（不带 directory，有界并发 8），**单次** transform-pool offload 解析+投影全批成功响应；item 恒 `degraded:true`（`fallback=True`，native 来源不可全信）。池满 → 503 `transform_busy` + `Retry-After: 2`（admission 先于 fan-out，零上游 IO）。**受控收束**（rev 8.8 整改，MAJOR-2）：任一 fan-out 任务异常时先同步 cancel 全部 sibling 任务并 await 收尾完毕才向上传播——无孤儿上游 IO |
+
+### 18.4 降级矩阵
+
+| dbaux | native 上游 | 结果 |
+|---|---|---|
+| 可用，全部可表示 | ——（零上游 IO） | canonical items（`degraded:false`） |
+| 可用，任一 record 不可表示（projector None / 行被 `rows_to_records` 跳过） | —— | **503 fail-closed**（不得把存在的 session 误报进 `missing`） |
+| 可用，`sqlite3.Error` | —— | **503 fail-closed**（§4 BLOCKER-1 同规：不回退 native） |
+| 不可用/竞态 | 全部 200 | degraded items（恒 `degraded:true`）+ per-sid 404 → `missing` |
+| 不可用/竞态 | 任一 非-404 4xx / 5xx / 网络错 / body 超 cap / malformed | **503 fail-closed**（不混装部分数据） |
+| 不可用/竞态 | 404 + body 超 cap | **503 fail-closed**（rev 8.8 整改，MAJOR-3：cap 超限优先于状态码语义——404 超体绝不误判 `missing`；404 + 正常体仍 → `missing`） |
+
+### 18.5 错误码表
+
+| 状态 | `code` | 触发 |
+|---|---|---|
+| 400 | `invalid_body` | §18.1 全部 malformed 输入族（新 code，加性） |
+| 400 | `too_many_sids` | 去重后 >50（新 code，加性） |
+| 400 | `unsupported_version` | `?v=` selector 全局面（非本端点新增） |
+| 503 | `upstream_unavailable` | native 路径：非-404 4xx / 5xx / 网络错（**含连接建立后流式读取期 mid-stream 网络错**——`read_with_cap` 契约下原样上抛，路由层映射，rev 8.9 整改）/ body 超 cap（**含 404 超体**，cap 优先于状态码语义）/ malformed |
+| 503 | `auxiliary_unavailable` | dbaux 不可表示（§13.2a/§13.2c 同判）/ `sqlite3.Error` / native item 不可表示（§13.2a） |
+| 503 | `transform_busy` | 池满（`Retry-After: 2`） |
+
+### 18.6 与 §13 单查的关系及 4xx 透传差异
+
+- **同一 canonical projector**：本端点是 §13 单查（`GET /slimapi/session/{sid}`）的**读扇出聚合**，item 形状 = §13.2 `SessionSkeletonV4` 逐字段一致，无新字段。
+- **4xx 处理差异（显式冻结）**：§13 单查对上游非-404 4xx **逐字透传**；本端点对任一非-404 4xx **整响应 503 `upstream_unavailable`**。理由：批量响应无 per-sid 透传面（混装「部分 200 + 部分 4xx 原文」会破坏 `{sessions, missing}` 二分结构且客户端无法归因）；fail-closed 与 §10 降级哲学一致（宁可整批重试，不混装部分数据）。
+
+### 18.7 与 §17 non-goal 的边界声明
+
+§17 冻结的 **cascade 编排层** non-goal 针对**写侧**（delete/archive 的级联编排、部分失败可见性）；本端点是**读侧扇出聚合**（多 sid 只读点查/fan-out，无编排状态、无部分失败语义——任一失败整响应 503）。先例：`/slimapi/sessions/status`（§3.y）亦是读聚合。二者不相交，§17 不因本节松动。
+
+---
+
 ## 附：与设计文档的对应
 
 | 契约节 | 设计权威 |

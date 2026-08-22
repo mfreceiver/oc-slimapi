@@ -26,6 +26,12 @@ ocdroid 对接时：
 
 ---
 
+## [4.10.0] - 2026-08-22 — 批量 session 详情端点（v4 §18；加性 minor，wire 版本不变仍 (4,4)）
+
+### Added
+
+- **`POST /slimapi/sessions/details?v=4` 批量 session 详情（v4-contract §18；纯加性，客户端必改点：无）**：body `{"sids":["ses_…",…]}`（重复 sid 静默去重、保首现序；去重后 ≤50，>50 → 400 `too_many_sids`；`sids` 缺失/非 JSON 对象/非字符串数组/空数组/含非字符串元素/含非法字符的 sid（字符集白名单 `^[A-Za-z0-9_-]{1,128}$`——sidecar 显式产品裁定（rev 8.9 裁定修正：非上游 schema 推论；上游 schema 实际接受任意 `ses` 前缀串），有意收窄到生成器产物域，严格窄于 §13 单查路径参数的 de facto 输入域（Starlette `{sid}` 仅结构性排除 `/`）；拒绝会在拼上游 URL 时被重解释的 `/`/`?`/`#` 与控制字符，hint 说明约束）/malformed JSON/请求体 raw body 超过 256 KiB → 400 `invalid_body`）。响应 200 `{"sessions":[<SessionSkeletonV4>…],"missing":["ses_…"]}`——item 形状与 `GET /slimapi/session/{sid}`（§13）**同一 canonical projector** 逐字段一致；`sessions`/`missing` 顺序 = 请求（去重后）顺序；`Cache-Control: no-store` + gzip/Vary 惯例。动机：oc-webui 逐 session 轮询单查（12h 观测 6.2k 次）→ 一次 POST 批量拉取。两级路径（同 §13 降级哲学）：dbaux 点查优先（canonical items `degraded:false`，零上游 IO）；不可用/竞态禁用 → native fan-out 回退（逐 sid 上游单查、有界并发、异常路径受控收束（cancel + await 全部 sibling）、单次 transform offload 批投影，item 恒 `degraded:true`；池满 → 503 `transform_busy` + `Retry-After: 2`）。任一 item 不可表示 / `sqlite3.Error` / native 路径非-404 4xx、5xx、网络错（含连接建立后流式读取期 mid-stream 网络错）、body 超 cap（**含 404 超体**——cap 优先于状态码语义，绝不误判 `missing`）、malformed → **整响应 503 fail-closed**（不混装部分数据；批量无 per-sid 4xx 透传面——与 §13 单查的 4xx 逐字透传不同，差异与理由见 §18.6）。`?directory=` 与 `X-Opencode-Directory` 头均 tolerant-ignore（B4 惯例：不校验不转发，无冲突检查）。
+
 ## [4.8.0] - 2026-08-21 — 版本窗收窄 + v3 退役（owner 2026-08-21 裁定：major 只跟协议大版本走，收窄发 minor；wire (3,4)→(4,4) v4-only；含 provider error 结构化字段）
 
 ### Changed

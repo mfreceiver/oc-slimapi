@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import re
 import sqlite3
 
 import httpx
@@ -9,9 +11,12 @@ from starlette.responses import Response
 
 from ..dbaux import (
     AuxiliaryUnavailableError,
+    PROJECT_JOIN_COLUMNS,
+    SESSION_PROJECTION_COLUMNS,
     fetch_sessions_page,
     has_wildcard,
     normalized_search,
+    rows_to_records,
 )
 from ..dbaux.cursor import (
     InvalidCursorError,
@@ -26,7 +31,11 @@ from ..errors import CodedHTTPException
 from .. import etag as etag_mod
 from .. import readiness as readiness_mod
 from ..gzip_util import accepts_gzip, json_response
-from ..selector import resolve_route_directory
+from ..selector import (
+    DIRECTORY_QUERY_PARAM,
+    _strip_query_keys,
+    resolve_route_directory,
+)
 from ..skeleton import (
     canonical_session_skeleton_v4,
     native_session_to_record,
@@ -36,7 +45,7 @@ from ..traffic import stash_up_in
 from ..transform import TransformBusy, read_with_cap
 from ..upstream import forward_directory_headers
 from ..upstream_errors import raise_upstream_status, raise_upstream_unavailable
-from ._catalog_common import busy_response, read_upstream_response
+from ._catalog_common import busy_response, read_upstream_response, stream_upstream
 
 router = APIRouter(prefix="/slimapi", tags=["sessions"])
 
@@ -656,6 +665,296 @@ async def sessions_status(request: Request, directory: str | None = None):
         payload,
         accept_encoding=request.headers.get("accept-encoding"),
     )
+
+
+# ---------------------------------------------------------------------------
+# POST /slimapi/sessions/details — batch session details
+# (v4-contract §18, [2026-08-22 新增；4.10.0])
+#
+# Motivation: oc-webui polled GET /slimapi/session/{sid} per session
+# (6.2k requests / 12h); one POST now returns skeletons for up to 50
+# sids. Same canonical projector as §13 (canonical_session_skeleton_v4).
+# This is a READ fan-out aggregate (like /slimapi/sessions/status) — it
+# does not touch the §17 write-side cascade non-goal.
+# ---------------------------------------------------------------------------
+
+#: 去重后 sid 上限（契约 §18 冻结：>50 → 400 too_many_sids）
+_MAX_BATCH_SIDS = 50
+
+#: native fan-out 有界并发。上游是 loopback；对齐聚合路由现有并发量级
+#: （questions fan-out 默认 8）。上限 50 项 → 每请求局部信号量足够，
+#: 不新增 config 面。
+_NATIVE_FANOUT_CONCURRENCY = 8
+
+#: 请求体 raw cap（actions.py 流式 body-read 惯例）：50 sid 的合法请求
+#: 远小于此；超限按 malformed 输入族 → 400 invalid_body。
+_BODY_CAP_BYTES = 256 * 1024
+
+
+def _session_batch_sql(sids: list[str]) -> str:
+    """同构 read_groups ``_SESSION_SINGLE_SQL`` 的点查形状，``WHERE s.id``
+    换 ``IN`` 动态占位符（占位符仅由 ``len(sids)`` 决定，值全部走参数
+    绑定，无注入面）。
+
+    不施加 allowlist —— 与 ``_SESSION_SINGLE_SQL`` 点查先例一致：sid
+    已知即放行（存在性由投影结果决定）；allowlist 只管列表发现面
+    ``fetch_sessions_page``。
+    """
+    columns = ", ".join(f"s.{c}" for c in SESSION_PROJECTION_COLUMNS)
+    joined = ", ".join(f"p.{c} AS p_{c}" for c in PROJECT_JOIN_COLUMNS)
+    placeholders = ", ".join("?" for _ in sids)
+    return (
+        f"SELECT {columns}, {joined}\n"
+        "FROM session s\n"
+        "LEFT JOIN project p ON s.project_id = p.id\n"
+        f"WHERE s.id IN ({placeholders})"
+    )
+
+
+def _batch_invalid_body(hint: str | None = None) -> CodedHTTPException:
+    if hint is not None:
+        return CodedHTTPException(400, code="invalid_body", hint=hint)
+    return CodedHTTPException(400, code="invalid_body")
+
+
+#: sid 白名单（rev 8.8 MAJOR-1；rev 8.9 MAJOR-2 裁定口径修正）：上游
+#: schema（session-id.ts）实际接受任意 ``ses`` 前缀串——本模式是 sidecar
+#: 显式产品裁定，有意收窄到生成器产物域（``ses_`` + 26 位：12 小写
+#: hex + 14 base62，identifier.ts），fixture / DB 内 sid 同落该模式。该
+#: 域严格窄于 §13 单查路径参数的 de facto 输入域（Starlette ``{sid}``
+#: 仅结构性排除 ``/``，点号/冒号/Unicode/超长仍可达）。拒绝 ``/``、
+#: ``?``、``#``（会在拼上游 URL 时被重解释为路径/query/fragment）与控
+#: 制字符（httpx ``build_request`` 抛 ``InvalidURL`` → 裸 500）——非法
+#: 输入在入口拒绝，dbaux / native 两路径语义天然一致。放宽属加性契约修
+#: 订（见 v4-contract §18.1）。
+_SID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_SID_CHARSET_HINT = "invalid sids entry: each sid must match ^[A-Za-z0-9_-]{1,128}$"
+
+
+async def _parse_batch_sids(request: Request) -> list[str]:
+    """读取 + 校验请求体 → 去重（保首现序）sid 列表（契约 §18 冻结面）。
+
+    ``sids`` 缺失 / 非 JSON 对象 / 非字符串数组 / 空数组 / 含非字符串
+    元素 / **含非法字符的 sid**（charset 白名单见 ``_SID_RE``）/ malformed
+    JSON / 超 raw cap → 400 ``invalid_body``；去重后 >50 → 400
+    ``too_many_sids``（去重先于计数）。
+    """
+    raw = bytearray()
+    async for chunk in request.stream():
+        raw += chunk
+        if len(raw) > _BODY_CAP_BYTES:
+            raise _batch_invalid_body()
+    try:
+        payload = orjson.loads(bytes(raw)) if raw else None
+    except orjson.JSONDecodeError as exc:
+        raise _batch_invalid_body() from exc
+    if not isinstance(payload, dict):
+        raise _batch_invalid_body()
+    sids = payload.get("sids")
+    if (
+        not isinstance(sids, list)
+        or not sids
+        or any(not isinstance(sid, str) for sid in sids)
+    ):
+        raise _batch_invalid_body()
+    if any(_SID_RE.fullmatch(sid) is None for sid in sids):
+        raise _batch_invalid_body(hint=_SID_CHARSET_HINT)
+    # 重复 sid 静默去重；响应 item 顺序 = 请求（首现）顺序
+    ordered = list(dict.fromkeys(sids))
+    if len(ordered) > _MAX_BATCH_SIDS:
+        raise CodedHTTPException(400, code="too_many_sids")
+    return ordered
+
+
+def _respond_batch(
+    request: Request, sids: list[str], found: dict[str, dict]
+) -> Response:
+    sessions = [found[sid] for sid in sids if sid in found]
+    missing = [sid for sid in sids if sid not in found]
+    return json_response(
+        {"sessions": sessions, "missing": missing},
+        accept_encoding=request.headers.get("accept-encoding"),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+def _project_dbaux_batch(
+    request: Request, rows: list, sids: list[str]
+) -> dict[str, dict]:
+    """rows → ``{sid: skeleton}``；任一不可表示 → 整响应 503。
+
+    §13.2a/§13.2c 同判（单查先例 ``_handle_session_single_v4`` 的批量
+    化）：projector 返回 None，或行存在却被 ``rows_to_records`` 跳过
+    （坏 JSON 列/缺 id）→ fail-closed——**不得**把存在的 session 误报
+    进 ``missing``。
+    """
+    row_ids = {row[0] for row in rows}  # 投影首列即 s.id
+    records = rows_to_records(rows)
+    record_ids = {record["id"] for record in records}
+    found: dict[str, dict] = {}
+    for record in records:
+        skeleton = canonical_session_skeleton_v4(record)
+        if skeleton is None:
+            raise _fail_closed_503(request)  # §13.2a
+        found[record["id"]] = skeleton
+    for sid in sids:
+        if sid in row_ids and sid not in record_ids:
+            raise _fail_closed_503(request)  # §13.2c（跳行 ≠ missing）
+    return found
+
+
+def _project_native_batch(items: list[tuple[str, bytes]]) -> dict[str, dict]:
+    """单次 transform offload 的批投影 worker：解析 + 投影全批成功响应。
+
+    与 read_groups ``_project_native_session_single`` 同一代码路径
+    （``native_session_to_record`` + ``canonical_session_skeleton_v4(
+    fallback=True)``——native 来源 item 恒 ``degraded:true``），仅批量
+    化：一次 admission 投影全批，不逐 sid 抢池位。任一 body 非 dict →
+    ``ValueError``（路由映射 503 ``upstream_unavailable``）；任一 item
+    required 字段不可表示 → ``_aux_unavailable()``（§13.2a 同判）。
+    """
+    found: dict[str, dict] = {}
+    for sid, body in items:
+        payload = orjson.loads(body)
+        if not isinstance(payload, dict):
+            raise ValueError("session single payload is not an object")
+        skeleton = canonical_session_skeleton_v4(
+            native_session_to_record(payload), fallback=True
+        )
+        if skeleton is None:
+            raise _aux_unavailable()
+        found[sid] = skeleton
+    return found
+
+
+async def _fetch_native_session(
+    request: Request, semaphore: asyncio.Semaphore, sid: str
+) -> tuple[str, int, bytes | None]:
+    """单个 sid 的上游 ``GET /session/{sid}``（不带 directory，有界并发）。
+
+    返回 ``(sid, status, body|None)``：body 有界读取（超 cap → None），
+    流量经 ``stash_up_in`` 记账。网络错经 ``stream_upstream`` 直接抛
+    503 ``upstream_unavailable``（整响应，不混装部分数据）。
+    """
+    async with semaphore:
+        try:
+            response = await stream_upstream(request, f"/session/{sid}", None)
+        except CodedHTTPException:
+            raise  # 已是映射后的结构化错误（网络错 → 503 upstream_unavailable）
+        except Exception as exc:
+            # 防御性兜底（rev 8.8 MAJOR-1）：sid 已在入口白名单化，理论上
+            # URL 构造不可能再抛；若仍抛（httpx.InvalidURL 等）→ 503
+            # ``upstream_unavailable``，不留裸 500 面。
+            raise_upstream_unavailable(exc)
+        try:
+            try:
+                body, _total = await read_with_cap(
+                    response,
+                    request.app.state.config.max_response_bytes,
+                    on_read=lambda n: stash_up_in(request, n),
+                )
+            except httpx.RequestError as exc:
+                # mid-stream 网络错（rev 8.9 MAJOR）：连接建立后的流式读
+                # 体网络错按 transform.py ``read_with_cap`` 契约原样上抛
+                # → 在此映射 503 ``upstream_unavailable``，不留裸 500 面
+                # （同 read_groups ``_session_single_native_fallback``
+                # 的 read_with_cap except 惯例）。异常路径经外层 gather
+                # 受控收束后再抛，错误体走全局 CodedHTTPException 渲染
+                # （gzip 协商 + Vary 惯例）。
+                raise_upstream_unavailable(exc)
+            return sid, response.status_code, body
+        finally:
+            await response.aclose()
+
+
+async def _details_via_native(request: Request, sids: list[str]) -> Response:
+    """路径 B：native fan-out 回退（dbaux 不可用 / 竞态禁用）。
+
+    admission **先于** fan-out（池满 → 503 ``transform_busy`` +
+    ``Retry-After: 2``，零上游 IO）；全批成功响应在**单次** offload 里
+    解析 + 投影。per-sid 结果规则：200 → item（恒 ``degraded:true``）；
+    404 → ``missing``；其他 4xx / 5xx / body 超 cap（**含 404 超体**——
+    cap 优先于状态码语义）/ malformed → 整响应 503
+    ``upstream_unavailable``（批量无 per-sid 透传面——与 §13 单查的
+    4xx 逐字透传不同，契约 §18 显式冻结此差异）。fan-out 任务在异常
+    路径下受控收束（cancel + await 全部收尾后才向上传播）。
+    """
+    semaphore = asyncio.Semaphore(_NATIVE_FANOUT_CONCURRENCY)
+    try:
+        async with request.app.state.transforms as pool:
+            tasks = [
+                asyncio.create_task(
+                    _fetch_native_session(request, semaphore, sid)
+                )
+                for sid in sids
+            ]
+            try:
+                outcomes = await asyncio.gather(*tasks)
+            except BaseException:
+                # 受控收束（rev 8.8 MAJOR-2）：异常路径先同步 cancel 全部
+                # fan-out 任务并 await 收尾完毕（孤儿任务不得继续跑上游
+                # IO），再向上传播原异常。
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+            for _sid, status, body in outcomes:
+                # body 超 cap 优先于状态码语义（rev 8.8 MAJOR-3）：404 +
+                # body 超 cap 同样整响应 503，绝不误判 missing（read_with_cap
+                # 仅在超 cap 时返回 None——空 body 是 b""，不落入此分支）。
+                if body is None:
+                    raise_upstream_unavailable()  # body 超 cap（200/404 均 fail-closed）
+                if status != 200 and status != 404:
+                    raise_upstream_unavailable()
+            entries = [
+                (sid, body) for sid, status, body in outcomes if status == 200
+            ]
+            try:
+                found = await pool.offload(_project_native_batch, entries)
+            except ValueError as exc:
+                # malformed upstream body（orjson.JSONDecodeError 为其子类）
+                raise_upstream_unavailable(exc)
+    except TransformBusy:
+        return busy_response(request.headers.get("accept-encoding"))
+    return _respond_batch(request, sids, found)
+
+
+@router.post("/sessions/details")
+async def sessions_details_batch(request: Request) -> Response:
+    """POST /slimapi/sessions/details?v=4 — 批量 session skeleton 详情。
+
+    Wire 契约：v4-contract §18（4.10.0，v4-only 加性 minor）。两级路径：
+    dbaux 点查优先（canonical items，``degraded:false``）；不可用/竞态
+    → native fan-out 回退（items 恒 ``degraded:true``）；任一不可表示
+    → 503 fail-closed。``?directory=`` 与 ``X-Opencode-Directory`` 均
+    tolerant-ignore（B4 惯例：不校验不转发，无冲突检查）。
+    """
+    # B4 tolerant-ignore：?directory= 读后丢弃（同 read_groups
+    # `_strip_directory_query` 惯例）。上游请求由本路由自建（不带
+    # query / directory 头），directory 在任何路径都不会到达上游。
+    request.scope["query_string"] = _strip_query_keys(
+        request.scope.get("query_string", b"") or b"",
+        frozenset({DIRECTORY_QUERY_PARAM}),
+    )
+    sids = await _parse_batch_sids(request)
+
+    # ---- 路径 A：dbaux 点查优先（§13 单查 `_handle_session_single_v4`
+    # 模式的批量化：AuxiliaryUnavailableError → 落路径 B；sqlite3.Error
+    # → fail-closed 503，不回退——BLOCKER-1 同规）。
+    dbaux = getattr(request.app.state, "dbaux", None)
+    if dbaux is not None and dbaux.status().available:
+        try:
+            rows = await dbaux.query(_session_batch_sql(sids), tuple(sids))
+        except AuxiliaryUnavailableError:
+            pass  # 竞态禁用 → 落路径 B（native fan-out）
+        except sqlite3.Error:
+            raise _fail_closed_503(request) from None
+        else:
+            found = _project_dbaux_batch(request, rows, sids)
+            return _respond_batch(request, sids, found)
+
+    # ---- 路径 B：native fan-out 回退
+    return await _details_via_native(request, sids)
 
 
 
