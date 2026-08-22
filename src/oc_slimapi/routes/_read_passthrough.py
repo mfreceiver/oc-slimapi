@@ -160,6 +160,10 @@ def _raw_upstream_url(request: Request, upstream_path: str) -> str:
     """
     raw_qs = request.scope.get("query_string", b"") or b""
     raw_qs = _strip_v_segments(raw_qs)
+    # BE-003: bare # (0x23) would be interpreted as a fragment separator
+    # by httpx, silently truncating the query. Percent-encode it here;
+    # all other bytes stay verbatim (no urlencode rebuild).
+    raw_qs = raw_qs.replace(b"#", b"%23")
     if raw_qs:
         return f"{upstream_path}?{raw_qs.decode('latin-1')}"
     return upstream_path

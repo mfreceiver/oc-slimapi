@@ -121,6 +121,10 @@ def _raw_upstream_url(request: Request) -> str:
     query = request.scope.get("query_string", b"") or b""
     query = _strip_v_segments(query)
     query = _strip_query_keys(query, frozenset({"directory"}))
+    # BE-003: bare # (0x23) would be interpreted as a fragment separator
+    # by httpx, silently truncating the query. Percent-encode it here;
+    # all other bytes stay verbatim (no urlencode rebuild).
+    query = query.replace(b"#", b"%23")
     if query:
         return f"/file/content?{query.decode('latin-1')}"
     return "/file/content"
