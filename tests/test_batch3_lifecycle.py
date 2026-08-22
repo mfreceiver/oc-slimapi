@@ -504,6 +504,9 @@ class TestInv2GraceSerialEpochCleanup:
                     raise
 
             hub.task = asyncio.create_task(slow_run())
+        slow_task = hub.task
+        old_flush = hub.flush_task
+        old_heartbeat = hub.heartbeat_task
         registry.unsubscribe(sub)
         removal = registry._removal_task
         assert removal is not None
@@ -521,6 +524,16 @@ class TestInv2GraceSerialEpochCleanup:
             # Hub was revived: _global still points to the hub.
             assert registry._global is hub
             assert hub.has_consumers()
+            # BE-002: the revival is REAL — a fresh run/flush/heartbeat
+            # group must exist. Pre-fix the abandon branch returned with
+            # all tasks dead, leaving the subscriber on a zombie hub.
+            assert hub.task is not slow_task
+            assert hub.flush_task is not old_flush
+            assert hub.heartbeat_task is not old_heartbeat
+            for fresh in (hub.task, hub.flush_task, hub.heartbeat_task):
+                assert fresh is not None and not fresh.done()
+            # The revival waiter is gone (spawned or went stale+cleared).
+            assert hub._revive_task is None
         finally:
             registry.unsubscribe(new_sub)
             await _close_hub(hub)

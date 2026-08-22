@@ -125,6 +125,16 @@ class GlobalHub:
         self.flush_task: asyncio.Task | None = None
         self.heartbeat_task: asyncio.Task | None = None
         self.stop_task: asyncio.Task | None = None
+        # BE-002 zombie-hub fix: closing barrier + group-revival waiter.
+        # ``_closing`` is set by ``HubRegistry.close()`` BEFORE it cancels
+        # any hub task; once set, ``ensure_upstream()`` is a hard no-op so
+        # close is terminal (nothing cancelled by close can be revived).
+        # ``_revive_task`` is the pending revival waiter armed when
+        # ``ensure_upstream()`` sees the current run task mid-cancel-unwind
+        # (``task.cancelling()`` True but ``task.done()`` False) — the
+        # zombie window where the old guard's ``done()`` check no-ops.
+        self._closing: bool = False
+        self._revive_task: asyncio.Task | None = None
         self.ever_connected = False
         self.pending: dict[str, DigestFields] = {}
         # B1b stage 1: shared, in-memory q/p activity source for the shadow
@@ -250,12 +260,83 @@ class GlobalHub:
         supervisor ``done_callback`` can force a rebuild without waiting
         for the just-cancelled run task to wind down (the ``task.done()``
         check below would otherwise block the rebuild).
+
+        BE-002: if the current run task is mid-cancel-unwind
+        (``cancelling()`` but not ``done()``), the ``done()`` guard above
+        no-ops and a fresh consumer would be left on a zero-task zombie
+        hub. In that window this arms :meth:`_revive_after_group` instead,
+        which rebuilds once the whole old group has quiesced. Terminals:
+        after :meth:`HubRegistry.close` (``_closing``), this is a no-op.
         """
+        if self._closing:
+            # BE-002 closing barrier: once close() has started, never build
+            # a group again — a revival here would outlive the registry.
+            return
         if self.stop_task:
             self.stop_task.cancel()
             self.stop_task = None
         if not self.task or self.task.done():
             self._spawn_group()
+            return
+        if self.task.cancelling():
+            # BE-002: the old group is mid-cancel-unwind (grace removal or
+            # close cancelled it, but the tasks have not finished raising
+            # CancelledError yet). Spawning immediately would briefly run
+            # TWO groups against the shared subscriber set; instead arm a
+            # revival waiter that rebuilds once the WHOLE group (run +
+            # flush + heartbeat) has quiesced.
+            if self._revive_task is not None:
+                return  # a waiter is already pending — do not stack
+            old_run = self.task
+            old_flush = self.flush_task
+            old_heartbeat = self.heartbeat_task
+            self._revive_task = asyncio.create_task(
+                self._revive_after_group(old_run, old_flush, old_heartbeat)
+            )
+
+    async def _revive_after_group(
+        self,
+        old_run: asyncio.Task | None,
+        old_flush: asyncio.Task | None,
+        old_heartbeat: asyncio.Task | None,
+    ) -> None:
+        """BE-002: rebuild the group after full quiescence of the old one.
+
+        Waits for the ENTIRE old group (run + flush + heartbeat), not just
+        the run task — ``run`` being done does not mean its siblings have
+        finished unwinding their ``CancelledError`` paths. All the guards
+        below are what keep this from becoming a task leak:
+
+        * ``_closing`` → close() won; never revive past the barrier.
+        * ``self.task is not old_run`` → a newer group already exists
+          (identity comparison, direction matters): this waiter is stale
+          and must not touch the new group or cancel anything armed on it
+          (e.g. a just-established grace timer).
+        * ``not has_consumers()`` → everyone left while we waited: do NOT
+          revive and do NOT schedule removal in reverse — hub removal
+          belongs to the unsubscribe paths (control unsubscribe arms
+          registry grace, token unsubscribe idle-grace, token attach
+          rollback re-arm). This hub deliberately never depends on the
+          registry.
+        """
+        try:
+            await asyncio.gather(
+                *[t for t in (old_run, old_flush, old_heartbeat) if t],
+                return_exceptions=True,
+            )
+            if self._closing:
+                return
+            if self.task is not old_run:
+                return  # stale: a newer group exists — leave it alone
+            if not self.has_consumers():
+                return  # consumers gone; teardown belongs to grace paths
+            self._spawn_group()
+        finally:
+            # Clear by task identity, not a boolean: only the CURRENT
+            # waiter may reset the slot (a stale waiter must not erase a
+            # newer waiter armed after it).
+            if self._revive_task is asyncio.current_task():
+                self._revive_task = None
 
     def _spawn_group(self) -> None:
         """INV-1 (P1-19): create a fresh run / flush / heartbeat group.

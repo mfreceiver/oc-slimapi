@@ -373,6 +373,16 @@ class HubRegistry:
             # during the await, reviving the hub. If so, abandon removal.
             if hub is not self._global or hub.has_consumers():
                 self._clear_removal_task_if_current()
+                if hub is self._global:
+                    # BE-002: a consumer arrived while the gather unwound
+                    # the old group. All old tasks are done here (the
+                    # gather above returned), so ensure_upstream() takes
+                    # its direct _spawn_group path — the subscriber is
+                    # never left hanging on a zero-task zombie hub.
+                    # Guarded to the REGISTERED hub: reviving an orphaned
+                    # hub (self._global already replaced) would spawn
+                    # tasks nothing will ever cancel.
+                    hub.ensure_upstream()
                 return
             # INV-2: no-await sync segment. on_upstream_reconnect() clears the
             # token hub's old-epoch state so the next hub starts clean.
@@ -478,8 +488,16 @@ class HubRegistry:
                 self._removal_task.cancel()
                 self._removal_task = None
             return
+        # BE-002 closing barrier FIRST — after this, the hub's
+        # ensure_upstream() is a hard no-op, so nothing cancelled below
+        # (including a pending revival waiter) can be revived by a late
+        # waiter callback or a racing subscriber.
+        hub._closing = True
         tasks = [
-            task for task in (hub.task, hub.flush_task, hub.heartbeat_task, hub.stop_task)
+            task for task in (
+                hub.task, hub.flush_task, hub.heartbeat_task, hub.stop_task,
+                hub._revive_task,
+            )
             if task is not None
         ]
         if self._removal_task is not None:
