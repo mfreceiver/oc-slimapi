@@ -16,12 +16,24 @@ from typing import Any
 import orjson
 from starlette.responses import Response
 
-# P1-31: minimum body size for gzip to be worth attempting. Bodies below this
-# threshold are returned raw because gzip's fixed header/footer overhead
-# (~18 bytes + deflate framing) almost always makes them LARGER. The version
-# gate 400 body (~44 bytes) and short error codes (~31 bytes) are canonical
-# examples. This is a CPU optimisation — the ``compress_if_beneficial`` size
-# comparison below catches any larger-but-incompressible body regardless.
+# P1-31: minimum body size for gzip to be worth attempting in the
+# ``compress_if_beneficial`` path. Bodies below this threshold are returned raw
+# because gzip's fixed header/footer overhead (~18 bytes + deflate framing)
+# almost always makes them LARGER.
+#
+# Two distinct compression paths exist:
+# 1. ``compress_if_beneficial`` (thin routes, transform worker, token-stream
+#    route) — checks MIN_GZIP_BYTES + actual benefit. Small bodies (< 64 B)
+#    skip gzip even when the client accepts it.
+# 2. ``json_response`` / ``error_response`` (JSON error bodies, version-gate
+#    400 responses, contract §9 P0-5 mandatory paths) — does NOT check
+#    MIN_GZIP_BYTES. If the client negotiated gzip, these paths compress
+#    regardless of size. The version gate 400 body (~44 bytes) and short error
+#    codes (~31 bytes) are therefore compressed when the client accepts gzip,
+#    even though they fall below the heuristic threshold.
+#
+# This is a CPU optimisation — the benefit comparison in path 1 catches any
+# larger-but-incompressible body regardless.
 MIN_GZIP_BYTES = 64
 
 

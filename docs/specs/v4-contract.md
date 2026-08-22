@@ -592,7 +592,7 @@ removed = [mid for mid in baseline.fingerprints if mid ∉ fresh_mids
            and (window_exhausted or boundary_newer(mid, fresh_oldest))]
 boundary_newer(mid, oldest): oldest is None → False（非穷尽空投影不推断任何 removal）
                             (mid.time_created, mid.id) > (oldest.time_created, oldest.id) 严格比较
-                            == 或 < → False（同时间戳并列防御性不报——宁可漏报 removed 走全量对账，不误报）
+                            == 或 < → False（同一 created 时间戳仍严格按 (created, id) 比较；仅当 oldKey <= oldestKey（包括同一 id）时防御性不报——宁可漏报 removed 走全量对账，不误报）（2026-08-22 澄清：原文「同时间戳并列防御性不报」与伪代码严格比较矛盾；本句对齐伪代码与实现，无行为变更。）
 ```
 指纹 = SHA-256（消息 canonical 投影字节）；**穷尽权威 = `nextCursor is None`**（截断窗口滚出与新删除并存不可区分 → 保守不报，客户端走全量对账）。**盲区声明**：本通道为 best-effort 前向差分，漏报（保守分支）由 `digest messagesRevision`（§7.5）+ 周期性全量 If-None-Match 对账兜底（P4 对账兜底）；**removed 不得出现假阳性**（契约级不变量）。
 

@@ -59,8 +59,9 @@ async def permissions(request: Request):
     handlers/permission.ts`` ``list`` effect calls
     ``Permission.Service.list()`` (``packages/opencode/src/permission/index.ts``),
     which reads the per-`InstanceState` pending map and returns a **bare
-    array** ``PermissionV1.Request[]`` (NOT an ``{items:}`` wrapper — unlike
-    questions' ``{pending:[]}``). It only returns pending cards for the
+    array** ``PermissionV1.Request[]`` (NOT an ``{items:}`` wrapper — the
+    upstream ``GET /question`` similarly returns a bare ``Question.Request[]``,
+    see ``groups/question.ts`` success schema). It only returns pending cards for the
     directory routed via ``X-Opencode-Directory`` (workspace-routing
     middleware: ``directory`` query param || ``x-opencode-directory`` header
     || ``process.cwd()``), so pending cards in OTHER workdirs are invisible.

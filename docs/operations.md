@@ -30,7 +30,7 @@ ocdroid (Android)
 
 | 依赖 | 说明 |
 |---|---|
-| Python ≥ 3.11（venv 推荐，Debian/Ubuntu PEP 668 不要系统强装） | 当前实测 3.14.4 |
+| Python ≥ 3.11.5（venv 推荐，Debian/Ubuntu PEP 668 不要系统强装） | 当前实测 3.14.4 |
 | opencode :4096 已启动 | 启动时 smoke 探针会打 `/session?limit=1` + `/session/{sid}/message?limit=1` |
 | systemd user instance + `Linger=yes` | 保证登出后服务存活；本机已开 |
 
@@ -603,7 +603,7 @@ sidecar 进程的启停、日志、升级由 **服务端运维** 负责，ocdroi
 | 症状 | 先查 |
 |---|---|
 | 服务起不来 | `journalctl --user -u oc-slimapi -n 50`；多半是 upstream / host 校验失败 |
-| `schema.degraded=true` | opencode 升级了；查 `opencode-src/current/` 对照字段，或临时设 `OC_SLIMAPI_SMOKE_SESSION_ID` 跳过随机探针 |
+| `schema.degraded=true` | opencode 升级了；查 `src-ref/opencode/current/`（本仓上游源码快照）对照字段，或临时设 `OC_SLIMAPI_SMOKE_SESSION_ID` 跳过随机探针 |
 | 客户端连上但 400 | 无 `?v=4` / `v=3` / 不支持值 → `unsupported_version`；directory 相关 → `invalid_directory_selector`/`directory_conflict`/`directory_header_retired`（消费集头通道已退役，用 `?directory=`） |
 | SSE 卡顿/断 | `journalctl --user -u oc-slimapi \| rg 'backpressure\|resync\|503'`；查 `/slimapi/metrics?v=4` 的订阅者计数（**metrics 探针自身须带 `?v=4`**，否则 400） |
 | SSE 订阅被 400 拒 | 订阅数触顶：digest 面 `MAX_SUBSCRIBERS_PER_DIRECTORY`（8）/`MAX_TOTAL_SUBSCRIBERS`（16），token stream 面 `TOKEN_STREAM_MAX_SUBSCRIBERS`（8）；按 §5.5 表调 env 后重启 |
