@@ -13,10 +13,15 @@ Fix
     untouched (no double-encoding path).
 
 Coverage
-    * Unit tests for both ``_raw_upstream_url`` functions.
+    * Unit tests for both ``_raw_upstream_url`` functions (19 tests).
     * ASGI-level integration tests that inject a raw ``#`` byte via
       ``scope["query_string"]`` (bypassing httpx client-side fragment
-      stripping) and verify the upstream mock receives the encoded URL.
+      stripping) and verify the upstream mock receives the encoded URL,
+      covering all 4 endpoint families that call ``_raw_upstream_url``:
+        - read_groups (``read_passthrough_get`` pipeline)
+        - providers (``_handle_providers_v4`` direct call at read_groups.py:279)
+        - write (``_write_passthrough`` pipeline at write_groups.py:172)
+        - file_raw (``file_raw._raw_upstream_url``)
 """
 
 from __future__ import annotations
@@ -174,6 +179,12 @@ class TestFileRawUpstreamUrl:
 # These construct the ASGI scope directly with a bare ``#`` byte so we bypass
 # httpx client-side fragment stripping. The test verifies that the upstream
 # mock receives the correctly percent-encoded URL (``%23`` instead of ``#``).
+#
+# Four endpoint families are tested:
+#   1. read_groups — ``read_passthrough_get`` pipeline (e.g. /slimapi/file)
+#   2. providers  — direct ``_raw_upstream_url`` call at read_groups.py:279
+#   3. write      — ``_write_passthrough`` pipeline at write_groups.py:172
+#   4. file_raw   — ``file_raw._raw_upstream_url``
 
 import httpx
 import pytest
@@ -181,7 +192,7 @@ from fastapi import FastAPI
 
 from oc_slimapi.config import Settings
 from oc_slimapi.errors import register_error_handlers
-from oc_slimapi.routes import read_groups, file_raw as file_raw_router
+from oc_slimapi.routes import read_groups, write_groups, file_raw as file_raw_router
 from oc_slimapi.selector import SlimapiSelectorMiddleware
 from oc_slimapi.transform import TransformConfig, TransformPool
 
@@ -251,11 +262,12 @@ async def _asgi_send(
 
 
 # ---------------------------------------------------------------------------
-# Passthrough route (read_groups) — /slimapi/file
+# Endpoint family builders
 # ---------------------------------------------------------------------------
+# Each returns (app, seen) where ``seen`` accumulates upstream requests.
 
-def _build_passthrough_app(handler):
-    """Minimal app for a passthrough read-group route with upstream mock."""
+def _build_read_groups_app(handler):
+    """read_groups router (``read_passthrough_get`` pipeline)."""
     seen: list[httpx.Request] = []
 
     def recording(request: httpx.Request) -> httpx.Response:
@@ -281,68 +293,62 @@ def _build_passthrough_app(handler):
     return app, seen
 
 
-@pytest.fixture
-def passthrough_stack():
-    def handler(request: httpx.Request) -> httpx.Response:
-        payload = {
-            "/file": b'[{"name":"readme.md","path":"readme.md"}]',
-        }.get(request.url.path, b'{"error":"nf"}')
-        return httpx.Response(
-            200, content=payload,
-            headers={"Content-Type": "application/json"},
-        )
-    return _build_passthrough_app(handler)
+def _build_providers_app(handler):
+    """read_groups router, providers route (direct ``_raw_upstream_url`` call)."""
+    seen: list[httpx.Request] = []
 
+    def recording(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return handler(request)
 
-async def test_passthrough_bare_hash_in_query_upstream_receives_encoded(passthrough_stack):
-    """Bare ``#`` in query → upstream receives ``%23``, query not truncated."""
-    app, seen = passthrough_stack
-    # scope["query_string"] with bare # — bypasses httpx client-side stripping
-    qs = b"v=4&path=readme.md&filter=a#b"
-    status, _headers, _body = await _asgi_send(app, path="/slimapi/file", query_string=qs)
-    assert status == 200
-    assert len(seen) == 1
-    upstream_url = str(seen[0].url)
-    assert "filter=a%23b" in upstream_url, (
-        f"expected %23 in upstream URL, got: {upstream_url}"
+    app = FastAPI()
+    settings = _settings()
+    app.state.config = settings
+    app.state.upstream = httpx.AsyncClient(
+        transport=httpx.MockTransport(recording),
+        base_url=settings.upstream,
     )
-    # Verify the query was NOT truncated at #
-    assert "filter=a" in upstream_url
-    assert "%23b" in upstream_url or "filter=a%23b" in upstream_url
+    app.state.schema_degraded = False
+    app.state.transforms = TransformPool(TransformConfig(
+        max_transforms=settings.max_transforms,
+        transform_wait_seconds=settings.transform_wait_seconds,
+        max_response_bytes=settings.max_response_bytes,
+    ))
+    app.include_router(read_groups.router)
+    register_error_handlers(app)
+    app.add_middleware(SlimapiSelectorMiddleware)
+    return app, seen
 
 
-async def test_passthrough_existing_pct23_not_double_encoded(passthrough_stack):
-    """Existing ``%23`` is NOT double-encoded."""
-    app, seen = passthrough_stack
-    qs = b"v=4&path=readme.md&q=a%23b"
-    status, _headers, _body = await _asgi_send(app, path="/slimapi/file", query_string=qs)
-    assert status == 200
-    assert len(seen) == 1
-    upstream_url = str(seen[0].url)
-    # Count occurrences of %23 — should be exactly 1 (not double-encoded to %2523)
-    assert upstream_url.count("%23") == 1, (
-        f"expected single %23, got: {upstream_url}"
+def _build_write_app(handler):
+    """write_groups router (``_write_passthrough`` pipeline)."""
+    seen: list[httpx.Request] = []
+
+    def recording(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return handler(request)
+
+    app = FastAPI()
+    settings = _settings()
+    app.state.config = settings
+    app.state.upstream = httpx.AsyncClient(
+        transport=httpx.MockTransport(recording),
+        base_url=settings.upstream,
     )
+    app.state.schema_degraded = False
+    app.state.transforms = TransformPool(TransformConfig(
+        max_transforms=settings.max_transforms,
+        transform_wait_seconds=settings.transform_wait_seconds,
+        max_response_bytes=settings.max_response_bytes,
+    ))
+    app.include_router(write_groups.router)
+    register_error_handlers(app)
+    app.add_middleware(SlimapiSelectorMiddleware)
+    return app, seen
 
-
-async def test_passthrough_no_hash_passes_verbatim(passthrough_stack):
-    """Query without ``#`` passes through unchanged (regression)."""
-    app, seen = passthrough_stack
-    qs = b"v=4&path=readme.md&filter=ab"
-    status, _headers, _body = await _asgi_send(app, path="/slimapi/file", query_string=qs)
-    assert status == 200
-    assert len(seen) == 1
-    upstream_url = str(seen[0].url)
-    assert "filter=ab" in upstream_url
-    assert "#" not in upstream_url  # no fragment artifact
-
-
-# ---------------------------------------------------------------------------
-# File-raw route — /slimapi/file/raw
-# ---------------------------------------------------------------------------
 
 def _build_file_raw_app(handler):
-    """Minimal app for file_raw route with upstream mock."""
+    """file_raw router (``file_raw._raw_upstream_url``)."""
     seen: list[httpx.Request] = []
 
     def recording(request: httpx.Request) -> httpx.Response:
@@ -368,59 +374,76 @@ def _build_file_raw_app(handler):
     return app, seen
 
 
-@pytest.fixture
-def file_raw_stack():
-    import base64
-    import orjson
+# ---------------------------------------------------------------------------
+# Parametrized fixture: one stack per endpoint family
+# ---------------------------------------------------------------------------
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        body = orjson.dumps({
-            "type": "binary",
-            "content": base64.b64encode(b"raw-data").decode("ascii"),
-            "mimeType": "image/png",
-        })
-        return httpx.Response(
-            200, content=body,
-            headers={"Content-Type": "application/json"},
-        )
-    return _build_file_raw_app(handler)
-
-
-async def test_file_raw_bare_hash_in_query_upstream_receives_encoded(file_raw_stack):
-    """Bare ``#`` in file_raw query → upstream receives ``%23``."""
-    app, seen = file_raw_stack
-    qs = b"v=4&path=image.png&filter=a#b"
-    status, _headers, _body = await _asgi_send(app, path="/slimapi/file/raw", query_string=qs)
-    assert status == 200
-    assert len(seen) == 1
-    upstream_url = str(seen[0].url)
-    assert "filter=a%23b" in upstream_url, (
-        f"expected %23 in upstream URL, got: {upstream_url}"
-    )
-    # path param must survive
-    assert "path=image.png" in upstream_url
+@pytest.fixture(
+    params=[
+        ("read_groups", "/slimapi/file", "GET", b"v=4&path=readme.md",
+         lambda r: httpx.Response(200, content=b'[{"name":"readme.md","path":"readme.md"}]',
+                                   headers={"Content-Type": "application/json"}),
+         _build_read_groups_app),
+        ("providers", "/slimapi/config/providers", "GET", b"v=4",
+         lambda r: httpx.Response(200, content=b'{"providers":[{"id":"p1","name":"Provider 1","models":{"m1":{"id":"m1","name":"Model 1","providerID":"p1"}}}],"default":{"p1":"m1"}}',
+                                   headers={"Content-Type": "application/json"}),
+         _build_providers_app),
+        ("write", "/slimapi/session/test-ses-id", "DELETE", b"v=4",
+         lambda r: httpx.Response(204),
+         _build_write_app),
+        ("file_raw", "/slimapi/file/raw", "GET", b"v=4&path=image.png",
+         lambda r: httpx.Response(200, content=b'{"type":"binary","content":"","mimeType":"image/png"}',
+                                   headers={"Content-Type": "application/json"}),
+         _build_file_raw_app),
+    ],
+    ids=["read_groups", "providers", "write", "file_raw"],
+)
+def family_stack(request):
+    """Parametrized fixture: each parameter is one endpoint family."""
+    _name, path, method, base_qs, handler_fn, builder = request.param
+    app, seen = builder(handler_fn)
+    return path, method, base_qs, app, seen
 
 
-async def test_file_raw_existing_pct23_not_double_encoded(file_raw_stack):
-    """Existing ``%23`` is NOT double-encoded (file_raw)."""
-    app, seen = file_raw_stack
-    qs = b"v=4&path=image.png&q=a%23b"
-    status, _headers, _body = await _asgi_send(app, path="/slimapi/file/raw", query_string=qs)
-    assert status == 200
-    assert len(seen) == 1
-    upstream_url = str(seen[0].url)
-    assert upstream_url.count("%23") == 1, (
-        f"expected single %23, got: {upstream_url}"
-    )
+# ---------------------------------------------------------------------------
+# Integration tests — 3 scenarios × 4 families = 12 tests
+# ---------------------------------------------------------------------------
 
+class TestIntegration:
+    """ASGI integration tests: bare ``#`` in query → upstream ``%23``."""
 
-async def test_file_raw_no_hash_passes_verbatim(file_raw_stack):
-    """Query without ``#`` passes through unchanged (regression, file_raw)."""
-    app, seen = file_raw_stack
-    qs = b"v=4&path=image.png&filter=ab"
-    status, _headers, _body = await _asgi_send(app, path="/slimapi/file/raw", query_string=qs)
-    assert status == 200
-    assert len(seen) == 1
-    upstream_url = str(seen[0].url)
-    assert "filter=ab" in upstream_url
-    assert "#" not in upstream_url
+    @staticmethod
+    async def _check(family_stack, qs_suffix: bytes, *, expect_contains: str | None = None,
+                     expect_count: int | None = None, expect_absent: str | None = None):
+        path, method, base_qs, app, seen = family_stack
+        qs = base_qs + qs_suffix
+        status, _headers, _body = await _asgi_send(
+            app, method=method, path=path, query_string=qs)
+        assert status in (200, 204)
+        assert len(seen) == 1
+        upstream_url = str(seen[0].url)
+        if expect_contains is not None:
+            assert expect_contains in upstream_url, (
+                f"expected {expect_contains!r} in upstream URL, got: {upstream_url}"
+            )
+        if expect_count is not None:
+            assert upstream_url.count(expect_contains) == expect_count, (
+                f"expected {expect_count}×{expect_contains!r}, got: {upstream_url}"
+            )
+        if expect_absent is not None:
+            assert expect_absent not in upstream_url
+
+    async def test_bare_hash_in_query_upstream_receives_encoded(self, family_stack):
+        """Bare ``#`` in query → upstream receives ``%23``, not truncated."""
+        await self._check(family_stack, b"&q=a#b", expect_contains="q=a%23b",
+                          expect_absent="#")
+
+    async def test_existing_pct23_not_double_encoded(self, family_stack):
+        """Existing ``%23`` is NOT double-encoded to ``%2523``."""
+        await self._check(family_stack, b"&q=a%23b", expect_contains="%23",
+                          expect_count=1)
+
+    async def test_no_hash_passes_verbatim(self, family_stack):
+        """Query without ``#`` passes through unchanged (regression)."""
+        await self._check(family_stack, b"&q=ab", expect_contains="q=ab",
+                          expect_absent="#")
