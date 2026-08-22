@@ -74,18 +74,22 @@ def _expand_wire_view(scope) -> int:
 # even if opencode's ``orderBy`` ever changes; clients merging paginated
 # skeleton pages depend on the strict-ASC guarantee.
 
-def _created_sort_key(msg: dict) -> int | float:
-    """Sort key: ``info.time.created`` ASC.
+def _created_value(msg: dict) -> int | float | None:
+    """Explicit ``info.time.created`` parse — ``None`` when malformed.
 
-    Defaults to ``0`` for missing / malformed fields so degenerate upstream
-    rows sort first under Python's stable sort instead of crashing the worker.
+    BE-001: this is the VALIDITY predicate, deliberately distinct from
+    :func:`_created_sort_key`'s ``0`` sentinel. The sentinel overloads
+    "malformed" with a legal sort position (schema allows a legitimate
+    ``created == 0`` epoch), so boundary logic must NOT reuse it — a
+    degenerate row must be distinguishable from a well-formed ``0`` row.
+    Only :func:`_created_sort_key` maps ``None`` back to ``0``.
     """
     info = msg.get("info") if isinstance(msg, dict) else None
     if not isinstance(info, dict):
-        return 0
+        return None
     time_obj = info.get("time")
     if not isinstance(time_obj, dict):
-        return 0
+        return None
     raw = time_obj.get("created")
     # Q7-P3-19 (owner adjudication 2026-08-22): accept int OR finite float.
     # Upstream practice only ever writes int epochs (ms) — this widening is
@@ -99,10 +103,22 @@ def _created_sort_key(msg: dict) -> int | float:
     # total ordering, inf would clamp to one end; note orjson already
     # rejects both at parse time — defense-in-depth) as do str/None.
     if isinstance(raw, bool):
-        return 0
+        return None
     if isinstance(raw, (int, float)) and math.isfinite(raw):
         return raw
-    return 0
+    return None
+
+
+def _created_sort_key(msg: dict) -> int | float:
+    """Sort key: ``info.time.created`` ASC.
+
+    Defaults to ``0`` for missing / malformed fields (see
+    :func:`_created_value`) so degenerate upstream rows sort first under
+    Python's stable sort instead of crashing the worker. This float-to-top
+    behaviour is intentional §8 wire surface and is NOT changed by BE-001.
+    """
+    value = _created_value(msg)
+    return 0 if value is None else value
 
 
 def _parse_sort_project(
@@ -496,7 +512,21 @@ def _message_id(item: dict) -> str | None:
 def _boundary_key(item: dict, mid: str | None) -> tuple[int | float, str] | None:
     if mid is None:
         return None
-    return (_created_sort_key(item), mid)
+    created = _created_value(item)
+    if created is None:
+        # BE-001: a degenerate row refuses to serve as a diff boundary.
+        # The historical ``(_created_sort_key(item), mid)`` minted the
+        # ``(0, deg_mid)`` sentinel tuple, which compares strictly SMALLER
+        # than every well-formed baseline key — so in a non-exhausted
+        # window every absent baseline mid judged ``newer`` and the whole
+        # window false-positived as removed. §10.3 freezes "removed must
+        # never show false positives"; returning None makes the caller's
+        # ``fresh_oldest_key is not None`` guard skip removal inference
+        # for the window entirely (conservative false-negative path —
+        # contract-tolerated). A legitimate ``created == 0`` row still
+        # returns ``(0, mid)`` and compares normally.
+        return None
+    return (created, mid)
 
 
 def _artifact_from_array_bytes(

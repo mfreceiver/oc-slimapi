@@ -576,3 +576,291 @@ async def test_bypass_removes_old_lineage_and_retry_resets():
     # dropped by the byte-cap bypass, so it re-fetches the full snapshot
     # with NO ``removed`` key.
     assert "removed" not in retry.json()
+
+
+# ---------------------------------------------------------------------------
+# BE-001: degenerate ``info.time.created`` rows must never false-positive the
+# removed inference. ``_created_sort_key``'s ``0`` sentinel (which floats
+# malformed rows to the page head — intentional §8 surface) overloaded
+# "malformed" with a legal sort position, so the historical
+# ``_boundary_key`` minted ``(0, deg_mid)`` and judged every absent baseline
+# mid strictly newer — reporting the whole window as removed. The fix makes
+# boundary validity explicit (``_created_value`` → None) while a legitimate
+# ``created == 0`` row still compares normally.
+# ---------------------------------------------------------------------------
+
+_MISSING = object()  # sentinel: the ``time`` object carries no "created" key
+
+
+def _degenerate_message(mid: str, created) -> dict:
+    time_obj = {} if created is _MISSING else {"created": created}
+    return {
+        "info": {"id": mid, "role": "user", "time": time_obj},
+        "parts": [
+            {"id": f"{mid}-part", "type": "text", "messageID": mid, "text": "bad"}
+        ],
+    }
+
+
+def test_created_value_boundary_and_sort_key_classification():
+    # Well-formed values — including the legitimate epoch 0, which must
+    # NEVER be conflated with the malformed sentinel.
+    valid = {"info": {"id": "m", "time": {"created": 0}}}
+    assert messages_list._created_value(valid) == 0
+    assert messages_list._created_sort_key(valid) == 0
+    assert messages_list._boundary_key(valid, "m") == (0, "m")
+    fractional = {"info": {"id": "m", "time": {"created": 5.5}}}
+    assert messages_list._created_value(fractional) == 5.5
+    assert messages_list._boundary_key(fractional, "m") == (5.5, "m")
+
+    # Degenerate variants (Q7-P3-19 malformed set): missing / non-dict
+    # traversal legs, string, bool, null, NaN, +Inf, -Inf.
+    degenerate_createds = [
+        _MISSING,
+        "not-a-number",
+        True,
+        None,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+    ]
+    for created in degenerate_createds:
+        item = _degenerate_message("m", created)
+        assert messages_list._created_value(item) is None
+        # Sort keeps the float-to-head §8 invariant (sentinel 0)…
+        assert messages_list._created_sort_key(item) == 0
+        # …but the row refuses to serve as a diff boundary.
+        assert messages_list._boundary_key(item, "m") is None
+
+    # Missing mid alone also mints no boundary.
+    assert messages_list._boundary_key(valid, None) is None
+    # Non-dict traversal legs stay swallowed exactly as before.
+    for broken in ({}, {"info": "not-a-dict"}, {"info": {"time": "x"}}):
+        assert messages_list._created_value(broken) is None
+        assert messages_list._boundary_key(broken, "m") is None
+
+
+async def test_created_zero_row_serves_as_diff_boundary():
+    # A legitimate ``created == 0`` row is a VALID boundary: an absent
+    # baseline mid strictly newer than it in a non-exhausted window is a
+    # true removal (not suppressed by the BE-001 fix).
+    payloads = [
+        orjson.dumps([
+            _message("m0", 0, "zero"),
+            _message("m1", 5, "five"),
+            _message("m2", 10, "ten"),
+        ]),
+        orjson.dumps([_message("m0", 0, "zero"), _message("m2", 10, "ten")]),
+    ]
+    calls = 0
+
+    def handler(request):
+        nonlocal calls
+        index = min(calls, len(payloads) - 1)
+        calls += 1
+        headers = (
+            {"Link": '</session/s1/message?before=opaque>; rel="next"'}
+            if index == 1 else {}
+        )
+        return httpx.Response(200, content=payloads[index], headers=headers)
+
+    async with _message_client(handler) as (client, _app):
+        first = await client.get("/slimapi/messages/s1")
+        second = await client.get(
+            f"/slimapi/messages/s1?since={first.json()['nextSince']}"
+        )
+
+    assert second.status_code == 200
+    assert second.json()["items"] == []
+    assert second.json()["removed"] == ["m1"]
+
+
+@pytest.mark.parametrize(
+    "label,created",
+    [
+        ("missing", _MISSING),
+        ("string", "not-a-number"),
+        ("bool", True),
+        ("null", None),
+    ],
+    ids=["missing-created", "string-created", "bool-created", "null-created"],
+)
+async def test_degenerate_fresh_boundary_suppresses_removal_inference(
+    label, created
+):
+    # Non-exhausted window whose oldest (page-head) row is degenerate: the
+    # pre-fix code minted the (0, "mdeg") sentinel boundary and reported the
+    # absent m1 as removed — a §10.3 contract violation. The window must
+    # instead infer NOTHING (conservative false-negative path), and the
+    # degenerate row must keep sorting to the response items head (§8).
+    payloads = [
+        orjson.dumps([_message("m1", 5, "five"), _message("m2", 10, "ten")]),
+        orjson.dumps([_degenerate_message("mdeg", created),
+                      _message("m2", 10, "ten")]),
+    ]
+    calls = 0
+
+    def handler(request):
+        nonlocal calls
+        index = min(calls, len(payloads) - 1)
+        calls += 1
+        headers = (
+            {"Link": '</session/s1/message?before=opaque>; rel="next"'}
+            if index == 1 else {}
+        )
+        return httpx.Response(200, content=payloads[index], headers=headers)
+
+    async with _message_client(handler) as (client, _app):
+        first = await client.get("/slimapi/messages/s1")
+        second = await client.get(
+            f"/slimapi/messages/s1?since={first.json()['nextSince']}"
+        )
+
+    assert second.status_code == 200
+    assert second.json()["nextCursor"] is not None
+    # Degenerate row floats to the items head — §8 sort invariant untouched.
+    assert [item["info"]["id"] for item in second.json()["items"]] == ["mdeg"]
+    # BE-001 core assertion: no removed false positives from this window.
+    assert second.json()["removed"] == []
+    assert "nextSince" in second.json()
+
+
+async def test_degenerate_baseline_row_is_never_reported_removed():
+    # A degenerate row in the BASELINE has no comparable boundary key, so
+    # its absence from the fresh window must be conservatively skipped —
+    # never inferred as a removal.
+    payloads = [
+        orjson.dumps([
+            _degenerate_message("m1", "not-a-number"),
+            _message("m2", 10, "ten"),
+        ]),
+        orjson.dumps([_message("m2", 10, "ten"), _message("m3", 20, "twenty")]),
+    ]
+    calls = 0
+
+    def handler(request):
+        nonlocal calls
+        index = min(calls, len(payloads) - 1)
+        calls += 1
+        headers = (
+            {"Link": '</session/s1/message?before=opaque>; rel="next"'}
+            if index == 1 else {}
+        )
+        return httpx.Response(200, content=payloads[index], headers=headers)
+
+    async with _message_client(handler) as (client, _app):
+        first = await client.get("/slimapi/messages/s1")
+        second = await client.get(
+            f"/slimapi/messages/s1?since={first.json()['nextSince']}"
+        )
+
+    assert second.status_code == 200
+    assert second.json()["removed"] == []
+
+
+async def test_exhausted_window_still_reports_removals_despite_degenerate_row():
+    # ``window_exhausted`` is authoritative (nextCursor is None): even with
+    # a degenerate row present, the exhausted branch keeps reporting every
+    # absent baseline mid — the BE-001 fix only guards the
+    # boundary-inference branch, never the exhausted path.
+    payloads = [
+        orjson.dumps([_message("m1", 5, "five"), _message("m2", 10, "ten")]),
+        orjson.dumps([_degenerate_message("mdeg", "not-a-number"),
+                      _message("m2", 10, "ten")]),
+    ]
+    calls = 0
+
+    def handler(request):
+        nonlocal calls
+        index = min(calls, len(payloads) - 1)
+        calls += 1
+        return httpx.Response(200, content=payloads[index])
+
+    async with _message_client(handler) as (client, _app):
+        first = await client.get("/slimapi/messages/s1")
+        second = await client.get(
+            f"/slimapi/messages/s1?since={first.json()['nextSince']}"
+        )
+
+    assert second.status_code == 200
+    assert second.json()["nextCursor"] is None
+    assert [item["info"]["id"] for item in second.json()["items"]] == ["mdeg"]
+    assert second.json()["removed"] == ["m1"]
+
+
+async def test_same_timestamp_boundary_reports_strictly_newer_id():
+    # Companion to ``test_same_timestamp_boundary_does_not_infer_sibling_removal``:
+    # ties compare strictly on ``(created, id)``. An absent baseline mid
+    # sharing the boundary's created but with a strictly GREATER id must
+    # still be reported — the BE-001 fix must not weaken tuple comparison.
+    payloads = [
+        orjson.dumps([
+            _message("m9", 2, "seed"),
+            _message("mB", 10, "same-ts-b"),
+            _message("mC", 10, "same-ts-c"),
+        ]),
+        orjson.dumps([_message("m9", 2, "seed"), _message("mB", 10, "same-ts-b")]),
+    ]
+    calls = 0
+
+    def handler(request):
+        nonlocal calls
+        index = min(calls, len(payloads) - 1)
+        calls += 1
+        headers = (
+            {"Link": '</session/s1/message?before=opaque>; rel="next"'}
+            if index == 1 else {}
+        )
+        return httpx.Response(200, content=payloads[index], headers=headers)
+
+    async with _message_client(handler) as (client, _app):
+        first = await client.get("/slimapi/messages/s1")
+        second = await client.get(
+            f"/slimapi/messages/s1?since={first.json()['nextSince']}"
+        )
+
+    assert second.status_code == 200
+    assert second.json()["removed"] == ["mC"]
+
+
+async def test_degenerate_window_still_signs_and_reuses_next_since():
+    # nextSince/CAS behaviour is untouched by degenerate rows: the diff
+    # response still signs a token, and a byte-identical retry takes the
+    # CAS success (gen reuse) branch and signs again.
+    fresh_payload = orjson.dumps([
+        _degenerate_message("mdeg", "not-a-number"),
+        _message("m2", 10, "ten"),
+    ])
+    payloads = [
+        orjson.dumps([_message("m1", 5, "five"), _message("m2", 10, "ten")]),
+        fresh_payload,
+        fresh_payload,
+    ]
+    calls = 0
+
+    def handler(request):
+        nonlocal calls
+        index = min(calls, len(payloads) - 1)
+        calls += 1
+        headers = (
+            {"Link": '</session/s1/message?before=opaque>; rel="next"'}
+            if index >= 1 else {}
+        )
+        return httpx.Response(200, content=payloads[index], headers=headers)
+
+    async with _message_client(handler) as (client, _app):
+        first = await client.get("/slimapi/messages/s1")
+        second = await client.get(
+            f"/slimapi/messages/s1?since={first.json()['nextSince']}"
+        )
+        assert "nextSince" in second.json()
+        third = await client.get(
+            f"/slimapi/messages/s1?since={second.json()['nextSince']}"
+        )
+
+    assert third.status_code == 200
+    # Valid baseline (no reset): the diff envelope carries ``removed``.
+    assert "removed" in third.json()
+    assert third.json()["removed"] == []
+    assert third.json()["items"] == []
+    assert "nextSince" in third.json()
