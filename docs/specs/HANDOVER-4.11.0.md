@@ -133,6 +133,8 @@ messages 路由 ETag 域标签统一为窗口版本 4 → 升级后旧 v4 ETag *
 
 版本底座：`GET /slimapi/versions` → `available:[4]`；所有 `/slimapi/**` 请求必带 `?v=4`。
 
+静态能力键（4.11.0 起）：`capabilities["4"].messagesSince` / `capabilities["4"].fileRaw` 恒 `true`——P1/P5 可直接读键门控（上表行为探测为运行时旁证，缺键 = 旧 sidecar，判定能力不可用；客户端应拒绝或按自身策略处理）。
+
 ---
 
 ## 5. 错误面速查

@@ -21,8 +21,15 @@ replay-log configuration does not alter the advertisement, §3.1).
 2026-08-19 revision batch: the ``"4"`` face gains two ADDITIVE keys —
 ``readiness`` (§3.3 nine-ID readiness gate, always advertised) and
 ``expand`` (§14, emitted iff ``messages.expand.v4`` is satisfied). Both
-are assembled by ``_capabilities4`` below and the four STATIC keys stay
+are assembled by ``_capabilities4`` below and the STATIC keys stay
 frozen verbatim in front of them.
+
+4.11.0 (revision five, same-batch): the static face grows two more
+ADDITIVE boolean keys — ``messagesSince`` (§10.3 messages ``?since=``
+forward differential, nextSince/removed response keys) and ``fileRaw``
+(§19 ``GET /slimapi/file/raw``). Both ship unconditionally true with
+their implementations (no single-key-on state exists); key absence =
+older sidecar without the capability (§3.1 probe semantics).
 
 Response constraints (§3, frozen):
 
@@ -78,6 +85,12 @@ CAPABILITIES: dict[str, dict] = {
         "auxiliaryFilters": True,
         **META_CAPABILITY_KEYS,
         "qpImmediateFull": True,
+        # 4.11.0 revision five, same-batch with their implementations
+        # (§10.3 / §19): unconditional static booleans, same pattern as
+        # qpImmediateFull — key absence on older sidecars = capability
+        # unavailable, clients must not pre-depend.
+        "messagesSince": True,
+        "fileRaw": True,
     },
 }
 

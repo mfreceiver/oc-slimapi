@@ -51,7 +51,9 @@
      "globalSessions": true,      # B3a 起
      "auxiliaryFilters": true,    # B3a 起
      "sseReplay": true,           # B3b 起已广告（同批落地）
-     "qpImmediateFull": true      # B3b 起已广告（同批落地；语义由 design-v4-qp-payload.md 结论冻结）
+     "qpImmediateFull": true,     # B3b 起已广告（同批落地；语义由 design-v4-qp-payload.md 结论冻结）
+     "messagesSince": true,       # 4.11.0 起已广告（同批落地）——messages `?since=` 前向差分（§10.3）
+     "fileRaw": true              # 4.11.0 起已广告（同批落地）——`GET /slimapi/file/raw` 裸二进制直读（§19）
    }}}
 ```
 
@@ -59,9 +61,10 @@
 - `current` 恒为最新主版本（=4，S-B04；「双版本期」限定为 4.0.0–4.7.0 历史表述，v4-only 窗下仍成立且与 `available` 唯一元素同值）。
 - **能力键为静态键**（v2.2 行 140/254）：存在即广告，**不随 DB 抖动**——DB 熔断/降级不改变 capabilities，瞬态可用性经 503 + health `auxiliary` 字段（§3.2）+ metrics 表达。
 - **广告时序（n1 冻结）**：`sseReplay`/`qpImmediateFull` 与实现**同批启用**——B3a 的 `capabilities["4"]` **不含**此二键；B3b 实现落地同期广告（**已执行，B3b-5**：两键随 4.0.0 发布面广告；本条为时序约束的历史记录）。消费者：键缺席 = 该能力不可用，不得预依赖。
+- **4.11.0 静态加性键（修订五同批落地）**：`capabilities["4"]` 静态面追加两布尔键——`messagesSince`（messages `?since=` 前向差分支持，含响应条件键 `nextSince`/`removed`，§10.3）与 `fileRaw`（`GET /slimapi/file/raw` 裸二进制直读，§19）；均与实现同批广告、恒 `true`（不存在只开其一的形态），键缺席 = 旧 sidecar 不支持该能力。
 - 消费者探测（B5a；历史条款——4.0.0–4.7.0 双版本期）：`capabilities["4"]` 不存在 → 继续 v=3；未知键容忍忽略。v4-only 窗（4.8.0 起）：`capabilities` 恒仅含 `"4"` 面、`?v=3`/无 `v` → 400（§0.1），该回退分支不可达；未知键容忍忽略仍适用。
 - **expand 能力探测注记（2026-08-19 补载——如实描述已发布状态；2026-08-21 版本窗收窄后注记）**：messages 的 2 条 expand 路由（§10/§14）在 `?v=4` 下**可达**（selector 放行；端点行为零版本分叉，语义全文 = §14）。历史（4.0.0–4.7.0 双版本期）：`capabilities["4"]` 静态键面不含 `expand` 键，expand 能力广告仅存在于 `capabilities["3"].expand`，客户端探测读该键、不因使用 `?v=4` 而改读他键。v4-only 窗下 `capabilities["3"]` 面已随版本窗移除，expand 探测唯一口径 = `capabilities["4"].expand`（§14 修订扩展键，iff `messages.expand.v4 ∈ satisfied` 方广告，§3.3 双向不变量）。
-- **修订扩展键（2026-08-19 修订冻结目标）**：`capabilities["4"]` 随实现批次**加性扩展**两键——`readiness`（§3.3 feature 就绪度门；修订二后全集 U = **十** ID）与 `expand`（§14：categories + fragmentMaxBytes，随 `messages.expand.v4` 进入 `satisfied` 加入）。扩键前本节静态四键即 `capabilities["4"]` 全部形状；`expand` 键出现前 expand 能力探测仍读 `capabilities["3"].expand`（上文注记——历史 4.0.0–4.7.0 行为；v4-only 窗下该键不存在，探测唯一口径 = `capabilities["4"].expand`）。
+- **修订扩展键（2026-08-19 修订冻结目标）**：`capabilities["4"]` 随实现批次**加性扩展**两键——`readiness`（§3.3 feature 就绪度门；修订二后全集 U = **十** ID）与 `expand`（§14：categories + fragmentMaxBytes，随 `messages.expand.v4` 进入 `satisfied` 加入）。扩键前本节当时的静态四键（历史语境；4.11.0 起静态键增至六，含 `messagesSince`/`fileRaw`）即 `capabilities["4"]` 全部形状；`expand` 键出现前 expand 能力探测仍读 `capabilities["3"].expand`（上文注记——历史 4.0.0–4.7.0 行为；v4-only 窗下该键不存在，探测唯一口径 = `capabilities["4"].expand`）。
 
 ### §3.2 `GET /slimapi/health`（v4-only 单视图）
 

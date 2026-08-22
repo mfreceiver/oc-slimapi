@@ -36,6 +36,7 @@ ocdroid 对接时：
 - **digest `messagesRevision`**（v4-contract §7.5，P4）：message 域 digest 帧加性字段，进程级单调变化信号，驱动 since 差分/If-None-Match 精拉；不跨进程比较。
 - **`GET /slimapi/file/raw` 裸二进制直读**（v4-contract §19，P5）：上游 `LegacyContent` binary 信封解码为裸 bytes 下发（省 base64 4/3 膨胀）；MIME 保真、强 ETag/304、no-store；畸形信封 502 `raw_decode_failed`。收编 `HttpImageHolder` 直连图片拉取。
 - **readiness 第 11 ID `sessions.details.v4`**（v4-contract §3.3，P3）：retroactive 正名——§18 批量详情面已于 4.10.0 生效；`required` 扩为十一项，客户端需同步全集。
+- **versions 能力键 `messagesSince` / `fileRaw`**（v4-contract §3.1）：`capabilities["4"]` 静态面新增两个加性布尔键，与 P1（`?since=` 差分）/ P5（file/raw 直读）实现同批广告、恒 `true`；键缺席 = 旧 sidecar 不支持该能力（探测回退见 HANDOVER-4.11.0 §4）。纯加性——未消费的客户端按「忽略未知键」零影响。
 
 ### Changed
 

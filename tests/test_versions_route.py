@@ -61,11 +61,18 @@ async def test_versions_capabilities_map():
         assert caps["4"]["auxiliaryFilters"] is True
         assert caps["4"]["sseReplay"] is True
         assert caps["4"]["qpImmediateFull"] is True
+        # 4.11.0 revision five: two more static booleans advertised
+        # same-batch with their implementations (§10.3 since differential,
+        # §19 file/raw).
+        assert caps["4"]["messagesSince"] is True
+        assert caps["4"]["fileRaw"] is True
         # 4.2.0 close-out: readiness + expand both land (SATISFIED is the
         # full universe); shapes locked in test_versions_readiness.py.
         assert set(caps["4"].keys()) == {
             "globalSessions", "auxiliaryFilters",
-            "sseReplay", "qpImmediateFull", "readiness", "expand",
+            "sseReplay", "qpImmediateFull",
+            "messagesSince", "fileRaw",
+            "readiness", "expand",
         }
 
 
@@ -89,7 +96,7 @@ async def test_versions_caps4_meta_lane_same_source():
 
 
 async def test_versions_caps4_static_key_order():
-    """Producer-owned key order follows contract §3.1 verbatim (the four
+    """Producer-owned key order follows contract §3.1 verbatim (the six
     static keys in their frozen order, then the §3.3 readiness gate and
     the §14 expand block — consumers must not rely on it, but the
     producer shape stays byte-stable for golden comparisons)."""
@@ -97,25 +104,31 @@ async def test_versions_caps4_static_key_order():
         body = (await client.get("/slimapi/versions")).json()
         assert list(body["capabilities"]["4"].keys()) == [
             "globalSessions", "auxiliaryFilters",
-            "sseReplay", "qpImmediateFull", "readiness", "expand",
+            "sseReplay", "qpImmediateFull",
+            "messagesSince", "fileRaw",
+            "readiness", "expand",
         ]
 
 
 async def test_versions_caps4_static_face_no_runtime_keys():
-    """§3.1 static-key principle: the four §3.1 keys of capabilities["4"]
-    never carry runtime-injected values and every advertised value is a
-    literal boolean True — replay-log configuration or DB state must not
-    bleed into the advertisement. (2026-08-19 revision: the face also
-    carries the module-constant-derived readiness gate and — since the
-    4.2.0 close-out, messages.expand.v4 satisfied — the §14 expand block.)"""
+    """§3.1 static-key principle: the six §3.1 static keys of
+    capabilities["4"] never carry runtime-injected values and every
+    advertised value is a literal boolean True — replay-log configuration
+    or DB state must not bleed into the advertisement. (2026-08-19
+    revision: the face also carries the module-constant-derived readiness
+    gate and — since the 4.2.0 close-out, messages.expand.v4 satisfied —
+    the §14 expand block; 4.11.0 adds the messagesSince/fileRaw static
+    booleans.)"""
     async with _client(_build_app()) as client:
         caps = (await client.get("/slimapi/versions")).json()["capabilities"]
         for key in ("globalSessions", "auxiliaryFilters", "sseReplay",
-                    "qpImmediateFull"):
+                    "qpImmediateFull", "messagesSince", "fileRaw"):
             assert caps["4"][key] is True
         assert set(caps["4"]) == {
             "globalSessions", "auxiliaryFilters",
-            "sseReplay", "qpImmediateFull", "readiness", "expand",
+            "sseReplay", "qpImmediateFull",
+            "messagesSince", "fileRaw",
+            "readiness", "expand",
         }
 
 

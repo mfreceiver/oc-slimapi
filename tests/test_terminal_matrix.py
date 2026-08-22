@@ -424,14 +424,19 @@ async def test_versions_terminal_shape():
         assert set(body["capabilities"].keys()) == {"4"}
         # four static §3.1 keys by value + the additive §3.3 readiness key
         # and §14 expand block (2026-08-19 revision / 4.2.0 close-out;
-        # payload shapes locked in test_versions_readiness.py)
+        # payload shapes locked in test_versions_readiness.py) + the two
+        # 4.11.0 revision-five static booleans (§10.3 / §19)
         assert body["capabilities"]["4"]["globalSessions"] is True
         assert body["capabilities"]["4"]["auxiliaryFilters"] is True
         assert body["capabilities"]["4"]["sseReplay"] is True
         assert body["capabilities"]["4"]["qpImmediateFull"] is True
+        assert body["capabilities"]["4"]["messagesSince"] is True
+        assert body["capabilities"]["4"]["fileRaw"] is True
         assert set(body["capabilities"]["4"]) == {
             "globalSessions", "auxiliaryFilters",
-            "sseReplay", "qpImmediateFull", "readiness", "expand",
+            "sseReplay", "qpImmediateFull",
+            "messagesSince", "fileRaw",
+            "readiness", "expand",
         }
 
 

@@ -120,6 +120,10 @@ VERSIONS_PAYLOAD_GOLDEN = {
             "auxiliaryFilters": True,
             "sseReplay": True,
             "qpImmediateFull": True,
+            # 4.11.0 修订五：静态面加性两键（§10.3 since 差分 / §19 file
+            # raw），随实现同批恒 true。
+            "messagesSince": True,
+            "fileRaw": True,
             "readiness": {
                 "ready": True,
                 "required": list(_B12_NORMALIZED_UNIVERSE),
@@ -507,7 +511,7 @@ async def test_versions_payload_dual_window():
         assert body["available"] == [4]
 
 
-async def test_versions_v4_capabilities_four_static_keys():
+async def test_versions_v4_capabilities_static_keys():
     app = _build_app()
     async with _client(app) as client:
         body = (await client.get("/slimapi/versions", headers=IDENTITY)).json()
@@ -521,13 +525,20 @@ async def test_versions_v4_capabilities_four_static_keys():
         # the 4.2.0 close-out (SATISFIED = full universe); the four static
         # values stay locked here, the readiness/expand payloads in
         # test_versions_readiness.py.
+        # 4.11.0 revision five: two more static booleans (messagesSince
+        # §10.3 / fileRaw §19) slot in after qpImmediateFull, same-batch
+        # with their implementations.
         assert caps["4"]["globalSessions"] is True
         assert caps["4"]["auxiliaryFilters"] is True
         assert caps["4"]["sseReplay"] is True
         assert caps["4"]["qpImmediateFull"] is True
+        assert caps["4"]["messagesSince"] is True
+        assert caps["4"]["fileRaw"] is True
         assert list(caps["4"].keys()) == [
             "globalSessions", "auxiliaryFilters",
-            "sseReplay", "qpImmediateFull", "readiness", "expand",
+            "sseReplay", "qpImmediateFull",
+            "messagesSince", "fileRaw",
+            "readiness", "expand",
         ]
 
 

@@ -171,6 +171,9 @@ VERSIONS_PAYLOAD_GOLDEN = {
             "auxiliaryFilters": True,
             "sseReplay": True,
             "qpImmediateFull": True,
+            # 4.11.0 修订五：静态面加性两键（§10.3 / §19），恒 true。
+            "messagesSince": True,
+            "fileRaw": True,
             "readiness": {
                 "ready": True,
                 "required": list(CONTRACT_REQUIRED_NORMALIZED),
@@ -507,7 +510,8 @@ def test_caps4_helper_expand_shape_when_satisfied():
     caps4 = versions_mod._capabilities4(sat)
     assert list(caps4.keys()) == [
         "globalSessions", "auxiliaryFilters", "sseReplay",
-        "qpImmediateFull", "readiness", "expand",
+        "qpImmediateFull", "messagesSince", "fileRaw",
+        "readiness", "expand",
     ]
     assert caps4["expand"]["categories"] == EXPAND_CATEGORIES
     assert len(EXPAND_CATEGORIES) == 12
@@ -522,7 +526,8 @@ def test_caps4_helper_current_state_expand_emitted():
     caps4 = versions_mod._capabilities4()
     assert list(caps4.keys()) == [
         "globalSessions", "auxiliaryFilters", "sseReplay",
-        "qpImmediateFull", "readiness", "expand",
+        "qpImmediateFull", "messagesSince", "fileRaw",
+        "readiness", "expand",
     ]
     assert "expand" in caps4
     assert caps4["expand"]["categories"] == EXPAND_CATEGORIES
@@ -537,7 +542,8 @@ def test_caps4_helper_gate_off_expand_absent():
         readiness.REQUIRED_SET - {EXPAND_FEATURE_ID})
     assert list(caps4.keys()) == [
         "globalSessions", "auxiliaryFilters", "sseReplay",
-        "qpImmediateFull", "readiness",
+        "qpImmediateFull", "messagesSince", "fileRaw",
+        "readiness",
     ]
     assert "expand" not in caps4
 
@@ -563,7 +569,8 @@ async def test_versions_caps4_readiness_emitted():
     caps4 = caps["4"]
     assert list(caps4.keys()) == [
         "globalSessions", "auxiliaryFilters", "sseReplay",
-        "qpImmediateFull", "readiness", "expand",
+        "qpImmediateFull", "messagesSince", "fileRaw",
+        "readiness", "expand",
     ]
     assert caps4["readiness"] == readiness.readiness_payload()
     assert caps4["readiness"] == {
