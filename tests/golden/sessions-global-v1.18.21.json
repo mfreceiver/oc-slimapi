@@ -1,15 +1,15 @@
 {
-  "version": "v1.18.18",
+  "version": "v1.18.21",
   "generator": "mirror-oracle-v1",
-  "fingerprint": "6bd28e9598c41b6e",
+  "fingerprint": "6d23e53d77682cd2",
   "dataset_manifest": {
     "sessions": 24,
     "projects": 2,
-    "digest": "0a98f151671b36ed"
+    "digest": "d3641a234fed5e21"
   },
-  "dataset_digest": "0a98f151671b36ed",
-  "response_fingerprint": "9807a27186ef8d8a",
-  "upstream_locked": "v1.18.18",
+  "dataset_digest": "d3641a234fed5e21",
+  "response_fingerprint": "63d8d23e134c81cf",
+  "upstream_locked": "v1.18.21",
   "regenerate_hint": ".venv/bin/python tests/v4_fixture.py --write-golden",
   "query": {
     "archived": "all",
@@ -31,7 +31,7 @@
         "id": "model-ses_time_now",
         "providerID": "prov-0"
       },
-      "version": "1.18.18",
+      "version": "1.18.21",
       "summary_additions": 5,
       "summary_deletions": 0,
       "summary_files": 1,
@@ -69,7 +69,7 @@
         "id": "model-ses_case_fold",
         "providerID": "prov-1"
       },
-      "version": "1.18.18",
+      "version": "1.18.21",
       "summary_additions": 0,
       "summary_deletions": 1,
       "summary_files": 0,
@@ -107,7 +107,7 @@
         "id": "model-ses_search_decoy",
         "providerID": "prov-0"
       },
-      "version": "1.18.18",
+      "version": "1.18.21",
       "summary_additions": 5,
       "summary_deletions": 0,
       "summary_files": 1,
@@ -145,7 +145,7 @@
         "id": "model-ses_archived_child",
         "providerID": "prov-0"
       },
-      "version": "1.18.18",
+      "version": "1.18.21",
       "summary_additions": 0,
       "summary_deletions": 0,
       "summary_files": 1,
@@ -183,7 +183,7 @@
         "id": "model-ses_revert_full",
         "providerID": "prov-2"
       },
-      "version": "1.18.18",
+      "version": "1.18.21",
       "summary_additions": 6,
       "summary_deletions": 2,
       "summary_files": 1,
@@ -226,7 +226,7 @@
         "id": "model-ses_orphan_proj",
         "providerID": "prov-0"
       },
-      "version": "1.18.18",
+      "version": "1.18.21",
       "summary_additions": 2,
       "summary_deletions": 0,
       "summary_files": 0,
@@ -264,7 +264,7 @@
         "id": "model-ses_tie_c",
         "providerID": "prov-1"
       },
-      "version": "1.18.18",
+      "version": "1.18.21",
       "summary_additions": 2,
       "summary_deletions": 1,
       "summary_files": 0,
@@ -302,7 +302,7 @@
         "id": "model-ses_tie_b",
         "providerID": "prov-0"
       },
-      "version": "1.18.18",
+      "version": "1.18.21",
       "summary_additions": 2,
       "summary_deletions": 0,
       "summary_files": 0,
@@ -340,7 +340,7 @@
         "id": "model-ses_tie_a",
         "providerID": "prov-0"
       },
-      "version": "1.18.18",
+      "version": "1.18.21",
       "summary_additions": 1,
       "summary_deletions": 0,
       "summary_files": 1,
@@ -378,7 +378,7 @@
         "id": "model-ses_host_style",
         "providerID": "prov-2"
       },
-      "version": "1.18.18",
+      "version": "1.18.21",
       "summary_additions": 5,
       "summary_deletions": 2,
       "summary_files": 1,
@@ -416,7 +416,7 @@
         "id": "model-ses_legacy_empty",
         "providerID": "prov-1"
       },
-      "version": "1.18.18",
+      "version": "1.18.21",
       "summary_additions": 3,
       "summary_deletions": 1,
       "summary_files": 0,
@@ -454,7 +454,7 @@
         "id": "model-ses_case",
         "providerID": "prov-2"
       },
-      "version": "1.18.18",
+      "version": "1.18.21",
       "summary_additions": 4,
       "summary_deletions": 2,
       "summary_files": 1,
@@ -492,7 +492,7 @@
         "id": "model-ses_same_level",
         "providerID": "prov-2"
       },
-      "version": "1.18.18",
+      "version": "1.18.21",
       "summary_additions": 2,
       "summary_deletions": 2,
       "summary_files": 0,
@@ -530,7 +530,7 @@
         "id": "model-ses_a_us",
         "providerID": "prov-1"
       },
-      "version": "1.18.18",
+      "version": "1.18.21",
       "summary_additions": 1,
       "summary_deletions": 1,
       "summary_files": 1,
@@ -568,7 +568,7 @@
         "id": "model-ses_a_pct",
         "providerID": "prov-0"
       },
-      "version": "1.18.18",
+      "version": "1.18.21",
       "summary_additions": 6,
       "summary_deletions": 0,
       "summary_files": 1,
@@ -606,7 +606,7 @@
         "id": "model-ses_root_3",
         "providerID": "prov-2"
       },
-      "version": "1.18.18",
+      "version": "1.18.21",
       "summary_additions": 5,
       "summary_deletions": 2,
       "summary_files": 0,
@@ -644,7 +644,7 @@
         "id": "model-ses_root_2",
         "providerID": "prov-1"
       },
-      "version": "1.18.18",
+      "version": "1.18.21",
       "summary_additions": 1,
       "summary_deletions": 1,
       "summary_files": 1,
@@ -682,7 +682,7 @@
         "id": "model-ses_child_c",
         "providerID": "prov-2"
       },
-      "version": "1.18.18",
+      "version": "1.18.21",
       "summary_additions": 1,
       "summary_deletions": 2,
       "summary_files": 1,
@@ -720,7 +720,7 @@
         "id": "model-ses_child_b",
         "providerID": "prov-2"
       },
-      "version": "1.18.18",
+      "version": "1.18.21",
       "summary_additions": 4,
       "summary_deletions": 2,
       "summary_files": 0,
@@ -758,7 +758,7 @@
         "id": "model-ses_child_a",
         "providerID": "prov-2"
       },
-      "version": "1.18.18",
+      "version": "1.18.21",
       "summary_additions": 0,
       "summary_deletions": 2,
       "summary_files": 1,
@@ -796,7 +796,7 @@
         "id": "model-ses_root_1",
         "providerID": "prov-1"
       },
-      "version": "1.18.18",
+      "version": "1.18.21",
       "summary_additions": 6,
       "summary_deletions": 1,
       "summary_files": 0,
@@ -834,7 +834,7 @@
         "id": "model-ses_time_zero",
         "providerID": "prov-1"
       },
-      "version": "1.18.18",
+      "version": "1.18.21",
       "summary_additions": 6,
       "summary_deletions": 1,
       "summary_files": 1,

@@ -31,7 +31,7 @@ from oc_slimapi.dbaux import ROW_KEYS
 # 真库 json 列，镜像容忍语义必须同步覆盖，否则 oracle 与生产漂移）。
 JSON_COLS = ("summary_diffs", "revert", "permission", "metadata", "model")
 
-ALIGNED_VERSION = "v1.18.18"  # AGENTS.md：opencode-src/current 对齐版本
+ALIGNED_VERSION = "v1.18.21"  # AGENTS.md：src-ref/opencode/current 对齐版本
 GOLDEN_GENERATOR = "mirror-oracle-v1"
 GOLDEN_DIR = Path(__file__).resolve().parent / "golden"
 GOLDEN_PATH = GOLDEN_DIR / f"sessions-global-{ALIGNED_VERSION}.json"
@@ -501,7 +501,7 @@ REAL_UPSTREAM_BINARY = os.environ.get(
     "OC_SLIMAPI_EQ_BINARY",
     str(Path.home() / ".opencode" / "bin" / "opencode"),
 )
-REAL_UPSTREAM_VERSION = "1.18.18"
+REAL_UPSTREAM_VERSION = "1.18.21"
 REAL_GOLDEN_GENERATOR = f"real-upstream-http-{REAL_UPSTREAM_VERSION}"
 REAL_GOLDEN_PATH = GOLDEN_DIR / f"sessions-global-real-{ALIGNED_VERSION}.json"
 
@@ -520,7 +520,7 @@ REAL_SERVER_ASSIGNED_FIELDS = [
 REAL_GOLDEN_HINT = (
     "OC_SLIMAPI_EQ_WRITE_REAL_GOLDEN=1 .venv/bin/python -m pytest "
     "tests/test_equivalence_anchor.py -k eq007_real_golden "
-    "（需真实 opencode 1.18.18 发布二进制）"
+    "（需真实 opencode 1.18.21 发布二进制）"
 )
 
 # golden 载荷的权威查询面（builder 与 validator 共用——漂移即校验失败）

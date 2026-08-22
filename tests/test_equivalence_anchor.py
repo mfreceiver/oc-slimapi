@@ -1,13 +1,13 @@
 """等价性锚定（design-v4-dbaux §10）：EQ-001..EQ-008。
 
 权威源混合（§10.4）：
-- ① 真实 opencode **发布二进制**（1.18.18）= 发布门（EQ-007：隔离实例
+- ① 真实 opencode **发布二进制**（1.18.21）= 发布门（EQ-007：隔离实例
   注入数据集 → 真实 HTTP handler vs 生产投影直读真实 DB 全量对照；
   二进制缺席才 skip）；
 - ② 版本标记 golden JSON = 日常 CI 默认——tests/golden/
-  sessions-global-v1.18.18.json（fixture 镜像 oracle 生成，生成器
-  mirror-oracle-v1）+ sessions-global-real-v1.18.18.json（真实 handler
-  生成，生成器 real-upstream-http-1.18.18，CI 降级校验）。
+  sessions-global-v1.18.21.json（fixture 镜像 oracle 生成，生成器
+  mirror-oracle-v1）+ sessions-global-real-v1.18.21.json（真实 handler
+  生成，生成器 real-upstream-http-1.18.21，CI 降级校验）。
 
 行集 oracle = tests/v4_fixture.mirror_page（独立谓词/排序/翻页实现）。
 """
@@ -336,12 +336,12 @@ def test_golden_in_repo_file_is_current():
 
 # --- EQ-007 真实进程权威等价门（rev gate BLOCKER-1；二进制缺席才 skip） ------
 #
-# 权威源① = 真实**发布二进制** /home/mar/.opencode/bin/opencode（1.18.18，
+# 权威源① = 真实**发布二进制** /home/mar/.opencode/bin/opencode（1.18.21，
 # 比源码构建更权威）。本机存在 → 默认必跑（session-scoped 隔离实例：
 # 随机高位端口 + 独立 HOME/XDG + tmp 目录）；仅二进制缺席允许 skip。
 # 二进制存在但起不来 / 版本漂移 = 测试**失败**（不静默 skip）。
 #
-# v1.18.18 注入 API（实测核对，与旧框架假设不同）：
+# v1.18.21 注入 API（实测核对，与旧框架假设不同）：
 # - POST /session?directory=<abs>：body CreateInput {parentID?, title?,
 #   agent?, model?, metadata?, permission?, workspaceID?}——**无 id、无
 #   location**（id 服务端生成，directory 由 query 参数路由）；
@@ -1347,7 +1347,7 @@ async def test_eq007_bad_json_probe_upstream_behavior(real_upstream):
         )
         conn.commit()
         conn.close()
-    # R5 MINOR-1：实证冻结——v1.18.18 上游坏 JSON → 500 整列表失败
+    # R5 MINOR-1：实证冻结——v1.18.21 上游坏 JSON → 500 整列表失败
     # （该版本无行级容忍；上游行为若漂移到其他状态码 = 语义变化，需上报）。
     assert status == 500, f"未预期的上游行为：{status} {snippet}"
     print(f"[EQ-007 实证] 上游坏 JSON → 500（整列表失败）：{snippet}")
