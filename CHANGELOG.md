@@ -26,6 +26,22 @@ ocdroid 对接时：
 
 ---
 
+## [4.11.1] - 2026-08-23 — 后端可靠性修复批（patch；wire 面无形状变化，客户端零必改）
+
+> 源于 2026-08-22 后端可靠性审计（`docs/automatic/20260822-1701_backend-reliability.md`）：P2×2 + P3×3 全部修复并附确定性回归测试，经独立对抗评审放行；无 P0/P1。wire 版本仍 (4,4)。
+
+### Fixed
+
+- **since 差分不再对缺 `info.time.created` 的退化行产生假阳性 `removed`**（BE-001，审计 P2；v4-contract §10.3 冻结不变量）：上游数据异常（缺/非数值/非有限 `created`）时，退化行此前以 epoch 0 浮顶并可被选为 removal 推断边界，导致窗口内未删除消息被误报 `removed`；现退化行拒绝作边界（该窗口宁可漏报，由 `messagesRevision` 变化 / 全量对账自愈），窗口耗尽或边界有效时的 `removed` 语义不变。
+- **SSE global hub 不再出现 grace 移除取消窗口内的僵尸连接**（BE-002，审计 P2）：hub grace 到期取消 unwind 的亚毫秒窗口内，新订阅者（`/slimapi/session/event` 与 token 双入口）可能落到零帧零心跳的死亡 hub 直到客户端超时；现取消的全组任务（run/flush/heartbeat）完全 unwind 后自动重生 upstream 组，重复 ensure、部分组存活、close 屏障等交错均收敛到单一重生路径。
+- **读组路由与 `GET /slimapi/file/raw` 转发不再截断含裸 `#` 的 query**（BE-003，审计 P3）：f-string 拼 URL 使 query 中原始 `#` 之后字节被当 fragment 静默丢弃；现字节域定点 `%23` 编码（仅 0x23），其余 query 字节保序不变（裸 `#` 属畸形客户端行为，正常 percent-encoded 流量零变化）。
+- **access-log 归档不再有压缩 TOCTOU 分裂/丢行窗口**（BE-004，审计 P3）：NTP 回拨跨午夜等场景下，压缩提交与 emit 日期切换可交错产生「.gz 旧前缀 + .jsonl 追加尾部」分裂归档或误删 live 文件；现以 active-transition 短锁串行化句柄切换与归档/prune 提交（同日期写入零锁开销），冲突轮次 defer 到下一维护周期，无丢行、无永久分裂。
+
+### Changed
+
+- **requires-python 收紧为 `>=3.11.5`**（BE-006 加固）：3.11.0–3.11.4 存在 `asyncio.wait_for(semaphore.acquire())` 许可丢失缺陷（CPython gh-90155，于 3.11.5 回移修复），两处 call-site 敏感；生产实测 3.14.4 免疫。仅打包元数据变化，不影响已部署运行时。
+- **契约/注释精度批**（no-wire 文档修正，随本版附带）：v4-contract §10.3 并列时间戳说明对齐伪代码严格 `(created, id)` 比较（BE-008，消除与伪代码矛盾的「同时间戳一律不报」表述）；`gzip_util` 阈值压缩与契约强制压缩两路径注释区分；`/permission`·`/question` 上游响应形状 docstring 修正；access-log 锁职责注释随 BE-004 同步更新。
+
 ## [4.11.0] - 2026-08-22 — 修订五：流量优化族 P1–P6（minor；wire 仍 v4，全部加性）
 
 > **客户端零必改**；P1/P2/P4/P5 为可选接入的省流能力，消费指引见 `docs/specs/CLIENT_CHANGES.md` §4.11.0，权威规范见 `docs/specs/v4-contract.md` 修订五。
