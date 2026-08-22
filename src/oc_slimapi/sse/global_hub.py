@@ -261,38 +261,76 @@ class GlobalHub:
         for the just-cancelled run task to wind down (the ``task.done()``
         check below would otherwise block the rebuild).
 
-        BE-002: if the current run task is mid-cancel-unwind
-        (``cancelling()`` but not ``done()``), the ``done()`` guard above
-        no-ops and a fresh consumer would be left on a zero-task zombie
-        hub. In that window this arms :meth:`_revive_after_group` instead,
-        which rebuilds once the whole old group has quiesced. Terminals:
-        after :meth:`HubRegistry.close` (``_closing``), this is a no-op.
+        BE-002 (gate review round 2): the rebuild decision is
+        FULL-GROUP-QUIESCENCE based. Decision order:
+
+        1. ``_closing`` → hard no-op (close() is terminal).
+        2. a pending ``_revive_task`` → that waiter OWNS the rebuild; a
+           later caller must neither spawn (a direct ``_spawn_group()``
+           here would bypass the quiescence wait — e.g. run already
+           ``done()`` while flush/heartbeat are still unwinding — and
+           briefly run TWO groups against the shared subscriber set) nor
+           stack a second waiter.
+        3. a healthy live run task (not done, not cancelling) → no-op.
+        4. the whole old group absent/done → synchronous ``_spawn_group``.
+        5. anything else — run mid-cancel-unwind (``cancelling()`` but not
+           ``done()``), or run already done/absent with flush/heartbeat
+           still alive — cancel the surviving members (idempotent for
+           already-cancelling tasks) and arm the single full-group
+           :meth:`_revive_after_group` waiter.
         """
         if self._closing:
             # BE-002 closing barrier: once close() has started, never build
             # a group again — a revival here would outlive the registry.
             return
+        if self._revive_task is not None:
+            # Round-2 blocking fix: the pending full-group waiter owns the
+            # rebuild. Returning here (BEFORE the done() check below) is
+            # what closes the bypass where a second ensure_upstream() saw
+            # ``task.done()`` True and spawned directly while the waiter
+            # was still waiting for the siblings to quiesce.
+            return
         if self.stop_task:
             self.stop_task.cancel()
             self.stop_task = None
-        if not self.task or self.task.done():
+        old_run = self.task
+        old_flush = self.flush_task
+        old_heartbeat = self.heartbeat_task
+        if (
+            old_run is not None
+            and not old_run.done()
+            and not old_run.cancelling()
+        ):
+            # Group running normally — nothing to ensure.
+            return
+        if all(
+            member is None or member.done()
+            for member in (old_run, old_flush, old_heartbeat)
+        ):
+            # Whole old group quiesced (or never built) → direct rebuild
+            # is safe: no sibling can still be mid-unwind.
             self._spawn_group()
             return
-        if self.task.cancelling():
-            # BE-002: the old group is mid-cancel-unwind (grace removal or
-            # close cancelled it, but the tasks have not finished raising
-            # CancelledError yet). Spawning immediately would briefly run
-            # TWO groups against the shared subscriber set; instead arm a
-            # revival waiter that rebuilds once the WHOLE group (run +
-            # flush + heartbeat) has quiesced.
-            if self._revive_task is not None:
-                return  # a waiter is already pending — do not stack
-            old_run = self.task
-            old_flush = self.flush_task
-            old_heartbeat = self.heartbeat_task
-            self._revive_task = asyncio.create_task(
-                self._revive_after_group(old_run, old_flush, old_heartbeat)
-            )
+        # Partial-group window: run mid-cancel-unwind, OR run already
+        # done/absent while flush/heartbeat are still alive. Cancel the
+        # survivors so the group CAN quiesce, then arm the single
+        # full-group revival waiter — never a direct _spawn_group() here
+        # (two concurrent groups would share the subscriber set). gather
+        # inside the waiter tolerates already-done members (run done).
+        # ``not member.cancelling()`` is load-bearing: re-cancelling a
+        # task that is ALREADY unwinding would inject a second
+        # CancelledError into its cleanup (truncating e.g. an httpx
+        # teardown in flight) — a pending cancellation needs no nudge.
+        for member in (old_run, old_flush, old_heartbeat):
+            if (
+                member is not None
+                and not member.done()
+                and not member.cancelling()
+            ):
+                member.cancel()
+        self._revive_task = asyncio.create_task(
+            self._revive_after_group(old_run, old_flush, old_heartbeat)
+        )
 
     async def _revive_after_group(
         self,

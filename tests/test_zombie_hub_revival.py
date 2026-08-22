@@ -481,6 +481,108 @@ class TestTokenAttachRollback:
 
 
 # ===========================================================================
+# 8 — round-2 gate review: no bypass of the full-group waiter
+# ===========================================================================
+
+class TestNoBypassOfPendingWaiter:
+    """A second ensure_upstream() while the waiter is pending and the old
+    run task is ALREADY done (but siblings still unwinding) must NOT
+    spawn directly — the pending waiter owns the rebuild."""
+
+    async def test_bypass_attempt_with_existing_waiter(self):
+        hub, gates = _make_gated_hub()
+        try:
+            hub.subscribers.add(Subscriber())
+            hub.ensure_upstream()
+            await _pump(2)  # park the gated trio at their 3600s sleeps
+            old_run = hub.task
+            old_flush = hub.flush_task
+            old_heartbeat = hub.heartbeat_task
+            spawns = _spawn_spy(hub)
+
+            await _cancel_trio(hub)
+            await _pump(2)  # trio parks mid-unwind at the gates
+            hub.ensure_upstream()  # arms the revival waiter
+            waiter = hub._revive_task
+            assert waiter is not None
+
+            # Old run finishes its unwind; siblings stay parked.
+            gates["run"].set()
+            await _pump(2)
+            assert old_run.done()
+            assert not old_flush.done() and not old_heartbeat.done()
+
+            # BYPASS ATTEMPT: pre-fix code took the ``task.done()`` branch
+            # here and spawned directly, leaving the waiter racing a
+            # second group. Must be a no-op while the waiter is pending.
+            hub.ensure_upstream()
+            hub.ensure_upstream()
+            assert hub._revive_task is waiter  # still the same one waiter
+            assert spawns == []                # no group was built
+            assert hub.task is old_run         # no new group assigned
+
+            # Release the siblings → exactly ONE new group, via the waiter.
+            gates["flush"].set()
+            gates["heartbeat"].set()
+            await _pump(4)
+            assert spawns == [1]
+            assert hub.task is not old_run
+            assert hub.flush_task is not old_flush
+            assert hub.heartbeat_task is not old_heartbeat
+            for fresh in (hub.task, hub.flush_task, hub.heartbeat_task):
+                assert fresh is not None and not fresh.done()
+            assert hub._revive_task is None
+        finally:
+            await _shutdown_hub(hub, gates)
+
+
+class TestPartialGroupWithoutWaiter:
+    """First ensure_upstream() landing on a hub whose run task is already
+    done while flush/heartbeat are still alive must NOT spawn directly —
+    it cancels the survivors and goes through the full-group waiter."""
+
+    async def test_partial_group_first_ensure_goes_through_waiter(self):
+        hub, gates = _make_gated_hub()
+        try:
+            hub.subscribers.add(Subscriber())
+            hub.ensure_upstream()
+            await _pump(2)  # park the gated trio
+            old_run = hub.task
+            old_flush = hub.flush_task
+            old_heartbeat = hub.heartbeat_task
+            spawns = _spawn_spy(hub)
+
+            # Make ONLY the run task done (cancel + release its gate),
+            # leaving flush/heartbeat alive and parked (never cancelled).
+            old_run.cancel()
+            gates["run"].set()
+            await _pump(2)
+            assert old_run.done()
+            assert not old_flush.done() and not old_heartbeat.done()
+
+            # First ensure_upstream on the partial group: no direct spawn.
+            hub.ensure_upstream()
+            assert spawns == []                # nothing spawned yet
+            assert hub._revive_task is not None  # waiter armed instead
+            assert hub.task is old_run         # group not replaced
+            # Survivors were cancelled so the group CAN quiesce.
+            assert old_flush.cancelling() and old_heartbeat.cancelling()
+
+            # Siblings finish unwinding → exactly one new group.
+            gates["flush"].set()
+            gates["heartbeat"].set()
+            await _pump(4)
+            assert spawns == [1]
+            assert hub.task is not old_run and not hub.task.done()
+            assert hub.flush_task is not old_flush and not hub.flush_task.done()
+            assert (hub.heartbeat_task is not old_heartbeat
+                    and not hub.heartbeat_task.done())
+            assert hub._revive_task is None
+        finally:
+            await _shutdown_hub(hub, gates)
+
+
+# ===========================================================================
 # 7a — events entry: subscriber gets REAL frames + heartbeats after revival
 # ===========================================================================
 
