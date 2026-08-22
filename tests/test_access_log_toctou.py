@@ -167,8 +167,11 @@ def test_compress_commit_defers_when_emit_reopens_source_mid_gzip(tmp_path):
 
         switch_done.set()  # release the compressor into its final commit
     finally:
+        # BE-004 review #3: release the pinned compressor FIRST, then join —
+        # if an assertion above already failed, join must not sit out its
+        # full timeout waiting for a barrier we control.
+        switch_done.set()
         t.join(15)
-        switch_done.set()  # safety net on any early failure
     assert not t.is_alive()
     assert errors == []
 
@@ -281,3 +284,110 @@ def test_prune_defers_active_handler_open_file(tmp_path):
     assert handler.current_path is None
     assert mod.prune_old_access_logs(str(tmp_path), 2, _TODAY) == 1
     assert not src.exists()
+
+
+class _UnknowablePathHandler(DailyAccessHandler):
+    """Handler whose active path cannot be determined (property raises)."""
+
+    @property
+    def current_path(self):  # type: ignore[override]
+        raise RuntimeError("active path unknowable")
+
+
+def test_unknowable_active_path_fails_closed(tmp_path):
+    """BE-004 review #1: indeterminable active path ⇒ defer, never commit.
+
+    ``_is_active_source`` must distinguish "authoritatively nothing open"
+    (ref None / current_path None → proceed) from "cannot determine"
+    (current_path raises → treat as ACTIVE → defer). Both the compress
+    commit and prune defer: source kept, no .gz, no deletion, no leftover
+    temp — the file archives/prunes normally once the path becomes
+    determinable again (next tick).
+    """
+    src = tmp_path / f"access-{_OLD.isoformat()}.jsonl"
+    src.write_text("line\n", encoding="utf-8")
+    gz = src.with_name(src.name + ".gz")
+
+    mod._active_handler_ref = _UnknowablePathHandler(directory=str(tmp_path))
+
+    # Compress: advisory snapshot cannot skip (returns None on raise), but
+    # the authoritative commit check must fail closed and defer.
+    assert mod.compress_old_access_logs(str(tmp_path), _TODAY) == 0
+    assert src.exists()
+    assert not gz.exists()
+    assert list(tmp_path.glob("*.gz.tmp.*")) == []
+
+    # Prune: same fail-closed rule for the unlink path.
+    assert mod.prune_old_access_logs(str(tmp_path), 2, _TODAY) == 0
+    assert src.exists()
+
+    # Determinable again (no handler): everything proceeds normally.
+    mod._active_handler_ref = None
+    assert mod.compress_old_access_logs(str(tmp_path), _TODAY) == 1
+    assert gz.exists()
+    assert not src.exists()
+
+
+def test_commit_first_then_rollback_emit_keeps_all_lines(tmp_path):
+    """BE-004 review #2: legitimate commit-first ordering must not over-defer.
+
+    Maintenance commits the archive (gzip + replace + unlink) BEFORE any
+    rollback emit happens; a subsequent stale-dated emit (clock rollback)
+    then re-creates a FRESH source .jsonl (new inode, append mode) and
+    writes a straggler tail. Invariants asserted:
+
+    * no loss, no duplication — the union of .gz + .jsonl lines equals
+      exactly the lines written, in order (archive prefix + rollback tail);
+    * later ticks conservatively skip the fresh .jsonl (.gz sibling
+      exists), leaving the shape stable.
+
+    NOTE — expected durable end state: a NON-OVERLAPPING .gz PREFIX plus
+    .jsonl TAIL under the same date stem. That is the inherent result of
+    archiving first and then rolling the clock back to append more lines
+    for that date; it is NOT the "permanently split archive" defect (which
+    means lost/divergent data). Every line survives exactly once, split
+    across the two files — data-conservation is the contract, single-file
+    re-merge is not.
+    """
+    src = tmp_path / f"access-{_OLD.isoformat()}.jsonl"
+    gz = src.with_name(src.name + ".gz")
+    src.write_text("archived-1\narchived-2\n", encoding="utf-8")
+
+    # Handler live on TODAY's file — the OLD-dated source is genuinely
+    # inactive, so maintenance must commit (not defer) on the first tick.
+    handler = _make_handler(tmp_path)
+    handler.emit(_make_record("today-line", target_date=_TODAY))
+    mod._active_handler_ref = handler
+
+    # 1) Commit-first: clean archive of the old file.
+    assert mod.compress_old_access_logs(str(tmp_path), _TODAY) == 1
+    assert gz.exists()
+    assert not src.exists()
+    with gzip.open(gz, "rt", encoding="utf-8") as f:
+        assert f.read() == "archived-1\narchived-2\n"
+
+    # 2) Clock rollback AFTER the commit: stale-dated emit re-creates the
+    #    source (fresh inode) and appends the tail. No lines sink into a
+    #    deleted inode — the handler's fd points at the new visible file.
+    handler.emit(_make_record("rollback-tail", target_date=_OLD))
+    assert handler.current_path == src
+    assert src.read_text(encoding="utf-8") == "rollback-tail\n"
+
+    # 3) Data conservation: archive prefix + rollback tail, each line once.
+    with gzip.open(gz, "rt", encoding="utf-8") as f:
+        gz_lines = f.read().splitlines()
+    jsonl_lines = src.read_text(encoding="utf-8").splitlines()
+    assert gz_lines + jsonl_lines == [
+        "archived-1",
+        "archived-2",
+        "rollback-tail",
+    ]
+
+    # 4) Stability: later ticks keep both files (conservative .gz-exists
+    #    skip), whether the handler still holds the source or not.
+    assert mod.compress_old_access_logs(str(tmp_path), _TODAY) == 0
+    handler.close()
+    assert mod.compress_old_access_logs(str(tmp_path), _TODAY) == 0
+    assert gz.exists() and src.exists()
+    assert src.read_text(encoding="utf-8") == "rollback-tail\n"
+    assert list(tmp_path.glob("*.gz.tmp.*")) == []

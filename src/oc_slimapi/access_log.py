@@ -62,9 +62,10 @@ _setup_lock = threading.Lock()
 # commit happens inside that short critical section, never under _MAINT_LOCK.
 _MAINT_LOCK = threading.Lock()
 
-# BE-004 short critical-section lock serialising *active-path transitions* —
-# the only points where the answer to "which .jsonl does the live handler
-# hold open" changes. Three participants:
+# BE-004 short critical-section lock serialising *active-path activations
+# and switches* — the points where a NEW file becomes (or is swapped in as)
+# the one the live handler holds open, plus the maintenance commits that
+# must be ordered against exactly those points. Participants:
 #
 #   * ``DailyAccessHandler.emit`` — held only across the date-switch
 #     close→open→``_current_date`` update segment; same-date emits never
@@ -75,6 +76,17 @@ _MAINT_LOCK = threading.Lock()
 #     (``_commit_archive`` / ``_prune_one``) — held around re-read-active +
 #     os.replace/unlink. gzip work itself runs WITHOUT this lock (it can
 #     take seconds; emit date-switches must not queue behind it).
+#
+# Deliberately NOT held by ``DailyAccessHandler.close()`` / ``__del__``:
+# those are active→inactive transitions in the production-safe direction
+# and need no ordering against commits. ``_close_current_fh`` drops the
+# handler's fh reference (``_current_fh = None``) before/regardless of the
+# fd actually closing, so a commit racing teardown observes either the
+# still-open path (defers one tick — harmless) or ``current_path is None``
+# (proceeds — safe: the handler has dropped the reference and will never
+# write through that fd again, so no straggler line can be sunk). The lock
+# protects activation/switch + commit ordering; teardown to "nothing open"
+# is benign from the commit side.
 #
 # Why re-check instead of verify-then-unlink: an unlocked post-replace
 # re-check that discovers the source went active would leave a permanently
@@ -519,13 +531,14 @@ def _cleanup_leftover_tmp(dir: str) -> None:
 def _active_source_path_str() -> "str | None":
     """Resolved path of the live handler's currently-open .jsonl, or None.
 
-    ``None`` covers: no handler installed, handler installed but no file
-    open yet, or the property raising (defensive — treated as holding
-    nothing). BE-004: this read is only *authoritative* when performed
-    while holding :data:`_ACTIVE_TRANSITION_LOCK` (i.e. mutually exclusive
-    with emit date-switches and setup re-init); the advisory entry-time
-    snapshot in :func:`compress_old_access_logs` deliberately runs without
-    it.
+    ADVISORY helper only (BE-004 review #1): used by the entry-time snapshot
+    in :func:`compress_old_access_logs` to skip gzip work on files already
+    held open. ``None`` here covers both "nothing open" and "could not
+    determine" (property raising) — for the advisory purpose the
+    distinction is irrelevant: don't skip, and let the authoritative check
+    decide. The authoritative unlink/replace decision therefore does NOT
+    go through this helper — :func:`_is_active_source` fails closed when
+    the active path cannot be determined.
     """
     handler = _active_handler_ref
     if handler is None:
@@ -548,10 +561,33 @@ def _is_active_source(p: Path) -> bool:
     BE-004: callers making unlink/replace decisions must invoke this while
     holding :data:`_ACTIVE_TRANSITION_LOCK` — ordering against the emit
     date-switch and setup re-init critical sections is the entire point.
+
+    Fail-closed (BE-004 review #1): the three distinguishable states are
+
+    * no handler installed  → authoritatively inactive (nothing is held
+      open anywhere);
+    * handler's ``current_path`` is ``None`` → authoritatively inactive
+      (that handler holds no file open — it returns ``None`` exactly when
+      ``_current_fh`` is ``None``);
+    * ``current_path`` RAISES → **indeterminable** → treated as ACTIVE:
+      defer rather than risk unlinking a file a live fd points at. A
+      transiently broken read costs one deferred tick; a wrong "inactive"
+      could sink straggler lines into a deleted inode. Asymmetric risk →
+      fail closed.
     """
-    active = _active_source_path_str()
-    if active is None:
+    handler = _active_handler_ref
+    if handler is None:
         return False
+    try:
+        active_path = handler.current_path
+    except Exception:
+        return True  # indeterminable — fail closed, defer this tick
+    if active_path is None:
+        return False
+    try:
+        active = str(active_path.resolve())
+    except OSError:
+        active = str(active_path)
     try:
         p_resolved = str(p.resolve())
     except OSError:
@@ -569,11 +605,13 @@ def _commit_archive(
     transitions and setup re-init). After the — unlocked, possibly slow —
     gzip has finished, re-read the active path:
 
-    * source became active again during the gzip window → discard the temp
-      and defer the whole file to a later maintenance tick. Committing
-      anyway would unlink a file the live fd points at (straggler lines
-      lost into a deleted inode), and an unlocked post-replace re-check
-      would instead produce a permanently split archive.
+    * source became active again during the gzip window — or its
+      activeness became indeterminable (fail-closed, see
+      :func:`_is_active_source`) — → discard the temp and defer the whole
+      file to a later maintenance tick. Committing anyway would unlink a
+      file the live fd points at (straggler lines lost into a deleted
+      inode), and an unlocked post-replace re-check would instead produce
+      a permanently split archive.
     * still inactive → ``os.replace`` the .gz into place (atomic, the .gz
       is now authoritative) and unlink the source.
 
@@ -590,7 +628,16 @@ def _commit_archive(
             try:
                 tmp_path.unlink()
             except OSError:
-                pass
+                # BE-004 review #4: not silent — a one-off failure is
+                # benign (next tick's _cleanup_leftover_tmp retries), but
+                # persistent permission problems must be observable.
+                log.warning(
+                    "Deferred compress of %s: failed to discard temp %s; "
+                    "leftover-tmp cleanup next maintenance tick will retry",
+                    p,
+                    tmp_path,
+                    exc_info=True,
+                )
             return False
         # Atomic replace — the .gz is now authoritative.
         os.replace(str(tmp_path), str(gz_path))
@@ -776,8 +823,9 @@ def _prune_one(p: Path, log: logging.Logger) -> bool:
     with _ACTIVE_TRANSITION_LOCK:
         if _is_active_source(p):
             log.info(
-                "Deferring prune of %s — file is the active handler's open "
-                "source; retrying next maintenance tick",
+                "Deferring prune of %s — file is (or cannot be determined "
+                "not to be) the active handler's open source; retrying next "
+                "maintenance tick",
                 p,
             )
             return False
