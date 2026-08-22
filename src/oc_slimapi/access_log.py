@@ -44,22 +44,56 @@ _LOGGER_NAME = "oc_slimapi.access"
 _setup_lock = threading.Lock()
 
 # Cross-thread serialisation for the maintenance file operations (compress /
-# prune / migrate). Startup runs on the main thread; the maintenance loop
-# runs compress/prune via ``asyncio.to_thread`` in the default thread pool —
-# so two maintenance operations CAN overlap (startup migrate + first loop
-# tick, or a hot-reload re-init racing the loop). Without this lock the two
-# would share fixed ``.gz.tmp`` names and clobber each other's archives.
-# Granularity: whole-function hold — maintenance is inherently serial work
-# (gzip is CPU-bound, the file set is small); holding the lock for the whole
-# call is simpler than per-file critical sections and avoids TOCTOU windows
-# between the existence checks and the writes.
+# prune / migrate) against EACH OTHER. Startup runs on the main thread; the
+# maintenance loop runs compress/prune via ``asyncio.to_thread`` in the
+# default thread pool — so two maintenance operations CAN overlap (startup
+# migrate + first loop tick, or a hot-reload re-init racing the loop).
+# Without this lock the two would share fixed ``.gz.tmp`` names and clobber
+# each other's archives. Granularity: whole-function hold — maintenance is
+# inherently serial work (gzip is CPU-bound, the file set is small).
+#
+# What _MAINT_LOCK does **not** do (BE-004): it does not order maintenance
+# against changes of the *active* handler/path. emit date-switch transitions
+# and setup_access_log re-init run without _MAINT_LOCK (setup serialises on
+# _setup_lock; emit on the per-handler logging lock only) — so the answer to
+# "which .jsonl does the live handler hold open" can flip at ANY point during
+# a _MAINT_LOCK-held run. That ordering is _ACTIVE_TRANSITION_LOCK's job
+# (below): the authoritative active-path re-check for every unlink/replace
+# commit happens inside that short critical section, never under _MAINT_LOCK.
 _MAINT_LOCK = threading.Lock()
+
+# BE-004 short critical-section lock serialising *active-path transitions* —
+# the only points where the answer to "which .jsonl does the live handler
+# hold open" changes. Three participants:
+#
+#   * ``DailyAccessHandler.emit`` — held only across the date-switch
+#     close→open→``_current_date`` update segment; same-date emits never
+#     take it (zero hot-path cost).
+#   * ``setup_access_log`` — held across the teardown→install segment that
+#     replaces ``_active_handler_ref``.
+#   * ``compress_old_access_logs`` / ``prune_old_access_logs`` final commits
+#     (``_commit_archive`` / ``_prune_one``) — held around re-read-active +
+#     os.replace/unlink. gzip work itself runs WITHOUT this lock (it can
+#     take seconds; emit date-switches must not queue behind it).
+#
+# Why re-check instead of verify-then-unlink: an unlocked post-replace
+# re-check that discovers the source went active would leave a permanently
+# split archive (.gz holds the old prefix, the .jsonl keeps appending, and
+# later ticks skip forever because the .gz exists). The lock closes the
+# TOCTOU window itself: either the transition lands first and the commit
+# defers, or the commit lands first and any later emit (re)opens a fresh
+# visible file — a straggler line is never silently written into a deleted
+# inode. Orthogonal to _MAINT_LOCK (maintenance-vs-maintenance) and
+# _setup_lock (setup-vs-setup).
+_ACTIVE_TRANSITION_LOCK = threading.Lock()
 
 # Reference to the currently-installed DailyAccessHandler (set by
 # setup_access_log), so maintenance functions can avoid unlinking the .jsonl
-# that the live handler still holds open (see P1-25). ``None`` when no handler
-# is installed (disabled, or before setup). Read-only by maintenance; only
-# setup_access_log writes it (under _setup_lock).
+# that the live handler still holds open (see P1-25, BE-004). ``None`` when
+# no handler is installed (disabled, or before setup). Written only by
+# setup_access_log (under _setup_lock AND the transition lock); maintenance
+# reads it — authoritative reads (unlink/replace commit decisions) happen
+# under _ACTIVE_TRANSITION_LOCK, the entry-time advisory snapshot does not.
 _active_handler_ref: "DailyAccessHandler | None" = None
 
 # Maintenance logger — separate from the access logger so diagnostic warnings
@@ -128,8 +162,11 @@ class DailyAccessHandler(logging.Handler):
     (crossing midnight) the old file handle is closed and a new one opened.
     Files are opened in append (``"a"``) mode.
 
-    Thread-safety is provided by the :class:`logging.Handler` lock mechanism —
-    callers do not need additional synchronisation.
+    Thread-safety: same-handler emits are serialised by the
+    :class:`logging.Handler` lock mechanism. The date-switch transition
+    additionally holds :data:`_ACTIVE_TRANSITION_LOCK` (BE-004) so a
+    concurrent maintenance commit can never unlink a file this handler
+    just (re-)opened.
     """
 
     def __init__(self, directory: str) -> None:
@@ -193,14 +230,27 @@ class DailyAccessHandler(logging.Handler):
 
         When the date has changed since the last emit, the previous file handle
         is closed and a new one opened.
+
+        BE-004: the date-switch transition (close → open → ``_current_date``
+        update) runs under :data:`_ACTIVE_TRANSITION_LOCK` so it is mutually
+        exclusive with maintenance final commits (``_commit_archive`` /
+        ``_prune_one``) — without this, a compressor that snapshotted the
+        active path before the switch could unlink the very file this emit
+        just (re-)opened (e.g. NTP rollback making ``record.created`` map to
+        a past date), silently sinking straggler lines into a deleted inode.
+        Same-date emits take no lock — zero hot-path cost.
         """
         try:
             today = datetime.fromtimestamp(record.created).date()
             if self._current_date != today:
-                self._close_current_fh()
-                self._ensure_dir()
-                self._current_fh = self._open_file(today)
-                self._current_date = today
+                with _ACTIVE_TRANSITION_LOCK:
+                    # Re-check under the lock: another emit may have
+                    # completed the same switch while we waited for it.
+                    if self._current_date != today:
+                        self._close_current_fh()
+                        self._ensure_dir()
+                        self._current_fh = self._open_file(today)
+                        self._current_date = today
             msg = self.format(record)
             if self._current_fh is None:
                 return  # defensive — should not happen after _open_file above
@@ -238,36 +288,44 @@ def setup_access_log(*, enabled: bool, dir: str) -> logging.Logger:
     with _setup_lock:
         logger.setLevel(logging.INFO)
         logger.propagate = False
-        # Clear old handlers (idempotent — repeated setup is safe).
-        for handler in list(logger.handlers):
-            logger.removeHandler(handler)
+        # BE-004: the teardown→install segment below replaces the process's
+        # active handler — i.e. the answer to "which .jsonl is held open".
+        # Hold the transition lock across the whole replacement so a
+        # concurrent maintenance final commit re-reads either the old or
+        # the new handler state, never a torn in-between (ref cleared but
+        # old fd still meaningful / new handler not yet visible).
+        with _ACTIVE_TRANSITION_LOCK:
+            # Clear old handlers (idempotent — repeated setup is safe).
+            for handler in list(logger.handlers):
+                logger.removeHandler(handler)
+                try:
+                    handler.close()
+                except Exception:
+                    pass
+            # Drop the stale active-handler reference whenever we tear down
+            # the installed handlers (re-init / disable). Re-installed below
+            # if enabled.
+            _active_handler_ref = None
+            if not enabled:
+                logger.disabled = True
+                return logger
+            logger.disabled = False
+            # Best-effort directory creation + handler install.
             try:
-                handler.close()
+                Path(dir).mkdir(parents=True, exist_ok=True)
+                handler = DailyAccessHandler(directory=dir)
+                handler.setFormatter(logging.Formatter("%(message)s"))
+                logger.addHandler(handler)
+                # Record the live handler so maintenance can avoid unlinking
+                # its currently-open .jsonl (P1-25, BE-004).
+                _active_handler_ref = handler
             except Exception:
-                pass
-        # Drop the stale active-handler reference whenever we tear down the
-        # installed handlers (re-init / disable). Re-installed below if enabled.
-        _active_handler_ref = None
-        if not enabled:
-            logger.disabled = True
-            return logger
-        logger.disabled = False
-        # Best-effort directory creation + handler install.
-        try:
-            Path(dir).mkdir(parents=True, exist_ok=True)
-            handler = DailyAccessHandler(directory=dir)
-            handler.setFormatter(logging.Formatter("%(message)s"))
-            logger.addHandler(handler)
-            # Record the live handler so maintenance can avoid unlinking its
-            # currently-open .jsonl across cross-midnight idle gaps (P1-25).
-            _active_handler_ref = handler
-        except Exception:
-            logger.warning(
-                "Failed to set up DailyAccessHandler in %r; disabling access log",
-                dir,
-                exc_info=True,
-            )
-            logger.disabled = True
+                logger.warning(
+                    "Failed to set up DailyAccessHandler in %r; disabling access log",
+                    dir,
+                    exc_info=True,
+                )
+                logger.disabled = True
     return logger
 
 
@@ -458,6 +516,96 @@ def _cleanup_leftover_tmp(dir: str) -> None:
                 pass
 
 
+def _active_source_path_str() -> "str | None":
+    """Resolved path of the live handler's currently-open .jsonl, or None.
+
+    ``None`` covers: no handler installed, handler installed but no file
+    open yet, or the property raising (defensive — treated as holding
+    nothing). BE-004: this read is only *authoritative* when performed
+    while holding :data:`_ACTIVE_TRANSITION_LOCK` (i.e. mutually exclusive
+    with emit date-switches and setup re-init); the advisory entry-time
+    snapshot in :func:`compress_old_access_logs` deliberately runs without
+    it.
+    """
+    handler = _active_handler_ref
+    if handler is None:
+        return None
+    try:
+        active_path = handler.current_path
+    except Exception:
+        return None
+    if active_path is None:
+        return None
+    try:
+        return str(active_path.resolve())
+    except OSError:
+        return str(active_path)
+
+
+def _is_active_source(p: Path) -> bool:
+    """True if *p* resolves to the live handler's currently-open file.
+
+    BE-004: callers making unlink/replace decisions must invoke this while
+    holding :data:`_ACTIVE_TRANSITION_LOCK` — ordering against the emit
+    date-switch and setup re-init critical sections is the entire point.
+    """
+    active = _active_source_path_str()
+    if active is None:
+        return False
+    try:
+        p_resolved = str(p.resolve())
+    except OSError:
+        p_resolved = str(p)
+    return p_resolved == active
+
+
+def _commit_archive(
+    p: Path, tmp_path: Path, gz_path: Path, log: logging.Logger,
+) -> bool:
+    """BE-004: final commit of one compressed archive (short critical section).
+
+    Runs under :data:`_ACTIVE_TRANSITION_LOCK`, i.e. mutually exclusive with
+    the points where the active handler/path can change (emit date-switch
+    transitions and setup re-init). After the — unlocked, possibly slow —
+    gzip has finished, re-read the active path:
+
+    * source became active again during the gzip window → discard the temp
+      and defer the whole file to a later maintenance tick. Committing
+      anyway would unlink a file the live fd points at (straggler lines
+      lost into a deleted inode), and an unlocked post-replace re-check
+      would instead produce a permanently split archive.
+    * still inactive → ``os.replace`` the .gz into place (atomic, the .gz
+      is now authoritative) and unlink the source.
+
+    Returns ``True`` when committed, ``False`` when deferred.
+    """
+    with _ACTIVE_TRANSITION_LOCK:
+        if _is_active_source(p):
+            log.info(
+                "Deferring compress commit of %s — source became the active "
+                "handler's open file during gzip; retrying next maintenance "
+                "tick",
+                p,
+            )
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+            return False
+        # Atomic replace — the .gz is now authoritative.
+        os.replace(str(tmp_path), str(gz_path))
+        # Best-effort removal of the source .jsonl.
+        try:
+            p.unlink()
+        except OSError:
+            log.warning(
+                "Compressed %s but failed to delete source; .gz is authoritative",
+                p,
+                exc_info=True,
+            )
+        return True
+
+
 def compress_old_access_logs(dir: str, today: date) -> int:
     """Gzip-compress daily access log files older than *today*.
 
@@ -467,35 +615,32 @@ def compress_old_access_logs(dir: str, today: date) -> int:
       future-dated from clock skew — never compress those).
     * Skips files whose ``.gz`` sibling already exists (conservative — a
       damaged ``.gz`` from a previous run is not re-compressed).
-    * Writes to a unique ``.gz.tmp.<pid>.<token>`` → ``os.replace`` (atomic
-      commit) → deletes the source ``.jsonl``.  If source deletion fails a
-      warning is logged but the ``.gz`` is kept (already authoritative).
+    * Writes to a unique ``.gz.tmp.<pid>.<token>`` → atomic commit via
+      :func:`_commit_archive` under :data:`_ACTIVE_TRANSITION_LOCK` →
+      deletes the source ``.jsonl``.  If source deletion fails a warning
+      is logged but the ``.gz`` is kept (already authoritative).
     * Orphaned ``.gz.tmp`` files are cleaned up at the start of every call.
 
-    The whole call is serialised by :data:`_MAINT_LOCK` — maintenance is
-    inherently serial work (gzip is CPU-bound, the file set is small), and
-    the lock prevents startup-migrate / loop-tick / hot-reload re-init from
-    racing on the same directory. Returns the number of successfully
-    compressed files.
+    Serialisation (BE-004): whole-call :data:`_MAINT_LOCK` keeps maintenance
+    operations from overlapping each other; the active-path skip is
+    two-stage — an advisory entry-time snapshot (avoids gzip work on files
+    already held open) plus the authoritative re-check inside the
+    transition-locked commit, which closes the TOCTOU window where an emit
+    date-switch (or setup re-init) re-opens the source mid-gzip. Returns
+    the number of successfully compressed files.
     """
     log = _get_maint_log()
     with _MAINT_LOCK:
         _cleanup_leftover_tmp(dir)
-        # Snapshot the live handler's currently-held path once (under the
-        # lock so setup_access_log cannot flip it mid-run). Comparing paths
-        # by resolved string avoids unlinking a .jsonl whose fd the handler
-        # still holds open across a cross-midnight idle gap (P1-25): the
-        # inode would be freed only on next emit / process exit.
-        active_path: "Path | None" = None
-        handler = _active_handler_ref
-        if handler is not None:
-            try:
-                active_path = handler.current_path
-            except Exception:
-                active_path = None
-        active_path_str = (
-            str(active_path.resolve()) if active_path is not None else None
-        )
+        # BE-004 advisory fast-path snapshot (NOT authoritative): skip files
+        # already held open at entry so we don't gzip them every tick just
+        # to discard the temp at commit time. emit date-switches and setup
+        # re-init run without _MAINT_LOCK, so the source can become active
+        # at ANY point below — only _commit_archive's re-read (under
+        # _ACTIVE_TRANSITION_LOCK) is race-free. Comparing by resolved
+        # string (P1-25) avoids unlinking a .jsonl whose fd the handler
+        # still holds across a cross-midnight idle gap.
+        active_path_str = _active_source_path_str()
         count = 0
         for p in sorted(Path(dir).glob("access-*.jsonl")):
             m = _ACCESS_LOG_RE.match(p.name)
@@ -512,37 +657,32 @@ def compress_old_access_logs(dir: str, today: date) -> int:
             if gz_path.exists():
                 continue
 
-            # P1-25: never unlink the live handler's open source file —
-            # defer to a later tick instead.
-            try:
-                p_resolved = str(p.resolve())
-            except OSError:
-                p_resolved = str(p)
-            if active_path_str is not None and p_resolved == active_path_str:
-                log.info(
-                    "Skipping compress of %s — live handler still holds its fd; "
-                    "deferring to next maintenance tick",
-                    p,
-                )
-                continue
+            # P1-25 advisory: skip the live handler's held file up front;
+            # _commit_archive re-checks authoritatively.
+            if active_path_str is not None:
+                try:
+                    p_resolved = str(p.resolve())
+                except OSError:
+                    p_resolved = str(p)
+                if p_resolved == active_path_str:
+                    log.info(
+                        "Skipping compress of %s — live handler still holds "
+                        "its fd; deferring to next maintenance tick",
+                        p,
+                    )
+                    continue
 
             tmp_path = _unique_tmp_path(gz_path, ".tmp")
             try:
-                # Compress to the unique temporary file.
+                # Compress to the unique temporary file — unlocked (BE-004):
+                # gzip can take a while; emit date-switches must not queue
+                # behind it.
                 with open(p, "rb") as f_in, gzip.open(tmp_path, "wb") as f_out:
                     f_out.writelines(f_in)
-                # Atomic replace — the .gz is now authoritative.
-                os.replace(str(tmp_path), str(gz_path))
-                # Best-effort removal of the source .jsonl.
-                try:
-                    p.unlink()
-                except OSError:
-                    log.warning(
-                        "Compressed %s but failed to delete source; .gz is authoritative",
-                        p,
-                        exc_info=True,
-                    )
-                count += 1
+                # Atomic commit (re-read active path under the transition
+                # lock; defers if the source went active during gzip).
+                if _commit_archive(p, tmp_path, gz_path, log):
+                    count += 1
             except Exception:
                 log.warning(
                     "Failed to compress %s", p, exc_info=True,
@@ -570,7 +710,10 @@ def prune_old_access_logs(dir: str, retain_days: int, today: date) -> int:
 
     Serialised by :data:`_MAINT_LOCK` so it cannot race with a concurrent
     :func:`compress_old_access_logs` / :func:`migrate_legacy_access_log` on
-    the same directory. Returns the number of successfully deleted files.
+    the same directory. Each individual unlink additionally goes through
+    :func:`_prune_one` under :data:`_ACTIVE_TRANSITION_LOCK` (BE-004) so
+    prune never deletes a file the live handler just (re-)opened. Returns
+    the number of successfully deleted files.
     """
     if retain_days <= 0:
         return 0
@@ -604,13 +747,42 @@ def prune_old_access_logs(dir: str, retain_days: int, today: date) -> int:
                         continue
                 if file_date < deadline:
                     try:
-                        p.unlink()
-                        count += 1
+                        if _prune_one(p, log):
+                            count += 1
                     except Exception:
                         log.warning(
                             "Failed to prune %s", p, exc_info=True,
                         )
     return count
+
+
+def _prune_one(p: Path, log: logging.Logger) -> bool:
+    """BE-004: unlink one expired file under the active-transition lock.
+
+    The active-source check and the unlink are one atomic step with respect
+    to emit date-switch transitions and setup re-init (same TOCTOU class as
+    the compress commit, :func:`_commit_archive`): with an NTP rollback,
+    ``record.created`` can map to a date already past the prune deadline,
+    and a bare unlink would delete the file the live handler just opened —
+    its fd would point at a deleted inode and straggler lines would be
+    lost. Returns ``True`` when unlinked, ``False`` when deferred to a
+    later tick.
+
+    ``.gz`` targets trivially pass the active-source check (the handler only
+    ever opens ``.jsonl`` files) — the uniform path costs one string
+    compare and keeps the invariant "no maintenance unlink outside the
+    transition lock".
+    """
+    with _ACTIVE_TRANSITION_LOCK:
+        if _is_active_source(p):
+            log.info(
+                "Deferring prune of %s — file is the active handler's open "
+                "source; retrying next maintenance tick",
+                p,
+            )
+            return False
+        p.unlink()
+        return True
 
 
 def migrate_legacy_access_log(dir: str) -> int:
@@ -662,6 +834,11 @@ def _migrate_one(path: Path, label: str, log: logging.Logger) -> bool:
     ``os.replace`` (same atomic-commit guarantee as
     :func:`compress_old_access_logs`, now with a non-shared temp name so two
     concurrent invocations cannot clobber each other's archive).
+
+    BE-004: no active-transition lock here — :class:`DailyAccessHandler`
+    only ever opens dated ``access-YYYY-MM-DD.jsonl`` files, never the
+    ``access.jsonl`` / ``access.jsonl.N`` sources this function consumes, so
+    there is no active-handler competition to serialise against.
 
     Returns ``True`` if the file was actually migrated, ``False`` if skipped
     (destination already exists).
