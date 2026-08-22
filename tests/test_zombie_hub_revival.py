@@ -583,6 +583,174 @@ class TestPartialGroupWithoutWaiter:
 
 
 # ===========================================================================
+# 9 — round-3: exception death rebuilds via the waiter (single entry)
+# ===========================================================================
+
+class TestExceptionDeathRevivalViaWaiter:
+    """A group member dying with an EXCEPTION must rebuild through the
+    full-group revival waiter, not a direct _spawn_group: pre-round-3 the
+    supervisor callback spawned immediately while the just-cancelled
+    siblings were still unwinding (two concurrent groups)."""
+
+    async def test_flush_exception_rebuilds_after_group_quiesce(self):
+        hub, gates = _make_gated_hub()
+        boom = asyncio.Event()
+        try:
+            hub.subscribers.add(Subscriber())
+
+            calls = {"n": 0}
+
+            async def boom_once_flush():
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    await boom.wait()
+                    raise RuntimeError("flush boom")
+                # Rebuilt group: fall back to a normal gated loop.
+                try:
+                    await asyncio.sleep(3600.0)
+                except asyncio.CancelledError:
+                    await gates["flush"].wait()
+                    raise
+
+            hub.flush_loop = boom_once_flush  # type: ignore[assignment]
+            hub.ensure_upstream()
+            await _pump(2)  # run/hb park; flush parks at the boom gate
+            old_run = hub.task
+            old_flush = hub.flush_task
+            old_hb = hub.heartbeat_task
+            spawns = _spawn_spy(hub)
+
+            boom.set()
+            await _pump(4)  # flush raises; callback cancels run/hb; waiter armed
+            assert old_flush.done() and not old_flush.cancelled()
+            assert old_run is not None and old_run.cancelling()
+            assert old_hb is not None and old_hb.cancelling()
+            assert hub._revive_task is not None  # revival pending…
+            # …and NO new group while run/hb are parked mid-unwind.
+            assert spawns == []
+            assert hub.task is old_run
+
+            gates["run"].set()
+            gates["heartbeat"].set()
+            await _pump(4)
+            assert spawns == [1]  # exactly one group, only after quiesce
+            assert calls["n"] == 2  # new group's flush started once
+            assert hub.task is not old_run and not hub.task.done()
+            assert hub.flush_task is not old_flush and not hub.flush_task.done()
+            assert hub.heartbeat_task is not old_hb
+            assert hub.heartbeat_task is not None and not hub.heartbeat_task.done()
+            assert hub._revive_task is None
+        finally:
+            boom.set()
+            await _shutdown_hub(hub, gates)
+
+    async def test_run_exception_rebuilds_after_group_quiesce(self):
+        hub, gates = _make_gated_hub()
+        boom = asyncio.Event()
+        try:
+            hub.subscribers.add(Subscriber())
+
+            calls = {"n": 0}
+
+            async def boom_once_run():
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    await boom.wait()
+                    raise RuntimeError("run boom")
+                # Rebuilt group: fall back to a normal gated loop.
+                try:
+                    await asyncio.sleep(3600.0)
+                except asyncio.CancelledError:
+                    await gates["run"].wait()
+                    raise
+
+            hub.run = boom_once_run  # type: ignore[assignment]
+            hub.ensure_upstream()
+            await _pump(2)  # flush/hb park; run parks at the boom gate
+            old_run = hub.task
+            old_flush = hub.flush_task
+            old_hb = hub.heartbeat_task
+            spawns = _spawn_spy(hub)
+
+            boom.set()
+            await _pump(4)  # run raises; callback cancels flush/hb; waiter armed
+            assert old_run.done() and not old_run.cancelled()
+            assert old_flush is not None and old_flush.cancelling()
+            assert old_hb is not None and old_hb.cancelling()
+            assert hub._revive_task is not None
+            assert spawns == []  # no group while siblings unwind
+            assert hub.task is old_run
+
+            gates["flush"].set()
+            gates["heartbeat"].set()
+            await _pump(4)
+            assert spawns == [1]
+            assert calls["n"] == 2
+            assert hub.task is not old_run and not hub.task.done()
+            assert hub.flush_task is not old_flush and not hub.flush_task.done()
+            assert (hub.heartbeat_task is not old_hb
+                    and not hub.heartbeat_task.done())
+            assert hub._revive_task is None
+        finally:
+            boom.set()
+            await _shutdown_hub(hub, gates)
+
+
+# ===========================================================================
+# 10 — round-3: stop_task disarm happens even when returning early
+# (waiter pending) — the disarm promise holds for EVERY ensure_upstream
+# ===========================================================================
+
+class TestStopTaskDisarmOrdering:
+    async def test_ensure_upstream_disarms_stop_task_even_with_pending_waiter(
+        self, monkeypatch,
+    ):
+        monkeypatch.setattr("oc_slimapi.sse.global_hub.GRACE_SECONDS", 999.0)
+        hub, gates = _make_gated_hub()
+        try:
+            sub = Subscriber()
+            hub.subscribers.add(sub)
+            hub.ensure_upstream()
+            await _pump(2)  # park the gated trio
+            spawns = _spawn_spy(hub)
+
+            await _cancel_trio(hub)
+            await _pump(2)  # trio parks mid-unwind
+            hub.ensure_upstream()  # #1: arms the waiter
+            waiter = hub._revive_task
+            assert waiter is not None
+
+            # Interleave: last consumer leaves → hub-level grace timer
+            # armed while the waiter is pending...
+            hub.subscribers.discard(sub)
+            assert not hub.has_consumers()
+            hub.stop_task = asyncio.create_task(hub.stop_after_grace())
+            armed_stop = hub.stop_task
+
+            # ...then a fresh consumer arrives → ensure_upstream #2 must
+            # DISARM the timer even though it returns early (waiter
+            # pending). Pre-round-3 the early return left it armed.
+            fresh = Subscriber()
+            hub.subscribers.add(fresh)
+            hub.ensure_upstream()
+            assert hub.stop_task is None
+            with contextlib.suppress(asyncio.CancelledError):
+                await armed_stop  # cancelled, unwinds immediately
+            assert hub._revive_task is waiter  # still the single waiter
+
+            # Waiter rebuilds one group; the disarmed timer never fires.
+            for gate in gates.values():
+                gate.set()
+            await _pump(4)
+            assert spawns == [1]
+            assert hub.task is not None and not hub.task.done()
+            assert hub._revive_task is None
+        finally:
+            hub.subscribers.clear()
+            await _shutdown_hub(hub, gates)
+
+
+# ===========================================================================
 # 7a — events entry: subscriber gets REAL frames + heartbeats after revival
 # ===========================================================================
 

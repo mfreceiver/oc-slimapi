@@ -256,33 +256,47 @@ class GlobalHub:
         grace timer fired a moment earlier.
 
         INV-1 (P1-19): the run / flush / heartbeat tasks form ONE atomic
-        group. Group creation is delegated to :meth:`_spawn_group` so the
-        supervisor ``done_callback`` can force a rebuild without waiting
-        for the just-cancelled run task to wind down (the ``task.done()``
-        check below would otherwise block the rebuild).
+        group. ``_spawn_group`` builds a group; since BE-002 round 3 the
+        supervisor ``done_callback`` no longer rebuilds directly but goes
+        through this method, making the full-group revival waiter the
+        SINGLE rebuild entry behind a synchronous ``_spawn_group`` (which
+        remains safe only when the whole old group is already done).
 
         BE-002 (gate review round 2): the rebuild decision is
         FULL-GROUP-QUIESCENCE based. Decision order:
 
         1. ``_closing`` → hard no-op (close() is terminal).
-        2. a pending ``_revive_task`` → that waiter OWNS the rebuild; a
+        2. cancel any armed ``stop_after_grace`` (round 3: BEFORE the
+           waiter check — every ensure_upstream() call represents fresh
+           consumer interest, so the hub-level grace timer must be
+           disarmed unconditionally, including the calls that then
+           return early because a waiter owns the rebuild; a leftover
+           sleeping timer would eventually fire at a group the waiter
+           rebuilt. ``stop_after_grace`` itself re-checks
+           ``has_consumers()`` before cancelling, so the early position
+           can only disarm, never disarm-too-late).
+        3. a pending ``_revive_task`` → that waiter OWNS the rebuild; a
            later caller must neither spawn (a direct ``_spawn_group()``
            here would bypass the quiescence wait — e.g. run already
            ``done()`` while flush/heartbeat are still unwinding — and
            briefly run TWO groups against the shared subscriber set) nor
            stack a second waiter.
-        3. a healthy live run task (not done, not cancelling) → no-op.
-        4. the whole old group absent/done → synchronous ``_spawn_group``.
-        5. anything else — run mid-cancel-unwind (``cancelling()`` but not
+        4. a healthy live run task (not done, not cancelling) → no-op.
+        5. the whole old group absent/done → synchronous ``_spawn_group``.
+        6. anything else — run mid-cancel-unwind (``cancelling()`` but not
            ``done()``), or run already done/absent with flush/heartbeat
-           still alive — cancel the surviving members (idempotent for
-           already-cancelling tasks) and arm the single full-group
-           :meth:`_revive_after_group` waiter.
+           still alive — cancel the surviving members and arm the single
+           full-group :meth:`_revive_after_group` waiter.
         """
         if self._closing:
             # BE-002 closing barrier: once close() has started, never build
             # a group again — a revival here would outlive the registry.
             return
+        if self.stop_task:
+            # Round 3: unconditional disarm, before every other decision
+            # (see decision order 2 above).
+            self.stop_task.cancel()
+            self.stop_task = None
         if self._revive_task is not None:
             # Round-2 blocking fix: the pending full-group waiter owns the
             # rebuild. Returning here (BEFORE the done() check below) is
@@ -290,9 +304,6 @@ class GlobalHub:
             # ``task.done()`` True and spawned directly while the waiter
             # was still waiting for the siblings to quiesce.
             return
-        if self.stop_task:
-            self.stop_task.cancel()
-            self.stop_task = None
         old_run = self.task
         old_flush = self.flush_task
         old_heartbeat = self.heartbeat_task
@@ -317,20 +328,34 @@ class GlobalHub:
         # full-group revival waiter — never a direct _spawn_group() here
         # (two concurrent groups would share the subscriber set). gather
         # inside the waiter tolerates already-done members (run done).
-        # ``not member.cancelling()`` is load-bearing: re-cancelling a
-        # task that is ALREADY unwinding would inject a second
-        # CancelledError into its cleanup (truncating e.g. an httpx
-        # teardown in flight) — a pending cancellation needs no nudge.
-        for member in (old_run, old_flush, old_heartbeat):
+        self._cancel_live_members((old_run, old_flush, old_heartbeat))
+        self._revive_task = asyncio.create_task(
+            self._revive_after_group(old_run, old_flush, old_heartbeat)
+        )
+
+    @staticmethod
+    def _cancel_live_members(
+        members: tuple[asyncio.Task | None, ...],
+    ) -> None:
+        """Cancel every member that is alive and not already cancelling.
+
+        BE-002 round 3: shared by :meth:`ensure_upstream` (partial-group
+        branch) and the supervisor done-callback (exception-death branch)
+        so the double-cancel hazard is guarded in exactly one place.
+        ``not member.cancelling()`` is load-bearing: re-cancelling a task
+        that is ALREADY unwinding would inject a second CancelledError
+        into its cleanup (truncating e.g. an httpx teardown in flight) —
+        a pending cancellation needs no nudge. Already-done members
+        (``not member.done()``) are skipped, so callers do not need a
+        separate "is the dead one" exclusion.
+        """
+        for member in members:
             if (
                 member is not None
                 and not member.done()
                 and not member.cancelling()
             ):
                 member.cancel()
-        self._revive_task = asyncio.create_task(
-            self._revive_after_group(old_run, old_flush, old_heartbeat)
-        )
 
     async def _revive_after_group(
         self,
@@ -439,10 +464,17 @@ class GlobalHub:
         * cancelled task → return (teardown path).
         * normal exit (run only — ``has_consumers()`` went False) → cancel
           flush + heartbeat to stop the small pre-grace spin.
-        * exception death → cancel the two siblings + rebuild via
-          :meth:`_spawn_group` iff ``has_consumers()``. The cancelled
-          siblings' own callbacks then see ``self.task is run_task`` go
-          False after the rebuild and return early (no cascading rebuild).
+        * exception death → cancel the siblings + rebuild via
+          :meth:`ensure_upstream` (BE-002 round 3: the SINGLE revival
+          entry) iff ``has_consumers()``. ensure_upstream lands in its
+          partial-group branch (the just-cancelled members are not done
+          yet) and arms the full-group waiter, so the new group is built
+          only after every old member quiesced — a direct ``_spawn_group``
+          here would run two groups against the shared subscriber set
+          during the unwind window. The cancelled siblings' own callbacks
+          fire cancelled → return early (no cascading rebuild), and a
+          second exception-death callback in the same group finds the
+          waiter already pending → ensure_upstream no-ops (single waiter).
         """
         def _on_done(task: asyncio.Task) -> None:
             if task.cancelled():
@@ -473,17 +505,19 @@ class GlobalHub:
                 else "heartbeat"
             )
             logger.warning(
-                "sse hub task %s died unexpectedly; rebuilding group",
+                "sse hub task %s died unexpectedly; reviving via group waiter",
                 which, exc_info=exc,
             )
-            for sib in (run_task, flush_task, heartbeat_task):
-                if sib is not task and sib is not None and not sib.done():
-                    sib.cancel()
+            # ``task`` itself is done here, so _cancel_live_members skips
+            # it via ``not member.done()``; the double-cancel guard keeps
+            # a second same-tick callback from injecting a CancelledError
+            # into a sibling the first callback already cancelled.
+            self._cancel_live_members((run_task, flush_task, heartbeat_task))
             if self.has_consumers():
-                # Force a rebuild via _spawn_group (NOT ensure_upstream):
-                # the just-cancelled run task may not be .done() yet, so
-                # ensure_upstream's ``task.done()`` guard would no-op.
-                self._spawn_group()
+                # Single revival entry: partial-group branch → waiter.
+                # Also safe-by-construction for the _closing barrier (its
+                # first check) and waiter dedup (its pending check).
+                self.ensure_upstream()
         return _on_done
 
     def subscribe(self, welcome: bool = True) -> Subscriber:
