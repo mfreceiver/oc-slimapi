@@ -322,11 +322,13 @@ class HubRegistry:
         may have revived the hub, in which case removal is abandoned. The
         cleanup→null segment after re-check is a no-await sync block:
 
-        * ``token_hub.on_upstream_reconnect()`` clears old-epoch state
-          (live_parts / _session_status / _retired_messages).
-          ``has_consumers()`` is False here → the resync fanout is a natural
-          no-op (zero wire impact). ``_part_revisions`` (CRITICAL 1) and
-          ``_removed_messages`` (replay queue) are PRESERVED.
+        * FIX-CORR-1: ``hub.notify_idle_recycle_loss()`` mirrors
+          ``GlobalHub._notify_upstream_loss`` — cross-domain replay
+          barrier + token-hub clear + epoch-invalidation callbacks, every
+          step best-effort. The barrier makes any pre-teardown reconnect
+          cursor answer ``resync{reconnect_no_replay}`` instead of a
+          silently-empty ``up_to_date`` replay (the idle window's events
+          were observed by nobody).
         * ``self._global = None`` drops the strong reference.
 
         F-011: every slot clear inside this coroutine goes through
@@ -384,13 +386,28 @@ class HubRegistry:
                     # tasks nothing will ever cancel.
                     hub.ensure_upstream()
                 return
-            # INV-2: no-await sync segment. on_upstream_reconnect() clears the
-            # token hub's old-epoch state so the next hub starts clean.
-            # has_consumers()==False → resync fanout is a no-op. CRITICAL 1:
+            # FIX-CORR-1: no-await sync segment. The idle window is an
+            # UNOBSERVED upstream gap — mirror _notify_upstream_loss:
+            # cross-domain replay barrier (§7.2 S-B01④) + token-hub clear
+            # + epoch-invalidation callbacks, all best-effort. Ordering
+            # invariant: AFTER the gather (no frame can append past the
+            # barrier watermark) and BEFORE the reference drop (no new
+            # hub can start appending into the barrier's span). CRITICAL 1:
             # _part_revisions and _removed_messages are PRESERVED by
             # on_upstream_reconnect (see its docstring).
-            if self._token_hub is not None:
-                self._token_hub.on_upstream_reconnect()
+            try:
+                hub.notify_idle_recycle_loss()
+            except Exception:
+                # Belt-and-braces: the callee is already per-step guarded;
+                # this keeps F-011 (never strand the slot / never skip the
+                # reference drop) even if the guard set is ever regressed.
+                # m3: ERROR, not warning — reaching here means the whole
+                # barrier sequence was skipped (silent-loss gap reopened).
+                logger.error(
+                    "idle-recycle loss notification failed — replay "
+                    "barrier NOT written (silent-loss gap reopened)",
+                    exc_info=True,
+                )
             self._global = None
             self._clear_removal_task_if_current()
         except Exception:

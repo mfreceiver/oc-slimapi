@@ -487,23 +487,30 @@ def test_breaker_p99_threshold_and_window_slide():
 
 
 def test_breaker_hysteresis_probe_recovery():
-    clk = FakeClock()
-    br = LatencyBreaker(clock=clk)
+    """FIX-CORR-3r3 连击迟滞：需连续 recover_probes（默认 3）个好探针
+    才转 probation（恢复放行）；任一慢探针清零连击。探针样本不进 P99
+    窗口（streak 与窗口解耦）。正式闭合由 probation 内真实查询试用
+    （见 test_probation_full_lifecycle）。"""
+    br = LatencyBreaker()
     for _ in range(11):
         br.record(1000.0)
     assert br.open
-    # 探针 15ms：成功但 P99 未回落到 <10ms → 不闭合（hysteresis）。
+    # 慢探针（≥10ms）→ 不闭合且清零连击。
     assert br.note_probe(15.0) is False
     assert br.open
-    # nearest-rank P99：窗口内单个 15ms 样本把 P99 钉在 15——更多 2ms
-    # 探针样本也不稀释（max 秩）。
-    for _ in range(5):
-        assert br.note_probe(2.0) is False
+    # 好探针 ×2：连击 2 < 3 → 不闭合。
+    assert br.note_probe(2.0) is False
+    assert br.note_probe(2.0) is False
     assert br.open
-    # 慢样本滑出 60s 窗口后，快探针 → P99 回落 <10ms → 闭合。
-    clk.advance(61.0)
+    # 连击被慢探针打断后须重新数满 3。
+    assert br.note_probe(15.0) is False
+    assert br.note_probe(2.0) is False
+    assert br.note_probe(2.0) is False
+    assert br.open
+    # 第 3 个连续好探针 → 转入 probation（非直接闭合，r3）。
     assert br.note_probe(2.0) is True
     assert not br.open
+    assert br.phase == "probation"
 
 
 def test_breaker_probe_failure_keeps_open():
@@ -512,13 +519,36 @@ def test_breaker_probe_failure_keeps_open():
     for _ in range(11):
         br.record(1000.0)
     assert br.open
-    # 失败探针不计样本（由 source.probe 处理失败路径）；慢探针不闭合
+    # 失败探针不计（由 source.probe 处理失败路径）；慢探针（≥阈值）
+    # 清零连击 → 不闭合。
     assert br.note_probe(50.0) is False
     assert br.open
 
 
+def test_trip_keeps_window_samples_r3():
+    """FIX-CORR-3r3：trip 不清空窗口（样本保留 = closed 态画像连续性）；
+    「误闭合快速收敛」职责由 probation 单样本规则承担（与窗口/间隔
+    时序解耦——生产时序版见盲区测试）。"""
+    br = LatencyBreaker(trip_threshold_ms=20.0)
+    for _ in range(11):
+        br.record(1000.0)
+    assert br.open
+    assert br.snapshot()["samples"] == 11  # 样本保留
+    # 3 个好探针 → probation（canary 残余便宜度场景：真实投影仍慢）。
+    assert br.note_probe(2.0) is False
+    assert br.note_probe(2.0) is False
+    assert br.note_probe(2.0) is True
+    assert br.phase == "probation"
+    # ……首个慢真实查询：probation 规则（latency ≥ trip_ms）立即复 trip。
+    br.record(1000.0)
+    assert br.open
+
+
 async def test_breaker_end_to_end_trip_and_probe(good_db: Path):
-    """查询样本推过阈值 → query 拒绝 circuit_open → 半开探针恢复。"""
+    """查询样本推过阈值 → query 拒绝 circuit_open → 半开探针转
+    probation → 首个「慢」查询（0.0001ms 阈值下任何真实延迟都 ≥ 阈值）
+    立即复 trip（r3 全环端到端）。graduation 见
+    test_probation_serves_queries_and_graduates。"""
     br = LatencyBreaker(trip_threshold_ms=0.0001, recover_threshold_ms=1000.0)
     src = DbAuxiliarySource(_resolved(good_db), breaker=br)
     await src.start()
@@ -531,10 +561,20 @@ async def test_breaker_end_to_end_trip_and_probe(good_db: Path):
         assert st.reason == "circuit_open"
         with pytest.raises(AuxiliaryUnavailableError, match="circuit_open"):
             await src.query("SELECT 1")
-        # 半开探针：真实 SELECT 1 延迟 << 1000ms → 恢复
+        # 半开探针（r3 迟滞）：前两个好探针不闭合，第 3 个连续好探针
+        # 转 probation（恢复放行）。真实 canary 延迟 << 1000ms 阈值。
+        assert await src.probe() is False
+        assert await src.probe() is False
         assert await src.probe() is True
         assert src.status().available
+        assert br.phase == "probation"
+        # 真实查询放行（试用期）——0.0001ms 阈值下任何真实延迟 ≥ trip
+        # → probation 首查询立即复 trip（r3 语义端到端）。
         assert (await src.query("SELECT 1"))[0][0] == 1
+        assert br.phase == "open"
+        assert src.status().reason == "circuit_open"
+        with pytest.raises(AuxiliaryUnavailableError, match="circuit_open"):
+            await src.query("SELECT 1")
     finally:
         await src.stop()
 
@@ -553,6 +593,377 @@ async def test_breaker_swap_resets_warmup(good_db: Path):
         assert src.status().available
         snap = src.breaker.snapshot()
         assert snap["total"] == 0 and snap["open"] is False
+        # r3：swap 全清含相位（probation 不跨连接存活）+ 试用连击。
+        assert snap["phase"] == "closed"
+        assert snap["probation_good"] == 0
+    finally:
+        await src.stop()
+
+
+# ---------------------------------------------------------------------------
+# FIX-CORR-3：半开探针两段式 —— SELECT 1 只作存活预检，canary 延迟才
+# 参与关断判据（连接健康但投影仍慢 → 熔断器保持 open）。
+# ---------------------------------------------------------------------------
+
+
+def test_canary_sql_shape_frozen():
+    """canary 必须与 projection.py 的查询形状**路径同构**（防漂移回归）：
+    LEFT JOIN + 双键 ORDER BY + LIMIT；且是纯 SELECT（mode=ro +
+    query_only 只读约束）。**p.id 必须在 SELECT 列表** —— EQP 实证无
+    p 列引用时 SQLite 会直接消除 LEFT JOIN（join 路径缺口重开）。"""
+    import re
+
+    sql = DbAuxiliarySource._CANARY_SQL
+    assert sql.strip().upper().startswith("SELECT")
+    assert "LEFT JOIN project p ON s.project_id = p.id" in sql
+    assert "ORDER BY s.time_updated DESC, s.id DESC" in sql
+    assert "LIMIT 1" in sql
+    # join 消除防线：SELECT 列表（LIMIT 之前）必须引用 p 列。
+    select_list = sql.split("FROM")[0]
+    assert "p.id" in select_list
+    # 词边界匹配（TIME_UPDATED 内含 UPDATE 子串，不得误伤）。
+    forbidden = r"\b(INSERT|UPDATE|DELETE|PRAGMA|CREATE|DROP)\b"
+    assert re.search(forbidden, sql.upper()) is None
+
+
+async def test_probe_canary_slow_keeps_breaker_open(
+    good_db: Path, monkeypatch
+):
+    """FIX-CORR-3 核心场景：连接健康（SELECT 1 快）但投影路径仍慢 →
+    探针不得关断熔断器（旧实现的 SELECT 1 单段计时在此会误关断）。"""
+    br = LatencyBreaker(trip_threshold_ms=20.0, recover_threshold_ms=10.0)
+    src = DbAuxiliarySource(_resolved(good_db), breaker=br)
+    await src.start()
+    try:
+        src.trip_breaker()
+        br.trip()  # source 状态与 breaker 本体都要处于 open
+        assert src.status().reason == "circuit_open"
+
+        import time as _time
+
+        def slow_canary() -> None:
+            _time.sleep(0.05)  # 50ms — P99 钉在慢档，≥ recover 10ms
+
+        monkeypatch.setattr(src, "_canary_sync", slow_canary)
+
+        for _ in range(3):
+            assert await src.probe() is False
+            st = src.status()
+            assert not st.available and st.reason == "circuit_open"
+    finally:
+        await src.stop()
+
+
+async def test_probe_canary_failure_stays_open(good_db: Path, monkeypatch):
+    """canary 执行失败（锁/schema 异常等）→ 保持熔断（fail-safe）。"""
+    br = LatencyBreaker(trip_threshold_ms=20.0, recover_threshold_ms=10.0)
+    src = DbAuxiliarySource(_resolved(good_db), breaker=br)
+    await src.start()
+    try:
+        src.trip_breaker()
+        br.trip()
+
+        def boom_canary() -> None:
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(src, "_canary_sync", boom_canary)
+        assert await src.probe() is False
+        assert src.status().reason == "circuit_open"
+    finally:
+        await src.stop()
+
+
+async def test_probe_liveness_failure_skips_canary(good_db: Path, monkeypatch):
+    """SELECT 1 存活预检失败 → 直接保持 open，canary 不执行。"""
+    br = LatencyBreaker(trip_threshold_ms=20.0, recover_threshold_ms=10.0)
+    src = DbAuxiliarySource(_resolved(good_db), breaker=br)
+    await src.start()
+    try:
+        src.trip_breaker()
+        br.trip()
+
+        canary_calls: list[int] = []
+
+        def spy_canary() -> None:
+            canary_calls.append(1)
+
+        def boom_probe() -> None:
+            raise sqlite3.OperationalError("connection closed")
+
+        monkeypatch.setattr(src, "_canary_sync", spy_canary)
+        monkeypatch.setattr(src, "_probe_sync", boom_probe)
+
+        assert await src.probe() is False
+        assert canary_calls == []  # canary 未被触碰
+        assert src.status().reason == "circuit_open"
+    finally:
+        await src.stop()
+
+
+async def test_probe_canary_fast_recovers(good_db: Path):
+    """两段都快 → 连续第 3 个好探针转 probation；随后 3 个好真实查询
+    （good_db 亚毫秒 << 20ms trip）graduation → closed（r3 全链）。"""
+    br = LatencyBreaker(trip_threshold_ms=20.0, recover_threshold_ms=1000.0)
+    src = DbAuxiliarySource(_resolved(good_db), breaker=br)
+    await src.start()
+    try:
+        src.trip_breaker()
+        br.trip()
+        assert src.status().reason == "circuit_open"
+        # good_db 极小：SELECT 1 与 canary（join+全扫+排序）都远低于阈值。
+        assert await src.probe() is False
+        assert await src.probe() is False
+        assert await src.probe() is True
+        assert br.phase == "probation"
+        for _ in range(3):
+            await src.query("SELECT 1")
+        assert br.phase == "closed"
+        assert src.status().available
+    finally:
+        await src.stop()
+
+
+async def test_canary_fast_real_slow_probation_retrips_production_timing(
+    good_db: Path,
+):
+    """FIX-CORR-3r3 盲区场景（rev-2 gate 点名，生产时序版）：canary 快
+    但真实投影慢 —— 生产钩子 ``in_transaction_pause`` 只作用于
+    ``_run_query``（真实查询）路径，canary/存活预检不经过它。
+
+    与 r2 版的关键差别：探针由 **30s 周期任务驱动**（FakeClock
+    advance(30)+tick()，而非手动连调 probe()），如实呈现生产时序下
+    r2「窗口样本复 trip」机制失效（warmup 慢样本滑出 60s 窗）——
+    收敛职责由 probation 单样本规则承担（与窗口/间隔时序解耦）。
+
+    断言链：(a) 慢真实查询 trip；(b) 3 个周期 tick 的好探针转
+    probation；(c) **诚实断言窗口已老化**（samples==0 → P99 复 trip
+    路径失效现场）；(d) 首个慢真实查询（50ms ≥ 20ms）仍**立即复
+    trip**（probation 规则，样本仅 1 个 << min_samples=10 亦成立）。"""
+    import time as _time
+
+    def slow_real_query() -> None:
+        _time.sleep(0.05)  # 50ms — 远超 trip 20ms / recover 10ms
+
+    clk = FakeClock()
+    br = LatencyBreaker(
+        trip_threshold_ms=20.0, recover_threshold_ms=10.0, clock=clk
+    )
+    src = DbAuxiliarySource(
+        _resolved(good_db),
+        breaker=br,
+        clock=clk,
+        in_transaction_pause=slow_real_query,
+    )
+    await src.start()
+    try:
+        for _ in range(10):
+            await src.query("SELECT 1")  # warmup（每个都真 50ms，不判）
+        await src.query("SELECT 1")  # 第 11 个 → P99 ≥ 20ms → trip
+        assert src.status().reason == "circuit_open"
+
+        # 生产时序：30s 周期任务驱动探针（trip_breaker 已排程 +30s）。
+        clk.advance(30.0)
+        await src.tick()  # probe #1 好（canary 无钩子路径，真快）
+        assert src.status().reason == "circuit_open"
+        clk.advance(30.0)
+        await src.tick()  # probe #2 → 连击 2
+        assert src.status().reason == "circuit_open"
+        clk.advance(30.0)
+        await src.tick()  # probe #3 → 转 probation（恢复放行）
+        assert src.status().available
+        assert br.phase == "probation"
+
+        # 诚实断言窗口已老化（r2 机制失效现场）：FakeClock now=1090，
+        # 11 个 warmup 慢样本（ts=1000.0）已全部滑出 60s 窗。
+        assert br.snapshot()["samples"] == 0
+
+        # 首个慢真实查询：窗口仅得 1 个新样本（< min_samples=10 →
+        # P99 路径必不触发），但 probation 单样本规则立即复 trip。
+        await src.query("SELECT 1")
+        assert br.snapshot()["samples"] == 1
+        assert br.phase == "open"
+        assert src.status().reason == "circuit_open"
+        with pytest.raises(AuxiliaryUnavailableError, match="circuit_open"):
+            await src.query("SELECT 1")
+    finally:
+        await src.stop()
+
+
+# ---------------------------------------------------------------------------
+# FIX-CORR-3r3：probation 试用期状态机 —— open →（K 连好探针）→
+# probation →（N 连好真实查询）closed；probation 任一慢真实查询立即
+# 复 trip（豁免 min_samples/warmup，与探针间隔/样本窗口时序解耦）。
+# ---------------------------------------------------------------------------
+
+
+def test_probation_full_lifecycle():
+    """breaker 级全生命周期：closed → open → probation → closed，
+    graduation 后 closed 态 P99 语义回归。"""
+    br = LatencyBreaker()
+    assert br.phase == "closed"
+    for _ in range(11):
+        br.record(1000.0)
+    assert br.phase == "open"
+    assert br.note_probe(2.0) is False
+    assert br.note_probe(2.0) is False
+    assert br.note_probe(2.0) is True
+    assert br.phase == "probation" and not br.open
+    # 好真实查询 ×2 → 仍 probation（试用连击渐进）。
+    br.record(5.0)
+    assert br.phase == "probation"
+    br.record(5.0)
+    assert br.phase == "probation"
+    assert br.snapshot()["probation_good"] == 2
+    # 第 3 个好真实查询 → graduation → closed。
+    br.record(5.0)
+    assert br.phase == "closed"
+    # closed 语义回归：慢样本积满 → P99 ≥ 20ms → trip。
+    for _ in range(11):
+        br.record(1000.0)
+    assert br.phase == "open"
+
+
+def test_probation_graduation_threshold_boundary():
+    """graduation 阈值 = trip_ms（20）且恰补集：19.9 计好、20.0（>=）
+    立即复 trip（与 closed 态触发准则对偶，边界固化）。"""
+    # 19.9ms < 20ms → 计好 ×3 → graduation。
+    br = LatencyBreaker(trip_threshold_ms=20.0)
+    for _ in range(11):
+        br.record(1000.0)
+    for _ in range(2):
+        assert br.note_probe(2.0) is False
+    assert br.note_probe(2.0) is True
+    assert br.phase == "probation"
+    br.record(19.9)
+    br.record(19.9)
+    br.record(19.9)
+    assert br.phase == "closed"
+    # 20.0ms ≥ 20ms → probation 首查询立即复 trip。
+    br2 = LatencyBreaker(trip_threshold_ms=20.0)
+    for _ in range(11):
+        br2.record(1000.0)
+    for _ in range(2):
+        assert br2.note_probe(2.0) is False
+    assert br2.note_probe(2.0) is True
+    br2.record(20.0)
+    assert br2.phase == "open"
+
+
+def test_probation_retrip_resets_probe_streak():
+    """probation 复 trip 清双连击计数 → 探针从零重数（好×2 不闭合，
+    第 3 个才回 probation）。"""
+    br = LatencyBreaker()
+    for _ in range(11):
+        br.record(1000.0)
+    for _ in range(2):
+        br.note_probe(2.0)
+    assert br.note_probe(2.0) is True
+    assert br.phase == "probation"
+    # 慢真实查询 → 复 trip（连击全清）。
+    br.record(1000.0)
+    assert br.phase == "open"
+    assert br.snapshot()["probe_streak"] == 0
+    # 探针连击从零重数。
+    assert br.note_probe(2.0) is False
+    assert br.note_probe(2.0) is False
+    assert br.note_probe(2.0) is True
+    assert br.phase == "probation"
+
+
+async def test_probe_exception_resets_streak(good_db: Path):
+    """MINOR-1：探针异常（存活预检/canary 抛错）清零探针连击——
+    「好、好、异常、好」不得在第 4 次凑满 3 连击（异常后须重新数满
+    3 个连续成功）。canary 与 liveness 两变体。"""
+    br = LatencyBreaker(trip_threshold_ms=20.0, recover_threshold_ms=1000.0)
+    src = DbAuxiliarySource(_resolved(good_db), breaker=br)
+    await src.start()
+    try:
+        src.trip_breaker()
+        br.trip()
+        # 好探针 ×2 建立连击。
+        assert await src.probe() is False
+        assert await src.probe() is False
+
+        # 变体一：canary 抛错 → probe_failed() 清零。
+        def boom_canary() -> None:
+            raise RuntimeError("canary boom")
+
+        orig_canary = src._canary_sync
+        src._canary_sync = boom_canary
+        assert await src.probe() is False
+        src._canary_sync = orig_canary
+
+        # 无清零的话此处 streak 会到 3 → True；有清零 → 重新从 1 数。
+        assert await src.probe() is False
+        assert await src.probe() is False
+        assert br.snapshot()["probe_streak"] == 2
+        assert await src.probe() is True
+        assert br.phase == "probation"
+
+        # 变体二：liveness（SELECT 1）抛错 → 同样清零（canary 不执行）。
+        br.trip()
+        src.trip_breaker()
+        assert await src.probe() is False
+        assert await src.probe() is False
+
+        def boom_probe() -> None:
+            raise RuntimeError("liveness boom")
+
+        orig_probe = src._probe_sync
+        src._probe_sync = boom_probe
+        assert await src.probe() is False
+        src._probe_sync = orig_probe
+
+        assert await src.probe() is False
+        assert await src.probe() is False
+        assert br.snapshot()["probe_streak"] == 2
+        assert await src.probe() is True
+        assert br.phase == "probation"
+    finally:
+        await src.stop()
+
+
+async def test_probation_serves_queries_and_graduates(
+    good_db: Path, caplog
+):
+    """probation 服务面：真实查询照常放行（试用期即真实流量试探）；
+    无查询时 probation 稳定驻留（tick 探针仅 circuit_open 态跑，状态
+    不漂移）；3 个好真实查询 graduation → closed + 可观测日志。"""
+    clk = FakeClock()
+    br = LatencyBreaker(
+        trip_threshold_ms=20.0, recover_threshold_ms=1000.0, clock=clk
+    )
+    src = DbAuxiliarySource(_resolved(good_db), breaker=br, clock=clk)
+    await src.start()
+    try:
+        src.trip_breaker()
+        br.trip()
+        for _ in range(2):
+            assert await src.probe() is False
+        assert await src.probe() is True
+        assert br.phase == "probation"
+
+        # 驻留不漂移：即使推进 300s，tick 走 available 分支（inode 校验），
+        # 不跑探针（探针仅 circuit_open 态）→ probation 稳定。
+        clk.advance(300.0)
+        await src.tick()
+        assert br.phase == "probation"
+
+        # probation 期查询照常放行；good_db 亚毫秒 << 20ms → 计好。
+        rows = await src.query("SELECT 1")
+        assert rows[0][0] == 1
+        assert br.phase == "probation"
+
+        # 3 个好真实查询 → graduation → closed（可观测日志）。
+        with caplog.at_level("INFO"):
+            await src.query("SELECT 1")
+            await src.query("SELECT 1")
+        assert br.phase == "closed"
+        assert src.status().available
+        assert any(
+            "probation graduated on real queries" in r.message
+            for r in caplog.records
+        )
     finally:
         await src.stop()
 
@@ -762,5 +1173,128 @@ async def test_snapshot_shape(good_db: Path):
         assert snap["source"] == "explicit-env"
         assert snap["path"] == str(good_db)
         assert set(snap["breaker"]) >= {"open", "samples", "total", "p99_ms"}
+    finally:
+        await src.stop()
+
+
+# ---------------------------------------------------------------------------
+# FIX-CORR-3r4：dequeue-recheck —— probation 复 trip 后已排队查询在
+# worker 出队时二次检查熔断器（open → 执行 SQL 前降级，零计时零样本）；
+# graduation 边沿日志移入 record() 原子点（MINOR-1(b)）。
+# ---------------------------------------------------------------------------
+
+
+async def test_probation_retrip_degrades_queued_queries_before_sql(good_db: Path):
+    """rev-3 gate MAJOR 反例（确定性事件门控版）：probation 首个慢真实
+    查询复 trip 时，其余已排队请求若不复查将逐个执行慢 SQL（暴露面 =
+    队列深度）。r4 出队二次检查 → 排队查询全部 bail（与入口拒绝同
+    reason ``circuit_open``）、**零 SQL 执行**（``in_transaction_pause``
+    钩子计数即真实 SQL 执行计数——bail 在 BEGIN 之前，不触发钩子）。
+
+    阶段：① 慢钩子顺序 10 warmup + 第 11 个 → P99 trip；② FakeClock
+    30s×3 tick 好 canary → probation；③ 切换事件钩子门控首查询 + 4 个
+    排队 → release 复 trip → 断言 4 个排队全 bail、sql_execs==12。
+    """
+    import time as _time
+
+    release = threading.Event()
+    entered = threading.Event()
+    sql_execs = [0]
+
+    def slow_warmup() -> None:
+        sql_execs[0] += 1
+        _time.sleep(0.05)  # 50ms — 远超 trip 20ms
+
+    def gate_first_probation_query() -> None:
+        sql_execs[0] += 1
+        entered.set()
+        release.wait(5)
+
+    clk = FakeClock()
+    br = LatencyBreaker(
+        trip_threshold_ms=20.0, recover_threshold_ms=10.0, clock=clk
+    )
+    src = DbAuxiliarySource(
+        _resolved(good_db),
+        breaker=br,
+        clock=clk,
+        in_transaction_pause=slow_warmup,
+    )
+    await src.start()
+    try:
+        for _ in range(10):
+            await src.query("SELECT count(*) FROM session")  # warmup
+        await src.query("SELECT count(*) FROM session")  # 第 11 个 → trip
+        assert src.status().reason == "circuit_open"
+
+        # 生产时序：3 个周期 tick 的好 canary → probation。
+        clk.advance(30.0)
+        await src.tick()
+        clk.advance(30.0)
+        await src.tick()
+        clk.advance(30.0)
+        await src.tick()
+        assert br.phase == "probation"
+        assert src.status().available
+
+        # 事件钩子门控首查询（直接属性替换，r3 先例）。
+        src._in_txn_pause = gate_first_probation_query
+        loop = asyncio.get_running_loop()
+        first = asyncio.create_task(src.query("SELECT count(*) FROM session"))
+        await loop.run_in_executor(None, entered.wait, 2)
+        rest = [
+            asyncio.create_task(src.query("SELECT count(*) FROM session"))
+            for _ in range(4)
+        ]
+        await asyncio.sleep(0.05)  # 4 个已入 FIFO（worker 忙于 first）
+        release.set()  # first 完成：50ms ≥ 20ms → probation 复 trip → open
+        rows = await asyncio.wait_for(first, timeout=5)
+        assert rows[0][0] == 3  # 首查询成功返回（probation 放行语义）
+        results = await asyncio.wait_for(
+            asyncio.gather(*rest, return_exceptions=True), timeout=5
+        )
+
+        assert len(results) == 4
+        for r in results:
+            assert isinstance(r, AuxiliaryUnavailableError)
+            assert r.reason == "circuit_open"  # 与入口拒绝同信号
+        # 真实 SQL 执行计数：warmup 10 + trip 1 + probation 首 1 = 12；
+        # 4 个排队查询零 SQL 执行（bail 在 BEGIN 之前）。
+        assert sql_execs[0] == 12
+        assert br.snapshot()["open"] is True
+        # 入口已受理（queries=「被受理的投影查询数」语义不变）。
+        assert src.snapshot()["counters"]["queries"] >= 16
+    finally:
+        release.set()
+        await src.stop()
+
+
+async def test_graduation_log_single_edge_under_concurrent_queries(
+    good_db: Path, caplog
+):
+    """r4 MINOR-1(b)：graduation 边沿日志由 ``record()`` 相位转换原子点
+    发出（worker 单线程串行 → 恰好一次）；并发提交恰在第 N 个好真实
+    查询处转换，日志**恰 1 条**（旧 query() 侧 phase_before 跨线程快照
+    在并发下可重复/错归因边沿——已删）。"""
+    br = LatencyBreaker(trip_threshold_ms=20.0, recover_threshold_ms=1000.0)
+    src = DbAuxiliarySource(_resolved(good_db), breaker=br)
+    await src.start()
+    try:
+        src.trip_breaker()
+        br.trip()
+        assert await src.probe() is False
+        assert await src.probe() is False
+        assert await src.probe() is True
+        assert br.phase == "probation"
+        with caplog.at_level("INFO"):
+            results = await asyncio.gather(
+                *[src.query("SELECT 1") for _ in range(3)]
+            )
+        assert len(results) == 3
+        assert br.phase == "closed"
+        graduated = [
+            r for r in caplog.records if "probation graduated" in r.message
+        ]
+        assert len(graduated) == 1  # 真边沿、单点、恰好一次
     finally:
         await src.stop()

@@ -152,8 +152,22 @@ class LatencyBreaker:
     - warmup 豁免：前 10 次（``min_samples`` 次）仅采样不判（与
       「不足 10 次不判」同路径——冷启动 P99 噪声不误熔断）；
     - 熔断阈值：P99 ≥ 20ms → open；
-    - 恢复：半开探针样本计入后 P99 < 10ms（hysteresis，防 20ms 临界抖动）
-      → close；trip 时清空窗口（恢复需新鲜证据）。
+    - 恢复（FIX-CORR-3r3，probation 试用期状态机）：
+      ``closed --P99≥trip--> open --K 连好探针--> probation
+      --N 连好真实查询--> closed``；probation 中任一真实查询延迟
+      ≥ trip 阈值 → **立即复 trip**（豁免 min_samples/warmup——
+      与探针间隔/样本窗口时序解耦，误闭合最坏暴露面 = 1 个慢查询
+      （r4：其余已排队查询出队时二次检查并降级，不执行 SQL））。
+      * 探针连击（``recover_probes``，默认 3）：半开探针需连续
+      低于恢复阈值（10ms）才转入 probation（非直接闭合）；任一
+      ≥ 阈值探针或探针异常（``probe_failed``）清零连击。探针样本
+      **不**进入 ``_samples``（P99 窗口语义只属于 ``record()``）。
+      * 试用连击（``recover_queries``，默认 3）：probation 内查询
+      放行、逐查询以 ``latency`` 标量判定（< trip_ms 计好、≥ trip_ms
+      复 trip——恰补集，阈值与 closed 态触发准则对偶）； probation
+      样本照常进窗口（为 closed 态积累画像），但判定**不读**窗口。
+    - trip **不清空窗口**（r2 起保留）：职责仅为 closed 态 P99 画像
+      连续性；「误闭合快速收敛」职责已移交 probation（r3）。
     """
 
     def __init__(
@@ -163,20 +177,37 @@ class LatencyBreaker:
         min_samples: int = 10,
         trip_threshold_ms: float = 20.0,
         recover_threshold_ms: float = 10.0,
+        recover_probes: int = 3,
+        recover_queries: int = 3,
         clock: Callable[[], float] = time.monotonic,
+        logger: logging.Logger | None = None,
     ) -> None:
         self._window_s = window_s
         self._min_samples = min_samples
         self._trip_ms = trip_threshold_ms
         self._recover_ms = recover_threshold_ms
+        self._recover_probes = max(1, int(recover_probes))
+        self._recover_queries = max(1, int(recover_queries))
         self._clock = clock
+        # r4：仅相位转换边沿日志（graduation）；None = 静默（独立构造/
+        # 旧单测零影响；DbAuxiliarySource 默认注入自身 logger）。
+        self._logger = logger
         self._samples: list[tuple[float, float]] = []
+        self._probe_streak = 0
+        self._probation_good = 0
         self._total = 0
-        self._open = False
+        # r3 三态相位（替代 r1/r2 的 ``_open: bool``）：probation 不表现
+        # 为 open——真实查询必须放行（试用期意义即真实流量试探）。
+        self._phase = "closed"
 
     @property
     def open(self) -> bool:
-        return self._open
+        return self._phase == "open"
+
+    @property
+    def phase(self) -> str:
+        """当前相位（closed / open / probation；只读公开——日志与测试）。"""
+        return self._phase
 
     def _prune(self, now: float) -> None:
         cutoff = now - self._window_s
@@ -195,14 +226,37 @@ class LatencyBreaker:
         return self._pctl(99)
 
     def record(self, latency_ms: float) -> None:
-        """计入一个样本；关闭态且已过 warmup、样本充足时判熔断。"""
+        """计入一个真实查询样本；按相位分派判定。
+
+        剪枝/追加/计数为**无条件前置步骤**（r3 必改点：probation 分支
+        return 于其后 → probation 样本照常进窗口且窗口保持新鲜）。
+        """
         now = self._clock()
         self._prune(now)
         self._samples.append((now, latency_ms))
         self._total += 1
-        if self._open:
+        if self._phase == "open":
+            return  # open 态不判（恢复路径由探针独占）
+        if self._phase == "probation":
+            # r3 试用期：逐查询即时判定，只读 latency 标量（不读窗口）。
+            if latency_ms >= self._trip_ms:
+                self.trip()  # 立即复 trip —— 豁免 min_samples/warmup
+            else:
+                self._probation_good += 1
+                if self._probation_good >= self._recover_queries:
+                    self._phase = "closed"
+                    self._probation_good = 0
+                    # r4 MINOR-1(b)：graduation 边沿日志在**本原子点**发出
+                    # （record() 仅由 worker 单线程串行调用 → 恰好一次；
+                    # query() 侧的跨线程 phase_before 快照已删——并发下
+                    # 多查询会重复/错归因边沿）。
+                    if self._logger is not None:
+                        self._logger.info(
+                            "dbaux circuit closed (probation graduated"
+                            " on real queries)"
+                        )
             return
-        # warmup 豁免：前 min_samples 次仅采样不判（§2.3-6）。
+        # closed：warmup 豁免（前 min_samples 次仅采样不判，§2.3-6）。
         if self._total <= self._min_samples:
             return
         if len(self._samples) < self._min_samples:
@@ -212,38 +266,68 @@ class LatencyBreaker:
             self.trip()
 
     def trip(self) -> None:
-        """打开熔断：清空窗口（恢复需新鲜证据，hysteresis 一部分）。"""
-        self._open = True
-        self._samples = []
+        """打开熔断（open 相位；r3：不清窗口、清双连击计数）。
+
+        复 trip 两条路径：probation 单样本规则（latency ≥ trip_ms）与
+        closed 态 P99 判定。连击计数清零 → 探针/试用各自从零重数。
+        """
+        self._phase = "open"
+        self._probe_streak = 0
+        self._probation_good = 0
 
     def note_probe(self, latency_ms: float) -> bool:
-        """半开探针结果计入；返回是否恢复（P99 < 恢复阈值 才闭合）。"""
-        if not self._open:
+        """半开探针结果（FIX-CORR-3r3 连击迟滞 → probation）。
+
+        连续第 ``recover_probes``（默认 3）个低于恢复阈值的探针 →
+        **转入 probation 试用期**（返回 True = 恢复放行；正式闭合需
+        probation 内真实查询试用）；任一 ≥ 阈值的探针清零连击。探针
+        样本不进入 ``_samples``（P99 窗口语义只属于 ``record()``）。
+        """
+        if self._phase != "open":
             return True
-        now = self._clock()
-        self._prune(now)
-        self._samples.append((now, latency_ms))
-        p99 = self._p99()
-        if p99 is not None and p99 < self._recover_ms:
-            self._open = False
+        if latency_ms < self._recover_ms:
+            self._probe_streak += 1
+        else:
+            self._probe_streak = 0
+        if self._probe_streak >= self._recover_probes:
+            self._phase = "probation"
+            self._probe_streak = 0
             return True
         return False
 
+    def probe_failed(self) -> None:
+        """探针异常（存活预检/canary 抛错）→ 清零探针连击。
+
+        异常 = 证据缺失 = 断连击：「连续 K 次成功」要求真实成功，
+        「好、好、异常、好」不得在第 4 次后凑满 3 连击（MINOR-1）。
+        """
+        if self._phase == "open":
+            self._probe_streak = 0
+
     def reset(self) -> None:
-        """swap/重开成功后清零（新连接 = 新延迟画像；warmup 重新起算）。"""
+        """swap/重开成功后清零（新连接 = 新延迟画像；warmup 重新起算）。
+
+        r3：probation 不跨连接存活——swap 全清回 closed，warmup 重启
+        即为保护（文档化取舍，见 fix-plan-corr-r3 §7）。
+        """
         self._samples = []
+        self._probe_streak = 0
+        self._probation_good = 0
         self._total = 0
-        self._open = False
+        self._phase = "closed"
 
     def snapshot(self) -> dict[str, Any]:
         now = self._clock()
         self._prune(now)
         return {
-            "open": self._open,
+            "open": self._phase == "open",
+            "phase": self._phase,
             "samples": len(self._samples),
             "total": self._total,
             "p50_ms": self._pctl(50),
             "p99_ms": self._p99(),
+            "probe_streak": self._probe_streak,
+            "probation_good": self._probation_good,
         }
 
 
@@ -301,6 +385,26 @@ class DbAuxiliarySource:
 
     BUSY_TIMEOUT_MS = 5000  # §2.3-3：与上游 database.ts:29 同值（冻结）
 
+    # FIX-CORR-3r2: 代表性半开 canary —— 与 projection.py 投影查询**路径
+    # 同构**：LEFT JOIN project + 无索引全扫 + TEMP B-TREE 排序（EQP 于
+    # 真实上游 DB 实证：SCAN session / SEARCH p USING COVERING INDEX
+    # sqlite_autoindex_project_1 / USE TEMP B-TREE FOR ORDER BY）。
+    # **load-bearing**：SELECT 必须引用至少一个 ``p`` 列 —— EQP 实证无
+    # p 列引用时 SQLite 直接消除 LEFT JOIN（只剩 SCAN，join 缺口重开）。
+    # 谓词省略是刻意的（谓词只会减少参与排序的行数 → 无谓词 = 上界
+    # 代表，保守方向正确）；LIMIT 1 vs LIMIT n 在排序全量完成后边际
+    # 可忽略；宽列物化的残余差距由连击迟滞 + probation 逐查询判定
+    # 兜底：首个 ≥trip 阈值真实查询立即复 trip；r4 起已排队查询出队
+    # 时二次检查熔断器，open 即在执行 SQL 前降级。纯 SELECT，符合
+    # mode=ro +
+    # PRAGMA query_only=ON 只读约束。SELECT 1 只保留为连接存活预检，
+    # 其延迟对延迟型故障零分辨力，不喂 breaker。
+    _CANARY_SQL = (
+        "SELECT s.id, p.id FROM session s "
+        "LEFT JOIN project p ON s.project_id = p.id "
+        "ORDER BY s.time_updated DESC, s.id DESC LIMIT 1"
+    )
+
     def __init__(
         self,
         resolution: ResolvedPath | DisabledResolution,
@@ -313,12 +417,23 @@ class DbAuxiliarySource:
     ) -> None:
         self._resolution = resolution
         self._probe_interval_s = probe_interval_s
-        self._breaker = breaker if breaker is not None else LatencyBreaker()
+        # r4：logger 先行初始化——默认 breaker 构造注入自身 logger，
+        # 使 graduation 边沿日志从 record() 原子点发出。显式传入的
+        # breaker 若未配置 logger（None）→ 补注入（同模块亲密赋值；
+        # 已配置则尊重调用方）——保证任何经 source 使用的 breaker 都
+        # 有边沿日志（既有显式 breaker 测试零改动）。
+        self._logger = logger if logger is not None else get_logger("dbaux")
+        if breaker is not None and breaker._logger is None:
+            breaker._logger = self._logger
+        self._breaker = (
+            breaker
+            if breaker is not None
+            else LatencyBreaker(logger=self._logger)
+        )
         self._clock = clock
         # 测试钩子：worker 内事务中段暂停（模拟慢查询 / swap 期间活跃
         # 查询）。生产恒 None。
         self._in_txn_pause = in_transaction_pause
-        self._logger = logger if logger is not None else get_logger("dbaux")
 
         # §2.2：专属单 worker。max_workers 必须固定 1——共享多 worker 池
         # 会并发访问同一连接 = 线程错误（§2.2 表 TransformPool 关系行）。
@@ -460,10 +575,24 @@ class DbAuxiliarySource:
             raise AuxiliaryUnavailableError(f"query_{kind}") from exc
         # 本查询样本可能刚把 P99 推过阈值 → 立即联动熔断态（后续请求被拒）。
         self._check_breaker_state()
+        # r4：graduation 边沿日志由 breaker.record() 原子点发出（此处
+        # 的跨线程 phase_before 快照已删——并发下不可靠，见 MINOR-1）。
         return rows
 
     def _run_query(self, sql: str, params: tuple) -> list[tuple]:
-        """worker 内同步执行：显式 BEGIN … COMMIT + finally ROLLBACK。"""
+        """worker 内同步执行：显式 BEGIN … COMMIT + finally ROLLBACK。
+
+        FIX-CORR-3r4（dequeue-recheck）：入口检查（query()）与实际执行
+        之间存在排队窗口；probation 首个慢查询复 trip 后，已排队请求若
+        不复查将逐个执行慢 SQL（暴露面 = 队列深度）。此处出队后、执行
+        前（t0 计时之前、BEGIN 之前、finally 之外）二次检查：breaker
+        open → 不执行 SQL、零计时零样本，抛与入口拒绝**完全同信号**的
+        ``AuxiliaryUnavailableError("circuit_open")``（路由层降级路径
+        逐字节一致）。probation **不算 open**（试用期语义 = 真实查询
+        放行）。
+        """
+        if self._breaker.open:
+            raise AuxiliaryUnavailableError("circuit_open")
         assert self._conn is not None
         conn = self._conn
         t0 = time.perf_counter()
@@ -607,7 +736,8 @@ class DbAuxiliarySource:
                 )
                 await self.swap()
                 return
-        # ② 熔断半开：周期单次探针；成功且 P99 回落（<10ms）→ 闭合。
+        # ② 熔断半开：周期单次探针；连续第 recover_probes 个好探针
+        # （r3）→ 进入 probation 试用期（真实查询试用，非直接闭合）。
         if self._state == "circuit_open":
             if self._next_probe_at is None or now >= self._next_probe_at:
                 await self.probe()
@@ -617,20 +747,50 @@ class DbAuxiliarySource:
             await self.reprobe()
 
     async def probe(self) -> bool:
-        """半开单次探针（§2.3-6）。返回是否恢复闭合。"""
+        """半开单次探针（§2.3-6，FIX-CORR-3r2 两段式）。返回是否恢复闭合。
+
+        Step 1 — 存活预检（``SELECT 1``）：只捕获连接层故障（被锁/
+        关闭/损坏），失败 → 保持熔断、不喂任何延迟样本；其延迟对延迟
+        型故障零分辨力，**不纳入计时**（oracle 定死：SELECT 1 延迟不得
+        参与 breaker 关断判据）。
+
+        Step 2 — 路径同构 canary（``_CANARY_SQL``）：LEFT JOIN + 扫+排序
+        路径；**只包此段计时**，其延迟喂 ``note_probe``。闭合需连续
+        ``recover_probes``（默认 3）个好探针（迟滞）—— 连接健康但投影
+        仍慢时熔断器保持 open（本修复的核心语义）；canary 相对宽列投影
+        的残余便宜度由迟滞 + probation 逐查询判定 + r4 出队二次检查
+        兜底（误闭合暴露面 = 1 个慢查询，排队请求执行前降级）。
+        """
         self._counters["probes"] += 1
         self._next_probe_at = self._clock() + self._probe_interval_s
-        t0 = time.perf_counter()
         try:
+            # Step 1 — liveness only (locked/closed/broken conn). Its
+            # latency is deliberately NOT measured: SELECT 1 cannot
+            # distinguish a healthy connection from a degraded-scan one.
             await self._submit(self._probe_sync)
         except Exception:  # noqa: BLE001 — 失败 → 保持熔断
+            self._breaker.probe_failed()  # MINOR-1：异常断探针连击
             self._logger.info("dbaux half-open probe failed — staying open")
+            return False
+        t0 = time.perf_counter()
+        try:
+            # Step 2 — representative canary; ONLY its latency certifies
+            # recovery of the latency fault.
+            await self._submit(self._canary_sync)
+        except Exception as exc:  # noqa: BLE001 — 失败 → 保持熔断
+            self._breaker.probe_failed()  # MINOR-1：异常断探针连击
+            self._logger.info(
+                "dbaux half-open canary failed — staying open: %s", exc
+            )
             return False
         latency_ms = (time.perf_counter() - t0) * 1000.0
         recovered = self._breaker.note_probe(latency_ms)
         if recovered:
             self._state, self._reason = "available", None
-            self._logger.info("dbaux circuit closed (probe p99 recovered)")
+            self._logger.info(
+                "dbaux circuit recovered to probation (canary streak"
+                " good) — real queries on trial"
+            )
         return recovered
 
     def _probe_sync(self) -> None:
@@ -639,6 +799,31 @@ class DbAuxiliarySource:
         try:
             cur.execute("BEGIN")
             cur.execute("SELECT 1")
+            cur.fetchall()
+            cur.execute("COMMIT")
+        finally:
+            try:
+                if self._conn.in_transaction:
+                    self._conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            cur.close()
+
+    def _canary_sync(self) -> None:
+        """代表性投影形 canary（worker 线程内执行，FIX-CORR-3）。
+
+        连接/游标纪律与 ``_probe_sync`` 完全一致（复用专属长连接
+        ``self._conn``、BEGIN/COMMIT、finally rollback+close）；区别仅在
+        SQL —— 它走与 projection.py 相同的无索引全扫 + TEMP B-TREE
+        排序路径（见 ``_CANARY_SQL`` 注释）。schema 门已校验 ``s.id``
+        等列；gate 拦截时本方法抛错 → probe 判失败保持 open（fail-safe
+        方向正确）。
+        """
+        assert self._conn is not None
+        cur = self._conn.cursor()
+        try:
+            cur.execute("BEGIN")
+            cur.execute(self._CANARY_SQL)
             cur.fetchall()
             cur.execute("COMMIT")
         finally:
@@ -685,7 +870,8 @@ class DbAuxiliarySource:
         if self._breaker.open and self._state == "available":
             self.trip_breaker()
             self._logger.warning(
-                "dbaux circuit OPEN (p99 over threshold) — degrading to http"
+                "dbaux circuit OPEN (latency over threshold) — degrading"
+                " to http"
             )
 
     def status(self) -> DbAuxStatus:

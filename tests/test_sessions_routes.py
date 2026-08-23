@@ -505,6 +505,34 @@ async def test_sessions_status_merges_idle_busy_retry_turn_fields(upstream_facto
     assert data["s_retry"]["turn"] == 0
 
 
+async def test_sessions_status_non_durable_omits_turn_fields(upstream_factory):
+    """FIX-CORR-2r2: a wired but NON-DURABLE registry (incarnation
+    persistence unconfirmed at startup) → BOTH turn fields omitted from
+    every entry (paired omission, same wire shape as no registry) → ocdroid
+    Tier-2 degrade. The rest of each entry is untouched."""
+    from oc_slimapi.turn_registry import IncarnationValue, TurnRegistry
+    body = orjson.dumps({
+        "s_idle": {"type": "idle"},
+        "s_busy": {"type": "busy"},
+    })
+    reg = TurnRegistry(incarnation=IncarnationValue(9, durable=False))
+    reg.bump_turn("s_busy")
+    assert reg.durable is False
+    upstream = upstream_factory(_status_handler_factory(body=body))
+    app = _build_app(upstream, turn_registry=reg)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/slimapi/sessions/status?directory=/app", headers=VERSION_HEADERS,
+        )
+    assert response.status_code == 200
+    data = response.json()
+    # Paired omission on EVERY entry — never a null (null would also fence
+    # wrong) and never only one of the two fields.
+    assert data["s_idle"] == {"type": "idle"}
+    assert data["s_busy"] == {"type": "busy"}
+
+
 async def test_sessions_status_turn_reflects_concurrent_bump(upstream_factory):
     """Live read: two status calls around a ``bump_turn`` observe turn 0 then
     turn 1 — the merge reads the registry at call time (no caching). This is

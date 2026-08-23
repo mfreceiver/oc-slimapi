@@ -26,6 +26,18 @@ ocdroid 对接时：
 
 ---
 
+## [4.12.1] - 2026-08-23 — 正确性修复批（patch；wire 仍 v4，客户端零必改）
+
+> 源于 2026-08-23 全仓深度代码质量审计（三项正确性缺陷经对抗反证独立确认）：三项 VERIFIED 正确性缺陷修复（FIX-CORR-1/2/3），方案经 oracle 门控审阅。wire 版本仍 (4,4)。
+
+### Fixed
+
+- **SSE replay：hub idle-grace 拆除后重连不再产生假 `up_to_date` 空重放**（FIX-CORR-1）：最后一订阅者离开触发 grace 计时，hub 任务组完全退出后的观察空窗内 opencode 事件无人消费、不在重放日志；现拆除时写跨域 replay barrier（全局域 + 全部 token 域），旧 cursor 重连首帧 `resync{reason:"reconnect_no_replay"}`，客户端按 §7.2 既有语义 HTTP 全量对齐；拆除后新 hub 的新帧不受影响。代价：拆除后首个携旧 cursor 的客户端多付一次全量拉取（此前是静默漏帧）。
+- **turn fence：`turnIncarnation` 持久化未确认时本进程不再发布 fence**（FIX-CORR-2，返修版）：此前写失败仍返回 `base+1` 且照常发布，重启后可复用/倒退已发布 incarnation，客户端字典序 fence 会静默丢弃新进程 digest。现启动写盘最多 3 次写入尝试（失败间重试两次）；仍未确认 → 本进程 digest 与 `GET /slimapi/sessions/status` **配对省略** `turnIncarnation`/`turn`（ocdroid 按既有可选字段语义降级 Tier-2，客户端零改动；契约 §7.5 配对缺失触发面）；写成功路径取值不变（主/legacy 双文件高水位合并；原子写补父目录 fsync **尽力缩小** rename 掉电窗口——目录 fsync 失败仅告警，不影响写入成功判定）。残余风险（如实声明）：已确认落盘的文件事后遭外部损坏回退，下一进程可能与已发布值撞名——先于本修复存在的双重故障风险类，维持接受。
+- **dbaux 熔断：半开探针两段式 + 路径同构 canary + 连击迟滞 + probation 试用期**（FIX-CORR-3）：`SELECT 1` 仅作连接存活预检（延迟不参与判据）；关断判据 = 与投影查询同扫排序路径的 canary（`session LEFT JOIN project` 按 `time_updated DESC, id DESC`，强制保留 join，mode=ro 纯 SELECT，每 30s 半开 tick 至多一次）**连续 3 次**低于恢复阈值——满足后**仅进入试用期（probation）**：真实查询恢复放行但逐查询判延迟，任一 ≥20ms 慢查询**立即复 trip**（不依赖探针间隔/样本窗口时序），连续 3 个好真实查询才正式闭合；探针异常清零连击（连续成功语义）。连接健康但投影仍慢 → 熔断器保持 open；canary 相对宽列投影残余便宜度所致误闭合的最坏暴露面，**限 probation 误恢复期间** = **1 个慢真实查询**（复 trip 后即恢复逐查询判定；正式 graduation 回到 closed 后不再承诺绝对一查询上限，恢复常规 P99/最小样本判定）；probation 复 trip 后，已排队请求于**出队执行前**二次检查熔断器并走与入口拒绝完全一致的降级路径（不执行 SQL，暴露面不含队列深度）。canary 仍略便宜于真实投影，如实声明（由试用期逐查询判定兜底）。
+
+---
+
 ## [4.12.0] - 2026-08-23 — 修订六：token 帧原子序号 + part 级 digest revision + 恢复语义闭合（minor；wire 仍 v4，全部加性）
 
 > 承接 webui/ocdroid 反馈四需求（part 完成态不可见 / asked 因果序 / eviction 恢复语义 / 帧去重账本），经 rev-sgpt 五轮深审（REJECT→四条款→三门控迭代）冻结实施；Lane A（digest 因果）与 Lane B（token 序号/恢复）分批落地、逐批门控 ≥9.5（Lane A 9.4+条件放行、Lane B 9.8）。契约修订六：`v4-contract.md` §3.1/§7.2/§7.4/§7.5/§7.7。
@@ -717,7 +729,7 @@ ocdroid 对接时：
 - **单实例语义（O3）**：无 instanceFp；scope key = `(serverGroupFp, sid)`。单进程 / 单 asyncio 事件循环，`TurnRegistry` 所有方法为同步纯 dict 操作，无需锁（契约 §7.2 单调可见性）。
 - **不 bump `X-Slimapi-Version`**（仍 `2` / `ACCEPTED_CLIENT_VERSIONS=(2,2)`）：纯加性可选字段 + 可选输入 header，非破坏性协议变更。
 - **未新增 `/slimapi` 路由**；`scripts/check_routes_doc.py` 仍一致（8 条）。无新增配置项（复用 `OC_SLIMAPI_ACCESS_LOG_DIR` 作为 incarnation 文件 state dir）。
-- 受影响实现文件：`src/oc_slimapi/turn_registry.py`（新增）、`src/oc_slimapi/sse/hub_types.py`（DigestFields）、`src/oc_slimapi/sse/global_hub.py`（publish stamp + setter）、`src/oc_slimapi/proxy.py`（commit point + scope 注册 + path 辅助）、`src/oc_slimapi/sse/registry.py`（HubRegistry 转发）、`src/oc_slimapi/app.py`（lifespan 装配）。ocdroid 解析见 `SessionSyncCoordinator.kt:1021-1022`（`props.turnIncarnation` / `props.turn`，props = slimapi flat root）。**wire 契约**：`docs/specs/v2-contract.md` §3.y（本仓库权威）；完整因果语义 / 术语 / 不变量见跨项目 SSOT `ocdroid/docs/2026-07-31-oc-slimapi-turn-token-contract.md`。
+- 受影响实现文件：`src/oc_slimapi/turn_registry.py`（新增）、`src/oc_slimapi/sse/hub_types.py`（DigestFields）、`src/oc_slimapi/sse/global_hub.py`（publish stamp + setter）、`src/oc_slimapi/proxy.py`（commit point + scope 注册 + path 辅助）、`src/oc_slimapi/sse/registry.py`（HubRegistry 转发）、`src/oc_slimapi/app.py`（lifespan 装配）。ocdroid 解析见 `SessionSyncCoordinator.kt:1021-1022`（`props.turnIncarnation` / `props.turn`，props = slimapi flat root）。**wire 契约**：`docs/specs/v2-contract.md` §3.y（本仓库权威）；完整因果语义 / 术语 / 不变量见跨项目 SSOT `ocdroid/docs/archive/2026-07-31-oc-slimapi-turn-token-contract.md`。
 
 ---
 

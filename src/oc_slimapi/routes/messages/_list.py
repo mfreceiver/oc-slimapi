@@ -197,52 +197,40 @@ def _project_list_sorted_and_pack(
 def _judge_pack_tail(
     identity: bytes, *, accept_encoding: str | None,
     if_none_match: str | None, rep_version: bytes | None,
-) -> tuple[str | None, bytes | None, dict[str, str], str | None]:
+) -> tuple[str | None, bytes, dict[str, str], str | None]:
     """F-201/F-271 off-loop response tail: 304 judgment + gzip + validator.
 
+    Thin delegation to :func:`oc_slimapi.etag.encode_conditional_tail`
+    (ARCH-2: the judge→compress→validator pipeline exists exactly once).
     The list/merged routes produce the envelope identity bytes in the
-    transform worker, but their POST-projection tail (up to two full-body
-    sha256 passes for the conditional judgment + gzip level-6 on the merged
-    8 MiB worst case) used to run on the event loop, stalling every SSE
-    heartbeat for tens to hundreds of milliseconds. This worker is that
-    tail, executed via ``pool.offload`` — WITHOUT holding admission (a slot
-    here would 503 requests that already finished projecting; see the
-    design doc §1.3). Pure CPU; same functions, same order, same inputs as
-    the historical inline tail → wire bytes are identical.
+    transform worker and run this tail via ``pool.offload`` WITHOUT
+    holding admission (a slot here would 503 requests that already
+    finished projecting; design §1.3) — pure CPU, wire bytes identical
+    to the historical inline tail.
 
-    Returns ``(verdict, encoded, coding_headers, etag_value)``:
+    Messages-envelope semantics: ``judge_empty_body=True`` — the
+    ``orjson.dumps`` envelope is never empty and the historical tail
+    judged unconditionally. ``compress`` resolves THIS module's
+    ``compress_if_beneficial`` global at call time — the W3-2 test seam
+    spies that binding (tests/test_etag.py::
+    test_b1_4_gzip_hit_does_not_compress_messages). 304-branch
+    placeholders are ``(b"", {})`` (was ``(None, None)`` — never read
+    by callers; both call sites return ``not_modified_response``
+    immediately on a verdict).
 
-    * ``verdict is None`` → serve 200: ``encoded``/``coding_headers`` ready,
-      ``etag_value`` the validator of the coding actually carried (``None``
-      when ``rep_version`` is None — ETag disabled, byte-identical legacy).
-    * ``verdict == "*"`` → 304: compressed once to label the coding it
-      would serve; ``etag_value`` is that coding's validator.
-    * other ``verdict`` string → 304 echoing exactly that validator; zero
-      compression happened.
+    Kept as a named module-level wrapper (not inlined at the call
+    sites) so the offload identity proofs keep observing this exact
+    function object (tests/test_offload_equivalence.py::
+    test_messages_tail_offload_proof).
     """
-    verdict: str | None = None
-    if rep_version is not None:
-        verdict = etag_mod.judge_conditional(
-            identity, if_none_match, rep_version,
-            accept_encoding=accept_encoding,
-        )
-        if verdict == "*":
-            _, c_headers = compress_if_beneficial(identity, accept_encoding)
-            actual = (
-                "gzip" if "Content-Encoding" in c_headers else "identity")
-            return (
-                "*", None, None,
-                etag_mod.compute_etag(identity, actual, rep_version),
-            )
-        if verdict is not None:
-            return verdict, None, None, verdict
-    encoded, c_headers = compress_if_beneficial(identity, accept_encoding)
-    etag_value: str | None = None
-    if rep_version is not None:
-        actual = (
-            "gzip" if "Content-Encoding" in c_headers else "identity")
-        etag_value = etag_mod.compute_etag(identity, actual, rep_version)
-    return None, encoded, c_headers, etag_value
+    return etag_mod.encode_conditional_tail(
+        identity,
+        accept_encoding=accept_encoding,
+        if_none_match=if_none_match,
+        rep_version=rep_version,
+        judge_empty_body=True,
+        compress=compress_if_beneficial,
+    )
 
 
 _REL_PARAM_RE = re.compile(

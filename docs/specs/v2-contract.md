@@ -362,7 +362,7 @@ data: {"reason":"subscriber_backpressure|reconnect_no_replay|token_memory_limit|
 
 ## §3.y Turn token fence（服务端因果标识，未 bump `X-Slimapi-Version`，仍 `2`）🔒
 
-> **跨项目 SSOT**：完整因果语义、术语、不变量、消费侧 lex 比较规则见 **`ocdroid/docs/2026-07-31-oc-slimapi-turn-token-contract.md`**（双方共同阅读的权威契约）。本节记录 **sidecar 侧的 wire 行为**（发什么字段、何时 stamp），与该 SSOT 一致。
+> **跨项目 SSOT**：完整因果语义、术语、不变量、消费侧 lex 比较规则见 **`ocdroid/docs/archive/2026-07-31-oc-slimapi-turn-token-contract.md`**（双方共同阅读的权威契约；v2 历史存档期内有效，现行因果语义以 `docs/specs/v4-contract.md` §7.5 为准）。本节记录 **sidecar 侧的 wire 行为**（发什么字段、何时 stamp），与该 SSOT 一致。
 
 sidecar 作为 ocdroid 与 opencode 之间的 Python 中继层，可观察所有 `POST /session/{sid}/prompt` / `/abort` forward 流量，因此是「轮次起点」的权威观察者。它派生服务端因果标识 `(turnIncarnation, turn)`，stamp 进转发的 `session.digest`（§3），供 ocdroid 做 lexicographic 严格单调 fence（丢弃旧 incarnation / 旧 turn 的过期 digest）。**加性 / 向后兼容**：digest 字段集不变，从「有时输出」变「恒输出」，对 ocdroid 处理 present/absent 两种情况的客户端加性兼容；turn_registry 未装配（lifespan 级部署配置缺失）时两字段缺省 → ocdroid 降级 Tier-2 启发式确认门（系统正常工作）。
 

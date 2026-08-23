@@ -1309,3 +1309,189 @@ async def test_skeleton_rep_version_v2_rotates_messages_etag(
             assert r4.status_code == 304        # same representation: hit
     finally:
         _teardown(app)
+
+
+# ---------------------------------------------------------------------------
+# ARCH-2 — the shared response-tail helper
+# (``etag.encode_conditional_tail``; the single implementation behind
+# ``routes.messages._judge_pack_tail`` and ``routes._read_passthrough.
+# _tail_encode``). Pure-function regressions: no app, no fixtures.
+# ---------------------------------------------------------------------------
+
+def test_encode_conditional_tail_grid_matches_legacy_semantics():
+    """Grid over (rep_version, AE, INM, body size): verdicts, validators
+    and compression counts match the pre-dedup inline tails exactly."""
+    from oc_slimapi.gzip_util import MIN_GZIP_BYTES
+
+    REP = b"rep\x00grid"
+    small = b"tiny"                    # < MIN_GZIP_BYTES → identity-only
+    big = b"grid-" * 20000             # compressible, >= MIN_GZIP_BYTES
+    ident_small = etag_mod.compute_etag(small, "identity", REP)
+    ident_big = etag_mod.compute_etag(big, "identity", REP)
+    gzip_big = etag_mod.compute_etag(big, "gzip", REP)
+
+    def make_compress():
+        state = {"n": 0}
+
+        def _compress(body, accept_encoding):
+            state["n"] += 1
+            if accept_encoding == "gzip" and len(body) >= MIN_GZIP_BYTES:
+                return b"GZ" + body, {"Content-Encoding": "gzip",
+                                      "Vary": "Accept-Encoding"}
+            return body, {"Vary": "Accept-Encoding"}
+
+        return state, _compress
+
+    def run(body, ae, inm):
+        state, _compress = make_compress()
+        out = etag_mod.encode_conditional_tail(
+            body, accept_encoding=ae, if_none_match=inm,
+            rep_version=REP, compress=_compress)
+        return out, state["n"]
+
+    identity_headers = {"Vary": "Accept-Encoding"}
+    gzip_headers = {"Content-Encoding": "gzip", "Vary": "Accept-Encoding"}
+
+    # 200, no header: pack + identity validator (small body).
+    out, n = run(small, None, None)
+    assert out == (None, small, identity_headers, ident_small)
+    assert n == 1
+    # 304: identity tag hit on the sub-min single candidate; 0 compress.
+    out, n = run(small, "gzip", ident_small)
+    assert out == (ident_small, b"", {}, ident_small)
+    assert n == 0
+    # 200: sub-min + gzip AE → still identity-served; gzip tag can't match.
+    out, n = run(small, "gzip", gzip_big)
+    assert out[:2] == (None, small)
+    assert out[2] == identity_headers and out[3] == ident_small
+    assert n == 1
+    # 304: gzip weak tag hit (gzip-capable, >= min); 0 compress.
+    out, n = run(big, "gzip", gzip_big)
+    assert out == (gzip_big, b"", {}, gzip_big)
+    assert n == 0
+    # 200: identity tag under a gzip-capable request — conservative 200
+    # (B1-C5 reverse direction); one compression, gzip validator labels
+    # the coding actually carried.
+    out, n = run(big, "gzip", ident_big)
+    assert out[0] is None
+    assert out[1] == b"GZ" + big and out[2] == gzip_headers
+    assert out[3] == gzip_big
+    assert n == 1
+    # 304: ``*`` — exactly ONE compression, echoing the actual coding.
+    out, n = run(big, "gzip", "*")
+    assert out == ("*", b"", {}, gzip_big)
+    assert n == 1
+    # 304: identity tag hit when the request cannot take gzip.
+    out, n = run(big, None, ident_big)
+    assert out == (ident_big, b"", {}, ident_big)
+    assert n == 0
+    # 200: well-formed non-matching tag.
+    out, n = run(big, "gzip", '"deadbee"')
+    assert out[0] is None and n == 1
+    # ETag disabled (rep_version None): never judges, never labels.
+    state, _compress = make_compress()
+    out = etag_mod.encode_conditional_tail(
+        big, accept_encoding="gzip", if_none_match="*",
+        rep_version=None, compress=_compress)
+    assert out == (None, b"GZ" + big, gzip_headers, None)
+    assert state["n"] == 1
+
+
+def test_encode_conditional_tail_bodiless_never_judges_or_etags():
+    """§10.a frozen bodiless semantics (``judge_empty_body=False``): an
+    empty body never judges and never carries an ETag — even under
+    ``If-None-Match: *``. Route-level counterpart: test_read_groups.py::
+    test_upstream_204_empty_body_no_etag_no_gzip."""
+    REP = b"rep\x00bodiless"
+    calls = {"n": 0}
+
+    def _compress(body, accept_encoding):
+        calls["n"] += 1
+        return body, {"Vary": "Accept-Encoding"}
+
+    out = etag_mod.encode_conditional_tail(
+        b"", accept_encoding="gzip", if_none_match="*",
+        rep_version=REP, compress=_compress)
+    assert out == (None, b"", {"Vary": "Accept-Encoding"}, None)
+    assert calls["n"] == 1  # the 200 path still packs (identity)
+
+
+def test_encode_conditional_tail_judge_empty_body_true_keeps_messages_semantics():
+    """``judge_empty_body=True`` (messages list/merged envelopes): the
+    judgment runs regardless of body emptiness — the frozen historical
+    ``_judge_pack_tail`` branch (the ``orjson.dumps`` envelope is never
+    empty, so the branch is theoretical there but stays byte-faithful)."""
+    REP = b"rep\x00messages"
+    empty_identity = etag_mod.compute_etag(b"", "identity", REP)
+    calls = {"n": 0}
+
+    def _compress(body, accept_encoding):
+        calls["n"] += 1
+        return body, {"Vary": "Accept-Encoding"}
+
+    # Sub-min empty body → identity single candidate: tag hit, 0 compress.
+    out = etag_mod.encode_conditional_tail(
+        b"", accept_encoding="gzip", if_none_match=empty_identity,
+        rep_version=REP, judge_empty_body=True, compress=_compress)
+    assert out == (empty_identity, b"", {}, empty_identity)
+    assert calls["n"] == 0
+    # No match → conservative 200, identity validator.
+    out = etag_mod.encode_conditional_tail(
+        b"", accept_encoding="gzip", if_none_match='"deadbee"',
+        rep_version=REP, judge_empty_body=True, compress=_compress)
+    assert out == (None, b"", {"Vary": "Accept-Encoding"}, empty_identity)
+    assert calls["n"] == 1
+
+
+def test_judge_pack_tail_and_tail_encode_delegate_with_caller_compress_binding(
+        monkeypatch):
+    """The two named wrappers delegate to the shared helper with the
+    caller's OWN module-global ``compress_if_beneficial`` — resolved at
+    call time, preserving the monkeypatch seams (W3-2 / F-302) — and with
+    their frozen bodiless flags (True / default False)."""
+    from oc_slimapi.routes import _read_passthrough as _rp
+
+    real = etag_mod.encode_conditional_tail
+    seen: list[dict] = []
+
+    def _spy(body, **kwargs):
+        seen.append(kwargs)
+        return real(body, **kwargs)
+
+    monkeypatch.setattr(etag_mod, "encode_conditional_tail", _spy)
+
+    list_calls = {"n": 0}
+    _orig_list_cib = messages._list.compress_if_beneficial
+
+    def _list_spy(body, accept_encoding):
+        list_calls["n"] += 1
+        return _orig_list_cib(body, accept_encoding)
+
+    monkeypatch.setattr(messages._list, "compress_if_beneficial", _list_spy)
+
+    rp_calls = {"n": 0}
+    _orig_rp_cib = _rp.compress_if_beneficial
+
+    def _rp_spy(body, accept_encoding):
+        rp_calls["n"] += 1
+        return _orig_rp_cib(body, accept_encoding)
+
+    monkeypatch.setattr(_rp, "compress_if_beneficial", _rp_spy)
+
+    BIG = b"delegate-" * 20000
+    REP = b"rep\x00delegate"
+
+    messages._list._judge_pack_tail(
+        BIG, accept_encoding="gzip", if_none_match=None, rep_version=REP)
+    assert len(seen) == 1
+    assert seen[0]["judge_empty_body"] is True
+    assert seen[0]["compress"] is _list_spy
+    assert list_calls["n"] == 1 and rp_calls["n"] == 0
+
+    seen.clear()
+    _rp._tail_encode(
+        BIG, accept_encoding="gzip", if_none_match=None, rep_version=REP)
+    assert len(seen) == 1
+    assert "judge_empty_body" not in seen[0]  # default False not passed
+    assert seen[0]["compress"] is _rp_spy
+    assert rp_calls["n"] == 1 and list_calls["n"] == 1

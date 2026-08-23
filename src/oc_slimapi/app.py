@@ -223,15 +223,38 @@ async def lifespan(app: FastAPI):
     # individually try/except-isolated so one failure does NOT skip the others
     # (mirrors the per-component convergence the old finally block enforced).
     #
-    # Registration order (and thus reverse-cleanup order) is:
-    #   access-log handler → snapshotter → upstream → transforms → hubs →
-    #   token_hub → maintenance task
-    # Cleanup runs in LIFO: maintenance → token_hub → hubs → transforms →
-    #   upstream → snapshotter → access-log handler.
+    # Registration order (and thus reverse-cleanup order) — all 14
+    # exit-stack registrations, anchored by cleanup-callback name (line
+    # numbers are the v4.12.0 / HEAD a4cc717 snapshot and WILL drift as
+    # this file edits; the names are the stable anchor):
+    #
+    #   1. access-log handlers    _close_access_log_handlers    (callback)
+    #   2. snapshotter            _stop_snapshotter             (push_async_callback)
+    #   3. upstream client        _aclose_upstream              (push_async_callback)
+    #   4. transform pool         _shutdown_transforms          (callback)
+    #   5. single-flight fulls    _shutdown_fulls               (callback)
+    #   6. catalog cache          _shutdown_catalog_cache       (callback)
+    #   7. raw-fetch registry     _shutdown_raw_fetch_registry  (callback; only when coalesce_enabled)
+    #   8. replay log             _close_replay_log             (callback)
+    #   9. replay sweep task      _stop_replay_sweep            (push_async_callback)
+    #  10. hub registry           _close_hubs                   (push_async_callback)
+    #  11. qp sweep shadow        _stop_qp_sweep                (push_async_callback; only when qp_sweep_enabled)
+    #  12. token hub              _stop_token_hub               (callback; registered AFTER hubs — NB-C4)
+    #  13. dbaux source           _stop_dbaux                   (push_async_callback)
+    #  14. access-log maintenance _stop_maintenance             (push_async_callback; only when access_log_active)
+    #
+    # Cleanup runs in exact LIFO: maintenance → dbaux → token_hub →
+    # qp_sweep → hubs → replay_sweep → replay_log → raw_fetch_registry →
+    # catalog_cache → fulls → transforms → upstream → snapshotter →
+    # access-log handlers. The three conditional registrations (7/11/14)
+    # drop out when their gate is off; the relative order of the rest is
+    # unchanged.
     # The only ordering constraint with cross-component semantics is
-    # token_hub.stop() BEFORE hubs.close() (NB-C4: flush loop must drain while
-    # the registry / hub are still coherent); that is satisfied by registering
-    # token_hub AFTER hubs.
+    # token_hub.stop() BEFORE hubs.close() (NB-C4: flush loop must drain
+    # while the registry / hub are still coherent); that is satisfied by
+    # registering token_hub AFTER hubs (#12 > #10). Each callback is
+    # individually try/except-isolated so one failure does NOT skip the
+    # others (mirrors the per-component convergence of the old finally).
     # ------------------------------------------------------------------
     async with AsyncExitStack() as stack:
         access_logger = setup_access_log(

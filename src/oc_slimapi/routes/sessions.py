@@ -116,8 +116,10 @@ async def _status_via_lease(
     if not isinstance(payload, dict):
         raise_upstream_unavailable()
     # Per-caller turn merge — identical to the direct path (contract §3.y.1).
+    # FIX-CORR-2r2: non-durable (persistence unconfirmed at startup) →
+    # paired omission → ocdroid Tier-2 (contract §7.5).
     turn_registry = getattr(request.app.state, "turn_registry", None)
-    if turn_registry is not None:
+    if turn_registry is not None and getattr(turn_registry, "durable", True):
         for sid, info in payload.items():
             if isinstance(info, dict):
                 inc, turn = turn_registry.snapshot(sid)
@@ -652,10 +654,13 @@ async def sessions_status(request: Request, directory: str | None = None):
     # Read-only turn merge (contract §3.y.1: paired turnIncarnation/turn at
     # the flat top level of each entry). Unobserved sid → (inc, 0). The
     # registry is lifespan-wired in production; when absent both fields are
-    # omitted (paired missing → ocdroid Tier-2 degrade). Entries whose value
-    # is not a dict (upstream schema violation) are passed through unchanged.
+    # omitted (paired missing → ocdroid Tier-2 degrade). FIX-CORR-2r2: the
+    # same paired omission applies when the registry is wired but its
+    # incarnation persistence was unconfirmed at startup (non-durable).
+    # Entries whose value is not a dict (upstream schema violation) are
+    # passed through unchanged.
     turn_registry = getattr(request.app.state, "turn_registry", None)
-    if turn_registry is not None:
+    if turn_registry is not None and getattr(turn_registry, "durable", True):
         for sid, info in payload.items():
             if isinstance(info, dict):
                 inc, turn = turn_registry.snapshot(sid)

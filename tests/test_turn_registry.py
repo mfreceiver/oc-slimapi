@@ -34,7 +34,7 @@ from oc_slimapi.turn_registry import (
 from oc_slimapi.sse.global_hub import GlobalHub
 from oc_slimapi.sse.hub import Subscriber
 from oc_slimapi.sse.hub_types import DigestFields
-from oc_slimapi.turn_registry import IncarnationStore, TurnRegistry
+from oc_slimapi.turn_registry import IncarnationStore, IncarnationValue, TurnRegistry
 
 
 # ── shared helpers (mirror tests/test_hub.py) ───────────────────────────────────
@@ -168,19 +168,37 @@ def test_incarnation_write_is_atomic_via_temp_then_replace(tmp_path, monkeypatch
 
 
 def test_incarnation_write_tmp_cleaned_up_on_replace_failure(tmp_path, monkeypatch):
-    """P0-4: when os.replace fails, the orphan ``.tmp`` is cleaned up."""
+    """P0-4 + FIX-CORR-2r2 (INTENTIONAL behavior change): when os.replace
+    fails (all 3 retry attempts), the orphan ``.tmp`` is cleaned up AND the
+    returned value is marked **non-durable** — the process withholds the
+    turn fence (snapshot → (None, None) → paired omission → Tier-2) instead
+    of publishing an unconfirmed value. The in-memory value still takes the
+    wall-clock floor (unpublished collision pad)."""
+    fixed_now = 1_750_000_000
+    monkeypatch.setattr(
+        "oc_slimapi.turn_registry.time.time", lambda: fixed_now
+    )
+    monkeypatch.setattr("oc_slimapi.turn_registry.time.sleep", lambda s: None)
     store = IncarnationStore(state_dir=str(tmp_path))
     # Seed a valid prior value so we can assert it survives a failed write.
     (tmp_path / "incarnation").write_text("7\n", encoding="utf-8")
 
+    replace_calls = []
+
     def boom(src, dst):
+        replace_calls.append((src, dst))
         raise OSError("rename denied (read-only filesystem)")
 
     monkeypatch.setattr("oc_slimapi.turn_registry.os.replace", boom)
 
-    # load_or_bump returns the computed value (8) in-memory even though the
-    # persist failed — best-effort, never crashes the lifespan.
-    assert store.load_or_bump() == 8
+    # load_or_bump retries the write 3 times, then degrades non-durable.
+    inc = store.load_or_bump()
+    assert inc == fixed_now + 1  # in-memory floor (NOT published)
+    assert inc.durable is False
+    assert len(replace_calls) == 3  # full retry budget exhausted
+    reg = TurnRegistry(incarnation=inc)
+    assert reg.durable is False
+    assert reg.snapshot("s") == (None, None)
     # The prior value is untouched on disk (the atomic replace never landed).
     assert (tmp_path / "incarnation").read_text().strip() == "7"
     # The orphan temp was cleaned up by the failure path.
@@ -188,11 +206,17 @@ def test_incarnation_write_tmp_cleaned_up_on_replace_failure(tmp_path, monkeypat
 
 
 def test_incarnation_write_crash_mid_write_leaves_prior_value(tmp_path, monkeypatch):
-    """P0-4: a crash (simulated as a failed open of the temp) cannot truncate
-    the already-persisted file. Pre-P0-4 a direct ``write_text`` would
-    truncate the final path before writing; a crash there left an empty file
-    → next restart reads 0 → incarnation 1 reused (fence reuse). Now the
-    final file is only touched via the atomic rename."""
+    """P0-4 + FIX-CORR-2r2: a crash (simulated as a failed open of the temp)
+    cannot truncate the already-persisted file; after 3 failed attempts the
+    store degrades non-durable (fence withheld, Tier-2). Pre-P0-4 a direct
+    ``write_text`` would truncate the final path before writing; a crash
+    there left an empty file → next restart reads 0 → incarnation 1 reused
+    (fence reuse). Now the final file is only touched via the atomic rename."""
+    fixed_now = 1_750_000_000
+    monkeypatch.setattr(
+        "oc_slimapi.turn_registry.time.time", lambda: fixed_now
+    )
+    monkeypatch.setattr("oc_slimapi.turn_registry.time.sleep", lambda s: None)
     store = IncarnationStore(state_dir=str(tmp_path))
     (tmp_path / "incarnation").write_text("42\n", encoding="utf-8")
 
@@ -206,11 +230,236 @@ def test_incarnation_write_crash_mid_write_leaves_prior_value(tmp_path, monkeypa
 
     monkeypatch.setattr("builtins.open", crash_on_temp_write)
 
-    assert store.load_or_bump() == 43  # computed in-memory
+    inc = store.load_or_bump()  # wall-clock floor, non-durable
+    assert inc == fixed_now + 1
+    assert inc.durable is False
+    assert TurnRegistry(incarnation=inc).snapshot("s") == (None, None)
     # The final file is fully intact — prior value survives the crash.
     assert (tmp_path / "incarnation").read_text().strip() == "42"
     # And no temp lingers.
     assert not (tmp_path / "incarnation.tmp").exists()
+
+
+# ── 1c. FIX-CORR-2: strict cross-process monotonicity under degraded writes ────
+
+
+def test_same_second_double_write_failure_publishes_nothing(tmp_path, monkeypatch):
+    """FIX-CORR-2r2 counterexample 1 (rev-2 gate): two processes failing in
+    the SAME wall-clock second must not publish colliding incarnations.
+
+    The round-1 floor design failed here — both processes returned the
+    identical ``time+1`` and published it (fence reuse). Direction X
+    ("don't publish unconfirmed") makes the collision constructionally
+    impossible: both processes withhold the fence entirely (non-durable →
+    snapshot (None, None) → paired field omission)."""
+    T = 1_750_000_000
+    monkeypatch.setattr(
+        "oc_slimapi.turn_registry.os.replace",
+        lambda src, dst: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    monkeypatch.setattr("oc_slimapi.turn_registry.time.time", lambda: T)
+    # Keep the retry backoff from sleeping in-test.
+    monkeypatch.setattr("oc_slimapi.turn_registry.time.sleep", lambda s: None)
+    (tmp_path / "incarnation").write_text("7\n", encoding="utf-8")
+
+    inc_a = IncarnationStore(state_dir=str(tmp_path)).load_or_bump()
+    inc_b = IncarnationStore(state_dir=str(tmp_path)).load_or_bump()  # same second, same disk
+
+    # Both retries exhausted (3 attempts each) → both non-durable.
+    assert inc_a.durable is False
+    assert inc_b.durable is False
+    # The in-memory values DO collide (this is precisely the round-1
+    # defect) — proving the floor alone cannot fence. The fix is that
+    # neither value is ever published:
+    assert inc_a == T + 1
+    assert inc_b == T + 1
+    reg_a = TurnRegistry(incarnation=inc_a)
+    reg_b = TurnRegistry(incarnation=inc_b)
+    assert reg_a.snapshot("s") == (None, None)
+    assert reg_b.snapshot("s") == (None, None)
+    # Zero published values → the collision is unobservable on the wire.
+
+
+def test_failed_then_recovered_write_no_published_regression(tmp_path, monkeypatch):
+    """FIX-CORR-2r2 counterexample 2 (rev-2 gate, oracle-corrected
+    assertions): after A fails to persist and B's write succeeds, B returns
+    base+1 (the success path NEVER takes the floor) — and there is no
+    regression because A never published anything, not because B > A."""
+    T = 1_750_000_000
+    real_replace = os.replace
+    state = {"boom": True}
+    monkeypatch.setattr(
+        "oc_slimapi.turn_registry.os.replace",
+        lambda src, dst: real_replace(src, dst)
+        if not state["boom"]
+        else (_ for _ in ()).throw(OSError("rename denied")),
+    )
+    monkeypatch.setattr("oc_slimapi.turn_registry.time.sleep", lambda s: None)
+    (tmp_path / "incarnation").write_text("7\n", encoding="utf-8")
+
+    # Process A: persistence fails at time T (all 3 attempts).
+    monkeypatch.setattr("oc_slimapi.turn_registry.time.time", lambda: T)
+    inc_a = IncarnationStore(state_dir=str(tmp_path)).load_or_bump()
+    assert inc_a.durable is False
+    assert inc_a == T + 1  # floor kept in-memory — but NEVER published
+    reg_a = TurnRegistry(incarnation=inc_a)
+    assert reg_a.snapshot("s") == (None, None)  # A's value is withheld
+
+    # Storage recovers; process B starts 10s later, reads disk base=7.
+    state["boom"] = False
+    monkeypatch.setattr("oc_slimapi.turn_registry.time.time", lambda: T + 10)
+    inc_b = IncarnationStore(state_dir=str(tmp_path)).load_or_bump()
+
+    # Success path returns base+1 (floor only exists on the failure
+    # branch) and is durable — the published fence sequence contains ONLY
+    # B's 8, so there is nothing to regress against.
+    assert inc_b == 8
+    assert inc_b.durable is True
+    reg_b = TurnRegistry(incarnation=inc_b)
+    assert reg_b.snapshot("s") == (8, 0)
+    assert (tmp_path / "incarnation").read_text().strip() == "8"
+
+    # Same-second variant: B also computes at time T — B still returns
+    # base+1 == 8 on the success path (the floor is failure-branch only).
+    (tmp_path / "incarnation").write_text("7\n", encoding="utf-8")
+    monkeypatch.setattr("oc_slimapi.turn_registry.time.time", lambda: T)
+    inc_c = IncarnationStore(state_dir=str(tmp_path)).load_or_bump()
+    assert inc_c == 8
+    assert inc_c.durable is True
+    # Even though 8 == A's in-memory floor + ... would be below A's floor
+    # (T+1), A never published: only C's 8 enters the fence sequence.
+
+
+def test_floor_not_below_file_base(tmp_path, monkeypatch):
+    """FIX-CORR-2b: the floor is a LOWER bound — a file value already
+    above the clock keeps ``base + 1`` (the fence is opaque; it may be a
+    huge integer). FIX-CORR-2r2: the value is non-durable (withheld)."""
+    monkeypatch.setattr(
+        "oc_slimapi.turn_registry.os.replace",
+        lambda src, dst: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    monkeypatch.setattr("oc_slimapi.turn_registry.time.time", lambda: 1_750_000_000)
+    monkeypatch.setattr("oc_slimapi.turn_registry.time.sleep", lambda s: None)
+    store = IncarnationStore(state_dir=str(tmp_path))
+    (tmp_path / "incarnation").write_text("9000000000000\n", encoding="utf-8")
+
+    inc = store.load_or_bump()
+    assert inc == 9_000_000_000_001
+    assert inc.durable is False
+
+
+def test_durable_registry_unchanged_wire():
+    """FIX-CORR-2r2 regression lock: a bare-int incarnation (legacy/test
+    construction) is treated as durable — pre-r2 semantics unchanged."""
+    reg = TurnRegistry(incarnation=5)
+    assert reg.durable is True
+    assert reg.snapshot("s") == (5, 0)
+    reg.bump_turn("s")
+    assert reg.snapshot("s") == (5, 1)
+
+
+def test_retry_recovers_transient_failure(tmp_path, monkeypatch):
+    """FIX-CORR-2r2: the startup write retries — a transient failure on
+    the first two attempts recovers on the third, so the value is durable
+    (published) and lands on disk."""
+    fixed_now = 1_750_000_000
+    real_replace = os.replace
+    state = {"failures_left": 2}
+
+    def flaky_replace(src, dst):
+        if state["failures_left"] > 0:
+            state["failures_left"] -= 1
+            raise OSError("transient EIO")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr("oc_slimapi.turn_registry.os.replace", flaky_replace)
+    monkeypatch.setattr("oc_slimapi.turn_registry.time.time", lambda: fixed_now)
+    monkeypatch.setattr("oc_slimapi.turn_registry.time.sleep", lambda s: None)
+    (tmp_path / "incarnation").write_text("7\n", encoding="utf-8")
+
+    store = IncarnationStore(state_dir=str(tmp_path))
+    inc = store.load_or_bump()
+
+    # Third attempt succeeded → durable, base+1 (floor NOT applied).
+    assert inc == 8
+    assert inc.durable is True
+    assert TurnRegistry(incarnation=inc).snapshot("s") == (8, 0)
+    assert (tmp_path / "incarnation").read_text().strip() == "8"
+
+
+def test_legacy_high_watermark_wins_over_corrupt_primary(tmp_path):
+    """FIX-CORR-2c: a corrupt primary falls back to the legacy value via a
+    high-watermark MAX over both files — the legacy value (9) must win,
+    not the implicit 0 of the corrupt primary (pre-CORR-2 returned 2)."""
+    (tmp_path / "primary").mkdir()
+    (tmp_path / "legacy").mkdir()
+    (tmp_path / "primary" / "incarnation").write_text("garbage\n", encoding="utf-8")
+    (tmp_path / "legacy" / "incarnation").write_text("9\n", encoding="utf-8")
+
+    store = IncarnationStore(
+        state_dir=str(tmp_path / "primary"),
+        legacy_state_dir=str(tmp_path / "legacy"),
+    )
+    assert store.load_or_bump() == 10
+    # The overwrite attempt recovered the primary file.
+    assert (tmp_path / "primary" / "incarnation").read_text().strip() == "10"
+
+
+def test_legacy_lower_than_primary_ignored(tmp_path):
+    """FIX-CORR-2c: when both files are valid, the max wins — a legacy
+    value below the primary must not drag the base down (nor up)."""
+    (tmp_path / "primary").mkdir()
+    (tmp_path / "legacy").mkdir()
+    (tmp_path / "primary" / "incarnation").write_text("12\n", encoding="utf-8")
+    (tmp_path / "legacy" / "incarnation").write_text("9\n", encoding="utf-8")
+
+    store = IncarnationStore(
+        state_dir=str(tmp_path / "primary"),
+        legacy_state_dir=str(tmp_path / "legacy"),
+    )
+    assert store.load_or_bump() == 13
+
+
+def test_write_persisted_fsyncs_parent_dir(tmp_path, monkeypatch):
+    """FIX-CORR-2a: a successful persist fsyncs BOTH the temp file and the
+    parent directory (closing the rename-loss power-fail window)."""
+    fsync_calls: list[int] = []
+    real_fsync = os.fsync
+
+    def spy_fsync(fd):
+        fsync_calls.append(fd)
+        return real_fsync(fd)
+
+    monkeypatch.setattr("oc_slimapi.turn_registry.os.fsync", spy_fsync)
+
+    store = IncarnationStore(state_dir=str(tmp_path))
+    assert store.load_or_bump() == 1
+
+    # One fsync for the temp file, one for the parent directory fd.
+    assert len(fsync_calls) == 2
+    # The value landed atomically.
+    assert (tmp_path / "incarnation").read_text().strip() == "1"
+
+
+def test_parent_dir_fsync_failure_degrades_to_success(tmp_path, monkeypatch, caplog):
+    """FIX-CORR-2a: the dir fsync is best-effort — its failure warns but
+    does NOT turn the persist into a failure (the rename already landed)."""
+    real_open = os.open
+
+    def boom_on_dir_open(path, flags, *args, **kwargs):
+        raise OSError("cannot open dir for fsync")
+
+    monkeypatch.setattr("oc_slimapi.turn_registry.os.open", boom_on_dir_open)
+
+    import logging
+
+    store = IncarnationStore(state_dir=str(tmp_path))
+    with caplog.at_level(logging.WARNING):
+        inc = store.load_or_bump()
+
+    assert inc == 1  # normal base+1 — NOT the degraded floor
+    assert (tmp_path / "incarnation").read_text().strip() == "1"
+    assert "parent-dir fsync failed" in caplog.text
 
 
 def test_incarnation_reload_after_successful_atomic_write(tmp_path):
@@ -422,6 +671,40 @@ async def test_publish_omits_turn_when_no_registry_wired():
         assert len(digests) == 1
         assert "turnIncarnation" not in digests[0]
         assert "turn" not in digests[0]
+    finally:
+        await _close_hub(hub)
+
+
+async def test_non_durable_registry_digest_omits_turn_pair():
+    """FIX-CORR-2r2: a wired but NON-DURABLE registry (persistence
+    unconfirmed at startup) omits the paired turn fields on the digest —
+    identical wire shape to "no registry wired" — so ocdroid degrades to
+    Tier-2 instead of fencing on an unconfirmed value (contract §7.5
+    paired-optional semantics)."""
+    hub = GlobalHub(client=None)
+    try:
+        reg = TurnRegistry(incarnation=IncarnationValue(42, durable=False))
+        reg.bump_turn("s1")
+        assert reg.durable is False
+        hub.set_turn_registry(reg)
+
+        subscriber = Subscriber()
+        hub.subscribers.add(subscriber)
+        hub.publish(make_global_event("/proj", "session.status", {
+            "sessionID": "s1", "status": "busy",
+        }))
+        hub.flush()
+
+        frames = await drain_queue(subscriber)
+        digests = [
+            data for event, data in (parse_event(f) for f in frames)
+            if event == "session.digest"
+        ]
+        assert len(digests) == 1
+        assert "turnIncarnation" not in digests[0]
+        assert "turn" not in digests[0]
+        # The digest itself is unaffected — only the fence pair is withheld.
+        assert digests[0]["status"] == "busy"
     finally:
         await _close_hub(hub)
 
@@ -766,8 +1049,18 @@ def test_legacy_file_remains_after_migration(tmp_path):
 
 
 def test_unwritable_new_path_returns_computed_inc(tmp_path, monkeypatch):
-    """New path unwritable (write fails) → still returns the computed inc
-    (base+1), does not crash, does not return a fixed fallback."""
+    """New path unwritable (write fails) → still returns a computed inc,
+    does not crash, does not return a fixed fallback.
+
+    FIX-CORR-2r2 (INTENTIONAL behavior change): the computed value under a
+    failed persist is the wall-clock floor max(base+1, time+1) marked
+    **non-durable** — the process withholds the fence (Tier-2) instead of
+    publishing a value the disk never learned."""
+    fixed_now = 1_750_000_000
+    monkeypatch.setattr(
+        "oc_slimapi.turn_registry.time.time", lambda: fixed_now
+    )
+    monkeypatch.setattr("oc_slimapi.turn_registry.time.sleep", lambda s: None)
     new_dir = tmp_path / "state"
     legacy_dir = tmp_path / "legacy"
     legacy_dir.mkdir()
@@ -776,6 +1069,8 @@ def test_unwritable_new_path_returns_computed_inc(tmp_path, monkeypatch):
     store = IncarnationStore(state_dir=str(new_dir), legacy_state_dir=str(legacy_dir))
     # Force the write to fail — simulates a read-only / unavailable state dir.
     monkeypatch.setattr(store, "_write_persisted", lambda inc: False)
-    # Legacy base = 5 → inc = 6 (computed in-memory even though persist failed).
+    # Legacy base = 5 → bare inc would be 6; the floor dominates
+    # (fixed_now + 1) — and the value is withheld (non-durable).
     inc = store.load_or_bump()
-    assert inc == 6  # NOT a fixed fallback like 1
+    assert inc == fixed_now + 1  # NOT a fixed fallback like 1, NOT bare 6
+    assert inc.durable is False

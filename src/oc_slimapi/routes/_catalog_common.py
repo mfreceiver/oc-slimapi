@@ -38,6 +38,8 @@ from ..upstream_errors import (
 )
 
 # Shared with tests so the route and the wire contract agree on Retry-After.
+# Single authoritative definition (ARCH-3): routes/messages/_router.py
+# re-exports ``busy_response`` as ``_busy_response`` and this constant.
 TRANSFORM_RETRY_AFTER_SECONDS = 2
 
 

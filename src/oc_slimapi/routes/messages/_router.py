@@ -7,43 +7,23 @@ The three family modules — :mod:`._list`, :mod:`._full_merge` and
 ``messages.router`` exposes the same route set as the pre-split module.
 Helpers consumed by more than one family (``_busy_response``,
 ``_resolve_messages_directory``) live here, the shared ancestor with no
-sibling-module imports.
+sibling-module imports. ``_busy_response`` is a re-export alias of
+:func:`oc_slimapi.routes._catalog_common.busy_response` (ARCH-3 dedup:
+one authoritative definition + one ``TRANSFORM_RETRY_AFTER_SECONDS``;
+the dependency direction stays routes/messages → routes, never back).
 """
 
 from __future__ import annotations
 
 from fastapi import APIRouter, Request
-from starlette.responses import Response
 
 from ...errors import CodedHTTPException
-from ...gzip_util import error_response
 from ...selector import resolve_route_directory
 from ...directory import validate_directory
+from .._catalog_common import TRANSFORM_RETRY_AFTER_SECONDS  # noqa: F401  (compat re-export)
+from .._catalog_common import busy_response as _busy_response
 
 router = APIRouter(prefix="/slimapi/messages/{sid}", tags=["messages"])
-
-# Fixed Retry-After for transform admission timeouts. Kept as a module constant
-# so tests and the route agree on the wire contract.
-TRANSFORM_RETRY_AFTER_SECONDS = 2
-
-
-def _busy_response(accept_encoding: str | None = None) -> Response:
-    """503 + ``Retry-After`` — emitted when the transform pool admission
-    times out.
-
-    Routed through :func:`error_response` so the body honours gzip
-    negotiation (contract §9) when the client sent ``Accept-Encoding: gzip``.
-    ``error_response`` sets ``Vary: Accept-Encoding`` (and Content-Encoding
-    when gzip is negotiated); ``Retry-After`` is appended afterward because
-    it is a transport header, not a body field.
-    """
-    response = error_response(
-        "transform_busy", 503,
-        accept_encoding=accept_encoding,
-        retry_after=TRANSFORM_RETRY_AFTER_SECONDS,
-    )
-    response.headers["Retry-After"] = str(TRANSFORM_RETRY_AFTER_SECONDS)
-    return response
 
 
 async def _resolve_messages_directory(request: Request, directory: str | None) -> str | None:

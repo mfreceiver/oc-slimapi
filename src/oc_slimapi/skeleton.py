@@ -174,6 +174,10 @@ def _utf8_bytes_exceeds(text: Any, limit: int) -> bool:
 
 def _expand_ref(
     category: str, message_id: str, part_id: str | None, sid: str,
+    # wire_view default 3 = pure-function historical FREEZE (golden: tests/
+    # test_expand_href_v4.py::test_projection_default_view_keeps_frozen_v3_bytes);
+    # production always passes 4 — routes/messages/_list.py::_expand_wire_view
+    # returns 4 unconditionally (D5). Do not "fix" the default to 4.
     wire_view: int = 3,
 ) -> dict[str, Any]:
     """Build one §5 expandRef entry (frozen schema).
@@ -197,6 +201,10 @@ def _expand_ref(
 
 def _emit_expand_refs(
     part: dict[str, Any], refs: list[tuple[str, str]], sid: str | None,
+    # wire_view default 3 = pure-function historical FREEZE (golden: tests/
+    # test_expand_href_v4.py::test_projection_default_view_keeps_frozen_v3_bytes);
+    # production always passes 4 — routes/messages/_list.py::_expand_wire_view
+    # returns 4 unconditionally (D5). Do not "fix" the default to 4.
     wire_view: int = 3,
 ) -> dict[str, Any]:
     """Attach deduped, deterministic ``expandRefs`` to a part (§5.2).
@@ -690,6 +698,10 @@ def _maybe_inline_state_field(
             thin_state["outputBytes"] = size
 
 
+# wire_view default 3 = pure-function historical FREEZE (golden: tests/
+# test_expand_href_v4.py::test_projection_default_view_keeps_frozen_v3_bytes);
+# production always passes 4 — routes/messages/_list.py::_expand_wire_view
+# returns 4 unconditionally (D5). Do not "fix" the default to 4.
 def _tool(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS, sid: str | None = None, wire_view: int = 3) -> dict[str, Any]:
     result = _pick(part, TOOL_KEYS)
     omitted: list[str] = []
@@ -902,6 +914,10 @@ def _patch(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits
     return _mark(result, omitted)
 
 
+# wire_view default 3 = pure-function historical FREEZE (golden: tests/
+# test_expand_href_v4.py::test_projection_default_view_keeps_frozen_v3_bytes);
+# production always passes 4 — routes/messages/_list.py::_expand_wire_view
+# returns 4 unconditionally (D5). Do not "fix" the default to 4.
 def _file(part: dict[str, Any], *, sid: str | None = None, wire_view: int = 3) -> dict[str, Any]:
     result = _pick(part, PART_IDS | {"filename", "mime"})
     omitted: list[str] = []
@@ -925,6 +941,10 @@ def _file(part: dict[str, Any], *, sid: str | None = None, wire_view: int = 3) -
     return _emit_expand_refs(_mark(result, omitted), refs, sid, wire_view)
 
 
+# wire_view default 3 = pure-function historical FREEZE (golden: tests/
+# test_expand_href_v4.py::test_projection_default_view_keeps_frozen_v3_bytes);
+# production always passes 4 — routes/messages/_list.py::_expand_wire_view
+# returns 4 unconditionally (D5). Do not "fix" the default to 4.
 def skeleton_part(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS, sid: str | None = None, wire_view: int = 3) -> dict[str, Any]:
     # §5: ``expandRefs`` is a sidecar-OWNED key — a foreign value from upstream
     # is dropped before any projection. It must never leak into the output, into
@@ -990,6 +1010,10 @@ def skeleton_message(
     limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS,
     fingerprint: bool = False,
     sid: str | None = None,
+    # wire_view default 3 = pure-function historical FREEZE (golden: tests/
+    # test_expand_href_v4.py::test_projection_default_view_keeps_frozen_v3_bytes);
+    # production always passes 4 — routes/messages/_list.py::_expand_wire_view
+    # returns 4 unconditionally (D5). Do not "fix" the default to 4.
     wire_view: int = 3,
 ) -> dict[str, Any]:
     # P1-29: normalise nested fields defensively. A malformed upstream message
@@ -1063,6 +1087,10 @@ def skeleton_messages(
     limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS,
     fingerprint: bool = False,
     sid: str | None = None,
+    # wire_view default 3 = pure-function historical FREEZE (golden: tests/
+    # test_expand_href_v4.py::test_projection_default_view_keeps_frozen_v3_bytes);
+    # production always passes 4 — routes/messages/_list.py::_expand_wire_view
+    # returns 4 unconditionally (D5). Do not "fix" the default to 4.
     wire_view: int = 3,
 ) -> list[dict[str, Any]]:
     """Project a full upstream message list to skeletons (design-expand §4).

@@ -18,11 +18,11 @@ cross-coding reuse fails closed (a conservative 200).
 from __future__ import annotations
 
 import hashlib
-from typing import Protocol
+from typing import Callable, Protocol
 
 from starlette.responses import Response
 
-from .gzip_util import MIN_GZIP_BYTES, accepts_gzip
+from .gzip_util import MIN_GZIP_BYTES, accepts_gzip, compress_if_beneficial
 
 # ETag scheme version — bump when the validator derivation itself changes
 # (distinct from the skeleton projection version below).
@@ -224,12 +224,12 @@ def judge_conditional(
          gzip — the echo does not mislabel. (A hand-forged gzip tag for
          an incompressible body cannot arise from a lawful exchange: the
          server never emitted one.)
-       * INM carries an identity strong tag → ALWAYS 200. The server
-         cannot distinguish "client's last request was identity-only"
-         from "benefit-gate fallback" history, so the conservative answer
-         is a full 200 (C5 "reverse direction likewise").
-       * ``*`` → 304 after one real compression, echoing the actual
-         coding's tag.
+        * INM carries an identity strong tag → ALWAYS 200. The server
+          cannot distinguish "client's last request was identity-only"
+          from "benefit-gate fallback" history, so the conservative answer
+          is a full 200 (C5 "reverse direction likewise").
+        * ``*`` → 304 after one real compression, echoing the actual
+          coding's tag.
     """
     if not if_none_match or not if_none_match.strip():
         return None
@@ -249,6 +249,72 @@ def judge_conditional(
     # Identity-tag (or no) match under a gzip-capable request: the served
     # coding is unknowable without compressing — conservative 200.
     return None
+
+
+#: Injectable ``compress_if_beneficial`` shape (see
+#: :func:`encode_conditional_tail`).
+CompressFn = Callable[[bytes, "str | None"], "tuple[bytes, dict[str, str]]"]
+
+
+def encode_conditional_tail(
+    body: bytes, *,
+    accept_encoding: str | None,
+    if_none_match: str | None,
+    rep_version: bytes | None,
+    judge_empty_body: bool = False,
+    compress: CompressFn = compress_if_beneficial,
+) -> "tuple[str | None, bytes, dict[str, str], str | None]":
+    """Shared response tail: 304 judgment → gzip → validator (single
+    implementation; ARCH-2 dedup of ``routes.messages._judge_pack_tail``
+    and ``routes._read_passthrough._tail_encode``).
+
+    Pipeline (identical pure calls, identical order as both historical
+    inline tails): :func:`judge_conditional` first (zero compression on
+    a tag hit); ``"*"`` compresses ONCE to label the coding it would
+    serve; the 200 path compresses via ``compress`` and labels its
+    validator with the coding actually carried.
+
+    ``judge_empty_body`` selects the caller's bodiless semantics:
+
+    * ``False`` (default, §10.a read-passthrough): an EMPTY body never
+      judges and never carries an ETag (``rep_version is not None and
+      body`` — bodiless 204/3xx successes pass through bare).
+    * ``True`` (messages list/merged envelopes): judgment ignores body
+      emptiness (the ``orjson.dumps`` envelope is never empty; the
+      historical tail judged unconditionally).
+
+    ``compress`` is injectable so each route module passes ITS OWN
+    module-global ``compress_if_beneficial`` binding — resolved at call
+    time, preserving the monkeypatch seams tests rely on
+    (``tests/test_etag.py::test_b1_4_gzip_hit_does_not_compress_messages``
+    spies ``messages._list.compress_if_beneficial``).
+
+    Returns ``(verdict, encoded, coding_headers, etag_value)``: a
+    non-None ``verdict`` (tag or ``"*"``) means 304 — ``encoded`` is
+    ``b""`` and ``coding_headers`` is ``{}`` placeholders there (callers
+    consume them only on the 200 path); ``None`` means the 200 payload
+    is ready. ``etag_value`` is ``None`` whenever the eligibility guard
+    (``rep_version`` + bodiless rule) excluded the body.
+    """
+    eligible = rep_version is not None and (judge_empty_body or bool(body))
+    verdict: str | None = None
+    if eligible:
+        verdict = judge_conditional(
+            body, if_none_match, rep_version,
+            accept_encoding=accept_encoding,
+        )
+        if verdict == "*":
+            _, coding = compress(body, accept_encoding)
+            actual = "gzip" if "Content-Encoding" in coding else "identity"
+            return "*", b"", {}, compute_etag(body, actual, rep_version)
+        if verdict is not None:
+            return verdict, b"", {}, verdict
+    encoded, coding = compress(body, accept_encoding)
+    etag_value: str | None = None
+    if eligible:
+        actual = "gzip" if "Content-Encoding" in coding else "identity"
+        etag_value = compute_etag(body, actual, rep_version)
+    return None, encoded, coding, etag_value
 
 
 def not_modified_response(

@@ -35,7 +35,16 @@ def fast_grace(monkeypatch):
 
 
 class _BoomTokenHub:
-    """Stand-in token hub whose reconnect hook blows up (F-011 use case)."""
+    """Stand-in token hub whose reconnect hook blows up (F-011 use case).
+
+    FIX-CORR-1: the removal path now routes through
+    ``GlobalHub.notify_idle_recycle_loss()``, which reads the hub-side
+    ``_token_hub`` — so the boom must be attached BEFORE ``get_global()``
+    to be forwarded onto the hub. ``subscriber_count = 0`` keeps
+    ``GlobalHub.has_consumers`` (which reads the attribute) working.
+    """
+
+    subscriber_count = 0
 
     def on_upstream_reconnect(self) -> None:
         raise RuntimeError("reconnect observer boom")
@@ -43,8 +52,10 @@ class _BoomTokenHub:
 
 async def test_teardown_exception_releases_slot_and_allows_rearm(fast_grace):
     registry = HubRegistry(None)
-    registry.get_global()
+    # Attach the boom hub BEFORE hub creation so get() forwards it onto
+    # the GlobalHub — the idle-recycle loss hook reads the hub-side ref.
     registry._token_hub = _BoomTokenHub()
+    registry.get_global()
 
     registry.maybe_arm_grace_if_idle()
     task = registry._removal_task
@@ -53,7 +64,12 @@ async def test_teardown_exception_releases_slot_and_allows_rearm(fast_grace):
     await task
     # F-011 lock: the slot no longer holds the dead task …
     assert registry._removal_task is None
-    # … so a later idle period can arm again.
+    # FIX-CORR-1 (intentional behavior change): the loss hook is per-step
+    # guarded, so a raising token hub no longer aborts the teardown —
+    # the hub reference IS dropped (no half-removed hub is stranded).
+    assert registry._global is None
+    # … so a later idle period can arm again (against a fresh hub).
+    registry.get_global()
     registry.maybe_arm_grace_if_idle()
     task2 = registry._removal_task
     assert task2 is not None and task2 is not task

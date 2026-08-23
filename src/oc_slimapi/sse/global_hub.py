@@ -672,6 +672,72 @@ class GlobalHub:
             except Exception:
                 logger.warning("upstream loss callback failed", exc_info=True)
 
+    def notify_idle_recycle_loss(self) -> None:
+        """Idle-grace teardown: observation stops without a disconnect event.
+
+        FIX-CORR-1: ``HubRegistry._remove_hub_after_grace`` calls this AFTER
+        the hub's task group has fully exited (gather returned) and the
+        revive re-check passed, right before the registry drops its strong
+        reference. The idle window is an UNOBSERVED upstream gap — the
+        opencode events of that window were consumed by nobody and are not
+        in the (process-wide) ReplayLog. Semantically equivalent to
+        :meth:`_notify_upstream_loss` (design §5.2 + §7.2 S-B01④): the
+        cross-domain replay barrier must make any pre-teardown cursor
+        answer ``resync{reconnect_no_replay}`` instead of a silently-empty
+        ``up_to_date`` replay. Epoch-invalidation observers (catalog TTL
+        cache) fire too — the SQLite projection may have drifted during
+        the idle window.
+
+        Ordering invariants (see ``_remove_hub_after_grace`` for the full
+        argument): the barrier is written after the last observation
+        opportunity (all tasks done — no frame can append past the
+        watermark) and before the reference drop (no new hub can start
+        appending into the barrier's span).
+
+        Differs from ``_notify_upstream_loss`` in one aspect: EVERY step is
+        individually best-effort. At teardown there is no retry loop to
+        recover on the next iteration, so a raising token hub must not
+        skip the epoch-invalidation callbacks.
+
+        m3 (FIX-CORR-1r2 disclosure): the barrier write itself is
+        fail-open — on failure the hub is STILL released and the
+        pre-teardown gap REOPENS (cursors may see silently-empty
+        ``up_to_date`` replays again, the pre-fix risk). This is a pure
+        in-memory dict operation (write_barrier) whose failure probability
+        is negligible; the deliberate trade is ERROR-level logging +
+        operator intervention rather than runtime retries / held-up
+        teardown. The disconnect path (``_notify_upstream_loss``) keeps a
+        WARNING for the same branch: its retry loop re-attempts the
+        barrier on the next loss event.
+        """
+        try:
+            self.resync_all()
+        except Exception:
+            logger.warning("idle-recycle resync_all failed", exc_info=True)
+        if self._replay is not None:
+            try:
+                self._replay.write_barrier()
+            except Exception:
+                # m3: fail-open by design (see docstring) — but the
+                # reopened silent-loss gap warrants operator visibility.
+                logger.error(
+                    "idle-recycle replay barrier write FAILED — "
+                    "pre-teardown cursors may see silently-empty "
+                    "up_to_date replays (gap reopened)"
+                )
+        if self._token_hub is not None:
+            try:
+                self._token_hub.on_upstream_reconnect()
+            except Exception:
+                logger.warning(
+                    "token-hub clear on idle recycle failed", exc_info=True
+                )
+        for callback in self._upstream_loss_callbacks:
+            try:
+                callback()
+            except Exception:
+                logger.warning("upstream loss callback failed", exc_info=True)
+
     async def stop_after_grace(self) -> None:
         """Grace timer used by ``unsubscribe`` / ``ensure_upstream``; exercised in tests."""
         await asyncio.sleep(GRACE_SECONDS)

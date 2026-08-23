@@ -8,7 +8,13 @@ forwarded ``session.digest`` SSE events so ocdroid can do causal fencing
 Design (frozen decisions O2 / O3 / O4 / S2 / S5 — see the implementation brief):
 
 * **O2 incarnation strategy A** (``persisted_last + 1``): single process,
-  single event loop — no file lock needed.
+  single event loop — no file lock needed. Durability gate (4.12.1
+  FIX-CORR-2r2): the startup write is retried a bounded number of times;
+  if still unconfirmed the value is marked **non-durable** and the process
+  **withholds the turn fence** (``snapshot`` → ``(None, None)`` → paired
+  field omission → ocdroid Tier-2) instead of publishing a value the disk
+  never learned. Only confirmed values are published; cross-process strict
+  monotonicity is required of published values alone.
 * **O3 single-instance semantics**: no instanceFp; the scope key is the
   ``sid`` alone (single sidecar + single opencode backend → ``sid`` is
   globally unique within the process, so no server-group fingerprint is
@@ -35,6 +41,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from collections import OrderedDict
 from pathlib import Path
 
@@ -63,6 +70,35 @@ _TURNS_MAX = 10_000
 # Single flat file holding the last-written incarnation integer, one line.
 _INCARNATION_FILENAME = "incarnation"
 
+# Startup persistence retries (FIX-CORR-2r2, direction X "don't publish
+# unconfirmed"): transient I/O hiccups (short NFS blips, disk busy) get a
+# bounded retry before the process gives up and degrades to Tier-2 (turn
+# fence not published this process). Attempt 1 is immediate; two retries
+# back off 0.1s / 0.25s — total worst-case added startup latency ~0.35s.
+_WRITE_ATTEMPTS = 3
+_WRITE_RETRY_DELAYS_S = (0.1, 0.25)
+
+
+class IncarnationValue(int):
+    """``int`` carrying the durability verdict of its persistence attempt.
+
+    Subclassing ``int`` keeps the existing call sites (app.py wiring,
+    annotations, tests asserting ``isinstance(inc, int)``) unchanged while
+    letting :class:`TurnRegistry` learn whether the value was confirmed on
+    disk. ``durable=True`` → the value is on disk (published); ``False`` →
+    persistence is UNCONFIRMED and the process must NOT publish the turn
+    fence (FIX-CORR-2r2: clients fence by lexicographic comparison of a
+    value the disk never learned — reuse/regression across processes — so
+    an unconfirmed value is withheld instead of published).
+    """
+
+    durable: bool
+
+    def __new__(cls, value: int, *, durable: bool) -> "IncarnationValue":
+        obj = super().__new__(cls, value)
+        obj.durable = durable
+        return obj
+
 
 class IncarnationStore:
     """Single-process-lifetime epoch counter (S5 incarnation persistence).
@@ -80,11 +116,16 @@ class IncarnationStore:
 
     * **Missing file** (first run): treated as ``persisted_last = 0`` →
       returns ``1`` and attempts to persist it.
-    * **Corrupt content** (non-integer): warn, return the fallback, do NOT
-      crash. We still attempt to overwrite with the fallback so the next
-      restart can recover.
-    * **Unwritable** (directory does not exist / permissions): warn, return
-      the fallback, do NOT crash.
+    * **Corrupt content** (non-integer): warn, treat the file as absent,
+      do NOT crash. We still attempt to overwrite with the computed value
+      so the next restart can recover.
+    * **Unwritable** (directory does not exist / permissions): warn and
+      return a **wall-clock monotonic floor** instead of the bare
+      ``base + 1`` (FIX-CORR-2b — see :meth:`load_or_bump`).
+    * **High-watermark across files** (FIX-CORR-2c): the primary and the
+      legacy persistence files are BOTH read; ``base`` is the max of all
+      valid values. A corrupt primary must never fall back below a
+      still-readable legacy value.
     """
 
     def __init__(self, state_dir: str, legacy_state_dir: str | None = None) -> None:
@@ -127,26 +168,56 @@ class IncarnationStore:
             return False, 0
         return True, value
 
-    def load_or_bump(self) -> int:
-        # 1) Read new path first: valid → use new value.
-        # 2) Else read legacy: valid → use legacy value (new path missing/corrupt
-        #    but legacy valid → fall back to legacy, avoiding incarnation
-        #    regression; only consult legacy when new is absent/corrupt).
-        # 3) Else base = 0 (fresh start).
-        # inc = base + 1; write ONLY the new path; legacy file is never deleted.
-        valid, base = self._read_path(self._path)
-        if not valid and self._legacy_path is not None:
-            valid, base = self._read_path(self._legacy_path)
+    def load_or_bump(self) -> IncarnationValue:
+        # FIX-CORR-2c: read BOTH files and take the high watermark — a
+        # corrupt (truncated/half-written) primary must never fall back
+        # below a still-readable legacy value, and vice versa. Under the
+        # normal migration invariant (primary migrated FROM legacy, so
+        # primary >= legacy) the max is simply the primary value; only
+        # anomalous states change the outcome.
+        # inc = base + 1; write ONLY the new path; legacy file is never
+        # deleted.
+        candidates = [
+            self._read_path(path)
+            for path in (self._path, self._legacy_path)
+            if path is not None
+        ]
+        valid_values = [value for valid, value in candidates if valid]
+        base = max(valid_values) if valid_values else 0
         inc = base + 1
-        # Write only the new path; on failure still return the computed inc
-        # (best-effort, no crash, no fixed fallback).
-        if not self._write_persisted(inc):
+        # FIX-CORR-2r2 (direction X — "don't publish unconfirmed"): retry
+        # the write a bounded number of times; if it is STILL unconfirmed
+        # the value is marked non-durable and the process withholds the
+        # turn fence entirely (TurnRegistry.snapshot → (None, None) →
+        # paired field omission → ocdroid Tier-2 per contract §7.5) rather
+        # than publishing a value the disk never learned. An unconfirmed
+        # but PUBLISHED value is unfixable cross-process: two same-second
+        # failures would reuse it, and a later successful write would
+        # regress below it (rev-2 gate counterexamples). An unconfirmed
+        # and UNPUBLISHED value can collide with nothing — nothing fences
+        # on it.
+        durable = False
+        for attempt in range(_WRITE_ATTEMPTS):
+            if self._write_persisted(inc):
+                durable = True
+                break
+            if attempt < _WRITE_ATTEMPTS - 1:
+                time.sleep(_WRITE_RETRY_DELAYS_S[min(attempt, len(_WRITE_RETRY_DELAYS_S) - 1)])
+        if not durable:
+            # The floor is NOT published (snapshot returns (None, None)
+            # for non-durable registries) — it only keeps the in-memory
+            # value self-consistent and acts as a collision pad for any
+            # hypothetical future observer of this process's internals.
+            floor = max(inc, int(time.time()) + 1)
+            inc = floor
             logger.warning(
-                "turn-registry: failed to persist incarnation %d to %s; "
-                "using value in-memory only (restart may re-read a stale value)",
-                inc, self._path,
+                "turn-registry: persistence unconfirmed after %d attempts "
+                "to %s — turn fence NOT published this process (paired "
+                "field omission → ocdroid Tier-2 degrade); value %d kept "
+                "in-memory only",
+                _WRITE_ATTEMPTS, self._path, inc,
             )
-        return inc
+        return IncarnationValue(inc, durable=durable)
 
     def _write_persisted(self, inc: int) -> bool:
         """Best-effort **atomic** write of ``inc`` to the persistence file.
@@ -184,6 +255,27 @@ class IncarnationStore:
             # Atomic commit — the final path now points at the fully-written,
             # fsynced content. A reader never observes a partial write.
             os.replace(str(tmp_path), str(self._path))
+            # FIX-CORR-2a: the rename is in the namespace, but the
+            # directory entry is not durable until the parent dir is
+            # fsynced — without it a power loss can revert the file to
+            # its previous content (or nothing) and a restart would
+            # re-read the pre-bump base, re-publishing the same fence.
+            try:
+                dir_fd = os.open(str(self._path.parent), os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                # Best-effort: the rename already landed; only the
+                # power-loss window remains. Degrade with a warning —
+                # this is NOT a write failure (the value is persisted in
+                # the page cache and will land barring power loss).
+                logger.warning(
+                    "turn-registry: parent-dir fsync failed for %s",
+                    self._path.parent,
+                    exc_info=True,
+                )
             return True
         except OSError:
             logger.warning(
@@ -221,16 +313,33 @@ class TurnRegistry:
       unique).
 
     All methods are synchronous pure-dict operations — no locking needed
-    under the single-event-loop model (contract §7.2). ``snapshot`` always
-    returns a ``(incarnation, turn)`` tuple: an unobserved ``sid`` returns
-    ``(incarnation, 0)``. The digest therefore always carries both fields
-    once a registry is wired (omitted only when the registry itself is
-    absent — a lifespan-level deployment property).
+    under the single-event-loop model (contract §7.2). ``snapshot`` returns
+    a ``(incarnation, turn)`` tuple for an unobserved ``sid`` as
+    ``(incarnation, 0)``. Two paired-omission triggers (FIX-CORR-2r2):
+    the registry itself is absent (lifespan-level deployment property), or
+    the registry is wired but its incarnation persistence was unconfirmed
+    at startup (non-durable — ``snapshot`` returns ``(None, None)`` and the
+    digest/REST merge layers omit both fields; ocdroid degrades to Tier-2
+    per contract §7.5 paired-optional semantics).
     """
 
     def __init__(self, incarnation: int) -> None:
         self.incarnation: int = incarnation
+        # FIX-CORR-2r2: IncarnationValue carries the durability verdict.
+        # A bare int (tests, legacy construction) is treated as durable —
+        # the pre-r2 semantics — so every existing call site is unchanged.
+        self._durable: bool = getattr(incarnation, "durable", True)
         self._turns: OrderedDict[str, int] = OrderedDict()
+
+    @property
+    def durable(self) -> bool:
+        """Whether the frozen incarnation was confirmed on disk at startup.
+
+        ``False`` → this process must not publish the turn fence; the
+        merge layers (digest stamp + /slimapi/sessions/status) omit both
+        paired fields and ocdroid degrades to Tier-2 (contract §7.5).
+        """
+        return self._durable
 
     def bump_turn(self, sid: str) -> int:
         """Increment the turn for ``sid`` and return it.
@@ -262,18 +371,23 @@ class TurnRegistry:
             )
         return self._turns[sid]
 
-    def snapshot(self, sid: str) -> tuple[int, int]:
+    def snapshot(self, sid: str) -> tuple[int | None, int | None]:
         """Return ``(incarnation, turn)`` for ``sid`` (always a tuple).
 
-        An unobserved ``sid`` returns ``(incarnation, 0)`` — there is no
-        None / header-gated degrade path: once a registry is wired the
-        digest always carries both fields.
+        An unobserved ``sid`` returns ``(incarnation, 0)``. Non-durable
+        registries (FIX-CORR-2r2: persistence unconfirmed at startup)
+        return ``(None, None)`` for EVERY sid — the paired fields are
+        omitted wire-side (digest stamp and REST merge both check for
+        None) and ocdroid degrades to Tier-2 rather than fencing on a
+        value the disk never learned.
 
         The returned turn is the *current* value at call time; the caller
         (GlobalHub.publish) freezes it onto the :class:`DigestFields` entry
         so a later bump does not retroactively change an already-stamped
         digest (contract §7.4, V10 acceptance).
         """
+        if not self._durable:
+            return (None, None)
         return (self.incarnation, self._turns.get(sid, 0))
 
 

@@ -94,36 +94,31 @@ def _tail_encode(
 ) -> tuple[str | None, bytes, dict[str, str], str | None]:
     """F-202 response tail: 304 judgment + gzip + validator (§10.a chain).
 
-    Same contract as ``routes.messages._judge_pack_tail`` (Wave 2 design
-    §2.2): returns ``(verdict, encoded, coding_headers, etag_value)`` where
-    a non-None ``verdict`` (tag or ``"*"``) means 304 with ``etag_value``
-    the validator to echo, and ``None`` means the 200 payload is ready.
-    The ``rep_version is not None and body`` guard mirrors the historical
-    inline tail exactly — bodiless successes (204/3xx etc.) never judge
-    and never carry an ETag. Pure CPU; runs inline below
+    Thin delegation to :func:`oc_slimapi.etag.encode_conditional_tail`
+    (ARCH-2 dedup — the same shared pipeline as
+    ``routes.messages._judge_pack_tail``, differing ONLY in the bodiless
+    rule). Returns ``(verdict, encoded, coding_headers, etag_value)``:
+    a non-None ``verdict`` (tag or ``"*"``) means 304 with
+    ``etag_value`` the validator to echo; ``None`` means the 200 payload
+    is ready.
+
+    §10.a semantics: default ``judge_empty_body=False`` — the
+    ``rep_version is not None and body`` guard of the historical inline
+    tail: bodiless successes (204/3xx etc.) never judge and never carry
+    an ETag. ``compress`` resolves this module's own binding at call
+    time (seam symmetry with the messages side). Kept as a named wrapper
+    for the ``asyncio.to_thread`` identity proof
+    (tests/test_offload_equivalence.py::
+    test_readgroup_tail_to_thread_proof); runs inline below
     ``_TAIL_OFFLOAD_MIN_BYTES`` and via ``asyncio.to_thread`` above.
     """
-    verdict: str | None = None
-    if rep_version is not None and body:
-        verdict = etag_mod.judge_conditional(
-            body, if_none_match, rep_version,
-            accept_encoding=accept_encoding,
-        )
-        if verdict == "*":
-            _, coding = compress_if_beneficial(body, accept_encoding)
-            actual = "gzip" if "Content-Encoding" in coding else "identity"
-            return (
-                "*", b"", {},
-                etag_mod.compute_etag(body, actual, rep_version),
-            )
-        if verdict is not None:
-            return verdict, b"", {}, verdict
-    encoded, coding = compress_if_beneficial(body, accept_encoding)
-    etag_value: str | None = None
-    if rep_version is not None and body:
-        actual = "gzip" if "Content-Encoding" in coding else "identity"
-        etag_value = etag_mod.compute_etag(body, actual, rep_version)
-    return None, encoded, coding, etag_value
+    return etag_mod.encode_conditional_tail(
+        body,
+        accept_encoding=accept_encoding,
+        if_none_match=if_none_match,
+        rep_version=rep_version,
+        compress=compress_if_beneficial,
+    )
 
 
 def _upstream_passthrough_headers(
