@@ -25,11 +25,10 @@ async def command(request: Request, directory: str | None = None):
 
     ``directory`` is accepted for slimapi API consistency and forwarded as
     ``X-Opencode-Directory``; the command catalog is global so upstream
-    ignores it (harmless). This is an ADDITIVE route: a client on an older
-    sidecar without it gets 404 ``thin_route_not_found`` from the catch-all
-    proxy and falls back to the passthrough ``GET /command``.
+    ignores it (harmless). Current sidecars expose only this thin route; there
+    is no passthrough fallback.
     """
-    # v3 (§5, Batch B): a consumed ``?directory=`` was validated + stripped
+    # v4: a consumed ``?directory=`` was validated + stripped
     # at dispatch — the stash replaces the (absent) query param here.
     directory = resolve_route_directory(request.scope, directory)
     if directory is not None:

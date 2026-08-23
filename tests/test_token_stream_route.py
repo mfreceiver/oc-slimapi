@@ -11,10 +11,9 @@ Scope:
   ``MAX_TOTAL_SUBSCRIBERS``), reject → 503-``sse_token_subscriber_limit``,
   NB-B1 grace-removal cancel on subscribe, first-attach start / last-detach
   stop lifecycle (NB-C4), metrics snapshot.
-* HTTP ``GET /slimapi/sessions/{sid}/stream`` — §5.5 handshake ordering
-  (server.connected → snapshot), ``Last-Event-ID`` → leading
-  ``reconnect_no_replay`` resync, NO SSE ``id:`` field, version gate,
-  admission 503, disconnect → unsubscribe, identity passthrough.
+* HTTP ``GET /slimapi/sessions/{sid}/stream`` — meta-first native-v4 join,
+  ``Last-Event-ID`` replay/resync, id-stamped business frames, admission 503,
+  disconnect → unsubscribe, identity passthrough.
 * Lever 2 gzip — ``Z_SYNC_FLUSH`` alignment to SSE event boundaries,
   ``Content-Encoding: gzip`` negotiation, control-plane ``/slimapi/events``
   NOT gzipped.
@@ -34,21 +33,50 @@ import pytest
 from fastapi import FastAPI
 
 from oc_slimapi.config import Settings, TOKEN_FLUSH_SECONDS
-from oc_slimapi.errors import register_error_handlers
+from oc_slimapi.errors import CodedHTTPException, register_error_handlers
 from oc_slimapi.routes import events, health, metrics, token_stream
 from oc_slimapi.selector import SlimapiSelectorMiddleware
 from oc_slimapi.sse.hub import HubRegistry, Subscriber, sse_frame as hub_sse_frame
+from oc_slimapi.sse.replay_log import ReplayLog
 from oc_slimapi.sse.token_hub import (
     STOP,
-    TokenStreamHub,
+    TokenStreamHub as _TokenStreamHub,
     TokenStreamRegistry,
     TokenSubscriber,
     TokenSubscriberCapacityError,
-    _connected_frame,
     _delta_frame,
+    _heartbeat_frame,
     _resync_frame,
-    _snapshot_frame,
 )
+
+
+_TEST_REPLAY_LOG: ReplayLog | None = None
+
+
+@pytest.fixture(autouse=True)
+def _test_replay_log():
+    global _TEST_REPLAY_LOG
+    replay_log = ReplayLog()
+    _TEST_REPLAY_LOG = replay_log
+    try:
+        yield
+    finally:
+        _TEST_REPLAY_LOG = None
+        replay_log.close()
+
+
+def _token_hub(**kwargs) -> _TokenStreamHub:
+    replay_log = kwargs.pop("replay_log", _TEST_REPLAY_LOG)
+    assert replay_log is not None
+    return _TokenStreamHub(replay_log=replay_log, **kwargs)
+
+
+TokenStreamHub = _token_hub
+
+
+def _hub_registry(**kwargs) -> HubRegistry:
+    assert _TEST_REPLAY_LOG is not None
+    return HubRegistry(replay_log=_TEST_REPLAY_LOG, **kwargs)
 
 VERSION_HEADERS = {"X-Slimapi-Version": "1"}
 
@@ -150,15 +178,19 @@ def _build_app(settings: Settings, *, include_control_events: bool = False) -> F
     app.state.deployment_revision = None
     upstream = httpx.AsyncClient()  # unused (hub client is None) but kept for parity
     app.state.upstream = upstream
+    replay_log = ReplayLog()
+    app.state.replay_log = replay_log
+    app.state.replay_epoch = replay_log.epoch
     hubs = HubRegistry(
         client=None,
+        replay_log=replay_log,
         max_subscribers_per_directory=settings.max_subscribers_per_directory,
         max_total_subscribers=settings.max_total_subscribers,
         queue_items=settings.sse_queue_items,
         buffer_bytes=settings.sse_buffer_bytes,
         max_frame_bytes=settings.sse_max_frame_bytes,
     )
-    token_hub = TokenStreamHub()
+    token_hub = TokenStreamHub(replay_log=replay_log)
     hubs.set_token_hub(token_hub)
     token_registry = TokenStreamRegistry(
         token_hub,
@@ -185,6 +217,7 @@ async def _close_app(app: FastAPI) -> None:
     app.state.token_hub.stop()
     with contextlib.suppress(Exception):
         await app.state.hubs.close()
+    app.state.replay_log.close()
     await app.state.upstream.aclose()
 
 
@@ -198,7 +231,7 @@ async def _close_app(app: FastAPI) -> None:
 #     is_disconnected() probe would otherwise busy-spin on repeated
 #     ``http.request`` returns and starve the event loop.
 #   * The token-stream generator parks on ``await queue.get()`` after the
-#     handshake, so the task never self-completes; after the park window we
+#     initial frames, so the task never self-completes; after the park window we
 #     cancel the task. Cancellation throws CancelledError into the
 #     generator's ``await queue.get()``, which unwinds its ``finally`` →
 #     ``registry.unsubscribe`` (so the ledger returns to 0 and the flush loop
@@ -256,11 +289,11 @@ async def _drive_stream(
             body.extend(message.get("body", b""))
 
     task = asyncio.create_task(app(scope, receive, send))
-    # Let the generator emit handshake frames, then park on queue.get.
+    # Let the generator emit initial frames, then park on queue.get.
     try:
         await asyncio.wait_for(asyncio.shield(task), timeout=park_timeout)
     except asyncio.TimeoutError:
-        pass  # expected: generator parked after the handshake
+        pass  # expected: generator parked after the initial frames
     # Cancel → CancelledError into the generator's queue.get → finally runs
     # (unsubscribe). shield kept the task alive across the park window.
     task.cancel()
@@ -394,10 +427,8 @@ class TestTokenSubscriber:
         assert th.dropped_frames_total == 1
         assert not sub.closed  # oversized drop does NOT close the sub
 
-    def test_queue_item_overflow_disconnects_with_sessionid_resync(self):
-        """§16-D: queue overflow → resync{subscriber_backpressure, sessionID}
-        + STOP + disconnect. The resync MUST carry sessionID (control-plane
-        omits it; token subs are per-session)."""
+    def test_queue_item_overflow_clears_backlog_and_seals_stop_only(self):
+        """Native-v4 queue overflow drops private backlog and seals with STOP."""
         th = TokenStreamHub()
         sub = TokenSubscriber(
             session_id="s1", metrics=th._metrics,
@@ -412,15 +443,11 @@ class TestTokenSubscriber:
         assert sub.closed
         assert sub.forced_disconnects == 1
         assert th.dropped_frames_total == 1  # NB-C5
-        # Queue now holds exactly resync + STOP (cleared first).
+        # Queue now holds STOP only (connection-private resync is forbidden).
         drained = []
         while not sub.queue.empty():
             drained.append(sub.queue.get_nowait())
-        assert drained[0] is not STOP
-        ev, data = parse_event(drained[0])
-        assert ev == "resync"
-        assert data == {"reason": "subscriber_backpressure", "sessionID": "s1"}
-        assert drained[1] is STOP
+        assert drained == [STOP]
 
     def test_buffer_byte_overflow_disconnects(self):
         """Buffer-byte cap (not item count) also triggers disconnect."""
@@ -446,16 +473,14 @@ class TestTokenSubscriber:
         sub.put(frame)  # overflow → closed
         before = th.dropped_frames_total
         # Subsequent puts silently drop, do NOT re-bump the metric and do NOT
-        # re-enqueue another resync (only one terminal pair).
+        # re-enqueue another terminal marker.
         assert sub.put(frame) is False
         assert th.dropped_frames_total == before
-        # Still only one resync on the queue.
-        resyncs = 0
+        # Still exactly one STOP on the queue.
+        drained = []
         while not sub.queue.empty():
-            item = sub.queue.get_nowait()
-            if item is not STOP:
-                resyncs += 1
-        assert resyncs == 1
+            drained.append(sub.queue.get_nowait())
+        assert drained == [STOP]
 
 
 # ===========================================================================
@@ -559,7 +584,7 @@ class TestTokenStreamRegistryAdmission:
 
     async def test_attach_failure_does_not_increment_ledger(self):
         """MAJOR 4: if attach_subscriber leaves sub.closed=True (defensive
-        early-exit, oversized-frame guard armed mid-handshake, or a future
+        early-exit, oversized-frame guard armed during attach, or a future
         Lane-A change), subscribe() must NOT increment total_subscribers —
         the sub never entered fanout so unsubscribe() would be a no-op
         against the membership guard and the slot would leak forever
@@ -571,8 +596,8 @@ class TestTokenStreamRegistryAdmission:
             th = app.state.token_hub
             original_attach = th.attach_subscriber
 
-            def closing_attach(sid, sub, wire_v4=False):
-                original_attach(sid, sub, wire_v4=wire_v4)
+            def closing_attach(sid, sub):
+                original_attach(sid, sub)
                 sub.closed = True  # simulate post-attach defensive close
 
             th.attach_subscriber = closing_attach  # type: ignore[method-assign]
@@ -608,8 +633,8 @@ class TestTokenStreamRegistryAdmission:
             hubs = app.state.hubs
             original_attach = th.attach_subscriber
 
-            def closing_attach(sid, sub, wire_v4=False):
-                original_attach(sid, sub, wire_v4=wire_v4)
+            def closing_attach(sid, sub):
+                original_attach(sid, sub)
                 sub.closed = True
 
             th.attach_subscriber = closing_attach  # type: ignore[method-assign]
@@ -664,8 +689,8 @@ class TestTokenStreamRegistryAdmission:
                 assert th._flush_task is not None
                 original_attach = th.attach_subscriber
 
-                def closing_attach(sid, sub, wire_v4=False):
-                    original_attach(sid, sub, wire_v4=wire_v4)
+                def closing_attach(sid, sub):
+                    original_attach(sid, sub)
                     sub.closed = True
 
                 th.attach_subscriber = closing_attach  # type: ignore[method-assign]
@@ -854,22 +879,17 @@ class TestBGraceSymmetry:
 
 
 # ===========================================================================
-# HTTP endpoint — handshake ordering, Last-Event-ID, no id:, version gate
+# HTTP endpoint — native join, Last-Event-ID, replay ids, version gate
 # ===========================================================================
 
-class TestTokenStreamHandshake:
-    async def test_handshake_emits_connected_then_snapshot(self):
-        """§5.5 under the v4-only face (V2b default flip): the handshake is
-        a NO-prefill join — slimapi.meta is the only connection-local
-        frame; ``server.connected`` is suppressed and live parts get NO
-        server-originated ``message.part.snapshot`` (state alignment is a
-        client HTTP full fetch after resync)."""
+class TestTokenStreamNativeJoin:
+    async def test_join_emits_meta_without_legacy_prefill(self):
+        """Native join emits meta only; state alignment uses HTTP after resync."""
         app = _build_app(_settings())
         try:
             th = app.state.token_hub
-            # Seed an active part BEFORE subscribe — v3 prefilled a
-            # snapshot; v4 must NOT (the pending window is flushed via the
-            # regular loop, never as a server-originated snapshot).
+            # Seed an active part before subscribe; attach must not emit
+            # connection-private state.
             th.on_part_updated(_updated_props("s1", "m1", "p1", text=""))
             th.on_part_delta(_delta_props("s1", "m1", "p1", delta="accumulated"))
             status, headers, body = await _drive_stream(
@@ -880,26 +900,25 @@ class TestTokenStreamHandshake:
             events = parse_sse_stream(body)
             # Terminal §7.2: slimapi.meta is the FIRST frame.
             assert events[0][0] == "slimapi.meta"
-            assert set(events[0][1]) == {"subscriberId", "tokens"}
+            assert set(events[0][1]) == {
+                "capabilities", "epoch", "seqBase", "subscriberId", "tokens",
+            }
             assert events[0][1]["tokens"] is True
-            # v4 no-prefill handshake: no connection-local welcome frame…
+            assert events[0][1]["capabilities"] == {
+                "sseReplay": True,
+                "tokenFrameSeq": True,
+            }
+            assert events[0][1]["seqBase"] == 0
+            # Removed connection-local wire families stay absent.
             assert all(e[0] != "server.connected" for e in events)
-            # …and no server-originated snapshot for the seeded LivePart.
             assert all(e[0] != "message.part.snapshot" for e in events)
             # After disconnect the subscriber was detached.
             assert app.state.token_registry.total_subscribers == 0
         finally:
             await _close_app(app)
 
-    async def test_no_sse_id_field_in_frames(self):
-        """Handshake emits no SSE ``id:`` field. (Q2-era docstring fix
-        2026-08-22: the old "token stream NEVER emits id:" claim was the
-        v2/v3 shape — under the v4 wire view live-fanout business frames
-        DO carry ``id: t:<sid>:<epoch>:<seq>`` prefixes, §7.1/§7.2 replay
-        domain; subscriber.wire_v4 stamping. This bare connect carries no
-        business frames, so it pins the handshake-half invariant: the
-        no-prefill join's connection-local frame (slimapi.meta) and any
-        control frames must never be id-stamped.)"""
+    async def test_meta_only_join_has_no_sse_id_field(self):
+        """A join with no business frames leaves meta/control frames id-less."""
         app = _build_app(_settings())
         try:
             _status, _headers, body = await _drive_stream(
@@ -974,13 +993,6 @@ class TestTokenStreamHandshake:
         finally:
             await _close_app(app)
 
-    # (test_handshake_overflow_returns_sse_token_handshake_overflow was
-    # removed with the V2b src teardown: it forced the v3 handshake
-    # pre-fill to overflow (handshake_max_items=0) → 503
-    # ``sse_token_handshake_overflow``. The v4 no-prefill join never
-    # brackets a handshake, so the failure mode is structurally
-    # unreachable under the v4-only face.)
-
     async def test_disconnect_detaches_subscriber(self):
         """Cancelling the stream (client disconnect) unwinds the generator's
         finally → unsubscribe, returning the ledger to zero."""
@@ -1007,9 +1019,9 @@ class TestGzipLever2:
         means a decompressor fed chunk-by-chunk sees only whole events at
         every flush boundary (no half ``data:`` line)."""
         frames = [
-            _connected_frame("s1"),
-            _snapshot_frame(("s1", "m1", "p1"), "hello", done=False),
             _delta_frame(("s1", "m1", "p1"), "chunk"),
+            _resync_frame("s1", "token_memory_limit"),
+            _heartbeat_frame(),
         ]
         compressor = zlib.compressobj(6, zlib.DEFLATED, zlib.MAX_WBITS | 16)
         per_flush: list[bytes] = []
@@ -1046,9 +1058,8 @@ class TestGzipLever2:
             assert raw[:2] != b"\x1f\x8b"  # plaintext SSE, no gzip magic
             events = parse_sse_stream(raw)
             assert events[0][0] == "slimapi.meta"
-            # (V2b default flip: v4 face suppresses server.connected and
-            # the live-part snapshot prefill — identity is still asserted
-            # above, which is this test's subject.)
+            # Removed connection-local wire families stay absent; identity is
+            # the behavior under test above.
             assert all(e[0] != "server.connected" for e in events)
             assert all(e[0] != "message.part.snapshot" for e in events)
         finally:
@@ -1057,7 +1068,7 @@ class TestGzipLever2:
     async def test_control_plane_events_is_not_gzipped(self):
         """The control-plane /slimapi/events never sets Content-Encoding:
         gzip (§7) — and under the terminal state its first frame is the
-        slimapi.meta handshake."""
+        slimapi.meta frame."""
         app = _build_app(_settings(), include_control_events=True)
         try:
             status, headers, body = await _drive_stream(
@@ -1070,8 +1081,7 @@ class TestGzipLever2:
             assert body[:2] != b"\x1f\x8b"
             events = parse_sse_stream(body)
             assert events[0][0] == "slimapi.meta"
-            # (V2b default flip: v4 face suppresses the connection-local
-            # ``server.connected`` welcome frame.)
+            # The retired connection-local welcome event stays absent.
             assert all(e[0] != "server.connected" for e in events)
         finally:
             await _close_app(app)
@@ -1177,7 +1187,7 @@ class TestMetricsTokenStream:
         app = FastAPI(title="no-token")
         app.state.config = _settings()
         app.state.upstream = httpx.AsyncClient()
-        hubs = HubRegistry(client=None)
+        hubs = _hub_registry(client=None)
         app.state.hubs = hubs
         app.include_router(metrics.router)
         register_error_handlers(app)
@@ -1196,7 +1206,7 @@ class TestMetricsTokenStream:
         app = _build_app(_settings())
         try:
             th = app.state.token_hub
-            # Seed a part so the handshake snapshot has data.
+            # Seed a part so live fanout has data available.
             th.on_part_updated(_updated_props("s1", "m1", "p1", text=""))
             th.on_part_delta(_delta_props("s1", "m1", "p1", delta="hello" * 100))
             _status, _headers, raw = await _drive_stream(
@@ -1303,22 +1313,8 @@ class TestNBC1MultiSeedEviction:
         sub_frames: list[bytes] = []
 
         class _Spy:
-            """Minimal sub stub for NB-C1 hub-level eviction tests.
-
-            Mirrors the hub→sub contract (``begin_handshake`` /
-            ``end_handshake`` / ``put`` / ``closed``); the CRITICAL 3
-            handshake/runtime queue physical separation lives inside
-            ``TokenSubscriber`` and is exercised separately by
-            ``test_token_subscriber_overflow.py``.
-            """
-            _in_handshake = False
+            """Minimal native-v4 subscriber stub for eviction tests."""
             closed = False
-
-            def begin_handshake(self):
-                self._in_handshake = True
-
-            def end_handshake(self):
-                self._in_handshake = False
 
             def put(self, frame):
                 sub_frames.append(frame)
@@ -1341,7 +1337,10 @@ class TestNBC1MultiSeedEviction:
         # Eviction fanned token_memory_limit resync (with sessionID) to the sub.
         resyncs = [parse_event(f) for f in sub_frames if parse_event(f)[0] == "resync"]
         assert len(resyncs) >= 1
-        assert resyncs[0] == ("resync", {"reason": "token_memory_limit", "sessionID": "s1"})
+        assert resyncs[0][0] == "resync"
+        assert resyncs[0][1]["reason"] == "token_memory_limit"
+        assert resyncs[0][1]["sessionID"] == "s1"
+        assert isinstance(resyncs[0][1]["seq"], int)
         assert th.token_memory_limit_total >= 1
 
     def test_never_evicts_current_key_on_seed_admission(self, monkeypatch):
@@ -1364,58 +1363,67 @@ class TestNBC1MultiSeedEviction:
         th.on_part_updated(_updated_props("s1", "m1", "p1", text="ABCDEFGH"))  # 8 > 4
         assert ("s1", "m1", "p1") not in th.live_parts
         assert ("s1", "m1", "p1") in th._disabled_parts
-        assert th.truncated_snapshots_total == 1
+        assert th.truncated_snapshots_total == 0
 
 
 # ===========================================================================
-# NB-D7 — directory query conflict 400 (design §5.1)
+# Directory query validation — selector-less route helper
 # ===========================================================================
 
-class TestNBD7DirectoryConflict:
-    """Structural guard mirroring the messages route: query ``directory``
-    conflicting with ``X-Opencode-Directory`` header → 400
-    ``directory_not_allowed``. When not conflicting, ``directory`` is a
-    no-op (the accumulator fans by ``sid`` which is globally unique in
-    single-user T3)."""
+class TestDirectoryQueryValidation:
+    """The route helper validates only the no-op ``directory`` query.
 
-    async def test_query_header_conflict_returns_400(self):
-        app = _build_app(_settings())
-        try:
-            response = await _get(
-                app, "/slimapi/sessions/s1/stream?directory=/app",
-                extra_headers={
-                    "X-Opencode-Directory": "/other",
-                    "Accept-Encoding": "identity",
-                },
-            )
-            # B3b wire lock: the token-stream directory rejection is a 400
-            # with raw identity bytes + no Cache-Control — INTENTIONALLY
-            # split from the file-route allowlist 403 on the same code
-            # (structural ambiguity vs authorization denial; do NOT merge).
-            assert response.status_code == 400
-            assert response.content == b'{"code":"directory_not_allowed"}'
-            assert response.headers["content-type"] == "application/json"
-            assert response.headers["vary"] == "Accept-Encoding"
-            assert "cache-control" not in response.headers
-        finally:
-            await _close_app(app)
+    Production header-only and query+header errors are owned by
+    ``SlimapiSelectorMiddleware`` before route dispatch.  This selector-less
+    test app deliberately proves the route helper never reads the retired
+    ``X-Opencode-Directory`` header itself.
+    """
 
-    async def test_query_header_match_no_conflict_200(self):
-        """Same directory in query and header (trailing-slash normalised) →
-        no 400; stream proceeds normally (directory is a no-op)."""
+    def test_helper_does_not_read_retired_directory_header(self):
+        class HeaderAccessForbiddenRequest:
+            query_params = httpx.QueryParams("directory=/app")
+
+            @property
+            def headers(self):
+                raise AssertionError("route helper read retired directory header")
+
+        token_stream._validate_directory_query(
+            HeaderAccessForbiddenRequest(), "/app",
+        )
+
+    def test_differing_query_values_are_rejected(self):
+        request = type(
+            "RequestStub", (),
+            {"query_params": httpx.QueryParams("directory=/app&directory=/other")},
+        )()
+        with pytest.raises(CodedHTTPException) as exc_info:
+            token_stream._validate_directory_query(request, "/other")
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.code == "invalid_directory_selector"
+
+    def test_invalid_query_value_is_rejected(self):
+        request = type(
+            "RequestStub", (),
+            {"query_params": httpx.QueryParams("directory=/app/../other")},
+        )()
+        with pytest.raises(CodedHTTPException) as exc_info:
+            token_stream._validate_directory_query(request, "/app/../other")
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.code == "invalid_directory"
+
+    async def test_query_and_retired_header_are_ignored_by_selectorless_route(self):
         app = _build_app(_settings())
         try:
             status, _headers, _body = await _drive_stream(
                 app, "/slimapi/sessions/s1/stream?directory=/app",
                 [("X-Slimapi-Version", "1"), ("Accept-Encoding", "identity"),
-                 ("X-Opencode-Directory", "/app/")],
+                 ("X-Opencode-Directory", "/other")],
             )
             assert status == 200
         finally:
             await _close_app(app)
 
-    async def test_query_alone_no_header_no_conflict(self):
-        """Query ``directory`` present, no header → no conflict."""
+    async def test_valid_query_remains_a_noop(self):
         app = _build_app(_settings())
         try:
             status, _headers, _body = await _drive_stream(
@@ -1423,36 +1431,5 @@ class TestNBD7DirectoryConflict:
                 [("X-Slimapi-Version", "1"), ("Accept-Encoding", "identity")],
             )
             assert status == 200
-        finally:
-            await _close_app(app)
-
-    async def test_header_alone_no_query_no_conflict(self):
-        """Header present, no query → no conflict (token stream ignores
-        a lone header — v1 only trusts query ``directory``)."""
-        app = _build_app(_settings())
-        try:
-            status, _headers, _body = await _drive_stream(
-                app, "/slimapi/sessions/s1/stream",
-                [("X-Slimapi-Version", "1"), ("Accept-Encoding", "identity"),
-                 ("X-Opencode-Directory", "/app")],
-            )
-            assert status == 200
-        finally:
-            await _close_app(app)
-
-    async def test_conflict_400_does_not_admit_subscriber(self):
-        """A 400 directory conflict must NOT consume a token subscriber
-        slot (the conflict check runs BEFORE admission)."""
-        app = _build_app(_settings(token_stream_max_subscribers=1))
-        try:
-            reg = app.state.token_registry
-            assert reg.total_subscribers == 0
-            response = await _get(
-                app, "/slimapi/sessions/s1/stream?directory=/app",
-                extra_headers={"X-Opencode-Directory": "/other"},
-            )
-            assert response.status_code == 400
-            # Still at zero — the 400 path returned before subscribe().
-            assert reg.total_subscribers == 0
         finally:
             await _close_app(app)

@@ -58,9 +58,8 @@ async def session_children(request: Request, sid: str,
     """Child sessions of a parent — thin skeleton read (stateless re-add).
 
     ``directory`` is routing-only (selects the opencode workdir instance),
-    forwarded as ``X-Opencode-Directory``. ADDITIVE route: older sidecars
-    answer 404 ``thin_route_not_found`` from the catch-all and the client
-    falls back to the passthrough ``GET /session/{sid}/children``.
+    forwarded as ``X-Opencode-Directory``. Current sidecars expose only this
+    thin route; there is no passthrough fallback.
 
     4.11.0 Phase A / A2: opts INTO the Batch 2 ETag wiring
     (``enable_etag=True``): per-coding validators + 304 on a matching
@@ -71,7 +70,7 @@ async def session_children(request: Request, sid: str,
     identity) and decides the served coding BEFORE the validator is
     derived, so the judged coding always equals the served coding.
     """
-    # v3 (§5, Batch B): a consumed ``?directory=`` was validated + stripped
+    # v4: a consumed ``?directory=`` was validated + stripped
     # at dispatch — the stash replaces the (absent) query param here.
     directory = resolve_route_directory(request.scope, directory)
     if directory is not None:

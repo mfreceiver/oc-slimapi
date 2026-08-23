@@ -1,7 +1,7 @@
 """``/slimapi/actions`` — action discovery and invocation routes (spec §5).
 
-Two sidecar-local endpoints (no upstream call; the reverse proxy catch-all is
-never involved):
+Two sidecar-local endpoints (no upstream call; no passthrough route is
+involved):
 
 * ``GET /slimapi/actions`` — catalog discovery: ``{"enabled": bool,
   "actions": [{"name","kind","description","requireConfirm"}]}`` straight from
@@ -20,7 +20,7 @@ never involved):
 
 Both endpoints negotiate gzip via :func:`json_response` and pin
 ``Cache-Control: no-store`` on every response (200 and coded error — contract
-§5).  The version selector (``?v=3`` terminal) already covers every
+§5).  The current ``?v=4`` selector already covers every
 ``/slimapi/**`` path.
 """
 

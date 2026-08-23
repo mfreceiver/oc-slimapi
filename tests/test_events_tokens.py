@@ -2,9 +2,8 @@
 
 Scope (plan Task L2-A, acceptance A-C1..A-C5):
 
-* A-C1 — ``?tokens=<anything-but-1>`` → 400 ``invalid_tokens``; default and
-  ``?tokens=1`` both build the stream with the unchanged ``server.connected``
-  first frame.
+* A-C1 — invalid ``?tokens=`` values → 400 ``invalid_tokens``; ``?tokens=1``
+  is retired on v4; the default stream starts with ``slimapi.meta``.
 * A-C2 — ``?tokens=1``: two upstream ``message.part.delta`` for the same
   ``(sessionID, messageID, partID)`` land in one ~100ms flush window and
   arrive as a SINGLE lean ``{type:"token", sessionID, messageID, partID,
@@ -41,10 +40,40 @@ from oc_slimapi.errors import CodedHTTPException, register_error_handlers
 from oc_slimapi.routes import health
 from oc_slimapi.routes.events import events, router as events_router
 from oc_slimapi.sse.hub import STOP, HubRegistry, Subscriber
+from oc_slimapi.sse.replay_log import ReplayLog
 from oc_slimapi.sse.token_hub import (
-    TokenStreamHub,
+    TokenStreamHub as _TokenStreamHub,
     TokenStreamRegistry,
 )
+
+
+_TEST_REPLAY_LOG: ReplayLog | None = None
+
+
+@pytest.fixture(autouse=True)
+def _test_replay_log():
+    global _TEST_REPLAY_LOG
+    replay_log = ReplayLog()
+    _TEST_REPLAY_LOG = replay_log
+    try:
+        yield
+    finally:
+        _TEST_REPLAY_LOG = None
+        replay_log.close()
+
+
+def _token_hub(**kwargs) -> _TokenStreamHub:
+    replay_log = kwargs.pop("replay_log", _TEST_REPLAY_LOG)
+    assert replay_log is not None
+    return _TokenStreamHub(replay_log=replay_log, **kwargs)
+
+
+TokenStreamHub = _token_hub
+
+
+def _hub_registry(**kwargs) -> HubRegistry:
+    assert _TEST_REPLAY_LOG is not None
+    return HubRegistry(replay_log=_TEST_REPLAY_LOG, **kwargs)
 
 VERSION_HEADERS = {"X-Slimapi-Version": "1"}
 
@@ -189,15 +218,19 @@ def _build_app(settings: Settings) -> FastAPI:
     app.state.deployment_revision = None
     upstream = httpx.AsyncClient()  # unused (hub client is None) but kept for parity
     app.state.upstream = upstream
+    replay_log = ReplayLog()
+    app.state.replay_log = replay_log
+    app.state.replay_epoch = replay_log.epoch
     hubs = HubRegistry(
         client=None,
+        replay_log=replay_log,
         max_subscribers_per_directory=settings.max_subscribers_per_directory,
         max_total_subscribers=settings.max_total_subscribers,
         queue_items=settings.sse_queue_items,
         buffer_bytes=settings.sse_buffer_bytes,
         max_frame_bytes=settings.sse_max_frame_bytes,
     )
-    token_hub = TokenStreamHub()
+    token_hub = TokenStreamHub(replay_log=replay_log)
     hubs.set_token_hub(token_hub)
     token_registry = TokenStreamRegistry(
         token_hub,
@@ -221,6 +254,7 @@ async def _close_app(app: FastAPI) -> None:
     app.state.token_hub.stop()
     with contextlib.suppress(Exception):
         await app.state.hubs.close()
+    app.state.replay_log.close()
     await app.state.upstream.aclose()
 
 
@@ -299,11 +333,11 @@ async def _drive_stream(
             body.extend(message.get("body", b""))
 
     task = asyncio.create_task(app(scope, receive, send))
-    # Let the generator emit handshake frames, then park on queue.get.
+    # Let the generator emit initial frames, then park on queue.get.
     try:
         await asyncio.wait_for(asyncio.shield(task), timeout=park_timeout)
     except asyncio.TimeoutError:
-        pass  # expected: generator parked after the handshake
+        pass  # expected: generator parked after the initial frames
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError, Exception):
         await task
@@ -341,11 +375,8 @@ async def test_tokens_non_literal_direct_call_400():
         await _close_app(app)
 
 
-async def test_default_events_builds_stream_meta_then_connected():
-    """Default (no tokens) builds the stream; slimapi.meta is the FIRST
-    frame. (V2b default flip: the selector-less stack now runs the v4
-    view, which SUPPRESSES the connection-local ``server.connected``
-    welcome frame — only meta is guaranteed.)"""
+async def test_default_events_builds_stream_meta_first_without_legacy_welcome():
+    """Default events starts with slimapi.meta and omits the retired welcome."""
     app = _build_app(_settings())
     try:
         status, _, body = await _drive_stream(app, "/slimapi/events", _headers())
@@ -365,9 +396,7 @@ async def test_default_events_builds_stream_meta_then_connected():
 
 async def test_tokens_one_builds_stream_meta_tokens_true():
     """``?tokens=1`` is RETIRED on the v4-only face: flat 400
-    ``tokens_stream_retired_in_v4`` before any stream opens (§7.3).
-    (The V2b default flip routed the selector-less stack onto the v4
-    view; the former tokens=1 attach path was removed with it.)"""
+    ``tokens_stream_retired_in_v4`` before any stream opens (§7.3)."""
     app = _build_app(_settings())
     try:
         status, _, body = await _drive_stream(
@@ -381,10 +410,9 @@ async def test_tokens_one_builds_stream_meta_tokens_true():
 
 # ===========================================================================
 # A-C2 — coalescing: 2 deltas, one (sid, mid, pid) window → single token frame
-# (the end-to-end variant via ``/slimapi/events?tokens=1`` was removed with
-# the V2b src teardown — tokens=1 is a flat 400 on the v4-only face; the
-# coalescing mechanism itself stays covered by the registry-unit test below
-# and the per-session token-stream route tests)
+# (``/slimapi/events?tokens=1`` is a flat 400 on the v4-only face; the
+# coalescing mechanism stays covered by the registry-unit test below and
+# the per-session token-stream route tests)
 # ===========================================================================
 
 async def test_token_frame_shape_via_flush_direct():
@@ -443,8 +471,7 @@ async def test_default_events_emits_no_token_frames_while_deltas_flow():
                 app, "/slimapi/events", _headers(), park_timeout=0.6)
             assert status == 200
             frames = list(_sse_frames(body))
-            # (V2b default flip: v4 view suppresses the connection-local
-            # ``server.connected`` welcome frame.)
+            # The retired connection-local welcome event stays absent.
             assert all(ev != "server.connected" for ev, _ in frames)
             assert all(data.get("type") != "token" for _, data in frames), (
                 "default events stream must not emit token frames"
@@ -462,9 +489,8 @@ async def test_default_events_emits_no_token_frames_while_deltas_flow():
 # A-C4 — backpressure reuses the unchanged Subscriber.put T3 guard
 # ===========================================================================
 
-async def test_events_tap_backpressure_resync_stop():
-    """An overflowing events-token queue → unchanged T3 guard:
-    ``resync{subscriber_backpressure}`` + ``STOP`` + forced disconnect."""
+async def test_events_tap_backpressure_stops_without_private_resync():
+    """An overflowing events-token queue is sealed with ``STOP`` only."""
     th = TokenStreamHub()
     reg = TokenStreamRegistry(
         th, None,
@@ -482,13 +508,10 @@ async def test_events_tap_backpressure_resync_stop():
         assert sub.closed, "overflow must force-disconnect the events subscriber"
         assert sub.forced_disconnects >= 1
         assert STOP in items, "overflow must enqueue the STOP sentinel"
-        resync = next(
-            (parse_event(it)[1] for it in items
-             if it is not STOP and parse_event(it)[0] == "resync"),
-            None,
-        )
-        assert resync is not None, "overflow must enqueue a resync frame"
-        assert resync["reason"] == "subscriber_backpressure"
+        assert all(
+            item is STOP or parse_event(item)[0] != "resync"
+            for item in items
+        ), "events-token overflow must not synthesize a private resync frame"
     finally:
         reg.detach_events_subscriber(sub)
         th.stop()
@@ -599,7 +622,7 @@ async def test_combined_ledger_last_detach_stops_flush_loop():
     events subscriber keeps the loop running (per-session ledger non-empty);
     the LAST detach (both ledgers empty) stops it (A-C5 symmetry)."""
     th = TokenStreamHub()
-    hubs = HubRegistry(client=None)
+    hubs = _hub_registry(client=None)
     hubs.set_token_hub(th)
     reg = TokenStreamRegistry(
         th, hubs,

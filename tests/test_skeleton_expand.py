@@ -15,7 +15,7 @@ from oc_slimapi.skeleton import (
 )
 
 SID = "ses_s"
-V3 = "?v=3"  # default-view (selector-less) projection href face; V2b retargets to v4
+V4 = "?v=4"  # v4-only expand href face
 
 
 def _text_part(text, pid="p1", mid="m1"):
@@ -69,7 +69,7 @@ def test_diffs_null_with_ref_and_other_summary_keys_preserved():
     assert out["info"]["expandRefs"] == [{
         "category": "info_summary_diffs",
         "messageID": "m1",
-        "href": f"/slimapi/messages/{SID}/expand/info_summary_diffs/m1{V3}",
+        "href": f"/slimapi/messages/{SID}/expand/info_summary_diffs/m1{V4}",
     }]
 
 
@@ -154,7 +154,7 @@ def test_reasoning_threshold_and_ref_metadata_time_full_only():
         "category": "part_reasoning",
         "messageID": "m1",
         "partID": "prt",
-        "href": f"/slimapi/messages/{SID}/expand/part_reasoning/m1/prt{V3}",
+        "href": f"/slimapi/messages/{SID}/expand/part_reasoning/m1/prt{V4}",
     }]
 
     # Inline reasoning with omitted metadata/time → no refs (/full-only §2.3).
@@ -195,7 +195,7 @@ def test_tool_multiple_omissions_refs_sorted_and_deduped():
     for r in refs:
         assert r["messageID"] == "m1"
         assert r["partID"] == "p1"
-        assert r["href"].endswith(f"/expand/{r['category']}/m1/p1{V3}")
+        assert r["href"].endswith(f"/expand/{r['category']}/m1/p1{V4}")
         assert r["href"].startswith(f"/slimapi/messages/{SID}/")
     assert out["hasFull"] is True
 
@@ -265,7 +265,7 @@ def test_step_snapshot_omission_ref():
     assert out["omitted"] == ["snapshot"]
     assert out["expandRefs"] == [{
         "category": "part_snapshot", "messageID": "m1", "partID": "p1",
-        "href": f"/slimapi/messages/{SID}/expand/part_snapshot/m1/p1{V3}",
+        "href": f"/slimapi/messages/{SID}/expand/part_snapshot/m1/p1{V4}",
     }]
 
 
@@ -291,7 +291,7 @@ def test_compaction_over_limit_emits_compaction_full_ref():
     assert out["hasFull"] is True
     assert out["expandRefs"] == [{
         "category": "compaction_full", "messageID": "m1", "partID": "p1",
-        "href": f"/slimapi/messages/{SID}/expand/compaction_full/m1/p1{V3}",
+        "href": f"/slimapi/messages/{SID}/expand/compaction_full/m1/p1{V4}",
     }]
 
 
@@ -457,7 +457,7 @@ def test_upstream_info_expand_refs_junk_replaced_or_removed():
     out = _msg([], info=info)
     assert out["info"]["expandRefs"] == [{
         "category": "info_summary_diffs", "messageID": "m1",
-        "href": f"/slimapi/messages/{SID}/expand/info_summary_diffs/m1{V3}",
+        "href": f"/slimapi/messages/{SID}/expand/info_summary_diffs/m1{V4}",
     }]
 
     info2 = {"id": "m1", "expandRefs": [{"category": "bogus"}],

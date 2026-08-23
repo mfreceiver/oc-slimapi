@@ -20,9 +20,6 @@ from starlette.responses import Response
 from ... import etag as etag_mod
 from ...envelope import messages_envelope_bytes
 from ...gzip_util import compress_if_beneficial, error_response
-# (V2b: the ``wire_view_from_scope`` import was removed with the v4-only
-# teardown; D5 (2026-08-22) then made the §14 href face a constant 4 — see
-# ``_expand_wire_view`` below.)
 from ...skeleton import SkeletonLimits, skeleton_messages
 from ...since_cache import CacheEntry, CommitResult, ObservedSnapshot, SinceCache
 from ...transform import TransformBusy, read_with_cap
@@ -49,18 +46,11 @@ _V4_EXPAND_FEATURE = "messages.expand.v4"
 
 
 def _expand_wire_view(scope) -> int:
-    """§14 href view selector: constant 4 in BOTH readiness gate states.
+    """Compatibility re-export for callers that still inspect the href view.
 
-    D5 adjudication (2026-08-22, owner): under the v4-only ``(4,4)``
-    selector window the historical gate-off fold to 3 minted
-    self-rejecting dead links — a v4 response's expandRefs href carried
-    ``?v=3`` and the selector middleware 400-rejects exactly that value.
-    The href face is therefore 4 regardless of
-    ``messages.expand.v4 ∈ SATISFIED`` (that gate now decides only the
-    capabilities face in versions.py). The readiness branch was removed:
-    its sole consumer was this return value, threaded into the projection
-    for href generation; the ``scope`` parameter is kept for the call
-    sites' shape."""
+    Projection itself is now versionless and natively emits v4 hrefs.
+    """
+    del scope
     return 4
 
 
@@ -123,7 +113,6 @@ def _created_sort_key(msg: dict) -> int | float:
 
 def _parse_sort_project(
     body: bytes, *, limits: SkeletonLimits, sid: str | None = None,
-    wire_view: int = 3,
 ) -> list[dict]:
     """Worker entry: parse + sort by ``info.time.created`` ASC + skeleton
     project (no serialization).
@@ -135,11 +124,6 @@ def _parse_sort_project(
     ``sid`` is threaded through to ``skeleton_messages`` so the projection
     emits ``expandRefs`` (design-expand §5.2) — without it, lane A's refs
     never reach the wire and the merged ref candidate set is empty.
-
-    v4 §14: ``wire_view`` is threaded by the ROUTE so every expandRefs href
-    carries the request's view. Since the V2b default flip it is constant 4
-    (``wire_view_from_scope`` no longer forks) — selector-less stacks emit
-    the same v4 hrefs.
 
     Batch 4 / B3: the fingerprint switch rides on ``limits.fingerprint``
     (built by the route from config) so this worker's signature is
@@ -157,14 +141,12 @@ def _parse_sort_project(
         # route maps to 503.
         raise ValueError("upstream message body is not a list of message dicts")
     parsed.sort(key=_created_sort_key)
-    return skeleton_messages(
-        parsed, limits=limits, sid=sid, wire_view=wire_view,
-    )
+    return skeleton_messages(parsed, limits=limits, sid=sid)
 
 
 def _project_list_sorted_and_pack(
     body: bytes, *, accept_encoding: str | None, limits: SkeletonLimits,
-    sid: str | None = None, wire_view: int = 3,
+    sid: str | None = None,
 ) -> bytes:
     """Worker entry: parse + sort + project + serialize to identity bytes.
 
@@ -185,12 +167,9 @@ def _project_list_sorted_and_pack(
     ``accept_encoding`` is retained in the signature for call-site symmetry
     (and existing slow-pack monkeypatches); the route owns coding choice.
 
-    v4 §14: ``wire_view`` is threaded to the projection so expandRefs hrefs
-    carry the request's selector view (default 3 — historical bytes).
+    Expand hrefs are generated natively as v4 by the projection.
     """
-    projected = _parse_sort_project(
-        body, limits=limits, sid=sid, wire_view=wire_view,
-    )
+    projected = _parse_sort_project(body, limits=limits, sid=sid)
     return orjson.dumps(projected)
 
 
@@ -590,15 +569,13 @@ def _project_list_artifact(
     accept_encoding: str | None,
     limits: SkeletonLimits,
     sid: str | None,
-    wire_view: int,
     baseline: CacheEntry | None,
     next_cursor: str | None,
     before_present: bool,
 ) -> _ProjectionArtifact:
     """Existing projection seam plus cache/diff admission work."""
     array_bytes = _project_list_sorted_and_pack(
-        body, accept_encoding=accept_encoding, limits=limits,
-        sid=sid, wire_view=wire_view,
+        body, accept_encoding=accept_encoding, limits=limits, sid=sid,
     )
     return _artifact_from_array_bytes(
         array_bytes, baseline=baseline, next_cursor=next_cursor,
@@ -732,11 +709,6 @@ async def _messages_via_lease(
             message_bytes=config.skeleton_inline_output_max_message_bytes,
             fingerprint=config.message_fingerprint_enabled,
         )
-        # v4 §14: the expandRefs href ``?v=`` value is read on the event
-        # loop (the worker threads have no scope access). D5 (2026-08-22):
-        # constant 4 in BOTH gate states — a self-minted ``?v=3`` href is
-        # 400-rejected by the v4-only selector.
-        wire_view = _expand_wire_view(request.scope)
         projected: list[dict] | None = None
         identity: bytes | None = None
         artifact: _ProjectionArtifact | None = None
@@ -750,7 +722,7 @@ async def _messages_via_lease(
                     if merged_mode:
                         projected = await pool.offload(
                             _parse_sort_project, body, limits=limits,
-                            sid=sid, wire_view=wire_view,
+                            sid=sid,
                         )
                     else:
                         if since_state.needs_artifact:
@@ -758,7 +730,6 @@ async def _messages_via_lease(
                                 _project_list_artifact, body,
                                 accept_encoding=accept_encoding,
                                 limits=limits, sid=sid,
-                                wire_view=wire_view,
                                 baseline=since_state.baseline,
                                 next_cursor=next_cursor,
                                 before_present=since_state.before_present,
@@ -769,7 +740,6 @@ async def _messages_via_lease(
                                 _project_list_sorted_and_pack, body,
                                 accept_encoding=accept_encoding,
                                 limits=limits, sid=sid,
-                                wire_view=wire_view,
                             )
                 except (orjson.JSONDecodeError, ValueError, TypeError, AttributeError) as exc:
                     raise_upstream_unavailable(exc)
@@ -831,10 +801,9 @@ async def _messages_via_lease(
             rep_version = etag_mod.response_rep_version(
                 config, wire_view=4)
             # D6 owner 裁决 2026-08-22：messages ETag 域标签统一为窗口
-            # 版本 4（此前 wire_view=3 为金样冻结保留）；代价是一次性
-            # validator 轮换（客户端全量重拉一轮，与 4.9.0 REP_VERSION
-            # 轮换同类）。与 sessions 侧（sessions.py / _catalog_common.py）
-            # 域标签一致。
+            # 版本 4；代价是一次性 validator 轮换（客户端全量重拉一轮，
+            # 与 4.9.0 REP_VERSION 轮换同类）。与 sessions 侧
+            #（sessions.py / _catalog_common.py）域标签一致。
             # §6.2 (gate C3): directory-sensitive route — the directory
             # Vary dimension is unconditional (cache-correctness semantics,
             # NOT an ETag accessory; Batch 3 merge_directory_vary precedent).
@@ -967,11 +936,6 @@ async def messages(
                 # released (see _merge_fulls; oracle §C-2: the fan-out must
                 # not hold the slot across per-full network GETs).
                 #
-                # v4 §14: view read on the loop, threaded to the projection
-                # for view-correct expandRefs hrefs. D5 (2026-08-22):
-                # constant 4 in BOTH gate states (self-minted ``?v=3``
-                # would be 400-rejected by the v4-only selector).
-                wire_view = _expand_wire_view(request.scope)
                 try:
                     if merged_mode:
                         projected = await pool.offload(
@@ -981,7 +945,7 @@ async def messages(
                                 message_bytes=config.skeleton_inline_output_max_message_bytes,
                                 fingerprint=config.message_fingerprint_enabled,
                             ),
-                            sid=sid, wire_view=wire_view,
+                            sid=sid,
                         )
                     else:
                         limits = SkeletonLimits(
@@ -993,7 +957,7 @@ async def messages(
                             artifact = await pool.offload(
                                 _project_list_artifact, body,
                                 accept_encoding=request.headers.get("accept-encoding"),
-                                limits=limits, sid=sid, wire_view=wire_view,
+                                limits=limits, sid=sid,
                                 baseline=since_state.baseline,
                                 next_cursor=next_cursor,
                                 before_present=since_state.before_present,
@@ -1003,7 +967,7 @@ async def messages(
                             identity = await pool.offload(
                                 _project_list_sorted_and_pack, body,
                                 accept_encoding=request.headers.get("accept-encoding"),
-                                limits=limits, sid=sid, wire_view=wire_view,
+                                limits=limits, sid=sid,
                             )
                 except (orjson.JSONDecodeError, ValueError, TypeError, AttributeError) as exc:
                     raise_upstream_unavailable(exc)

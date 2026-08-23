@@ -43,9 +43,8 @@ async def questions(request: Request):
     into a single envelope, fixing the slim-mode cold-start regression where
     pending questions in a workdir ≠ ``process.cwd()`` could not be seen.
 
-    Additive (re-add); **no** ``X-Slimapi-Version`` bump (still 2). Each
-    question entry is the upstream entry verbatim plus a ``directory`` field
-    stamped with the directory it was fetched from (field order: id,
+    Each question entry is the upstream entry verbatim plus a ``directory``
+    field stamped with the directory it was fetched from (field order: id,
     sessionID, questions, tool, then directory).
 
     Discovery source: ``GET /experimental/session?roots=true`` — opencode's

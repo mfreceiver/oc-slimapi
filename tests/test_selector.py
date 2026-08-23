@@ -1,24 +1,13 @@
-"""v3-contract §2 selector state machine — **terminal state**.
+"""Current v4 selector state machine.
 
-Exercises the SlimapiSelectorMiddleware end-to-end through httpx.ASGITransport
-with a minimal app wiring selector + health + versions routers (mirrors the
-production stack order: RequestId → Traffic → Selector → routes, minus the
-accounting layers that have their own tests in test_access_log_v3_fields.py).
+Exercises ``SlimapiSelectorMiddleware`` end-to-end through a minimal app.
+Only ``?v=4`` is admitted; the legacy version header is never read. Missing,
+retired, unsupported, malformed, and differing multi-value selectors retain
+their exact error boundaries. Discovery and non-slim paths retain their
+special precedence/zero-touch behavior.
 
-Terminal semantics under test (dual-version window: ``?v=4`` also admitted):
-
-* ``?v=3`` / ``?v=4`` are the admitted pipelines; the ``X-Slimapi-Version``
-  header is never read (any value, present or absent, changes nothing).
-* no ``v`` / ``v=2`` / unsupported → 400 ``unsupported_version`` [3, 4].
-* lexical garbage / differing multi-value → 400 ``invalid_version_selector``.
-* ``GET /slimapi/versions`` exempt; non-GET → 405 (+``Allow: GET``) with
-  priority above the selector.
-* non-/slimapi paths: zero-touch passthrough.
-
-B12（2026-08-21 v4 自包含 golden 化清点）：本文件**无**「先发 ?v=3 求
-期望再比 v4」形态——所有断言本就内联字面；``?v=3`` admitted 半区
-（test_v3_without_header_ok 等）是 v3 守护网（三分处置②，Phase 4 v3 面
-拆除前保留），v4 admitted 的正向覆盖在 tests/test_v4_dual_window.py。
+The retired ``?v=3`` and legacy-header cases remain explicit negative
+boundaries so a future refactor cannot accidentally reopen them.
 """
 from __future__ import annotations
 
@@ -123,7 +112,7 @@ async def test_v2_with_header_also_unsupported():
 # consolidate/delete the v3 half once the guard net goes.
 # ---------------------------------------------------------------------------
 
-async def test_v3_without_header_ok():
+async def test_retired_v3_without_header_is_unsupported():
     """v3 was the 3.x terminal admission view; since the 2026-08-21 window
     narrowing (shipped 4.8.0) it answers the unsupported-version 400."""
     app = _build_app()
@@ -133,7 +122,7 @@ async def test_v3_without_header_ok():
         assert resp.json() == {"code": "unsupported_version", "supported": [4]}
 
 
-async def test_v3_with_any_header_ignored():
+async def test_retired_v3_with_any_header_is_unsupported():
     """§1: the retired header is not read — it cannot rescue a ?v=3 request
     across the window narrowing either."""
     app = _build_app()

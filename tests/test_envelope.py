@@ -1,14 +1,8 @@
-"""v3-contract §4 envelope tests (Batch B, TDD).
+"""Current v4 envelope tests.
 
-B12 (2026-08-21) three-way split: the messages-envelope family and the
-sessions-status map passthrough were rewritten to the ``?v=4`` face —
-v4-contract §10 freezes messages as byte-identical to v3 (envelope shape,
-nextCursor splice, 304 header set) and §12 marks /sessions/status 零 v4
-分叉. V2b (2026-08-21 Phase-4 guard teardown) deleted the sessions-list
-envelope guardian net (the v3 list face is rejected; the v4 global-list
-envelope is locked in test_sessions_v4_matrix / test_terminal_matrix) and
-the retired-v2-form rejection guards (version-window 400 coverage lives
-in the selector test-suite).
+The v4 contract freezes the messages envelope shape, nextCursor splice, and
+304 header set; `/sessions/status` remains a map passthrough. Version-window
+rejection coverage belongs to the selector test suite.
 
 Covers:
 
@@ -71,7 +65,7 @@ def _sessions_payload() -> bytes:
 
 
 def _build_app(handler) -> FastAPI:
-    app = FastAPI(title="oc-slimapi-v3-envelope-test")
+    app = FastAPI(title="oc-slimapi-envelope-test")
     app.state.config = _settings()
     app.state.upstream = httpx.AsyncClient(
         base_url="http://127.0.0.1:4096",
@@ -136,10 +130,11 @@ async def client_factory():
 # ---------------------------------------------------------------------------
 
 async def test_messages_v4_envelope_null_cursor_byte_verbatim(client_factory):
-    """Terminal §4 (B12 ①: v4 messages ≡ v3, §10 zero difference): the
-    messages list body is the {"items":…,"nextCursor":null} envelope (bare
-    arrays no longer exist on the wire); the pagination header is NOT
-    produced (the client reads the cursor from the envelope)."""
+    """The messages list uses the current items/nextCursor envelope.
+
+    Bare arrays no longer exist on the wire, and the client reads pagination
+    from the envelope rather than an auxiliary header.
+    """
     client = await client_factory(_message_handler())
     try:
         v4 = await client.get("/slimapi/messages/s1?v=4", headers=IDENTITY)
@@ -159,7 +154,7 @@ async def test_messages_v4_envelope_null_cursor_byte_verbatim(client_factory):
 
 async def test_messages_v4_envelope_non_null_cursor(client_factory):
     """Upstream Link → envelope nextCursor carries the opaque cursor
-    verbatim (B12 ①: v4 messages ≡ v3, §10 zero difference)."""
+    verbatim."""
     link = '</session/s1/message?limit=40&before=CURSOR123>; rel="next"'
     client = await client_factory(_message_handler(link=link))
     try:
@@ -171,8 +166,7 @@ async def test_messages_v4_envelope_non_null_cursor(client_factory):
 
 
 async def test_messages_v4_error_response_not_enveloped(client_factory):
-    """§4.4 (B12 ①: v4 messages ≡ v3, §10 zero difference): error bodies
-    keep the v2 shape (code, no items)."""
+    """§4.4: error bodies keep their code-only shape, with no items."""
     client = await client_factory(
         _message_handler(body=b'{"error": "not found"}'))
     try:
@@ -187,10 +181,11 @@ async def test_messages_v4_error_response_not_enveloped(client_factory):
 
 
 async def test_messages_v4_304_empty_body_no_aux_headers(client_factory):
-    """§6.4 (B12 ①: v4 messages ≡ v3, §10 zero difference; ETag validator
-    differs by wire=v4 domain but the 304 header SET is frozen): v4 304 =
-    no body + only the ETag/Vary/Cache-Control set — the pagination headers
-    are NOT copied (client reads them from the cached envelope)."""
+    """§6.4: a v4 304 has no body and only the frozen cache header set.
+
+    Pagination headers are not copied; the client reads the cursor from its
+    cached envelope.
+    """
     link = '</session/s1/message?limit=40&before=CURSOR123>; rel="next"'
     client = await client_factory(_message_handler(link=link))
     try:

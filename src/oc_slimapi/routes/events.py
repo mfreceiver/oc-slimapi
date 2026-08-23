@@ -6,9 +6,7 @@ from ..gzip_util import json_response
 from ..sse.hub import STOP, SubscriberCapacityError, sse_frame
 from ..sse.replay_log import (
     GLOBAL_DOMAIN,
-    RESYNC_RECONNECT_NO_REPLAY,
     ReplayFrames,
-    ReplayLog,
     ReplayResync,
 )
 from ..sse.replay_wire import classify_reconnect, frame_with_id, meta_v4_extension
@@ -80,12 +78,11 @@ async def events(request: Request, tokens: str | None = None):
             hint=TOKENS_STREAM_RETIRED_IN_V4["hint"],
         )
 
-    # B3b-2: replay wiring (absent on minimal test apps → v4 degrades to the
-    # id-less / un-replayed stream, mirroring the v3 shape).
-    replay_log: ReplayLog | None = getattr(request.app.state, "replay_log", None)
-    replay_epoch: str | None = getattr(request.app.state, "replay_epoch", None)
-    if replay_epoch is None and replay_log is not None:
-        replay_epoch = replay_log.epoch
+    # v4-native assembly requires the one lifespan-owned ReplayLog shared by
+    # both SSE domains. Missing state is an invalid application assembly,
+    # not a selector-less/no-log runtime mode.
+    replay_log = request.app.state.replay_log
+    replay_epoch = replay_log.epoch
     last_event_id = request.headers.get("last-event-id")
 
     # Replay classification MUST run BEFORE hubs.subscribe(): the outcome
@@ -93,26 +90,12 @@ async def events(request: Request, tokens: str | None = None):
     # fanout set at T1 > T0 — replay covers seq ≤ last_seq@T0 while the queue
     # carries every frame published after attach, so a frame can never be
     # delivered twice and none can fall in the gap.
-    replay_plan = None
-    if replay_log is not None:
-        replay_plan = classify_reconnect(
-            last_event_id, replay_log, domain=GLOBAL_DOMAIN,
-        )
-    elif last_event_id:
-        # No replay infrastructure on this app (minimal/test stack): a
-        # reconnect cursor we cannot evaluate is NEVER first-connect — the
-        # client may be missing frames we have no record of. Fail safe with
-        # the blanket resync (mirrors the v3 semantics).
-        replay_plan = ReplayResync(RESYNC_RECONNECT_NO_REPLAY)
+    replay_plan = classify_reconnect(
+        last_event_id, replay_log, domain=GLOBAL_DOMAIN,
+    )
 
     try:
-        # rev-gate BLOCKER-1 / condition 5: the wire version flows INTO
-        # the subscription — the v4 face suppresses the connection-local
-        # ``server.connected`` welcome frame (outside the frozen no-id
-        # control set; must not bypass the replay log) and is stamped on
-        # the subscriber so fanout frames carry ``id:`` from the start.
-        # (Constant ``True`` under the v4-only window.)
-        subscriber = request.app.state.hubs.subscribe(wire_v4=True)
+        subscriber = request.app.state.hubs.subscribe()
     except SubscriberCapacityError as exc:
         return json_response(
             {"code": exc.code, "limit": exc.limit, "current": exc.current},
@@ -131,10 +114,9 @@ async def events(request: Request, tokens: str | None = None):
         "subscriberId": subscriber_id,
         "tokens": tokens == "1",
     }
-    if replay_log is not None and replay_epoch is not None:
-        meta_fields.update(
-            meta_v4_extension(replay_epoch, replay_log.last_seq(GLOBAL_DOMAIN))
-        )
+    meta_fields.update(
+        meta_v4_extension(replay_epoch, replay_log.last_seq(GLOBAL_DOMAIN))
+    )
     meta = sse_frame(meta_fields, event="slimapi.meta")
     # (L2-A v3 face: ``tokens=1`` attached the events subscriber to the
     # token flush loop (TokenStreamRegistry.events_tokens / events_tap) so

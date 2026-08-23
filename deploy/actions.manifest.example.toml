@@ -12,9 +12,9 @@
 #   write bits), owned by the sidecar runtime user. A bad file disables the
 #   feature (fail-closed); a bad action drops only that action (WARNING).
 #
-# Security posture: plaintext :4097 reachable; this is a risk-accepted surface
-#   co-equal to the pre-existing catch-all → opencode control endpoints.
-#   Mitigations (not authorization): spawn concurrency cap, single-flight +
+# Security posture: plaintext :4097 reachable; catch-all is closed, but each
+#   enabled local action is an explicit control surface and must be treated as
+#   privileged. Mitigations (not authorization): spawn concurrency cap, single-flight +
 #   min_interval throttle, shell=False, structured audit at WARNING to journald.
 
 # --- queries (echo stdout as markdown) --------------------------------------

@@ -1,6 +1,10 @@
 # 设计方案：Token 批式 SSE（opt-in 实时流）
 
-> **历史设计稿（v4）**：本文件记录 token stream 的设计历史、评审过程与 rationale。**当前 wire 契约以 `docs/specs/v2-contract.md` §3.x 为准**；端点级实现追踪见 `docs/specs/INTERFACE_MAP.md` §3.1。
+> **历史设计稿（v4）**：本文件记录 token stream 的设计历史、评审过程与
+> rationale；其中 snapshot、`server.connected`、done marker、版本头与旧 T3
+> 口径均可能已被后续实现取代。当前 wire 权威见
+> [`v4-contract.md`](v4-contract.md) §7，consumer 算法见
+> [`PROTOCOL.md`](PROTOCOL.md)；`v2-contract.md` 仅为历史存档。
 
 > 状态：**设计稿 v4 — 架构级 PASS**（联合 3 评委 grok 9.2 / opus 9.0 / bgpt 8.7 + 我方 backstop bgpt 7.4；**双边共识**）。残留 fold 为 §16 阶段契约，转入每阶段 9.5 门控。
 > 性质：**加性 wire 行为**（新端点 + 新 event 类型 + health 加性字段），**不 bump `X-Slimapi-Version`**。

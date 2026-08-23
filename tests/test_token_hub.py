@@ -29,11 +29,48 @@ import json
 import pytest
 
 from oc_slimapi.sse.hub import GlobalHub, Subscriber
+from oc_slimapi.sse.replay_log import ReplayLog
 from oc_slimapi.sse.token_hub import (
     DeltaAccumulator,
     LivePart,
-    TokenStreamHub,
+    TokenStreamHub as _TokenStreamHub,
 )
+
+
+_TEST_REPLAY_LOG: ReplayLog | None = None
+
+
+@pytest.fixture(autouse=True)
+def _test_replay_log():
+    global _TEST_REPLAY_LOG
+    replay_log = ReplayLog()
+    _TEST_REPLAY_LOG = replay_log
+    try:
+        yield
+    finally:
+        _TEST_REPLAY_LOG = None
+        replay_log.close()
+
+
+def _token_hub(**kwargs) -> _TokenStreamHub:
+    replay_log = kwargs.pop("replay_log", _TEST_REPLAY_LOG)
+    assert replay_log is not None
+    return _TokenStreamHub(replay_log=replay_log, **kwargs)
+
+
+TokenStreamHub = _token_hub
+
+
+def _global_hub(client=None, **kwargs) -> GlobalHub:
+    assert _TEST_REPLAY_LOG is not None
+    return GlobalHub(client=client, replay_log=_TEST_REPLAY_LOG, **kwargs)
+
+
+def _hub_registry(**kwargs):
+    from oc_slimapi.sse.hub import HubRegistry
+
+    assert _TEST_REPLAY_LOG is not None
+    return HubRegistry(replay_log=_TEST_REPLAY_LOG, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -431,7 +468,7 @@ class TestDropPart:
         assert th._total_live_bytes == 0
 
     def test_idempotent_second_call_returns_false(self):
-        """§16 Stage-B: drop_part is idempotent — resync/truncated emitted once."""
+        """drop_part applies state retirement exactly once."""
         th = TokenStreamHub()
         key = ("s1", "m1", "p1")
         first = th.drop_part(key)
@@ -513,7 +550,7 @@ class TestStubs:
 @pytest.fixture
 async def bare_hub():
     """Bare GlobalHub; tears down background tasks."""
-    h = GlobalHub(client=None)
+    h = _global_hub(client=None)
     try:
         yield h
     finally:
@@ -675,7 +712,7 @@ class TestPublishIntegration:
 class TestRegistryInjection:
     async def test_set_token_hub_propagates_to_existing_global(self):
         from oc_slimapi.sse.hub import HubRegistry
-        registry = HubRegistry(client=None)
+        registry = _hub_registry(client=None)
         try:
             # Force-create the GlobalHub first.
             hub = registry.get_global()
@@ -689,7 +726,7 @@ class TestRegistryInjection:
     async def test_set_token_hub_propagates_to_lazily_created_global(self):
         """When set BEFORE the first get(), the hub picks it up on construction."""
         from oc_slimapi.sse.hub import HubRegistry
-        registry = HubRegistry(client=None)
+        registry = _hub_registry(client=None)
         try:
             th = TokenStreamHub()
             registry.set_token_hub(th)
@@ -700,7 +737,7 @@ class TestRegistryInjection:
 
     async def test_publish_routes_through_registry_wired_hub(self):
         from oc_slimapi.sse.hub import HubRegistry
-        registry = HubRegistry(client=None)
+        registry = _hub_registry(client=None)
         try:
             th = TokenStreamHub()
             registry.set_token_hub(th)
@@ -731,9 +768,8 @@ class TestPartRevisionSemantics:
 
     ``_part_revisions[key]`` is bumped lazily in emit paths via
     ``_next_part_revision``. ``on_part_updated`` itself does NOT bump.
-    Each emitted frame (snapshot / delta / done / truncated) consumes
-    the next strictly-increasing revision so a client using strict
-    ``>`` never drops a frame.
+    Each emitted delta consumes the next strictly-increasing revision so a
+    client using strict ``>`` never drops a frame.
     """
 
     def test_on_part_updated_does_not_bump(self):
@@ -765,22 +801,13 @@ class TestPartRevisionSemantics:
         # First emit → 0 (regardless of the ignored params above).
         assert th._next_part_revision(("s1", "m1", "p1")) == 0
 
-    def test_per_frame_increment_residual_delta_then_done_distinct(self):
-        """End-to-end via direct _fanout_frame inspection: residual delta
-        and done marker from one text-end event carry DISTINCT revisions
-        (Option B per-frame, strictly increasing)."""
+    def test_residual_delta_consumes_one_revision_and_finish_retires(self):
+        """Native v4 text-end emits only the residual delta, then retires."""
         th = TokenStreamHub()
         captured_frames: list[bytes] = []
 
         class _SpySub:
-            _in_handshake = False
             closed = False
-
-            def begin_handshake(self):
-                self._in_handshake = True
-
-            def end_handshake(self):
-                self._in_handshake = False
 
             def put(self, frame):
                 captured_frames.append(frame)
@@ -791,22 +818,15 @@ class TestPartRevisionSemantics:
         th.on_part_updated(_updated_props(text=""))
         th.on_part_delta(_delta_props(delta="abc"))
         captured_frames.clear()
-        # text-end → finish_part emits residual delta (rev=0) + done (rev=1).
+        # text-end → finish_part emits residual delta (rev=0), no done marker.
         th.on_part_updated(_updated_props(text="final", end=1700))
         delta_frames = [f for f in captured_frames
                         if parse_event(f)[0] == "message.part.delta"]
-        snapshot_frames = [f for f in captured_frames
-                           if parse_event(f)[0] == "message.part.snapshot"]
         assert len(delta_frames) == 1
-        assert len(snapshot_frames) == 1
         d_rev = parse_event(delta_frames[0])[1]["partEventRevision"]
-        s_rev = parse_event(snapshot_frames[0])[1]["partEventRevision"]
         assert d_rev == 0, f"residual delta should be rev=0, got {d_rev}"
-        assert s_rev == 1, f"done marker should be rev=1, got {s_rev}"
-        assert s_rev > d_rev, (
-            "Option B: done marker revision must be strictly greater than "
-            "the residual delta's revision (per-frame)"
-        )
+        assert ("s1", "m1", "p1") not in th.live_parts
+        assert ("s1", "m1", "p1") in th._disabled_parts
 
 
 class TestMessageRemovedRetiresState:
@@ -912,91 +932,32 @@ class TestRevisionGating:
         assert key not in th._part_revisions
 
 
-class TestDuplicateTombstoneFifo:
-    """rev-ogpt MAJOR 6: duplicate ``message.removed`` for an
-    already-recorded (sid, mid) refreshes TTL AND ``move_to_end``s the
-    key so the freshest tombstone is never oldest in FIFO order."""
+class TestNativeV4Attach:
+    """Native v4 attach registers without connection-private prefill."""
 
-    def test_duplicate_moves_to_end(self):
-        from oc_slimapi.config import TOKEN_REMOVED_MESSAGES_MAX
+    def test_attach_registers_without_emitting_frames(self):
         th = TokenStreamHub()
-        # Fill cap.
-        for i in range(TOKEN_REMOVED_MESSAGES_MAX):
-            th.on_message_removed("s1", f"m{i}")
-        # The oldest is ("s1", "m0"). Re-touch it.
-        th.on_message_removed("s1", "m0")
-        # m0 should now be the LAST key.
-        last_key = next(reversed(th._removed_messages))
-        assert last_key == ("s1", "m0")
-
-    def test_duplicate_then_new_insert_evicts_next_oldest(self):
-        from oc_slimapi.config import TOKEN_REMOVED_MESSAGES_MAX
-        th = TokenStreamHub()
-        # Fill exactly to cap.
-        for i in range(TOKEN_REMOVED_MESSAGES_MAX):
-            th.on_message_removed("s1", f"m{i}")
-        # Re-touch m0 (would be oldest without move_to_end).
-        th.on_message_removed("s1", "m0")
-        # Insert new — m1 (the new oldest after m0 moved) should be evicted.
-        th.on_message_removed("s1", "m_new")
-        assert ("s1", "m0") in th._removed_messages
-        assert ("s1", "m1") not in th._removed_messages
-        assert ("s1", "m_new") in th._removed_messages
-
-
-class TestHandshakeBypass:
-    """rev-ogpt CRITICAL 3: ``attach_subscriber`` brackets the pre-fill
-    with ``begin_handshake`` / ``end_handshake`` so the T3 overflow
-    guard is bypassed. A closed sub (e.g. prior disconnect) is NOT
-    registered to fanout."""
-
-    def test_handshake_modes_bracket_prefill(self):
-        """During the pre-fill the sub reports ``_in_handshake == True``;
-        afterwards ``False``."""
-        th = TokenStreamHub()
-        handshake_states_during_put: list[bool] = []
 
         class _StateSpy:
             def __init__(self):
                 self.frames = []
-                self._in_handshake = False
                 self.closed = False
 
-            def begin_handshake(self):
-                self._in_handshake = True
-
-            def end_handshake(self):
-                self._in_handshake = False
-
             def put(self, frame):
-                handshake_states_during_put.append(self._in_handshake)
                 self.frames.append(frame)
                 return True
 
         spy = _StateSpy()
         th.attach_subscriber("s1", spy)
-        # Every put during attach was in handshake mode.
-        assert all(handshake_states_during_put), (
-            "all pre-fill puts must run in handshake mode"
-        )
-        # After attach, handshake mode ended.
-        assert spy._in_handshake is False
-        # Sub was registered to fanout.
         assert spy in th._subs_by_sid.get("s1", set())
+        assert spy.frames == []
 
     def test_closed_sub_not_registered(self):
         th = TokenStreamHub()
         class _ClosedSub:
             def __init__(self):
                 self.frames = []
-                self._in_handshake = False
                 self.closed = True  # prior disconnect
-
-            def begin_handshake(self):
-                self._in_handshake = True
-
-            def end_handshake(self):
-                self._in_handshake = False
 
             def put(self, frame):
                 self.frames.append(frame)

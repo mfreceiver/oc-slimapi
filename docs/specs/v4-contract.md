@@ -1,4 +1,4 @@
-# oc-slimapi v4 wire 契约（4.0.0 实施基线 + 2026-08-19 正式修订；修订二：POST 等效动作族——已发版 v4.3.0；修订三 [2026-08-20]：providers 投影 ModelEntry 恢复 optional limit——已发版 v4.4.0；修订四 [2026-08-21]：toolcard 投影族（patch files 归一化 + tool metadata.files/diffStats + compress title + outputBytes）——已发版 v4.9.0；修订五 [2026-08-22]：P1–P6 流量优化族（messages `?since=` 前向差分 + thin 路由 ETag + digest `messagesRevision` + `/slimapi/file/raw` 二进制直读 + readiness 第 11 ID）——已发版 v4.11.0；修订六 [2026-08-23]：token 帧原子序号发布（payload `seq`）+ part 级 digest revision bump + flush-before-asked 因果闭合 + `token_memory_limit` 可重放恢复语义（§3.1/§7.2/§7.4/§7.5/§7.7）——目标 4.12.0）
+# oc-slimapi v4 wire 契约（4.0.0 实施基线 + 2026-08-19 正式修订；修订二：POST 等效动作族——已发版 v4.3.0；修订三 [2026-08-20]：providers 投影 ModelEntry 恢复 optional limit——已发版 v4.4.0；修订四 [2026-08-21]：toolcard 投影族（patch files 归一化 + tool metadata.files/diffStats + compress title + outputBytes）——已发版 v4.9.0；修订五 [2026-08-22]：P1–P6 流量优化族（messages `?since=` 前向差分 + thin 路由 ETag + digest `messagesRevision` + `/slimapi/file/raw` 二进制直读 + readiness 第 11 ID）——已发版 v4.11.0；修订六 [2026-08-23]：token 帧原子序号发布（payload `seq`）+ part 级 digest revision bump + flush-before-asked 因果闭合 + `token_memory_limit` 可重放恢复语义（§3.1/§7.2/§7.4/§7.5/§7.7）；修订七 [2026-08-23]：v4-native 实现归一化、token directory 优先级勘误与 56 路由/current consumer guide 对齐——public v4 wire 不变）
 
 > **状态**：**4.0.0 实施基线（2026-08-18，B3a+B3b 已落地）+ 2026-08-19 正式修订（owner 裁决：修订并入 v4——v4 尚无消费方，修订无破坏影响）**。B0 批冻结全部可观察语义（2026-08-17，rev-6 PASS-with-notes + S-B01 四项 owner 终裁全收敛）；wire 终态 = 4.0.0（`ACCEPTED_CLIENT_VERSIONS` (3,3)→(3,4)；现行窗 (4,4) v4-only——见 §0.1 版本窗收窄修订）。B3a 批（阶段 A selector 双版本——历史批次命名，交付于 4.0.0–4.7.0 双版本窗 / B1 dbaux 连接生命周期 / B2 投影 SQL / B3 cursor / B4 路由分叉降级矩阵 / B5 观测）已按本契约落地并全量测试通过；B3b 批（SSE id:/重放、§7 全量、能力键 `sseReplay`/`qpImmediateFull` 广告）**已落地**。S-B01 四项（§7.0）**已全部 owner 终裁（2026-08-17）**；其余章节（含 DB 设计 R1/R2/R3/R6，已凭真库实证冻结——见 design-v4-dbaux §0.2）均为冻结语义。
 > **2026-08-19 正式修订范围**（各修订节带**当前状态注记**——现行已发布行为 → 修订后冻结目标，实现批次随后落地）：providers 安全投影（§12）/ session 单查 parity（§13）/ expand 闭环（§14）/ 表示层（§15）/ method 边界与修订 non-goals（§16-§17）/ readiness 门禁（§3.3）。修订仅作用 `?v=4` 视图，`?v=3` 零改动（v3 冻结）；无新 major、无版本窗变更（`ACCEPTED_CLIENT_VERSIONS` 仍 (3,4)——该窗口前提已被 2026-08-21 版本窗收窄修订覆盖，见 §0）。设计出处：owner 终裁（2026-08-19）。**D4-A 断链考证注记（2026-08-22）**：原文引用的 `docs/ocmar/plans/2026-08-19-v4-rebaseline.md` §4-§7 路径在本仓 git 全历史中不存在（`git log --all --follow` 与对象库全文检索均无命中，无重命名前路径可考）——修订内容的存续出处 = 本文件 §12-§17 与 `design-v4-selector.md` / `design-v4-dbaux.md` / `design-v4-sse-replay.md` / `design-v4-qp-payload.md` 设计文档。
@@ -217,7 +217,7 @@ v4 sessions **无 ETag/Vary/304**（v2.2 行 254 §6）；v3 全表面 ETag 原�
 3. **消费集**：`messages/{sid}`（含 **expand 两路由，§14——同样消费 `?directory=`**）、`sessions`（列表+status）、`todo`/`children`/`diff`、`agent`/`command`、**§10.1 全部收编路由（按各自 directory 列——以上游组声明为准：file=FileQuery、file/status=WorkspaceRoutingQuery、vcs=WorkspaceRoutingQuery、find=FindFileQuery、providers=WorkspaceRoutingQuery、session 单查=WorkspaceRoutingQuery 等）**。
 4. **多值规则**：`?directory=` **多值异值** → 400 `{"code":"invalid_directory_selector"}`。
 5. **双现/头退役规则（仅消费集）**：query 与 `X-Opencode-Directory` 头同时出现——归一化后同值 → 正常；不同值 → 400 `{"code":"directory_conflict","queryDirectory":<str>,"headerDirectory":<str>}`；**消费集内 directory 头出现（头退役终态）** → 400 `directory_header_retired`（提示改用 `?directory=`）。
-6. **stream 例外**：query-only directory 接受（no-op，不报错）；query 与头同时存在且归一化后不同值 → 400 `directory_not_allowed`；多值异值前置 400 `invalid_directory_selector`（消费集统一规则），单值化后按前述规则判定。
+6. **stream 例外**：production selector 负责完整优先级；query-only directory 接受（no-op，不报错、不 stash、不 strip）；仅头或 query+头归一化同值 → 400 `directory_header_retired`；query+头归一化异值 → 400 `directory_conflict`（保留 `queryDirectory` / `headerDirectory` 字段）；多值异值前置 400 `invalid_directory_selector`（消费集统一规则）。
 7. **不在消费集（宽容忽略）**：`questions`/`permissions`（跨目录自发现聚合）、`events`、`health`/`versions`/`ready`/`metrics`/`actions`/`directories`。
 
 ### §5.2 v4
@@ -243,7 +243,7 @@ v4 sessions **无 ETag/Vary/304**（v2.2 行 254 §6）；v3 全表面 ETag 原�
 
 ## §7 SSE id: / 重放（v4-only）[四项已全部 owner 终裁，2026-08-17]
 
-> 设计权威：`design-v4-sse-replay.md`（协议矩阵用例表 + 状态机全文）。本节为 wire 可见语义，**已随 B3b 批落地（B3b-2，全量测试通过）**。**v3 SSE 帧名帧形零变化**（v2.2 行 153 冻结）——id:/重放仅 v4 生效；v3 客户端无感知（历史 4.0.0–4.7.0 表述——v4-only 窗下 `?v=3` 已 400，无 v3 SSE 客户端）。能力键 `sseReplay`/`qpImmediateFull` 已随 B3b 落地并广告（§3.1）。
+> 设计出处：`design-v4-sse-replay.md`（历史协议矩阵与状态机 rationale；wire 语义以本节为权威）。本节为 wire 可见语义，**已随 B3b 批落地（B3b-2，全量测试通过）**。**v3 SSE 帧名帧形零变化**（v2.2 行 153 冻结）——id:/重放仅 v4 生效；v3 客户端无感知（历史 4.0.0–4.7.0 表述——v4-only 窗下 `?v=3` 已 400，无 v3 SSE 客户端）。能力键 `sseReplay`/`qpImmediateFull` 已随 B3b 落地并广告（§3.1）。
 
 ### §7.0 四项协议裁决记录（S-B01，B0 出门 gate）
 
@@ -289,7 +289,7 @@ v4 sessions **无 ETag/Vary/304**（v2.2 行 254 §6）；v3 全表面 ETag 原�
 
 ### §7.5 SSE 跨视图同步语义（2026-08-19 补载 [冻结]）
 
-以下 SSE 语义 v3/v4 两视图一致（逐条现状载明，本节即权威全文）；v4 附加差异单独标注：
+以下是当前 v4-only SSE 语义；历史视图只在明确标注的演进注记中出现：
 
 - **digest 帧载荷字段集（基线帧形；2026-08-22 D4-A 正文化转录 [冻结]）**：`event: session.digest` data payload 字段集 = `{sessionID, directory, status?, messageID?, updatedAt?, archived?, deleted?, lastError?, turnIncarnation?, turn?}`——可选字段**仅发有变化的**（digest 为 per-sid 逐帧产出；debounce 250ms/session）。**`updatedAt` = sidecar wall-clock**（epoch-ms，sidecar 收到事件时；非上游 message `info.time.updated`——该字段 v1.18.x message 级不可靠），跨窗口严格单调不保证（时钟回拨/同毫秒批量）→ 客户端 watermark 必须用 **`(updatedAt, messageID)` 二元组字典序**（`MessageID = msg_+…` 单调递增、字典序可排）：先 strict 比 `updatedAt`（时间相等/回退→不删既有消息，幂等），相等再 strict 比 `messageID`。**字段来源**：`status` ← `session.status`（归一化恒字符串，见下条）；`messageID`/`updatedAt` ← `message.updated` / `message.appended`（该 sid 最新）；`archived` ← `session.updated` 的 `time.archived`；`deleted` ← `session.deleted`（`deleted=true` 时强制省略 `lastError`，见下条）；`turnIncarnation`/`turn` 为 flat 顶层配对字段（两字段必须同时出现或同时缺失；bump-before-send、per-sid 单调；跨项目 SSOT = ocdroid `docs/archive/2026-07-31-oc-slimapi-turn-token-contract.md`）。**配对缺失触发面（4.12.1）**：registry 未装配，**或 incarnation 持久化未确认**（启动重试后仍未确认 → 本进程不发布 turn fence，`snapshot` 恒 `(None,None)` → 配对省略；ocdroid 按 SSOT §9 Tier-2 降级——不发布未确认值，跨进程严格递增仅对已发布值成立）。**abort 静默丢弃**（`error.name=="MessageAbortedError"`：不写 lastError、不发 G1-B 帧）。**历史演进注记**：本条转录自 v2-contract §3 `session.digest`（G1-A）帧定义与 §5 watermark tie-break 条，语义零改动（2026-08-22 D4-A）；加性演进不在此重复——`changed:[sid…]`（§7.4 末条）、`lastError` provider 结构化字段与脱敏管线（§7.6）、status 归一化（下条）。两视图一致。
 - **digest `messagesRevision`（修订五 [P4] 加性，4.11.0）**：digest 条目窗口含 message 域事件（`message.updated`/`message.appended`/`message.removed`）时，帧携带 `messagesRevision: <int>`——进程级全局单调修订号（relevant 事件 bump；多事件 debounce 窗口 flush 携带**窗口末值**）。**修订六扩展（4.12.0）[冻结]**：事件集追加 `message.part.updated` / `message.part.removed`——part 完成态（text-start 空帧/text-end 满帧/cleanup）与 part 撤销（revert）同 bump 该 sid 的 message revision，走同一 0.25s debounce 合并语义（同窗 N 个 part 事件 = 单帧窗口末值）；`message.part.delta` 维持排除（per-chunk 不落库、不进 digest——上游 v1.18.21 实证 part.updated 每 part 生命周期仅 2-4 次，非 per-token）。**因果保障**：part 事件 bump 的 revision 经 flush-before-asked（§7.4）先于 asked 帧可达——asked 到达时 digest 水位已含 part 完成态。生命周期 = **进程**（重启清零，客户端**不得跨进程比较**；进程内 SSE 重连/upstream resync 可比较——resync 不清零）。`message.removed` 分支 bump 处语义序最后（retired gate → prune → token hub → bump）；part 事件同尊重 retired gate（whole-removal 后迟到的 part 事件不造 digest）。用途 = **变化信号**（触发客户端对账：`/messages?since=` 差分或 If-None-Match 精拉），非序号承诺、不承载 per-sid 语义——与既有 `(updatedAt, messageID)` 双水位正交；与 §10.3 since 通道的对账兜底关系见 §10.3 末条。**跨 sid 规则（终门控 rev-2 冻结三条款）**：① revision allocator 在事件循环内**全局递增**（跨 sid 单点分配，无 per-sid 序号）；② `messagesRevision` **仅同一 sid 的 successive digest 可比较**（跨 sid 比较无语义）；③ **禁止**用其他 sid 的 max revision 丢弃/去重当前 sid digest——不同 sid 因 debounce / targeted flush 时序差，wire 顺序可出现 `[N+1, N]` 逆序（sid-B 先 asked-flush、sid-A 后批量 flush），此为合法序非乱序。
@@ -297,8 +297,7 @@ v4 sessions **无 ETag/Vary/304**（v2.2 行 254 §6）；v3 全表面 ETag 原�
 - **digest `lastError` sticky 清除语义**：`session.error` 携带 sessionID → 该 sid digest 记 `lastError:{name, message, at}`（`name` 截断 128 字符）并立即定向 flush + 记入 sticky 存储；该 sid **下一次 `session.status=busy`** → sticky 弹出 + digest **显式 `lastError:null` 清除帧** + 定向 flush（busy 判定对字符串/对象信封两形态一致）；`session.deleted` → sticky 弹出 + 字段省略；后续 flush 在本窗口未自行设置/清除时合并 sticky 值（贴回语义，直到 busy 清除帧）；**sticky 仅在同一 sidecar 进程生命周期内成立**（进程内内存态、无持久化，重启即丢、不复活不重贴；重启后新 `session.error` 才重新记录）；FIFO 容量上限 10,000 sid，逐出后不再贴回。两视图一致。`lastError` 对象另含**可选结构化 provider 字段**（§7.6，2026-08-21 加性——`{name,message,at}` 基线三键与本条三态语义零变化）。
 - **SSE 恒 identity**：两端点 SSE 流不做 gzip/content-encoding，响应**无 `Vary` 头**（响应头 = `Cache-Control: no-cache, no-transform` + `X-Accel-Buffering: no`；SSE 路径不参与 `Accept-Encoding` 内容协商）。两视图一致。
 - **digest 水位定位与 catch-up 盲区（after 游标等效方案裁决，2026-08-19 冻结）**：上游 `MessageV2.page()` 仅 `before` 向后 keyset（v1.18.18 实证），v4 messages 亦无 after 游标；增量 catch-up 等效方案 = **digest 触发 + 条件重拉**（水位仅当触发器不当过滤器；两盲区：`message.removed` 不进 digest、SSE 断连窗口无补偿；双轨消费 = digest 触发 If-None-Match 精拉 + 低频周期 304 对账兜底，重启/epoch 变化视为全失效）。v4 重放（§7.2 `id:`/Last-Event-ID）可缩小断连盲区但不消除（逐出/barrier 仍 resync），周期对账在两视图均为必选。两视图一致。
-- **v4 附加——meta 首帧字段集（v3 形状不动）**：v4 视图首帧 `event: slimapi.meta` data 字段序 = `subscriberId, tokens, capabilities, epoch, seqBase`；v4 追加三键：`capabilities: {"sseReplay": true}`（**4.12.0 前恒此一键**——`qpImmediateFull` 仅广告于 `GET /slimapi/versions` 的 `capabilities["4"]`，不入 meta 帧；**修订六注记（4.12.0）**：token 流 `/sessions/{sid}/stream` 的 meta capabilities 在重放日志接线时**加性含 `tokenFrameSeq: true`**——连接级激活通告，与本连接业务帧是否携带 payload `seq`（§7.7）严格一致；全局流 `/events` meta 恒 `sseReplay` 一键不变）、`epoch`（进程代，16 hex 字符串）、`seqBase`（连接建立时该域已发布最大 seq，整数；首连后首个带 `id:` 帧恰为 `seqBase + 1`）。meta 帧自身**无 `id:`**（§7.0②）。
-- **v4 附加——welcome 帧抑制**：v4 连接不产出连接本地 `server.connected` 首帧（v3 照旧产出）；v4 线上首帧恒为 `slimapi.meta`。
+- **meta 首帧字段集**：首帧 `event: slimapi.meta` data 字段序 = `subscriberId, tokens, capabilities, epoch, seqBase`。全局流 capabilities = `{"sseReplay":true}`；token 流另有 `tokenFrameSeq:true`。`epoch` 是进程代 16-hex 字符串；`seqBase` 是连接建立时该域已发布最大 seq。meta 自身**无 `id:`**，且线上没有连接本地 welcome 帧。
 
 ### §7.6 lastError 结构化 provider 字段（2026-08-21 加性修订 [冻结]）
 
@@ -339,60 +338,54 @@ digest `lastError` 对象（G1-A，有 sid）与 session-less `event: session.er
 - **向后兼容（加性）**：老客户端忽略未知键即可，零必改点；不 bump wire 版本。未知 `code` 值（未来扩展）客户端应回退按 `message` 展示。
 - **写路径不变**：provider 错误经 SSE `session.error` 送达；`prompt_async` 等写路由（§10.1 基线）**立返 202**，4xx verbatim / 5xx→503 冻结职责不受本修订影响。
 
-### §7.7 token 流业务帧形（`GET /slimapi/sessions/{sid}/stream`；2026-08-22 D4-A 正文化转录 [冻结]）
+### §7.7 token 流业务帧形（`GET /slimapi/sessions/{sid}/stream`；v4-native [冻结]）
 
-> 历史演进注记：本小节转录自 v2-contract §3.x.2「Wire 帧」（P1 范围/opt-in 语义转录自 §3.x.1；端点现行态见 §7.3 末条），语义零改动（2026-08-22 D4-A）。v2 原文「不发 SSE `id:` 字段；`Last-Event-ID` 仅触发首帧 resync、值忽略」为 v2/v3 视图行为——v4 视图按 §7.1/§7.2 分配独立 id: 并支持重放，两代语义以 §7.0-§7.2 冻结条款为准，本节照录 v2 基线帧形不改写。
+连接首帧恒为无 id 的 `slimapi.meta`，不存在连接本地 welcome、snapshot、
+tombstone prefill 或 done marker。当前 sequenced 业务帧集合恰为：
 
-帧清单（6 类）：
+1. `message.part.delta{sessionID,messageID,partID,field,delta,seq,partEventRevision}`；
+2. `message.removed{sessionID,messageID,seq}`；
+3. replayable `resync{reason:"token_memory_limit",sessionID,seq}`。
 
-```
-# 1) 订阅首帧：活跃 part 累计全文锚点
-event: message.part.snapshot
-data: {"sessionID":"…","messageID":"…","partID":"…","text":"<累计全文>","done":false}
+三类均带 `id:t:<sid>:<epoch>:<seq>`，payload `seq` 与 id 末段同源同值。
+只有 `message.part.delta` 携带 per-frame `partEventRevision`；客户端按同 part
+strict `>` 去重。`message.removed` 清除该 message 的 live 渲染态并可重放；
+global digest 的 session 删除信号与它独立、互不替代。
 
-# 2) 批式增量（100ms / 4KiB flush）
-event: message.part.delta
-data: {"sessionID":"…","messageID":"…","partID":"…","text":"<本窗拼接>"}
+**发布原子性**：reserve seq → encode payload → append ReplayLog → fanout 在同一
+同步临界段完成。任一步失败会 rollback seq 并丢弃该帧；token 业务帧绝不以
+无 id、未入日志的形式降级下发。`token_memory_limit` 发布失败还会写 barrier/
+sticky invalidation 并以 `reconnect_no_replay` 终止在线订阅者，强制 HTTP 对齐。
 
-# 3) 终态 marker（杠杆1：去终态全文——仅完成标记，无 text；权威全文走 /messages/{sid}）
-event: message.part.snapshot
-data: {"sessionID":"…","messageID":"…","partID":"…","done":true}
+**控制帧**：meta、heartbeat 及
+`epoch_changed|replay_expired|replay_gap|reconnect_no_replay` 控制 resync 无 id/seq、
+不入 replay。`session_idle|session_deleted` **不属于 active-v4 resync 值域**：二者
+均在原 token 连接上清空 backlog 并只排 STOP，作为 terminal disconnect，绝不发送
+同名 resync。删除的权威 wire 信号来自 global `session.digest{deleted:true}`。两条
+生命周期路径都会先写 token-domain replay barrier；barrier 后携旧 cursor 重连会
+收到冻结控制帧 `resync{reason:"reconnect_no_replay"}`，再做 HTTP reconciliation。
+普通 subscriber queue 溢出同样只排 STOP；恢复由 Last-Event-ID + ReplayLog 分类或
+HTTP reconciliation 完成，不产生私有 backpressure resync 帧。其余冻结
+`V4_RESYNC_REASONS` 仍按 §7.2 实现。
 
-# 4) 大 part 超 1MiB（done:false 或 done:true 均可能）——不静默 drop
-event: message.part.snapshot
-data: {"sessionID":"…","messageID":"…","partID":"…","truncated":true,"done":false|true}
+**内存驱逐**：`token_memory_limit` 是可重放、非终止的 advisory 业务帧。
+服务端先丢弃被逐 part 的 live/pending 状态，再 flush 同 sid 其它 part，最后发布
+该 resync；未驱逐 part 继续在同一 seq 域工作。客户端收到后不清空其它 part、
+不重置账本，也无需立即执行专用 GET；被逐 part 在完成时通过
+`messagesRevision` + messages since/full 对账收敛。
 
-# 5) resync（背压/重连/超大/内存上限/生成结束清理；token resync 恒带 sessionID）
-event: resync
-data: {"reason":"subscriber_backpressure|reconnect_no_replay|token_memory_limit|session_idle|session_deleted","sessionID":"…"}
+**REST 权威边界**：中途 delta 不落库，故 REST 对本地未完成的 `streamOwned`
+part 非权威。对账时只有 `/full/{mid}` 中同 part 出现非空 `time.end` 才以 REST
+text 覆盖并解除 `streamOwned`；无 `time.end` 时保留流文本。skeleton 不含 part
+`time`，缺席不得解释为完成或未完成。单 part 超过 1MiB 时服务端 drop_part，
+不发额外 wire 信号；最终仍由 revision + `/full` 收口。
 
-# 6) server.connected{sessionID} / server.heartbeat{}（15s）
-#    └ Q2 校正注记（2026-08-22 owner 裁决，按代码事实）：v4-only 面**抑制
-#      server.connected**——v4 握手 = no-prefill join，连接本地帧仅有
-#      slimapi.meta（首帧恒为它，§7.2 终态；tests/test_token_stream_route.py:861-888
-#      白盒钉死：无 server-originated message.part.snapshot，状态对齐 = resync 后
-#      客户端 HTTP full fetch）。本行 server.connected 描述保留为历史（v2/v3）
-#      形态；heartbeat 不受影响。
-```
-
-- **`message.removed` 帧（token-stream 保留，非控制面）**：token hub 收到上游 `message.removed` 后：(1) 清理该 message 的累加器/修订状态；(2) 向当前订阅者 fan-out `message.removed{sessionID,messageID}` 帧；(3) 记入有界回放队列（cap 1000 / TTL 24h）。客户端在**握手期**可能收到回放的 `message.removed` 帧（`server.connected` → tombstones 回放 → snapshot → fanout），运行时也可能收到实时 fan-out 帧；收到后应丢弃该 message 的 live 渲染态。控制面 `session.digest` 的 `deleted=true` 是独立信号，二者共存、不替代。队列不受 `resync_all` / `on_upstream_reconnect` 影响。**Q2 校正注记（2026-08-22 owner 裁决）**：上述「握手期回放」（含 server.connected 与 tombstone/snapshot 预填）为 v2/v3 历史形态——v4-only 面握手 = no-prefill join，无握手期回放（tests/test_token_stream_route.py:861-888 白盒钉死）；**运行时 fan-out 路径不变**，`message.removed` 帧在 v4 下经运行时 fan-out 及重放域（§7.2 tombstone 条，帧形 `frames.py:137-151` 现行）照常到达。
-- **终态顺序不变式（wire 强约束；v2/v3 历史语义——v4 结构性不发布 `snapshot{done:true}`，见 §7.7 payload `seq` 条三帧集合）**：对同一 `(sid,mid,pid)`，所有 `message.part.delta` 帧必先于对应 `snapshot{done:true}` 入队；`done:true` 后该 part 不许再发 delta。
-- **杠杆1（决定性；v2/v3 历史语义——v4 无 done marker）**：终态 `snapshot{done:true}` 是**仅完成 marker，不带 text**——权威全文走 `/messages/{sid}`（持久化真值），幂等覆盖且凌驾所有 token 帧；客户端可接受 digest 完成先于/晚于 token 终态帧。**现行 v4 终态闭合**：终态不经任何 token wire 帧——经 REST/digest 通道（§7.5 revision 收敛 + §7.7 终态 REST 合并规则：对账 GET 见非空 `time.end` 即覆盖收口）。
-- **resync reasons**（token 流均带 `sessionID`）：`reconnect_no_replay`（上游重连）/ `subscriber_backpressure`（订阅者 T3 溢出）/ `token_memory_limit`（全局累加器上限，**4.12.0 起为可重放业务 resync——见下条**）/ `session_idle`（生成结束清理）/ `session_deleted`（会话被删除）。**单 part >1MiB 不走 resync**（v2/v3 历史语义：走 `snapshot{truncated:true}`，客户端清该 part 渲染态、停 append、走 `/messages/{sid}`——v4 面结构性不发布 truncated 帧，其投递为 `_deliver_v3_only`，不入重放日志、不耗 seq）。**现行 v4 行为（按 budgets.py::`_reserve` 实现）**：将使该 part 超过 `TOKEN_PART_MAX_BYTES`（1MiB）的 delta **直接丢弃不发布**，且该 part 随即 `drop_part`（后续 delta 亦在 ingest gate 拦截）——v4 token wire 上**无任何信号帧**；客户端经 revision 对账（该 part 的 part.updated 仍 bump digest revision）在 `/full` 见终态（`time.end` 判据，终态 REST 合并规则）。
-- **token 帧 payload `seq`（修订六，4.12.0 [冻结]）**：**v4 sequenced 业务帧集合 = 恰三帧**：`message.part.delta` / `message.removed` / 可重放 resync（`resync{reason:"token_memory_limit"}`，§7.7 下条）——此三帧的 data payload 增可忽略字段 `seq:<int>`，与该帧 SSE `id:` 末段**同源同值**（同一 reserve→encode→append 原子路径分配，§7.1 域序列）。`message.part.snapshot` 族（`snapshot{done:true}` 终态 marker / `snapshot{truncated:true}`）**不属于 v4 sequenced 业务帧集合**——v4 服务端从不发布 snapshot 族帧（§7.0②/§7.2 R2 gate：状态对齐一律客户端 HTTP fetch），上述帧形为 **v2/v3 历史语义**（存档见 `v3-contract.md` §7；v4-only 窗下 `?v=3` 已 400）。meta/heartbeat/控制面 resync **无** `seq` 亦无 `id:`（不参与序列）。`seq` 仅在重放日志接线时出现（生产 v4 恒有；探测键 `tokenFrameSeq`，§3.1）。**消费规则**：per `(epoch, sessionID)` 连接账本，严格 `>` 接受——`seq` ≤ 已处理值的迟到/重放帧丢弃（防 replay 重放与迟到回调重复应用）；同 epoch 内 SSE 重连账本延续不清（epoch 仅进程重启变化，§7.0②）；跨 epoch 不可比较（重启走 `epoch_changed` 全量对齐）。**跳跃接受 = 有意策略**：`seq` > 已处理 +1 的跳跃按序缺口处理——接受并推进账本；这不是「服务端允许真实发布空洞」，而是与下条原子承诺配套的设计（线上不存在真空洞，缺口仅可能来自背压断连路径——该路径走重放/`replay_gap` 对账后由客户端重建账本）。**服务端原子承诺**：`seq` 消耗与日志 append 同步原子（任一步失败 → 回滚分配、该帧丢弃不发布——线上不出现「帧已到而日志无此帧」的空洞）。
-- **`token_memory_limit` 恢复协议 v2（advisory resync + revision 收敛；修订六，4.12.0 [冻结]）**：内存上限驱逐 live part 时，`resync{reason:"token_memory_limit",sessionID}` 自 4.12.0 起为**可重放业务 resync**——带 `id:` + payload `seq`、写入重放日志（离线客户端重连时按其 cursor 重放）、**流不终止**（后续其它/新建 part 的帧继续按同域 seq 发布，区别于 `session_idle`/`session_deleted` 的终止语义）。服务端驱逐动作（按实现序，`budgets.py::_evict_part_for_memory`）：先清被逐 part 的 live/pending 状态（其未 flush 尾部 delta 随 `drop_part` **丢弃、不上 wire**），再 flush 该 sid **其余** part 的 pending 增量（占 seq、严格先于 resync），随后发布 resync——resync 在重放序列上排在一切已发布增量之后；被逐 part 自驱逐点起在重放序列上无任何后续增量。**协议 v2 条款**：
-  - **advisory 性质**：该 resync 不 rebase 流基线、不重置任何 part 的增量基——流 seq 域连续，**未驱逐 part 的增量流不被中断**；它仅通告「被逐 part 已 REST-owned」。
-  - **客户端零专用恢复动作（收到 resync 当下）**：**不清态、无专用恢复 GET、无恢复期缓存重放**——继续按 seq 规则照常按序应用后续帧即可；连接账本规则不变，无恢复专用水位（appliedSeq 矛盾按构造消除）。终态收敛依赖既有 revision 对账通道（「被逐 part 终态经 revision 收敛通道」条）+ 终态 REST 合并规则（「终态 REST 合并规则」条）。可选：**session 级** UI 提示（`token_memory_limit` resync 仅含 `sessionID`、无 part 身份——定向到某 part 的提示不可实现）；可选任意时刻 GET 刷新，但**对 live part 不得用作覆盖源**（下条）。
-  - **REST 对 live part 非权威（禁止双源合并覆盖）**：上游中途流 delta 不落库（`processor.ts` 仅发 delta；仅 text-end 的完整 `PartUpdated` 落库）——REST 投影对客户端 live-accumulating part 只能拿到空 start 或已完成终态，拿不到中途累积文本；「GET 安装覆盖 live part」既会丢已积累文本也可能与缓存 delta 双重应用，**禁止**。
-  - **终态 REST 合并规则（4.12.0 客户端规则更新——对账逻辑的终态例外）**：客户端对账 GET 时，对本地**未完成**的 `streamOwned` part：若响应同 part（同 messageID+partID）携带**非空 `time.end`**——持久化终态判据（上游 text-end `PartUpdated` 全字段落库、CAS 投影 verbatim）——**必须**以 REST 文本覆盖、标记完成、解除 `streamOwned`；REST 同 part 无 `time.end`（中途/未完成）时仍**禁止**覆盖（上条反双源合并规则不变）。**判据可见性**：part 级 `time` 为 /full-only 键（skeleton 投影 `PART_IDS` 不含 `time`，design-expand §2.3）——skeleton 列表（`GET /slimapi/messages/{sid}`）**结构性不含** part `time`，其缺席**不得**被推断为「未完成」；携带判据的对账面 = `GET /slimapi/messages/{sid}/full/{mid}`（verbatim 吸收仅剥 LSP diagnostics，`time.end` 原样到达）。完整五步收口算法（revision 定位 → 含 unfinished streamOwned part 则 /full → `time.end` 判定收口/保留）冻结于 CLIENT_CHANGES.md P4「终态收口五步算法」；升级判据 = revision 定位的 message 含本地 unfinished `streamOwned` part → `/full`。
-  - **被逐 part 终态经 revision 收敛通道**：被逐 part 在本进程生命周期内不恢复增量流（disabled gate 拦截其后续流事件）；其完成态（text-end `PartUpdated` / 消息级完成）经 `message.part.updated` → `messagesRevision` bump → digest → 客户端常规 `?since`/GET 对账收敛（§7.5；**bump 不受 tokenstream 驱逐影响**——被逐 part 的 part.updated 仍 bump digest revision，收敛通道锚点）。收敛有界：part/message 完成时刻；若 sid 先 idle 则 terminal 对账覆盖。
-  - **fail-closed 保障**：驱逐后 resync 帧发布失败（极小概率：日志 append 异常）→ 服务端终止该 sid 全部在线订阅者（携带 `reconnect_no_replay` 原因帧）+ 置 per-sid 持久失效标记（**epoch 内粘滞**：后续无 `Last-Event-ID` 首连一律 `reconnect_no_replay` 强制 HTTP 对齐，不进普通 first-connect；进程重启由 `epoch_changed` 自然解除）——绝不静默弃帧使客户端运行在失效基线上。
-- **`session_deleted` 服务端终止**：上游 `session.deleted` 到达时，sidecar 对该 sid 的所有 token 订阅者**同步**发 `resync{session_deleted,sessionID}` 后立即终止连接（发 STOP 关闭流）；客户端收到该 resync + 连接关闭后应视为该 session 的 token stream 已结束，如需重建须重新订阅。
-- **truncated 处理（v2/v3 历史语义——v4 结构性不发布 `snapshot{truncated:true}`，现行 v4 超限行为见上条 resync reasons 末注）**：收 `snapshot{truncated:true}`（`done:false` 或 `done:true` 均可能）→ 清该 part 渲染态、停 append、走 `/messages/{sid}` 重拉权威。
-- **reasoning/tool part**（`part.type!="text"`）的 delta **静默 drop+计数**，不 resync；field≠"text" 的 delta 丢弃。
-- **per-frame `partEventRevision`**：token stream 帧的 `partEventRevision` 由 token hub **per-frame** 维护（每帧唯一递增）；客户端按 strict `>` 去重（消费端算法见 CLIENT_CHANGES.md「partEventRevision 必须 strict `>` 去重」节）。
-- **P1 范围与 opt-in**：仅 text part（reasoning / tool-input 延后 P2+）；不做二进制流。客户端前台/动画层才连；切背景/换 session 应断开（同时最多 1 条前台 stream）；连接独立于控制面 `/events`，两条连接互不替代。批式增量 = token-stream flush loop（100ms / 4KiB 窗口）对每个 `(sessionID, messageID, partID)` 完成窗口拼接；渲染须对任意 batch 稳健（不按 token 计数、不假定帧间隔）。背压复用既有 subscriber T3 守卫（`resync{subscriber_backpressure}` + 断连）。
-- **token T3 资源信封（独立账本；2026-08-22 Q4 正文化转录 [冻结]）**：token 订阅**独立账本**，与控制面 SSE T3 隔离——不占控制面 subscriber 上限，避免 token 高吞吐挤掉 q/p 或误触控制面背压。**admission 常量**：`token_stream_max_subscribers=8`、`token_stream_queue_items=64`、`token_stream_buffer_bytes=512KiB/sub`、`token_stream_max_frame_bytes=1MiB`。**内存预算 = Option B（拆 4+4，不双计）**：`TOKEN_LIVEPARTS_MAX_BYTES=4MiB`（live LivePart.chunks 累计）、`TOKEN_PENDING_MAX_BYTES=4MiB`（pending DeltaAccumulator 累计，与 live **不双计**——同一 delta chunk 不在两池同时占额度）、单 part 上限 `TOKEN_PART_MAX_BYTES=1MiB`、全局活跃 part 数 `TOKEN_LIVE_PARTS_MAX=32`；worst-case ≈ `8 × 512KiB + 4MiB + 4MiB = 12MiB`（runtime 正常态）。`_reserve` 处理 delta 超剩余预算 → 退役最旧 part（按 `last_delta_ms`）+ `resync{token_memory_limit,sessionID}`。**admission 溢出** → 503 `{"code":"sse_token_subscriber_limit","limit":8,"current":N}` + `Retry-After:5`。**历史（v2/v3）形态如实标注**：① `token_stream_handshake_buffer_bytes=8MiB/sub` 握手暂存与 503 `sse_token_handshake_overflow`（items 超 2048 / bytes 超 8MiB）——v4 no-prefill join 不 bracket 握手，该失败模式在 v4-only 面**结构性不可达**（tests/test_token_stream_route.py:972-976 移除注记；常量与错误码保留定义）；② v2「token stream 默认 gzip（杠杆2，首个 SSE gzip 例外）」已被 v3 起恒 identity 取代——现行 = §7.5「SSE 恒 identity」两端点无例外。**历史演进注记**：本条转录自 v2-contract §6.x「Token stream T3 信封」，语义零改动（2026-08-22 Q4）；v2 worst-case 原文含 handshake buffer 项（`8 × (512KiB + 8MiB) + 4 + 4 = 76MiB`），v4 无握手暂存故上文本按 runtime 形态载 12MiB，76MiB 为 v2/v3 历史口径。
+**范围与预算**：仅 text part 且 field 必须为 `text`；reasoning/tool delta 静默
+丢弃并计数。flush 窗口为 100ms/4KiB，客户端不得依赖 token 粒度或固定帧间隔。
+token 订阅使用独立 T3 账本：最多 8 subscribers、64 queue items、512KiB/sub、
+1MiB/frame；live/pending 各 4MiB、单 part 1MiB、最多 32 live parts。admission
+溢出 → 503 `sse_token_subscriber_limit` + `Retry-After:5`。客户端只在前台当前
+session 建立 token 流；它与全局 `/events` 独立、互不替代。
 
 ## §8 错误族与优先级 [冻结]
 
@@ -455,9 +448,14 @@ v4 sessions 归入 sessions 桶既有记账；降级路径请求带 degraded 标
 
 **4.8.0 起 v3 wire 版本已退役**：`ACCEPTED_CLIENT_VERSIONS = (4,4)`，`?v=3` 答复 400 `unsupported_version` `supported:[4]`。原 (3,4) 永久双版本裁决（2026-08-19 owner 终态裁决）被本修订覆盖——退役通过版本窗收窄（4.8.0 minor；major 仅跟协议大版本 bump，owner 2026-08-21 裁定）直接实施，不经观测判据评估。历史观测数据（08-19 99.7% → 08-20 69.5% → 08-21 49.1%，SSE active v3=0 连续两日）为 merge 门佐证，非退役触发条件。
 
-## §10 路由全集逐条（v4 差异列）[冻结]
+## §10 路由全集逐条（当前 v4-only）[冻结]
 
-**51 条** /slimapi 路由（read **26** + write **17** + SSE 2 + 发现/运维 **6**；**计数方法 = 路由 × 方法表行**，与 `scripts/check_routes_doc.py` 的路由↔INTERFACE_MAP 一致性校验同口径——2026-08-19 修订，取代原「45 条（read 23 + write 12 + 发现/运维 8）」旧计数）。**已发布（4.0.0/4.1.0）v4 差异仅下列 4 条**，其余 **47** 条 v4 无版本分叉（经 selector 分派；历史 4.0.0–4.7.0 双版本期两视图行为一致，v4-only 窗下唯一可达视图 = v4——路由/方法/directory/ETag/统一行为语义全文见 §10.1 基线路由表与 §10.2 消息投影基线）；**2026-08-19 正式修订（冻结目标）追加差异面见本节末修订块与 §12-§17**；**修订二（owner 裁决 2026-08-19，已实施——write 组三条 POST 等效动作路由已激活，`session.post-actions.v4 ∈ satisfied`）**：
+当前共有 **56 条** `/slimapi` method/path（GET 36 + POST 18 + PATCH 1 +
+DELETE 1；计数方法 = 路由 × 方法表行），与
+`scripts/check_routes_doc.py` 的源码 decorator ↔ `INTERFACE_MAP.md` gate 同口径。
+所有路由只有 v4 视图；下表保留最初 v4 引入时的四个主要差异面，不能读作
+当前只实现四条 v4 路由。其余 current route 的完整输入/DTO/错误见本节、
+§10.1-§19 与 `PROTOCOL.md` 导航。
 
 | 路由 | v4 差异 |
 |---|---|
@@ -466,13 +464,19 @@ v4 sessions 归入 sessions 桶既有记账；降级路径请求带 degraded 标
 | `GET /slimapi/sessions/{sid}/stream` | §7：v4 分配独立 id:（token 流）；directory 消费保留 |
 | `GET /slimapi/versions` | §3.1 v4-only 载荷（`available`:[4]、capabilities 仅 "4" 面；历史 4.0.0–4.7.0 为双版本载荷） |
 
-`GET /slimapi/health` 视图差异（§3.2，v4-only 单视图；历史 4.0.0–4.7.0 为双视图）为响应差异，路由行为不变。messages（4 条 + 2 expand）、sessions/status、todo/children/diff、directories、agent、command、file/vcs/find/config/session-single/context（读组）、active、global/health、metrics、ready、actions（2）、write 17 条：**零 v4 差异**。其中两处显式注载（2026-08-19 补载）：
+`GET /slimapi/health` 当前只有 v4 单视图。messages（list/full + 2 expand）、
+sessions/status/details、todo/children/diff、directories、agent、command、
+file/vcs/find/config/session-single/context、active、global/health、metrics、ready、
+actions（2）与 write 20 条均属于当前 v4 路由全集。历史“双视图差异”只用于
+版本考古。
 
-- **`GET /slimapi/session/{sid}` 单查**：`?v=4` 下**不升级 v4 骨架形状**——恒返回既有 skeleton 投影（§4.1 `SESSION_KEYS` 白名单列集；SessionSkeletonV4 仅用于 `GET /slimapi/sessions?v=4` 列表项；单查无 v4 分叉）。v4 客户端取单会话 v4 骨架走 `/slimapi/sessions?v=4` 列表。
+- **`GET /slimapi/session/{sid}` 单查**：返回与列表同源的 canonical
+  `SessionSkeletonV4`；dbaux 点查优先，失败时 whole-response native fallback，
+  语义见 §13。
 - **`GET /slimapi/sessions/status`**：零 v4 分叉（无版本分支代码路径），directory 消费 = §5.1 基线（§5.2 表行：query 单值消费剥离、头出现 400、多值 400）；上游 `/session/status` 数据与 directory 无关（恒全局 map），`directory` 仅作 workspace 路由通道。
 - 2 条 expand 路由的可达性与能力探测口径见 §3.1 注记（`capabilities["4"]` 无 `expand` 键）。
 
-### §10.1 基线路由表（47 条零差异路由的权威语义；2026-08-21 正文化转录 [冻结]）
+### §10.1 基线路由表（当前 v4 路由的权威语义；2026-08-21 正文化转录 [冻结]）
 
 > 历史演进注记：本小节语义 4.0.0 起原经继承基线条款指向 v3 契约 §10/§4；F-126 自包含化后就地正文化，语义零改动。
 
@@ -517,7 +521,7 @@ v4 sessions 归入 sessions 桶既有记账；降级路径请求带 degraded 标
   - `truncated`（absent-aware 加性诊断）：`true` 当聚合 `items` 数超 `_MAX_AGGREGATE_ITEMS`(=10000)——后续 directory 不再 extend，`authoritativeDirectories` 同步降级为 succeeded list（与发现截断同语义）；缺省 `false`。
   - 边界：无任何 session（`/experimental/session` 返 `[]`）→ `{items:[], errors:[], authoritativeDirectories:null, discoveryComplete:true}`（**权威空**，replace-all 安全）；发现调用 total failure（网络/5xx/4xx/坏 JSON/非 list）→ HTTP 503 `{"code":"upstream_unavailable"}`（**无 envelope**；客户端保留既有状态并重试）；不读 opencode SQLite（上游 `/question` 是 legacy `:4096` server 挂载路径 per-Location；发现调用 `/experimental/session` 是 opencode v2 全局端点）。
 
-**写路由（17 端点；#1-12 directory 消费——上游 session/question 组均声明 WorkspaceRoutingQuery；#13-17 不消费——上游 v2 session 组按 sid 自路由，`?directory=` 宽容剥离不转发不报错）**：
+**写路由（20 端点；#1-12 directory 消费——上游 session/question 组均声明 WorkspaceRoutingQuery；#13-17 不消费——上游 session 组按 sid 自路由，`?directory=` 宽容剥离不转发不报错；#18-20 为现行 POST 等效动作）**：
 
 | # | 路由 | 上游 | 方法 | 备注 |
 |---|---|---|---|---|
@@ -538,8 +542,11 @@ v4 sessions 归入 sessions 桶既有记账；降级路径请求带 degraded 标
 | 15 | `/slimapi/session/{id}/revert/stage` | `/api/session/{id}/revert/stage` | POST | revert 三段式之 stage；body `{"messageID":…,"files"?:bool}` 透传；成功 **200** `{"data":…}` 逐字（无投影）；与 #8 单步 `/revert` **加性并存**，互不替代 |
 | 16 | `/slimapi/session/{id}/revert/clear` | `/api/session/{id}/revert/clear` | POST | 无 payload；成功 204 |
 | 17 | `/slimapi/session/{id}/revert/commit` | `/api/session/{id}/revert/commit` | POST | 无 payload；成功 204 |
+| 18 | `/slimapi/session/{id}` | `/session/{id}` | POST | 与 #2 PATCH 字节等效（PatchPayload） |
+| 19 | `/slimapi/session/{id}/archive` | `/session/{id}` | POST→PATCH | 空 body 合成 `time.archived` epoch-ms；非空 body 透传 |
+| 20 | `/slimapi/session/{id}/delete` | `/session/{id}` | POST→DELETE | 与 #3 DELETE 请求实体/响应等效 |
 
-（修订二激活后 write 组另有三条 POST 等效动作路由（§16.2），见本节末修订块——计数 51→54。）
+三条 POST 等效动作已激活；精确 body/错误/等效性见 §16.2。
 
 ### §10.2 消息投影基线（`GET /slimapi/messages/{sid}` 骨架缩减与 expandRefs；2026-08-21 正文化转录 [冻结]；修订四 [2026-08-21]：toolcard 投影族——已发版 v4.9.0；修订五 [2026-08-22]：加性 `?since=` 前向差分——**见 §10.3**（本节投影基线语义零改动）——目标 4.11.0）
 
@@ -581,7 +588,9 @@ v4 sessions 归入 sessions 桶既有记账；降级路径请求带 degraded 标
 | `POST /slimapi/session/{sid}/archive`（新） | §16 修订二：同门控激活；body 可选（合法 PATCH body 透传 / 缺省 sidecar 合成 `{"time":{"archived":<now epoch-ms>}}` 走 PATCH 等效管线）；`?v=3` → 404（4.0.0–4.7.0 历史，v4-only 窗下不可达） |
 | `POST /slimapi/session/{sid}/delete`（新） | §16 修订二：同门控激活；**DELETE 等效路由**（请求实体处理与 DELETE 完全相同并原样转发——读取实体、同 cap 413、Content-Type 透传、body 逐字节转发，无忽略分支，§16.2-b；上游递归删子+吞错语义如实继承，非幂等可接受——owner q1）；`?v=3` → 404（4.0.0–4.7.0 历史，v4-only 窗下不可达） |
 
-其余路由维持零 v4 差异；**计数方法（路由 × 方法表行）不变——4.2.0 已实现 51 条，修订二实施后 54 条（write 20），修订五实施后 55 条（`GET /slimapi/file/raw` 加性，§19）**。
+历史计数：4.2.0 为 51，修订二后 54，修订五加入 `/file/raw` 后 55；
+后续 `/slimapi/sessions/details` 加性落地形成当前 **56 条**。现行计数以源码
+decorator gate 为准。
 
 ### §10.3 messages `?since=` 前向差分（修订五 [P1]；4.11.0）
 

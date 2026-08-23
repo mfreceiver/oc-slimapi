@@ -85,9 +85,9 @@ class _TokenMetrics:
     """
 
     orphan_deltas: int = 0
-    flushed_frames_total: int = 0       # Stage C: delta + marker + snapshot emits
-    dropped_frames_total: int = 0       # Stage C: oversized non-snapshot frames dropped
-    truncated_snapshots_total: int = 0  # Stage C: snapshot{truncated:true} fans
+    flushed_frames_total: int = 0       # Native business-frame deliveries
+    dropped_frames_total: int = 0       # Oversized/backpressured frames dropped
+    truncated_snapshots_total: int = 0  # Compatibility key; native-v4 stays zero
     token_memory_limit_total: int = 0   # Stage C: resync{token_memory_limit} fans
     # 4.12.0 修订六 B-1: general business-frame publish failures on the
     # reserve→encode→append path (frame dropped + seq rolled back — the

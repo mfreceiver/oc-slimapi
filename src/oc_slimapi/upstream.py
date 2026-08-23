@@ -37,8 +37,8 @@ def forward_upstream_headers(
 
     Contract §7 observability: every sidecar→opencode request must carry the
     ``X-Request-ID`` so the sidecar's access log line can be correlated with
-    opencode's own logs. The catch-all proxy already does this; thin routes
-    (catalog, /ready) use this helper for the same effect.
+    opencode's own logs. Thin routes (catalog, /ready, and controlled writes)
+    use this helper consistently.
     """
     headers = forward_directory_headers(directory)
     if request_id:

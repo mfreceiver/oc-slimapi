@@ -219,7 +219,7 @@ class FlushEngineMixin:
                 # completed (sid, mid, pid) window concat is fanned to the
                 # ``/slimapi/events?tokens=1`` subscribers as a lean
                 # ``{type:"token", ...}`` frame. Fires on the 100ms
-                # flush_loop cadence (NOT the handshake-only flush_sid) so
+                # flush_loop cadence (not the targeted flush_sid path) so
                 # events-token consumers see live tokens. Empty list → no-op
                 # (zero per-flush overhead when no events-token subscriber).
                 # The tap reuses ``Subscriber.put`` so the unchanged T3
@@ -238,13 +238,10 @@ class FlushEngineMixin:
         # _check_pending_budget force-flushes — not just the 100ms loop ticks.
         self._metrics.flush_ticks_total += 1
     def flush_sid(self, sid: str) -> None:
-        """Drain pending accumulators for ONE sid only (§5.5 handshake step 3).
+        """Drain pending accumulators for one sid only.
 
-        Called by :meth:`attach_subscriber` BEFORE snapshotting the new
-        subscriber. Existing subscribers receive the residual deltas; the
-        new subscriber (not yet in ``_subs_by_sid``) does NOT — so the
-        subsequent snapshot reflects already-flushed state (C2: no
-        double-count). This is the "clear-pending" half of the handshake.
+        Memory eviction uses this to publish surviving pending deltas before
+        its replayable ``token_memory_limit`` resync, preserving seq order.
 
         Stage E: decrements ``_total_pending_bytes`` for each drained
         accumulator (same pattern as :meth:`flush`).

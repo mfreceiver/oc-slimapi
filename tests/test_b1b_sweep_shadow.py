@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from conftest import current_replay_log
+
 import asyncio
 import importlib
 import time
@@ -145,14 +147,14 @@ def test_budget_resets_at_utc_day_boundary():
 
 
 def test_global_hub_immediate_qp_event_updates_activity():
-    hub = GlobalHub(None)
+    hub = GlobalHub(None, replay_log=current_replay_log())
     before = time.time()
     hub.publish({"directory": "/repo", "payload": {"type": "question.asked", "properties": {}}})
     assert before <= hub.qp_last_activity["/repo"] <= time.time()
 
 
 def test_non_qp_hub_event_does_not_update_qp_activity():
-    hub = GlobalHub(None)
+    hub = GlobalHub(None, replay_log=current_replay_log())
     hub.publish({"directory": "/repo", "payload": {"type": "session.updated", "properties": {}}})
     assert "/repo" not in hub.qp_last_activity
 
@@ -163,7 +165,7 @@ def test_hub_observer_retains_non_qp_directory_after_pending_flush():
         now=lambda: 100.0,
         jitter=lambda: 1.0,
     )
-    hub = GlobalHub(None)
+    hub = GlobalHub(None, replay_log=current_replay_log())
     hub.set_directory_observer(shadow.observe_directory)
 
     hub.publish(
@@ -185,7 +187,7 @@ def test_hub_observer_retains_non_qp_directory_after_pending_flush():
 
 
 def test_hub_directory_observer_exception_does_not_break_publish():
-    hub = GlobalHub(None)
+    hub = GlobalHub(None, replay_log=current_replay_log())
 
     def broken_observer(directory: str) -> None:
         raise RuntimeError(f"observer failed for {directory}")
@@ -205,7 +207,7 @@ def test_hub_directory_observer_exception_does_not_break_publish():
 
 def test_missing_directory_is_not_sent_to_hub_observer():
     observed: list[str] = []
-    hub = GlobalHub(None)
+    hub = GlobalHub(None, replay_log=current_replay_log())
     hub.set_directory_observer(observed.append)
 
     for directory in (None, ""):
@@ -322,7 +324,7 @@ def test_observing_new_directory_wakes_scheduler():
 
 
 def test_other_immediate_hub_event_does_not_update_qp_activity():
-    hub = GlobalHub(None)
+    hub = GlobalHub(None, replay_log=current_replay_log())
     hub.publish({"directory": "/repo", "payload": {"type": "server.connected", "properties": {}}})
     assert "/repo" not in hub.qp_last_activity
 

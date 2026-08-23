@@ -20,6 +20,8 @@ Plan: docs/ocmar/plans/2026-08-21-audit-fix-batch1.md §泳道 L1-4.
 
 from __future__ import annotations
 
+from conftest import current_replay_log
+
 import asyncio
 
 from oc_slimapi.qp_sweep import QpSweepShadow
@@ -36,7 +38,7 @@ def test_dual_write_points_share_one_bounded_table(monkeypatch):
     """F-015: hub-side and sweep-side writes hit the SAME table; the cap
     holds regardless of which side grew it, evicting oldest-first."""
     monkeypatch.setattr(hub_types, "QP_LAST_ACTIVITY_MAX", 5)
-    hub = GlobalHub(None)
+    hub = GlobalHub(None, replay_log=current_replay_log())
     sweep = QpSweepShadow(activity=hub.qp_last_activity, interval_seconds=1.0)
     assert sweep.activity is hub.qp_last_activity
 

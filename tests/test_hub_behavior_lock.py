@@ -16,8 +16,8 @@ or ``tests/test_hub.py``. Locks the boundaries called out in the Batch 2 spec:
   4. subscriber admission: per-directory/total caps -> 503
      ``sse_subscriber_limit_directory``/``_total`` (limit/current/Retry-After)
   5. unsubscribe/close lifecycle (no task leak)
-  6. backpressure: buffer overflow -> immediate clear + resync{subscriber_backpressure}
-     + STOP (old frames NOT delivered)
+  6. backpressure: buffer overflow -> immediate clear + STOP
+     (old frames NOT delivered)
   7. registry metrics (subscribers / queue / hub summary shape + counters)
 
 Reference: ``docs/specs/v1-contract.md`` §3 (SSE) + §6 (T3 resource limits).
@@ -44,6 +44,8 @@ alignment; do not over-specify beyond these keys)::
 """
 
 from __future__ import annotations
+
+from conftest import current_replay_log
 
 import asyncio
 import contextlib
@@ -153,7 +155,7 @@ async def _teardown_hub(hub: GlobalHub) -> None:
 @pytest.fixture
 async def hub():
     """Bare GlobalHub(client=None); teardown cancels all background tasks."""
-    h = GlobalHub(client=None)
+    h = GlobalHub(client=None, replay_log=current_replay_log())
     try:
         yield h
     finally:
@@ -414,7 +416,7 @@ class TestDigestAccumulation:
         debounce-merge behavior is already locked by
         ``test_status_and_message_merge_into_single_digest`` and siblings
         (which call ``flush()`` explicitly with no sleep)."""
-        hub = GlobalHub(client=None)
+        hub = GlobalHub(client=None, replay_log=current_replay_log())
         try:
             sub = hub.subscribe()  # starts flush_loop + heartbeat_loop + run
 
@@ -1026,6 +1028,7 @@ class TestAdmission:
     async def test_per_directory_cap_raises_with_code_limit_current(self):
         registry = HubRegistry(
             client=None,
+            replay_log=current_replay_log(),
             max_subscribers_per_directory=2,
             max_total_subscribers=10,
         )
@@ -1045,6 +1048,7 @@ class TestAdmission:
     async def test_total_cap_raises_with_code_limit_current(self):
         registry = HubRegistry(
             client=None,
+            replay_log=current_replay_log(),
             max_subscribers_per_directory=10,
             max_total_subscribers=2,
         )
@@ -1062,8 +1066,10 @@ class TestAdmission:
             await registry.close()
 
     async def test_rejected_total_accumulates_across_multiple_rejections(self):
+        replay_log = current_replay_log()
         registry = HubRegistry(
             client=None,
+            replay_log=replay_log,
             max_subscribers_per_directory=1,
             max_total_subscribers=10,
         )
@@ -1077,8 +1083,10 @@ class TestAdmission:
             await registry.close()
 
     async def test_rejection_does_not_increment_total_subscribers(self):
+        replay_log = current_replay_log()
         registry = HubRegistry(
             client=None,
+            replay_log=replay_log,
             max_subscribers_per_directory=1,
             max_total_subscribers=10,
         )
@@ -1095,6 +1103,7 @@ class TestAdmission:
         """When both caps would be exceeded, per-directory wins (checked first)."""
         registry = HubRegistry(
             client=None,
+            replay_log=current_replay_log(),
             max_subscribers_per_directory=1,
             max_total_subscribers=1,
         )
@@ -1109,6 +1118,7 @@ class TestAdmission:
     async def test_slot_freed_after_unsubscribe_can_be_reused(self):
         registry = HubRegistry(
             client=None,
+            replay_log=current_replay_log(),
             max_subscribers_per_directory=1,
             max_total_subscribers=10,
         )
@@ -1122,7 +1132,7 @@ class TestAdmission:
             await registry.close()
 
     async def test_subscriber_id_is_unique_and_prefixed(self):
-        registry = HubRegistry(client=None)
+        registry = HubRegistry(client=None, replay_log=current_replay_log())
         try:
             s1 = registry.subscribe()
             s2 = registry.subscribe()
@@ -1139,8 +1149,10 @@ class TestAdmission:
 
         from oc_slimapi.routes.events import events
 
+        replay_log = current_replay_log()
         registry = HubRegistry(
             client=None,
+            replay_log=replay_log,
             max_subscribers_per_directory=1,
             max_total_subscribers=10,
         )
@@ -1148,7 +1160,9 @@ class TestAdmission:
             registry.subscribe()  # fill the single slot
             request = type("Req", (), {})()
             request.app = type("App", (), {})()
-            request.app.state = type("State", (), {"hubs": registry})()
+            request.app.state = type(
+                "State", (), {"hubs": registry, "replay_log": replay_log}
+            )()
             request.headers = {}
             response = await events(request)
             assert response.status_code == 503
@@ -1165,8 +1179,10 @@ class TestAdmission:
 
         from oc_slimapi.routes.events import events
 
+        replay_log = current_replay_log()
         registry = HubRegistry(
             client=None,
+            replay_log=replay_log,
             max_subscribers_per_directory=10,
             max_total_subscribers=1,
         )
@@ -1174,7 +1190,9 @@ class TestAdmission:
             registry.subscribe()  # fill the single total slot
             request = type("Req", (), {})()
             request.app = type("App", (), {})()
-            request.app.state = type("State", (), {"hubs": registry})()
+            request.app.state = type(
+                "State", (), {"hubs": registry, "replay_log": replay_log}
+            )()
             request.headers = {}
             response = await events(request)
             assert response.status_code == 503
@@ -1193,7 +1211,7 @@ class TestLifecycle:
     background tasks are cancelled+awaited, hub reference is released."""
 
     async def test_close_with_no_hub_is_safe(self):
-        registry = HubRegistry(client=None)
+        registry = HubRegistry(client=None, replay_log=current_replay_log())
         await registry.close()  # must not raise
         assert registry.total_subscribers == 0
         # Public observable for "_global is None": no hub surfaces in the
@@ -1201,7 +1219,7 @@ class TestLifecycle:
         assert registry.snapshot_metrics()["sse"]["hubs"] == []
 
     async def test_close_resets_total_subscribers_to_zero(self):
-        registry = HubRegistry(client=None)
+        registry = HubRegistry(client=None, replay_log=current_replay_log())
         try:
             registry.subscribe()
             registry.subscribe()
@@ -1217,7 +1235,7 @@ class TestLifecycle:
         (metrics show no hub; every previously-live task is done) rather than
         the private ``_removal_task`` handle, so a split that renames it cannot
         regress this unnoticed."""
-        registry = HubRegistry(client=None)
+        registry = HubRegistry(client=None, replay_log=current_replay_log())
         me = asyncio.current_task()
         live: set[asyncio.Task] = set()
         try:
@@ -1239,6 +1257,7 @@ class TestLifecycle:
         (would otherwise over-admit later)."""
         registry = HubRegistry(
             client=None,
+            replay_log=current_replay_log(),
             max_subscribers_per_directory=2,
             max_total_subscribers=10,
         )
@@ -1257,7 +1276,7 @@ class TestLifecycle:
 
     async def test_unsubscribe_when_no_hub_is_safe(self):
         """unsubscribe on a registry with no hub yet created is a no-op."""
-        registry = HubRegistry(client=None)
+        registry = HubRegistry(client=None, replay_log=current_replay_log())
         registry.unsubscribe(Subscriber())
         assert registry.total_subscribers == 0
         assert registry.snapshot_metrics()["sse"]["hubs"] == []
@@ -1265,7 +1284,7 @@ class TestLifecycle:
 
     async def test_global_hub_shared_across_get_calls_regardless_of_directory(self):
         """get(directory) ignores the directory key — one process-wide hub."""
-        registry = HubRegistry(client=None)
+        registry = HubRegistry(client=None, replay_log=current_replay_log())
         try:
             h1 = registry.get("/a")
             h2 = registry.get("/b")
@@ -1281,7 +1300,7 @@ class TestLifecycle:
 
         Locks only the public identity behavior (``hub1 is hub2``); we
         intentionally do NOT assert on the private ``_removal_task`` handle."""
-        registry = HubRegistry(client=None)
+        registry = HubRegistry(client=None, replay_log=current_replay_log())
         try:
             s1 = registry.subscribe()
             hub1 = registry.get_global()
@@ -1296,7 +1315,7 @@ class TestLifecycle:
             await registry.close()
 
     async def test_repeated_subscribe_unsubscribe_cycles_do_not_leak_counter(self):
-        registry = HubRegistry(client=None)
+        registry = HubRegistry(client=None, replay_log=current_replay_log())
         try:
             for _ in range(10):
                 s = registry.subscribe()
@@ -1312,7 +1331,7 @@ class TestLifecycle:
         every one of them is done afterwards, plus the registry reports no
         hub via the public metrics snapshot. Field-layout-agnostic: a split
         that renames the hub's task attributes cannot regress this."""
-        registry = HubRegistry(client=None)
+        registry = HubRegistry(client=None, replay_log=current_replay_log())
         me = asyncio.current_task()
         live: set[asyncio.Task] = set()
         try:
@@ -1329,12 +1348,9 @@ class TestLifecycle:
         # And the registry holds no live hub (public observable).
         assert registry.snapshot_metrics()["sse"]["hubs"] == []
 
-    async def test_global_hub_subscribe_emits_server_connected_first(self, hub):
+    async def test_global_hub_subscribe_has_no_connection_local_welcome(self, hub):
         sub = hub.subscribe()
-        first = await asyncio.wait_for(sub.queue.get(), timeout=0.2)
-        ev_name, data = parse(first)
-        assert ev_name == "server.connected"
-        assert data == {}
+        assert sub.queue.empty()
 
     async def test_global_hub_subscribe_starts_background_tasks(self, hub):
         """subscribe() spawns all three hub background loops (run, flush,
@@ -1365,16 +1381,16 @@ class TestLifecycle:
 
 
 # ===========================================================================
-# Section 6: backpressure (buffer overflow -> clear + resync + STOP)
+# Section 6: backpressure (buffer overflow -> clear + STOP)
 # ===========================================================================
 
 class TestBackpressure:
     """T3 hardening (contract §6): overflow -> immediate disconnect, queue
-    cleared, single resync{subscriber_backpressure} + STOP enqueued."""
+    cleared, and STOP enqueued."""
 
-    async def test_queue_items_overflow_clears_and_emits_resync_then_stop(self):
+    async def test_queue_items_overflow_clears_and_emits_stop(self):
         """Third put on a queue_items=2 subscriber triggers immediate clear +
-        resync{subscriber_backpressure} + STOP. Old frames NOT delivered."""
+        STOP. Old frames are not delivered."""
         sub = Subscriber(queue_items=2, buffer_bytes=4096, max_frame_bytes=4096)
         a = sse_frame({"seq": "a"}, event="t")
         b = sse_frame({"seq": "b"}, event="t")
@@ -1394,16 +1410,10 @@ class TestBackpressure:
                 items.append(sub.queue.get_nowait())
             except asyncio.QueueEmpty:
                 break
-        assert len(items) == 2  # resync + STOP
-        assert items[-1] is STOP
-        resync = items[0]
-        assert b"event: resync" in resync
-        # orjson emits no space after the colon; assert on the unambiguous
-        # substring so the test is robust to JSON formatting choices.
-        assert b"subscriber_backpressure" in resync
+        assert items == [STOP]
 
         # Critical (contract §6): old frames NOT still on the queue.
-        joined = b"".join(i for i in items[:-1] if isinstance(i, (bytes, bytearray)))
+        joined = b"".join(i for i in items if isinstance(i, (bytes, bytearray)))
         assert b'"seq": "a"' not in joined
         assert b'"seq": "b"' not in joined
         assert b'"seq": "c"' not in joined
@@ -1449,8 +1459,8 @@ class TestBackpressure:
         sub.put(sse_frame({"i": 3}, event="t"))  # overflow -> closed
         assert sub.closed
         assert sub.put(sse_frame({"i": 4}, event="t")) is False
-        # Queue holds only resync + STOP from the overflow path.
-        assert sub.queue.qsize() == 2
+        # Queue holds only STOP from the overflow path.
+        assert sub.queue.qsize() == 1
 
     async def test_stop_sentinel_not_counted_in_byte_ledger(self):
         sub = Subscriber(queue_items=4, buffer_bytes=4096, max_frame_bytes=4096)
@@ -1488,26 +1498,13 @@ class TestBackpressure:
         sub.ack(sse_frame({"x": 1}, event="t"))  # no prior put
         assert sub.queued_bytes == 0
 
-    async def test_overflow_resync_payload_exact_shape(self):
-        """Lock the exact wire shape of the subscriber_backpressure resync,
-        and that STOP is enqueued alongside it.
-
-        Contract §6 (line 165/280): on overflow the cleared queue must hold
-        BOTH ``resync{subscriber_backpressure}`` AND ``STOP`` simultaneously,
-        so the overflow-clear path can only be exercised with
-        ``queue_items >= 2`` (config rejects ``sse_queue_items < 2``). The
-        previous form used ``queue_items=1``, which silently dropped STOP via
-        the ``suppress(QueueFull)`` in ``put`` — a contract-illegal input."""
+    async def test_overflow_queue_exact_shape(self):
+        """The cleared queue contains only STOP, with no synthetic wire frame."""
         sub = Subscriber(queue_items=2, buffer_bytes=4096, max_frame_bytes=4096)
         sub.put(sse_frame({"i": 1}, event="t"))
         sub.put(sse_frame({"i": 2}, event="t"))  # fills both slots
         assert sub.put(sse_frame({"i": 3}, event="t")) is False  # overflow -> clear
 
-        resync = sub.queue.get_nowait()  # first item after clear
-        ev_name, data = parse(resync)
-        assert ev_name == "resync"
-        assert data == {"reason": "subscriber_backpressure"}
-        # Contract §6: STOP must also have been enqueued (fits because queue_items>=2).
         assert sub.queue.get_nowait() is STOP
         assert sub.queue.qsize() == 0
 
@@ -1559,7 +1556,7 @@ class TestBackpressure:
         hub, sub = pair
         # Attach a tiny-capacity subscriber already at capacity.
         full = Subscriber(queue_items=1, buffer_bytes=4096, max_frame_bytes=4096)
-        full.put(sse_frame({}, event="server.connected"))  # fill the 1 slot
+        full.put(sse_frame({}, event="test.fill"))  # fill the 1 slot
         hub.subscribers.add(full)
         try:
             before = hub.emitted_frames_total
@@ -1583,7 +1580,7 @@ class TestMetrics:
     subscribers / hubs / clients subtrees."""
 
     async def test_snapshot_shape_strict(self):
-        registry = HubRegistry(client=None)
+        registry = HubRegistry(client=None, replay_log=current_replay_log())
         try:
             sub = registry.subscribe()
             snap = registry.snapshot_metrics()
@@ -1624,7 +1621,7 @@ class TestMetrics:
             await registry.close()
 
     async def test_snapshot_no_hub_returns_empty_arrays(self):
-        registry = HubRegistry(client=None)
+        registry = HubRegistry(client=None, replay_log=current_replay_log())
         try:
             snap = registry.snapshot_metrics()
             assert snap["sse"]["hubs"] == []
@@ -1641,7 +1638,7 @@ class TestMetrics:
             await registry.close()
 
     async def test_snapshot_hub_counters_initial_zero(self):
-        registry = HubRegistry(client=None)
+        registry = HubRegistry(client=None, replay_log=current_replay_log())
         try:
             registry.subscribe()
             hub = snap_hub(registry.snapshot_metrics())[0]
@@ -1653,16 +1650,14 @@ class TestMetrics:
         finally:
             await registry.close()
 
-    async def test_snapshot_welcome_frame_accounted_in_client_queue(self):
-        """Immediately after subscribe(), the welcome frame sits on the queue;
-        queueItems=1, bufferBytes=len(welcome), counters zero."""
-        registry = HubRegistry(client=None)
+    async def test_snapshot_native_subscribe_has_empty_client_queue(self):
+        """Native v4 subscribe does not enqueue a connection-local welcome."""
+        registry = HubRegistry(client=None, replay_log=current_replay_log())
         try:
             sub = registry.subscribe()
-            welcome = sse_frame({}, event="server.connected")
             client = snap_client(registry.snapshot_metrics())[0]
-            assert client["queueItems"] == 1
-            assert client["bufferBytes"] == len(welcome)
+            assert client["queueItems"] == 0
+            assert client["bufferBytes"] == 0
             assert client["droppedFramesTotal"] == 0
             assert client["forcedDisconnectsTotal"] == 0
             assert client["subscriberId"] == sub.id
@@ -1670,13 +1665,10 @@ class TestMetrics:
             await registry.close()
 
     async def test_snapshot_publish_and_flush_increment_hub_counters(self):
-        registry = HubRegistry(client=None)
+        registry = HubRegistry(client=None, replay_log=current_replay_log())
         try:
             sub = registry.subscribe()
             hub = registry.get_global()
-            # Drain welcome so it doesn't sit on the queue.
-            welcome = await sub.queue.get()
-            sub.ack(welcome)
 
             hub.publish(ev("/p", "session.status", {"sessionID": "s1", "status": "busy"}))
             hub.flush()
@@ -1694,11 +1686,10 @@ class TestMetrics:
     async def test_snapshot_question_event_increments_counters_immediately(self):
         """question.* fans out immediately (no debounce) and bumps
         emitted_frames_total by len(subscribers)."""
-        registry = HubRegistry(client=None)
+        registry = HubRegistry(client=None, replay_log=current_replay_log())
         try:
             sub = registry.subscribe()
             hub = registry.get_global()
-            await sub.queue.get()  # drain welcome
 
             hub.publish(ev("/p", "question.asked", {"id": "q1"}))
             hub_entry = snap_hub(registry.snapshot_metrics())[0]
@@ -1710,6 +1701,7 @@ class TestMetrics:
     async def test_snapshot_rejected_total_reflected(self):
         registry = HubRegistry(
             client=None,
+            replay_log=current_replay_log(),
             max_subscribers_per_directory=1,
             max_total_subscribers=10,
         )
@@ -1724,7 +1716,7 @@ class TestMetrics:
             await registry.close()
 
     async def test_snapshot_client_dropped_and_forced_counters_reflect_put_outcomes(self):
-        registry = HubRegistry(client=None)
+        registry = HubRegistry(client=None, replay_log=current_replay_log())
         try:
             sub = registry.subscribe()
             # Swap in a tiny-capacity subscriber so we can exercise both the
@@ -1763,7 +1755,7 @@ class TestMetrics:
         after Batch2 routes the skeleton through ``pool.snapshot_metrics()``,
         because the observable ``activeTransforms``/``waitingTransforms`` are
         unchanged. That makes this a behavior-preserving-split lock."""
-        registry = HubRegistry(client=None)
+        registry = HubRegistry(client=None, replay_log=current_replay_log())
         pool = TransformPool(TransformConfig(
             max_transforms=1, transform_wait_seconds=1.0, max_response_bytes=4096,
         ))
@@ -1791,7 +1783,7 @@ class TestMetrics:
         ``snapshot_metrics``, so the spy counter stays 0 → assertion fails →
         xfail. Once Batch2 routes through the public API, the spy is invoked
         → XPASS (then this mark is removed)."""
-        registry = HubRegistry(client=None)
+        registry = HubRegistry(client=None, replay_log=current_replay_log())
         pool = TransformPool(TransformConfig(
             max_transforms=2, transform_wait_seconds=1.0, max_response_bytes=4096,
         ))
@@ -1823,7 +1815,7 @@ class TestMetrics:
             pool.shutdown()
 
     async def test_snapshot_multiple_subscribers_all_listed_as_clients(self):
-        registry = HubRegistry(client=None)
+        registry = HubRegistry(client=None, replay_log=current_replay_log())
         try:
             s1 = registry.subscribe()
             s2 = registry.subscribe()

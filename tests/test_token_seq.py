@@ -19,8 +19,8 @@ e. 🔴 fail-closed — resync publish failure after the eviction cleared
    state terminates EVERY subscriber of the sid (+ best-effort barrier);
 f. route-private four-value resyncs stay id-less / un-logged / seq-free
    (the two reason sets are disjoint by construction);
-g. v3 subscribers consume seq-bearing frames (payload field present, no
-   id line) and keep receiving the token_memory_limit frame;
+g. native subscribers consume replay-id-stamped seq-bearing frames and
+   keep receiving the token_memory_limit frame;
 h. same-epoch reconnect: the domain seq ledger continues (no reset).
 
 R2 gate (round-4) additions:
@@ -136,12 +136,6 @@ def _seq_of(id_: str) -> int:
 
 
 def _v4_sub(th: TokenStreamHub, sid: str = SID) -> TokenSubscriber:
-    sub = TokenSubscriber(session_id=sid, metrics=th._metrics)
-    th.attach_subscriber(sid, sub, wire_v4=True)
-    return sub
-
-
-def _v3_sub(th: TokenStreamHub, sid: str = SID) -> TokenSubscriber:
     sub = TokenSubscriber(session_id=sid, metrics=th._metrics)
     th.attach_subscriber(sid, sub)
     return sub
@@ -345,7 +339,7 @@ async def test_failclosed_resync_failure_terminates_sid_subscribers(monkeypatch)
     th = TokenStreamHub(replay_log=log)
     sub1 = _v4_sub(th)
     sub2 = TokenSubscriber(session_id=SID, metrics=th._metrics)
-    th.attach_subscriber(SID, sub2, wire_v4=True)
+    th.attach_subscriber(SID, sub2)
     try:
         th.on_part_updated(_text_start(SID, "mA", "p1"))
         th.on_part_delta(_delta(SID, "mA", "p1", "a"))
@@ -431,54 +425,6 @@ async def test_route_private_resyncs_stay_idless_unlogged_seqfree():
         assert REPLAYABLE_RESYNC_REASONS & V4_RESYNC_REASONS == frozenset()
         with pytest.raises(ValueError):
             th._fanout_replayable_resync(SID, RESYNC_REPLAY_GAP)
-    finally:
-        th.detach_subscriber(SID, sub)
-        th.stop()
-
-
-# ---------------------------------------------------------------------------
-# g. v3 subscribers — payload seq visible, behavior unchanged
-# ---------------------------------------------------------------------------
-
-async def test_v3_subscriber_consumes_seq_bearing_frames(monkeypatch):
-    log = ReplayLog(epoch=EPOCH)
-    th = TokenStreamHub(replay_log=log)
-    sub = _v3_sub(th)
-    try:
-        th.on_part_updated(_text_start(SID, "m1", "p1"))
-        th.on_part_delta(_delta(SID, "m1", "p1", "aa"))
-        th.flush()  # seq 1
-        items = _drain(sub)
-        # v3 wire: no id line, but the additive payload seq field is there
-        delta_items = [i for i in items if isinstance(i, bytes)
-                       and i.startswith(b"event: message.part.delta")]
-        assert len(delta_items) == 1
-        event, data = _parse(delta_items[0])
-        assert data["seq"] == 1
-        assert data["text"] == "aa"
-        assert "partEventRevision" in data
-
-        # v3 keeps receiving the token_memory_limit frame (raw, seq field)
-        monkeypatch.setattr(
-            "oc_slimapi.sse.tokenstream.budgets.TOKEN_LIVEPARTS_MAX_BYTES", 1,
-        )
-        th.on_part_updated(_text_start(SID, "mB", "p1"))  # evicts m1/p1
-        th.on_part_delta(_delta(SID, "mB", "p1", "b"))
-        monkeypatch.undo()
-        th.flush()
-        after = _drain(sub)
-        resync_items = [i for i in after if isinstance(i, bytes)
-                        and i.startswith(b"event: resync")]
-        assert len(resync_items) == 1
-        assert not resync_items[0].startswith(b"id: ")
-        event, data = _parse(resync_items[0])
-        assert event == "resync"
-        assert data == {
-            "reason": "token_memory_limit", "sessionID": SID, "seq": 2,
-        }
-        # the v3 stream continues after the eviction (B delta seq 3)
-        deltas = _delta_frames(after)
-        assert [d["seq"] for _, d in deltas] == [3]
     finally:
         th.detach_subscriber(SID, sub)
         th.stop()
@@ -687,9 +633,9 @@ async def test_eviction_matrix_midstream_pending_tail_discarded(monkeypatch):
 
 
 async def test_eviction_matrix_after_textend_plugin_rewrite(monkeypatch):
-    """矩阵③text-end 插件改写后驱逐：终态全文（插件改写后）**从不上
-    v4 wire**——done marker 为 v3-only 无 seq（lever 1：权威全文走 REST），
-    wire 只见积累 delta；其后另一 part 被驱逐 → resync，seq 域连续、
+    """矩阵③text-end 插件改写后驱逐：插件改写后的终态全文由 REST
+    提供权威对齐，token wire 只见积累 delta；其后另一 part 被驱逐 →
+    resync，seq 域连续、
     已完成 part 不受扰、被逐 part 无后续流帧。
     （旋钮注：用 count cap 驱逐——byte cap=1 会让首个 delta 在 ingest
     即自逐该 part，测不到「完成后另一 part 被逐」场景。）"""
@@ -703,8 +649,7 @@ async def test_eviction_matrix_after_textend_plugin_rewrite(monkeypatch):
         th.on_part_updated(_text_start(SID, "mA", "p1"))
         th.on_part_delta(_delta(SID, "mA", "p1", "pre"))    # 流上积累文本
         # text-end（插件改写终态 "REWRITTEN"）：finish_part 同步 drain
-        # residual "pre" → delta seq 1；done marker v3-only（无 seq、不入
-        # 日志、不上 v4 wire）；A retire。
+        # residual "pre" → delta seq 1；终态全文不上 token wire；A retire。
         th.on_part_updated(_text_end(SID, "mA", "p1", "REWRITTEN"))
         th.on_part_updated(_text_start(SID, "mB", "p1"))
         th.on_part_delta(_delta(SID, "mB", "p1", "b"))
@@ -784,4 +729,3 @@ async def test_eviction_matrix_before_client_connect(monkeypatch):
         th.detach_subscriber(SID, sub)
     finally:
         th.stop()
-

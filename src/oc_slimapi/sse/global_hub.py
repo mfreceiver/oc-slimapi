@@ -98,7 +98,7 @@ class GlobalHub:
         traffic_ledger: "TrafficLedger | None" = None,
         turn_registry: "TurnRegistry | None" = None,
         directory_allowlist: list[str] | None = None,
-        replay_log: "ReplayLog | None" = None,
+        replay_log: "ReplayLog",
     ):
         self.client = client
         self.subscribers: set[Subscriber] = set()
@@ -107,17 +107,14 @@ class GlobalHub:
         self.max_frame_bytes = max_frame_bytes
         self._traffic_ledger = traffic_ledger
         self.directory_allowlist = directory_allowlist
-        # B3b-2 (v4 SSE replay): the process-wide bounded ring replay log
-        # (app.state.replay_log, forwarded through HubRegistry so the
-        # lazily-created hub gets it too). ``None`` = v3-only stack (no
-        # logging, no id stamping — byte-identical v3 behaviour). When
-        # wired, EVERY published global business frame (IMMEDIATE q/p,
+        # The lifespan-owned process-wide bounded replay log is a required
+        # dependency, forwarded through HubRegistry so the lazily-created hub
+        # gets the same ring. EVERY published global business frame (IMMEDIATE q/p,
         # session.digest, session.error) is recorded in the GLOBAL domain
         # ("已发布帧" semantics — logged even with zero v4 / zero live
         # subscribers, so a reconnecting client can replay what it missed
-        # while disconnected); per-subscriber delivery then prefixes the
-        # ``id:`` line for wire_v4 subscribers only (v3 subscribers keep
-        # id-less bytes).
+        # while disconnected). Successful append prefixes the ``id:`` line;
+        # append failure keeps the warning + id-less live fallback.
         self._replay = replay_log
         # Turn token fence (S9 ingest-time snapshot stamp). Injected from
         # app.py via set_turn_registry(); ``None`` → no stamping (fields
@@ -287,7 +284,7 @@ class GlobalHub:
         (:meth:`TokenStreamRegistry.subscribe`) can guarantee the single
         ``/global/event`` connection is live before attaching a token
         subscriber — WITHOUT adding a control-plane subscriber or emitting a
-        ``server.connected`` frame (design §5.2: token subscribe must
+        connection-local wire frame (design §5.2: token subscribe must call
         ``registry.get_global().ensure_upstream()``). Idempotent: a no-op
         when the tasks are already running, and cancels any armed
         ``stop_after_grace`` so a fresh consumer does not get torn down by a
@@ -558,21 +555,13 @@ class GlobalHub:
                 self.ensure_upstream()
         return _on_done
 
-    def subscribe(self, welcome: bool = True) -> Subscriber:
-        """Admit a subscriber; ``welcome=False`` skips the connection-local
-        ``server.connected`` frame (rev-gate BLOCKER-1 / condition 5: on v4
-        the frame is suppressed — it is not in the frozen no-``id:`` control
-        set (meta/resync/heartbeat) and connection-local frames must not
-        bypass the replay log. v3 callers keep the default ``True`` —
-        byte-identical unchanged)."""
+    def subscribe(self) -> Subscriber:
+        """Admit a subscriber to the native-v4 global stream."""
         subscriber = Subscriber(
             queue_items=self.queue_items,
             buffer_bytes=self.buffer_bytes,
             max_frame_bytes=self.max_frame_bytes,
         )
-        # Welcome frame first so the client sees it before any digest/heartbeat.
-        if welcome:
-            subscriber.put(sse_frame({}, event="server.connected"))
         self.subscribers.add(subscriber)
         self.ensure_upstream()
         logger.info("sse subscriber attach", extra={"subscriber_id": subscriber.id})
@@ -654,11 +643,10 @@ class GlobalHub:
         pre-replay behaviour (resync fanout only) with a warning.
         """
         self.resync_all()
-        if self._replay is not None:
-            try:
-                self._replay.write_barrier()
-            except Exception:
-                logger.warning("replay barrier write failed", exc_info=True)
+        try:
+            self._replay.write_barrier()
+        except Exception:
+            logger.warning("replay barrier write failed", exc_info=True)
         if self._token_hub is not None:
             self._token_hub.on_upstream_reconnect()
         # 4.10.1 (B): best-effort epoch-invalidation hooks (catalog TTL
@@ -714,17 +702,16 @@ class GlobalHub:
             self.resync_all()
         except Exception:
             logger.warning("idle-recycle resync_all failed", exc_info=True)
-        if self._replay is not None:
-            try:
-                self._replay.write_barrier()
-            except Exception:
-                # m3: fail-open by design (see docstring) — but the
-                # reopened silent-loss gap warrants operator visibility.
-                logger.error(
-                    "idle-recycle replay barrier write FAILED — "
-                    "pre-teardown cursors may see silently-empty "
-                    "up_to_date replays (gap reopened)"
-                )
+        try:
+            self._replay.write_barrier()
+        except Exception:
+            # m3: fail-open by design (see docstring) — but the reopened
+            # silent-loss gap warrants operator visibility.
+            logger.error(
+                "idle-recycle replay barrier write FAILED — "
+                "pre-teardown cursors may see silently-empty "
+                "up_to_date replays (gap reopened)"
+            )
         if self._token_hub is not None:
             try:
                 self._token_hub.on_upstream_reconnect()
@@ -855,17 +842,6 @@ class GlobalHub:
         # takes effect on the next config change (documented ops semantic).
         clear_allowlist_roots_cache()
 
-    def set_replay_log(self, replay_log: "ReplayLog | None") -> None:
-        """Wire the process-wide :class:`ReplayLog` (B3b-2).
-
-        Mirrors :meth:`set_token_hub`: ``HubRegistry`` owns the canonical
-        reference (``app.state.replay_log``, constructed in lifespan) and
-        pushes it onto the live GlobalHub and any hub constructed later
-        via ``HubRegistry.get``. ``None`` = v3-only stack (no logging, no
-        id stamping — accepted for tests / detach).
-        """
-        self._replay = replay_log
-
     def _replay_publish(self, frame: bytes) -> bytes | None:
         """Record one published global business frame in the replay log.
 
@@ -881,15 +857,12 @@ class GlobalHub:
         帧" semantics — REPLAY-007/018: frames published while a client
         was backpressured or fully offline must be replayable).
         """
-        replay = self._replay
-        if replay is None:
-            return None
         try:
-            entry = replay.append(GLOBAL_DOMAIN, frame)
+            entry = self._replay.append(GLOBAL_DOMAIN, frame)
         except Exception:
             logger.warning("replay log append failed", exc_info=True)
             return None
-        return sse_id_line(GLOBAL_DOMAIN, replay.epoch, entry.seq)
+        return sse_id_line(GLOBAL_DOMAIN, self._replay.epoch, entry.seq)
 
     def _directory_allowed(self, directory: Any) -> bool:
         allowlist = self.directory_allowlist
@@ -907,13 +880,11 @@ class GlobalHub:
         if not self._directory_allowed(directory):
             self.allowlist_dropped_events += 1
             return
-        # B3b-2: log the published frame (global domain) and — only for
-        # wire_v4 subscribers — deliver the id-prefixed bytes. v3
-        # subscribers keep receiving the frame VERBATIM (zero-change iron
-        # rule: the id line exists solely in the v4 subscriber's copy).
+        # Successful append delivers id-prefixed bytes. Append failure keeps
+        # the warning + id-less live fallback.
         id_line = self._replay_publish(frame)
         for subscriber in tuple(self.subscribers):
-            if id_line is not None and subscriber.wire_v4:
+            if id_line is not None:
                 subscriber.put(id_line + frame)
             else:
                 subscriber.put(frame)
@@ -924,13 +895,11 @@ class GlobalHub:
         """rev-ogpt MAJOR 4 (3rd-round terminal audit): enforce FIFO cap +
         TTL on the ``_retired_messages`` gate.
 
-        Mirrors :meth:`TokenStreamHub._prune_removed_messages` so the
-        GlobalHub gate and the token-hub replay queue share identical
-        lifetime semantics (``TOKEN_REMOVED_MESSAGES_MAX`` FIFO cap +
-        ``TOKEN_REMOVED_MESSAGES_TTL_MS`` TTL). Without this alignment the
-        GlobalHub gate was a plain ``set`` that leaked unbounded across
-        long-running processes (only ``session.deleted`` and
-        ``resync_all`` cleared it).
+        The gate uses the token-domain retirement bounds
+        (``TOKEN_REMOVED_MESSAGES_MAX`` FIFO cap +
+        ``TOKEN_REMOVED_MESSAGES_TTL_MS`` TTL). Without those bounds the
+        GlobalHub gate would leak across long-running processes (only
+        ``session.deleted`` and ``resync_all`` otherwise clear it).
 
         Called on-insert (from :meth:`publish` ``message.removed`` branch)
         and opportunistically from :meth:`flush` so the TTL is enforced

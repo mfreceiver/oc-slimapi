@@ -8,6 +8,7 @@ from oc_slimapi.config import Settings
 from oc_slimapi.errors import CodedHTTPException, register_error_handlers
 from oc_slimapi.routes import messages, sessions
 from oc_slimapi.proxy import install_proxy
+from oc_slimapi.selector import SlimapiSelectorMiddleware
 
 
 def _settings() -> Settings:
@@ -16,7 +17,7 @@ def _settings() -> Settings:
         max_message_bytes=32 * 1024 * 1024,
         max_transforms=1, transform_wait_seconds=0.5, max_response_bytes=64 * 1024,
         smoke_session_id=None,
-        server_api_version=1, accepted_client_versions=(1, 1),
+        server_api_version=4, accepted_client_versions=(4, 4),
     )
 
 
@@ -26,9 +27,8 @@ def _build_app(upstream: httpx.AsyncClient) -> FastAPI:
     app.state.upstream = upstream
     app.state.schema_degraded = False
     app.include_router(sessions.router)
-    # messages router is needed for the directory query/header conflict path,
-    # which is the surviving source of ``directory_not_allowed`` on the
-    # slimapi surface after the allowlist gate was removed.
+    # messages router is needed for the selector's directory query/header
+    # conflict path.
     from oc_slimapi.transform import TransformConfig, TransformPool
     app.state.transforms = TransformPool(TransformConfig(
         max_transforms=1, transform_wait_seconds=0.5, max_response_bytes=64 * 1024,
@@ -36,6 +36,7 @@ def _build_app(upstream: httpx.AsyncClient) -> FastAPI:
     app.include_router(messages.router)
     register_error_handlers(app)
     install_proxy(app)
+    app.add_middleware(SlimapiSelectorMiddleware)
     return app
 
 
@@ -55,13 +56,7 @@ async def test_coded_exception_renders_code_body():
 
 
 async def test_directory_conflict_renders_code(upstream_factory):
-    """query directory ≠ X-Opencode-Directory header → 400 directory_not_allowed.
-
-    slimapi no longer runs an allowlist gate on directories, but it still
-    refuses a structurally-ambiguous query/header combo with the same
-    ``directory_not_allowed`` code; that path is the surviving source of
-    the code on the slimapi surface and is what the registered error
-    handler renders into ``{"code": ...}`` here."""
+    """v4 selector rejects differing query/header directories as a conflict."""
     def handler(request: httpx.Request) -> httpx.Response:
         # The conflict is detected before any upstream call, so this handler
         # should never be reached; the 200 is just a safe default.
@@ -72,8 +67,12 @@ async def test_directory_conflict_renders_code(upstream_factory):
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get(
-            "/slimapi/messages/s1?directory=/app",
-            headers={"X-Slimapi-Version": "1", "X-Opencode-Directory": "/other"},
+            "/slimapi/messages/s1?v=4&directory=/app",
+            headers={"X-Opencode-Directory": "/other"},
         )
     assert response.status_code == 400
-    assert response.json()["code"] == "directory_not_allowed"
+    assert response.json() == {
+        "code": "directory_conflict",
+        "queryDirectory": "/app",
+        "headerDirectory": "/other",
+    }

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from conftest import current_replay_log
+
 import logging
 import os
 
@@ -161,7 +163,11 @@ async def test_allowlist_file_route_allows_directory_subtree_and_blocks_prefix_t
 
 
 async def test_empty_allowlist_does_not_filter_sse():
-    hub = GlobalHub(client=None, directory_allowlist=[])
+    hub = GlobalHub(
+        client=None,
+        directory_allowlist=[],
+        replay_log=current_replay_log(),
+    )
     subscriber = Subscriber()
     hub.subscribers.add(subscriber)
     try:
@@ -174,7 +180,11 @@ async def test_empty_allowlist_does_not_filter_sse():
 
 
 async def test_nonempty_allowlist_drops_outside_digest_and_counts_once():
-    hub = GlobalHub(client=None, directory_allowlist=["/allowed"])
+    hub = GlobalHub(
+        client=None,
+        directory_allowlist=["/allowed"],
+        replay_log=current_replay_log(),
+    )
     subscriber = Subscriber()
     hub.subscribers.add(subscriber)
     try:
@@ -187,7 +197,11 @@ async def test_nonempty_allowlist_drops_outside_digest_and_counts_once():
 
 
 async def test_nonempty_allowlist_drops_outside_immediate_and_unknown_frames():
-    hub = GlobalHub(client=None, directory_allowlist=["/allowed"])
+    hub = GlobalHub(
+        client=None,
+        directory_allowlist=["/allowed"],
+        replay_log=current_replay_log(),
+    )
     subscriber = Subscriber()
     hub.subscribers.add(subscriber)
     try:
@@ -200,7 +214,11 @@ async def test_nonempty_allowlist_drops_outside_immediate_and_unknown_frames():
 
 
 async def test_nonempty_allowlist_allows_subtree_and_preserves_changed_field():
-    hub = GlobalHub(client=None, directory_allowlist=["/allowed"])
+    hub = GlobalHub(
+        client=None,
+        directory_allowlist=["/allowed"],
+        replay_log=current_replay_log(),
+    )
     subscriber = Subscriber()
     hub.subscribers.add(subscriber)
     try:
@@ -220,7 +238,11 @@ async def test_health_reports_allowlist_and_dropped_event_count():
     app.state.config = settings
     app.state.schema_degraded = False
     app.state.deployment_revision = None
-    hub = GlobalHub(client=None, directory_allowlist=settings.directory_allowlist)
+    hub = GlobalHub(
+        client=None,
+        directory_allowlist=settings.directory_allowlist,
+        replay_log=current_replay_log(),
+    )
     hub.allowlist_dropped_events = 3
 
     class Registry:
@@ -328,7 +350,11 @@ async def test_symlink_escape_digest_frame_dropped_and_counted(tmp_path):
     allowed_root.mkdir()
     outside.mkdir()
     os.symlink(outside, allowed_root / "link")
-    hub = GlobalHub(client=None, directory_allowlist=[str(allowed_root)])
+    hub = GlobalHub(
+        client=None,
+        directory_allowlist=[str(allowed_root)],
+        replay_log=current_replay_log(),
+    )
     subscriber = Subscriber()
     hub.subscribers.add(subscriber)
     try:
@@ -470,7 +496,11 @@ async def test_relative_directory_frame_dropped_when_allowlist_set(
     allowed_root = tmp_path / "allowed_root"
     allowed_root.mkdir()
     monkeypatch.chdir(allowed_root)
-    hub = GlobalHub(client=None, directory_allowlist=[str(allowed_root)])
+    hub = GlobalHub(
+        client=None,
+        directory_allowlist=[str(allowed_root)],
+        replay_log=current_replay_log(),
+    )
     subscriber = Subscriber()
     hub.subscribers.add(subscriber)
     try:
@@ -545,7 +575,11 @@ async def test_root_retarget_runtime_hub_reapply_same_allowlist_value(tmp_path):
     os.symlink(old_root, link)
     allowlist = [str(link)]
 
-    hub = GlobalHub(client=None, directory_allowlist=allowlist)
+    hub = GlobalHub(
+        client=None,
+        directory_allowlist=allowlist,
+        replay_log=current_replay_log(),
+    )
     subscriber = Subscriber()
     hub.subscribers.add(subscriber)
     try:

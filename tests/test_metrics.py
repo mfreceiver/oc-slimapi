@@ -17,6 +17,7 @@ from __future__ import annotations
 import httpx
 from fastapi import FastAPI
 
+from conftest import current_replay_log
 from oc_slimapi.config import Settings
 from oc_slimapi.errors import register_error_handlers
 from oc_slimapi.routes import metrics
@@ -61,6 +62,7 @@ def _build_app(settings: Settings) -> tuple[FastAPI, HubRegistry, httpx.AsyncCli
     app.state.transforms = transforms
     hubs = HubRegistry(
         upstream,
+        replay_log=current_replay_log(),
         max_subscribers_per_directory=settings.max_subscribers_per_directory,
         max_total_subscribers=settings.max_total_subscribers,
         queue_items=settings.sse_queue_items,

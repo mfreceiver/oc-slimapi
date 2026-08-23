@@ -19,6 +19,8 @@ Plan: docs/ocmar/plans/2026-08-21-audit-fix-batch1.md §泳道 L1-3.
 
 from __future__ import annotations
 
+from conftest import current_replay_log
+
 import asyncio
 import contextlib
 import inspect
@@ -51,7 +53,7 @@ class _BoomTokenHub:
 
 
 async def test_teardown_exception_releases_slot_and_allows_rearm(fast_grace):
-    registry = HubRegistry(None)
+    registry = HubRegistry(None, replay_log=current_replay_log())
     # Attach the boom hub BEFORE hub creation so get() forwards it onto
     # the GlobalHub — the idle-recycle loss hook reads the hub-side ref.
     registry._token_hub = _BoomTokenHub()
@@ -80,7 +82,7 @@ async def test_teardown_exception_releases_slot_and_allows_rearm(fast_grace):
 
 
 async def test_cancelled_stale_task_does_not_clear_newer_task(fast_grace):
-    registry = HubRegistry(None)
+    registry = HubRegistry(None, replay_log=current_replay_log())
     registry.get_global()
 
     registry.maybe_arm_grace_if_idle()
@@ -106,7 +108,7 @@ async def test_cancelled_stale_task_does_not_clear_newer_task(fast_grace):
 
 
 async def test_normal_path_clears_references_and_names_task(fast_grace):
-    registry = HubRegistry(None)
+    registry = HubRegistry(None, replay_log=current_replay_log())
     registry.get_global()
 
     registry.maybe_arm_grace_if_idle()

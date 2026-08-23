@@ -14,6 +14,8 @@ Covers the 6 required scenarios from the implementation brief:
 
 from __future__ import annotations
 
+from conftest import current_replay_log
+
 import asyncio
 import json
 import os
@@ -595,7 +597,7 @@ def test_digest_fields_omits_pair_when_either_is_none():
 
 async def test_publish_stamps_turn_when_scope_known():
     """session.status ingest stamps turn/inc onto the entry (registry wired)."""
-    hub = GlobalHub(client=None)
+    hub = GlobalHub(client=None, replay_log=current_replay_log())
     try:
         reg = TurnRegistry(incarnation=42)
         reg.bump_turn("s1")  # turn = 1
@@ -626,7 +628,7 @@ async def test_publish_stamps_inc_zero_for_unobserved_sid():
     """An unobserved sid → snapshot always returns (inc, 0); the digest
     now always carries turnIncarnation/turn once a registry is wired
     (no header-gated degrade)."""
-    hub = GlobalHub(client=None)
+    hub = GlobalHub(client=None, replay_log=current_replay_log())
     try:
         reg = TurnRegistry(incarnation=42)
         hub.set_turn_registry(reg)
@@ -655,7 +657,7 @@ async def test_publish_stamps_inc_zero_for_unobserved_sid():
 
 async def test_publish_omits_turn_when_no_registry_wired():
     """No TurnRegistry injected → no stamping at all (legacy behaviour)."""
-    hub = GlobalHub(client=None)
+    hub = GlobalHub(client=None, replay_log=current_replay_log())
     try:
         subscriber = Subscriber()
         hub.subscribers.add(subscriber)
@@ -681,7 +683,7 @@ async def test_non_durable_registry_digest_omits_turn_pair():
     identical wire shape to "no registry wired" — so ocdroid degrades to
     Tier-2 instead of fencing on an unconfirmed value (contract §7.5
     paired-optional semantics)."""
-    hub = GlobalHub(client=None)
+    hub = GlobalHub(client=None, replay_log=current_replay_log())
     try:
         reg = TurnRegistry(incarnation=IncarnationValue(42, durable=False))
         reg.bump_turn("s1")
@@ -898,7 +900,7 @@ async def test_v10_ingest_snapshot_freezes_value_against_later_bump():
     later bump cannot retroactively mutate it. A subsequent ingest stamps
     the new (higher) value.
     """
-    hub = GlobalHub(client=None)
+    hub = GlobalHub(client=None, replay_log=current_replay_log())
     try:
         reg = TurnRegistry(incarnation=5)
         hub.set_turn_registry(reg)
@@ -950,7 +952,7 @@ async def test_v10_busy_flush_carries_frozen_stamp():
     immediate flush emits the stamped turn/inc. Regression guard for the
     ordering of the stamp block relative to the busy flush.
     """
-    hub = GlobalHub(client=None)
+    hub = GlobalHub(client=None, replay_log=current_replay_log())
     try:
         reg = TurnRegistry(incarnation=8)
         reg.bump_turn("s1")  # turn=1

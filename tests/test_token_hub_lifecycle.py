@@ -22,7 +22,37 @@ import pytest
 
 from oc_slimapi.config import TOKEN_ACC_IDLE_MS
 from oc_slimapi.sse.hub import GlobalHub, Subscriber
-from oc_slimapi.sse.token_hub import TokenStreamHub, _now_ms
+from oc_slimapi.sse.replay_log import ReplayLog
+from oc_slimapi.sse.token_hub import TokenStreamHub as _TokenStreamHub, _now_ms
+
+
+_TEST_REPLAY_LOG: ReplayLog | None = None
+
+
+@pytest.fixture(autouse=True)
+def _test_replay_log():
+    global _TEST_REPLAY_LOG
+    replay_log = ReplayLog()
+    _TEST_REPLAY_LOG = replay_log
+    try:
+        yield
+    finally:
+        _TEST_REPLAY_LOG = None
+        replay_log.close()
+
+
+def _token_hub(**kwargs) -> _TokenStreamHub:
+    replay_log = kwargs.pop("replay_log", _TEST_REPLAY_LOG)
+    assert replay_log is not None
+    return _TokenStreamHub(replay_log=replay_log, **kwargs)
+
+
+TokenStreamHub = _token_hub
+
+
+def _global_hub(client=None, **kwargs) -> GlobalHub:
+    assert _TEST_REPLAY_LOG is not None
+    return GlobalHub(client=client, replay_log=_TEST_REPLAY_LOG, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +227,7 @@ class _FakeClient:
 @pytest.fixture
 async def bare_hub():
     """Bare GlobalHub; tears down background tasks."""
-    h = GlobalHub(client=None)
+    h = _global_hub(client=None)
     try:
         yield h
     finally:
@@ -210,17 +240,17 @@ async def bare_hub():
 
 class TestHasConsumers:
     def test_empty_hub_no_consumers(self):
-        hub = GlobalHub(client=None)
+        hub = _global_hub(client=None)
         assert hub.has_consumers() is False
 
     def test_control_subscriber_present(self):
-        hub = GlobalHub(client=None)
+        hub = _global_hub(client=None)
         hub.subscribers.add(Subscriber())
         assert hub.has_consumers() is True
 
     def test_token_hub_stub_returns_zero(self):
         """Stage A/B stub subscriber_count=0 → has_consumers falls through."""
-        hub = GlobalHub(client=None)
+        hub = _global_hub(client=None)
         hub.set_token_hub(TokenStreamHub())
         assert hub.has_consumers() is False
 
@@ -228,19 +258,19 @@ class TestHasConsumers:
         """When Stage D wires subscriber_count > 0, the hub stays alive even
         with zero control-plane subs (the §16-B 'has_consumers 贯穿所有 grace
         路径' contract)."""
-        hub = GlobalHub(client=None)
+        hub = _global_hub(client=None)
 
-        class _StageDStub(TokenStreamHub):
+        class _StageDStub(_TokenStreamHub):
             @property
             def subscriber_count(self) -> int:
                 return 1
 
-        hub.set_token_hub(_StageDStub())
+        hub.set_token_hub(_StageDStub(replay_log=_TEST_REPLAY_LOG))
         assert hub.has_consumers() is True
 
     def test_control_subs_short_circuit_token_check(self):
         """If control subs exist, the token hub is not consulted (None-safe)."""
-        hub = GlobalHub(client=None)
+        hub = _global_hub(client=None)
         hub.subscribers.add(Subscriber())
         # No token hub wired — must still return True (no None deref).
         assert hub.has_consumers() is True
@@ -262,7 +292,7 @@ class TestStopAfterGrace:
 
         monkeypatch.setattr("oc_slimapi.sse.global_hub.asyncio.sleep", _fast)
 
-        hub = GlobalHub(client=None)
+        hub = _global_hub(client=None)
 
         async def _park_forever():
             # Real suspension (not asyncio.sleep, which is patched) so the
@@ -288,14 +318,14 @@ class TestStopAfterGrace:
 
         monkeypatch.setattr("oc_slimapi.sse.global_hub.asyncio.sleep", _fast)
 
-        hub = GlobalHub(client=None)
+        hub = _global_hub(client=None)
 
-        class _StageDStub(TokenStreamHub):
+        class _StageDStub(_TokenStreamHub):
             @property
             def subscriber_count(self) -> int:
                 return 1
 
-        hub.set_token_hub(_StageDStub())
+        hub.set_token_hub(_StageDStub(replay_log=_TEST_REPLAY_LOG))
 
         async def _park_forever():
             await asyncio.Event().wait()
@@ -384,7 +414,7 @@ class TestRunReconnectWiring:
             RuntimeError("boom"),       # 5: retry → SKIPPED
         ]
         client = _FakeClient(outcomes)
-        hub = GlobalHub(client=client)
+        hub = _global_hub(client=client)
         hub.set_token_hub(th)
         hub.subscribers.add(Subscriber())  # has_consumers=True → loop keeps going
 
@@ -426,7 +456,7 @@ class TestRunReconnectWiring:
             _FakeStreamCtx(lines=[]),  # 2: reconnect → FIRES
         ]
         client = _FakeClient(outcomes)
-        hub = GlobalHub(client=client)
+        hub = _global_hub(client=client)
         hub.set_token_hub(th)
         hub.subscribers.add(Subscriber())
 
@@ -592,11 +622,9 @@ class TestOnSessionDeleted:
 
     def test_terminates_subscribers_on_session_deleted(self):
         """INV-4 (P0-3): on_session_deleted directly terminates subscribers
-        (resync{session_deleted} → STOP), not via the deferred flush-loop
-        resync queue. Test updated from test_records_pending_session_deleted_resync
-        because the behavior changed: _enqueue_session_resync is replaced by
-        direct sub.terminate."""
-        from oc_slimapi.sse.tokenstream.frames import STOP, _resync_frame
+        with STOP, not via the deferred flush-loop resync queue. Lifecycle-only
+        reasons are not emitted as native-v4 resync frames."""
+        from oc_slimapi.sse.tokenstream.frames import STOP
         th = TokenStreamHub()
         # Attach a fake subscriber.
         class _FakeSub:
@@ -604,13 +632,9 @@ class TestOnSessionDeleted:
                 self.session_id = "s1"
                 self.closed = False
                 self.frames = []
-                self._in_handshake = False
-            def begin_handshake(self): self._in_handshake = True
-            def end_handshake(self): self._in_handshake = False
             def put(self, frame): self.frames.append(frame); return True
             def terminate(self, reason):
                 self.closed = True
-                self.frames.append(_resync_frame(self.session_id, reason))
                 self.frames.append(STOP)
         sub = _FakeSub()
         th.attach_subscriber("s1", sub)
@@ -620,8 +644,7 @@ class TestOnSessionDeleted:
         assert th._pending_session_resinks == []
         # Subscriber terminated directly.
         assert sub.closed is True
-        resyncs = [f for f in sub.frames if isinstance(f, bytes) and b"resync" in f]
-        assert len(resyncs) == 1
+        assert sub.frames == [STOP]
 
     def test_does_not_touch_other_sessions(self):
         th = TokenStreamHub()
@@ -948,7 +971,7 @@ class TestNBGuards:
     def test_nb3_post_drop_text_start_does_not_create_live_part(self):
         """NB3: after drop_part, a re-issued text-start for the same key
         MUST NOT create a dead LivePart (late deltas still drop on
-        _disabled; a dangling LivePart would confuse Stage-C snapshot)."""
+        _disabled; a dangling LivePart would violate retired-state gating)."""
         th = TokenStreamHub()
         th.on_part_updated(_updated_props(text=""))
         key = ("s1", "m1", "p1")

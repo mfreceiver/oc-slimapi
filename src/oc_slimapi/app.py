@@ -518,6 +518,7 @@ async def lifespan(app: FastAPI):
         # once at the upstream consume site (run()).
         app.state.hubs = HubRegistry(
             app.state.upstream,
+            replay_log=app.state.replay_log,
             max_subscribers_per_directory=settings.max_subscribers_per_directory,
             max_total_subscribers=settings.max_total_subscribers,
             queue_items=settings.sse_queue_items,
@@ -525,11 +526,6 @@ async def lifespan(app: FastAPI):
             max_frame_bytes=settings.sse_max_frame_bytes,
             traffic_ledger=app.state.traffic_ledger,
         )
-        # B3b-2: share the process replay log with every lazily-created
-        # GlobalHub — business frames append to the global domain (v4
-        # subscribers get id-stamped deliveries) and confirmed upstream
-        # loss writes cross-domain barriers (design-v4-sse-replay §3.4).
-        app.state.hubs.set_replay_log(app.state.replay_log)
         # 4.10.1 (B): deterministic catalog-cache invalidation on upstream
         # epoch loss — the hub's canonical once-per-epoch upstream-loss hook
         # (_notify_upstream_loss) fires this callback, so a restarted

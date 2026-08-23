@@ -51,9 +51,8 @@ async def session_todo(request: Request, sid: str,
 
     ``directory`` is routing-only (selects the opencode workdir instance),
     forwarded as ``X-Opencode-Directory`` — same semantics as the messages
-    route. ADDITIVE route: older sidecars answer 404
-    ``thin_route_not_found`` from the catch-all and the client falls back
-    to the passthrough ``GET /session/{sid}/todo``.
+    route. Current sidecars expose only this thin route; there is no
+    passthrough fallback.
 
     4.11.0 Phase A / A2: this route opts INTO the Batch 2 ETag wiring
     (``enable_etag=True``): per-coding validators + 304 on a matching
@@ -64,7 +63,7 @@ async def session_todo(request: Request, sid: str,
     → identity) and decides the served coding BEFORE the validator is
     derived, so the judged coding always equals the served coding.
     """
-    # v3 (§5, Batch B): a consumed ``?directory=`` was validated + stripped
+    # v4: a consumed ``?directory=`` was validated + stripped
     # at dispatch — the stash replaces the (absent) query param here.
     directory = resolve_route_directory(request.scope, directory)
     if directory is not None:

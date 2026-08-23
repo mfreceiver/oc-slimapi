@@ -1,13 +1,11 @@
-"""v3-contract §10.b — the 12 annexed WRITE endpoints (Batch C2), plus the
-5..6 B4 additions (#13-#17: agent / model / revert three-step — non-consuming
-directory, see the B4 section note below).
+"""Current v4 controlled write routes.
 
 Every endpoint is a **controlled write proxy**: the sidecar never rewrites
 success semantics, only adding protection (request/response caps), audit
 (tracking headers) and ``?v=``/``?directory=`` consumption. Paths are the
-legacy opencode paths under the ``/slimapi`` prefix.
+opencode paths under the ``/slimapi`` prefix.
 
-Frozen unified behaviour (contract §10.b「统一行为」, anchored to upstream
+Current unified behaviour (v4 contract §10.b, anchored to upstream
 opencode v1.18.16 — ``groups/session.ts:203-397``, ``groups/question.ts:32-48``):
 
 * **request body + content-type forwarded verbatim** (both legal PATCH
@@ -21,14 +19,12 @@ opencode v1.18.16 — ``groups/session.ts:203-397``, ``groups/question.ts:32-48`
 * **query verbatim** (§5.2): post-selector raw bytes embedded in the
   upstream URL — unknown params / repeats / percent-encodings survive; the
   sidecar-reserved ``v`` is stripped everywhere, ``directory`` additionally
-  so on v3 (consumed by the selector);
+  on directory-consuming routes;
 * **directory consumed on all 12** (every upstream endpoint declares
-  ``WorkspaceRoutingQuery``): v3 ``?directory=`` → selector stash →
-  forwarded as the ``X-Opencode-Directory`` header; v2 → the header is the
-  channel (bound + validated); v2 ``?directory=`` values are validated then
-  forwarded verbatim (not consumed);
-* the B4 additions (#13-#17) are **exceptions to directory consumption**:
-  their upstream v2 session group resolves location per-sid via
+  ``WorkspaceRoutingQuery``): ``?directory=`` → selector stash → forwarded
+  as the ``X-Opencode-Directory`` header; the client header is retired;
+* the agent/model/revert-control additions (#13-#17) are **exceptions to
+  directory consumption**: their upstream session group resolves location per-sid via
   sessionLocationMiddleware and does NOT participate in directory routing —
   client ``?directory=`` is tolerated and dropped (never forwarded upstream,
   never an error), matching the questions/permissions non-consuming set
@@ -51,16 +47,14 @@ opencode v1.18.16 — ``groups/session.ts:203-397``, ``groups/question.ts:32-48`
   ``Vary: Accept-Encoding`` (§6.2 terminal single value
   set: every §10.b write route consumes directory).
 
-§16 修订二 (v4-contract, 2026-08-19 freeze — the POST equivalent action
-family): three more POST routes live in this module (#18-#20 —
+The POST-equivalent action family adds three routes (#18-#20 —
 ``POST /session/{sid}`` ≡ PATCH, ``POST …/delete`` ≡ DELETE,
 ``POST …/archive`` convenience w/ octet-level default synthesis),
-gated per request on the v4 wire view + ``session.post-actions.v4 ∈
-readiness.SATISFIED`` (§3.3 dynamic module read). Admitted requests run
+gated per request on ``session.post-actions.v4 ∈ readiness.SATISFIED``
+(§3.3 dynamic module read). Admitted requests run
 the very ``_write_passthrough`` pipeline below — zero new wire semantics
-except the archive synthesis; every non-admitted arrival (v3 baseline,
-or gate-closed leakage) answers the pre-revision coded 404
-``thin_route_not_found`` (see the §16.2 section note below).
+except the archive synthesis; a defensive gate-closed arrival answers coded
+404 ``thin_route_not_found``.
 """
 
 from __future__ import annotations
@@ -95,7 +89,7 @@ router = APIRouter(prefix="/slimapi", tags=["write-groups"])
 
 
 def _resolve(request: Request) -> str | None:
-    """Workspace directory for a write route (§5.2 terminal, v3-only).
+    """Workspace directory for a current v4 write route.
 
     The selector consumed ``?directory=`` into the scope stash (validated)
     — forward it as the ``X-Opencode-Directory`` header. The header is
@@ -147,9 +141,7 @@ async def _write_passthrough(
         # never re-read from the socket.
         body = bytearray(preset_body)
 
-    # upOut accounting parity: the retired catch-all forwarder counted the
-    # request bytes it relayed upstream; the annexed write pipeline counts
-    # the buffered body it is about to send.
+    # Count the buffered request bytes this controlled write sends upstream.
     if body:
         stash_up_out(request, len(body))
 
@@ -176,8 +168,7 @@ async def _write_passthrough(
 
     # S2 turn-fence commit point (bump-before-send): prompt_async/abort
     # writes advance the per-sid turn counter before the upstream send —
-    # this is where the retired catch-all forwarder used to bump (the
-    # strong-fence contract tolerates holes on connection-level failure).
+    # The strong-fence contract tolerates holes on connection-level failure.
     if method == "POST" and is_turn_bumping_path(upstream_path):
         turn_registry = getattr(request.app.state, "turn_registry", None)
         sid = extract_sid_from_path(upstream_path)
@@ -277,24 +268,15 @@ async def delete_session(request: Request, session_id: str) -> Response:
         request, method="DELETE", upstream_path=f"/session/{session_id}")
 
 
-# --- §16 修订二：POST 等效动作族（v4-contract 2026-08-19 冻结；feature
-# ``session.post-actions.v4``，§3.3 第 10 ID）。三条 POST 组合的命中面分两层：
+# --- POST equivalent action family (v4 contract §16). The selector and the
+# handler read the same ``session.post-actions.v4`` readiness gate:
 #
-# * **selector 层（过渡态 405，不在本模块）**：``?v=4`` 且门控未激活时，
-#   selector 在 directory 消费前拦下 coded 405 ``method_not_applicable``
-#   （§16.1/§8.3 链——§16.3 四位组合表第二行），请求永远到不了下面三条
-#   路由；
-# * **handler 层（本模块）**：请求一旦到达（selector 已放行的「v4 且
-#   ``session.post-actions.v4 ∈ satisfied``」激活态，或 v3——selector 从不
-#   拦 v3），按下述分叉：
-#     - v4 + 门控激活 → §16.2 等效管线（就是上面 ``_write_passthrough``
-#       的逐字节复用——sidecar 零新增语义，仅 archive 合成一例外）；
-#     - 其余一切（v3 冻结基线；防御性覆盖门控关穿透）→ coded 404
-#       ``thin_route_not_found``，与 4.0.0 catch-all 基线逐字节一致
-#       （proxy.py 同一 error_response 路径：gzip 协商 + Vary，无 Allow）。
-#
-# v3 面：三条组合此前经 catch-all 答 404 ``thin_route_not_found``；路由注册
-# 后由 handler 原样复现该答案（v3-contract §8.2 冻结不变）。
+# * gate closed: selector answers 405 ``method_not_applicable`` before
+#   directory consumption;
+# * gate open: the handler reuses ``_write_passthrough`` byte-for-byte,
+#   except for the archive route's documented default-body synthesis;
+# * a defensive handler-side gate-closed arrival answers coded 404
+#   ``thin_route_not_found``.
 
 _POST_ACTIONS_FEATURE = "session.post-actions.v4"
 
@@ -305,20 +287,13 @@ def _post_actions_admitted(scope: dict) -> bool:
     The gate reads ``readiness.SATISFIED`` dynamically at request time
     (same convention as the selector's boundary gate) — a flip batch
     reassigns the set and this predicate changes with zero edits here.
-    (V2b: the historical ``wire_view_from_scope(scope) >= 4`` conjunct
-    died with the 2026-08-21 narrowing — under the (4, 4) v4-only window
-    ``wire_view_from_scope`` is constant 4 for every scope, so the
-    comparison was vacuously true and admission reduces to the gate
-    check; see selector.wire_view_from_scope.)
+    Under the v4-only window, admission is exactly the readiness check.
     """
     return _POST_ACTIONS_FEATURE in readiness_mod.SATISFIED
 
 
 def _pre_revision_404(request: Request) -> Response:
-    """The pre-revision answer for the three POST combos: coded 404
-    ``thin_route_not_found`` (gzip-negotiated, ``Vary: Accept-Encoding``,
-    no Allow / no-store) — byte-identical to the catch-all boundary these
-    paths answered from before the routes existed (proxy.py)."""
+    """Defensive gate-closed answer for the POST-equivalent family."""
     return error_response(
         "thin_route_not_found", 404,
         accept_encoding=request.headers.get("accept-encoding"),
@@ -329,12 +304,12 @@ def _pre_revision_404(request: Request) -> Response:
 async def post_update_session(request: Request, session_id: str) -> Response:
     """#18（§16.2-a）— POST /session/{id} ≡ PATCH /session/{id}.
 
-    Admitted (v4 + ``session.post-actions.v4``): the request runs the very
+    Admitted with ``session.post-actions.v4``: the request runs the very
     PATCH pipeline ``update_session`` uses — body/content-type verbatim,
     request/response caps, directory consumption, evaluation order,
     4xx-verbatim / 5xx→503 error mapping, no-store — byte-for-byte the
     controlled-write semantics; only the wire method the client chose
-    differs. Non-admitted: pre-revision 404.
+    differs. A defensive non-admitted arrival receives coded 404.
     """
     if not _post_actions_admitted(request.scope):
         return _pre_revision_404(request)
@@ -408,8 +383,8 @@ async def post_delete_session(request: Request, session_id: str) -> Response:
     byte-for-byte, NO ignore-body branch. The upstream recursive
     child-delete + error-swallowing semantics are inherited as-is
     (owner ruling q1: non-idempotency acceptable — a repeated delete
-    answers whatever the upstream answers, e.g. 404). Non-admitted:
-    pre-revision 404.
+    answers whatever the upstream answers, e.g. 404). A defensive
+    non-admitted arrival receives coded 404.
     """
     if not _post_actions_admitted(request.scope):
         return _pre_revision_404(request)
@@ -490,11 +465,11 @@ async def session_command(request: Request, session_id: str) -> Response:
 
 
 # ---------------------------------------------------------------------------
-# B4 六条加性端点（wire contract v3 → v4 B0 起草段；上游锚点
-# opencode v1.18.18 ``packages/protocol/src/groups/session.ts:173-305``，
-# v2 ``/api/session/...`` 前缀，非 legacy ``/session/...``）。
+# Five non-directory-consuming session-control endpoints. Upstream anchor:
+# opencode ``packages/protocol/src/groups/session.ts`` under the current
+# ``/api/session/...`` prefix.
 #
-# 与既有 #1-#12 的关键差异：**directory 列 = 不消费**。上游 v2 session 组
+# 与既有 #1-#12 的关键差异：**directory 列 = 不消费**。上游 session 组
 # 经 sessionLocationMiddleware 按 sid 从 DB 解析 location，不消费 directory；
 # 客户端带 ``?directory=`` 时宽容忽略（不转发上游、不报错），同
 # questions/permissions 非消费集语义（_DIRECTORY_CONSUMING_PATTERNS 未收录
@@ -505,10 +480,10 @@ async def session_command(request: Request, session_id: str) -> Response:
 
 
 def _strip_directory_query(request: Request) -> None:
-    """B4 非消费集目录宽容：剥掉 ``scope['query_string']`` 中的 ``directory``。
+    """非消费集目录宽容：剥掉 ``scope['query_string']`` 中的 ``directory``。
 
     与 selector 自身消费集的剥离同源（:meth:`_strip_query_keys` 字节保真，
-    & 分段扫描，不解析引号/编码）——B4 路由不在消费集，selector 不会代剥，
+    & 分段扫描，不解析引号/编码）——这些路由不在消费集，selector 不会代剥，
     这里在进入上游管线前就地处理，使上游请求 URL 无 directory 痕迹。
     """
     request.scope["query_string"] = _strip_query_keys(
@@ -519,10 +494,10 @@ def _strip_directory_query(request: Request) -> None:
 
 @router.post("/session/{session_id}/agent")
 async def session_agent(request: Request, session_id: str) -> Response:
-    """#13 agent（B4）— POST，body ``{"agent":"<id>"}`` 透传 → 上游 204。
+    """#13 agent — POST，body ``{"agent":"<id>"}`` 透传 → 上游 204。
 
-    Upstream: opencode v1.18.18 ``protocol/groups/session.ts:173``-305
-    (v2 session group, ``/api/session/{sid}/agent``)。directory 不消费 —
+    Upstream: opencode ``protocol/groups/session.ts``
+    (``/api/session/{sid}/agent``)。directory 不消费 —
     ``?directory=`` 宽容忽略、不转发。
     """
     _strip_directory_query(request)
@@ -533,11 +508,11 @@ async def session_agent(request: Request, session_id: str) -> Response:
 
 @router.post("/session/{session_id}/model")
 async def session_model(request: Request, session_id: str) -> Response:
-    """#14 model（B4）— POST，body ``{"model":"<provider/model>"}`` 透传 →
+    """#14 model — POST，body ``{"model":"<provider/model>"}`` 透传 →
     上游 204。
 
-    Upstream: opencode v1.18.18 ``protocol/groups/session.ts`` (v2 session
-    group, ``/api/session/{sid}/model``)。directory 不消费（同上）。
+    Upstream: opencode ``protocol/groups/session.ts``
+    (``/api/session/{sid}/model``)。directory 不消费（同上）。
     """
     _strip_directory_query(request)
     return await _write_passthrough(
@@ -547,11 +522,11 @@ async def session_model(request: Request, session_id: str) -> Response:
 
 @router.post("/session/{session_id}/revert/stage")
 async def revert_stage(request: Request, session_id: str) -> Response:
-    """#15 revert/stage（B4，三段式第 1 段）— POST，body
+    """#15 revert/stage（三段式第 1 段）— POST，body
     ``{"messageID":"…","files"?:bool}`` 透传 → 上游 200 ``{data:…}``。
 
-    Upstream: opencode v1.18.18 ``protocol/groups/session.ts`` (v2 session
-    group, ``/api/session/{sid}/revert/stage``)。目录不消费（同上）；
+    Upstream: opencode ``protocol/groups/session.ts``
+    (``/api/session/{sid}/revert/stage``)。目录不消费（同上）；
     与既有单步 ``POST /session/{sid}/revert``（#8）路径不同不互截。
     """
     _strip_directory_query(request)
@@ -562,10 +537,10 @@ async def revert_stage(request: Request, session_id: str) -> Response:
 
 @router.post("/session/{session_id}/revert/clear")
 async def revert_clear(request: Request, session_id: str) -> Response:
-    """#16 revert/clear（B4，三段式第 2 段）— POST，无 payload → 上游 204。
+    """#16 revert/clear（三段式第 2 段）— POST，无 payload → 上游 204。
 
-    Upstream: opencode v1.18.18 ``protocol/groups/session.ts`` (v2 session
-    group, ``/api/session/{sid}/revert/clear``)。目录不消费（同上）。
+    Upstream: opencode ``protocol/groups/session.ts``
+    (``/api/session/{sid}/revert/clear``)。目录不消费（同上）。
     """
     _strip_directory_query(request)
     return await _write_passthrough(
@@ -575,10 +550,10 @@ async def revert_clear(request: Request, session_id: str) -> Response:
 
 @router.post("/session/{session_id}/revert/commit")
 async def revert_commit(request: Request, session_id: str) -> Response:
-    """#17 revert/commit（B4，三段式第 3 段）— POST，无 payload → 上游 204。
+    """#17 revert/commit（三段式第 3 段）— POST，无 payload → 上游 204。
 
-    Upstream: opencode v1.18.18 ``protocol/groups/session.ts`` (v2 session
-    group, ``/api/session/{sid}/revert/commit``)。目录不消费（同上）。
+    Upstream: opencode ``protocol/groups/session.ts``
+    (``/api/session/{sid}/revert/commit``)。目录不消费（同上）。
     """
     _strip_directory_query(request)
     return await _write_passthrough(

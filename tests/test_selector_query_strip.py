@@ -1,4 +1,4 @@
-"""v3-contract §2/§5.2 — selector consumes & strips ``?v`` on ``/slimapi/**``.
+"""V4 selector consumes and strips ``?v`` on ``/slimapi/**``.
 
 ``v`` is a sidecar-reserved parameter: after the selector judges it, the
 ``v`` parameter pairs are REMOVED from the downstream ``query_string`` and
@@ -13,16 +13,18 @@ the raw query byte-identical (re-asserted here once for the strip context).
 """
 from __future__ import annotations
 
-import logging
+from types import SimpleNamespace
 
 import httpx
 import pytest
+from fastapi import FastAPI
 from httpx import ASGITransport
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from oc_slimapi.selector import SlimapiSelectorMiddleware
+from oc_slimapi.routes import health
 
 
 async def _echo(request):
@@ -56,7 +58,7 @@ async def _get(app, path, headers=None) -> dict:
 # ---------------------------------------------------------------------------
 
 
-async def test_v3_strips_all_v_pairs_preserving_bytes():
+async def test_v4_strips_all_v_pairs_preserving_bytes():
     out = await _get(_app(), "/slimapi/probe?v=4&a=1&v=4&b=%20x")
     assert out["status"] == 200
     # duplicate v pairs both removed; a→b order, %20 encoding preserved.
@@ -127,11 +129,18 @@ async def test_catchall_query_untouched():
     ["?v=4", "?v=4&x=1"],
 )
 async def test_health_functional_with_v(query):
-    # Real-route smoke: v is consumed; health answers the single v3 view and
+    # Real-route smoke: v is consumed; health answers the single v4 view and
     # never chokes on the (stripped) residual query.
-    from tests.test_access_log_v3_fields import _build_app  # noqa: F401
-
-    app = _build_app(logging.getLogger("oc_slimapi.test.capture"))
+    app = FastAPI()
+    app.state.config = SimpleNamespace(
+        accepted_client_versions=(4, 4),
+        directory_allowlist=None,
+        skeleton_inline_output_max_bytes=4096,
+    )
+    app.state.schema_degraded = False
+    app.state.deployment_revision = None
+    app.include_router(health.router)
+    app.add_middleware(SlimapiSelectorMiddleware)
     transport = ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get(f"/slimapi/health{query}")

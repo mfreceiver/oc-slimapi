@@ -13,6 +13,8 @@ Covers:
 
 from __future__ import annotations
 
+from conftest import current_replay_log
+
 import asyncio
 
 import pytest
@@ -61,7 +63,7 @@ async def _close_hub(hub: GlobalHub) -> None:
 @pytest.fixture
 async def hub():
     """Bare GlobalHub with no subscriber; always tears down tasks."""
-    h = GlobalHub(client=None)
+    h = GlobalHub(client=None, replay_log=current_replay_log())
     try:
         yield h
     finally:

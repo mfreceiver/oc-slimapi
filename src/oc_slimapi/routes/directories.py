@@ -29,12 +29,9 @@ async def directories(request: Request):
 
     **No query parameters** — this is a GLOBAL discovery call (unlike the
     catalog endpoints' no-op ``directory``, this endpoint accepts none at
-    all to avoid implying it is scoped). Admitted via the version selector
-    (``?v=3`` terminal) like every ``/slimapi/**`` route.
-
-    Additive (brand-new endpoint); **no** ``X-Slimapi-Version`` bump (still
-    2). An older sidecar without this route returns 404
-    ``thin_route_not_found`` from the catch-all and the client falls back.
+    all to avoid implying it is scoped). Admitted via the current ``?v=4``
+    selector like every ``/slimapi/**`` route. There is no passthrough
+    fallback for this catalog.
 
     Resource bounds (review blocker): TransformPool admission is acquired
     **before** the upstream GET and held across fetch→guard→aggregate;

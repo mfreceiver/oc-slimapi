@@ -1,6 +1,8 @@
 """Tests that SSE hub emits expected diagnostic logs on key events."""
 from __future__ import annotations
 
+from conftest import current_replay_log
+
 import asyncio
 import contextlib
 import io
@@ -37,7 +39,7 @@ def _capture_logger(name: str):
 @pytest.mark.asyncio
 async def test_subscriber_attach_detach_logs():
     """subscribe and unsubscribe emit logger.info with subscriber_id."""
-    hub = GlobalHub(client=None)
+    hub = GlobalHub(client=None, replay_log=current_replay_log())
     logger, handler, buf = _capture_logger("oc_slimapi.sse.global_hub")
     try:
         sub = hub.subscribe()
@@ -56,7 +58,7 @@ async def test_subscriber_attach_detach_logs():
 @pytest.mark.asyncio
 async def test_backpressure_forced_disconnect_logs():
     """Backpressure overflow → logger.warning with subscriber_id."""
-    hub = GlobalHub(client=None)
+    hub = GlobalHub(client=None, replay_log=current_replay_log())
     logger, handler, buf = _capture_logger("oc_slimapi.sse.hub_types")
     try:
         sub = hub.subscribe()
@@ -89,7 +91,7 @@ async def test_json_decode_error_logs(caplog):
         _FakeStreamCtx(lines=['data: {"bad json', '']),
     ]
     client = _FakeClient(outcomes)
-    hub = GlobalHub(client=client)
+    hub = GlobalHub(client=client, replay_log=current_replay_log())
     hub.subscribers.add(Subscriber())  # ensures has_consumers → loop keeps going
 
     # Start the run loop.
@@ -121,7 +123,11 @@ async def test_traffic_accounting_failure_logs(caplog):
         _FakeStreamCtx(lines=['data: {"valid": "json"}', '']),
     ]
     client = _FakeClient(outcomes)
-    hub = GlobalHub(client=client, traffic_ledger=_RogueLedger())
+    hub = GlobalHub(
+        client=client,
+        traffic_ledger=_RogueLedger(),
+        replay_log=current_replay_log(),
+    )
     hub.subscribers.add(Subscriber())
 
     hub.task = asyncio.create_task(hub.run())

@@ -1,4 +1,4 @@
-"""v3-contract §3a — /slimapi/health + /slimapi/ready.
+"""V4 /slimapi/health and /slimapi/ready view locks.
 
 B12 (2026-08-21) three-way split: /ready is 零 v4 分叉 (v4-contract §3.2
 "ready 端点形状不变" + §10 route table — shape frozen to the ready-only

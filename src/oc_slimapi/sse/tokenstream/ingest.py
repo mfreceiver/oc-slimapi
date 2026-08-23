@@ -14,7 +14,7 @@ from ..hub_types import (
     RESYNC_SESSION_IDLE,
     normalize_session_status,
 )
-from .frames import PartKey, _now_ms, _snapshot_frame
+from .frames import PartKey, _now_ms
 from .models import DeltaAccumulator
 
 
@@ -37,13 +37,11 @@ class IngestMixin:
         """Handle ``message.part.updated`` (design §5.3).
 
         ``text-start`` (``part.time.end is None``) creates a
-        :class:`LivePart` regardless of subscribers — this is the B1
-        invariant that lets a subscriber attach mid-generation and still
-        see the full accumulated text via the handshake snapshot. Repeated
-        starts are idempotent (we never reset an existing accumulator: a
+        :class:`LivePart` regardless of subscribers. Repeated starts are
+        idempotent (we never reset an existing accumulator: a
         middle ``updated`` frame must not clobber accumulated deltas).
         ``text-end`` triggers :meth:`finish_part` (Stage C: synchronous
-        drain + terminal marker + retire). Non-text parts are recorded in
+        residual drain + retire). Non-text parts are recorded in
         ``_nontext_parts`` so their ``field:"text"`` deltas drop silently
         (C3).
 
@@ -56,9 +54,8 @@ class IngestMixin:
         rev-ogpt CRITICAL 1 (Option B — per-FRAME): ``on_part_updated``
         does NOT bump ``_part_revisions`` itself — bumps happen lazily
         in each emit path via :meth:`_next_part_revision`. Each emitted
-        frame (delta / snapshot / done / truncated) gets a strictly
-        increasing revision, so a client using strict ``>`` on
-        ``partEventRevision`` reliably accepts every delivery frame.
+        delta frame gets a strictly increasing revision, so a client using
+        strict ``>`` on ``partEventRevision`` accepts every delivery frame.
 
         rev-ogpt MAJOR 5: the structural / type / disabled / lifecycle
         checks below run BEFORE any code that could lead to a frame
@@ -113,8 +110,7 @@ class IngestMixin:
         if self._is_disabled(key):
             return
         # ACCEPTED text part. Option B: NO revision bump here — bumps
-        # happen lazily in the emit paths (flush / finish_part / snapshot
-        # / truncated) via ``_next_part_revision``.
+        # happen lazily only when a delta is actually published.
         if t.get("end") is None:
             # NB1: type-guard the seed — part.get("text") may be a non-string
             # in a malformed / future upstream payload; an int/dict seed
@@ -127,8 +123,7 @@ class IngestMixin:
             if key not in self.live_parts:
                 self._start_part(key, seed)
             return
-        # text-end → finish_part: synchronous drain(_pending) +
-        # snapshot{done:true} marker (lever 1, no text) fanout + retire (C1).
+        # text-end → finish_part: synchronous drain(_pending) + retire (C1).
         raw_final = part.get("text")
         final_text = raw_final if isinstance(raw_final, str) else ""
         self.finish_part(key, final_text)
@@ -240,36 +235,16 @@ class IngestMixin:
            ``.delta`` events cannot revive it. Byte gauges are
            decremented (floored at 0). Subscribers who process the
            ``message.removed`` frame therefore cannot subsequently see
-           stale delta / snapshot frames from a late part event.
+           stale delta frames from a late part event.
         2. Fan ``message.removed`` to every current token subscriber of
            the session.
-        3. Record the tombstone in the bounded replay queue so a client
-           that attaches AFTER the removal (or reconnects post-upstream-
-           loss) learns about it during the handshake.
-
-        rev-ogpt MAJOR 6: a duplicate ``message.removed`` for an
-        already-recorded (sid, mid) refreshes the replay-queue timestamp
-        AND ``move_to_end``s the key, so the "newest" tombstone is never
-        the oldest in FIFO order (v0.5 only refreshed the timestamp,
-        leaving the duplicate at its original insertion position → the
-        cap could evict the freshest data).
-
-        The replay queue is global (not per-session) and survives
-        ``on_upstream_reconnect`` — its whole purpose is to bridge the
-        gap for clients that were disconnected when the removal happened.
+        The shared replay log is the sole historical tombstone source.
         """
         # CRITICAL 2: retire BEFORE fanout so subscribers cannot observe
         # stale state after the tombstone frame.
         self._retire_message(sid, mid)
         # Live fanout to current subscribers of this session.
         self._fanout_message_removed(sid, mid)
-        # Record in replay queue. MAJOR 6: always update value + move to
-        # end (refresh TTL + FIFO position) so duplicates do not leave a
-        # stale insertion-order entry that the cap could evict prematurely.
-        now_ms = _now_ms()
-        self._removed_messages[(sid, mid)] = now_ms
-        self._removed_messages.move_to_end((sid, mid))
-        self._prune_removed_messages(now_ms)
     def on_part_removed(self, sid: str, mid: str, pid: str) -> None:
         """Handle upstream ``message.part.removed`` (rev-ogpt MAJOR 4).
 
@@ -337,41 +312,17 @@ class IngestMixin:
         # CRITICAL 2 gate: block late part events for this message.
         self._retired_messages.add((sid, mid))
     # ------------------------------------------------------------------
-    # finish_part (C1 + lever 1) — terminal drain + marker + retire
+    # finish_part — terminal residual drain + retire
     # ------------------------------------------------------------------
     def finish_part(self, key: PartKey, final_text: str) -> None:
-        """Synchronous drain + terminal ``snapshot{done:true}`` + retire (C1).
+        """Synchronously publish residual delta, then retire the part.
 
-        Lever 1 (§16-C): the terminal marker carries NO ``text`` — the
-        authoritative text is delivered by the existing digest → ``/since``
-        path. ``final_text`` is accepted for API symmetry (it is the
-        ``part.text`` from the text-end ``message.part.updated``) but is
-        NOT put on the wire; we only use the part-existence check to decide
-        whether to emit the marker at all.
-
-        Order (§5.6 wire-strong invariant): residual ``_pending`` is
-        drained and fanned as a ``delta`` frame BEFORE the ``done:true``
-        marker — same-tick, synchronous, no await window. Then the marker
-        fans to every subscriber of the sid. Then :meth:`drop_part` retires
-        the part (idempotent — late deltas for the key silently drop on
-        ``_disabled``).
-
-        rev-ogpt CRITICAL 1 (Option B — per-FRAME): the residual delta
-        frame consumes its own revision via :meth:`_next_part_revision`,
-        and the ``done:true`` marker consumes the NEXT revision (strictly
-        greater). A client using strict ``>`` therefore accepts both
-        frames (the pre-fix per-event design gave them the same revision
-        → strict ``>`` would have silently dropped the done marker).
-
-        If the part was already retired (truncate / eviction / TTL) the
-        marker is suppressed — the subscriber already learned about the
-        part's fate via ``snapshot{truncated:true}`` or
-        ``resync{token_memory_limit}``.
+        Authoritative completion is reconciled through digest revision plus
+        HTTP full state.
         """
         # C1: synchronous drain of residual pending → fanout delta FIRST.
         # CRITICAL 1 (Option B): the residual delta consumes its own
-        # strictly-increasing revision (distinct from the done marker
-        # below — both are independent delivery frames).
+        # strictly-increasing revision.
         acc = self._pending.pop(key, None)
         if acc is not None and acc.byte_count:
             pending_bytes = acc.byte_count
@@ -381,22 +332,6 @@ class IngestMixin:
                 # 4.12.0 修订六 B-1: delta publication rides the atomic
                 # reserve→encode→append path (payload embeds the seq).
                 self._fanout_delta_frame(key, text)
-        # Lever 1: terminal marker (no text) — only if the LivePart still
-        # exists. A truncated / evicted / TTL-retired key has no LivePart
-        # and the subscriber already received the appropriate frame.
-        # CRITICAL 1 (Option B): the done marker consumes the NEXT
-        # revision (strictly greater than the residual delta above when
-        # both are emitted).
-        if key in self.live_parts:
-            marker = _snapshot_frame(
-                key, text=None, done=True,
-                part_revision=self._next_part_revision(key),
-            )
-            # rev-gate R2 BLOCKER-1: the done:true marker is
-            # v4-INELIGIBLE (snapshot family) — _fanout_frame routes it to
-            # the v3-only delivery path: not logged, no seq, never on the
-            # v4 wire (live or replay).
-            self._fanout_frame(key, marker)
         # Retire via drop_part (idempotent). Disabling ensures any late
         # delta for this key silently drops on _disabled (no orphan noise).
         self.drop_part(key)
@@ -423,14 +358,15 @@ class IngestMixin:
         carry no actionable meaning for the accumulator and are ignored so
         the :meth:`ttl_sweep` busy-guard keys off a known-good signal.
 
-        WHY idle→retire immediately + pending resync: the upstream has
-        authoritatively said this session is done. Any LiveParts still
-        hanging are abandoned text-ends we missed (opencode bug, sidecar
-        restart, etc.) — clearing them prevents orphan-LivePart leakage.
-        We enqueue a ``session_idle`` resync (new reason; clients already
-        handle it per ocdroid §3.9) for the flush loop to fan out so
-        subscribers drop stale stream state and re-fetch authoritative
-        /since.
+        WHY idle→retire immediately + barrier + STOP-only termination: the
+        upstream has authoritatively said this session is done. Any LiveParts
+        still hanging are abandoned text-ends we missed (opencode bug,
+        sidecar restart, etc.) — clearing them prevents orphan-LivePart
+        leakage. ``RESYNC_SESSION_IDLE`` is an internal lifecycle reason, not
+        an active-v4 wire reason: the flush loop routes it through
+        ``TokenSubscriber.terminate``, which suppresses the reason and queues
+        STOP only. The barrier makes an old-cursor reconnect receive the
+        frozen ``reconnect_no_replay`` control resync and reconcile over HTTP.
         """
         normalized = normalize_session_status(status)
         if normalized is None or normalized not in ("busy", "idle"):
@@ -443,33 +379,30 @@ class IngestMixin:
             return
         # idle
         self._retire_session(sid)
-        # rev-gate R4 BLOCKER-1: the retire above invalidates the
-        # accumulator state for this sid. Write the token-domain replay
-        # barrier AT THE SOURCE, unconditionally (zero-online-subscriber
-        # case included) — a cursor-N reconnect must hit
-        # resync{reconnect_no_replay}, never an up-to-date live entry on
-        # a残缺 part.
+        # The retire above invalidates the accumulator state for this sid.
+        # Write the token-domain replay barrier at the source, including the
+        # zero-subscriber case: an old cursor must reconnect through the
+        # frozen reconnect_no_replay control reason, never across the gap.
         self._write_replay_barrier(sid, RESYNC_SESSION_IDLE)
         self._enqueue_session_resync(sid, RESYNC_SESSION_IDLE)
     def on_session_deleted(self, sid: str) -> None:
         """Clear all state for a deleted session (§16-B) + terminate token
         subscribers (INV-4 / P0-3).
 
-        WHY no separate ``reconnect_no_replay`` reason here: deleted
-        sessions are signalled to clients via the existing control-plane
-        digest (``session.deleted`` in ``session.digest``).
+        The authoritative deletion signal is the global control-plane
+        ``session.digest{deleted:true}``. The token domain separately writes a
+        replay barrier and terminates each original connection with STOP only:
+        ``session_deleted`` is not in ``V4_RESYNC_REASONS``, so
+        :meth:`TokenSubscriber.terminate` does not serialize that reason. An
+        old-cursor reconnect is classified as the frozen
+        ``reconnect_no_replay`` control resync and then reconciles over HTTP.
 
-        INV-4 (P0-3): session.deleted is a **server-side termination signal**
-        for token subscribers. Each subscriber for this sid receives
-        ``resync{session_deleted} → STOP`` via :meth:`TokenSubscriber.terminate`.
         The generator receives STOP → breaks → finally →
         :meth:`TokenStreamRegistry.unsubscribe` (normal path: detach +
         decrement + last-detach stop flush + grace arm). Previously only a
-        resync was enqueued via the flush loop (no STOP) — the subscriber
-        connection stayed open forever (resource leak). The direct
-        ``terminate`` replaces ``_enqueue_session_resync`` so the frames
-        are delivered immediately in the correct order (resync THEN STOP),
-        not deferred to the next flush tick where STOP could precede resync.
+        lifecycle reason was enqueued via the flush loop without STOP, so the
+        subscriber connection stayed open forever. Direct ``terminate`` now
+        closes it immediately without emitting an out-of-domain resync.
 
         WHY also clear ``_session_status`` here (but NOT
         in ``_retire_session``): per spec ``_retire_session`` only owns
@@ -492,13 +425,11 @@ class IngestMixin:
         """
         self._retire_session(sid)
         self._session_status.pop(sid, None)
-        # rev-gate R4 核对结论：deletion 有独立 token 域退役逻辑
-        # （_retire_session + deleted-sid gate + terminate），故与 idle/
-        # eviction 同类——不写 barrier 的话，cursor < last_seq 的重连会把
-        # 已删除会话的旧 delta 重放成"活跃"流（复活），cursor == last_seq
-        # 则 up-to-date 挂在死流上。全局 session.digest 只覆盖订阅了全局
-        # 流的客户端；token 流须独立保证旧 cursor 不恢复 → 写 barrier，
-        # 重连走 resync{reconnect_no_replay} → HTTP 对齐（404/缺失确认删除）。
+        # Deletion has its own token-domain retirement path. The barrier keeps
+        # old cursors from replaying stale deltas or attaching up-to-date to a
+        # dead stream; reconnect goes through reconnect_no_replay and HTTP
+        # reconciliation. Global session.digest{deleted:true} remains the
+        # authoritative deletion signal.
         self._write_replay_barrier(sid, RESYNC_SESSION_DELETED)
         # CRITICAL 2 gate cleanup for this session.
         for key in [k for k in self._retired_messages if k[0] == sid]:
@@ -506,9 +437,9 @@ class IngestMixin:
         # P1-22: record sid in the deleted-sid gate so late part events
         # for this session are dropped (no LivePart resurrection).
         self._remember_deleted_sid(sid)
-        # INV-4 (P0-3): server-side termination — directly terminate each
-        # subscriber (resync{session_deleted} → STOP). Do NOT detach or
-        # decrement; the generator's finally → unsubscribe handles that.
+        # Server-side lifecycle termination: session_deleted is deliberately
+        # outside V4_RESYNC_REASONS, so terminate queues STOP only. Do not
+        # detach or decrement; the generator's finally handles unsubscribe.
         for sub in tuple(self._subs_by_sid.get(sid, ())):
             sub.terminate(RESYNC_SESSION_DELETED)
     def _retire_session(self, sid: str) -> None:
@@ -550,9 +481,9 @@ class IngestMixin:
         WHY this is gated on known-idle (bgpt NB#4): a session that has
         gone quiet for >60s while STILL BUSY (per upstream
         ``session.status``) is most likely in a long generation pause —
-        retiring its LivePart would drop accumulated text and force a
-        snapshot resync on the next delta, defeating the whole point of
-        the accumulator. We only retire when the upstream has explicitly
+        retiring its LivePart would drop accumulated text and invalidate the
+        incremental baseline, defeating the whole point of the accumulator.
+        We only retire when the upstream has explicitly
         told us the session is idle. Unknown status also does NOT retire.
 
         Returns the list of retired keys. Stage C's flush_loop calls this
@@ -579,9 +510,6 @@ class IngestMixin:
             # Stage B: drop cached revision alongside the part.
             self._part_revisions.pop(key, None)
             retired.append(key)
-        # Stage B v0.6 §P.2: prune expired + overflow entries from the
-        # message.removed replay queue (TTL 24h + FIFO cap 1000).
-        self._prune_removed_messages(now_ms)
         return retired
     # ------------------------------------------------------------------
     # Upstream lifecycle (Stage B wires reconnect state-clear;
@@ -620,12 +548,8 @@ class IngestMixin:
         out of scope for this fix. Documented here so revisitors know
         the invariant is "same sidecar process lifetime" only.
 
-        rev-ogpt CRITICAL 2: ``_retired_messages`` is also cleared — the
-        new upstream epoch starts fresh, late events from the previous
-        epoch cannot arrive (GlobalBus has no replay). ``_removed_messages``
-        (replay queue) is INTENTIONALLY preserved so a client reconnecting
-        post-upstream-loss still learns about prior message removals
-        during its handshake.
+        ``_retired_messages`` is cleared because the new upstream epoch
+        starts fresh; historical removals remain solely in ReplayLog.
         """
         self.live_parts.clear()
         self._nontext_parts.clear()
@@ -646,8 +570,7 @@ class IngestMixin:
         # P1-22: deleted-sid gate cleared (new epoch — deleted sessions
         # from the old epoch cannot send late part events).
         self._deleted_sids.clear()
-        # NOTE: _removed_messages (replay queue) AND _part_revisions are
-        # intentionally NOT cleared — see docstring.
+        # _part_revisions intentionally survives this reconnect.
         # Fan reconnect_no_replay to every sid with an attached subscriber.
         # (If subscribers themselves were torn down by the HTTP layer during
         # the reconnect, _subs_by_sid is already empty — no-op.)

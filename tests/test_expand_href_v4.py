@@ -1,4 +1,4 @@
-"""V4 formal revision §14 — expandRefs href generated per wire view.
+"""V4 formal revision §14 — expandRefs hrefs are natively v4.
 
 v4-contract §14 (2026-08-19 frozen): every ``expandRefs`` href carries the
 REQUEST's selector view — v4 requests emit ``?v=4`` (the v3 wire face was
@@ -13,14 +13,14 @@ are rejected by the selector middleware). This file locks:
   sidecar, ONLY query key; the client appends ``directory`` second; a
   sidecar-emitted href therefore never contains ``&``;
 * **dedup / sort invariance** — expandRefs dedup + (category, partID) sort
-  semantics are view-invariant (inherited unchanged from v3 §4a);
-* **selector-less default v3** — stacks without the selector middleware
-  keep the historical v3 hrefs;
+  semantics are unchanged;
+* **selector-less projection** — helper calls remain v4-native even when a
+  custom stack omits selector middleware;
 * **expand endpoint bytes** — the /expand route renders the same frozen
   envelope on the v4 face (§14 inherits v3 §4b).
 
-Pure-function tests thread ``wire_view`` explicitly; route tests go through
-``SlimapiSelectorMiddleware`` with the ``?v=4`` selector.
+Pure-function tests call the versionless projection API; route tests go
+through ``SlimapiSelectorMiddleware`` with the ``?v=4`` selector.
 """
 from __future__ import annotations
 
@@ -102,35 +102,34 @@ def _collect_hrefs(projected: list[dict]) -> list[str]:
     return hrefs
 
 
-def _assert_query_order_frozen(href: str, view: int) -> None:
+def _assert_query_order_frozen(href: str) -> None:
     """§14: ``v`` is the first (and only sidecar-emitted) query key."""
     assert href.count("?") == 1
     query = href.split("?", 1)[1]
-    assert query == f"v={view}"  # no '&', no other keys, `v` first
+    assert query == "v=4"  # no '&', no other keys, `v` first
 
 
-def test_projection_default_view_keeps_frozen_v3_bytes():
-    """No wire_view passed → the pure functions keep their historical
-    output: every href ends ``?v=3`` (byte-for-byte the v3 wire shape)."""
+def test_projection_is_natively_v4():
+    """Every pure projection entry point emits the frozen v4 href bytes."""
     out = skeleton_messages([_rich_message()], sid=SID)[0]
     hrefs = _collect_hrefs([out])
     assert len(hrefs) == 8  # 1 message-level + 4 tool + 2 file + 1 reasoning
     for href in hrefs:
-        _assert_query_order_frozen(href, 3)
+        _assert_query_order_frozen(href)
     assert out["info"]["expandRefs"] == [{
         "category": "info_summary_diffs",
         "messageID": "m1",
-        "href": f"/slimapi/messages/{SID}/expand/info_summary_diffs/m1?v=3",
+        "href": f"/slimapi/messages/{SID}/expand/info_summary_diffs/m1?v=4",
     }]
 
 
-def test_projection_v4_view_swaps_all_hrefs():
-    """wire_view=4 → every message-level AND part-level href is ``?v=4``."""
-    out = skeleton_messages([_rich_message()], sid=SID, wire_view=4)[0]
+def test_projection_all_href_categories_are_v4():
+    """Every message-level and part-level href is ``?v=4``."""
+    out = skeleton_messages([_rich_message()], sid=SID)[0]
     hrefs = _collect_hrefs([out])
     assert len(hrefs) == 8
     for href in hrefs:
-        _assert_query_order_frozen(href, 4)
+        _assert_query_order_frozen(href)
         assert href.endswith("?v=4")
     assert out["info"]["expandRefs"] == [{
         "category": "info_summary_diffs",
@@ -139,13 +138,8 @@ def test_projection_v4_view_swaps_all_hrefs():
     }]
 
 
-def test_projection_dedup_and_sort_invariant_under_v4():
-    """§14 inherits v3 §4a: dedup (multi-key collapse) + (category, partID)
-    sort are IDENTICAL under v4 — only the ``?v=`` value differs.
-
-    B12: both views are pinned to the SAME literal refs-shape golden —
-    the invariance property follows transitively without evaluating the
-    v4 expectation off a live v3 result (v3 half kept as guard net)."""
+def test_projection_dedup_and_sort_are_frozen_under_v4():
+    """Dedup (multi-key collapse) and (category, partID) sort stay frozen."""
     golden = {
         "message": [{"category": "info_summary_diffs", "messageID": "m1"}],
         "parts": [
@@ -185,7 +179,7 @@ def test_projection_dedup_and_sort_invariant_under_v4():
             ],
         }
 
-    v4 = skeleton_messages([_rich_message()], sid=SID, wire_view=4)[0]
+    v4 = skeleton_messages([_rich_message()], sid=SID)[0]
     assert _refs_shape(v4) == golden
 
     tool = v4["parts"][1]["expandRefs"]
@@ -198,21 +192,11 @@ def test_projection_dedup_and_sort_invariant_under_v4():
     for r in tool + file_refs + v4["parts"][0]["expandRefs"]:
         assert r["href"].endswith("?v=4")
 
-    # v3 守护网（Phase 4 拆除前保留）：默认视图（v3）同形状——href 侧
-    # 由 test_projection_default_view_keeps_frozen_v3_bytes 字节锁定。
-    v3 = skeleton_messages([_rich_message()], sid=SID)[0]
-    assert _refs_shape(v3) == golden
-
-
-def test_projection_without_sid_emits_no_refs_either_view():
-    """Without sid no href can be built — refs are dropped under BOTH views
-    (the reductions themselves still apply; view never leaks a href)."""
-    for view in (3, 4):
-        out = skeleton_messages(
-            [_rich_message()], sid=None, wire_view=view,
-        )[0]
-        assert _collect_hrefs([out]) == []
-        assert "expandRefs" not in out["info"]
+def test_projection_without_sid_emits_no_refs():
+    """Without sid no href can be built, so refs are dropped."""
+    out = skeleton_messages([_rich_message()], sid=None)[0]
+    assert _collect_hrefs([out]) == []
+    assert "expandRefs" not in out["info"]
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +320,7 @@ async def test_route_v4_default_mode_all_hrefs_v4(upstream_factory):
     hrefs = _collect_hrefs(items)
     assert len(hrefs) == 8
     for href in hrefs:
-        _assert_query_order_frozen(href, 4)
+        _assert_query_order_frozen(href)
     assert b"?v=3" not in r.content
 
 

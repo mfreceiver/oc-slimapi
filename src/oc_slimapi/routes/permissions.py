@@ -67,11 +67,8 @@ async def permissions(request: Request):
     || ``process.cwd()``), so pending cards in OTHER workdirs are invisible.
     This endpoint fans out across every discovered workdir and merges the
     results into a single envelope — the cold-start recovery path for
-    ocdroid's slim mode (v2 removed the permission aggregation endpoint;
-    before this, cold start/reconnect could only poll the catch-all
-    ``GET /permission``, which only sees ``process.cwd()``'s instance).
+    ocdroid's slim mode.
 
-    Additive (new endpoint); **no** ``X-Slimapi-Version`` bump (still 2).
     Each permission entry is the upstream ``PermissionV1.Request`` whitelist
     projection plus a ``directory`` field stamped with the directory it was
     fetched from (field order: the 7 Request fields, then directory).

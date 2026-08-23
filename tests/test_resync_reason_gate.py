@@ -14,8 +14,8 @@ Spec (N1, frozen by the Wave-1 plan): parse every ``.py`` under
 
 and assert each enumerated argument value is a member of the single
 frozen module-level frozenset ``SSE_RESYNC_REASONS``
-(``oc_slimapi.sse.hub_types`` — the leaf anchor; the frozen v4 four plus
-the v3-only lifecycle reasons). Accepted argument forms:
+(``oc_slimapi.sse.hub_types`` — the leaf anchor; the frozen v4 replay
+reasons plus shared lifecycle reasons). Accepted argument forms:
 
 * a string literal that is a member of the frozen set;
 * a constant-name reference (``RESYNC_X``) whose module-level assignment
@@ -307,7 +307,7 @@ def test_src_tree_resync_reasons_all_in_frozen_domain():
 
 def test_frozen_sets_are_frozen_and_complete():
     """The oracle itself: frozenset instances with the exact frozen members
-    (v4 four + v3 lifecycle four). Any change here is a wire-contract
+    (v4 replay four + shared lifecycle four). Any change here is a wire-contract
     change and must go through the contract process, not a silent edit."""
     assert type(SSE_RESYNC_REASONS) is frozenset
     assert type(V4_RESYNC_REASONS) is frozenset

@@ -21,7 +21,7 @@ from oc_slimapi.proxy import install_proxy
 from oc_slimapi.routes import children, health
 from oc_slimapi.transform import TransformConfig, TransformPool
 
-VERSION_HEADERS = {"X-Slimapi-Version": "2"}
+VERSION_HEADERS: dict[str, str] = {}
 
 
 def _child(sid: str = "c1") -> dict:

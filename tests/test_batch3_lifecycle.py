@@ -10,6 +10,8 @@ and epoch switches are strictly serial.
 
 from __future__ import annotations
 
+from conftest import current_replay_log
+
 import asyncio
 
 import pytest
@@ -80,7 +82,7 @@ class TestInv1Supervisor:
     async def test_flush_death_rebuilds_group_atomically(self):
         """flush_loop dies with an exception → siblings cancelled + group
         rebuilt (new run / flush / heartbeat). No orphan or duplicate."""
-        hub = GlobalHub(client=None)
+        hub = GlobalHub(client=None, replay_log=current_replay_log())
         try:
             sub = Subscriber()
             hub.subscribers.add(sub)  # has_consumers() == True
@@ -123,7 +125,7 @@ class TestInv1Supervisor:
 
     async def test_heartbeat_death_rebuilds_group_atomically(self):
         """heartbeat_loop dies → siblings cancelled + group rebuilt."""
-        hub = GlobalHub(client=None)
+        hub = GlobalHub(client=None, replay_log=current_replay_log())
         try:
             sub = Subscriber()
             hub.subscribers.add(sub)
@@ -157,7 +159,7 @@ class TestInv1Supervisor:
 
     async def test_run_death_rebuilds_group_atomically(self):
         """run dies with an exception → siblings cancelled + group rebuilt."""
-        hub = GlobalHub(client=None)
+        hub = GlobalHub(client=None, replay_log=current_replay_log())
         try:
             sub = Subscriber()
             hub.subscribers.add(sub)
@@ -192,7 +194,7 @@ class TestInv1Supervisor:
     async def test_member_death_no_rebuild_without_consumers(self):
         """A member dies but has_consumers() is False → siblings cancelled,
         NO rebuild (nothing to serve)."""
-        hub = GlobalHub(client=None)
+        hub = GlobalHub(client=None, replay_log=current_replay_log())
         try:
             # No subscribers → has_consumers() == False.
             calls = {"n": 0}
@@ -225,7 +227,7 @@ class TestInv1Supervisor:
     async def test_run_normal_exit_cancels_flush_and_heartbeat(self):
         """run() exits normally (has_consumers False) → its done_callback
         cancels flush + heartbeat immediately (small pre-grace leak fix)."""
-        hub = GlobalHub(client=None)
+        hub = GlobalHub(client=None, replay_log=current_replay_log())
         try:
             # ensure_upstream starts the group; run() will see
             # has_consumers()==False and exit immediately on the first tick.
@@ -254,7 +256,7 @@ class TestInv1Supervisor:
         Scenario: flush dies → callback cancels siblings + rebuilds. The
         old siblings' own done_callbacks must see the stale-group guard
         and return without cascading another rebuild."""
-        hub = GlobalHub(client=None)
+        hub = GlobalHub(client=None, replay_log=current_replay_log())
         try:
             sub = Subscriber()
             hub.subscribers.add(sub)
@@ -287,7 +289,7 @@ class TestInv1TokenFlushWatchdog:
     async def test_flush_death_rebuilds_when_subscribers_present(self):
         """flush_loop dies (flush raises) while subscriber_count > 0 →
         watchdog logs CRITICAL and rebuilds _flush_task."""
-        th = TokenStreamHub()
+        th = TokenStreamHub(replay_log=current_replay_log())
         try:
             # Fake a subscriber so subscriber_count > 0.
             class _FakeSub:
@@ -330,7 +332,7 @@ class TestInv1TokenFlushWatchdog:
     async def test_flush_death_no_rebuild_without_subscribers(self):
         """flush_loop dies but subscriber_count == 0 → no rebuild (the next
         first-attach start() will create a fresh task)."""
-        th = TokenStreamHub()
+        th = TokenStreamHub(replay_log=current_replay_log())
         try:
             assert th.subscriber_count == 0
 
@@ -357,7 +359,7 @@ class TestInv1TokenFlushWatchdog:
     async def test_flush_death_then_new_start_after_rebuild(self):
         """After watchdog rebuilds, the new _flush_task survives and flushes
         correctly (no infinite death loop)."""
-        th = TokenStreamHub()
+        th = TokenStreamHub(replay_log=current_replay_log())
         try:
             class _FakeSub:
                 def put(self, frame):
@@ -393,8 +395,7 @@ class TestInv1TokenFlushWatchdog:
 
 class TestInv2GraceSerialEpochCleanup:
     """registry._remove_hub_after_grace: await gather + re-check +
-    token_hub.on_upstream_reconnect (preserving _part_revisions /
-    _removed_messages)."""
+    token_hub.on_upstream_reconnect while preserving _part_revisions."""
 
     async def test_grace_removal_clears_token_hub_old_epoch_state(self, monkeypatch):
         """grace removal fires → token_hub.on_upstream_reconnect() called →
@@ -403,13 +404,13 @@ class TestInv2GraceSerialEpochCleanup:
         monkeypatch.setattr("oc_slimapi.sse.global_hub.GRACE_SECONDS", 0.0)
         monkeypatch.setattr("oc_slimapi.sse.registry.GRACE_SECONDS", 0.0)
 
-        th = TokenStreamHub()
+        th = TokenStreamHub(replay_log=current_replay_log())
         # Populate old-epoch state.
         th._session_status["s1"] = "busy"
         th.live_parts[("s1", "m1", "p1")] = LivePart()
         th._retired_messages.add(("s1", "m1"))
 
-        registry = HubRegistry(client=None)
+        registry = HubRegistry(client=None, replay_log=current_replay_log())
         registry.set_token_hub(th)
 
         sub = registry.subscribe()
@@ -429,16 +430,14 @@ class TestInv2GraceSerialEpochCleanup:
 
     async def test_part_revisions_preserved_across_epoch_cleanup(self, monkeypatch):
         """CRITICAL 1: _part_revisions survives on_upstream_reconnect
-        (ocdroid strict-`>` watermark invariant). Also _removed_messages
-        (replay queue) survives."""
+        (ocdroid strict-`>` watermark invariant)."""
         monkeypatch.setattr("oc_slimapi.sse.global_hub.GRACE_SECONDS", 0.0)
         monkeypatch.setattr("oc_slimapi.sse.registry.GRACE_SECONDS", 0.0)
 
-        th = TokenStreamHub()
+        th = TokenStreamHub(replay_log=current_replay_log())
         th._part_revisions[("s1", "m1", "p1")] = 42
-        th._removed_messages[("s1", "m1")] = 99999
 
-        registry = HubRegistry(client=None)
+        registry = HubRegistry(client=None, replay_log=current_replay_log())
         registry.set_token_hub(th)
 
         sub = registry.subscribe()
@@ -451,8 +450,6 @@ class TestInv2GraceSerialEpochCleanup:
         # CRITICAL 1: _part_revisions preserved.
         assert ("s1", "m1", "p1") in th._part_revisions
         assert th._part_revisions[("s1", "m1", "p1")] == 42
-        # Replay queue preserved.
-        assert ("s1", "m1") in th._removed_messages
 
     async def test_grace_removal_awaits_hub_tasks(self, monkeypatch):
         """INV-2: after cancelling hub tasks, the removal awaits their full
@@ -461,7 +458,7 @@ class TestInv2GraceSerialEpochCleanup:
         monkeypatch.setattr("oc_slimapi.sse.global_hub.GRACE_SECONDS", 0.0)
         monkeypatch.setattr("oc_slimapi.sse.registry.GRACE_SECONDS", 0.0)
 
-        registry = HubRegistry(client=None)
+        registry = HubRegistry(client=None, replay_log=current_replay_log())
         sub = registry.subscribe()
         hub = registry.get_global()
         run_ref = hub.task
@@ -487,7 +484,7 @@ class TestInv2GraceSerialEpochCleanup:
         monkeypatch.setattr("oc_slimapi.sse.global_hub.GRACE_SECONDS", 0.0)
         monkeypatch.setattr("oc_slimapi.sse.registry.GRACE_SECONDS", 0.0)
 
-        registry = HubRegistry(client=None)
+        registry = HubRegistry(client=None, replay_log=current_replay_log())
         sub = registry.subscribe()
         hub = registry.get_global()
         # Replace run with a slow-to-cancel task so the gather has a wide
@@ -544,7 +541,7 @@ class TestInv2GraceSerialEpochCleanup:
         monkeypatch.setattr("oc_slimapi.sse.global_hub.GRACE_SECONDS", 0.0)
         monkeypatch.setattr("oc_slimapi.sse.registry.GRACE_SECONDS", 0.0)
 
-        registry = HubRegistry(client=None)
+        registry = HubRegistry(client=None, replay_log=current_replay_log())
         sub = registry.subscribe()
         hub = registry.get_global()
         # Slow-to-cancel run task.
@@ -585,8 +582,8 @@ class TestInv3SubscribeRollback:
     start / attach triggers symmetric rollback."""
 
     def _build_registry(self) -> tuple:
-        th = TokenStreamHub()
-        hubs = HubRegistry(client=None)
+        th = TokenStreamHub(replay_log=current_replay_log())
+        hubs = HubRegistry(client=None, replay_log=current_replay_log())
         hubs.set_token_hub(th)
         reg = TokenStreamRegistry(
             th, hubs,
@@ -605,7 +602,7 @@ class TestInv3SubscribeRollback:
         monkeypatch.setattr("oc_slimapi.sse.registry.GRACE_SECONDS", 0.0)
         reg, th, hubs = self._build_registry()
         try:
-            def raising_attach(sid, sub, wire_v4=False):
+            def raising_attach(sid, sub):
                 raise RuntimeError("attach boom")
 
             th.attach_subscriber = raising_attach  # type: ignore[assignment]
@@ -632,7 +629,7 @@ class TestInv3SubscribeRollback:
         but the code is NOT a capacity error — the exception propagates as-is."""
         reg, th, hubs = self._build_registry()
         try:
-            def raising_attach(sid, sub, wire_v4=False):
+            def raising_attach(sid, sub):
                 raise RuntimeError("attach boom")
 
             th.attach_subscriber = raising_attach  # type: ignore[assignment]
@@ -652,7 +649,7 @@ class TestInv3SubscribeRollback:
         except Exception."""
         reg, th, hubs = self._build_registry()
         try:
-            def cancelling_attach(sid, sub, wire_v4=False):
+            def cancelling_attach(sid, sub):
                 raise asyncio.CancelledError()
 
             th.attach_subscriber = cancelling_attach  # type: ignore[assignment]
@@ -689,11 +686,11 @@ class TestInv3SubscribeRollback:
             calls = {"n": 0}
             real_attach = th.attach_subscriber
 
-            def fail_once(sid, sub, wire_v4=False):
+            def fail_once(sid, sub):
                 calls["n"] += 1
                 if calls["n"] == 1:
                     raise RuntimeError("first attach boom")
-                real_attach(sid, sub, wire_v4=wire_v4)
+                real_attach(sid, sub)
 
             th.attach_subscriber = fail_once  # type: ignore[assignment]
 
@@ -721,14 +718,7 @@ class _FakeSub:
     def __init__(self, session_id: str = "s1") -> None:
         self.session_id = session_id
         self.frames: list = []
-        self._in_handshake = False
         self.closed = False
-
-    def begin_handshake(self) -> None:
-        self._in_handshake = True
-
-    def end_handshake(self) -> None:
-        self._in_handshake = False
 
     def put(self, frame) -> bool:
         self.frames.append(frame)
@@ -750,7 +740,7 @@ class TestInv4SessionDeletedTermination:
         followed by STOP — strict order, delivered synchronously (not via
         flush loop)."""
         from oc_slimapi.sse.tokenstream.frames import STOP
-        th = TokenStreamHub()
+        th = TokenStreamHub(replay_log=current_replay_log())
         sub = _FakeSub(session_id="s1")
         th.attach_subscriber("s1", sub)
         sub.frames.clear()
@@ -773,7 +763,7 @@ class TestInv4SessionDeletedTermination:
     def test_no_enqueue_session_resync(self):
         """INV-4: on_session_deleted does NOT call _enqueue_session_resync
         (the old deferred flush-loop path is removed)."""
-        th = TokenStreamHub()
+        th = TokenStreamHub(replay_log=current_replay_log())
         th.on_session_deleted("s1")
         assert th._pending_session_resinks == []
 
@@ -781,7 +771,7 @@ class TestInv4SessionDeletedTermination:
         """INV-4: on_session_deleted terminates the subscriber but does NOT
         detach it from _subs_by_sid — the generator's finally → unsubscribe
         relies on has_subscriber() == True to run the normal cleanup."""
-        th = TokenStreamHub()
+        th = TokenStreamHub(replay_log=current_replay_log())
         sub = _FakeSub(session_id="s1")
         th.attach_subscriber("s1", sub)
         th.on_session_deleted("s1")
@@ -792,7 +782,7 @@ class TestInv4SessionDeletedTermination:
         """Only subscribers for the deleted sid are terminated; subscribers
         for other sids are untouched."""
         from oc_slimapi.sse.tokenstream.frames import STOP
-        th = TokenStreamHub()
+        th = TokenStreamHub(replay_log=current_replay_log())
         sub1 = _FakeSub(session_id="s1")
         sub2 = _FakeSub(session_id="s2")
         th.attach_subscriber("s1", sub1)
@@ -809,7 +799,7 @@ class TestInv4SessionDeletedTermination:
 
     def test_live_parts_cleared_for_deleted_sid(self):
         """Existing cleanup is preserved: _retire_session clears live_parts."""
-        th = TokenStreamHub()
+        th = TokenStreamHub(replay_log=current_replay_log())
         th._subs_by_sid.setdefault("s1", set()).add(_FakeSub(session_id="s1"))
         th.live_parts[("s1", "m1", "p1")] = LivePart()
         th.on_session_deleted("s1")
@@ -818,7 +808,7 @@ class TestInv4SessionDeletedTermination:
     def test_multiple_subscribers_all_terminated(self):
         """Multiple subscribers for the same deleted sid are all terminated."""
         from oc_slimapi.sse.tokenstream.frames import STOP
-        th = TokenStreamHub()
+        th = TokenStreamHub(replay_log=current_replay_log())
         sub_a = _FakeSub(session_id="s1")
         sub_b = _FakeSub(session_id="s1")
         th.attach_subscriber("s1", sub_a)
@@ -838,8 +828,8 @@ class TestInv4SessionDeletedTermination:
         monkeypatch.setattr("oc_slimapi.sse.global_hub.GRACE_SECONDS", 0.0)
         monkeypatch.setattr("oc_slimapi.sse.registry.GRACE_SECONDS", 0.0)
 
-        th = TokenStreamHub()
-        hubs = HubRegistry(client=None)
+        th = TokenStreamHub(replay_log=current_replay_log())
+        hubs = HubRegistry(client=None, replay_log=current_replay_log())
         hubs.set_token_hub(th)
         reg = TokenStreamRegistry(
             th, hubs,
@@ -896,14 +886,14 @@ class TestP1_22DeletedSidGate:
     def test_deleted_sid_blocks_part_updated(self):
         """After on_session_deleted, a late message.part.updated for the same
         sid does NOT create a LivePart."""
-        th = TokenStreamHub()
+        th = TokenStreamHub(replay_log=current_replay_log())
         th.on_session_deleted("s1")
         th.on_part_updated(_updated_props("s1", "m1", "p1", text="hello"))
         assert ("s1", "m1", "p1") not in th.live_parts
 
     def test_deleted_sid_blocks_part_delta(self):
         """After on_session_deleted, a late message.part.delta is dropped."""
-        th = TokenStreamHub()
+        th = TokenStreamHub(replay_log=current_replay_log())
         # Create a LivePart first, then delete the session.
         th.on_part_updated(_updated_props("s1", "m1", "p1", text=""))
         assert ("s1", "m1", "p1") in th.live_parts
@@ -916,7 +906,7 @@ class TestP1_22DeletedSidGate:
 
     def test_deleted_sid_blocks_part_removed(self):
         """After on_session_deleted, a late message.part.removed is a no-op."""
-        th = TokenStreamHub()
+        th = TokenStreamHub(replay_log=current_replay_log())
         th.on_session_deleted("s1")
         # Should not crash or create state.
         th.on_part_removed("s1", "m1", "p1")
@@ -924,14 +914,14 @@ class TestP1_22DeletedSidGate:
 
     def test_other_sid_not_blocked(self):
         """Part events for a DIFFERENT sid are not blocked by a deleted sid."""
-        th = TokenStreamHub()
+        th = TokenStreamHub(replay_log=current_replay_log())
         th.on_session_deleted("s1")
         th.on_part_updated(_updated_props("s2", "m2", "p2", text="hello"))
         assert ("s2", "m2", "p2") in th.live_parts
 
     def test_gate_cleared_on_reconnect(self):
         """on_upstream_reconnect clears the deleted-sid gate (new epoch)."""
-        th = TokenStreamHub()
+        th = TokenStreamHub(replay_log=current_replay_log())
         th.on_session_deleted("s1")
         assert "s1" in th._deleted_sids
         th.on_upstream_reconnect()
@@ -943,7 +933,7 @@ class TestP1_22DeletedSidGate:
     def test_gate_is_bounded(self):
         """The deleted-sid gate has a FIFO cap (TOKEN_REMOVED_MESSAGES_MAX)."""
         from oc_slimapi.config import TOKEN_REMOVED_MESSAGES_MAX
-        th = TokenStreamHub()
+        th = TokenStreamHub(replay_log=current_replay_log())
         for i in range(TOKEN_REMOVED_MESSAGES_MAX + 50):
             th.on_session_deleted(f"sid_{i}")
         # Cap enforced.
@@ -961,16 +951,16 @@ class TestP1_22DeletedSidGate:
 class TestInv5ConfigFrameCeiling:
     """TokenStreamHub.max_frame_bytes sourced from Settings (not hardcoded)."""
 
-    def test_hub_uses_configured_max_frame_bytes(self):
-        """A hub constructed with max_frame_bytes=512KiB truncates a 700KiB
-        snapshot instead of silently accepting it (the default 1MiB would
-        accept it)."""
+    def test_hub_uses_configured_max_frame_bytes_without_attach_prefill(self):
+        """Native-v4 attach emits no historical snapshot/truncated frame."""
         config_bytes = 512 * 1024
-        th = TokenStreamHub(max_frame_bytes=config_bytes)
+        th = TokenStreamHub(
+            max_frame_bytes=config_bytes,
+            replay_log=current_replay_log(),
+        )
         assert th._max_frame_bytes == config_bytes
 
-        # Create a LivePart with large seed BEFORE attaching (so the
-        # handshake snapshot picks it up).
+        # Retain a LivePart whose historical serialisation exceeds the cap.
         big_text = "x" * (700 * 1024)
         th.on_part_updated({
             "part": {
@@ -981,23 +971,18 @@ class TestInv5ConfigFrameCeiling:
         })
         assert ("s1", "m1", "p1") in th.live_parts
 
-        # Attach subscriber — handshake snapshot exceeds 512KiB frame cap.
+        # Native-v4 attach joins only live fanout. Historical recovery is via
+        # ReplayLog or authoritative HTTP alignment, never private prefill.
         sub = _FakeSub(session_id="s1")
         th.attach_subscriber("s1", sub)
 
-        truncated_frames = [
-            f for f in sub.frames
-            if isinstance(f, bytes) and b"truncated" in f
-        ]
-        assert len(truncated_frames) > 0, (
-            "INV-5: a snapshot exceeding the configured max_frame_bytes "
-            "must be truncated, not silently accepted"
-        )
+        assert sub.frames == []
+        assert th.truncated_snapshots_total == 0
 
     def test_default_hub_uses_1mib(self):
         """Without explicit config, the hub uses the 1MiB default."""
         from oc_slimapi.config import DEFAULT_TOKEN_MAX_FRAME_BYTES
-        th = TokenStreamHub()
+        th = TokenStreamHub(replay_log=current_replay_log())
         assert th._max_frame_bytes == DEFAULT_TOKEN_MAX_FRAME_BYTES
 
 
@@ -1034,7 +1019,7 @@ class TestInv6EofLossAndDoubleNotify:
             def stream(self, *args, **kwargs):
                 return _MockResponse()
 
-        hub = GlobalHub(client=_MockClient())
+        hub = GlobalHub(client=_MockClient(), replay_log=current_replay_log())
         sub = Subscriber()
         hub.subscribers.add(sub)
 
@@ -1081,7 +1066,7 @@ class TestInv6EofLossAndDoubleNotify:
             def stream(self, *args, **kwargs):
                 raise ConnectionError("connect failed")
 
-        hub = GlobalHub(client=_MockClient())
+        hub = GlobalHub(client=_MockClient(), replay_log=current_replay_log())
         sub = Subscriber()
         hub.subscribers.add(sub)
 
@@ -1128,7 +1113,7 @@ class TestP1_21SessionMetadataCap:
     def test_session_status_capped(self):
         """Injecting > _SESSION_STATUS_MAX sids evicts the oldest."""
         from oc_slimapi.sse.tokenstream.hub import _SESSION_STATUS_MAX
-        th = TokenStreamHub()
+        th = TokenStreamHub(replay_log=current_replay_log())
         for i in range(_SESSION_STATUS_MAX + 50):
             th.on_session_status(f"sid_{i}", "busy")
         assert len(th._session_status) <= _SESSION_STATUS_MAX
@@ -1138,7 +1123,7 @@ class TestP1_21SessionMetadataCap:
     def test_sticky_last_error_capped(self):
         """sticky_last_error is bounded (FIFO cap)."""
         from oc_slimapi.sse.global_hub import _LAST_UPDATED_AT_BY_SID_MAX
-        hub = GlobalHub(client=None)
+        hub = GlobalHub(client=None, replay_log=current_replay_log())
         for i in range(_LAST_UPDATED_AT_BY_SID_MAX + 50):
             hub.sticky_last_error[f"sid_{i}"] = {"name": "err", "message": "x", "at": 0}
             hub.sticky_last_error.move_to_end(f"sid_{i}")
@@ -1150,7 +1135,7 @@ class TestP1_21SessionMetadataCap:
     def test_deleted_tombstones_capped(self):
         """deleted_tombstones is bounded (FIFO cap)."""
         from oc_slimapi.sse.global_hub import _LAST_UPDATED_AT_BY_SID_MAX
-        hub = GlobalHub(client=None)
+        hub = GlobalHub(client=None, replay_log=current_replay_log())
         for i in range(_LAST_UPDATED_AT_BY_SID_MAX + 50):
             hub.deleted_tombstones[f"sid_{i}"] = None
             hub.deleted_tombstones.move_to_end(f"sid_{i}")

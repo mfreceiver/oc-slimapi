@@ -1,8 +1,8 @@
 """``GET /slimapi/sessions/{sid}/stream`` — token-stream SSE (design §5.1).
 
-Generates a per-session ``text/event-stream`` of in-flight text-part deltas
-plus handshake / snapshot / terminal / resync frames, sourced from the
-process-wide :class:`TokenStreamHub` accumulator.
+Generates a per-session ``text/event-stream`` of in-flight text-part deltas,
+tombstones and resync controls sourced from the process-wide
+:class:`TokenStreamHub` accumulator.
 
 Stage-D scope (design-token-stream.md §5.1 / §5.5 / §5.6 / §7):
 
@@ -12,26 +12,22 @@ Stage-D scope (design-token-stream.md §5.1 / §5.5 / §5.6 / §7):
 * Admission runs in :meth:`TokenStreamRegistry.subscribe` under the token
   cap (independent ledger, NOT ``MAX_TOTAL_SUBSCRIBERS``); overflow → 503
   ``sse_token_subscriber_limit`` + ``Retry-After``.
-* Replay semantics (B3b-2, v4-contract §7; the sole face since the V2b
-  teardown of the historical v3 no-replay path): business frames
-  (delta / snapshot done marker / truncated / message.removed tombstone)
+* Replay semantics (v4-contract §7): business frames
+  (delta / message.removed tombstone / replayable resync)
   carry ``id: t:<sid>:<epoch>:<seq>``; a ``Last-Event-ID:
   t:<sid>:<epoch>:<seq>`` reconnect replays the window after the cursor
   (frames strictly seq-increasing before any new frame) per the frozen
   four-way classification (① syntax / ② endpoint+sid / ③ epoch /
-  ④ barrier→window→gap); meta / resync / heartbeat / handshake frames
+  ④ barrier→window→gap); meta / route-private resync / heartbeat frames
   never carry an id.
 * **Identity-only stream (§7.2 terminal, v4-contract §7 "SSE 恒
-  identity")**: the body is NEVER content-encoded — meta / handshake /
+  identity")**: the body is NEVER content-encoded — meta /
   business / resync frames are yielded raw regardless of
   ``Accept-Encoding`` — so the response emits no ``Vary`` header and
   does not participate in Accept-Encoding negotiation (an
   AE-independent representation needs no variance marker; the stream is
-  no-cache anyway). The historical Stage-D/E "Lever 2" streaming-gzip
-  exception (a per-connection ``zlib`` deflater with ``Z_SYNC_FLUSH``
-  after every event block) was retired with the v2 pipeline teardown —
-  the route is identity-only because its frames are token-deltas, not
-  because of a version fork.
+  no-cache anyway). The route is identity-only because its frames are
+  latency-sensitive token deltas, not because of a version fork.
 * Lifecycle: ``subscribe`` starts the flush loop on first-attach; the
   generator's ``finally`` detaches on disconnect / client-close, and the
   last-detach stops the loop (NB-C4). Idempotent and leak-free.
@@ -46,13 +42,10 @@ from ..directory import validate_directory
 from ..errors import CodedHTTPException
 from ..gzip_util import json_response
 from ..sse.replay_log import (
-    RESYNC_RECONNECT_NO_REPLAY,
     ReplayFrames,
-    ReplayLog,
     ReplayResync,
     token_domain,
 )
-from ..sse.hub_types import RESYNC_RECONNECT_NO_REPLAY
 from ..sse.replay_wire import classify_reconnect, frame_with_id, meta_v4_extension
 from ..sse.token_hub import (
     STOP,
@@ -65,25 +58,18 @@ from ..sse_observability import sse_close, sse_open
 router = APIRouter(prefix="/slimapi", tags=["token-stream"])
 
 
-def _resolve_directory_conflict(request: Request, directory: str | None) -> None:
-    """NB-D7 (design §5.1): guard ``directory`` query vs ``X-Opencode-Directory``
-    header — same structural 400 ``directory_not_allowed`` as the messages
-    route. The directory is otherwise a NO-OP for token-stream fanout (the
-    accumulator keys on ``sid``, which is globally unique in single-user T3;
-    directory does not change which frames a subscriber receives). The
-    conflict check is kept because a query+header mismatch is structurally
-    ambiguous regardless of whether the value is consumed downstream —
-    slimapi refuses to guess which one to honour. Normalisation is applied
-    for parity with the messages route even though the result is unused.
+def _validate_directory_query(request: Request, directory: str | None) -> None:
+    """Validate the no-op ``directory`` query without reading retired headers.
 
-    §5.6 terminal: the multi-value pre-check — a ``?directory=`` with
-    differing (normalised) values → 400 ``invalid_directory_selector``
-    (the consuming-set-wide rule, evaluated unconditionally under the
-    v3-only terminal state). After single-valuing, the inherited guard
-    runs: query-only accepted no-op; query+header normalised-different →
-    ``directory_not_allowed``. A header alone is retired at the dispatch
-    layer (§5.7). This route is NOT dispatch-consumed — the stream query
-    keeps its ``directory`` bytes.
+    Differing normalised values in a repeated ``?directory=`` query produce
+    400 ``invalid_directory_selector``; a single value still passes through
+    :func:`validate_directory`.  The validated value does not participate in
+    token fanout because the accumulator keys on globally unique ``sid``.
+
+    In production, header-only and query+header directory errors are emitted
+    by ``SlimapiSelectorMiddleware`` before route dispatch.  Selector-less
+    callers of this helper therefore validate query input only and must not
+    inspect the retired inbound directory header.
     """
     getlist = getattr(request.query_params, "getlist", None)
     if getlist is None:  # mock/direct-invocation requests (httpx QueryParams)
@@ -93,11 +79,6 @@ def _resolve_directory_conflict(request: Request, directory: str | None) -> None
         raise CodedHTTPException(400, code="invalid_directory_selector")
     if directory is None:
         return
-    header_dir = request.headers.get("x-opencode-directory")
-    if header_dir:  # treat empty header as absent
-        if (header_dir.rstrip("/") or "/") != (directory.rstrip("/") or "/"):
-            raise CodedHTTPException(400, code="directory_not_allowed")
-    # Normalise for parity (unused — directory does not filter fanout).
     validate_directory(directory)
 
 
@@ -105,54 +86,32 @@ def _resolve_directory_conflict(request: Request, directory: str | None) -> None
 async def token_stream(request: Request, sid: str, directory: str | None = None):
     """Per-session token-stream SSE.
 
-    ``directory`` query (design §5.1): a conflict with the
-    ``X-Opencode-Directory`` header (trailing-slash-normalised values
-    differ) → 400 ``directory_not_allowed`` (NB-D7, structural guard mirroring
-    the messages route). When not conflicting, ``directory`` is a NO-OP:
-    the accumulator keys on ``sid`` which is globally unique (single-user
-    T3), so directory filtering does not change which frames this connection
-    receives and does not open a second upstream connection.
+    The optional ``directory`` query is validated but remains a fanout NO-OP:
+    the accumulator keys on globally unique ``sid``.  In production, the
+    selector handles retired directory-header errors before route dispatch;
+    this handler does not read that header itself.
     """
-    # NB-D7: structural directory conflict guard (before admission).
-    _resolve_directory_conflict(request, directory)
+    # Query validation remains before replay classification and admission.
+    _validate_directory_query(request, directory)
     registry = request.app.state.token_registry
     last_event_id = request.headers.get("last-event-id")
 
-    # B3b-2 replay wiring (absent on minimal test apps → v4 degrades to the
-    # id-less / un-replayed stream, mirroring the v3 shape).
-    replay_log: ReplayLog | None = getattr(request.app.state, "replay_log", None)
-    replay_epoch: str | None = getattr(request.app.state, "replay_epoch", None)
-    if replay_epoch is None and replay_log is not None:
-        replay_epoch = replay_log.epoch
+    replay_log = request.app.state.replay_log
+    replay_epoch = replay_log.epoch
 
     # Replay classification MUST run BEFORE registry.subscribe(): the
     # outcome freezes a log snapshot at T0 while the subscriber joins the
     # fanout set at T1 > T0 — replay covers seq ≤ last_seq@T0, the queue
     # carries everything published after attach; no frame twice, no gap.
-    replay_plan = None
-    if replay_log is not None:
-        replay_plan = classify_reconnect(
-            last_event_id, replay_log,
-            domain=token_domain(sid), token_sid=sid,
-        )
-    elif last_event_id:
-        # No replay infrastructure on this app (minimal/test stack): a
-        # reconnect cursor we cannot evaluate is NEVER first-connect — the
-        # client may be missing frames we have no record of. Fail safe with
-        # the blanket resync (mirrors the v3 semantics).
-        replay_plan = ReplayResync(RESYNC_RECONNECT_NO_REPLAY)
+    replay_plan = classify_reconnect(
+        last_event_id, replay_log,
+        domain=token_domain(sid), token_sid=sid,
+    )
 
     try:
-        # rev-gate BLOCKER-1: the wire version flows INTO the subscription
-        # (before the handshake pre-fill runs) — v4 attaches with the
-        # no-prefill handshake (no server.connected / historical
-        # tombstones / live-part snapshot) and every later fanout frame
-        # is id-stamped from the start.
-        subscriber = registry.subscribe(sid, wire_v4=True)
+        subscriber = registry.subscribe(sid)
     except TokenSubscriberCapacityError as exc:
         body = {"code": exc.code, "limit": exc.limit, "current": exc.current}
-        if exc.buffer_bytes is not None:
-            body["bufferBytes"] = exc.buffer_bytes
         return json_response(
             body,
             status_code=503,
@@ -167,29 +126,20 @@ async def token_stream(request: Request, sid: str, directory: str | None = None)
     # published between subscribe() and the first yield shift seqBase
     # ahead of the replay plan the client is about to receive.
     meta_fields: dict = {"subscriberId": subscriber_id, "tokens": True}
-    if replay_log is not None and replay_epoch is not None:
-        meta_fields.update(
-            meta_v4_extension(
-                replay_epoch, replay_log.last_seq(token_domain(sid)),
-            )
+    meta_fields.update(
+        meta_v4_extension(
+            replay_epoch, replay_log.last_seq(token_domain(sid)),
         )
-        # 4.12.0 修订六 B-1: this stream's business frames embed the
-        # replay publish seq in their payloads (``seq`` == the ``id:``
-        # line's last segment on the v4 wire; visible to v3 wires too).
-        # Advertised as an ADDITIVE per-stream capability key — absent on
-        # no-replay-log stacks, where frames carry neither id lines nor
-        # payload seq (key absence = capability unavailable, §3.1 probe
-        # semantics). The versions endpoint advertises the same key on
-        # the static ``capabilities["4"]`` face.
-        meta_fields["capabilities"] = {
-            **meta_fields["capabilities"], "tokenFrameSeq": True,
-        }
+    )
+    meta_fields["capabilities"] = {
+        **meta_fields["capabilities"], "tokenFrameSeq": True,
+    }
     meta_frame = sse_frame(meta_fields, event="slimapi.meta")
-    # §7.2 terminal (v3-only): the meta first frame is the id channel (the
+    # §7.2 terminal: the meta first frame is the id channel (the
     # retired X-Slimapi-Subscriber-ID header is never produced), AND the
     # frozen "SSE 流不做 content-encoding（帧字节原样）" clause — the
     # stream is ALWAYS identity regardless of Accept-Encoding
-    # (meta/handshake/business/resync frames raw).
+    # (meta/business/resync frames raw).
     # Pull the traffic ledger here so a missing / disabled ledger does not
     # crash the SSE path on the first yield.
     traffic_ledger = getattr(request.app.state, "traffic_ledger", None)
@@ -216,14 +166,13 @@ async def token_stream(request: Request, sid: str, directory: str | None = None)
                 pass
 
         try:
-            # v3 §9.1 (Batch A): sse_open row when the stream actually
-            # starts; sse_close + same lifecycleId in the finally below.
+            # Open the traffic lifecycle when the stream actually starts;
+            # close it with the same lifecycleId in the finally below.
             # ``getattr`` — direct route-invocation tests may pass mock
             # requests without ``.scope`` (helper then no-ops).
             lifecycle_id = sse_open(getattr(request, "scope", None), bucket="token_stream_sse")
-            # §7.2 terminal: meta FIRST — before the handshake frames
-            # subscribe() already enqueued AND the replay / Last-Event-ID
-            # resync block below. ``tokens`` is frozen ``true`` on /stream
+            # §7.2 terminal: meta FIRST, before replay / Last-Event-ID
+            # handling and newly published frames. ``tokens`` is true on /stream
             # (a token stream always carries tokens). Identity stream —
             # frames are yielded raw (§7.2 terminal). v4 (§7.0②) extends
             # meta additively (capabilities/epoch/seqBase); the meta frame
@@ -231,30 +180,22 @@ async def token_stream(request: Request, sid: str, directory: str | None = None)
             out = meta_frame
             _account(out)
             yield out
-            if replay_plan is not None:
-                # v4 (§7.2): reconnect handling — replay frames / resync
-                # yielded strictly before the handshake deque and any new
-                # frame. Resync frames never carry an id; the server never
-                # sends a snapshot frame (the client does an HTTP full
-                # fetch after resync).
-                if isinstance(replay_plan, ReplayResync):
-                    out = _resync_frame(sid, replay_plan.reason)
+            # v4 (§7.2): reconnect handling — replay frames / resync are
+            # yielded strictly before any new frame. Resync frames never
+            # carry an id; the client does an HTTP full fetch after resync.
+            if isinstance(replay_plan, ReplayResync):
+                out = _resync_frame(sid, replay_plan.reason)
+                _account(out)
+                yield out
+            elif isinstance(replay_plan, ReplayFrames):
+                for entry in replay_plan.entries:
+                    frame = frame_with_id(
+                        entry.payload, token_domain(sid), replay_epoch, entry.seq,
+                    )
+                    out = frame
                     _account(out)
                     yield out
-                elif isinstance(replay_plan, ReplayFrames):
-                    for entry in replay_plan.entries:
-                        frame = frame_with_id(
-                            entry.payload, token_domain(sid), replay_epoch, entry.seq,
-                        )
-                        out = frame
-                        _account(out)
-                        yield out
-                # ReplayIgnoreReset → first-connect semantics: nothing.
-            # (The v3 blanket-resync leg — any Last-Event-ID → leading
-            # reconnect_no_replay before server.connected — was removed
-            # with the V2b src teardown: under the v4-only face the
-            # handler-time classification above ALWAYS yields a plan when
-            # a cursor is present, so no generator-side leg is reachable.)
+            # ReplayIgnoreReset → first-connect semantics: nothing.
             while True:
                 item = await subscriber.queue.get()
                 if item is STOP:
@@ -278,9 +219,8 @@ async def token_stream(request: Request, sid: str, directory: str | None = None)
     # §7.2 terminal: frames are always identity → the representation does
     # not depend on Accept-Encoding, so no Vary is emitted (an
     # AE-independent representation needs no AE variance marker; the stream
-    # is no-cache anyway). The retired X-Slimapi-Subscriber-ID header is
-    # never produced (§1) — the slimapi.meta first frame's
-    # ``subscriberId`` is the id channel.
+    # is no-cache anyway). ``subscriberId`` is carried by the first
+    # slimapi.meta frame rather than an HTTP response header.
 
     return StreamingResponse(
         generate(),

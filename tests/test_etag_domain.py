@@ -1,20 +1,10 @@
-"""v3-contract §6 ETag domain-isolation tests (Batch B, TDD).
+"""Current v4 ETag domain-isolation tests.
 
-B12 (2026-08-21) three-way split: the two messages-route ETag behavioural
-checks (same request → same validator; envelope-content change rotates it)
-were rewritten to the ``?v=4`` face — v4 messages ≡ v3 (§10) with the
-validator keyed to the REP wire=v4 domain (§15), so the behaviour holds
-per-view.
+The messages validator is keyed to the REP `wire=v4` domain. These tests lock
+stable validators for identical representations, rotation on envelope-content
+changes, and URI-selector exclusion from `Vary`.
 
-V2b (2026-08-21 Phase-4 guard teardown) deleted the v3-face guardian net:
-the wire-marker unit locks (b"wire=v3" fingerprints, the default-view-3
-terminal — the src lane re-locks the wire=v4 fingerprint/default when the
-physical v3 removal lands), the retired-v2-form validator rejection
-guards, and the v3 sessions 304 shape lock (the v4 global sessions list
-carries no ETag at all, §4; its representation is locked in
-test_sessions_v4_representation / test_vary_directory_unconditional).
-
-Covers (all on the admitted ``?v=4`` face):
+Covers (on the admitted ``?v=4`` face):
 
 * §6.3 — envelope routes' canonical ETag input is the envelope body (same
   request → same ETag; envelope content change → different ETag).
@@ -65,7 +55,7 @@ def _sessions_payload() -> bytes:
 
 
 def _build_app(handler) -> FastAPI:
-    app = FastAPI(title="oc-slimapi-v3-etag-test")
+    app = FastAPI(title="oc-slimapi-etag-test")
     app.state.config = _settings()
     app.state.upstream = httpx.AsyncClient(
         base_url="http://127.0.0.1:4096",
@@ -102,8 +92,7 @@ async def client_factory():
 
 
 async def test_v4_etag_same_request_stable_and_own_view_304(client_factory):
-    """§6.3 (B12 ①: v4 messages ≡ v3, §10 + §15 wire=v4 REP domain): same
-    v4 request → same ETag; re-sent on the v4 view → 304."""
+    """§6.3/§15: the same v4 request is stable and revalidates to 304."""
     client = await client_factory(lambda req: httpx.Response(
         200, content=_message_payload(),
         headers={"Content-Type": "application/json"}))
@@ -122,9 +111,7 @@ async def test_v4_etag_same_request_stable_and_own_view_304(client_factory):
 
 
 async def test_v4_etag_changes_with_envelope_content(client_factory):
-    """§6.3 (B12 ①: v4 messages ≡ v3, §10): the canonical input is the
-    envelope body — a nextCursor change (different envelope bytes, same
-    items) rotates the validator."""
+    """§6.3: a nextCursor change rotates the envelope-body validator."""
     state = {"link": None}
     link_next = '</session/s1/message?limit=40&before=CURSOR123>; rel="next"'
 

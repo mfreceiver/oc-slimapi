@@ -352,9 +352,9 @@ class Subscriber:
     3. Either the queue is at ``queue_items`` OR the buffer would exceed
        ``buffer_bytes`` → **immediate disconnect**: ``closed = True``,
        ``forced_disconnects`` bump, queue drained, queued_bytes reset, and a
-       single ``resync{reason:subscriber_backpressure}`` frame + ``STOP``
-       sentinel enqueued so the SSE generator tears the connection down
-       promptly. Crucially the previously-queued frames are NOT delivered —
+       single ``STOP`` sentinel enqueued so the SSE generator tears the
+       connection down promptly. Crucially the previously-queued frames are
+       NOT delivered —
        the contract (§6) mandates this so a slow client cannot keep
        draining stale data after the sidecar has decided it is too far
        behind.
@@ -372,17 +372,6 @@ class Subscriber:
     dropped_frames: int = 0
     forced_disconnects: int = 0
 
-    # B3b-2 (v4 SSE replay): set by the /events route when — and only when
-    # — the request ran the v4 wire view (selector-admitted ``?v=4``). A
-    # ``wire_v4`` subscriber receives business frames WITH their
-    # ``id: <domain>:<epoch>:<seq>`` prefix line; v3 subscribers keep the
-    # byte-identical id-less frames (the v3 zero-change iron rule). The
-    # flag is flipped by the route immediately after ``subscribe()``
-    # returns (no await between) so no fanout can race an un-stamped
-    # delivery; the subscriber's own welcome ``server.connected`` frame is
-    # connection-scoped and never stamped.
-    wire_v4: bool = False
-
     # Backing queue (constructed post-init so maxsize honours queue_items).
     queue: asyncio.Queue = field(default=None)
 
@@ -396,14 +385,13 @@ class Subscriber:
         Returns ``True`` iff the frame was actually accepted onto the queue
         (so the caller can count it as a successfully emitted frame); returns
         ``False`` on every non-success exit (closed, oversized dropped,
-        overflow path with self-produced resync+STOP, STOP that could not be
+        overflow path with self-produced STOP, STOP that could not be
         enqueued). Byte bookkeeping and overflow behaviour are unchanged from
         the v1 contract — only the return value was added in v6 §3.5.
         """
         if self.closed:
-            # Post-disconnect: silently drop. The resync + STOP pair already
-            # enqueued by the overflow path is the only thing the SSE
-            # generator should see.
+            # Post-disconnect: silently drop. The STOP already enqueued by the
+            # overflow path is the only thing the SSE generator should see.
             return False
         if frame is STOP:
             # Control sentinel — only return True if it actually landed.
@@ -436,20 +424,10 @@ class Subscriber:
         self._clear_queue()
         logger.warning("sse subscriber forced disconnect (backpressure)",
                       extra={"subscriber_id": self.id})
-        # rev-gate R3 BLOCKER-1: ``subscriber_backpressure`` is NOT in the
-        # frozen v4 reason domain (V4_RESYNC_REASONS) — a v4 wire never
-        # carries it. v4 termination = STOP only (the disconnect itself is
-        # the observable signal; recovery = Last-Event-ID reconnect +
-        # ReplayLog replay per REPLAY-007). v3 keeps the frozen
-        # resync + STOP pair, byte-identical.
-        reason = RESYNC_SUBSCRIBER_BACKPRESSURE
-        if self.wire_v4 and reason not in V4_RESYNC_REASONS:
-            with contextlib.suppress(asyncio.QueueFull):
-                self.queue.put_nowait(STOP)
-            return False
-        resync = sse_frame({"reason": reason}, event="resync")
+        # ``subscriber_backpressure`` is outside the frozen v4 resync reason
+        # domain. Terminate with STOP only; the client reconnects with
+        # Last-Event-ID and recovers through ReplayLog replay/resync.
         with contextlib.suppress(asyncio.QueueFull):
-            self.queue.put_nowait(resync)
             self.queue.put_nowait(STOP)
         return False
 

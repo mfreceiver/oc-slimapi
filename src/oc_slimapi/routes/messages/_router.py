@@ -17,7 +17,6 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Request
 
-from ...errors import CodedHTTPException
 from ...selector import resolve_route_directory
 from ...directory import validate_directory
 from .._catalog_common import TRANSFORM_RETRY_AFTER_SECONDS  # noqa: F401  (compat re-export)
@@ -27,32 +26,15 @@ router = APIRouter(prefix="/slimapi/messages/{sid}", tags=["messages"])
 
 
 async def _resolve_messages_directory(request: Request, directory: str | None) -> str | None:
-    """Resolve query ``directory`` to a normalised value to forward upstream.
+    """Return the selector-normalised workspace directory for upstream.
 
-    slimapi no longer gates directories — any directory is forwarded to
-    upstream opencode (which decides whether it can serve it). The two
-    structural checks below are kept:
-
-    - ``directory is None`` → not blocked (returns None; upstream default applies).
-      v1 only trusts query ``directory``; a lone ``X-Opencode-Directory`` header
-      is not validated and not forwarded (unchanged behaviour).
-    - query present AND header present AND they differ → 400 ``directory_not_allowed``
-      (defensive: the conflict is structurally ambiguous, regardless of which
-      directories are involved — slimapi refuses to guess which one to forward).
-
-    Returns the normalised directory to forward (or None).
-
-    v3 (§5, Batch B): the dispatch selector already consumed + validated the
-    ``?directory=`` query on consuming routes and stripped it from the query
-    — ``resolve_route_directory`` substitutes that stash for the (absent)
-    query param, so the rest of this resolver runs unchanged on an
-    already-validated value (header conflicts were decided at dispatch).
+    The selector owns every query/header precedence and error decision.  It
+    validates and stashes a consumed ``?directory=`` before stripping it from
+    the downstream query; this route helper only reads that state (falling back
+    to the bound query value for direct test invocation) and validates it
+    idempotently.
     """
     directory = resolve_route_directory(request.scope, directory)
     if directory is None:
         return None
-    header_dir = request.headers.get("x-opencode-directory")
-    if header_dir:  # treat empty header as absent
-        if (header_dir.rstrip("/") or "/") != (directory.rstrip("/") or "/"):
-            raise CodedHTTPException(400, code="directory_not_allowed")
     return validate_directory(directory)

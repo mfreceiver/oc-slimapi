@@ -1,7 +1,8 @@
-> **Design document — aligned with v2-contract.md (lite-v2)**
+> **历史设计文档 — lite-v2 存档，不是当前实现或 wire 权威。**
 >
-> Sections describing deleted endpoints have been removed. See v2-contract.md
-> for the authoritative wire specification.
+> 下文保留当时的版本头、catch-all、DTO 与 endpoint 决策用于考古，**不得用于
+> 新客户端实现**。当前 wire 权威是 [`v4-contract.md`](v4-contract.md)，完整
+> consumer 导航见 [`PROTOCOL.md`](PROTOCOL.md)。`v2-contract.md` 仅是历史契约。
 
 # oc-slimapi 设计
 

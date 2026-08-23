@@ -1,5 +1,4 @@
-"""B3a-A version-window matrix — design-v4-selector §2/§3; 2026-08-21
-narrowing update: the window collapsed to v4-only ((4, 4)).
+"""V4-only version-window matrix.
 
 Covers the Phase-A core deltas:
 
@@ -162,7 +161,7 @@ def _build_app(settings: Settings | None = None,
     downstream query string, the selector/directory stashes — everything the
     fork needs to prove.
     """
-    app = FastAPI(title="v4-dual-window")
+    app = FastAPI(title="v4-only-window")
     if with_selector:
         app.add_middleware(SlimapiSelectorMiddleware)
     app.state.config = settings or _settings()
@@ -177,7 +176,7 @@ def _build_app(settings: Settings | None = None,
         return {
             "query": request.scope.get("query_string", b"").decode("latin-1"),
             "selector": state.get(sel.SELECTOR_STATE_KEY),
-            "directory": state.get(sel.V3_DIRECTORY_STATE_KEY, None),
+            "directory": state.get(sel.DIRECTORY_STATE_KEY, None),
         }
 
     @app.get("/slimapi/sessions/status")
@@ -186,7 +185,7 @@ def _build_app(settings: Settings | None = None,
         return {
             "query": request.scope.get("query_string", b"").decode("latin-1"),
             "selector": state.get(sel.SELECTOR_STATE_KEY),
-            "directory": state.get(sel.V3_DIRECTORY_STATE_KEY, None),
+            "directory": state.get(sel.DIRECTORY_STATE_KEY, None),
         }
 
     register_error_handlers(app)
@@ -213,7 +212,7 @@ def _client(app: FastAPI) -> httpx.AsyncClient:
 # A1 — version gate + S-B04 config migration
 # ---------------------------------------------------------------------------
 
-def test_pinned_constants_dual_window():
+def test_pinned_constants_v4_only_window():
     assert SERVER_API_VERSION == 4
     assert ACCEPTED_CLIENT_VERSIONS == (4, 4)  # 2026-08-21 收窄
 
@@ -222,7 +221,7 @@ def test_server_api_version_env_is_ignored_with_warning(monkeypatch, caplog):
     """S-B04: the env knob no longer influences the view — warning + ignore.
 
     Even a value that WOULD have been in-range (3) is ignored: the field is
-    constant-pinned to SERVER_API_VERSION during the dual window, and
+    constant-pinned to SERVER_API_VERSION in the v4-only window, and
     validate() (i.e. startup) must not break — it only warns.
     """
     monkeypatch.setenv("OC_SLIMAPI_SERVER_API_VERSION", "3")
@@ -266,10 +265,10 @@ def test_validate_fail_closed_pin_blocks_narrowing():
 
 
 # ---------------------------------------------------------------------------
-# A2 — selector dual-version matrix
+# A2 — v4-only selector matrix
 # ---------------------------------------------------------------------------
 
-async def test_v4_health_dual_view():
+async def test_v4_health_view():
     app = _build_app()
     async with _client(app) as client:
         resp = await client.get("/slimapi/health?v=4", headers=IDENTITY)
@@ -374,9 +373,9 @@ async def test_v4_sessions_no_directory_forwards_untouched():
         assert body["query"] == "cursor=abc"
 
 
-async def test_v4_non_retired_consuming_route_keeps_v3_semantics():
-    """sessions/status is in the v4 consuming set (NOT retired): a v4
-    request consumes ``?directory=`` exactly like v3."""
+async def test_v4_non_retired_consuming_route_uses_current_directory_policy():
+    """sessions/status is in the v4 consuming set, so query directory is
+    consumed and the current validation ladder applies."""
     app = _build_app()
     async with _client(app) as client:
         resp = await client.get(
@@ -386,7 +385,7 @@ async def test_v4_non_retired_consuming_route_keeps_v3_semantics():
         assert body["selector"] == {"result": "v4", "wire": "4"}
         assert body["directory"] == "/w"
         assert body["query"] == ""
-        # and the v3 error ladder still applies on it for bad forms:
+        # The current error ladder applies to invalid forms.
         resp = await client.get(
             "/slimapi/sessions/status?v=4&directory=/a&directory=/b",
             headers=IDENTITY)

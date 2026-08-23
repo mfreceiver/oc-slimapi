@@ -1,9 +1,9 @@
-"""v3-contract §9.1 — access-log observability fields (Batch A).
+"""Access-log observability compatibility fields.
 
 Covers: wireVersion / selectorResult / directoryForm / recordType /
 lifecycleId on request rows; sse_open + sse_close rows for the events and
-token-stream endpoints (lifecycle pairing); legacy-shape regression (old
-ocdroid form byte-identical modulo additive tail fields).
+token-stream endpoints (lifecycle pairing); frozen historical row-shape
+regression and retired-client rejection.
 """
 from __future__ import annotations
 
@@ -24,7 +24,9 @@ from oc_slimapi.selector import SlimapiSelectorMiddleware
 from oc_slimapi.sse_observability import next_lifecycle_id, sse_close, sse_open
 from oc_slimapi.traffic import TrafficLedger
 
-V2_HEADER = {"X-Slimapi-Version": "2"}
+from conftest import current_replay_log
+
+RETIRED_VERSION_HEADER = {"X-Slimapi-Version": "2"}
 
 # ---------------------------------------------------------------------------
 # capture logger fixture
@@ -73,7 +75,7 @@ def _settings(**overrides) -> Settings:
 
 def _build_app(logger, *, ledger: TrafficLedger | None = None) -> FastAPI:
     """Stack order mirrors production: Traffic(outer) → Selector → routes."""
-    app = FastAPI(title="access-v3-test")
+    app = FastAPI(title="access-v4-test")
 
     @app.get("/plain")
     async def plain():
@@ -105,7 +107,7 @@ async def test_row_no_v_rejected(capture_logger):
     """Terminal: no selector at all → 400, row records rejected/null."""
     app = _build_app(capture_logger)
     async with _client(app) as client:
-        r = await client.get("/slimapi/health", headers=V2_HEADER)
+        r = await client.get("/slimapi/health", headers=RETIRED_VERSION_HEADER)
         assert r.status_code == 400  # header not read; retired-version request
     rows = _rows(capture_logger)
     assert len(rows) == 1
@@ -120,7 +122,7 @@ async def test_row_no_v_rejected(capture_logger):
 async def test_row_v2_explicit_rejected(capture_logger):
     app = _build_app(capture_logger)
     async with _client(app) as client:
-        r = await client.get("/slimapi/health?v=2", headers=V2_HEADER)
+        r = await client.get("/slimapi/health?v=2", headers=RETIRED_VERSION_HEADER)
         assert r.status_code == 400
     row = _rows(capture_logger)[0]
     assert row["selectorResult"] == "rejected"
@@ -157,7 +159,7 @@ async def test_row_exempt(capture_logger):
     assert row["wireVersion"] is None
 
 
-async def test_row_not_applicable_for_catch_all(capture_logger):
+async def test_row_not_applicable_for_non_slimapi_route(capture_logger):
     app = _build_app(capture_logger)
     async with _client(app) as client:
         r = await client.get("/plain?v=3")
@@ -255,7 +257,7 @@ async def test_legacy_old_ocdroid_form_rejected(capture_logger):
     retirement 400 — the endpoint exists, the protocol version does not."""
     app = _build_app(capture_logger)
     async with _client(app) as client:
-        r = await client.get("/slimapi/health", headers=V2_HEADER)
+        r = await client.get("/slimapi/health", headers=RETIRED_VERSION_HEADER)
         assert r.status_code == 400
         assert r.json() == {"code": "unsupported_version", "supported": [4]}
 
@@ -278,7 +280,7 @@ class _FakeHubs:
     def __init__(self) -> None:
         self.sub = _FakeSubscriber()
 
-    def subscribe(self, wire_v4: bool = False) -> _FakeSubscriber:
+    def subscribe(self) -> _FakeSubscriber:
         return self.sub
 
     def unsubscribe(self, subscriber) -> None:
@@ -296,6 +298,7 @@ async def test_events_sse_open_close_rows(capture_logger, monkeypatch):
 
     app = _build_app(capture_logger)
     app.include_router(events_routes.router)
+    app.state.replay_log = current_replay_log()
     hubs = _FakeHubs()
     # One real frame, then the STOP sentinel — the generator drains the
     # frame, yields it, sees STOP and exits CLEANLY (finally → sse_close).

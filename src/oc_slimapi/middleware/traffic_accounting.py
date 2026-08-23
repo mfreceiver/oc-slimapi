@@ -11,8 +11,8 @@ BaseHTTPMiddleware re-reads the response body to dispatch it, which has known
 issues with :class:`StreamingResponse` and long-lived SSE connections
 (first-byte delay, buffering, leaked tasks). This implementation just wraps
 the ``receive`` and ``send`` callables, accumulates ``len(chunk)``, and
-forwards every chunk unmodified to the inner app — so SSE token streams and
-the catch-all reverse proxy keep streaming exactly as before.
+forwards every chunk unmodified to the inner app, including long-lived SSE
+token streams.
 
 **Byte-counting calibre (``downIn`` / ``downOut``) — wire bytes, not logical
 bytes.** Both counters measure ASGI transport-layer bytes: ``downIn`` is the

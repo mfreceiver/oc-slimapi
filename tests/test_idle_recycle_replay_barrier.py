@@ -54,16 +54,13 @@ class _BoomTokenHub:
         raise RuntimeError("reconnect observer boom")
 
 
-def _armed_registry(log: ReplayLog | None, callbacks=()) -> HubRegistry:
-    """Registry with a live hub created AFTER log/callback wiring.
+def _armed_registry(log: ReplayLog, callbacks=()) -> HubRegistry:
+    """Registry with a live hub created after callback wiring.
 
-    Mirrors app.py's lifespan ordering (set_replay_log /
-    add_upstream_loss_callback BEFORE the first get()), so the hub receives
-    the log via the ctor kwarg and the callbacks via get()'s forward loop.
+    Mirrors app.py's lifespan ordering: the ring is a constructor dependency
+    and callbacks are registered before the first get().
     """
-    registry = HubRegistry(None)
-    if log is not None:
-        registry.set_replay_log(log)
+    registry = HubRegistry(None, replay_log=log)
     for callback in callbacks:
         registry.add_upstream_loss_callback(callback)
     registry.get_global()
@@ -165,8 +162,7 @@ async def test_idle_removal_token_hub_boom_still_drops_hub_and_callbacks(
 ):
     log = ReplayLog()
     calls: list[str] = []
-    registry = HubRegistry(None)
-    registry.set_replay_log(log)
+    registry = HubRegistry(None, replay_log=log)
     registry.add_upstream_loss_callback(lambda: calls.append("cb"))
     registry._token_hub = _BoomTokenHub()
     registry.get_global()
@@ -269,12 +265,13 @@ async def test_revived_hub_does_not_write_barrier(fast_grace):
 
 
 # ===========================================================================
-# 6 — no replay log wired: teardown still completes (v3-only / test stack)
+# 6 — required replay log: teardown still completes
 # ===========================================================================
 
 
-async def test_idle_removal_without_replay_log_still_tears_down(fast_grace):
-    registry = _armed_registry(log=None)
+async def test_idle_removal_with_required_replay_log_still_tears_down(fast_grace):
+    log = ReplayLog()
+    registry = _armed_registry(log=log)
 
     await _run_idle_removal(registry)
 

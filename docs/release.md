@@ -34,7 +34,7 @@
 | 类型 | 变化 | 何时使用 |
 |---|---|---|
 | `patch` | `0.1.0 → 0.1.1` | Bug 修复、内部重构、测试/文档、无客户端行为变化 |
-| `minor` | `0.1.0 → 0.2.0` | **加性** wire 能力（新可选字段/新端点、旧客户端可忽略）；含 v3 视图内的减性投影缩减等 owner 决策收编变更（唯一消费方同步发版承接）；含版本窗**收窄**（owner 2026-08-21 裁定：收窄不 bump 协议大版本，如 4.8.0 (3,4)→(4,4) v3 退役） |
+| `minor` | `0.1.0 → 0.2.0` | **加性** wire 能力（新可选字段/新端点、旧客户端可忽略）；以及经 owner 批准、wire 大版本不变但需消费方同步承接的行为修订；版本窗收窄先例为 4.8.0 `(3,4)→(4,4)` |
 | `major` | `0.1.0 → 1.0.0` | **与 wire 协议版本绑定**（owner 决策 2026-08-17）：仅当 wire `ACCEPTED_CLIENT_VERSIONS` bump（协议大版本升级）时使用；减性/破坏性 wire 变更若不 bump wire 协议版本，不发 major |
 
 Tag 格式：**`v` + semver**（例：`v0.1.0`），与 ocdroid 一致。
@@ -46,9 +46,11 @@ Tag 格式：**`v` + semver**（例：`v0.1.0`），与 ocdroid 一致。
 - **仅破坏性**变更 bump；加性变更 **同版本**。
 - Bump 时必须同步：`versioning.py`、`docs/specs/v4-contract.md`（v4-only 窗下版本窗相关变更仅触及 v4 契约；`v3-contract.md` 已为历史存档，不再同步修订）、`CHANGELOG.md`（写明客户端必改点）。
 
-### 1.3 双版本期（wire (3,4)）说明
+### 1.3 历史：双版本期（wire (3,4)）
 
-4.0.0（P3）起 sidecar 进入 wire **双版本期**（路线见 `docs/system-architecture-proposal-2026-08-17.md` §7）：
+> 本节仅解释 4.0.0–4.7.0 的发版历史；当前 `(4,4)` 不按本节做协商。
+
+4.0.0（P3）起 sidecar 曾进入 wire **双版本期**（路线见 `docs/system-architecture-proposal-2026-08-17.md` §7）：
 
 - `GET /slimapi/versions` 曾报 `available: [3, 4]`、`current: 4`（4.0.0–4.7.0 v3/v4 并存；4.8.0 起收窄为 `available: [4]`）。
 - **major 与 wire 协议版本绑定铁律不变**：wire `ACCEPTED_CLIENT_VERSIONS` bump（协议大版本升级）才发 major。
@@ -68,7 +70,9 @@ Tag 格式：**`v` + semver**（例：`v0.1.0`），与 ocdroid 一致。
    - **显式空**（机制启用，`/slimapi/file/**` 全 403）或 **非空**（子树过滤 + SSE 帧过滤）：**前置条件** = 确认 ocdroid 已适配 `/file` 403 `directory_not_allowed` 语义或不依赖这些端点（对照当时 ocdroid 版本的 `docs/slim-mode-api-routing.md` / CHANGELOG 回执），未确认前**不得**在生产启用该 env（机制为部署事项：sidecar 默认不启用，启用与否由运维按本门槛决定）。
 6. **deploy 模板 env 对账**：`deploy/oc-slimapi.service` 的 env 集 ⊆ `src/oc_slimapi/config.py` 读取 env 集，且值合法（示例值不得与 `config.validate()` fail-closed 规则冲突——版本窗等已钉死项不得出现在模板）。
 
-### 2.1 P3 major（4.0.0）前置 checklist（n5）
+### 2.1 历史：P3 major（4.0.0）前置 checklist（n5）
+
+> 已完成的 4.0.0 发布记录，不是当前 release checklist。
 
 给 **major（P3，4.0.0）** 的发布前置门槛（在 §2 通用清单之上追加；冻结点见 `docs/refactor-plans/slimapi-refactor-plan.md` §4.2）：
 
@@ -195,8 +199,8 @@ systemctl --user restart oc-slimapi
 | [`scripts/check.sh`](../scripts/check.sh) | 质量门禁 |
 | [`scripts/release.sh`](../scripts/release.sh) | 发版唯一入口 |
 | [`pyproject.toml`](../pyproject.toml) | 包版本号源 |
-| [`docs/specs/v3-contract.md`](specs/v3-contract.md) | Wire 契约（权威，v3 基准 + (3,4) 双版本窗口；`v2-contract.md` 为 ≤2.x 历史） |
-| [`docs/specs/v4-contract.md`](specs/v4-contract.md) | v4 wire 契约（4.0.0 实施基线 + 2026-08-19 修订冻结；版本窗相关变更必同步） |
+| [`docs/specs/v3-contract.md`](specs/v3-contract.md) | ≤4.7.0 历史 wire 契约存档；`v2-contract.md` 为 ≤2.x 历史存档，不再作为现行规范源 |
+| [`docs/specs/v4-contract.md`](specs/v4-contract.md) | **现行 wire 契约权威**（4.8.0 起 v4-only 自包含；版本窗相关变更必同步） |
 | `src/oc_slimapi/versioning.py` | Wire API 接受区间 |
 
 ---

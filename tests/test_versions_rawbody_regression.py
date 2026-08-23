@@ -1,4 +1,4 @@
-"""versions 逐字节回归（rev gate MINOR-1；V2b 收缩后仅剩 versions 面）。
+"""Versions endpoint byte-for-byte regression coverage.
 
 既有测试以语义断言为主，测试名中的 "byte-identical" 声明缺逐字节证据。
 本文件补齐 /slimapi/versions 的 **raw body bytes + status + content-type +
@@ -14,7 +14,7 @@ v4-only 面的现行锚，保留。
 侧边栏版本字段（``oc_slimapi.__version__``）随发版变化：比较前在基线
 与现场**两侧同态替换**为占位符（其余字节仍逐字节比较）。
 
-再生成：``.venv/bin/python tests/test_v3_rawbody_regression.py --capture``
+再生成：``.venv/bin/python tests/test_versions_rawbody_regression.py --capture``
 打印最新基线常量，有意更新时手工回填并 review diff。
 """
 
@@ -47,7 +47,7 @@ IDENTITY = {"Accept-Encoding": "identity"}
 # fileRaw (§19), same-batch with their implementations. 4.12.0 修订六 B-1:
 # tokenFrameSeq appended additively after fileRaw (token-stream business
 # frames embed payload seq + id lines). Regenerate:
-#   .venv/bin/python tests/test_v3_rawbody_regression.py --capture
+#   .venv/bin/python tests/test_versions_rawbody_regression.py --capture
 BASELINE_VERSIONS_BODY = (
     b'{"current":4,"available":[4],"capabilities":{"4":{"globalSessions":true,"auxiliaryFilters":true,"sseReplay":true,"qpImmediateFull":true,"messagesSince":true,"fileRaw":true,"tokenFrameSeq":true,"readiness":{"ready":true,"required":["events.global.replay.v4","events.token.replay.v4","messages.expand.v4","method.boundary.v4","providers.redacted.v4","representation.vary.v4","selector.v4","session.list.global.v4","session.post-actions.v4","session.single.projection.v4","sessions.details.v4"],"satisfied":["events.global.replay.v4","events.token.replay.v4","messages.expand.v4","method.boundary.v4","providers.redacted.v4","representation.vary.v4","selector.v4","session.list.global.v4","session.post-actions.v4","session.single.projection.v4","sessions.details.v4"]},"expand":{"categories":["info_summary_diffs","part_text","part_reasoning","part_state_output","part_state_error","part_state_input_full","part_state_metadata_full","part_state_attachments","part_url","part_source","part_snapshot","compaction_full"],"fragmentMaxBytes":8388608}}},"sidecarVersion":"<SIDECAR_VERSION>"}'
 )

@@ -256,7 +256,7 @@ class _FakeHubs:
     def __init__(self) -> None:
         self.sub = _FakeSubscriber()
 
-    def subscribe(self, wire_v4: bool = False) -> _FakeSubscriber:
+    def subscribe(self) -> _FakeSubscriber:
         return self.sub
 
     def unsubscribe(self, subscriber) -> None:
@@ -267,7 +267,7 @@ class _FakeTokenRegistry:
     def __init__(self) -> None:
         self.sub = _FakeSubscriber("tok_test")
 
-    def subscribe(self, sid: str, wire_v4: bool = False) -> _FakeSubscriber:
+    def subscribe(self, sid: str) -> _FakeSubscriber:
         return self.sub
 
     def unsubscribe(self, subscriber) -> None:
@@ -316,8 +316,8 @@ class _ScriptedHubRegistry(HubRegistry):
     def push_script(self, script) -> None:
         self._scripts.append(script)
 
-    def subscribe(self, wire_v4: bool = False):
-        sub = super().subscribe(wire_v4=wire_v4)
+    def subscribe(self):
+        sub = super().subscribe()
         if self._scripts:
             script = self._scripts.pop(0)
             hub = self.get_global()
@@ -345,8 +345,8 @@ class _ScriptedTokenRegistry(TokenStreamRegistry):
     def push_script(self, script) -> None:
         self._scripts.append(script)
 
-    def subscribe(self, sid: str, wire_v4: bool = False):
-        sub = super().subscribe(sid, wire_v4=wire_v4)
+    def subscribe(self, sid: str):
+        sub = super().subscribe(sid)
         if self._scripts:
             script = self._scripts.pop(0)
             asyncio.get_running_loop().create_task(self._guard(script, sub, sid))
@@ -390,8 +390,10 @@ class _RealStack:
         **registry_kwargs,
     ) -> None:
         self.log = log if log is not None else ReplayLog(epoch=EPOCH)
-        self.hubs = _ScriptedHubRegistry(**registry_kwargs)
-        self.hubs.set_replay_log(self.log)
+        self.hubs = _ScriptedHubRegistry(
+            replay_log=self.log,
+            **registry_kwargs,
+        )
         self.token_hub = TokenStreamHub(replay_log=self.log)
         self.hubs.set_token_hub(self.token_hub)
         token_kwargs: dict = {
@@ -572,31 +574,10 @@ async def test_emit_directory_frame_logs_to_global_domain_without_subscribers():
         await _kill_hub_tasks(hub)
 
 
-async def test_emit_directory_frame_v3_subscriber_gets_raw_bytes():
-    """v3 zero change: wired log, non-v4 subscriber → id-less frame."""
+async def test_emit_directory_frame_subscriber_gets_id_stamped():
     log = ReplayLog(epoch=EPOCH)
     hub = GlobalHub(None, replay_log=log)
     sub = hub.subscribe()
-    try:
-        hub.publish(_q_event(1))
-        item = sub.queue.get_nowait()
-        # welcome frame first, then the business frame
-        assert item.startswith(b"event: server.connected")
-        item = sub.queue.get_nowait()
-        assert item == _q_frame(1)
-        assert not item.startswith(b"id:")
-    finally:
-        hub.subscribers.discard(sub)
-        await _kill_hub_tasks(hub)
-
-
-async def test_emit_directory_frame_v4_subscriber_gets_id_stamped():
-    log = ReplayLog(epoch=EPOCH)
-    hub = GlobalHub(None, replay_log=log)
-    # v4 admission path (rev-gate BLOCKER-1): welcome suppressed at the
-    # source — the first queued item is already the stamped business frame.
-    sub = hub.subscribe(welcome=False)
-    sub.wire_v4 = True
     try:
         hub.publish(_q_event(1))
         item = sub.queue.get_nowait()
@@ -626,7 +607,6 @@ async def test_notify_upstream_loss_writes_barriers_and_fans_resync():
     hub = GlobalHub(None, replay_log=log)
     hub.set_token_hub(TokenStreamHub(replay_log=log))
     sub = hub.subscribe()
-    sub.wire_v4 = True
     try:
         hub.publish(_q_event(1))
         hub.publish(_q_event(2))
@@ -673,7 +653,6 @@ async def test_token_fanout_logs_and_stamps_v4():
     log = ReplayLog(epoch=EPOCH)
     th = TokenStreamHub(replay_log=log)
     sub = TokenSubscriber(session_id=SID, metrics=th._metrics)
-    sub.wire_v4 = True
     th.attach_subscriber(SID, sub)
     try:
         th.on_part_updated(_text_start(SID, "m1", "p1"))
@@ -724,46 +703,13 @@ async def test_token_message_removed_tombstone_logged_contiguous():
         th.stop()
 
 
-async def test_token_truncated_frame_v3_only_never_logged(monkeypatch):
-    """R2 gate: the truncated marker (message.part.snapshot{truncated:true})
-    is v4-INELIGIBLE — it must reach v3 subscribers (byte-identical
-    semantics) but never enter the ReplayLog nor consume a v4 seq."""
+async def test_token_budget_drop_emits_no_snapshot_and_no_replay(monkeypatch):
+    """Oversized part state is dropped without an outbound snapshot or seq."""
     log = ReplayLog(epoch=EPOCH)
     th = TokenStreamHub(replay_log=log)
     monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_PART_MAX_BYTES", 4)
     sub = TokenSubscriber(session_id=SID, metrics=th._metrics)
-    th.attach_subscriber(SID, sub)  # v3 subscriber (wire_v4=False)
-    try:
-        th.on_part_updated(_text_start(SID, "m1", "p1"))
-        th.on_part_delta(_delta(SID, "m1", "p1", "hello world longer than cap"))
-        th.flush()
-        # v3 subscriber still receives the truncated marker frame.
-        drained = []
-        while not sub.queue.empty():
-            try:
-                drained.append(sub.queue.get_nowait())
-            except Exception:
-                break
-        assert any(
-            b"event: message.part.snapshot" in f and b'"truncated":true' in f
-            for f in drained
-        )
-        # ... but it never entered the ReplayLog (no seq allocated).
-        assert log.domain_frame_count(token_domain(SID)) == 0
-        assert log.last_seq(token_domain(SID)) == 0
-    finally:
-        th.detach_subscriber(SID, sub)
-        th.stop()
-
-
-async def test_token_truncated_frame_never_reaches_v4_sub(monkeypatch):
-    """R2 gate: a v4 subscriber never receives the truncated marker on the
-    wire, live or otherwise."""
-    log = ReplayLog(epoch=EPOCH)
-    th = TokenStreamHub(replay_log=log)
-    monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_PART_MAX_BYTES", 4)
-    sub = TokenSubscriber(session_id=SID, metrics=th._metrics)
-    th.attach_subscriber(SID, sub, wire_v4=True)
+    th.attach_subscriber(SID, sub)
     try:
         th.on_part_updated(_text_start(SID, "m1", "p1"))
         th.on_part_delta(_delta(SID, "m1", "p1", "hello world longer than cap"))
@@ -787,7 +733,6 @@ async def test_global_heartbeat_never_id_never_logged(monkeypatch):
     hub = GlobalHub(None, replay_log=log)
     monkeypatch.setattr(global_hub_module, "HEARTBEAT_SECONDS", 0.02)
     sub = hub.subscribe()
-    sub.wire_v4 = True
     task = asyncio.create_task(hub.heartbeat_loop())
     try:
         await asyncio.sleep(0.08)
@@ -813,7 +758,6 @@ async def test_token_heartbeat_and_resync_not_logged():
     log = ReplayLog(epoch=EPOCH)
     th = TokenStreamHub(replay_log=log)
     sub = TokenSubscriber(session_id=SID, metrics=th._metrics)
-    sub.wire_v4 = True
     th.attach_subscriber(SID, sub)
     try:
         th.on_part_updated(_text_start(SID, "m1", "p1"))
@@ -2572,23 +2516,16 @@ def test_meta_v4_extension_shape():
     }
 
 
-async def test_v4_without_replay_log_degrades_to_v3_shape():
-    """Minimal apps without app.state.replay_log: v4 keeps working with
-    id-less frames and the v3-style reconnect resync."""
+async def test_minimal_app_without_replay_log_is_invalid_assembly():
+    """The v4-native route requires the lifespan-owned shared replay log."""
     hubs = _FakeHubs()
     hubs.sub.queue.put_nowait(
         sse_frame({"sessionID": SID}, event="server.heartbeat")
     )
     hubs.sub.queue.put_nowait(HUB_STOP)
     app = _fake_app(hubs=hubs)
-    response, body = await _read(
-        app, "/slimapi/events?v=4",
-        headers={"Last-Event-ID": f"g:{EPOCH}:3"},
-    )
-    assert response.status_code == 200
-    frames = list(_frames(body))
-    _assert_v4_no_forbidden_frames(frames)
-    assert frames[0][2].keys() == {"subscriberId", "tokens"}
-    assert frames[1] == ("resync", None, {"reason": "reconnect_no_replay"})
-    for block in _blocks(body):
-        assert not block.startswith(b"id:")
+    with pytest.raises(AttributeError, match="replay_log"):
+        await _read(
+            app, "/slimapi/events?v=4",
+            headers={"Last-Event-ID": f"g:{EPOCH}:3"},
+        )

@@ -305,8 +305,8 @@ def main() -> int:
         print(f"\n共 {len(missing)}/{len(routes)} 条未在 "
               f"{DOC.relative_to(ROOT)} 表行中出现。")
         print("修复：在 INTERFACE_MAP.md 对应章节补该端点表行（首单元格格式"
-              " `**<METHOD> \\<path>**`）；若该路由确应走 catch-all 透传，"
-              "说明它不该在 routes/ 下声明。")
+              " `**<METHOD> \\<path>**`）。所有 routes/ 下的 `/slimapi` 路由"
+              "都必须记录；catch-all 已关闭，不能作为缺失文档的替代。")
         return 1
 
     if method_mismatches:
@@ -323,7 +323,7 @@ def main() -> int:
         for full, miss in semantic_failures:
             print(f"  - {full}：缺少 {miss}")
         print("\n修复：在该路由的 INTERFACE_MAP 行补齐对应错误码描述"
-              "（与 docs/specs/v2-contract.md §7 对齐）。")
+              "（与 docs/specs/v4-contract.md 及生产 route 行为对齐）。")
         return 1
 
     sem_count = sum(1 for _m, p, _f in routes if p in SEMANTIC_CHECKS)

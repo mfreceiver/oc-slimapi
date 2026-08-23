@@ -21,8 +21,50 @@ ocdroid 对接时：
 
 - **每次**用户可见 / 客户端可观测的 wire 行为变更，必须在对应版本下增加条目（Added / Changed / Fixed / Removed / Security）。
 - 条目写**行为与路径**，不写实现细节（避免“改了哪行 Python”）。
-- 破坏性变更：同时更新 `docs/specs/v3-contract.md`（及差异层受影响时的 `docs/specs/v4-contract.md`）+ bump wire API 版本 + 在本文件 **Changed** 中显式写 `X-Slimapi-Version` 与客户端必改点。
+- 破坏性变更：更新现行权威 `docs/specs/v4-contract.md`，按 owner 裁决决定
+  是否 bump wire API 版本，并在 **Changed** 中显式写 `?v=` selector 与客户端
+  必改点；`v2-contract.md` / `v3-contract.md` 历史正文不回写。
 - 发版时由 `./scripts/release.sh` 校验本文件含有目标版本标题（见 `docs/release.md`）。
+
+---
+
+## [Unreleased]
+
+_暂无。_
+
+---
+
+## [4.13.0] - 2026-08-24 — v4-native 全局归一化（minor；public wire 零变化）
+
+> 包版本按 minor 从 4.12.2 升至 4.13.0；Wire API 仍为 v4 `(4,4)`。
+> 本批只删除不可达的旧实现分支、收敛内部装配并修正文档；所有 public HTTP/SSE
+> wire 行为保持不变，webui/ocdroid 客户端零必改。
+
+### Added
+
+- 新增 `docs/specs/PROTOCOL.md`：面向 webui/ocdroid 的 v4-only canonical
+  consumer guide，完整汇总当前 56 个 `/slimapi` method/path、DTO、错误、
+  directory、ETag/gzip 与 global/token SSE reconciliation；
+  `docs/specs/v4-contract.md` 仍是 wire 规范权威。
+
+### Changed
+
+- **内部 v4-native 归一化，public wire 零变化**：删除 shared SSE runtime 中已不可达
+  的旧 subscriber/welcome/snapshot 分支与 optional ReplayLog 装配路径；生产仍输出
+  相同 v4 meta/replay/business/control 帧，append failure 与生命周期顺序不变。
+- 当前文档、路由映射、客户端清单与 release/check 提示统一为 v4-only；旧 v2/v3
+  协议、双版本窗、版本头与 catch-all 仅保留为明确历史存档，不再作为 current
+  接入说明。
+
+### Fixed
+
+- 勘正 token stream directory 错误优先级：query-only 允许；header-only 与
+  query+同值 header 返回 `directory_header_retired`；query+异值 header 返回
+  `directory_conflict`；重复异值 query 返回 `invalid_directory_selector`。
+- 勘正 active-v4 token 生命周期说明：`session_idle` / `session_deleted` 在原连接
+  均为 STOP-only terminal disconnect，不发送同名 resync；删除权威信号来自 global
+  `session.digest{deleted:true}`，barrier 后携旧 cursor 重连按既有冻结值
+  `reconnect_no_replay` 触发 HTTP 对齐。实现与 public wire 均未改变。
 
 ---
 

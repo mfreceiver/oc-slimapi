@@ -26,6 +26,8 @@ Self-contained: own helpers + fixtures; does NOT touch tests/conftest.py.
 
 from __future__ import annotations
 
+from conftest import current_replay_log
+
 import asyncio
 import json
 
@@ -91,7 +93,7 @@ async def _teardown_hub(hub: GlobalHub) -> None:
 @pytest.fixture
 async def hub():
     """Bare GlobalHub(client=None); teardown cancels all background tasks."""
-    h = GlobalHub(client=None)
+    h = GlobalHub(client=None, replay_log=current_replay_log())
     try:
         yield h
     finally:

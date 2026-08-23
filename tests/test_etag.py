@@ -24,6 +24,7 @@ import orjson
 import pytest
 from fastapi import FastAPI
 
+from conftest import current_replay_log
 from oc_slimapi import etag as etag_mod
 from oc_slimapi.envelope import messages_envelope_bytes
 from oc_slimapi.config import Settings
@@ -146,7 +147,8 @@ def _build_app(
     ))
     app.state.schema_degraded = False
     app.state.deployment_revision = None
-    app.state.hubs = HubRegistry(upstream)
+    app.state.hubs = HubRegistry(
+        upstream, replay_log=current_replay_log())
     if with_registry and settings.coalesce_enabled:
         app.state.raw_fetch_registry = LeasedSingleFlight(
             max_bytes=settings.raw_fetch_max_bytes,

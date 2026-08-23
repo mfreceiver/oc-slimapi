@@ -7,9 +7,9 @@ value into the response headers as ``X-Request-ID``.
 
 This middleware must be registered *after* the traffic-accounting middleware
 (``TrafficAccountingMiddleware``) so the request_id is available in
-``scope["state"]`` when the traffic logger writes the access log.  It is
-also registered *before* the reverse-proxy catch-all so that the proxy can
-read the request_id from ``scope["state"]`` and forward it upstream.
+``scope["state"]`` when the traffic logger writes the access log. It runs
+outside route handlers so every upstream call can read the request_id from
+``scope["state"]`` and forward it.
 
 Pure-ASGI (not BaseHTTPMiddleware) to keep SSE / StreamingResponse streaming
 unbuffered, exactly like ``TrafficAccountingMiddleware``.
@@ -35,8 +35,8 @@ def _find_request_id(scope: dict[str, Any]) -> str | None:
 
     P1-15: the value is restricted to **printable ASCII** (0x20–0x7e).
     Non-ASCII multibyte sequences (e.g. UTF-8 Chinese) are rejected because
-    the catch-all proxy forwards the request-id into an httpx request header
-    via ``client.build_request()``; a non-ASCII header value raises an
+    route handlers forward the request-id into an httpx request header via
+    ``client.build_request()``; a non-ASCII header value raises an
     encoding exception at BUILD time (before the ``send`` try/except that
     maps to ``upstream_unavailable``), surfacing as a bare 500 rather than a
     structured error. Fail-closed: reject → caller generates a fresh uuid.

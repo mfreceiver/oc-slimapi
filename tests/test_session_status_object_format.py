@@ -25,6 +25,8 @@ or other test modules; cf. test_hub_behavior_lock.py header note).
 
 from __future__ import annotations
 
+from conftest import current_replay_log
+
 import asyncio
 import json
 
@@ -97,7 +99,7 @@ async def seed_sticky(hub: GlobalHub, sub: Subscriber, sid: str = "s1") -> None:
 async def pair():
     """GlobalHub(client=None) with one manually-attached subscriber; teardown
     cancels all background tasks."""
-    hub = GlobalHub(client=None)
+    hub = GlobalHub(client=None, replay_log=current_replay_log())
     try:
         sub = Subscriber()
         hub.subscribers.add(sub)
@@ -332,7 +334,7 @@ class TestTokenHubMirror:
         status — object envelope must drive _session_status exactly like the
         legacy string."""
         hub, sub = pair
-        th = TokenStreamHub()
+        th = TokenStreamHub(replay_log=current_replay_log())
         hub.set_token_hub(th)
 
         hub.publish(ev("/proj", "session.status", {
@@ -349,7 +351,7 @@ class TestTokenHubMirror:
     async def test_string_busy_idle_drive_session_status_regression(self, pair):
         """REQ 6 (regression): legacy string format unchanged through the mirror."""
         hub, sub = pair
-        th = TokenStreamHub()
+        th = TokenStreamHub(replay_log=current_replay_log())
         hub.set_token_hub(th)
 
         hub.publish(ev("/proj", "session.status", {
@@ -366,7 +368,7 @@ class TestTokenHubMirror:
         """REQ 6/4: an invalid status shape must not mark the sid busy in the
         token hub either."""
         hub, sub = pair
-        th = TokenStreamHub()
+        th = TokenStreamHub(replay_log=current_replay_log())
         hub.set_token_hub(th)
         hub.publish(ev("/proj", "session.status", {
             "sessionID": "s1", "status": {"type": 7},
@@ -378,14 +380,14 @@ class TestTokenHubMirror:
     def test_on_session_status_direct_object_envelope(self):
         """REQ 6: on_session_status itself accepts both formats (defensive
         parity — the shared normalizer is applied at the entry point)."""
-        th = TokenStreamHub()
+        th = TokenStreamHub(replay_log=current_replay_log())
         th.on_session_status("s1", {"type": "busy"})
         assert th._session_status.get("s1") == "busy"
         th.on_session_status("s1", {"type": "idle"})
         assert th._session_status.get("s1") != "busy"
 
     def test_on_session_status_direct_invalid_shapes(self):
-        th = TokenStreamHub()
+        th = TokenStreamHub(replay_log=current_replay_log())
         th.on_session_status("s1", {})
         th.on_session_status("s1", {"type": None})
         th.on_session_status("s1", 3.14)

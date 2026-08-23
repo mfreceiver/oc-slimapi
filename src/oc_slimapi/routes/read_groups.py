@@ -1,4 +1,4 @@
-"""v3-contract §10.a read-group routes (Batch C1).
+"""Current §10.a read-group routes.
 
 Seven annexed read groups as thin controlled proxies (no byte slimming —
 governance only: selector ``v``/``directory`` consumption, cap, ETag,
@@ -95,22 +95,13 @@ router = APIRouter(prefix="/slimapi", tags=["read-groups"])
 def _resolve(request: Request, directory: str | None) -> str | None:
     """Resolve the workspace directory for a read-group route.
 
-    v3 (§5.2): the selector already consumed ``?directory=`` (query or
-    compatible header) into the scope stash and stripped the query —
-    ``resolve_route_directory`` returns that stashed value (validated).
-
-    v2 (§5.2 frozen): the query — ``directory`` included — is forwarded
-    VERBATIM in the upstream URL and is deliberately NOT consumed here.
-    The v2 client's real channel is the ``X-Opencode-Directory`` header:
-    bind + validate it (thin routes do not auto-forward client headers),
-    or ``None`` when absent.
+    The selector owns query/header precedence, validation, and query stripping.
+    This helper consumes only its normalized state, with the bound query value
+    retained solely for direct route invocation in tests.
     """
-    resolved = resolve_route_directory(request.scope, None)
+    resolved = resolve_route_directory(request.scope, directory)
     if resolved is not None:
         return validate_directory(resolved)
-    header_dir = request.headers.get("x-opencode-directory")
-    if header_dir:  # treat empty header as absent
-        return validate_directory(header_dir)
     return None
 
 
@@ -131,7 +122,7 @@ def _authorized_file_directory(request: Request, directory: str | None) -> str |
       cached — rev-2 sub-1), relative candidates fail closed with the
       uniform 403 ``directory_not_allowed`` (sub-2; no existence leak),
       and on a pass the CANONICAL (realpath) form is returned so the
-      forwarded ``X-Opencode-Directory`` binds the upstream access to the
+      forwarded canonical directory header binds the upstream access to the
       exact object the authorization decision was made on (sub-3) — a
       symlink swapped between check and upstream resolution cannot
       retarget the lookup.

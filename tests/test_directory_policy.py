@@ -1,4 +1,4 @@
-"""v3-contract §5 directory-query tests (Batch B, TDD).
+"""v4 directory-query policy tests.
 
 B12 (2026-08-21) three-way split: the consumer-ladder functions below now
 drive the ``?v=4`` face — v4-contract §5.1 inherits the v3 §5 consumption /
@@ -15,13 +15,12 @@ Covers:
   ``directory_conflict`` (frozen ``queryDirectory``/``headerDirectory``
   field names) / multi-value same folds / multi-value different → 400
   ``invalid_directory_selector``.
-* v3 forwarding — the consumed directory (query OR compatible header)
+* v4 forwarding — the consumed query directory
   reaches upstream as ``X-Opencode-Directory``; the ``directory`` pairs
   are stripped from the downstream query (other params intact).
-* §5.6 stream exception — multi-value different → 400
-  ``invalid_directory_selector`` (selector pre-check + route guard);
-  query-only accepted (no-op); query+header different → 400
-  ``directory_not_allowed`` (inherited v2 guard).
+* §5.6 stream exception — production selector precedence: query-only is an
+  accepted no-op; header-only and dual-present same are retired; dual-present
+  different conflicts; repeated distinct query values are invalid.
 * §5.5 tolerant-ignore set — any directory form on non-consuming routes
   is ignored (no 400, no consumption).
 * Invalid directory value → 400 ``invalid_directory``.
@@ -33,10 +32,9 @@ import httpx
 import orjson
 import pytest
 from fastapi import FastAPI
-from starlette.requests import Request
 
 from oc_slimapi.config import Settings
-from oc_slimapi.errors import CodedHTTPException, register_error_handlers
+from oc_slimapi.errors import register_error_handlers
 from oc_slimapi.routes import (
     agent,
     children,
@@ -46,7 +44,6 @@ from oc_slimapi.routes import (
     messages,
     sessions,
     todo,
-    token_stream,
     versions,
 )
 from oc_slimapi.selector import SlimapiSelectorMiddleware
@@ -266,9 +263,8 @@ async def test_agent_matrix_invalid_value_rejected(stack):
 # Consuming set spot-checks (query-only consumption + strip + forward)
 # ---------------------------------------------------------------------------
 
-# 2026-08-21 narrowing: the (only) admitted v4 face drives the consumption
-# checks; the global sessions list row left with the v3 face (directory is
-# retired on it in v4 — locked in test_v4_dual_window.py).
+# The only admitted v4 face drives these consumption checks. The global
+# sessions list intentionally omits directory (locked in test_v4_only_window.py).
 _CONSUMING_CASES = [
     ("/slimapi/messages/s1", "messages"),
     ("/slimapi/sessions/status", "status"),
@@ -327,95 +323,37 @@ async def test_diff_forwards_messageid_without_directory(stack):
 
 
 # ---------------------------------------------------------------------------
-# §5.6 stream exception
+# §5.6 stream exception — production selector precedence
 # ---------------------------------------------------------------------------
 
-def _stream_request(query: str, *, header: str | None = None):
-    """Direct-invocation Request with a simulated ADMITTED v4 selector stash
-    (B12 ①: the §5.6 route guard is wire-agnostic and the stream route keeps
-    the v3 consumption semantics in v4 — v4-contract §5.2)."""
+class _StreamCapture:
+    def __init__(self) -> None:
+        self.scope = None
+
+    async def __call__(self, scope, receive, send) -> None:
+        self.scope = scope
+        await send({
+            "type": "http.response.start", "status": 200,
+            "headers": [(b"content-type", b"application/json")],
+        })
+        await send({"type": "http.response.body", "body": b"[]"})
+
+
+async def _run_stream_selector(
+    query: str, *, header: str | None = None,
+) -> tuple[int, dict | list, dict | None]:
+    capture = _StreamCapture()
+    middleware = SlimapiSelectorMiddleware(capture)
     headers: list[tuple[bytes, bytes]] = []
     if header is not None:
         headers.append((b"x-opencode-directory", header.encode()))
-    from oc_slimapi.selector import SELECTOR_STATE_KEY
-    state = {SELECTOR_STATE_KEY: {"result": "v4", "wire": "4"}}
-    scope = {
-        "type": "http", "asgi": {"version": "3.0"},
-        "http_version": "1.1", "method": "GET",
-        "scheme": "http", "path": "/slimapi/sessions/s1/stream",
-        "raw_path": b"/slimapi/sessions/s1/stream",
-        "query_string": query.encode(),
-        "headers": headers, "client": ("127.0.0.1", 1), "server": ("t", 80),
-        "state": state,
-    }
-    return Request(scope)
-
-
-def test_stream_v4_multi_different_invalid_directory_selector():
-    from oc_slimapi.routes.token_stream import _resolve_directory_conflict
-    request = _stream_request("directory=/w&directory=/p")
-    with pytest.raises(CodedHTTPException) as excinfo:
-        _resolve_directory_conflict(request, "/p")
-    assert excinfo.value.status_code == 400
-    assert excinfo.value.code == "invalid_directory_selector"
-
-
-def test_stream_v4_multi_same_folds_to_single_value():
-    from oc_slimapi.routes.token_stream import _resolve_directory_conflict
-    request = _stream_request("directory=/w&directory=/w")
-    # no raise — folded, then the single value flows through the v2 guard
-    _resolve_directory_conflict(request, "/w")
-
-
-def test_stream_v4_query_only_accepted_noop():
-    from oc_slimapi.routes.token_stream import _resolve_directory_conflict
-    request = _stream_request("directory=/w")
-    _resolve_directory_conflict(request, "/w")
-
-
-def test_stream_v4_dual_different_directory_not_allowed():
-    """§5.6: after single-valuing, the inherited v2 guard owns the
-    both-present-different rejection (existing code ``directory_not_allowed``)."""
-    from oc_slimapi.routes.token_stream import _resolve_directory_conflict
-    request = _stream_request("directory=/w", header="/p")
-    with pytest.raises(CodedHTTPException) as excinfo:
-        _resolve_directory_conflict(request, "/w")
-    assert excinfo.value.status_code == 400
-    assert excinfo.value.code == "directory_not_allowed"
-
-
-def test_stream_v4_header_only_noop():
-    from oc_slimapi.routes.token_stream import _resolve_directory_conflict
-    request = _stream_request("", header="/w")
-    _resolve_directory_conflict(request, None)
-
-
-async def test_stream_selector_precheck_rejects_multi_different():
-    """The selector-level §5.6 pre-check (before the route guard) rejects
-    multi-value-different on the stream path with the same code."""
-    from oc_slimapi.selector import SlimapiSelectorMiddleware
-
-    class _Capture:
-        def __init__(self) -> None:
-            self.scope = None
-
-        async def __call__(self, scope, receive, send) -> None:
-            self.scope = scope
-            await send({
-                "type": "http.response.start", "status": 200,
-                "headers": [(b"content-type", b"application/json")],
-            })
-            await send({"type": "http.response.body", "body": b"[]"})
-
-    capture = _Capture()
-    middleware = SlimapiSelectorMiddleware(
-        capture)
+    raw_query = f"v=4&{query}" if query else "v=4"
     scope = {
         "type": "http", "http_version": "1.1", "method": "GET",
         "path": "/slimapi/sessions/s1/stream",
         "raw_path": b"/slimapi/sessions/s1/stream",
-        "query_string": b"v=4&directory=/w&directory=/p",
-        "headers": [], "client": ("127.0.0.1", 1), "server": ("t", 80),
+        "query_string": raw_query.encode(),
+        "headers": headers, "client": ("127.0.0.1", 1), "server": ("t", 80),
         "state": {},
     }
     sent: list[dict] = []
@@ -428,59 +366,57 @@ async def test_stream_selector_precheck_rejects_multi_different():
 
     await middleware(scope, receive, send)
     start = next(m for m in sent if m["type"] == "http.response.start")
-    assert start["status"] == 400
-    import json as _json
     body = b"".join(
         m.get("body", b"") for m in sent if m["type"] == "http.response.body")
-    assert orjson.loads(body) == {"code": "invalid_directory_selector"}
+    return start["status"], orjson.loads(body), capture.scope
 
 
-async def test_stream_selector_single_value_not_consumed():
-    """§5.6: a single-valued directory on stream is NOT stash-consumed and
-    NOT stripped by the selector — the route guard judges it."""
-    from oc_slimapi.selector import (
-        SELECTOR_STATE_KEY,
-        SlimapiSelectorMiddleware,
-        V3_DIRECTORY_STATE_KEY,
+async def test_stream_query_only_is_allowed_noop():
+    status, body, scope = await _run_stream_selector("directory=/w")
+    assert status == 200
+    assert body == []
+    assert scope is not None
+    assert scope["state"]["slimapi_selector"]["result"] == "v4"
+    assert "slimapi_directory" not in scope["state"]
+    assert scope["query_string"] == b"directory=/w"
+
+
+async def test_stream_header_only_is_retired():
+    status, body, scope = await _run_stream_selector("", header="/w")
+    assert status == 400
+    assert body == {"code": "directory_header_retired"}
+    assert scope is None
+
+
+async def test_stream_query_plus_same_header_is_retired():
+    status, body, scope = await _run_stream_selector(
+        "directory=/w", header="/w/",
     )
+    assert status == 400
+    assert body == {"code": "directory_header_retired"}
+    assert scope is None
 
-    class _Capture:
-        def __init__(self) -> None:
-            self.scope = None
 
-        async def __call__(self, scope, receive, send) -> None:
-            self.scope = scope
-            await send({
-                "type": "http.response.start", "status": 200,
-                "headers": [(b"content-type", b"application/json")],
-            })
-            await send({"type": "http.response.body", "body": b"[]"})
-
-    capture = _Capture()
-    middleware = SlimapiSelectorMiddleware(
-        capture)
-    scope = {
-        "type": "http", "http_version": "1.1", "method": "GET",
-        "path": "/slimapi/sessions/s1/stream",
-        "raw_path": b"/slimapi/sessions/s1/stream",
-        "query_string": b"v=4&directory=/w",
-        "headers": [], "client": ("127.0.0.1", 1), "server": ("t", 80),
-        "state": {},
+async def test_stream_query_plus_different_header_conflicts():
+    status, body, scope = await _run_stream_selector(
+        "directory=/w", header="/p",
+    )
+    assert status == 400
+    assert body == {
+        "code": "directory_conflict",
+        "queryDirectory": "/w",
+        "headerDirectory": "/p",
     }
+    assert scope is None
 
-    async def receive() -> dict:
-        return {"type": "http.request", "body": b"", "more_body": False}
 
-    async def send(message: dict) -> None:
-        pass
-
-    await middleware(scope, receive, send)
-    assert capture.scope is not None
-    assert capture.scope["state"][SELECTOR_STATE_KEY]["result"] == "v4"
-    assert V3_DIRECTORY_STATE_KEY not in capture.scope["state"]
-    # `v` stripped (sidecar-reserved), `directory` preserved verbatim for
-    # the route guard.
-    assert capture.scope["query_string"] == b"directory=/w"
+async def test_stream_repeated_distinct_query_is_invalid():
+    status, body, scope = await _run_stream_selector(
+        "directory=/w&directory=/p",
+    )
+    assert status == 400
+    assert body == {"code": "invalid_directory_selector"}
+    assert scope is None
 
 
 # ---------------------------------------------------------------------------

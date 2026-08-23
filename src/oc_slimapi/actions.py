@@ -10,9 +10,8 @@ supplied):
   ``{kind, ok, markdown, exit_code, duration_ms, truncated, message?}``.
 
 Security posture (also pasted into the manifest header comment and
-operations.md): this is a **risk-accepted** surface, co-equal to the
-pre-existing plaintext catch-all → opencode control endpoints
-(``/global/upgrade``, ``/global/config`` PATCH, ...).  Low-cost mitigations —
+operations.md): this is a **risk-accepted** local control surface exposed by
+the sidecar itself; there is no passthrough catch-all. Low-cost mitigations —
 not authorization: default-empty manifest, spawn concurrency cap,
 per-action single-flight + min-interval throttling, owner-only-write
 manifest, non-disableable structured audit, ``shell=False``, and an argv

@@ -24,6 +24,7 @@ import httpx
 from fastapi import FastAPI
 from httpx import ASGITransport
 
+from conftest import current_replay_log
 from oc_slimapi.config import Settings
 from oc_slimapi.errors import register_error_handlers
 from oc_slimapi.routes import metrics
@@ -64,7 +65,10 @@ def _build_app(replay_log: ReplayLog | None) -> tuple[FastAPI, httpx.AsyncClient
     upstream = httpx.AsyncClient()
     app.state.config = _settings()
     app.state.upstream = upstream
-    hubs = HubRegistry(upstream)
+    hubs = HubRegistry(
+        upstream,
+        replay_log=replay_log if replay_log is not None else current_replay_log(),
+    )
     app.state.hubs = hubs
     if replay_log is not None:
         app.state.replay_log = replay_log

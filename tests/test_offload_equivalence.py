@@ -49,6 +49,7 @@ import orjson
 import pytest
 from fastapi import FastAPI
 
+from conftest import current_replay_log
 from oc_slimapi.config import Settings
 from oc_slimapi.errors import register_error_handlers
 from oc_slimapi.proxy import install_proxy
@@ -211,7 +212,8 @@ def _messages_app(settings: Settings, upstream: httpx.AsyncClient,
     ))
     app.state.schema_degraded = False
     app.state.deployment_revision = None
-    app.state.hubs = HubRegistry(upstream)
+    app.state.hubs = HubRegistry(
+        upstream, replay_log=current_replay_log())
     if with_registry and settings.coalesce_enabled:
         app.state.raw_fetch_registry = LeasedSingleFlight(
             max_bytes=settings.raw_fetch_max_bytes,
@@ -442,15 +444,23 @@ async def _scenario_readgroup(cases: dict[str, str]) -> None:
 _CHILD_SCRIPT = """
 import asyncio, json, sys
 sys.path.insert(0, {tests_dir!r})
+from conftest import _CURRENT_REPLAY_LOG
+from oc_slimapi.sse.replay_log import ReplayLog
 import test_offload_equivalence as m
 
 async def main():
-    cases = {{}}
-    await m._scenario_messages(cases)
-    await m._scenario_lease(cases)
-    await m._scenario_etag_off(cases)
-    await m._scenario_readgroup(cases)
-    print(json.dumps(cases))
+    replay_log = ReplayLog()
+    token = _CURRENT_REPLAY_LOG.set(replay_log)
+    try:
+        cases = {{}}
+        await m._scenario_messages(cases)
+        await m._scenario_lease(cases)
+        await m._scenario_etag_off(cases)
+        await m._scenario_readgroup(cases)
+        print(json.dumps(cases))
+    finally:
+        _CURRENT_REPLAY_LOG.reset(token)
+        replay_log.close()
 
 asyncio.run(main())
 """

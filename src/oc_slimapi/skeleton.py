@@ -1,4 +1,4 @@
-"""Pure v2-contract message/session projection functions."""
+"""Pure current-contract message/session projection functions."""
 
 from __future__ import annotations
 
@@ -174,25 +174,18 @@ def _utf8_bytes_exceeds(text: Any, limit: int) -> bool:
 
 def _expand_ref(
     category: str, message_id: str, part_id: str | None, sid: str,
-    # wire_view default 3 = pure-function historical FREEZE (golden: tests/
-    # test_expand_href_v4.py::test_projection_default_view_keeps_frozen_v3_bytes);
-    # production always passes 4 — routes/messages/_list.py::_expand_wire_view
-    # returns 4 unconditionally (D5). Do not "fix" the default to 4.
-    wire_view: int = 3,
 ) -> dict[str, Any]:
-    """Build one §5 expandRef entry (frozen schema).
+    """Build one current §5 expandRef entry (frozen schema).
 
-    Message-level href: ``/slimapi/messages/{sid}/expand/{category}/{mid}?v={view}``
-    Part-level href:    ``/slimapi/messages/{sid}/expand/{category}/{mid}/{partID}?v={view}``
+    Message-level href: ``/slimapi/messages/{sid}/expand/{category}/{mid}?v=4``
+    Part-level href:    ``/slimapi/messages/{sid}/expand/{category}/{mid}/{partID}?v=4``
     ``directory`` is appended by the client (§5.2).
 
-    v4 §14: ``?v=`` carries the request's wire view — v3 requests keep the
-    frozen v3 bytes (``?v=3``), v4 requests emit ``?v=4``. ``v`` stays the
-    FIRST (and, from the sidecar, ONLY) query key — the client appends
-    ``directory`` second (§14 frozen key order: ``v`` then ``directory``).
+    ``v`` stays the FIRST (and, from the sidecar, ONLY) query key — the client
+    appends ``directory`` second (§14 frozen key order).
     """
     base = f"/slimapi/messages/{sid}/expand/{category}/{message_id}"
-    href = f"{base}/{part_id}?v={wire_view}" if part_id is not None else f"{base}?v={wire_view}"
+    href = f"{base}/{part_id}?v=4" if part_id is not None else f"{base}?v=4"
     ref = {"category": category, "messageID": message_id, "href": href}
     if part_id is not None:
         ref["partID"] = part_id
@@ -201,11 +194,6 @@ def _expand_ref(
 
 def _emit_expand_refs(
     part: dict[str, Any], refs: list[tuple[str, str]], sid: str | None,
-    # wire_view default 3 = pure-function historical FREEZE (golden: tests/
-    # test_expand_href_v4.py::test_projection_default_view_keeps_frozen_v3_bytes);
-    # production always passes 4 — routes/messages/_list.py::_expand_wire_view
-    # returns 4 unconditionally (D5). Do not "fix" the default to 4.
-    wire_view: int = 3,
 ) -> dict[str, Any]:
     """Attach deduped, deterministic ``expandRefs`` to a part (§5.2).
 
@@ -215,8 +203,8 @@ def _emit_expand_refs(
     themselves still apply). Parts without a ``messageID`` — or refs whose
     partID is falsy (missing/empty, M3) — get no part-level refs.
 
-    v4 §14: ``wire_view`` selects the ``?v=`` value in every href (dedup /
-    sort semantics are view-invariant — inherited unchanged from v3 §4a).
+    Every href is emitted in the native v4 form; dedup and sort semantics are
+    unchanged.
     """
     if not sid or not refs:
         return part
@@ -224,7 +212,7 @@ def _emit_expand_refs(
     if not message_id:
         return part
     part["expandRefs"] = [
-        _expand_ref(category, message_id, part_id, sid, wire_view)
+        _expand_ref(category, message_id, part_id, sid)
         for category, part_id in sorted({(c, p) for c, p in refs if p})
     ]
     return part
@@ -698,11 +686,12 @@ def _maybe_inline_state_field(
             thin_state["outputBytes"] = size
 
 
-# wire_view default 3 = pure-function historical FREEZE (golden: tests/
-# test_expand_href_v4.py::test_projection_default_view_keeps_frozen_v3_bytes);
-# production always passes 4 — routes/messages/_list.py::_expand_wire_view
-# returns 4 unconditionally (D5). Do not "fix" the default to 4.
-def _tool(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS, sid: str | None = None, wire_view: int = 3) -> dict[str, Any]:
+def _tool(
+    part: dict[str, Any], *,
+    budget: dict[str, int] | None = None,
+    limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS,
+    sid: str | None = None,
+) -> dict[str, Any]:
     result = _pick(part, TOOL_KEYS)
     omitted: list[str] = []
     refs: list[tuple[str, str]] = []
@@ -836,7 +825,7 @@ def _tool(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits:
     for key in part:
         if key not in TOOL_KEYS and key != "state":
             omitted.append(key)
-    return _emit_expand_refs(_mark(result, omitted), refs, sid, wire_view)
+    return _emit_expand_refs(_mark(result, omitted), refs, sid)
 
 
 def _patch(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS, sid: str | None = None) -> dict[str, Any]:
@@ -914,11 +903,7 @@ def _patch(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits
     return _mark(result, omitted)
 
 
-# wire_view default 3 = pure-function historical FREEZE (golden: tests/
-# test_expand_href_v4.py::test_projection_default_view_keeps_frozen_v3_bytes);
-# production always passes 4 — routes/messages/_list.py::_expand_wire_view
-# returns 4 unconditionally (D5). Do not "fix" the default to 4.
-def _file(part: dict[str, Any], *, sid: str | None = None, wire_view: int = 3) -> dict[str, Any]:
+def _file(part: dict[str, Any], *, sid: str | None = None) -> dict[str, Any]:
     result = _pick(part, PART_IDS | {"filename", "mime"})
     omitted: list[str] = []
     refs: list[tuple[str, str]] = []
@@ -938,14 +923,15 @@ def _file(part: dict[str, Any], *, sid: str | None = None, wire_view: int = 3) -
     for key in part:
         if key not in PART_IDS | {"filename", "mime", "url", "source"}:
             omitted.append(key)
-    return _emit_expand_refs(_mark(result, omitted), refs, sid, wire_view)
+    return _emit_expand_refs(_mark(result, omitted), refs, sid)
 
 
-# wire_view default 3 = pure-function historical FREEZE (golden: tests/
-# test_expand_href_v4.py::test_projection_default_view_keeps_frozen_v3_bytes);
-# production always passes 4 — routes/messages/_list.py::_expand_wire_view
-# returns 4 unconditionally (D5). Do not "fix" the default to 4.
-def skeleton_part(part: dict[str, Any], *, budget: dict[str, int] | None = None, limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS, sid: str | None = None, wire_view: int = 3) -> dict[str, Any]:
+def skeleton_part(
+    part: dict[str, Any], *,
+    budget: dict[str, int] | None = None,
+    limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS,
+    sid: str | None = None,
+) -> dict[str, Any]:
     # §5: ``expandRefs`` is a sidecar-OWNED key — a foreign value from upstream
     # is dropped before any projection. It must never leak into the output, into
     # ``omitted``/``hasFull``, or survive a whole-part deepcopy (compaction);
@@ -961,7 +947,7 @@ def skeleton_part(part: dict[str, Any], *, budget: dict[str, int] | None = None,
         # synthetic/ignored/time are /full-only — omitted, never refs.
         copied = _pick(part, PART_IDS | {"text"})
         omitted = [key for key in part if key not in PART_IDS | {"text"}]
-        return _emit_expand_refs(_mark(copied, omitted), [], sid, wire_view)
+        return _emit_expand_refs(_mark(copied, omitted), [], sid)
     if part_type == "reasoning":
         # n1: threshold evaluated on the ORIGINAL text BEFORE _pick — an
         # oversized text is never deep-copied.
@@ -975,13 +961,13 @@ def skeleton_part(part: dict[str, Any], *, budget: dict[str, int] | None = None,
             if result.get("id"):
                 refs.append(("part_reasoning", result["id"]))
         # reasoning metadata/time omissions are /full-only (§2.3) — no refs.
-        return _emit_expand_refs(_mark(result, omitted), refs, sid, wire_view)
+        return _emit_expand_refs(_mark(result, omitted), refs, sid)
     if part_type == "tool":
-        return _tool(part, budget=budget, limits=limits, sid=sid, wire_view=wire_view)
+        return _tool(part, budget=budget, limits=limits, sid=sid)
     if part_type == "patch":
         return _patch(part, budget=budget, limits=limits, sid=sid)
     if part_type == "file":
-        return _file(part, sid=sid, wire_view=wire_view)
+        return _file(part, sid=sid)
     if part_type in {"step-start", "step-finish"}:
         result = _mark(_pick(part, PART_IDS), [key for key in part if key not in PART_IDS])
         refs: list[tuple[str, str]] = []
@@ -990,7 +976,7 @@ def skeleton_part(part: dict[str, Any], *, budget: dict[str, int] | None = None,
         # tokens are /full-only (§2.3).
         if part.get("snapshot") not in (None, "") and result.get("id"):
             refs.append(("part_snapshot", result["id"]))
-        return _emit_expand_refs(result, refs, sid, wire_view)
+        return _emit_expand_refs(result, refs, sid)
     if part_type == "compaction":
         copied = deepcopy(part)
         # Compaction is retained unless the single part violates its explicit cap.
@@ -1001,7 +987,7 @@ def skeleton_part(part: dict[str, Any], *, budget: dict[str, int] | None = None,
         # Lane-A falsy-id guard: partID only when the part id is truthy;
         # _emit_expand_refs suppresses without a messageID.
         refs = [("compaction_full", part["id"])] if part.get("id") else []
-        return _emit_expand_refs(_mark(_pick(part, PART_IDS), ["*"]), refs, sid, wire_view)
+        return _emit_expand_refs(_mark(_pick(part, PART_IDS), ["*"]), refs, sid)
     return _mark(_pick(part, PART_IDS), [key for key in part if key not in PART_IDS] or ["*"])
 
 
@@ -1010,11 +996,6 @@ def skeleton_message(
     limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS,
     fingerprint: bool = False,
     sid: str | None = None,
-    # wire_view default 3 = pure-function historical FREEZE (golden: tests/
-    # test_expand_href_v4.py::test_projection_default_view_keeps_frozen_v3_bytes);
-    # production always passes 4 — routes/messages/_list.py::_expand_wire_view
-    # returns 4 unconditionally (D5). Do not "fix" the default to 4.
-    wire_view: int = 3,
 ) -> dict[str, Any]:
     # P1-29: normalise nested fields defensively. A malformed upstream message
     # where ``info`` is null or ``parts`` is a non-list (int/bool/string) would
@@ -1044,7 +1025,7 @@ def skeleton_message(
         if sid and info_id and isinstance(orig_diffs, list) and orig_diffs:
             result["info"]["expandRefs"] = [
                 _expand_ref(
-                    "info_summary_diffs", message_id, None, sid, wire_view,
+                    "info_summary_diffs", message_id, None, sid,
                 )
             ]
     parts = message.get("parts") if isinstance(message, dict) else None
@@ -1057,7 +1038,7 @@ def skeleton_message(
     budget = {"used": 0}
     thin_parts = [
         skeleton_part(
-            part, budget=budget, limits=limits, sid=sid, wire_view=wire_view,
+            part, budget=budget, limits=limits, sid=sid,
         )
         for part in parts if isinstance(part, dict)
     ]
@@ -1087,22 +1068,14 @@ def skeleton_messages(
     limits: SkeletonLimits = DEFAULT_SKELETON_LIMITS,
     fingerprint: bool = False,
     sid: str | None = None,
-    # wire_view default 3 = pure-function historical FREEZE (golden: tests/
-    # test_expand_href_v4.py::test_projection_default_view_keeps_frozen_v3_bytes);
-    # production always passes 4 — routes/messages/_list.py::_expand_wire_view
-    # returns 4 unconditionally (D5). Do not "fix" the default to 4.
-    wire_view: int = 3,
 ) -> list[dict[str, Any]]:
-    """Project a full upstream message list to skeletons (design-expand §4).
+    """Project an upstream message list to current skeletons (§4).
 
-    v4 §14: ``wire_view`` selects the ``?v=`` value in every expandRefs
-    href (3 → frozen v3 bytes, 4 → ``?v=4``); default 3 keeps the pure
-    functions' historical output byte-identical.
+    Every generated expand href uses the native v4 selector.
     """
     return [
         skeleton_message(
             message, limits=limits, fingerprint=fingerprint, sid=sid,
-            wire_view=wire_view,
         )
         for message in messages
     ]

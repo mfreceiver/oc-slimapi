@@ -27,6 +27,7 @@ import orjson
 import pytest
 from fastapi import FastAPI
 
+from conftest import current_replay_log
 from oc_slimapi.config import Settings
 from oc_slimapi.errors import register_error_handlers
 from oc_slimapi.middleware.traffic_accounting import TrafficAccountingMiddleware
@@ -77,7 +78,8 @@ def _build_app(
     app.state.upstream = upstream
     app.state.schema_degraded = False
     app.state.deployment_revision = None
-    app.state.hubs = HubRegistry(upstream)
+    app.state.hubs = HubRegistry(
+        upstream, replay_log=current_replay_log())
     app.state.transforms = TransformPool(TransformConfig(
         max_transforms=settings.max_transforms,
         transform_wait_seconds=settings.transform_wait_seconds,
@@ -350,4 +352,3 @@ async def test_messages_cap_bail_stashes_upin(upstream_factory):
 # ===========================================================================
 # Scenario 4 — proxy mid-stream upstream response aclose via finally (P1-10)
 # ===========================================================================
-

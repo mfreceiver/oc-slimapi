@@ -1,4 +1,4 @@
-"""Tests for the v2 curated SSE contract.
+"""Tests for the native-v4 curated SSE contract.
 
 Covers:
 * digest merges status + messageID into one debounced frame per session
@@ -8,16 +8,18 @@ Covers:
 * text deltas / tool.* / message.part.* are dropped
 * reconnect emits a resync frame
 * sessions across multiple directories all flow into the digest stream
-* subscribe() emits server.connected first
+* subscribe() has no connection-local welcome frame
 * HubRegistry shares one global hub regardless of directory key
 * /slimapi/events route wires the SSE response correctly end-to-end
-* T3: subscriber queue overflow clears the queue and emits resync + STOP
+* T3: subscriber queue overflow clears the queue and emits STOP only
   (old frames are NOT delivered)
 * T3: HubRegistry admission raises SubscriberCapacityError past the caps
 * T3: HubRegistry.snapshot_metrics() matches the contract shape
 """
 
 from __future__ import annotations
+
+from conftest import current_replay_log
 
 import asyncio
 import json
@@ -101,7 +103,7 @@ async def _close_hub(hub: GlobalHub) -> None:
 @pytest.fixture
 async def hub():
     """Bare GlobalHub; always tears down background tasks (incl. stop_after_grace)."""
-    h = GlobalHub(client=None)
+    h = GlobalHub(client=None, replay_log=current_replay_log())
     try:
         yield h
     finally:
@@ -122,7 +124,7 @@ def _fresh_hub() -> tuple[GlobalHub, Subscriber]:
     Prefer the ``fresh_hub`` / ``hub`` fixtures — they cancel stop_after_grace.
     Kept for call sites that already wrap with ``await _close_hub(hub)``.
     """
-    hub = GlobalHub(client=None)
+    hub = GlobalHub(client=None, replay_log=current_replay_log())
     subscriber = Subscriber()
     hub.subscribers.add(subscriber)
     return hub, subscriber
@@ -272,13 +274,9 @@ async def test_multi_directory_sessions_each_emit_their_own_digest(fresh_hub):
     assert digests["s2"]["status"] == "idle"
 
 
-async def test_subscribe_emits_server_connected_first(hub):
+async def test_subscribe_has_no_connection_local_welcome(hub):
     subscriber = hub.subscribe()
-    # First frame must be server.connected; no other frame may precede it.
-    first = await asyncio.wait_for(subscriber.queue.get(), timeout=0.2)
-    event_name, data = parse_event(first)
-    assert event_name == "server.connected"
-    assert data == {}
+    assert subscriber.queue.empty()
 
 
 async def test_message_appended_updates_message_id(fresh_hub):
@@ -314,7 +312,7 @@ async def test_deleted_flag_persists_across_subsequent_status_changes(fresh_hub)
 
 
 async def test_hub_registry_shares_one_global_hub_across_directories():
-    registry = HubRegistry(client=None)
+    registry = HubRegistry(client=None, replay_log=current_replay_log())
     try:
         h1 = registry.get("/dir-a")
         h2 = registry.get("/dir-b")
@@ -325,7 +323,7 @@ async def test_hub_registry_shares_one_global_hub_across_directories():
 
 
 async def test_close_is_safe_when_no_hub_was_created():
-    registry = HubRegistry(client=None)
+    registry = HubRegistry(client=None, replay_log=current_replay_log())
     # Should not raise.
     await registry.close()
 
@@ -337,7 +335,7 @@ class _MockHubs:
     def get_global(self) -> GlobalHub:
         return self._hub
 
-    def subscribe(self, wire_v4: bool = False) -> Subscriber:
+    def subscribe(self) -> Subscriber:
         # Direct delegation: this mock bypasses admission control so the
         # events-route tests can exercise the SSE generator without a
         # fully-configured registry.
@@ -354,7 +352,11 @@ class _MockHubs:
 class _MockRequest:
     def __init__(self, hub: GlobalHub, headers: dict[str, str] | None = None):
         self.app = type("App", (), {})()
-        self.app.state = type("State", (), {"hubs": _MockHubs(hub)})()
+        self.app.state = type(
+            "State",
+            (),
+            {"hubs": _MockHubs(hub), "replay_log": current_replay_log()},
+        )()
         self.headers = headers or {}
 
 
@@ -369,12 +371,12 @@ async def _events_route_chunks(hub: GlobalHub, headers: dict[str, str] | None = 
     return response
 
 
-async def test_events_route_streams_server_connected_first(hub):
+async def test_events_route_streams_first_native_frame(hub):
     response = await _events_route_chunks(hub)
     iterator = response.body_iterator
     chunks: list[bytes] = []
     try:
-        # Pull exactly two frames: server.connected then any queue item.
+        # Pull the first native-v4 frame.
         first = await asyncio.wait_for(anext(iterator), timeout=0.5)
         chunks.append(first)
     except StopAsyncIteration:
@@ -390,7 +392,11 @@ async def test_events_route_streams_server_connected_first(hub):
 
 
 async def test_events_route_honours_last_event_id_with_resync(hub):
-    response = await _events_route_chunks(hub, headers={"last-event-id": "anything"})
+    epoch = current_replay_log().epoch
+    other_epoch = ("0" if epoch[0] != "0" else "1") + epoch[1:]
+    response = await _events_route_chunks(
+        hub, headers={"last-event-id": f"g:{other_epoch}:0"}
+    )
     iterator = response.body_iterator
     chunks: list[bytes] = []
     try:
@@ -404,7 +410,7 @@ async def test_events_route_honours_last_event_id_with_resync(hub):
     assert chunks and chunks[0].startswith(b"event: slimapi.meta")
     combined = b"".join(chunks)
     assert b"event: resync" in combined
-    assert b"reconnect_no_replay" in combined
+    assert b"epoch_changed" in combined
 
 
 # ---------------------------------------------------------------------------
@@ -701,11 +707,11 @@ async def test_extract_session_id_uses_info_id_for_session_events(fresh_hub):
 
 
 # ---------------------------------------------------------------------------
-# Lane-H / Gap 3: Subscriber overflow — immediate clear + resync + STOP
+# Lane-H / Gap 3: Subscriber overflow — immediate clear + STOP
 # (contract §6)
 # ---------------------------------------------------------------------------
 
-async def test_subscriber_overflow_clears_queue_and_emits_resync_then_stop():
+async def test_subscriber_overflow_clears_queue_and_emits_stop():
     """Slow client: queue full → immediate disconnect.
 
     The previously-queued frames MUST be cleared (not drained to completion)
@@ -733,7 +739,7 @@ async def test_subscriber_overflow_clears_queue_and_emits_resync_then_stop():
     assert subscriber.forced_disconnects == 1
     assert subscriber.queued_bytes == 0
 
-    # Drain remaining items: ONLY resync + STOP.
+    # Drain remaining items: ONLY STOP.
     items = []
     while True:
         try:
@@ -741,15 +747,10 @@ async def test_subscriber_overflow_clears_queue_and_emits_resync_then_stop():
         except asyncio.QueueEmpty:
             break
         items.append(item)
-    assert len(items) == 2  # resync frame + STOP
-    assert items[-1] is STOP
-
-    resync = items[0]
-    assert b"event: resync" in resync
-    assert b"subscriber_backpressure" in resync
+    assert items == [STOP]
 
     # Critical guarantee (contract §6): old frames NOT still in the queue.
-    payload = b"".join(item for item in items[:-1] if isinstance(item, (bytes, bytearray)))
+    payload = b"".join(item for item in items if isinstance(item, (bytes, bytearray)))
     assert b'"seq": "aaaa"' not in payload
     assert b'"seq": "bbbb"' not in payload
     assert b'"seq": "cccc"' not in payload
@@ -799,6 +800,7 @@ async def test_subscriber_buffer_bytes_overflow_triggers_disconnect():
 async def test_registry_admission_raises_when_per_directory_cap_exceeded():
     registry = HubRegistry(
         client=None,
+        replay_log=current_replay_log(),
         max_subscribers_per_directory=2,
         max_total_subscribers=10,
     )
@@ -821,6 +823,7 @@ async def test_registry_admission_raises_when_per_directory_cap_exceeded():
 async def test_registry_admission_raises_when_total_cap_exceeded():
     registry = HubRegistry(
         client=None,
+        replay_log=current_replay_log(),
         max_subscribers_per_directory=10,
         max_total_subscribers=2,
     )
@@ -841,6 +844,7 @@ async def test_registry_unsubscribe_is_idempotent():
     §6 admission would otherwise go negative / over-admit)."""
     registry = HubRegistry(
         client=None,
+        replay_log=current_replay_log(),
         max_subscribers_per_directory=2,
         max_total_subscribers=10,
     )
@@ -864,6 +868,7 @@ async def test_registry_unsubscribe_is_idempotent():
 async def test_snapshot_metrics_matches_contract_shape():
     registry = HubRegistry(
         client=None,
+        replay_log=current_replay_log(),
         max_subscribers_per_directory=8,
         max_total_subscribers=16,
     )
@@ -908,10 +913,9 @@ async def test_snapshot_metrics_matches_contract_shape():
             "droppedFramesTotal", "forcedDisconnectsTotal",
         }
         assert client_entry["subscriberId"] == s1.id
-        # Welcome frame is sitting in the queue waiting for the SSE generator.
-        welcome = sse_frame({}, event="server.connected")
-        assert client_entry["queueItems"] == 1
-        assert client_entry["bufferBytes"] == len(welcome)
+        # Native v4 subscribe has no connection-local welcome frame.
+        assert client_entry["queueItems"] == 0
+        assert client_entry["bufferBytes"] == 0
         assert client_entry["droppedFramesTotal"] == 0
         assert client_entry["forcedDisconnectsTotal"] == 0
         # Skeleton subtree (no transform pool wired in this test)
@@ -929,6 +933,7 @@ async def test_snapshot_metrics_counts_rejects_and_current_subscribers():
     live subscribers only."""
     registry = HubRegistry(
         client=None,
+        replay_log=current_replay_log(),
         max_subscribers_per_directory=1,
         max_total_subscribers=10,
     )
@@ -1188,8 +1193,10 @@ async def test_events_teardown_releases_registry_slot():
     """
     from oc_slimapi.routes.events import events
 
+    replay_log = current_replay_log()
     registry = HubRegistry(
         client=None,
+        replay_log=replay_log,
         max_subscribers_per_directory=10,
         max_total_subscribers=10,
     )
@@ -1198,7 +1205,9 @@ async def test_events_teardown_releases_registry_slot():
             assert registry.total_subscribers == 0
             request = type("Request", (), {})()
             request.app = type("App", (), {})()
-            request.app.state = type("State", (), {"hubs": registry})()
+            request.app.state = type(
+                "State", (), {"hubs": registry, "replay_log": replay_log}
+            )()
             request.headers = {}
             response = await events(request)
             assert response.media_type == "text/event-stream"
@@ -1572,10 +1581,9 @@ def test_subscriber_put_oversized_frame_returns_false():
     assert not subscriber.closed
 
 
-def test_subscriber_put_overflow_returns_false_and_emits_resync_stop():
+def test_subscriber_put_overflow_returns_false_and_emits_stop_only():
     """The overflow path returns False (the original frame was NOT enqueued);
-    the self-produced resync + STOP are on the queue but are not counted
-    by the new return value (caller shouldn't see ``True`` for them)."""
+    the terminal STOP replaces stale data without a synthetic resync."""
     subscriber = Subscriber(
         queue_items=2, buffer_bytes=4096, max_frame_bytes=4096,
     )
@@ -1585,8 +1593,8 @@ def test_subscriber_put_overflow_returns_false_and_emits_resync_stop():
     # Third put triggers the overflow path.
     assert subscriber.put(sse_frame({"i": 3}, event="test")) is False
     assert subscriber.closed is True
-    # resync + STOP present, original overflow frame NOT on the queue.
-    assert subscriber.queue.qsize() == 2
+    # STOP is the only remaining item; the original overflow frame is absent.
+    assert list(subscriber.queue._queue) == [STOP]
 
 
 def test_subscriber_put_stop_sentinel_returns_true_when_enqueued():

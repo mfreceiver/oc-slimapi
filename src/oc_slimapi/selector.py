@@ -112,17 +112,17 @@ SSE_RESULT_DIMS = ("v2", "v3", "v4", "absent", "not_applicable")
 VERSION_QUERY_PARAM = "v"
 VERSIONS_PATH = "/slimapi/versions"
 
-# §5.3/§5.7: the canonical (and only) v3 directory input is the
+# §5.3/§5.7: the canonical directory input is the
 # ``?directory=`` query parameter; the ``X-Opencode-Directory`` header is
 # retired input — presence on a consuming route is a 400.
 DIRECTORY_QUERY_PARAM = "directory"
 DIRECTORY_HEADER_NAME = "x-opencode-directory"
 
-# Scope-state key: set ONLY when a v3 request on a §5.3 consuming (non-stream)
+# Scope-state key: set ONLY when a request on a §5.3 consuming (non-stream)
 # route actually supplied a usable ``?directory=`` value — the value is the
 # validated resolved directory (consume succeeded). Routes read it via
 # :func:`resolve_route_directory` instead of the (now stripped) query param.
-V3_DIRECTORY_STATE_KEY = "slimapi_v3_directory"
+DIRECTORY_STATE_KEY = "slimapi_directory"
 
 # §2 lexical rule: ASCII digits, no leading zero, at least one digit.
 _SELECTOR_LEXICAL_RE = re.compile(r"^[1-9][0-9]*$")
@@ -412,8 +412,8 @@ def resolve_route_directory(scope: Scope, query_value: str | None) -> str | None
       unchanged.
     """
     state = scope.get("state")
-    if isinstance(state, dict) and V3_DIRECTORY_STATE_KEY in state:
-        return state[V3_DIRECTORY_STATE_KEY]
+    if isinstance(state, dict) and DIRECTORY_STATE_KEY in state:
+        return state[DIRECTORY_STATE_KEY]
     return query_value
 
 
@@ -639,23 +639,23 @@ class SlimapiSelectorMiddleware:
         Returns ``None`` on success (including "nothing to consume" and
         every tolerant route), or an error-body dict for a 400.
 
-        **v4 fork (checked FIRST — the retirement error outranks the whole
-        v3 validation ladder)**: on a retired route (global sessions list)
+        **Retirement fork (checked FIRST — the retirement error outranks the
+        validation ladder)**: on a retired route (global sessions list)
         ANY directory input — query key present (single/multi/blank) or
         header present in any form — is a uniform 400
         ``directory_retired_in_v4``; without any directory input the route
         forwards untouched (global facade). Priority chain stays intact:
         the version-family 400s above have already run before this.
 
-        **Otherwise the v3 ladder applies verbatim** (identical for wire
-        3 and wire 4 on every non-retired route):
+        **Otherwise the current validation ladder applies verbatim** on every
+        non-retired route:
 
         1. multi-value distinct (normalised) → ``invalid_directory_selector``;
         2. dual-present normalised-different → ``directory_conflict``;
         3. header present otherwise (header-only / dual-present same) →
            ``directory_header_retired``;
         4. query-only single value → consume: validate, stash under
-           :data:`V3_DIRECTORY_STATE_KEY`, strip every ``directory`` pair
+           :data:`DIRECTORY_STATE_KEY`, strip every ``directory`` pair
            from the downstream query (byte-preserving, same scan as the
            ``v`` strip).
 
@@ -704,7 +704,7 @@ class SlimapiSelectorMiddleware:
             return None
         state = scope.setdefault("state", {})
         if isinstance(state, dict):
-            state[V3_DIRECTORY_STATE_KEY] = resolved
+            state[DIRECTORY_STATE_KEY] = resolved
         # Strip AFTER the form was recorded (§9.1 directoryForm observes
         # the client-sent query) and only on the success path — a 400
         # request never forwards, so its query bytes are irrelevant.

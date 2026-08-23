@@ -346,12 +346,6 @@ class _FrameSub:
         self.frames: list[bytes] = []
         self.closed = False
 
-    def begin_handshake(self) -> None:
-        return None
-
-    def end_handshake(self) -> None:
-        return None
-
     def put(self, frame: bytes) -> bool:
         self.frames.append(frame)
         return True
@@ -385,25 +379,30 @@ def _delta_props(delta: str) -> dict:
 
 
 async def _scenario_token_frames(cases: dict[str, str]) -> None:
-    """W3-1 golden: scripted attach → ingest → flush sequence; every wire
-    frame digested. The hub split must be a pure move (byte-identical
-    frame stream for the same event sequence)."""
+    """Native-v4 golden: scripted attach → ingest → flush sequence; every
+    published token frame is digested. Attach itself emits no legacy
+    handshake/snapshot frame."""
+    from oc_slimapi.sse.replay_log import ReplayLog
     from oc_slimapi.sse.tokenstream.hub import TokenStreamHub
 
-    hub = TokenStreamHub()
-    sub = _FrameSub("s1")
-    hub.attach_subscriber("s1", sub)
-    hub.on_part_updated(_updated_props(text=""))
-    hub.on_part_delta(_delta_props(delta="Hello "))
-    hub.on_part_delta(_delta_props(delta="refactor "))
-    hub.flush()
-    hub.on_part_delta(_delta_props(delta="golden"))
-    # Terminal part end (finish_part drains residuals synchronously —
-    # the ingest→flush→terminal chain in one digest).
-    hub.on_part_updated(_updated_props(end=1234))
-    hub.flush()
-    frames = sub.frames
-    assert len(frames) >= 3, (
+    replay_log = ReplayLog(epoch="0123456789abcdef")
+    try:
+        hub = TokenStreamHub(replay_log=replay_log)
+        sub = _FrameSub("s1")
+        hub.attach_subscriber("s1", sub)
+        hub.on_part_updated(_updated_props(text=""))
+        hub.on_part_delta(_delta_props(delta="Hello "))
+        hub.on_part_delta(_delta_props(delta="refactor "))
+        hub.flush()
+        hub.on_part_delta(_delta_props(delta="golden"))
+        # Terminal part end (finish_part drains residuals synchronously —
+        # the ingest→flush→terminal chain in one digest).
+        hub.on_part_updated(_updated_props(end=1234))
+        hub.flush()
+        frames = sub.frames
+    finally:
+        replay_log.close()
+    assert len(frames) >= 2, (
         f"degenerate frame snapshot ({len(frames)} frames) — the ingest "
         "envelope shape regressed again"
     )
@@ -443,8 +442,8 @@ def _fetch_cases() -> dict[str, str]:
 
 
 def test_refactor_golden_matrix():
-    """N6 gate: record on the pre-refactor baseline, replay hash-identical
-    after every Wave 3 lane."""
+    """N6 gate: non-token cases stay byte-identical; the token case pins the
+    native-v4 no-handshake/no-snapshot stream."""
     cases = _fetch_cases()
 
     if os.environ.get(RECORD_ENV) == "1":
@@ -452,7 +451,7 @@ def test_refactor_golden_matrix():
         document = {
             "_meta": {
                 "matrix": 1,
-                "recorded_on": "pre-Wave-3 baseline",
+                "recorded_on": "v4-native Task 4 baseline",
                 "digest_basis": "raw wire bytes / raw token frames",
                 "hashseed": "PYTHONHASHSEED=0 subprocess (skeleton _pick "
                             "key order is per-process)",
@@ -467,7 +466,7 @@ def test_refactor_golden_matrix():
 
     assert GOLDEN_PATH.is_file(), (
         f"golden missing: {GOLDEN_PATH} (record with {RECORD_ENV}=1 on the "
-        "pre-refactor baseline)"
+        "current v4-native baseline)"
     )
     stored = orjson.loads(GOLDEN_PATH.read_bytes())["cases"]
     mismatches = [

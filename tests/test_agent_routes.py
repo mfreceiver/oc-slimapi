@@ -21,6 +21,7 @@ import orjson
 import pytest
 from fastapi import FastAPI
 
+from conftest import current_replay_log
 from oc_slimapi.config import Settings
 from oc_slimapi.errors import register_error_handlers
 from oc_slimapi.proxy import install_proxy
@@ -65,7 +66,8 @@ def _build_app(settings: Settings, upstream: httpx.AsyncClient) -> FastAPI:
     ))
     app.state.schema_degraded = False
     app.state.deployment_revision = None
-    app.state.hubs = HubRegistry(upstream)
+    app.state.hubs = HubRegistry(
+        upstream, replay_log=current_replay_log())
     for router in (health.router, agent.router):
         app.include_router(router)
     install_proxy(app)

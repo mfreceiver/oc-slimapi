@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 
     from ..traffic import TrafficLedger
     from ..turn_registry import TurnRegistry
+    from .replay_log import ReplayLog
     from .tokenstream import TokenStreamHub
 
 logger = get_logger(__name__)
@@ -39,8 +40,8 @@ class HubRegistry:
 
     ``get(directory)`` is kept for back-compat with callers that still pass a
     directory key, but the directory is ignored — the same hub is returned
-    regardless. ``HubRegistry(client)`` and ``close()`` signatures are
-    unchanged.
+    regardless. The process-wide replay log is a required construction
+    dependency and is forwarded to the lazily-created global hub.
 
     Admission runs entirely inside :meth:`subscribe`: the capacity check and
     the ``subscribers.add`` happen with no ``await`` between them, so under
@@ -54,6 +55,7 @@ class HubRegistry:
         self,
         client: httpx.AsyncClient | None,
         *,
+        replay_log: "ReplayLog",
         max_subscribers_per_directory: int = DEFAULT_MAX_SUBSCRIBERS_PER_DIRECTORY,
         max_total_subscribers: int = DEFAULT_MAX_TOTAL_SUBSCRIBERS,
         queue_items: int = DEFAULT_SSE_QUEUE_ITEMS,
@@ -80,10 +82,9 @@ class HubRegistry:
         # lifespan and pushes it here; the registry forwards the reference
         # onto any lazily-created GlobalHub (mirrors _token_hub wiring).
         self._turn_registry: TurnRegistry | None = None
-        # B3b-2: process-wide replay log (app.state.replay_log), forwarded
-        # onto any lazily-created GlobalHub via the ctor kwarg (mirrors
-        # _token_hub / _turn_registry wiring). ``None`` = v3-only stack.
-        self._replay_log: Any | None = None
+        # B3b-2: the lifespan-owned, process-wide replay log is required at
+        # construction and forwarded to the lazily-created GlobalHub.
+        self._replay_log = replay_log
         self._removal_task: asyncio.Task | None = None
         # 4.10.1 (B): best-effort epoch-invalidation callbacks (catalog
         # cache invalidate). Stashed here and forwarded onto every
@@ -119,20 +120,6 @@ class HubRegistry:
         self._turn_registry = registry
         if self._global is not None:
             self._global._turn_registry = registry
-
-    def set_replay_log(self, replay_log: Any | None) -> None:
-        """Wire the process-wide :class:`ReplayLog` (B3b-2) onto the
-        registry and any live GlobalHub.
-
-        Mirrors :meth:`set_token_hub`: app.py constructs the replay log in
-        lifespan (``app.state.replay_log``) and pushes it here BEFORE any
-        hub exists; ``get()`` forwards it onto the lazily-created GlobalHub
-        via the ctor kwarg. ``None`` is accepted for tests / v3-only stacks
-        (hub runs the unchanged id-less / un-logged pipeline).
-        """
-        self._replay_log = replay_log
-        if self._global is not None:
-            self._global.set_replay_log(replay_log)
 
     def add_upstream_loss_callback(self, callback: Any) -> None:
         """Register a best-effort epoch-invalidation callback (4.10.1 B).
@@ -210,16 +197,8 @@ class HubRegistry:
             self._remove_hub_after_grace(hub), name="hub-grace-removal"
         )
 
-    def subscribe(self, wire_v4: bool = False) -> Subscriber:
+    def subscribe(self) -> Subscriber:
         """Admit a new subscriber under T3 caps, then start / reuse the hub.
-
-        ``wire_v4`` (rev-gate BLOCKER-1 / condition 5): suppresses the
-        connection-local ``server.connected`` welcome frame (v4-only —
-        the frame is outside the frozen no-``id:`` control set and must
-        not bypass the replay log) and stamps ``subscriber.wire_v4`` so
-        the fanout choke point id-stamps business frames for this
-        connection. v3 callers keep the default ``False`` — the welcome
-        frame and raw frame bytes are byte-identical unchanged.
 
         Capacity check + ``subscribers.add`` happen with no ``await`` between
         them (contract §6 admission critical section). On overflow raises
@@ -249,8 +228,7 @@ class HubRegistry:
                 limit=self.max_total_subscribers,
                 current=self.total_subscribers,
             )
-        subscriber = hub.subscribe(welcome=not wire_v4)
-        subscriber.wire_v4 = wire_v4
+        subscriber = hub.subscribe()
         self.total_subscribers += 1
         # ---- end critical section ----
         return subscriber
@@ -393,7 +371,7 @@ class HubRegistry:
             # invariant: AFTER the gather (no frame can append past the
             # barrier watermark) and BEFORE the reference drop (no new
             # hub can start appending into the barrier's span). CRITICAL 1:
-            # _part_revisions and _removed_messages are PRESERVED by
+            # Current token sequencing/budget state is PRESERVED by
             # on_upstream_reconnect (see its docstring).
             try:
                 hub.notify_idle_recycle_loss()

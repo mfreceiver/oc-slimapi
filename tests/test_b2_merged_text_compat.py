@@ -34,7 +34,7 @@ from oc_slimapi.skeleton import (
 from oc_slimapi.transform import TransformConfig, TransformPool
 
 SID = "ses_s"
-V3 = "?v=3"  # default-view (selector-less) projection href face; V2b retargets to v4
+V4 = "?v=4"  # v4-only expand href face
 HDR = {"X-Slimapi-Version": "2"}
 
 
@@ -211,7 +211,7 @@ def test_reasoning_greater_2048_still_folds_part_reasoning():
         "category": "part_reasoning",
         "messageID": "m1",
         "partID": "prt",
-        "href": f"/slimapi/messages/{SID}/expand/part_reasoning/m1/prt{V3}",
+        "href": f"/slimapi/messages/{SID}/expand/part_reasoning/m1/prt{V4}",
     }]
 
 
@@ -230,7 +230,7 @@ def test_diffs_skeleton_always_null_ref_only_when_nonempty_list():
     assert out["info"]["expandRefs"] == [{
         "category": "info_summary_diffs",
         "messageID": "m1",
-        "href": f"/slimapi/messages/{SID}/expand/info_summary_diffs/m1{V3}",
+        "href": f"/slimapi/messages/{SID}/expand/info_summary_diffs/m1{V4}",
     }]
 
     # Empty / falsy / non-list → diffs still null, but NO ref (m1 rule).
@@ -282,5 +282,5 @@ def test_tool_state_output_folding_and_ref_unchanged():
         "category": "part_state_output",
         "messageID": "m1",
         "partID": "p1",
-        "href": f"/slimapi/messages/{SID}/expand/part_state_output/m1/p1{V3}",
+        "href": f"/slimapi/messages/{SID}/expand/part_state_output/m1/p1{V4}",
     }]

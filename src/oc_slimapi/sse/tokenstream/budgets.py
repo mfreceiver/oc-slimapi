@@ -27,7 +27,7 @@ from ...config import (
     TOKEN_REMOVED_MESSAGES_TTL_MS,
 )
 from ..hub_types import RESYNC_TOKEN_MEMORY_LIMIT
-from .frames import PartKey, _now_ms, _truncated_frame
+from .frames import PartKey, _now_ms
 from .ingest import _SESSION_STATUS_MAX
 from .models import LivePart
 
@@ -82,10 +82,9 @@ class BudgetMixin:
 
         rev-ogpt CRITICAL 1 (Option B — per-FRAME) + MAJOR 5: this is
         the SINGLE increment site for ``_part_revisions`` (besides
-        pop-on-retire paths). Every token frame with independent
-        delivery semantics (snapshot / delta / done marker / truncated)
-        calls this so no two frames emitted for the same part ever
-        share a revision. Initializes to -1 internally so the first
+        pop-on-retire paths). Every emitted delta calls this so no two
+        delivered frames for the same part share a revision. Initializes
+        to -1 internally so the first
         emitted frame for a new part yields 0. Move-to-end + FIFO cap
         (``TOKEN_DISABLED_MAX``) keep the map bounded (MAJOR 5) and LRU-
         correct.
@@ -99,59 +98,13 @@ class BudgetMixin:
             self._part_revisions.popitem(last=False)
         return rev
     def _truncate_part_for_all(self, key: PartKey, done: bool) -> int | None:
-        """C6 backstop (HISTORICAL v3 fanout semantics): fan
-        ``snapshot{truncated:true}`` to **v3 subscribers only** of the
-        key's sid, then :meth:`drop_part`. v4-INELIGIBLE since rev-gate
-        R2 (see ``_deliver_v3_only`` at the call site below): a v4
-        subscriber never receives the truncated frame and there is no
-        snapshot handshake — v4 state alignment is HTTP-based
-        (revision reconciliation per the frozen contract §7.7).
+        """Retire an oversized part without constructing legacy wire frames.
 
-        Idempotent via the ``_is_disabled`` check up front (``drop_part``
-        would return False for an already-disabled key) — the truncated
-        frame is emitted exactly once per part even if multiple code paths
-        race (per-tick snapshot fanout, _reserve per-part overflow,
-        finish_part terminal marker).
-
-        Returns the per-frame revision consumed for THIS truncated frame
-        (or ``None`` if the part was already disabled — second-call no-op).
-        (HISTORICAL v3 behavior) callers use the returned value to deliver
-        a direct-put truncated frame to a v3 handshake sub that is not yet
-        in the fanout set (:meth:`_emit_snapshot_or_truncated`).
-
-        Stage B v0.4 (MAJOR 4 fix): the per-part revision is captured
-        BEFORE :meth:`drop_part` clears ``_part_revisions[key]``, so the
-        truncated frame still carries a valid ``partEventRevision``.
-
-        rev-ogpt CRITICAL 1 (Option B — per-FRAME): the truncated frame
-        consumes its OWN revision via :meth:`_next_part_revision`
-        (strictly greater than the previous delivery), so a client using
-        strict ``>`` reliably accepts it. The idempotency check
-        (``_is_disabled``) runs BEFORE the increment so a second-call
-        no-op does not waste a revision.
+        The method name/signature remain internal-call compatible. Native v4
+        clients converge through revision reconciliation and authoritative
+        HTTP state; ``truncatedSnapshotsTotal`` therefore remains zero.
         """
-        # Idempotency: if the key is already disabled, a previous call
-        # already fanned the truncated frame — no-op (do NOT increment
-        # the revision for a no-op).
-        if self._is_disabled(key):
-            return None
-        # Per-frame (Option B): consume the NEXT revision BEFORE
-        # drop_part clears ``_part_revisions[key]``. The captured value
-        # is what the truncated frame carries on the wire.
-        captured_rev = self._next_part_revision(key)
-        # drop_part now disables the key (so subsequent calls hit the
-        # idempotency branch above) and clears ``_part_revisions[key]``.
-        self.drop_part(key)
-        sid = key[0]
-        trunc = _truncated_frame(key, done, part_revision=captured_rev)
-        # rev-gate R2 BLOCKER-1: the truncated marker belongs to the
-        # ``message.part.snapshot`` family — v4-INELIGIBLE. It is NOT
-        # replay-logged (no seq), and delivered to v3 subscribers only.
-        # A v4 reconnect therefore never sees it in the replay window;
-        # v4 state alignment is HTTP-based per the frozen contract.
-        self._deliver_v3_only(sid, trunc)
-        self._metrics.truncated_snapshots_total += 1
-        return captured_rev
+        return 0 if self.drop_part(key) else None
     # ------------------------------------------------------------------
     # Memory accounting (Stage C live budget + Stage E pending budget split)
     # ------------------------------------------------------------------
@@ -160,16 +113,11 @@ class BudgetMixin:
         (Stage C; Stage E renamed to "live budget" after the 4+4 split).
 
         Returns True iff the delta may be appended; False if it was dropped
-        (after the appropriate fanout). Failure modes (§6 / §5.8):
+        after the appropriate state transition. Failure modes (§6 / §5.8):
 
         * **Per-part cap** (``TOKEN_PART_MAX_BYTES``): this delta would
-          push the part over 1 MiB → :meth:`_truncate_part_for_all` fans
-          ``snapshot{truncated:true, done:false}`` to **v3 subscribers
-          only** + drop_part. Returns False. For a **v4** subscriber there
-          is no token-wire signal at all: the oversized delta is dropped
-          (never appended), the part is disabled by ``drop_part``, and the
-          client converges via revision reconciliation (``/full``
-          ``time.end`` per the frozen contract §7.7).
+          push the part over 1 MiB → drop/disable the part. The client
+          converges through digest revision and authoritative HTTP state.
         * **Global LIVE byte cap** (``TOKEN_LIVEPARTS_MAX_BYTES``, 4MiB
           after Stage E split): this delta would push the global
           accumulator over the cap → LRU-evict the oldest LivePart (by
@@ -178,8 +126,8 @@ class BudgetMixin:
           repeat until under budget. If after eviction the delta still
           cannot fit (only this part left, or the delta alone exceeds the
           cap — unreachable in practice because the per-part cap is
-          smaller), truncate + drop. Returns False iff the current key
-          was ultimately truncated.
+          smaller), retire + drop. Returns False iff the current key was
+          ultimately retired.
 
         Note: this method ONLY checks the LIVE budget (LivePart chunks).
         The PENDING budget (DeltaAccumulator chunks) is checked separately
@@ -223,38 +171,16 @@ class BudgetMixin:
         REST merge rule (rest text overrides once the same part carries
         a non-empty ``time.end`` on the reconciliation GET).
 
-        (HISTORICAL v3 behavior — the re-snapshot loop below still runs
-        but delivers v3-only frames; v4 subscribers never see it) After
-        the eviction, re-emit a ``snapshot{done:false}`` for each
-        REMAINING live part of the same sid to every already-attached
-        subscriber, so existing subscribers get a fresh snapshot anchor
-        without needing to reconnect (S-2 method B).
-
-        (HISTORICAL v3, same scope) ``skip_key`` (MB-P-S1): the key the
-        CALLER is currently reserving/admitting for (e.g. ``_reserve``'s
-        ``key``, ``_start_part``'s new ``key``). It is **re-included** in
-        the re-snapshot loop via the nodrop path
-        (:meth:`_emit_snapshot_or_truncated_nodrop`), which delivers the
-        snapshot or truncated frame **without** calling ``drop_part``.
-        This closes the client-anchor gap for clear-only (method B,
-        ``triggersReconnect=false``) eviction: the current key's
-        v3-subscriber-side anchor is restored by the re-snapshot, just
-        like any other remaining live part. On the v4 face the anchor
-        concept is gone — the advisory resync (protocol v2) re-bases
-        nothing and the client keeps consuming by seq.
-
-        O1 invariant (still holds): the current key (``skip_key``) is
-        ***never*** passed to ``_truncate_part_for_all`` or ``drop_part``
-        during re-snapshot — the nodrop path emits truncated frames directly
-        and keeps the LivePart alive. The caller's stale ``live`` reference
-        remains valid; no gauge drift or orphan deltas.
+        ``skip_key`` is the key the caller is currently reserving/admitting
+        for. Candidate selection excludes it, preserving the caller's live
+        object reference and preventing gauge drift or orphan deltas.
 
         4.12.0 修订六 B-2 (rev-2 修正 2, 语义精化): the eviction clears
         the part's live/pending state (``drop_part`` — unchanged) and
         publishes the ``token_memory_limit`` resync as a REPLAYABLE
         business frame via :meth:`_fanout_replayable_resync` (B-1 atomic
         path: id line + payload seq + ReplayLog entry) — replacing the
-        historical v3-only control-frame degradation. The stream does NOT
+        historical connection-private control degradation. The stream does NOT
         terminate: later frames for the sid (other, un-evicted parts /
         future new parts) keep publishing on the same seq sequence.
 
@@ -263,7 +189,7 @@ class BudgetMixin:
         ``_disabled_parts``, so every later ``message.part.updated`` /
         ``message.part.delta`` for it is silently dropped at the ingest
         gates. The part is REST-owned from here on — never a server-side
-        re-snapshot or state rebuild. v4 final-state closure face =
+        incremental state rebuild. v4 final-state closure face =
         ``/full/{mid}`` (the ``time.end`` predicate; CLIENT_CHANGES
         five-step algorithm): the ``/messages`` skeleton face carries no
         part ``time`` at all.
@@ -281,8 +207,7 @@ class BudgetMixin:
         if not self.drop_part(key):
             return  # already disabled — eviction resync already fanned.
         sid = key[0]
-        # I1: drain pending for this sid before resync + re-snapshot
-        # (mirrors attach_subscriber handshake step 2, preventing C2 double-count).
+        # Drain pending for this sid before the replayable resync.
         # The EVICTED key's own pending accumulator was already popped and
         # DISCARDED by drop_part above — its un-flushed tail delta is never
         # published. flush_sid therefore only publishes the OTHER live parts'
@@ -295,30 +220,6 @@ class BudgetMixin:
         # _fanout_replayable_resync; the state is already cleared here).
         self._fanout_replayable_resync(sid, RESYNC_TOKEN_MEMORY_LIMIT)
         self._metrics.token_memory_limit_total += 1
-        # Re-snapshot remaining live parts of this sid to existing subs.
-        # MB-P-S1: include skip_key via nodrop path (no drop_part).
-        # [4.12.0 修订六 R4 gate note] This re-snapshot loop only affects
-        # the historical v3 wire (v3 subscribers still receive
-        # snapshot/truncated frames here to get a fresh anchor — S-2
-        # method B). v4 subscribers are NEVER sent the message.part.snapshot
-        # family (R2 frozen philosophy: no snapshots to v4, live or here);
-        # their state alignment is exclusively the client's HTTP fetch.
-        subs = list(self._subs_by_sid.get(sid, ()))
-        if not subs:
-            return
-        for live_key in sorted(
-            k for k in self.live_parts if k[0] == sid
-        ):
-            live = self.live_parts[live_key]
-            text = "".join(live.chunks)
-            if live_key == skip_key:
-                for sub in subs:
-                    self._emit_snapshot_or_truncated_nodrop(
-                        sub, live_key, text, done=False
-                    )
-            else:
-                for sub in subs:
-                    self._emit_snapshot_or_truncated(sub, live_key, text, done=False)
     def _check_pending_budget(self, current_key: PartKey) -> None:
         """Stage E (§16-C residual split): global PENDING budget overflow handler.
 
@@ -381,11 +282,9 @@ class BudgetMixin:
         the admission. We therefore run the SAME LRU while-evict here,
         never evicting the key we are admitting (mirrors ``_reserve``'s
         ``never evict the current key`` contract). Seeds do NOT contribute
-        to the pending budget (they are never buffered in
-        ``DeltaAccumulator`` — (HISTORICAL v3 behavior) delivered via the
-        v3 handshake snapshot, not a delta frame; under v4 no-prefill
-        join this snapshot is never published and HTTP is the alignment
-        source).
+        to the pending budget because they are never buffered in
+        ``DeltaAccumulator`` or emitted as delta frames; ReplayLog plus HTTP
+        is the native-v4 alignment source.
         """
         # Global part COUNT cap: evict oldest (LRU) before creating.
         while len(self.live_parts) >= TOKEN_LIVE_PARTS_MAX:
@@ -416,15 +315,14 @@ class BudgetMixin:
                 oldest = min(candidates, key=lambda k: self.live_parts[k].last_delta_ms)
                 self._evict_part_for_memory(oldest, skip_key=key)
     def drop_part(self, key: PartKey) -> bool:
-        """Retire a part (C4: truncated / finished / evicted).
+        """Retire a part (C4: oversized / finished / evicted).
 
         Pops ``_pending`` (decrementing ``_total_pending_bytes``, floored at
         0 — Stage E) and ``live_parts`` (decrementing ``_total_live_bytes``,
         floored at 0) and discards the key from ``_nontext_parts``.
         Idempotent: the FIRST call records the key in ``_disabled_parts``
-        and returns ``True`` so the caller (Stage C truncate-fanout /
-        finish_part / memory-evict) emits the resync / truncated frame
-        exactly once; subsequent calls return ``False``. Calling
+        and returns ``True`` so callers perform any associated replayable
+        resync exactly once; subsequent calls return ``False``. Calling
         ``drop_part`` on a key that was never seen is legal and still
         marks it disabled (no future deltas will be accepted for it).
         """
@@ -450,7 +348,7 @@ class BudgetMixin:
         """Record a tombstone in the bounded ``_disabled_parts`` map.
 
         WHY bounded: an unbounded ``set`` would grow forever across a
-        long-running sidecar (every truncated / too_large part stays
+        long-running sidecar (every oversized part stays
         forever). We cap at ``TOKEN_DISABLED_MAX`` entries with a
         ``TOKEN_DISABLED_TTL_S`` expiry, evicting oldest first
         (insertion-ordered ``OrderedDict``). Idempotent: re-recording an
@@ -512,8 +410,9 @@ class BudgetMixin:
 
         Late part events for a deleted session are dropped at the entry of
         ``on_part_updated`` / ``on_part_delta`` / ``on_part_removed`` so they
-        cannot resurrect a LivePart. Cap + TTL aligned with the replay queue
-        (``TOKEN_REMOVED_MESSAGES_MAX`` / ``TOKEN_REMOVED_MESSAGES_TTL_MS``).
+        cannot resurrect a LivePart. Cap + TTL use the shared late-event gate
+        retention budget (``TOKEN_REMOVED_MESSAGES_MAX`` /
+        ``TOKEN_REMOVED_MESSAGES_TTL_MS``).
         ``move_to_end`` on re-delete keeps the freshest entry at the tail.
         """
         now_ms = _now_ms()
@@ -541,30 +440,3 @@ class BudgetMixin:
         """P1-21: FIFO cap on ``_session_status`` to prevent unbounded growth."""
         while len(self._session_status) > _SESSION_STATUS_MAX:
             self._session_status.popitem(last=False)
-    def _prune_removed_messages(self, now_ms: int) -> None:
-        """Enforce FIFO cap + TTL on the ``_removed_messages`` replay queue.
-
-        Stage B v0.6 §P.2 (MAJOR 4 方案 C). Called on-insert (from
-        :meth:`on_message_removed`) for cap enforcement and periodically
-        from :meth:`ttl_sweep` for TTL cleanup. Oldest-first eviction
-        relies on the ``OrderedDict`` preserving insertion order
-        (refreshed by ``move_to_end`` in :meth:`on_message_removed` for
-        duplicate-tombstone correctness — rev-ogpt MAJOR 6).
-
-        rev-ogpt CRITICAL 2: every evicted key is ALSO discarded from
-        ``_retired_messages`` so the gate's lifetime is coupled to the
-        replay queue (the gate cannot outlive the tombstone — once the
-        client can no longer be told about the removal, late events for
-        that message are acceptably processed as "new" events; the
-        digest fingerprint mechanism catches the inconsistency).
-        """
-        cutoff = now_ms - TOKEN_REMOVED_MESSAGES_TTL_MS
-        # TTL: remove entries older than the 24h TTL.
-        expired = [k for k, ts in self._removed_messages.items() if ts < cutoff]
-        for k in expired:
-            self._removed_messages.pop(k, None)
-            self._retired_messages.discard(k)  # CRITICAL 2 gate cleanup
-        # FIFO cap: evict oldest until under limit.
-        while len(self._removed_messages) > TOKEN_REMOVED_MESSAGES_MAX:
-            evicted_key, _ = self._removed_messages.popitem(last=False)
-            self._retired_messages.discard(evicted_key)  # CRITICAL 2 gate cleanup

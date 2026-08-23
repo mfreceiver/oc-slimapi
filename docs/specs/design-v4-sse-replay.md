@@ -1,6 +1,8 @@
 # 设计方案：SSE 重放协议（v4）
 
-> **v4 设计稿（B0-3）**：本文件定义 v4 SSE 重放协议（`id:` + `Last-Event-ID` 恢复）的完整设计。**现行 wire 契约以 `docs/specs/v3-contract.md` §7 为准（帧名帧形冻结，v2.2 行 153）**；本设计仅在 v4 生效。
+> **历史设计稿（B0-3）**：本文件记录 v4 SSE replay 的设计与评审演进，
+> 不是现行规范源。当前 wire 权威见 [`v4-contract.md`](v4-contract.md) §7，
+> consumer 算法见 [`PROTOCOL.md`](PROTOCOL.md)；`v3-contract.md` 仅为历史存档。
 >
 > 状态：**设计稿 v4（B0 批）— 协议设计**
 > 性质：**v4-only 加性 wire 行为**（v4 版本协商后启用；v3 帧名帧形零变化；落地时 `sseReplay` 能力键随实现同批广告，B3b）

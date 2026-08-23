@@ -30,12 +30,24 @@ from fastapi import FastAPI
 from oc_slimapi.config import Settings
 from oc_slimapi.errors import register_error_handlers
 from oc_slimapi.proxy import install_proxy
-from oc_slimapi.routes import events, health, messages, sessions
+from oc_slimapi.routes import (
+    children,
+    events,
+    health,
+    messages,
+    permissions,
+    questions,
+    sessions,
+    write_groups,
+)
+from oc_slimapi.selector import SlimapiSelectorMiddleware
 from oc_slimapi.sse.hub import HubRegistry
+from oc_slimapi.sse.replay_log import ReplayLog
 from oc_slimapi.config import settings as _cfg_settings
 from oc_slimapi.transform import TransformConfig, TransformPool
 
 VERSION_HEADERS = {"X-Slimapi-Version": "1"}
+_APPS_TO_CLOSE: list[FastAPI] = []
 
 
 def _settings(**overrides) -> Settings:
@@ -56,7 +68,12 @@ def _settings(**overrides) -> Settings:
     return Settings(**base)
 
 
-def _build_app(settings: Settings, upstream: httpx.AsyncClient) -> FastAPI:
+def _build_app(
+    settings: Settings,
+    upstream: httpx.AsyncClient,
+    *,
+    selector: bool = False,
+) -> FastAPI:
     """Construct a fresh FastAPI app with the routers wired up and ``app.state``
     pre-populated, mirroring ``oc_slimapi.app.lifespan`` but without running
     the smoke probe against the mocked upstream."""
@@ -70,12 +87,42 @@ def _build_app(settings: Settings, upstream: httpx.AsyncClient) -> FastAPI:
     ))
     app.state.schema_degraded = False
     app.state.deployment_revision = None
-    app.state.hubs = HubRegistry(upstream)
-    for router in (health.router, sessions.router, messages.router, events.router):
+    replay_log = ReplayLog()
+    app.state.replay_log = replay_log
+    app.state.hubs = HubRegistry(upstream, replay_log=replay_log)
+    for router in (
+        health.router,
+        sessions.router,
+        children.router,
+        messages.router,
+        events.router,
+        questions.router,
+        permissions.router,
+        write_groups.router,
+    ):
         app.include_router(router)
+    if selector:
+        app.add_middleware(SlimapiSelectorMiddleware)
     install_proxy(app)
     register_error_handlers(app)
+    _APPS_TO_CLOSE.append(app)
     return app
+
+
+async def _close_app(app: FastAPI) -> None:
+    await app.state.hubs.close()
+    app.state.replay_log.close()
+    app.state.transforms.shutdown()
+
+
+@pytest.fixture(autouse=True)
+async def _close_test_apps():
+    """Close every required ReplayLog/HubRegistry built by this module."""
+    start = len(_APPS_TO_CLOSE)
+    yield
+    for app in reversed(_APPS_TO_CLOSE[start:]):
+        await _close_app(app)
+    del _APPS_TO_CLOSE[start:]
 
 
 def _sample_upstream_payload() -> bytes:
@@ -312,15 +359,12 @@ async def test_health_stays_responsive_during_slow_transform(app_and_client, mon
     original_pack = msgs_mod._project_list_sorted_and_pack
     slow_packs_started = asyncio.Event()
 
-    def slow_pack(body, *, accept_encoding, limits, sid=None, wire_view=3):
+    def slow_pack(body, *, accept_encoding, limits, sid=None):
         # Signal that the worker has picked up the job, then park it.
-        # ``wire_view`` follows the real worker's §14 seam so the route's
-        # v3/v4 href threading passes through the stand-in unchanged.
         slow_packs_started.set()
         time.sleep(0.5)
         return original_pack(
-            body, accept_encoding=accept_encoding, limits=limits, sid=sid,
-            wire_view=wire_view)
+            body, accept_encoding=accept_encoding, limits=limits, sid=sid)
 
     monkeypatch.setattr(msgs_mod, "_project_list_sorted_and_pack", slow_pack)
 
@@ -370,12 +414,12 @@ async def test_messages_list_413_negotiates_gzip(upstream_factory):
 
     upstream = upstream_factory(handler)
     settings = _settings(max_response_bytes=cap, transform_wait_seconds=2.0)
-    app = _build_app(settings, upstream)
+    app = _build_app(settings, upstream, selector=True)
     transport = httpx.ASGITransport(app)
     try:
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.get(
-                "/slimapi/messages/s1?mode=skeleton",
+                "/slimapi/messages/s1?mode=skeleton&v=4",
                 headers={**VERSION_HEADERS, "Accept-Encoding": "gzip"},
             )
         assert response.status_code == 413
@@ -1076,12 +1120,12 @@ async def test_messages_list_unknown_directory_passes_through(upstream_factory):
 
     upstream = upstream_factory(handler)
     settings = _settings()
-    app = _build_app(settings, upstream)
+    app = _build_app(settings, upstream, selector=True)
     transport = httpx.ASGITransport(app=app)
     try:
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.get(
-                "/slimapi/messages/s1?directory=/nope",
+                "/slimapi/messages/s1?v=4&directory=/nope",
                 headers=VERSION_HEADERS,
             )
         assert response.status_code == 200
@@ -1092,22 +1136,22 @@ async def test_messages_list_unknown_directory_passes_through(upstream_factory):
 
 
 async def test_messages_list_query_header_conflict_400(upstream_factory):
-    """G7-soft: query directory ≠ X-Opencode-Directory header → 400 even if both allowed."""
+    """The real selector owns query/header directory conflict precedence."""
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=b"[]", headers={"Content-Type": "application/json"})
 
     upstream = upstream_factory(handler)
     settings = _settings()
-    app = _build_app(settings, upstream)
+    app = _build_app(settings, upstream, selector=True)
     transport = httpx.ASGITransport(app=app)
     try:
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.get(
-                "/slimapi/messages/s1?directory=/app",
+                "/slimapi/messages/s1?v=4&directory=/app",
                 headers={**VERSION_HEADERS, "X-Opencode-Directory": "/other"},
             )
         assert response.status_code == 400
-        assert response.json()["code"] == "directory_not_allowed"
+        assert response.json()["code"] == "directory_conflict"
     finally:
         app.state.transforms.shutdown()
 
@@ -1120,11 +1164,13 @@ async def test_messages_list_no_directory_passes(upstream_factory):
 
     upstream = upstream_factory(handler)
     settings = _settings()
-    app = _build_app(settings, upstream)
+    app = _build_app(settings, upstream, selector=True)
     transport = httpx.ASGITransport(app=app)
     try:
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            response = await client.get("/slimapi/messages/s1", headers=VERSION_HEADERS)
+            response = await client.get(
+                "/slimapi/messages/s1?v=4", headers=VERSION_HEADERS,
+            )
         assert response.status_code == 200
     finally:
         app.state.transforms.shutdown()
@@ -1144,12 +1190,12 @@ async def test_full_message_unknown_directory_passes_through(upstream_factory):
 
     upstream = upstream_factory(handler)
     settings = _settings()
-    app = _build_app(settings, upstream)
+    app = _build_app(settings, upstream, selector=True)
     transport = httpx.ASGITransport(app=app)
     try:
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.get(
-                "/slimapi/messages/s1/full/m1?directory=/nope", headers=VERSION_HEADERS,
+                "/slimapi/messages/s1/full/m1?v=4&directory=/nope", headers=VERSION_HEADERS,
             )
         assert response.status_code == 200
         assert captured["dir"] == "/nope"
@@ -1170,12 +1216,12 @@ async def test_messages_list_allowed_directory_forwarded_normalized(upstream_fac
 
     upstream = upstream_factory(handler)
     settings = _settings()
-    app = _build_app(settings, upstream)
+    app = _build_app(settings, upstream, selector=True)
     transport = httpx.ASGITransport(app=app)
     try:
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.get(
-                "/slimapi/messages/s1?directory=/app/", headers=VERSION_HEADERS,
+                "/slimapi/messages/s1?v=4&directory=/app/", headers=VERSION_HEADERS,
             )
         assert response.status_code == 200
         # Normalised: trailing slash stripped before forwarding.
@@ -1185,25 +1231,22 @@ async def test_messages_list_allowed_directory_forwarded_normalized(upstream_fac
 
 
 async def test_full_message_query_header_conflict_400(upstream_factory):
-    """G7-soft: query ``directory`` conflicting with ``X-Opencode-Directory``
-    header → 400 ``directory_not_allowed`` on /full/{mid} too. Both
-    directories are in the allowlist, so this isolates the conflict check
-    from the allowlist check."""
+    """The selector owns directory conflict precedence on /full/{mid}."""
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=b"{}", headers={"Content-Type": "application/json"})
 
     upstream = upstream_factory(handler)
     settings = _settings()
-    app = _build_app(settings, upstream)
+    app = _build_app(settings, upstream, selector=True)
     transport = httpx.ASGITransport(app=app)
     try:
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.get(
-                "/slimapi/messages/s1/full/m1?directory=/app",
+                "/slimapi/messages/s1/full/m1?v=4&directory=/app",
                 headers={**VERSION_HEADERS, "X-Opencode-Directory": "/other"},
             )
         assert response.status_code == 400
-        assert response.json()["code"] == "directory_not_allowed"
+        assert response.json()["code"] == "directory_conflict"
     finally:
         app.state.transforms.shutdown()
 
@@ -1540,44 +1583,33 @@ def test_created_sort_key_rejects_bool_nan_inf():
         ("GET", "/slimapi/messages/s1/full?ids=m1,m2", "batch multi-mid expand (/full?ids=)"),
         ("GET", "/slimapi/messages/s1/since/100", "incremental sync (/since/{ts})"),
         # sessions.py deletions (§1)
-        ("GET", "/slimapi/sessions/s1/children", "session children"),
         ("GET", "/slimapi/sessions/s1/status", "single session status"),
         # NOTE: GET /slimapi/sessions/status (batch) was re-added on
         # 2026-08-03 (additive, see CHANGELOG / v2-contract §2). It is no
         # longer a deleted endpoint — covered by test_sessions_routes.py.
         ("GET", "/slimapi/projects", "projects discovery"),
-        # questions.py deletions (§1, entire file retired)
-        ("GET", "/slimapi/questions", "questions list"),
-        ("GET", "/slimapi/permissions", "permissions list"),
-        ("POST", "/slimapi/questions/q1/reply", "question reply"),
-        ("POST", "/slimapi/questions/q1/reject", "question reject"),
-        ("POST", "/slimapi/sessions/s1/permissions/p1", "permission reply"),
     ],
     ids=[
         "full-ids", "since-ts",
-        "session-children", "session-status", "projects",
-        "questions", "permissions",
-        "question-reply", "question-reject", "permission-reply",
+        "session-status", "projects",
     ],
 )
 async def test_deleted_endpoints_return_404(upstream_factory, method, path, description):
-    """lite-v2 §1 + §9.3: ALL removed endpoints return 404 because the
-    handlers are no longer registered (or the entire router file was deleted).
-    Covers GET and POST methods across messages, sessions, and questions
-    families — 10 paths total (batch /sessions/status was re-added 2026-08-03)."""
+    """Only genuinely retired paths remain unregistered."""
     # Handler should never be called: the route does not exist.
     def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
         return httpx.Response(200, content=b"[]")
 
     upstream = upstream_factory(handler)
-    app = _build_app(_settings(), upstream)
+    app = _build_app(_settings(), upstream, selector=True)
     transport = httpx.ASGITransport(app=app)
     try:
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             if method == "GET":
-                response = await client.get(path, headers=VERSION_HEADERS)
+                separator = "&" if "?" in path else "?"
+                response = await client.get(f"{path}{separator}v=4", headers=VERSION_HEADERS)
             else:
-                response = await client.post(path, headers=VERSION_HEADERS)
+                response = await client.post(f"{path}?v=4", headers=VERSION_HEADERS)
         # Unregistered route → FastAPI's default 404 (no handler matched).
         assert response.status_code == 404, (
             f"{description}: expected 404 for deleted endpoint, got "
@@ -1585,6 +1617,41 @@ async def test_deleted_endpoints_return_404(upstream_factory, method, path, desc
         )
     finally:
         app.state.transforms.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/slimapi/sessions/{sid}/children"),
+        ("GET", "/slimapi/questions"),
+        ("GET", "/slimapi/permissions"),
+        ("POST", "/slimapi/question/{request_id}/reply"),
+        ("POST", "/slimapi/question/{request_id}/reject"),
+        ("POST", "/slimapi/session/{session_id}/permissions/{permission_id}"),
+    ],
+)
+async def test_live_route_families_are_registered(method, path):
+    """A production-like router assembly proves live families were not retired."""
+    upstream = httpx.AsyncClient(base_url="http://127.0.0.1:4096")
+    app = _build_app(_settings(), upstream)
+    try:
+        routes = [
+            candidate
+            for included in app.routes
+            for candidate in (
+                getattr(included, "original_router", None).routes
+                if getattr(included, "original_router", None) is not None
+                else [included]
+            )
+        ]
+        matches = {
+            (route.path, candidate)
+            for route in routes
+            for candidate in getattr(route, "methods", set())
+        }
+        assert (path, method) in matches
+    finally:
+        await upstream.aclose()
 
 
 # ---------------------------------------------------------------------------

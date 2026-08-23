@@ -27,6 +27,8 @@ import contextlib
 
 import pytest
 
+from conftest import current_replay_log
+
 from oc_slimapi.sse.global_hub import GlobalHub
 from oc_slimapi.sse.hub_types import Subscriber
 from oc_slimapi.sse.registry import HubRegistry
@@ -53,7 +55,7 @@ def _make_gated_hub() -> tuple[GlobalHub, dict[str, asyncio.Event]]:
     gate BEFORE re-raising — modelling a slow unwind (httpx connection
     teardown). Releasing a gate completes that task's unwind.
     """
-    hub = GlobalHub(client=None)
+    hub = GlobalHub(client=None, replay_log=current_replay_log())
     gates = {
         "run": asyncio.Event(),
         "flush": asyncio.Event(),
@@ -284,7 +286,7 @@ class TestStaleWaiter:
 
 class TestCloseBarrier:
     async def test_close_with_pending_revival_never_revives(self):
-        registry = HubRegistry(client=None)
+        registry = HubRegistry(client=None, replay_log=current_replay_log())
         # Build the hub through the registry so close() exercises its path.
         registry.subscribe()
         hub = registry.get_global()
@@ -352,7 +354,7 @@ class TestConsumerLeavesDuringWait:
     async def test_no_revival_and_grace_removal_succeeds(self, monkeypatch):
         monkeypatch.setattr("oc_slimapi.sse.global_hub.GRACE_SECONDS", 0.0)
         monkeypatch.setattr("oc_slimapi.sse.registry.GRACE_SECONDS", 0.0)
-        registry = HubRegistry(client=None)
+        registry = HubRegistry(client=None, replay_log=current_replay_log())
         sub = registry.subscribe()
         hub = registry.get_global()
         assert hub is not None
@@ -416,8 +418,8 @@ class TestTokenAttachRollback:
         self, monkeypatch,
     ):
         monkeypatch.setattr("oc_slimapi.sse.registry.GRACE_SECONDS", 0.0)
-        th = TokenStreamHub()
-        hubs = HubRegistry(client=None)
+        th = TokenStreamHub(replay_log=current_replay_log())
+        hubs = HubRegistry(client=None, replay_log=current_replay_log())
         hubs.set_token_hub(th)
         reg = TokenStreamRegistry(
             th, hubs,
@@ -464,7 +466,7 @@ class TestTokenAttachRollback:
 
         monkeypatch.setattr(th, "attach_subscriber", boom)
         with pytest.raises(RuntimeError):
-            reg.subscribe("s1", wire_v4=True)
+            reg.subscribe("s1")
 
         # Rollback re-armed grace removal despite the pending waiter.
         removal = hubs._removal_task
@@ -760,7 +762,7 @@ class TestEventsEntryRealFrames:
     ):
         monkeypatch.setattr("oc_slimapi.sse.registry.GRACE_SECONDS", 0.0)
         monkeypatch.setattr("oc_slimapi.sse.global_hub.HEARTBEAT_SECONDS", 0.05)
-        registry = HubRegistry(client=None)
+        registry = HubRegistry(client=None, replay_log=current_replay_log())
         sub = registry.subscribe()
         hub = registry.get_global()
         assert hub is not None
@@ -829,8 +831,8 @@ class TestTokenEntryRevival:
         self, monkeypatch,
     ):
         monkeypatch.setattr("oc_slimapi.sse.registry.GRACE_SECONDS", 0.0)
-        th = TokenStreamHub()
-        hubs = HubRegistry(client=None)
+        th = TokenStreamHub(replay_log=current_replay_log())
+        hubs = HubRegistry(client=None, replay_log=current_replay_log())
         hubs.set_token_hub(th)
         reg = TokenStreamRegistry(
             th, hubs,
@@ -865,7 +867,7 @@ class TestTokenEntryRevival:
         # Token subscribe: cancel_pending_removal() FIRST (kills the
         # removal task inside its gather — the abandon branch never runs),
         # then ensure_upstream() — pre-fix this no-op'd → zombie.
-        tok_sub = reg.subscribe("s1", wire_v4=True)
+        tok_sub = reg.subscribe("s1")
         assert not tok_sub.closed
         assert hubs._removal_task is None  # cancelled + slot cleared
         assert hub._revive_task is not None  # revival waiter armed

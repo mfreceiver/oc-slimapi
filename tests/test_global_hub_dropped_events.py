@@ -20,6 +20,8 @@ Plan: docs/ocmar/plans/2026-08-21-audit-fix-batch1.md §泳道 L1-2.
 
 from __future__ import annotations
 
+from conftest import current_replay_log
+
 from oc_slimapi.sse import global_hub as global_hub_module
 from oc_slimapi.sse.global_hub import GlobalHub
 from oc_slimapi.sse.registry import HubRegistry
@@ -31,7 +33,7 @@ def ev(directory, event_type: str, properties: dict | None = None) -> dict:
 
 
 def test_per_type_drop_counts():
-    hub = GlobalHub(None)
+    hub = GlobalHub(None, replay_log=current_replay_log())
     hub.publish(ev(None, "todo.updated"))
     hub.publish(ev(None, "todo.updated"))
     hub.publish(ev(None, "file.edited"))
@@ -44,7 +46,7 @@ def test_per_type_drop_counts():
 
 
 def test_curated_events_are_not_counted_as_dropped():
-    hub = GlobalHub(None)
+    hub = GlobalHub(None, replay_log=current_replay_log())
     # Every curated family returns early — none may reach the catch-all
     # counter.
     hub.publish(ev("/p", "permission.asked", {"id": "p1"}))       # IMMEDIATE
@@ -57,7 +59,7 @@ def test_curated_events_are_not_counted_as_dropped():
 
     # shape 加性演进：droppedEventsByType（2026-08-21 R-5 裁决，取代 4.5.0
     # 内部-only 决定）——hubs[] 条目现在暴露该表（浅拷贝），既有键零改动。
-    registry = HubRegistry(None)
+    registry = HubRegistry(None, replay_log=current_replay_log())
     registry.get_global().publish(ev(None, "todo.updated"))
     hub_entry = registry.snapshot_metrics()["sse"]["hubs"][0]
     assert set(hub_entry) == {
@@ -74,7 +76,7 @@ def test_curated_events_are_not_counted_as_dropped():
 
 def test_drop_table_cardinality_is_bounded(monkeypatch):
     monkeypatch.setattr(global_hub_module, "_DROPPED_TYPES_MAX", 2)
-    hub = GlobalHub(None)
+    hub = GlobalHub(None, replay_log=current_replay_log())
     hub.publish(ev(None, "todo.updated"))
     hub.publish(ev(None, "file.edited"))
     hub.publish(ev(None, "tool.updated"))  # 3rd distinct type → __other__

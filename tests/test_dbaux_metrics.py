@@ -10,6 +10,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from conftest import current_replay_log
 from oc_slimapi.config import Settings
 from oc_slimapi.dbaux import DbAuxiliarySource, resolve_db_path
 from oc_slimapi.dbaux.path_resolution import ResolvedPath
@@ -50,6 +51,7 @@ def _build_app(aux=None) -> tuple[FastAPI, HubRegistry, httpx.AsyncClient]:
     ))
     hubs = HubRegistry(
         upstream,
+        replay_log=current_replay_log(),
         max_subscribers_per_directory=settings.max_subscribers_per_directory,
         max_total_subscribers=settings.max_total_subscribers,
         queue_items=settings.sse_queue_items,

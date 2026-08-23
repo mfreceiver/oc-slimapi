@@ -22,8 +22,9 @@ Harness 双轨（并行线隔离——本线不改 selector.py / readiness.py）
   selector 的版本裁决。门控经 ``gate_on`` fixture 显式钉住激活态
   （集成批次后 ``SATISFIED`` 全集本就是默认——fixture 使断言不随未来
   翻转漂移；handler 动态读模块属性）。
-* **集成断言（full-stack 轨）**：真实 selector + catch-all 全栈装配
-  （与 ``test_method_boundary_v4.py`` 同构）——v3 → 404 基线、过渡态
+* **集成断言（full-stack 轨）**：真实 selector + terminal no-passthrough
+  boundary 全栈装配（与 ``test_method_boundary_v4.py`` 同构）——retired
+  v3 selector → 400、过渡态
   （``transitional_gates`` 回拨九项集）v4 三组合仍由 selector 拦
   ``method_not_applicable`` 405（handler 不接管、零上游 IO）。
 """
@@ -44,8 +45,8 @@ from oc_slimapi.errors import register_error_handlers
 from oc_slimapi.proxy import install_proxy
 from oc_slimapi.routes import write_groups
 from oc_slimapi.selector import (
+    DIRECTORY_STATE_KEY,
     SELECTOR_STATE_KEY,
-    V3_DIRECTORY_STATE_KEY,
     SlimapiSelectorMiddleware,
 )
 
@@ -88,7 +89,7 @@ class _AdmittedWireStash:
     生产 selector 唯一能让 ``wire_view_from_scope`` 报 4 的方式就是写入
     ``state[SELECTOR_STATE_KEY] = {"result": "v4", "wire": "4"}``；本类做
     同一件事（外加可选 directory 消费 stash，模拟消费集单值剥离后的
-    ``V3_DIRECTORY_STATE_KEY``）。测试 URL 不携带 ``?v=``（wire view 由
+    ``DIRECTORY_STATE_KEY``）。测试 URL 不携带 ``?v=``（wire view 由
     注入而来，不经解析）——与 ``wire_view_from_scope`` docstring 所述
     「direct route invocation in tests」同一约定。
     """
@@ -108,14 +109,14 @@ class _AdmittedWireStash:
                     "wire": self.wire,
                 }
                 if self.directory is not None:
-                    state[V3_DIRECTORY_STATE_KEY] = self.directory
+                    state[DIRECTORY_STATE_KEY] = self.directory
         await self.app(scope, receive, send)
 
 
 @pytest.fixture
 async def make_app():
     """App factory（write_groups router → error handlers → stash 或真实
-    selector（+ catch-all））。跟踪 MockTransport 上游 client 并在测试后
+    selector（+ terminal no-passthrough boundary））。跟踪 MockTransport 上游 client 并在测试后
     关闭（conftest ``upstream_factory`` 惯例）。"""
     clients: list[httpx.AsyncClient] = []
 
@@ -143,8 +144,8 @@ async def make_app():
             app.add_middleware(_AdmittedWireStash, wire=wire,
                                directory=directory)
         else:
-            # 生产装配（app.py 顺序）：selector 中间件最外 + catch-all
-            # 兜底在后——v3/过渡态集成断言轨。
+            # 生产装配（app.py 顺序）：selector 中间件最外 + terminal
+            # no-passthrough boundary 在后——retired-v3/过渡态集成断言轨。
             app.add_middleware(SlimapiSelectorMiddleware)
             install_proxy(app)
         return app, seen
@@ -538,16 +539,15 @@ async def test_archive_directory_stash_forwarded(make_app, gate_on):
 
 
 # ===========================================================================
-# 非 v4 / 门控分支：v3 → 404 基线；门控关 → handler 不接管
+# 非 v4 / 门控分支：retired v3 → 400；门控关 → handler 不接管
 # ===========================================================================
 
 
 @pytest.mark.parametrize("path", POST_ACTION_PATHS)
-async def test_v3_returns_thin_route_not_found(make_app, path):
-    """v3 冻结基线（2026-08-21 收窄临时翻转，V2b 删）：三组合在 v3 曾 →
-    404 ``thin_route_not_found``；版本窗收窄后 ``?v=3`` 一律 400
-    ``unsupported_version``（supported:[4]）。零上游 IO 的守护点保留。"""
-    app, seen = make_app(_canned)          # full-stack：真实 selector + catch-all
+async def test_retired_v3_selector_is_rejected(make_app, path):
+    """``?v=3`` 一律 400 ``unsupported_version``（supported:[4]），
+    且零上游 IO。"""
+    app, seen = make_app(_canned)  # full-stack：真实 selector + terminal boundary
     async with _client(app) as client:
         r = await client.post(f"{path}?v=3", content=b"{}", headers=IDENTITY)
     assert r.status_code == 400
@@ -586,7 +586,7 @@ async def test_full_stack_gate_on_routes_equivalence(
     激活态（§16.3 第三行）下 v4 三组合经 selector 放行（405 面消失）→
     本模块 handler 等效管线 → 上游收到对应等效调用。两线（selector
     合取 + handler 分支）在此会合。"""
-    app, seen = make_app(_canned)          # full-stack：真实 selector + catch-all
+    app, seen = make_app(_canned)  # full-stack：真实 selector + terminal boundary
     async with _client(app) as client:
         r = await client.post(f"{path}?v=4", content=b"{}", headers=IDENTITY)
     assert r.status_code == expected_status

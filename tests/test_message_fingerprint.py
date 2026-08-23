@@ -15,6 +15,8 @@ Covers plan §6 Task 4.2 ACs:
 
 from __future__ import annotations
 
+from conftest import current_replay_log
+
 import asyncio
 import re
 
@@ -111,7 +113,9 @@ def _build_app(settings: Settings, upstream: httpx.AsyncClient) -> FastAPI:
     ))
     app.state.schema_degraded = False
     app.state.deployment_revision = None
-    app.state.hubs = HubRegistry(upstream)
+    app.state.hubs = HubRegistry(
+        upstream, replay_log=current_replay_log(),
+    )
     app.include_router(messages.router)
     register_error_handlers(app)
     return app
@@ -517,7 +521,7 @@ class TestDigestIndependence:
     ):
         upstream = upstream_factory(_messages_handler())
         app = _build_app(_settings(), upstream)
-        hub = GlobalHub(client=None)
+        hub = GlobalHub(client=None, replay_log=current_replay_log())
         app.state.hubs._global = hub  # wire a live hub onto this app
         try:
             baseline = [_fingerprint_of(m)

@@ -73,9 +73,8 @@ async def session_diff(request: Request, sid: str,
     same-named query parameter (selects which user message to diff).
     Upstream ``[]`` semantics (summary.ts:129-137): omitted ``messageID``,
     unknown message, or non-user role all answer 200 ``[]`` — empty results
-    are normal bodies, not errors. ADDITIVE route: older sidecars answer
-    404 ``thin_route_not_found`` from the catch-all and the client falls
-    back to the passthrough ``GET /session/{sid}/diff``.
+    are normal bodies, not errors. Current sidecars expose only this thin
+    route; there is no passthrough catch-all or legacy fallback path.
 
     Mirrors todo/children (4.11.0 Phase A / A2): opts INTO the Batch 2
     ETag wiring (``enable_etag=True``): per-coding validators + 304 on a
@@ -87,7 +86,7 @@ async def session_diff(request: Request, sid: str,
     BEFORE the validator is derived, so the judged coding always equals
     the served coding.
     """
-    # v3 (§5, Batch B): a consumed ``?directory=`` was validated + stripped
+    # v4: a consumed ``?directory=`` was validated + stripped
     # at dispatch — the stash replaces the (absent) query param here.
     directory = resolve_route_directory(request.scope, directory)
     if directory is not None:

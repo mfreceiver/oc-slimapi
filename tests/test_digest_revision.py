@@ -31,6 +31,8 @@ does NOT touch tests/conftest.py.
 
 from __future__ import annotations
 
+from conftest import current_replay_log
+
 import asyncio
 import json
 
@@ -135,7 +137,7 @@ async def _teardown_hub(hub: GlobalHub) -> None:
 @pytest.fixture
 async def hub():
     """Bare GlobalHub(client=None); teardown cancels all background tasks."""
-    h = GlobalHub(client=None)
+    h = GlobalHub(client=None, replay_log=current_replay_log())
     try:
         yield h
     finally:
@@ -536,7 +538,7 @@ async def test_malformed_part_events_no_bump_no_crash(pair):
 
 def sse_id_seq(raw: bytes) -> int | None:
     """Extract the wire ``id: <domain>:<epoch>:<seq>`` seq from one SSE
-    frame (wire_v4 subscribers only). None when the frame carries no id
+    frame. None when the frame carries no id
     line."""
     for line in raw.decode().split("\n"):
         if line.startswith("id: "):
@@ -552,7 +554,7 @@ async def test_gate_blocks_token_route_and_disabled_key(pair):
     from oc_slimapi.sse.tokenstream.hub import TokenStreamHub
 
     hub, sub = pair
-    th = TokenStreamHub()
+    th = TokenStreamHub(replay_log=current_replay_log())
     hub.set_token_hub(th)
     removed_calls: list[tuple[str, str, str]] = []
     orig_removed = th.on_part_removed
@@ -590,12 +592,9 @@ async def test_gate_blocks_token_route_and_disabled_key(pair):
 
 
 async def test_v4_sse_id_digest_precedes_question_asked(hub):
-    """(Blocking 2) wire_v4=True 订阅者：解析 ``id:`` 行，断言 digest 的
+    """(Blocking 2) v4 订阅者：解析 ``id:`` 行，断言 digest 的
     SSE id seq 严格小于 asked 的——真实线序（非仅队列位置）。"""
-    from oc_slimapi.sse.replay_log import ReplayLog
-
-    hub.set_replay_log(ReplayLog())
-    sub = Subscriber(wire_v4=True)
+    sub = Subscriber()
     hub.subscribers.add(sub)
     before = seq()
     hub.publish(ev("/p", "message.updated", msg_props("s1", "m1")))  # pending
@@ -615,10 +614,7 @@ async def test_v4_sse_id_digest_precedes_question_asked(hub):
 async def test_v4_sse_id_digest_precedes_question_v2_asked(hub):
     """(Blocking 2) question.v2.asked 同等 SSE id 线序覆盖（pending 经
     part.updated 入口造，顺带锁 part 路径的 id 线序）。"""
-    from oc_slimapi.sse.replay_log import ReplayLog
-
-    hub.set_replay_log(ReplayLog())
-    sub = Subscriber(wire_v4=True)
+    sub = Subscriber()
     hub.subscribers.add(sub)
     before = seq()
     hub.publish(ev("/p", "message.part.updated", part_updated_props("s1", "m1", "p1")))
@@ -717,11 +713,11 @@ async def test_evicted_part_late_textend_still_bumps_revision(pair, monkeypatch)
     tokenstream 驱逐 gate 相互独立，`_retired_messages` gate 仅拦
     whole-removal）。被逐 part 终态由此经 revision → digest → 常规
     ?since/GET 对账收敛。"""
-    from oc_slimapi.sse.replay_log import ReplayLog, token_domain
+    from oc_slimapi.sse.replay_log import token_domain
     from oc_slimapi.sse.tokenstream.hub import TokenStreamHub
 
     hub, sub = pair
-    log = ReplayLog()
+    log = current_replay_log()
     th = TokenStreamHub(replay_log=log)
     hub.set_token_hub(th)
     monkeypatch.setattr(
@@ -776,4 +772,3 @@ async def test_cross_sid_wire_order_inverse_revision(pair):
     assert [d["messagesRevision"] for d in digests] == [n_b, n_a]  # [N+1, N]
     # 两帧各自携带本 sid 的 window-end 修订（有效 digest，非乱序可丢弃）
     assert n_b == n_a + 1  # 分配序全局递增 ≠ wire 序
-

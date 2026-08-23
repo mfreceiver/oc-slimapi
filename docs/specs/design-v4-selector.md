@@ -1,5 +1,10 @@
 # v4 selector 双版本结构设计（design-v4-selector）
 
+> **历史设计文档（4.0.0–4.7.0 双版本阶段）**：下文记录 `(3,4)` 分派设计，
+> 不代表当前仍支持双版本。4.8.0 起现行实现固定 `(4,4)`，唯一入口是
+> `?v=4`。当前 wire 权威见 [`v4-contract.md`](v4-contract.md)，消费导航见
+> [`PROTOCOL.md`](PROTOCOL.md)。
+>
 > **状态**：B0-2 设计文档（2026-08-17，B0 规范先行批次）。落地于 B3a-A（selector 双版本结构性改造，独立 rev gate）。
 > **依据**：`docs/system-architecture-proposal-2026-08-17.md`（v2.2）行 244-249（版本轨道）、行 254 §2（v4-contract 双版本章节要求）、行 66/136（v4 sessions directory 拒绝）；`docs/specs/v3-contract.md` §2/§8.3（现行选择器状态机与优先级链）；`src/oc_slimapi/selector.py` 代码事实。
 > **纪律**：本设计不新增决策，全部裁决可回溯 v2.2 行号；与 v4-contract §2（wire 状态表）配套——本文件面向实现（B3a-A），契约面向消费者。

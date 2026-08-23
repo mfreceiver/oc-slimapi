@@ -103,7 +103,7 @@ curl -s "$BASE/slimapi/metrics?$V" | jq '
 |---|---|---|
 | `messages` | `/slimapi/messages/**`（list / `/since` / `/full`） | **骨架投影** full→thin（核心省流） |
 | `events_sse` | `/slimapi/events`（控制面 SSE） | **策展**：上游全量 token/tool 流 → `session.digest`+q/p 小帧（最大省流点） |
-| `token_stream_sse` | `/slimapi/sessions/{sid}/stream` | gzip + done-marker（见 §4 注意） |
+| `token_stream_sse` | `/slimapi/sessions/{sid}/stream` | identity SSE；v4-native delta/removed/replayable resync（无 snapshot/done marker） |
 | `sessions` | `/slimapi/sessions/**`（列表/`/status`/`/children`） | session/child skeleton 投影 |
 | `command` | `/slimapi/command`、`/slimapi/command/**` | **骨架投影**：catalog whitelist（`name/description/agent/hints`），丢 `template`（~97.7%） |
 | `agent` | `/slimapi/agent`、`/slimapi/agent/**` | **骨架投影**：catalog whitelist（`name/description/mode/hidden/native`），丢 `prompt`+`permission`（>96%） |
@@ -125,12 +125,15 @@ curl -s "$BASE/slimapi/metrics?$V" | jq '
 - **记账内容**：`upIn` = 聚合抓取的上游字节（发现 `/experimental/session` + 各 directory 的 `/permission` fan-out 成本，经 `stash_up_in` 计入）；`downOut` = 聚合 envelope 下发字节（白名单投影后）。
 - **运维含义**：查"permissions 省了多少"不能在 `ratios.permissions` 找到独立比值——需从 `other` 桶读数，或按 access log 的 `bucket=="other"` + `path=="/slimapi/permissions"` 过滤（见 §5）。未来如需独立桶，可在 `bucketize()` 加 `permissions` 分支（纯 ops 面，不 bump wire）。
 
-**events SSE 在非 gzip 下，`tokens=1` 的 `token` 帧增量流量**：
+**当前 SSE 分桶**：
 
-- `events_sse` 桶**恒不 gzip**（控制面 SSE 无 `Content-Encoding`，契约 §9 gzip 三层语义第 1 层）。`GET /slimapi/events?tokens=1` 激活后，该连接额外收到 lean `token` 帧（`{type:"token",sessionID,messageID,partID,delta}`），每帧经 `record_sse_downstream(bucket="events_sse", bytes_out=len(frame))` **计入 `events_sse` 桶的 `downOut`**（per-subscriber-per-frame，与 digest/q-p 帧同路径同桶，不另设子桶）。
-- **增量流量性质**：`token` 帧是 token flush loop（100ms/4KiB 窗口）的增量 concat 明文下发，**未经 gzip 压缩**——`tokens=1` 时 `events_sse.downOut` 明显高于纯 digest 流（动画层成本）。**非异常**：这是 lean token 帧的设计代价（换取端到端低延迟实时性）；若需对照纯控制面省流比，须**分时段**统计（`tokens=1` 连接存在期间单开时段），或对比同窗口内 `upIn`（上游 token 流成本与 digest 共享同一条 `/global/event`，只计一次）。
-- **背压不累计**：`token` 帧溢出走 `Subscriber.put` T3 守卫（`resync{subscriber_backpressure}` + 断连），溢出帧不记账（发出前即丢弃），故 `downOut` 反映**实际发出**的 token 帧字节。
-- **多订阅 fanout**：同 `tokens=1` 语义与 §4 SSE fanout 例外一致——`downOut` 按订阅者翻倍，`upIn` 只计一条共享上游连接。
+- `events_sse` 仅承载全局 `session.digest`、question/permission 直推与 control；
+  `GET /slimapi/events?tokens=1` 已退役并返回 400
+  `tokens_stream_retired_in_v4`，不会产生 token 增量流量。
+- token 增量只走 `token_stream_sse`；两条 SSE 均恒 identity。`downOut` 按
+  实际成功下发的 subscriber×frame 记账；共享上游 `upIn` 仍只计一次。
+- 普通 subscriber queue 溢出清空并 STOP；控制面 reconciliation 由 replay/
+  control resync 驱动。未成功下发的帧不计 `downOut`。
 
 ---
 
@@ -171,9 +174,9 @@ curl -s "$BASE/slimapi/metrics?$V" | jq '
 | `client` | 客户端 app 名（来自 `X-Client-Name`，明文，**不 hash**） |
 | `clientVer` | 客户端版本（来自 `X-Client-Version`，明文，**不 hash**） |
 | `clientId` | 设备标识 hash（来自 `X-Client-Id`，默认 `sha256(raw)[:16]`；设 `OC_SLIMAPI_CLIENT_ID_SALT` 时为 `hmac_sha256(salt,raw)[:16]`） |
-| `wireVersion` | `"2"` \| `"3"` \| `"4"` \| `null`——该请求生效的 wire 语义（`?v=3` → `"3"`、`?v=4` → `"4"`——**4.0.0 起 (3,4) 双版本期**；**v2 管线已于 3.0.0 退役**——`"2"` 值及无 `v`/`?v=2` 语义为 2.x 并行期历史维度，3.0.0 起恒为 400（记 `rejected`）；被拒/豁免/非 `/slimapi` → `null`） |
-| `selectorResult` | `absent`（无 `v`）\| `v2`（`?v=2`）\| `v3`（`?v=3`）\| `v4`（`?v=4`，4.0.0 起）\| `rejected`（词法/不支持被 400）\| `exempt`（`GET /slimapi/versions`）\| `not_applicable`（catch-all 非 `/slimapi` 路由）。**3.0.0 终态：`absent`/`v2` 值的请求已不可达（一律 400 记 `rejected`）；枚举保留供历史日志（≤2.x 期）与 snapshot 矩阵维度对账** |
-| `directoryForm` | `query` \| `header` \| `both` \| `absent` \| `null`——directory 输入形态（仅 directory 消费集路由非 null：messages list/full、sessions 列表/status、todo/children/diff、agent/command、stream；其余含 catch-all = `null`） |
+| `wireVersion` | `"2"` \| `"3"` \| `"4"` \| `null`——当前成功进入业务路由的值只有 `"4"`；`"2"`/`"3"` 是旧日志兼容维度。被拒、豁免与非 `/slimapi` 请求为 `null`。 |
+| `selectorResult` | 当前生产者为 `v4`、`rejected`、`exempt`、`not_applicable`；`absent`/`v2`/`v3` 只为历史日志与 frozen matrix 解读保留。`not_applicable` 当前主要表示终局 404/405 边界，不表示可用 catch-all。 |
+| `directoryForm` | `query` \| `header` \| `both` \| `absent` \| `null`——记录 selector 看到的输入形态；当前消费方只应发送 query。header/both 可出现在被拒记录中，不能据此推断 header 仍受支持。 |
 | `recordType` | `request`（每 HTTP 请求一行）\| `sse_open` \| `sse_close`（SSE 建立断开标记行）。**消费口径：统计请求数/字节时必须过滤 `recordType=="request"`** |
 | `lifecycleId` | 进程内单调递增 int；同一条 SSE 连接的 `sse_open`/`sse_close` 行同值（配对键）。仅生命周期行有值，`request` 行为 `null`。`requestId` 在 SSE 重连时可复用，仅辅助关联，**配对以 `lifecycleId` 为准** |
 | `sessionsSource` | `"db"` \| `"http"` \| 缺席——v4 `GET /slimapi/sessions` 数据面来源（4.0.0 加性稀疏字段：DB 投影源成功→`"db"`；降级矩阵 Class A HTTP 降级 200→`"http"`；v3 路径/其他路由/被拒请求**字段缺席**=否定语义，不写 `null`）。配套聚合：ledger 矩阵键 `degraded\|<kind>\|<statusClass>\|<bucket>`（kind=`http`/`fail_closed`）、`/slimapi/metrics` `sessionsDegraded` 块（`degraded_200`/`fail_closed_503` 按响应逐次计数）、snapshot `v4.degradedMatrix` |
@@ -347,9 +350,10 @@ jq -c '{ts, ratio: .ratios.messages.downOutOverUpIn}' /tmp/snap-all.jsonl
 
 三者为**不同口径**，不直接对照：snapshot 是聚合 cumulative，access log 是逐请求明细，`metrics.traffic` 块是实时聚合。分析"某时段省了多少"用 access log（§5）；分析"长期趋势 / 跨重启累计"用 snapshot。
 
-### 9.4 v3 观测节（2026-08-16 加性）
+### 9.4 历史命名保留：`v3` 观测节（2026-08-16 加性）
 
-`metrics.traffic.v3` 与每帧 snapshot 的 `v3` 键（同源，均来自内存 ledger）：
+`metrics.traffic.v3` 与每帧 snapshot 的 `v3` 键（同源，均来自内存 ledger）。
+这里的 `v3` 是冻结的 **ops schema label**，不是 v3 wire 支持声明：
 
 ```jsonc
 {
@@ -365,7 +369,7 @@ jq -c '{ts, ratio: .ratios.messages.downOutOverUpIn}' /tmp/snap-all.jsonl
 }
 ```
 
-- **matrix** 维度 = 契约 v3 §9.2 的 `date × selectorResult × wireVersion × directoryForm × recordType × statusClass × bucket` 计数矩阵（内存视角无 date 维，跨日用 §9.4 末尾的离线聚合或按天 snapshot 帧对齐）；`statusClass` 形如 `"2xx"`，无 status 时 `"none"`。**3.0.0 终态：`v2`/`absent` 维度值已不可达（无 `v`/`?v=2` 一律 400 记 `rejected`）——矩阵保留全枚举维度供 ≤2.x 历史帧对账。**
+- **matrix** 维度 = `selectorResult × wireVersion × directoryForm × recordType × statusClass × bucket` 计数矩阵（access log 离线聚合另含 date）；`statusClass` 形如 `"2xx"`，无 status 时 `"none"`。`v2`/`v3`/`absent` 枚举只为旧文件对账保留，当前不产出成功旧 wire 流量。
 - **sseActive 语义**：`v4` = `?v=4` SSE（4.0.0 起维度，与 `selectorResult` 的 `v4` 取值同源）；`not_applicable` = catch-all 透传 SSE（≤2.x 历史维度：`/event`、`/global/event` 曾不经省流面但计入观测；**3.0.0 起 catch-all 关闭，该维度不再增长**）；`absent` = 无 `v` 参数的旧客户端 SSE。`rejected`/`exempt` 无 SSE 端点，恒不出现。**3.0.0 终态：`v2`/`absent` 维度自然归零（旧客户端开流前即 400）；五维枚举（4.0.0 起含 `v4`）保留供历史帧对账与退役判据（§9.3）核验。**
 - **离线对账**：跨日 carry-in 公式 `sseActive[D+1,k] = sseActive[D,k] + sse_open[D,k] − matched_sse_close[D,k]`（`sseActive[D,k]` 取 D 日首行时的窗口起点存量）。**matched/orphan 配对按 `lifecycleId`**（§11.8）：close 行的 `lifecycleId` 能配到先前未匹配 open（同 dim、跨日 carry）→ `matched_sse_close`（计入 close 当日，并从待配对集合移除）；配不到（open 早于数据窗口 / sidecar 重启后集合已空 / id 缺失）→ **孤儿 close**，只补记计数，**不冲减存量**（避免错误消耗他人活跃连接）。`traffic_snapshot.aggregate_v3_observability(records)` 提供该纯函数实现（输入按天 access log 解析出的记录列表，输出 `counts`/`countsByDate`/`sseActive`/`sseOpens`/`sseMatchedCloses`/`sseOrphanCloses`/`sseLive`），供运维脚本与测试对账复用。
 
@@ -373,6 +377,6 @@ jq -c '{ts, ratio: .ratios.messages.downOutOverUpIn}' /tmp/snap-all.jsonl
 
 ## 10. 相关
 
-- 契约 / 设计：[`docs/specs/v2-contract.md`](../specs/v2-contract.md)（§2 `/slimapi/metrics`、§7 可观测性/access log/client header、§12 流量查询）、[`docs/specs/v3-contract.md`](../specs/v3-contract.md)（§9 v3 观测字段口径）
+- 当前 wire / consumer：[`docs/specs/v4-contract.md`](../specs/v4-contract.md)、[`docs/specs/PROTOCOL.md`](../specs/PROTOCOL.md)；`v2-contract.md` / `v3-contract.md` 仅用于解释旧日志格式的来源
 - 运维手册：[`docs/operations.md`](../operations.md)（§5 日志策略、§5.2 落盘目录、§5.3 维护）
 - 变更记录：[`CHANGELOG.md`](../CHANGELOG.md) `[0.7.0]`（access log + traffic 首版）、`[1.0.0]`（按天切分 + client header + snapshot）

@@ -23,6 +23,7 @@ import httpx
 import orjson
 from fastapi import FastAPI
 
+from conftest import current_replay_log
 from oc_slimapi.errors import register_error_handlers
 from oc_slimapi.middleware.traffic_accounting import TrafficAccountingMiddleware
 from oc_slimapi.routes import events
@@ -110,8 +111,11 @@ def _build_app(
 
     ledger = TrafficLedger()
     app.state.traffic_ledger = ledger
+    replay_log = current_replay_log()
+    app.state.replay_log = replay_log
     app.state.hubs = HubRegistry(
         None,
+        replay_log=replay_log,
         max_total_subscribers=max_total_subscribers,
         traffic_ledger=ledger,
     )
@@ -220,8 +224,8 @@ async def test_sse_end_to_end_traffic_saving(upstream_factory):
 
     try:
         # -- Drive SSE endpoint -------------------------------------------
-        # Events SSE endpoint (contract: GET /slimapi/events, requires the
-        # X-Slimapi-Version header). No query string in this scenario.
+        # Events SSE endpoint in a selector-less unit assembly. Selector
+        # behavior is covered separately, so this scenario has no query.
         path = "/slimapi/events"
         if "?" in path:
             pure_path, query = path.split("?", 1)
@@ -324,8 +328,8 @@ async def test_sse_end_to_end_traffic_saving(upstream_factory):
         frames = _parse_sse_frames(bytes(body))
         frame_events = {e for e, _ in frames}
         assert "slimapi.meta" in frame_events, "missing terminal meta frame"
-        # V2b default flip: this selector-less stack now runs the v4 SSE
-        # pipeline, which suppresses the v3 server.connected welcome frame.
+        # Selector-less test stacks use the same native-v4 SSE pipeline;
+        # the retired server.connected welcome frame must stay absent.
         assert "server.connected" not in frame_events
         assert "session.digest" in frame_events, "missing digest frame(s)"
 

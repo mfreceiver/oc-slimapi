@@ -2,7 +2,8 @@
 
 > **基线**：sidecar v4.11.0（已上线生产）；wire 版本仍为 **v4-only**（`?v=4` 唯一合法）。
 > **本批次全部加性，客户端零必改**——不接入任何新能力则行为与 4.10.x 完全一致（唯一例外见 §3.2 validator 轮换，一次性自动重拉）。
-> 权威规范：`docs/specs/v4-contract.md` 修订五；消费要点：`docs/specs/CLIENT_CHANGES.md` §4.11.0；变更记录：`CHANGELOG.md` [4.11.0]。
+> 权威规范：`docs/specs/v4-contract.md` 修订五；当前完整消费导航：
+> `docs/specs/PROTOCOL.md`；变更记录：`CHANGELOG.md` [4.11.0]。
 > 本批次 = 流量优化族 P1–P6（4.11.0）+ 批量详情（4.10.0）+ 服务端新鲜度/观测（4.10.1，客户端零感知）。
 
 ---
@@ -38,7 +39,7 @@ GET /slimapi/file/raw?path=<必填>&v=4[&directory=<可选>]
 | 编码 | binary 恒 identity（声明 gzip 也不压缩）；text 走常规 gzip 协商 |
 | 缓存 | `Cache-Control: no-store`（不可存储缓存）；binary 强 ETag + `If-None-Match` 304 可用；text 弱 ETag（`W/"…"`） |
 | 错误 | `path` 缺失 → 400 `invalid_params`；信封畸形 → 502 `raw_decode_failed`；超限 → 413 `response_too_large`；上游 4xx **verbatim 透传**（含 404）；上游 5xx/网络 → 503 `upstream_unavailable` |
-| directory 语义 | 与 `/slimapi/file` 组一致（`?directory=` 或 `X-Opencode-Directory` 头，allowlist 拒绝 → 403） |
+| directory 语义 | 与 `/slimapi/file` 组一致：只接受 `?directory=` query；入站 directory header 已退役；allowlist 拒绝 → 403 |
 
 **推荐用法**：`HttpImageHolder` / 图片加载从直连 opencode 或 `/slimapi/file` 迁到本端点；404/失败降级路径维持既有兜底。
 

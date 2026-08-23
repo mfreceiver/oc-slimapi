@@ -1,4 +1,4 @@
-"""v3-contract §7.2 / §1 — SSE subscriber-header retirement checks.
+"""v4 SSE meta and retired subscriber-header checks.
 
 B12 (2026-08-21) kept the two header-retirement checks (X-Slimapi-
 Subscriber-ID never produced) — the 3.0.0 header retirement applies to
@@ -19,6 +19,8 @@ Harness: fake hubs / fake token registry with pre-filled finite queues
 read the whole body.
 """
 from __future__ import annotations
+
+from conftest import current_replay_log
 
 import asyncio
 from types import SimpleNamespace
@@ -57,7 +59,7 @@ class _FakeHubs:
     def __init__(self) -> None:
         self.sub = _FakeSubscriber()
 
-    def subscribe(self, wire_v4: bool = False) -> _FakeSubscriber:
+    def subscribe(self) -> _FakeSubscriber:
         return self.sub
 
     def unsubscribe(self, subscriber) -> None:
@@ -68,7 +70,7 @@ class _FakeTokenRegistry:
     def __init__(self) -> None:
         self.sub = _FakeSubscriber("tok_test")
 
-    def subscribe(self, sid: str, wire_v4: bool = False) -> _FakeSubscriber:
+    def subscribe(self, sid: str) -> _FakeSubscriber:
         return self.sub
 
     def unsubscribe(self, subscriber) -> None:
@@ -105,10 +107,11 @@ def _settings(**overrides) -> Settings:
 def _build_app(
     *, hubs: _FakeHubs | None = None, token_registry=None,
 ) -> FastAPI:
-    app = FastAPI(title="v3-sse-meta-test")
+    app = FastAPI(title="v4-sse-meta-test")
     app.state.config = _settings()
     app.state.schema_degraded = False
     app.state.deployment_revision = None
+    app.state.replay_log = current_replay_log()
     app.state.hubs = hubs if hubs is not None else _FakeHubs()
     app.state.token_registry = (
         token_registry if token_registry is not None else _FakeTokenRegistry()
@@ -140,9 +143,9 @@ def _put_business_frame(sub: _FakeSubscriber) -> None:
     sub.queue.put_nowait(HUB_STOP)
 
 
-def _put_handshake(sub: _FakeSubscriber) -> None:
+def _put_token_frame(sub: _FakeSubscriber) -> None:
     # token_stream.py compares against token_hub's STOP sentinel.
-    sub.queue.put_nowait(sse_frame({"sessionID": SID}, event="server.connected"))
+    sub.queue.put_nowait(sse_frame({}, event="server.heartbeat"))
     sub.queue.put_nowait(TOKEN_STOP)
 
 
@@ -164,7 +167,7 @@ async def test_v4_stream_response_has_no_subscriber_id_header():
     """B12 ①: the 3.0.0 header retirement is view-agnostic — the v4 face
     never carries X-Slimapi-Subscriber-ID either."""
     registry = _FakeTokenRegistry()
-    _put_handshake(registry.sub)
+    _put_token_frame(registry.sub)
     app = _build_app(token_registry=registry)
     response, _ = await _read_stream(
         app, f"/slimapi/sessions/{SID}/stream?v=4",

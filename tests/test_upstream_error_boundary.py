@@ -31,6 +31,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from conftest import current_replay_log
 from oc_slimapi.config import Settings
 from oc_slimapi.errors import CodedHTTPException, register_error_handlers
 from oc_slimapi.proxy import install_proxy
@@ -101,7 +102,8 @@ def _build_app(upstream: httpx.AsyncClient) -> FastAPI:
         max_response_bytes=settings.max_response_bytes,
     ))
     app.state.schema_degraded = False
-    app.state.hubs = HubRegistry(upstream)
+    app.state.hubs = HubRegistry(
+        upstream, replay_log=current_replay_log())
     app.include_router(sessions.router)
     app.include_router(messages.router)
     register_error_handlers(app)
@@ -244,6 +246,5 @@ async def test_messages_list_upstream_404_maps_session_not_found(upstream_factor
     assert response.headers["content-type"] == "application/json"
     assert response.headers["vary"] == "Accept-Encoding"
     assert "cache-control" not in response.headers
-
 
 

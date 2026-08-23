@@ -7,6 +7,8 @@ Covers: :meth:`CatalogCache.invalidate` lifecycle semantics, the
 
 from __future__ import annotations
 
+from conftest import current_replay_log
+
 import asyncio
 
 import pytest
@@ -90,7 +92,7 @@ class TestGlobalHubEpochCallback:
         return _cache()
 
     async def test_notify_upstream_loss_fires_registered_callback(self):
-        hub = GlobalHub(client=None)
+        hub = GlobalHub(client=None, replay_log=current_replay_log())
         cache = self._seeded_cache()
         await cache.refresh(("agent",), _factory())
         assert cache.lookup(("agent",)) is not None
@@ -102,7 +104,7 @@ class TestGlobalHubEpochCallback:
     async def test_callback_failure_degrades_to_warning(
         self, caplog
     ):
-        hub = GlobalHub(client=None)
+        hub = GlobalHub(client=None, replay_log=current_replay_log())
         ran: list[int] = []
 
         def _boom() -> None:
@@ -123,7 +125,7 @@ class TestGlobalHubEpochCallback:
         )
 
     async def test_no_callbacks_registered_is_noop(self):
-        hub = GlobalHub(client=None)
+        hub = GlobalHub(client=None, replay_log=current_replay_log())
         hub._notify_upstream_loss()  # bare hub, no observers → no raise
 
 
@@ -191,7 +193,7 @@ class TestGenerationFence:
 
 class TestHubRegistryWiring:
     def test_registry_forwards_stashed_callbacks_to_lazy_hub(self):
-        registry = HubRegistry(None)
+        registry = HubRegistry(None, replay_log=current_replay_log())
         flag: list[int] = []
 
         def _cb() -> None:
@@ -204,7 +206,7 @@ class TestHubRegistryWiring:
         assert flag == [1]
 
     def test_registry_adds_callback_to_already_live_hub(self):
-        registry = HubRegistry(None)
+        registry = HubRegistry(None, replay_log=current_replay_log())
         hub = registry.get_global()  # hub exists first
         flag: list[int] = []
 
@@ -217,7 +219,7 @@ class TestHubRegistryWiring:
         assert flag == [1]
 
     async def test_end_to_end_registry_cache_invalidation(self):
-        registry = HubRegistry(None)
+        registry = HubRegistry(None, replay_log=current_replay_log())
         cache = _cache()
         await cache.refresh(("agent",), _factory())
         registry.add_upstream_loss_callback(cache.invalidate)
