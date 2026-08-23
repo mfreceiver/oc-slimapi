@@ -10,7 +10,11 @@ Frozen semantics (plan §2 A3 / v4-contract revision lane — do not expand):
   (the MESSAGE_EVENTS digest branch) and ``message.removed`` (AFTER the
   full existing semantic sequence: retired-gate write → cap/TTL prune →
   token-hub ``on_message_removed`` → bump LAST).
-* ``message.part.*`` events NEVER bump. Session-only events never bump.
+* 4.12.0（修订六）: ``message.part.updated`` / ``message.part.removed``
+  ALSO bump (part-level completion-state visibility, via the unified
+  ``_bump_message_revision`` helper — same debounce window semantics as
+  message.updated/appended). ``message.part.delta`` still NEVER bumps.
+  Session-only events never bump.
 * The digest field is carried ONLY on message windows (a digest entry that
   includes message events). Session-only digests OMIT the key entirely.
 * Same debounce window, multiple events → the seq bumps multiple times and
@@ -193,15 +197,16 @@ async def test_message_removed_bumps_and_digest_carries_revision(pair):
 # ---------------------------------------------------------------------------
 
 
-async def test_message_part_events_do_not_bump(pair):
+async def test_message_part_delta_does_not_bump(pair):
+    """修订六（4.12.0）：part.delta 维持现状——per-chunk 高频事件不
+    bump、不进 digest（part.updated/part.removed 的 bump 语义由
+    TestPartRevision 组覆盖）。"""
     hub, sub = pair
     before = seq()
-    hub.publish(ev("/p", "message.part.updated",
-                   part_updated_props("s1", "m1", "p1")))
     hub.publish(ev("/p", "message.part.delta",
                    part_updated_props("s1", "m1", "p1")))
     assert seq() == before
-    # part events produce no digest entry at all
+    # part.delta produces no digest entry at all
     hub.flush()
     assert only_digests(await drain(sub)) == []
 
@@ -299,7 +304,8 @@ async def test_removed_semantic_sequence_intact_after_bump(pair):
                    part_updated_props("s1", "m1", "p1")))
     frames = await drain(sub, timeout=0.1)
     assert frames == []  # gate: late part event fully swallowed
-    assert seq() == bumped  # part events never bump
+    assert seq() == bumped  # retired-gated late part event does not bump
+    # (ungated message.part.updated / part.removed DO bump — revision-6)
 
 
 async def test_removed_without_pending_entry_bumps_global_only(pair):
@@ -387,3 +393,295 @@ def test_sse_frame_unused_import_guard():
     """sse_frame is imported for symmetry with test_b1a; keep a trivial use
     so the import is not flagged dead while the file evolves."""
     assert sse_frame({}, event="server.heartbeat") is not None
+
+
+# ---------------------------------------------------------------------------
+# 修订六（4.12.0）：part 级 revision bump + flush-before-asked 因果闭合
+# ---------------------------------------------------------------------------
+
+
+def part_removed_props(sid: str, mid: str, pid: str) -> dict:
+    """Properties for a message.part.removed event (flat schema:
+    {sessionID, messageID, partID} — opencode session.ts:604-628)."""
+    return {"sessionID": sid, "messageID": mid, "partID": pid}
+
+
+def asked_props(sid: str) -> dict:
+    """Properties for question.asked / question.v2.asked (flat
+    sessionID — upstream Request schema v1/question.ts:35-42)."""
+    return {"id": "q1", "sessionID": sid, "questions": []}
+
+
+async def test_part_updated_bumps_and_window_merges_to_end_value(pair):
+    """(a) part.updated 每 part 生命周期 2-4 次发射均 bump；同窗多事件
+    debounce 合并单帧、携带窗末 revision 值，且与 message.updated 同组
+    合并（同 debounce 语义）。"""
+    hub, sub = pair
+    before = seq()
+    # 一个 part 生命周期内的典型三连发（text-start/text-end/cleanup）
+    hub.publish(ev("/p", "message.part.updated", part_updated_props("s1", "m1", "p1")))
+    hub.publish(ev("/p", "message.part.updated", part_updated_props("s1", "m1", "p1")))
+    hub.publish(ev("/p", "message.part.updated", part_updated_props("s1", "m2", "p2")))
+    # 同组：message.updated 落进同一 debounce 窗
+    hub.publish(ev("/p", "message.updated", msg_props("s1", "m3")))
+    assert seq() == before + 4
+    hub.flush()
+    digests = only_digests(await drain(sub))
+    assert len(digests) == 1  # 同窗合并单帧
+    assert digests[0]["messagesRevision"] == before + 4  # 窗末值
+    assert digests[0]["messageID"] == "m3"  # 窗内最后 message_id 盖章
+    assert digests[0]["sessionID"] == "s1"
+
+
+async def test_part_removed_bumps_revision_revert_scenario(pair):
+    """(b) part.removed（revert.ts:119 / session.ts:393 低频显式发射）同
+    bump；同窗 N 个 part.removed 每个独立推进 revision、窗末值成帧。"""
+    hub, sub = pair
+    before = seq()
+    # revert 场景：一条消息 N 个 part 同窗被逐个移除
+    for pid in ("p1", "p2", "p3"):
+        hub.publish(ev("/p", "message.part.removed",
+                       part_removed_props("s1", "m1", pid)))
+    assert seq() == before + 3  # 每事件推进 1（allocator 单点自增）
+    hub.flush()
+    digests = only_digests(await drain(sub))
+    assert len(digests) == 1
+    assert digests[0]["messagesRevision"] == before + 3
+    assert digests[0]["messageID"] == "m1"
+
+
+async def test_question_asked_digest_precedes_asked_frame(pair):
+    """(c) flush-before-asked：question.asked 转发前 targeted flush 该 sid
+    的 pending digest——同一 SSE 流先收 digest(rev=N) 再收 asked。"""
+    hub, sub = pair
+    before = seq()
+    hub.publish(ev("/p", "message.updated", msg_props("s1", "m1")))  # pending
+    hub.publish(ev("/p", "question.asked", asked_props("s1")))
+    frames = await drain(sub)
+    assert len(frames) == 2
+    name0, data0 = parse(frames[0])
+    assert name0 == "session.digest"
+    assert data0["messagesRevision"] == before + 1
+    assert data0["changed"] == ["s1"]
+    name1, data1 = parse(frames[1])
+    assert name1 is None  # IMMEDIATE 裸帧无 event 行
+    assert data1["type"] == "question.asked"
+
+
+async def test_question_v2_asked_digest_precedes_asked_frame(pair):
+    """(c) v2 双名并存（hub_types IMMEDIATE 同列）——同等因果闭合。"""
+    hub, sub = pair
+    before = seq()
+    hub.publish(ev("/p", "message.part.updated",
+                   part_updated_props("s1", "m1", "p1")))  # pending 经 part 入口
+    hub.publish(ev("/p", "question.v2.asked", asked_props("s1")))
+    frames = await drain(sub)
+    assert len(frames) == 2
+    name0, data0 = parse(frames[0])
+    assert name0 == "session.digest"
+    assert data0["messagesRevision"] == before + 1
+    _, data1 = parse(frames[1])
+    assert data1["type"] == "question.v2.asked"
+
+
+async def test_question_asked_other_sid_pending_stays_in_window(pair):
+    """flush-before-asked 是 targeted：asked 的 sid 无 pending 时无操作，
+    其他 sid 的 entry 留在 debounce 窗（不提前、不丢失）。"""
+    hub, sub = pair
+    hub.publish(ev("/p", "message.updated", msg_props("s2", "mX")))  # s2 pending
+    hub.publish(ev("/p", "question.asked", asked_props("s1")))       # s1 asked
+    frames = await drain(sub)
+    assert len(frames) == 1
+    _, data = parse(frames[0])
+    assert data["type"] == "question.asked"  # s1 无 pending → asked 独立转发
+    hub.flush()  # s2 的 pending 到窗末正常成帧
+    digests = only_digests(await drain(sub))
+    assert len(digests) == 1
+    assert digests[0]["sessionID"] == "s2"
+
+
+async def test_retired_message_late_part_events_no_digest(pair):
+    """(d) whole-removal 后迟到的 part.updated/part.removed 被
+    _retired_messages gate 拦截——不 bump、不造 digest。"""
+    hub, sub = pair
+    before = seq()
+    hub.publish(ev("/p", "message.removed", {"sessionID": "s1", "messageID": "m1"}))
+    assert seq() == before + 1  # message.removed 自身 bump（不造 entry）
+    hub.publish(ev("/p", "message.part.updated", part_updated_props("s1", "m1", "p1")))
+    hub.publish(ev("/p", "message.part.removed", part_removed_props("s1", "m1", "p1")))
+    assert seq() == before + 1  # 迟到 part 事件零推进
+    hub.flush()
+    assert only_digests(await drain(sub)) == []
+
+
+async def test_malformed_part_events_no_bump_no_crash(pair):
+    """(e) 缺 sessionID/messageID/partID 的畸形 part 事件不 bump 不崩
+    （落入 token-hub 尾路由，无 token hub 即 no-op）。"""
+    hub, sub = pair
+    before = seq()
+    hub.publish(ev("/p", "message.part.updated", {"sessionID": "s1"}))  # 缺 part dict
+    hub.publish(ev("/p", "message.part.updated",
+                   {"part": {"id": "p1", "sessionID": "s1"}}))          # 缺 messageID
+    hub.publish(ev("/p", "message.part.removed",
+                   {"sessionID": "s1", "messageID": "m1"}))             # 缺 partID
+    assert seq() == before
+    hub.flush()
+    assert only_digests(await drain(sub)) == []
+
+
+# ---------------------------------------------------------------------------
+# 修订六返工（rev-sgpt Blocking 1-3 + non-blocking）
+# ---------------------------------------------------------------------------
+
+
+def sse_id_seq(raw: bytes) -> int | None:
+    """Extract the wire ``id: <domain>:<epoch>:<seq>`` seq from one SSE
+    frame (wire_v4 subscribers only). None when the frame carries no id
+    line."""
+    for line in raw.decode().split("\n"):
+        if line.startswith("id: "):
+            return int(line.rstrip().rsplit(":", 1)[1])
+    return None
+
+
+async def test_gate_blocks_token_route_and_disabled_key(pair):
+    """(Blocking 1) GlobalHub retired gate 命中时：TokenHub 不被调用
+    （spy 断言 call 级阻断——两 gate 独立清理，不能依赖 TokenHub 自身
+    gate 兜底）、不产生 disabled key、不 bump digest。正对照：未 gate
+    的 part.removed 正常路由且写入 disabled（防止过度拦截）。"""
+    from oc_slimapi.sse.tokenstream.hub import TokenStreamHub
+
+    hub, sub = pair
+    th = TokenStreamHub()
+    hub.set_token_hub(th)
+    removed_calls: list[tuple[str, str, str]] = []
+    orig_removed = th.on_part_removed
+
+    def spy_removed(sid: str, mid: str, pid: str) -> None:
+        removed_calls.append((sid, mid, pid))
+        orig_removed(sid, mid, pid)
+
+    th.on_part_removed = spy_removed
+    updated_calls: list[dict] = []
+    orig_updated = th.on_part_updated
+
+    def spy_updated(props: dict) -> None:
+        updated_calls.append(props)
+        orig_updated(props)
+
+    th.on_part_updated = spy_updated
+
+    before = seq()
+    hub.publish(ev("/p", "message.removed", {"sessionID": "s1", "messageID": "m1"}))
+    assert seq() == before + 1  # message.removed 自身 bump
+    # gate 现持有 (s1, m1)：迟到的 part 事件在 GlobalHub 侧被拦
+    hub.publish(ev("/p", "message.part.removed", part_removed_props("s1", "m1", "p1")))
+    hub.publish(ev("/p", "message.part.updated", part_updated_props("s1", "m1", "p1")))
+    assert removed_calls == []       # TokenHub.on_part_removed 未被调用
+    assert updated_calls == []       # 对称：on_part_updated 同样被拦
+    assert ("s1", "m1", "p1") not in th._disabled_parts  # 无 disabled key
+    assert seq() == before + 1       # gate 命中零推进
+    hub.flush()
+    assert only_digests(await drain(sub)) == []
+    # 正对照：未 gate 的 (s1, m2) 正常路由 → disabled key 写入（常规退役）
+    hub.publish(ev("/p", "message.part.removed", part_removed_props("s1", "m2", "p9")))
+    assert removed_calls == [("s1", "m2", "p9")]
+    assert ("s1", "m2", "p9") in th._disabled_parts
+
+
+async def test_v4_sse_id_digest_precedes_question_asked(hub):
+    """(Blocking 2) wire_v4=True 订阅者：解析 ``id:`` 行，断言 digest 的
+    SSE id seq 严格小于 asked 的——真实线序（非仅队列位置）。"""
+    from oc_slimapi.sse.replay_log import ReplayLog
+
+    hub.set_replay_log(ReplayLog())
+    sub = Subscriber(wire_v4=True)
+    hub.subscribers.add(sub)
+    before = seq()
+    hub.publish(ev("/p", "message.updated", msg_props("s1", "m1")))  # pending
+    hub.publish(ev("/p", "question.asked", asked_props("s1")))
+    frames = await drain(sub)
+    assert len(frames) == 2
+    ids = [sse_id_seq(f) for f in frames]
+    assert ids[0] is not None and ids[1] is not None
+    assert ids[0] < ids[1]  # digest SSE id < asked SSE id
+    name0, data0 = parse(frames[0])
+    assert name0 == "session.digest"
+    assert data0["messagesRevision"] == before + 1
+    _, data1 = parse(frames[1])
+    assert data1["type"] == "question.asked"
+
+
+async def test_v4_sse_id_digest_precedes_question_v2_asked(hub):
+    """(Blocking 2) question.v2.asked 同等 SSE id 线序覆盖（pending 经
+    part.updated 入口造，顺带锁 part 路径的 id 线序）。"""
+    from oc_slimapi.sse.replay_log import ReplayLog
+
+    hub.set_replay_log(ReplayLog())
+    sub = Subscriber(wire_v4=True)
+    hub.subscribers.add(sub)
+    before = seq()
+    hub.publish(ev("/p", "message.part.updated", part_updated_props("s1", "m1", "p1")))
+    hub.publish(ev("/p", "question.v2.asked", asked_props("s1")))
+    frames = await drain(sub)
+    assert len(frames) == 2
+    ids = [sse_id_seq(f) for f in frames]
+    assert ids[0] is not None and ids[1] is not None
+    assert ids[0] < ids[1]
+    name0, data0 = parse(frames[0])
+    assert name0 == "session.digest"
+    assert data0["messagesRevision"] == before + 1
+    _, data1 = parse(frames[1])
+    assert data1["type"] == "question.v2.asked"
+
+
+async def test_asked_bad_sessionid_pending_not_flushed(pair):
+    """(Blocking 3) asked 的 sessionID 缺失/空/非 str → 无 targeted
+    flush：已有 pending 留在 debounce 窗内（不提前、不丢失）。"""
+    hub, sub = pair
+    hub.publish(ev("/p", "message.updated", msg_props("s1", "m1")))  # pending
+    for bad in ({}, {"sessionID": ""}, {"sessionID": 123}):
+        props = {"id": "q1"}
+        props.update(bad)
+        hub.publish(ev("/p", "question.asked", props))
+    frames = await drain(sub)
+    assert len(frames) == 3  # 三条 asked 裸帧，无 digest 插入
+    assert only_digests(frames) == []
+    hub.flush()  # pending 到窗末正常成帧
+    digests = only_digests(await drain(sub))
+    assert len(digests) == 1
+    assert digests[0]["sessionID"] == "s1"
+
+
+async def test_question_resolution_family_never_flushes_pending(pair):
+    """(Blocking 3) question.replied/rejected（含 v2）即使带有效 sid 也
+    不触发 flush-before-asked——因果闭合仅 asked 渲染族需要。"""
+    hub, sub = pair
+    hub.publish(ev("/p", "message.updated", msg_props("s1", "m1")))  # pending
+    for event_type in (
+        "question.replied", "question.rejected",
+        "question.v2.replied", "question.v2.rejected",
+    ):
+        hub.publish(ev("/p", event_type,
+                       {"sessionID": "s1", "requestID": "q1", "answers": []}))
+    frames = await drain(sub)
+    assert len(frames) == 4  # 四条裸帧，无 digest 插入
+    assert only_digests(frames) == []
+    hub.flush()
+    assert len(only_digests(await drain(sub))) == 1  # pending 留窗成帧
+
+
+async def test_part_events_cross_window_updated_at_monotonic(pair):
+    """(non-blocking) part.updated 与 part.removed 分落两个 debounce 窗：
+    第二窗 digest 的 updatedAt 严格大于第一窗（per-session 跨窗单调，
+    _bump_updated_at 的 max(now, prev+1) 保证）。"""
+    hub, sub = pair
+    hub.publish(ev("/p", "message.part.updated", part_updated_props("s1", "m1", "p1")))
+    hub.flush()
+    first = only_digests(await drain(sub))
+    assert len(first) == 1
+    hub.publish(ev("/p", "message.part.removed", part_removed_props("s1", "m1", "p1")))
+    hub.flush()
+    second = only_digests(await drain(sub))
+    assert len(second) == 1
+    assert second[0]["updatedAt"] > first[0]["updatedAt"]

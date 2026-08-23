@@ -559,10 +559,13 @@ class TestPublishIntegration:
         assert ("s1", "m1", "p1") in th.live_parts
 
     async def test_token_routing_no_digest_pollution(self, bare_hub):
-        """Token ingest must NOT produce any control-plane digest.
+        """Token ingest must NOT add digest pollution beyond 修订六's
+        single legitimate bump.
 
-        Contract §3: message.part.updated no longer triggers digest — it
-        only routes to the token hub."""
+        4.12.0（修订六）：``message.part.updated`` now bumps the digest
+        revision (completion-state visibility) — exactly ONE digest frame
+        per debounce window. ``message.part.delta`` (per-chunk firehose)
+        still contributes ZERO digest output."""
         subscriber = Subscriber()
         bare_hub.subscribers.add(subscriber)
         th = TokenStreamHub()
@@ -581,8 +584,10 @@ class TestPublishIntegration:
         }))
         bare_hub.flush()
         frames = await drain_queue(subscriber, timeout=0.1)
-        # Contract §3: part events no longer produce digest frames.
-        assert frames == [], f"expected no digests, got {frames!r}"
+        # 修订六：updated 恰产一帧 digest；delta 零贡献（不重复、不污染）。
+        assert len(frames) == 1, f"expected exactly 1 digest, got {frames!r}"
+        assert b"session.digest" in frames[0]
+        assert b'"messagesRevision"' in frames[0]
 
     async def test_message_part_delta_alone_produces_no_digest(self, bare_hub):
         """``message.part.delta`` (token stream only) must NOT touch the
@@ -606,9 +611,10 @@ class TestPublishIntegration:
         """Without a token hub, ``message.part.*`` events do not crash and
         do not route to any token accumulator.
 
-        Contract §3: ``message.part.updated`` no longer emits a digest.
-        ``message.part.delta`` alone remains a full drop (no digest, no
-        state) — unchanged.
+        4.12.0（修订六）：``message.part.updated`` bumps the digest even
+        with no token hub wired (helper runs outside the token route) —
+        exactly one digest frame. ``message.part.delta`` alone remains a
+        full drop (no digest, no state) — unchanged.
         """
         subscriber = Subscriber()
         bare_hub.subscribers.add(subscriber)
@@ -627,8 +633,10 @@ class TestPublishIntegration:
         }))
         bare_hub.flush()
         frames = await drain_queue(subscriber, timeout=0.1)
-        # Contract §3: part events no longer produce digest frames.
-        assert frames == [], f"expected no digests from part events, got {frames!r}"
+        # 修订六：delta 全 drop；updated 恰一帧 digest（不依赖 token hub）。
+        assert len(frames) == 1, f"expected exactly 1 digest, got {frames!r}"
+        assert b"session.digest" in frames[0]
+        assert b'"messagesRevision"' in frames[0]
 
     async def test_control_plane_branches_untouched(self, bare_hub):
         """Sanity: the curated branches above the token-routing still

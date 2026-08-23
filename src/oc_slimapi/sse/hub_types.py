@@ -289,7 +289,12 @@ class DigestFields:
     changed: list[str] | None = None
     # 4.11.0 Phase A / A3 (P4): messagesRevision — the process-wide
     # monotonic message-universe revision stamped onto MESSAGE windows
-    # only (a digest entry that includes message.updated/appended/removed).
+    # only. 4.12.0（修订六）: the message-window family grew to include
+    # ``message.part.updated`` / ``message.part.removed`` (part-level
+    # completion-state visibility; ``message.part.delta`` still NEVER
+    # stamps) alongside message.updated/appended/removed — all via the
+    # unified ``GlobalHub._bump_message_revision`` helper, same debounce
+    # window semantics.
     # Session-only digests leave it None → ``to_payload`` omits the key.
     # Lifecycle = the PROCESS: a restart zeroes the counter, so clients
     # MUST NOT compare revisions across processes; upstream resync does

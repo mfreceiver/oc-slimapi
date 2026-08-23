@@ -1668,44 +1668,54 @@ async def test_digest_fields_converged(fresh_hub):
     assert "childrenVersion" not in payload
 
 
-async def test_part_updated_does_not_touch_digest(fresh_hub, monkeypatch):
-    """Contract §3: message.part.updated no longer triggers digest.
-    Per contract, only session.* / message.updated / message.appended
-    drive the digest. Part events only route to the token hub."""
+async def test_part_updated_bumps_digest_revision(fresh_hub, monkeypatch):
+    """修订六（4.12.0）：message.part.updated 经统一 helper 接入 digest
+    修订——低频完成态变化（上游每 part 生命周期 2-4 次）可经 digest 感知，
+    与 message.updated 同组同 debounce。Token-hub-only 路由时代结束。"""
     hub, subscriber = fresh_hub
 
     FIXED = 1700000000000
     monkeypatch.setattr("oc_slimapi.sse.global_hub._now_ms", lambda: FIXED)
 
+    from oc_slimapi.sse import global_hub as gh
+
+    before = gh._message_revision_seq
     hub.publish(make_global_event("/proj", "message.part.updated", {
         "part": {"sessionID": "s1", "messageID": "m1", "id": "p1"},
         "sessionID": "s1", "messageID": "m1",
     }))
-    # Part events no longer create pending entries.
-    assert "s1" not in hub.pending
+    assert gh._message_revision_seq == before + 1
+    assert "s1" in hub.pending  # 修订六：part 事件现在造 pending entry
 
     hub.flush()
     frames = await drain_queue(subscriber)
-    assert frames == []  # No digest produced from part event
+    assert len(frames) == 1
+    assert b"session.digest" in frames[0]
+    assert b'"messagesRevision"' in frames[0]
 
 
-async def test_part_removed_does_not_touch_digest(fresh_hub, monkeypatch):
-    """Contract §3: message.part.removed no longer triggers digest.
-    Part events only route to the token hub."""
+async def test_part_removed_bumps_digest_revision(fresh_hub, monkeypatch):
+    """修订六（4.12.0）：message.part.removed 同 bump（revert 场景）——
+    同 message.updated 组同 debounce 语义。"""
     hub, subscriber = fresh_hub
 
     FIXED = 1700000000000
     monkeypatch.setattr("oc_slimapi.sse.global_hub._now_ms", lambda: FIXED)
 
+    from oc_slimapi.sse import global_hub as gh
+
+    before = gh._message_revision_seq
     hub.publish(make_global_event("/proj", "message.part.removed", {
         "sessionID": "s1", "messageID": "m1", "partID": "p1",
     }))
-    # Part events no longer create pending entries.
-    assert "s1" not in hub.pending
+    assert gh._message_revision_seq == before + 1
+    assert "s1" in hub.pending
 
     hub.flush()
     frames = await drain_queue(subscriber)
-    assert frames == []  # No digest produced from part event
+    assert len(frames) == 1
+    assert b"session.digest" in frames[0]
+    assert b'"messagesRevision"' in frames[0]
 
 
 async def test_bump_updated_at_same_ms_collision(monkeypatch, fresh_hub):

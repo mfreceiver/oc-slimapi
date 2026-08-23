@@ -75,7 +75,9 @@ _DROPPED_LOG_INTERVAL_SECONDS = 60.0
 
 # 4.11.0 Phase A / A3 (P4): process-wide monotonic counter for the digest
 # ``messagesRevision`` field. Bumped by every RELEVANT message event
-# (message.updated / message.appended / message.removed) — nothing else.
+# (message.updated / message.appended / message.removed — plus, since 4.12.0
+# revision-6, valid non-gated message.part.updated / message.part.removed);
+# per-chunk ``message.part.delta`` never bumps — nothing else does.
 # Lifecycle = the process: initial 0, zeroed only by a restart (clients must
 # not compare revisions across processes); upstream resync does NOT reset it.
 # Independent of subscribers: the bump happens in publish() regardless of
@@ -200,9 +202,10 @@ class GlobalHub:
         self._dropped_since_log = 0
         # rev-ogpt MAJOR 3 + MAJOR 4 (3rd-round terminal audit): bounded
         # gate of retired (sessionID, messageID) tuples. Populated by
-        # ``message.removed``; checked by ``message.part.updated`` to
-        # prevent late part events from resurrecting state for a deleted
-        # message (token-hub route + digest updatedAt bump).
+        # ``message.removed``; checked by BOTH ``message.part.updated`` and
+        # ``message.part.removed`` to prevent late part events from
+        # resurrecting state for a deleted message (token-hub route +
+        # digest revision bump).
         #
         # Typed as an ``OrderedDict`` keyed by (sid, mid) → insertion
         # timestamp (epoch-ms) so the gate can be capped + TTL-evicted
@@ -241,6 +244,41 @@ class GlobalHub:
         entry.updated_at = updated_at
         self._last_updated_at_by_sid[session_id] = updated_at
         self._last_updated_at_by_sid.move_to_end(session_id)
+
+    def _bump_message_revision(
+        self,
+        session_id: str,
+        directory: Any,
+        message_id: str | None,
+    ) -> None:
+        """修订六（4.12.0）：统一的 message-change digest 入口。
+
+        rev-1 B5 裁定：「bump message revision + 写 pending digest
+        entry」的单一实现，服务于 message.updated / message.appended /
+        message.part.updated / message.part.removed 四个分派分支——同
+        组、同 debounce 语义（DEBOUNCE_SECONDS=0.25s 窗口，多事件
+        overwrite 成窗末值）。语义与 4.11.0 Phase A 的 MESSAGE_EVENTS
+        分派逐字段对齐（本 helper 即该内联序列的等价提取）：
+
+        * ``DigestFields()`` setdefault —— 首个事件即造 entry。注意
+          ``message.removed`` 的「不造 entry、只给已存在 entry 盖章」
+          语义**不迁入**本 helper（行为不同，仍内联在其分支）。
+        * directory / message_id 仅在 str 时盖章。
+        * ``_bump_updated_at``：sidecar wall-clock、per-session 跨窗
+          严格单调。
+        * 进程级 revision allocator 单点自增 + 窗口末值盖章
+          （overwrite，非 max/first）。ingest 时冻结，对齐 turn-fence
+          stamping 纪律。
+        """
+        global _message_revision_seq
+        entry = self.pending.setdefault(session_id, DigestFields())
+        if isinstance(directory, str):
+            entry.directory = directory
+        if isinstance(message_id, str):
+            entry.message_id = message_id
+        self._bump_updated_at(session_id, entry)
+        _message_revision_seq += 1
+        entry.messages_revision = _message_revision_seq
 
     def ensure_upstream(self) -> None:
         """Start the run / flush / heartbeat tasks if not already running.
@@ -930,6 +968,20 @@ class GlobalHub:
                 # (both write points — here and QpSweepShadow.record_activity
                 # — share this dict reference by app.py construction).
                 record_qp_activity(self.qp_last_activity, directory, time.time())
+            # 修订六（4.12.0，B3 裁定 b + rev-2 条款 4）：flush-before-asked
+            # 因果闭合。asked 卡片的渲染依赖该 sid 的最新 digest 状态
+            # （busy/updatedAt/messagesRevision）——转发 asked 前对该 sid
+            # targeted flush（flush_sid 把 pending digest entry 立即成帧
+            # 发出，其他 sid 留在 debounce 窗），保证同一 SSE 流上订阅者
+            # 先收 digest(rev=N) 再收 asked。无 pending 则 flush_sid 无
+            # 操作（asked 照常独立转发）。仅 asked 族：reply/reject 不带
+            # 「客户端即将按 digest 渲染」的因果依赖。上游 schema
+            # （v1/question.ts:35-42 Request、question.ts:70 v2 Asked）props
+            # 均为扁平 ``sessionID`` 字段；缺失/非 str → 无操作。
+            if event_type in ("question.asked", "question.v2.asked"):
+                qsid = props.get("sessionID")
+                if isinstance(qsid, str) and qsid:
+                    self.flush_sid(qsid)
             frame = sse_frame({
                 "directory": directory,
                 "type": event_type,
@@ -1041,24 +1093,10 @@ class GlobalHub:
                 return
             info = props.get("info") if isinstance(props.get("info"), dict) else {}
             message_id = info.get("id") if isinstance(info.get("id"), str) else props.get("messageID")
-            entry = self.pending.setdefault(session_id, DigestFields())
-            if isinstance(directory, str):
-                entry.directory = directory
-            if isinstance(message_id, str):
-                entry.message_id = message_id
-            # lite-v2 §4.2: updatedAt is the sidecar's wall-clock observation
-            # time, NOT the upstream message timestamp. Using _bump_updated_at
-            # ensures strict monotonicity within the debounce window.
-            # lite-v2-dev (🟠-2): now per-session cross-debounce monotonic.
-            self._bump_updated_at(session_id, entry)
-            # 4.11.0 Phase A / A3: relevant message event → bump the
-            # process-wide revision and stamp the window. Overwrite (not
-            # max/first) so a multi-event debounce window flushes the
-            # WINDOW-END value. Frozen at ingest, mirroring the turn-fence
-            # stamping discipline.
-            global _message_revision_seq
-            _message_revision_seq += 1
-            entry.messages_revision = _message_revision_seq
+            # 修订六（4.12.0）：内联序列等价迁移至 _bump_message_revision
+            # （4.11.0 Phase A 行为零变化——setdefault/directory/message_id/
+            # updatedAt/revision 窗末值，顺序与语义逐字段一致）。
+            self._bump_message_revision(session_id, directory, message_id)
             return
 
         # G1: session.error — immediate digest (with sid) or session.error frame (session-less).
@@ -1129,24 +1167,21 @@ class GlobalHub:
         # per-token firehose into the TokenStreamHub BEFORE the catch-all
         # drop. Stage A scope: ingest + data structures only — no flush,
         # no subscribers, no fan-out (Stage B/C/D). Returning here keeps
-        # the control-plane branches above untouched AND prevents these
-        # high-frequency events from polluting the curated digest. When no
-        # token hub is wired, behaviour is unchanged (events are dropped).
+        # the control-plane branches above untouched. When no token hub
+        # is wired, part events still reach the 修订六 digest bump below.
         #
-        # lite-v2 (contract §3 alignment): per-message part state is no
-        # longer tracked by the hub. Per contract §3 (v2 删除的帧), only
-        # ``session.*`` / ``message.updated`` / ``message.appended`` drive
-        # the digest. ``message.part.updated`` / ``message.part.removed``
-        # no longer bump ``digest.updatedAt`` — they only route to the
-        # token hub for the delta/snapshot stream. A retired-message gate
-        # (``_retired_messages``) prevents late part events from
-        # resurrecting token hub state for a deleted message.
-        #   * ``message.removed`` records the retired-message gate and
-        #     fans out via the token hub; it does NOT bump updatedAt
-        #     (skeleton reload is driven by the client's own message-list
-        #     state, not by the digest).
-        # ``message.part.delta`` (token stream) does NOT touch the digest
-        # — clients see deltas in real time.
+        # 修订六（4.12.0）digest 语义（取代 lite-v2 contract §3 的旧规则
+        # ——「part 事件不进 digest」已于 4.12.0 随 part 级 revision bump
+        # 退役）：``message.part.updated`` / ``message.part.removed`` 与
+        # ``message.updated`` / ``message.appended`` 同组、同 debounce
+        # （0.25s）经 _bump_message_revision 推进 digest 修订（上游每
+        # part 生命周期仅 2-4 次发射，完成态变化经 digest 可感知）。
+        # retired-message gate（``_retired_messages``）在两分支均在 token
+        # 路由与 bump **之前**拦截——whole-removal 后迟到的 part 事件既
+        # 不复活 token hub 状态，也不造 digest。``message.removed`` 记录
+        # gate 并经 token hub 扇出；它不造 digest entry（只给已 pending
+        # 的 entry 盖窗末 revision）。``message.part.delta``（per-chunk
+        # 火线）仍完全不触碰 digest——客户端实时见 delta。
         if event_type in (
             "message.part.delta", "message.part.updated",
             "message.part.removed", "message.removed",
@@ -1169,14 +1204,20 @@ class GlobalHub:
                         # rev-ogpt MAJOR 3: retired-message gate — if this
                         # message was removed upstream, late
                         # ``message.part.updated`` must NOT resurrect any
-                        # state (token hub routing). Per contract §3, part
-                        # events no longer bump digest updatedAt anyway.
+                        # state (token hub routing) NOR bump the digest
+                        # (修订六: the gate check precedes BOTH effects).
                         if (psid, pmid) in self._retired_messages:
                             return
-                        # Contract §3: part events NO LONGER trigger
-                        # digest — only route to token hub.
                         if self._token_hub is not None:
                             self._token_hub.on_part_updated(props)
+                        # 修订六（4.12.0）：part.updated 接入 digest 修订。
+                        # 上游每 part 生命周期仅 2-4 次发射（text-start 空/
+                        # text-end 满/cleanup 各一次；per-chunk 走
+                        # part.delta 不落库），完成态变化经 digest 可感知。
+                        # retired gate 已在上方拦截（whole-removal 后迟到
+                        # 事件不造 digest）；与 message.updated 同组同
+                        # debounce（0.25s）窗末值语义。
+                        self._bump_message_revision(psid, directory, pmid)
                         return
             elif event_type == "message.part.removed":
                 # opencode v1.18.4 payload (schema session.ts:604-628):
@@ -1189,18 +1230,31 @@ class GlobalHub:
                     and isinstance(pmid, str) and pmid
                     and isinstance(ppid, str) and ppid
                 ):
-                    # Contract §3: part events NO LONGER trigger digest —
-                    # only route to the token hub so it can
-                    # retire the corresponding LivePart / pending
-                    # accumulator / revision. Without this routing the
+                    # rev-sgpt Blocking 1（4.12.0 返工）：retired-message gate
+                    # 在 token 路由**之前**（对齐 part.updated 分支时序）。
+                    # 理由：TokenHub 自身的 gate 与 GlobalHub gate 各自独立
+                    # 定时清理，不能假定永久同步——若 TokenHub gate 已过期
+                    # 清掉而 GlobalHub gate 仍在，放行 on_part_removed 会让
+                    # drop_part() 对从未见过的 key 也写入 _disabled_parts
+                    # （budgets.py:375 明示 never-seen key 合法且仍标记
+                    # disabled）。gate 命中 → return，TokenHub 不被调用、
+                    # 不产生 disabled key、不 bump digest。
+                    if (psid, pmid) in self._retired_messages:
+                        return
+                    # token 路由：让 token hub retire 对应 LivePart / pending
+                    # accumulator / revision。Without this routing the
                     # token hub would keep emitting stale delta / snapshot
                     # frames for a part the upstream has removed.
                     # ``on_part_removed`` is idempotent (``drop_part``
-                    # returns False on second call) and is gated by the
-                    # token hub's ``_retired_messages`` set when the
-                    # whole message has already been retired.
+                    # returns False on second call).
                     if self._token_hub is not None:
                         self._token_hub.on_part_removed(psid, pmid, ppid)
+                    # 修订六（4.12.0）：part.removed 同组同 debounce bump
+                    # （revert.ts:119 / session.ts:393 两低频显式发射点，
+                    # 典型即 revert 场景）。gate 已在上方先行拦截；bump 在
+                    # token 路由之后，对齐 message.removed「状态工作先行、
+                    # bump 最后」纪律。
+                    self._bump_message_revision(psid, directory, pmid)
                     return
             elif event_type == "message.removed":
                 # opencode v1.18.4 payload: flat ``{sessionID, messageID}``.
@@ -1211,7 +1265,8 @@ class GlobalHub:
                     and isinstance(pmid, str) and pmid
                 ):
                     # rev-ogpt MAJOR 3: record the retired message so late
-                    # ``message.part.updated`` cannot resurrect any state.
+                    # ``message.part.updated`` / ``message.part.removed``
+                    # cannot resurrect any state.
                     # rev-ogpt MAJOR 4 (3rd-round): the gate is a bounded
                     # OrderedDict with FIFO cap (``TOKEN_REMOVED_MESSAGES_MAX``)
                     # + TTL (``TOKEN_REMOVED_MESSAGES_TTL_MS``) aligned with
@@ -1236,9 +1291,14 @@ class GlobalHub:
                     # above completes first. A removal does not fabricate a
                     # digest entry by itself; an already-pending entry for
                     # this sid is stamped with the post-removal window-end
-                    # value. (Single `global` declaration lives in the
-                    # MESSAGE_EVENTS branch above — a second one after any
-                    # use is a SyntaxError.)
+                    # value. This branch deliberately does NOT use
+                    # _bump_message_revision (修订六 helper): that helper
+                    # setdefault-creates an entry, while removal only
+                    # stamps an ALREADY-pending one — different semantics,
+                    # kept inline. (The ``global`` declaration moved here
+                    # from the MESSAGE_EVENTS branch when that branch
+                    # migrated to the helper in 4.12.0.)
+                    global _message_revision_seq
                     _message_revision_seq += 1
                     entry = self.pending.get(psid)
                     if entry is not None:
