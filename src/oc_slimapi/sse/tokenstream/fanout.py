@@ -8,11 +8,15 @@ compatibility).
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from ...config import TOKEN_REMOVED_MESSAGES_TTL_MS
 from ...logging_config import get_logger
-from ..hub_types import TOKEN_FRAME_TYPE
+from ..hub_types import (
+    RESYNC_RECONNECT_NO_REPLAY,
+    RESYNC_TOKEN_MEMORY_LIMIT,
+    TOKEN_FRAME_TYPE,
+)
 from ..replay_log import (
     FRAME_KIND_BUSINESS,
     FRAME_KIND_TOMBSTONE,
@@ -22,6 +26,7 @@ from ..replay_wire import V4_RESYNC_REASONS, sse_id_line
 from .frames import (
     PartKey,
     _connected_frame,
+    _delta_frame,
     _heartbeat_frame,
     _message_removed_frame,
     _now_ms,
@@ -62,6 +67,29 @@ def _v4_frame_eligible(frame: bytes) -> bool:
     covered regardless of which call site constructed the frame.
     """
     return not frame.startswith(_V4_INELIGIBLE_FRAME_PREFIX)
+
+
+# 4.12.0 修订六 B-2 (rev-2 条款 1 + 修正 3): the resync reason domain is
+# now TWO explicitly separated sets — wire-visible unions exist for tests,
+# but the implementation branches on the specific subset:
+#
+# * :data:`V4_RESYNC_REASONS` (unchanged, hub_types) — ROUTE-PRIVATE
+#   control resyncs (epoch_changed / replay_expired / replay_gap /
+#   reconnect_no_replay). No ``id:`` line, no payload ``seq``, NEVER
+#   appended to the ReplayLog, emitted by the reconnect classification
+#   path (routes) and :meth:`FanoutMixin._fanout_resync`.
+#
+# * :data:`REPLAYABLE_RESYNC_REASONS` (below) — REPLAYABLE business
+#   resyncs. Currently EXACTLY ``token_memory_limit``: published through
+#   the B-1 atomic reserve→encode→append path (id line + payload seq +
+#   ReplayLog entry, consumes a seq), replayable on reconnect.
+#
+# The two sets are disjoint BY CONSTRUCTION here. ``token_memory_limit``
+# must NEVER be routed through :meth:`_fanout_resync` (that would make it
+# an id-less, un-logged control frame — the exact regression this
+# separation forbids), and no frozen-four reason may ever be routed
+# through :meth:`_fanout_replayable_resync` (ValueError guard below).
+REPLAYABLE_RESYNC_REASONS = frozenset({RESYNC_TOKEN_MEMORY_LIMIT})
 
 
 def _events_token_frame(key: PartKey, text: str) -> bytes:
@@ -109,6 +137,7 @@ class FanoutMixin:
         needs the live ``HubRegistry`` reference (NB-B1).
         """
         return sum(len(subs) for subs in self._subs_by_sid.values())
+
     def has_consumers(self) -> bool:
         """True while ANY token consumer remains.
 
@@ -147,6 +176,7 @@ class FanoutMixin:
     # ------------------------------------------------------------------
     # Subscribe fanout bookkeeping (§5.5 handshake, §5.7 stream-perspective)
     # ------------------------------------------------------------------
+
     def attach_subscriber(self, sid: str, sub: Any, wire_v4: bool = False) -> None:
         """Stage D's ``TokenSubscriber`` calls this on HTTP connect.
 
@@ -275,6 +305,7 @@ class FanoutMixin:
             return
         # 5. enter fanout.
         self._subs_by_sid.setdefault(sid, set()).add(sub)
+
     def detach_subscriber(self, sid: str, sub: Any) -> None:
         """Remove a subscriber from the sid's fanout set. Idempotent.
 
@@ -289,6 +320,7 @@ class FanoutMixin:
         subs.discard(sub)
         if not subs:
             self._subs_by_sid.pop(sid, None)
+
     def has_subscriber(self, sid: str, sub: Any) -> bool:
         """True iff ``sub`` is currently in ``sid``'s fanout set (NB-D1).
 
@@ -304,40 +336,85 @@ class FanoutMixin:
     # ------------------------------------------------------------------
     # Fanout helpers
     # ------------------------------------------------------------------
-    def _replay_publish_token(
-        self, sid: str, frame: bytes, kind: str = FRAME_KIND_BUSINESS
-    ) -> bytes | None:
-        """Append ``frame`` to the sid's replay domain; return its id line.
 
-        B3b-2 choke point for token-domain business frames. Called on the
-        LIVE fanout path (``_fanout_frame`` for v4-ELIGIBLE frames /
-        ``_fanout_message_removed``) BEFORE the no-subscriber early return —
-        the log records *published* frames, not *delivered* ones, so frames
-        emitted while a subscriber was overflowed/disconnected still replay
-        (REPLAY-007). rev-gate R2 BLOCKER-1: callers gate on
-        :func:`_v4_frame_eligible` first — the ``message.part.snapshot``
-        family never reaches this method. Returns ``None`` when no replay
-        log is wired or the append degrades (bookkeeping must never fail
-        publishing); the caller then delivers the raw frame unchanged.
+    def _publish_seq_frame(
+        self,
+        sid: str,
+        build: Callable[[int], bytes],
+        *,
+        kind: str = FRAME_KIND_BUSINESS,
+    ) -> tuple[bytes, bytes] | None:
+        """Atomic reserve→encode→append for a v4-eligible business frame
+        (4.12.0 修订六 B-1 / rev-1 B1 + rev-2 条款 1).
+
+        Call order (all synchronous, ONE event-loop step — no interleaving
+        publisher can observe the intermediate states):
+
+        1. ``seq = self._replay.reserve_seq(token_domain(sid))`` —
+           tentative allocation from the SAME sequence that mints replay
+           SSE ids (same ``(epoch, token-domain)``);
+        2. ``frame = build(seq)`` — serialize WITH the seq embedded as a
+           payload ``seq`` field (the historical defect being fixed: the
+           frame used to be serialized BEFORE the seq existed, so the
+           payload could never carry it);
+        3. ``append(..., seq=seq)`` — confirm into the ReplayLog (memory
+           deque + byte bookkeeping, synchronous);
+        4. only then does the caller fan out (v4 subscribers receive
+           ``id: g:<epoch>:<seq>``-shaped lines whose last segment equals
+           the payload ``seq`` by construction).
+
+        Failure handling — the B-1 rule that REPLACES the historical
+        degradation: on ANY failure in steps 1–3 the reservation is rolled
+        back (:meth:`ReplayLog.rollback_seq` — the domain sequence stays
+        hole-free; the next successful frame reuses the value), the frame
+        is DROPPED (never fanned out un-logged / without its id), and
+        ``seq_publish_failures_total`` is bumped. The old
+        ``_replay_publish_token`` contract — "append failure degrades to
+        delivering the raw frame with no id line" — is deliberately
+        abolished: an un-logged frame on a v4 wire is indistinguishable
+        from a lost frame after reconnect.
+
+        Returns ``(id_line, frame)`` on success; ``None`` on failure
+        (dropped + counted). Callers that need fail-closed semantics
+        instead of drop-and-continue (B-2 eviction resync) branch on the
+        ``None`` themselves.
         """
-        if self._replay is None:
+        replay = self._replay
+        if replay is None:  # defensive — callers gate on `self._replay`
             return None
+        domain = token_domain(sid)
+        seq: int | None = None
         try:
-            entry = self._replay.append(token_domain(sid), frame, kind=kind)
-        except Exception:  # noqa: BLE001 — publishing never fails on log errors
-            logger.warning("replay log append failed for sid %r", sid, exc_info=True)
+            seq = replay.reserve_seq(domain)
+            frame = build(seq)
+            entry = replay.append(domain, frame, kind=kind, seq=seq)
+        except Exception:  # noqa: BLE001 — publish failure drops the frame
+            if seq is not None and not replay.rollback_seq(domain, seq):
+                logger.error(
+                    "seq rollback refused for sid %r seq %s — domain "
+                    "sequence carries a hole (structurally unreachable "
+                    "under the synchronous-scope contract)", sid, seq,
+                )
+            self._metrics.seq_publish_failures_total += 1
+            logger.warning(
+                "replay publish failed for sid %r; frame dropped", sid,
+                exc_info=True,
+            )
             return None
-        return sse_id_line(token_domain(sid), self._replay.epoch, entry.seq)
+        return sse_id_line(domain, replay.epoch, entry.seq), frame
+
     def _write_replay_barrier(self, sid: str, why: str) -> None:
         """Write a replay barrier for the sid's token domain (rev-gate R4).
 
-        Called at every server-side **state invalidation** source for the
-        token accumulator — session idle retire (:meth:`on_session_status`),
-        memory eviction (:meth:`_evict_part_for_memory`), session deletion
-        (:meth:`on_session_deleted`) — UNCONDITIONALLY at the source, i.e.
-        regardless of whether any (v4 or v3) subscriber is currently
-        online. Rationale (v4-contract §7.2 window semantics / R4
-        BLOCKER-1): after the invalidation the accumulator state that
+        Called at server-side **state invalidation** sources whose resync
+        is NOT itself replayable — session idle retire
+        (:meth:`on_session_status`), session deletion
+        (:meth:`on_session_deleted`), and the B-2 fail-closed path in
+        :meth:`_fanout_replayable_resync` (replayable-resync publish
+        failure after the state was already cleared) — UNCONDITIONALLY at
+        the source, i.e. regardless of whether any (v4 or v3) subscriber
+        is currently online. Rationale (v4-contract §7.2 window semantics
+        / R4 BLOCKER-1): after the invalidation the accumulator state that
         produced the logged frames is gone, so a client reconnecting with
         ``Last-Event-ID == last_seq`` must NOT be judged up-to-date (it
         would enter live mode holding a残缺 part). The barrier makes any
@@ -346,8 +423,16 @@ class FanoutMixin:
         connection's own delivery stays the R3 semantics (silent STOP for
         non-frozen reasons); this barrier only governs RECONNECTS.
 
-        Degrade pattern mirrors :meth:`_replay_publish_token`: a log
-        failure is logged and swallowed (invalidation must never fail).
+        4.12.0 修订六 B-2 NOTE — memory eviction
+        (:meth:`_evict_part_for_memory`) NO LONGER writes a barrier: its
+        alignment signal is now the replayable ``token_memory_limit``
+        resync frame itself (in the log, at its own seq). A barrier would
+        intercept every cursor ≤ watermark and the replayable resync
+        (seq = watermark+1) could then never be replayed — the frame IS
+        the R4 guarantee for that path.
+
+        Degrade pattern: a log failure is logged and swallowed
+        (invalidation must never fail).
         """
         if self._replay is None:
             return
@@ -357,6 +442,7 @@ class FanoutMixin:
             logger.warning(
                 "replay barrier write failed for sid %r (%s)", sid, why, exc_info=True
             )
+
     def _deliver_logged(self, sid: str, frame: bytes, id_line: bytes | None) -> int:
         """Deliver a (possibly replay-logged) frame to the sid's subscribers.
 
@@ -370,6 +456,7 @@ class FanoutMixin:
         for sub in tuple(subs):
             sub.put(id_line + frame if (id_line is not None and sub.wire_v4) else frame)
         return len(subs)
+
     def _deliver_v3_only(self, sid: str, frame: bytes) -> int:
         """Deliver a v3-ONLY frame (snapshot family) to the sid's v3 subs.
 
@@ -390,27 +477,72 @@ class FanoutMixin:
                 sub.put(frame)
                 delivered += 1
         return delivered
+
     def _fanout_frame(self, key: PartKey, frame: bytes) -> None:
-        """Fan a frame to every subscriber of the key's sid + count emits.
+        """Fan a v4-INELIGIBLE (snapshot-family) frame to v3 subs + count.
 
-        B3b-2: a v4-ELIGIBLE frame (:func:`_v4_frame_eligible`) is appended
-        to the sid's replay domain FIRST (published semantics — logged even
-        with zero subscribers), then delivered with per-sub id stamping for
-        v4 connections.
+        4.12.0 修订六 B-1 scope narrowing: this choke point now serves
+        ONLY the ``message.part.snapshot`` family (the ``done:true``
+        terminal marker from :meth:`finish_part` — handshake / truncated
+        snapshots reach subscribers via the per-sub emit helpers, not
+        here). rev-gate R2 BLOCKER-1 semantics unchanged: the frame is
+        NOT logged, consumes no seq, and is delivered to v3 subscribers
+        ONLY via :meth:`_deliver_v3_only` (v4 state alignment is
+        HTTP-based per the frozen contract).
 
-        rev-gate R2 BLOCKER-1: a v4-INELIGIBLE frame (the
-        ``message.part.snapshot`` family — e.g. the ``snapshot{done:true}``
-        terminal marker from :meth:`finish_part`) is NOT logged, consumes no
-        seq, and is delivered to v3 subscribers ONLY via
-        :meth:`_deliver_v3_only`.
+        v4-ELIGIBLE frames (``message.part.delta``) MUST go through
+        :meth:`_fanout_delta_frame` — their payload embeds the publish
+        seq, so they cannot be pre-serialized at the call site anymore.
+        A structurally eligible frame arriving here is a programming
+        error: logged at ERROR (loud regression signal) and delivered
+        v3-only rather than silently entering the un-logged path.
         """
         sid = key[0]
         if _v4_frame_eligible(frame):
-            id_line = self._replay_publish_token(sid, frame)
-            delivered = self._deliver_logged(sid, frame, id_line)
-        else:
-            delivered = self._deliver_v3_only(sid, frame)
+            logger.error(
+                "v4-eligible frame reached _fanout_frame (sid %r) — use "
+                "_fanout_delta_frame; delivering v3-only", sid,
+            )
+        delivered = self._deliver_v3_only(sid, frame)
         self._metrics.flushed_frames_total += delivered
+
+    def _fanout_delta_frame(self, key: PartKey, text: str) -> None:
+        """Publish + fan one ``message.part.delta`` frame (B-1 primary path).
+
+        4.12.0 修订六 B-1: the v4-eligible delta publication is
+        reserve→encode→append→fanout — the frame bytes are serialized
+        AFTER the tentative seq allocation so the payload carries
+        ``seq`` (equal to the ``id:`` line's last segment on the v4
+        wire). Only a confirmed append fans out; a publish failure drops
+        the frame + rolls the seq back + bumps
+        ``seq_publish_failures_total`` (no un-logged fanout — see
+        :meth:`_publish_seq_frame`).
+
+        The per-frame ``partEventRevision`` is consumed BEFORE the
+        publish attempt (a dropped frame wastes its revision — an
+        accepted gap, same precedent as oversized-snapshot drops; a
+        client comparing strict ``>`` still accepts the next delivery).
+
+        No replay log wired (v3-only stacks / minimal test apps): the
+        legacy shape — no payload ``seq``, no id line, raw fanout to
+        every subscriber — keeps those stacks byte-identical.
+        """
+        sid = key[0]
+        rev = self._next_part_revision(key)
+        if self._replay is None:
+            frame = _delta_frame(key, text, part_revision=rev)
+            delivered = self._deliver_logged(sid, frame, None)
+        else:
+            published = self._publish_seq_frame(
+                sid,
+                lambda seq: _delta_frame(key, text, part_revision=rev, seq=seq),
+            )
+            if published is None:
+                return  # dropped + rolled back + counted (B-1).
+            id_line, frame = published
+            delivered = self._deliver_logged(sid, frame, id_line)
+        self._metrics.flushed_frames_total += delivered
+
     def _fanout_message_removed(self, sid: str, mid: str) -> None:
         """Fan a ``message.removed`` frame to every subscriber of ``sid``.
 
@@ -419,30 +551,57 @@ class FanoutMixin:
         ``_removed_messages`` + the handshake replay in
         :meth:`attach_subscriber`.
 
-        B3b-2: the tombstone is ALSO appended to the sid's replay domain
-        with :data:`FRAME_KIND_TOMBSTONE` — a reconnecting client that
-        missed the live frame replays it WITH its ``id:`` (it consumes a
-        seq exactly like a business frame, keeping the ID sequence
+        B3b-2: the tombstone is appended to the sid's replay domain with
+        :data:`FRAME_KIND_TOMBSTONE` — a reconnecting client that missed
+        the live frame replays it WITH its ``id:`` (it consumes a seq
+        exactly like a business frame, keeping the ID sequence
         hole-free; REPLAY-012).
+
+        4.12.0 修订六 B-1: the tombstone rides the same atomic
+        reserve→encode→append path (payload embeds the seq); a publish
+        failure drops it + rolls the seq back + counts (the bounded
+        ``_removed_messages`` handshake queue still informs later v3
+        attaches even when the replay publish failed).
         """
-        frame = _message_removed_frame(sid, mid)
-        id_line = self._replay_publish_token(sid, frame, kind=FRAME_KIND_TOMBSTONE)
-        delivered = self._deliver_logged(sid, frame, id_line)
+        if self._replay is None:
+            frame = _message_removed_frame(sid, mid)
+            delivered = self._deliver_logged(sid, frame, None)
+        else:
+            published = self._publish_seq_frame(
+                sid,
+                lambda seq: _message_removed_frame(sid, mid, seq=seq),
+                kind=FRAME_KIND_TOMBSTONE,
+            )
+            if published is None:
+                return  # dropped + rolled back + counted (B-1).
+            id_line, frame = published
+            delivered = self._deliver_logged(sid, frame, id_line)
         self._metrics.flushed_frames_total += delivered
+
     def _fanout_resync(self, sid: str, reason: str) -> None:
         """Fan ``resync{reason, sessionID}`` to every subscriber of sid.
 
-        rev-gate R3 BLOCKER-1: the frozen v4 reason domain is EXACTLY
-        :data:`V4_RESYNC_REASONS` (epoch_changed / replay_expired /
-        replay_gap / reconnect_no_replay). A v4 subscriber facing a
-        NON-frozen reason (``token_memory_limit`` via
-        :meth:`_evict_part_for_memory`, ``session_idle`` via the pending
-        session-resync batch) is TERMINATED instead —
-        :meth:`TokenSubscriber.terminate` suppresses the out-of-domain
-        frame on v4 wires (STOP only; the disconnect is the observable
-        signal, recovery = Last-Event-ID reconnect → ReplayLog replay or
-        a frozen-reason resync). v3 subscribers keep the frozen
-        ``resync{reason}`` frame, byte-identical.
+        ROUTE-PRIVATE control-frame path (4.12.0 修订六 B-2 / rev-2 修正
+        3): the ONLY reasons legal here are the frozen four
+        (:data:`V4_RESYNC_REASONS`) plus v3-only lifecycle reasons
+        (``session_idle`` …). The frame carries NO ``id:`` line, NO
+        payload ``seq``, and is NEVER appended to the ReplayLog — a
+        reconnecting client re-derives it from the classification
+        protocol, never from the window.
+
+        rev-gate R3 BLOCKER-1: a v4 subscriber facing a NON-frozen reason
+        (``session_idle`` via the pending session-resync batch) is
+        TERMINATED instead — :meth:`TokenSubscriber.terminate` suppresses
+        the out-of-domain frame on v4 wires (STOP only; the disconnect is
+        the observable signal, recovery = Last-Event-ID reconnect →
+        ReplayLog replay or a frozen-reason resync). v3 subscribers keep
+        the frozen ``resync{reason}`` frame, byte-identical.
+
+        4.12.0 修订六 B-2: ``token_memory_limit`` is NO LONGER routed
+        here — it became a REPLAYABLE business resync and must go through
+        :meth:`_fanout_replayable_resync` (id line + payload seq +
+        ReplayLog entry). Routing it back here would silently regress it
+        to an id-less control frame.
         """
         subs = self._subs_by_sid.get(sid)
         if not subs:
@@ -455,6 +614,104 @@ class FanoutMixin:
             if frame is None:
                 frame = _resync_frame(sid, reason)
             sub.put(frame)
+
+    def _fanout_replayable_resync(self, sid: str, reason: str) -> None:
+        """Fan a REPLAYABLE business resync (B-2, 4.12.0 修订六).
+
+        Value domain: EXACTLY :data:`REPLAYABLE_RESYNC_REASONS`
+        (``token_memory_limit`` today). Anything else — including the
+        frozen route-private four — is a programming error and raises
+        :class:`ValueError` (the two reason sets must stay disjoint; see
+        the REPLAYABLE_RESYNC_REASONS block comment above).
+
+        With a replay log wired the frame rides the B-1 atomic
+        reserve→encode→append path: it consumes a seq, embeds it in the
+        payload, lands in the ReplayLog (``FRAME_KIND_BUSINESS``), and is
+        delivered to v4 subscribers WITH its ``id:`` line / v3 subscribers
+        raw (payload seq visible on both wires — additive JSON field).
+        The stream does NOT terminate: subsequent frames for the sid
+        (other parts / future new parts) keep publishing on the same
+        sequence.
+
+        🔴 fail-closed (rev-2 修正 1): this method is called AFTER the
+        caller already cleared server-side state (eviction dropped the
+        LivePart). A silent drop here would leave every ONLINE client
+        running on a dead baseline with no signal ever arriving — live or
+        on replay. So a publish failure does NOT degrade to drop+count:
+
+        * bumps ``seq_resync_failclosed_total`` + ERROR log;
+        * attempts a best-effort replay barrier (so a post-termination
+          reconnect WITH any cursor ≤ watermark resolves to
+          ``resync{reconnect_no_replay}`` → full HTTP alignment instead
+          of replaying a stale window);
+        * marks the domain's sticky invalidation flag
+          (:meth:`ReplayLog.mark_invalidated`, round-4 Blocking 1) — the
+          barrier cannot reach clients that reconnect with NO
+          ``Last-Event-ID`` (a fresh domain's first-seq failure leaves
+          them cursor-less) nor future first-connects after a
+          zero-subscriber eviction; the flag forces every no-cursor
+          connect until the domain's next successful publish;
+        * TERMINATES every subscriber of the sid with
+          ``reconnect_no_replay`` — a member of the frozen v4 domain, so
+          BOTH wires now carry the reason frame (v4: resync + STOP; v3:
+          resync + STOP) instead of a bare STOP (round-4 Blocking 1:
+          the termination path aligns with the persistent marker, which
+          remains the primary mechanism covering zero-subscriber and
+          future first-connect scenarios).
+
+        Recovery is the client's reconnect → classification protocol.
+        Residual risk: if the log is so broken that BOTH the barrier and
+        the flag write fail, a reconnecting client may briefly re-enter
+        live mode on a stale view of the evicted part; the next digest /
+        part update HTTP fetch corrects it. That is strictly better than
+        the guaranteed-silent permanent divergence of the drop path.
+
+        No replay log wired (v3-only stacks): the frame is fanned raw to
+        every subscriber (v3-mirror degrade — the same no-log shape the
+        delta path uses); nothing is terminated.
+        """
+        if reason not in REPLAYABLE_RESYNC_REASONS:
+            raise ValueError(
+                f"reason {reason!r} is not a replayable business resync "
+                f"(allowed: {sorted(REPLAYABLE_RESYNC_REASONS)}); use "
+                "_fanout_resync for route-private control resyncs"
+            )
+        if self._replay is None:
+            self._deliver_logged(sid, _resync_frame(sid, reason), None)
+            return
+        domain = token_domain(sid)
+        published = self._publish_seq_frame(
+            sid, lambda seq: _resync_frame(sid, reason, seq=seq),
+        )
+        if published is None:
+            self._metrics.seq_resync_failclosed_total += 1
+            logger.error(
+                "replayable resync publish failed for sid %r (%s) after "
+                "state eviction — failing closed: terminating %d "
+                "subscriber(s) + best-effort replay barrier + sticky "
+                "invalidation flag",
+                sid, reason, len(self._subs_by_sid.get(sid, ())),
+                exc_info=True,
+            )
+            self._write_replay_barrier(sid, reason)
+            # Sticky invalidation marker (round-4 Blocking 1): covers
+            # no-cursor reconnects and future first-connects — the
+            # barrier alone cannot. Best-effort like the barrier: the
+            # flag write is a plain in-memory set, but the log object
+            # may already be in a broken state, so never let it raise.
+            try:
+                self._replay.mark_invalidated(domain)
+            except Exception:  # noqa: BLE001 — best-effort, log already broken
+                logger.error(
+                    "sticky invalidation flag write failed for domain %r",
+                    domain, exc_info=True,
+                )
+            for sub in tuple(self._subs_by_sid.get(sid, ())):
+                sub.terminate(RESYNC_RECONNECT_NO_REPLAY)
+            return
+        id_line, frame = published
+        self._deliver_logged(sid, frame, id_line)
+
     def _fanout_heartbeat(self) -> None:
         """Fan ``server.heartbeat{}`` to every token subscriber (§5.6 frame 6)."""
         if not self._subs_by_sid:
@@ -463,6 +720,7 @@ class FanoutMixin:
         for subs in self._subs_by_sid.values():
             for sub in tuple(subs):
                 sub.put(frame)
+
     def _emit_snapshot_or_truncated(
         self, sub: Any, key: PartKey, text: str | None, done: bool
     ) -> None:
@@ -521,6 +779,7 @@ class FanoutMixin:
         trunc_rev = self._truncate_part_for_all(key, done)
         if not in_fanout and trunc_rev is not None:
             sub.put(_truncated_frame(key, done, part_revision=trunc_rev))
+
     def _emit_snapshot_or_truncated_nodrop(
         self, sub: Any, key: PartKey, text: str | None, done: bool
     ) -> None:

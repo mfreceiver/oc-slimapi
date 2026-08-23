@@ -154,16 +154,22 @@ class TokenStreamHub(BudgetMixin, FlushEngineMixin, IngestMixin, FanoutMixin):
         # domain ("published frames" semantics — logged even with zero
         # subscribers, REPLAY-007/018) and v4 subscribers receive the frame
         # with its ``id: t:<sid>:<epoch>:<seq>`` line prepended.
+        # 4.12.0 修订六 B-1: publication is reserve→encode→append→fanout —
+        # the seq is allocated BEFORE serialization and embedded as a
+        # payload ``seq`` field (id-line last segment == payload seq; v3
+        # subscribers see the payload field too, no id line). The B-2
+        # ``token_memory_limit`` eviction resync rides the same path as a
+        # REPLAYABLE business frame (see fanout.REPLAYABLE_RESYNC_REASONS).
         # rev-gate R2 BLOCKER-1: the ``message.part.snapshot`` family
         # (done:true marker / truncated marker) is v4-INELIGIBLE — never
         # logged, never id-stamped, delivered to v3 subscribers only
         # (:func:`_v4_frame_eligible`). ``None`` (v3-only stacks / minimal
         # test apps) keeps the pipeline byte-identical to the pre-v4
-        # terminal state: no logging, no id stamping. Per-sub handshake
-        # frames (server.connected / handshake snapshots / handshake
-        # tombstone replay) and resync / heartbeat frames are
-        # connection-scoped or control frames — they are NEVER logged and
-        # NEVER id-stamped.
+        # terminal state: no logging, no id stamping, no payload seq.
+        # Per-sub handshake frames (server.connected / handshake snapshots
+        # / handshake tombstone replay) and route-private resync /
+        # heartbeat frames are connection-scoped or control frames — they
+        # are NEVER logged and NEVER id-stamped.
         self._replay: ReplayLog | None = replay_log
         # Bounded OrderedDicts (§16-B): key → insertion-time-ms.
         self._nontext_parts: OrderedDict[PartKey, int] = OrderedDict()

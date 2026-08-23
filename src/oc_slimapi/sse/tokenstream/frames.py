@@ -84,6 +84,7 @@ def _snapshot_frame(
 
 def _delta_frame(
     key: PartKey, text: str, part_revision: int | None = None,
+    seq: int | None = None,
 ) -> bytes:
     payload: dict[str, Any] = {
         "sessionID": key[0],
@@ -97,6 +98,16 @@ def _delta_frame(
         # Multiple deltas across multiple flush windows of one part
         # therefore carry distinct values (0, 1, 2, ...).
         payload["partEventRevision"] = part_revision
+    if seq is not None:
+        # 4.12.0 修订六 B-1: the replay-domain publish seq, stamped into
+        # the payload by the reserve→encode→append path so the frame is
+        # self-describing on every wire version (additive JSON field —
+        # v3 clients ignore unknown keys; same shape family as the
+        # 4.11.0 partEventRevision additive). Always equal to the last
+        # segment of the v4 ``id:`` line the frame is delivered with.
+        # ``None`` (no replay log wired) omits the key — the v3-only
+        # stack keeps its historical byte-identical frame shape.
+        payload["seq"] = seq
     return sse_frame(payload, event="message.part.delta")
 
 
@@ -122,8 +133,19 @@ def _truncated_frame(
     return sse_frame(payload, event="message.part.snapshot")
 
 
-def _resync_frame(sid: str, reason: str) -> bytes:
-    return sse_frame({"reason": reason, "sessionID": sid}, event="resync")
+def _resync_frame(sid: str, reason: str, seq: int | None = None) -> bytes:
+    # NOTE: keep the payload dicts inline — the N1 resync-reason gate
+    # (tests/test_resync_reason_gate.py) only resolves literal dicts.
+    if seq is None:
+        return sse_frame({"reason": reason, "sessionID": sid}, event="resync")
+    # 4.12.0 修订六 B-2: a REPLAYABLE business resync (currently only
+    # ``token_memory_limit``) carries the payload seq exactly like a
+    # delta frame — stamped by the reserve→encode→append path, equal
+    # to the ``id:`` line's last segment on the v4 wire, omitted on
+    # no-replay-log stacks.
+    return sse_frame(
+        {"reason": reason, "sessionID": sid, "seq": seq}, event="resync",
+    )
 
 
 def _connected_frame(sid: str) -> bytes:
@@ -134,7 +156,7 @@ def _heartbeat_frame() -> bytes:
     return sse_frame({}, event="server.heartbeat")
 
 
-def _message_removed_frame(sid: str, mid: str) -> bytes:
+def _message_removed_frame(sid: str, mid: str, seq: int | None = None) -> bytes:
     """Stage B v0.6 §P.4 (MAJOR 4 方案 C): tombstone frame for an upstream
     ``message.removed`` event. Tells token-stream subscribers to drop all
     local stream state for ``(sid, mid)`` — the message is gone upstream,
@@ -146,7 +168,12 @@ def _message_removed_frame(sid: str, mid: str) -> bytes:
     client that attaches AFTER the removal still learns about it during
     the handshake (``server.connected`` → ``message.removed`` batch →
     snapshot live → enter fanout).
+
+    4.12.0 修订六 B-1: ``seq`` (replay-domain publish seq, additive
+    payload field) is stamped when a replay log is wired; ``None`` keeps
+    the historical v3-only handshake-replay shape byte-identical.
     """
-    return sse_frame(
-        {"sessionID": sid, "messageID": mid}, event="message.removed",
-    )
+    payload: dict[str, Any] = {"sessionID": sid, "messageID": mid}
+    if seq is not None:
+        payload["seq"] = seq
+    return sse_frame(payload, event="message.removed")

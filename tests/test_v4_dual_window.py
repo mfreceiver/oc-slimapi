@@ -124,6 +124,9 @@ VERSIONS_PAYLOAD_GOLDEN = {
             # raw），随实现同批恒 true。
             "messagesSince": True,
             "fileRaw": True,
+            # 4.12.0 修订六 B-1：token 流 seq 域（业务帧 payload seq +
+            # id 行），随实现同批恒 true。
+            "tokenFrameSeq": True,
             "readiness": {
                 "ready": True,
                 "required": list(_B12_NORMALIZED_UNIVERSE),
@@ -534,10 +537,12 @@ async def test_versions_v4_capabilities_static_keys():
         assert caps["4"]["qpImmediateFull"] is True
         assert caps["4"]["messagesSince"] is True
         assert caps["4"]["fileRaw"] is True
+        assert caps["4"]["tokenFrameSeq"] is True  # 4.12.0 修订六 B-1
         assert list(caps["4"].keys()) == [
             "globalSessions", "auxiliaryFilters",
             "sseReplay", "qpImmediateFull",
             "messagesSince", "fileRaw",
+            "tokenFrameSeq",
             "readiness", "expand",
         ]
 

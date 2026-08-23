@@ -432,10 +432,12 @@ async def test_versions_terminal_shape():
         assert body["capabilities"]["4"]["qpImmediateFull"] is True
         assert body["capabilities"]["4"]["messagesSince"] is True
         assert body["capabilities"]["4"]["fileRaw"] is True
+        assert body["capabilities"]["4"]["tokenFrameSeq"] is True  # 修订六 B-1
         assert set(body["capabilities"]["4"]) == {
             "globalSessions", "auxiliaryFilters",
             "sseReplay", "qpImmediateFull",
             "messagesSince", "fileRaw",
+            "tokenFrameSeq",
             "readiness", "expand",
         }
 

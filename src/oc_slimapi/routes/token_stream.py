@@ -173,6 +173,17 @@ async def token_stream(request: Request, sid: str, directory: str | None = None)
                 replay_epoch, replay_log.last_seq(token_domain(sid)),
             )
         )
+        # 4.12.0 修订六 B-1: this stream's business frames embed the
+        # replay publish seq in their payloads (``seq`` == the ``id:``
+        # line's last segment on the v4 wire; visible to v3 wires too).
+        # Advertised as an ADDITIVE per-stream capability key — absent on
+        # no-replay-log stacks, where frames carry neither id lines nor
+        # payload seq (key absence = capability unavailable, §3.1 probe
+        # semantics). The versions endpoint advertises the same key on
+        # the static ``capabilities["4"]`` face.
+        meta_fields["capabilities"] = {
+            **meta_fields["capabilities"], "tokenFrameSeq": True,
+        }
     meta_frame = sse_frame(meta_fields, event="slimapi.meta")
     # §7.2 terminal (v3-only): the meta first frame is the id channel (the
     # retired X-Slimapi-Subscriber-ID header is never produced), AND the

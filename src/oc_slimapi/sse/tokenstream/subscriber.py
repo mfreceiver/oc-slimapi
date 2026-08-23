@@ -866,6 +866,9 @@ class TokenStreamRegistry:
             "truncatedSnapshotsTotal": th.truncated_snapshots_total,
             "orphanDeltasTotal": th.orphan_deltas,
             "tokenMemoryLimitTotal": th.token_memory_limit_total,
+            # 4.12.0 修订六 B-1/B-2 additive
+            "seqPublishFailuresTotal": m.seq_publish_failures_total,
+            "seqResyncFailclosedTotal": m.seq_resync_failclosed_total,
             # S-3a additive
             "gzipRawBytesTotal": m.gzip_raw_bytes_total,
             "gzipCompressedBytesTotal": m.gzip_compressed_bytes_total,

@@ -213,7 +213,7 @@ class _DomainState:
 
     __slots__ = (
         "entries", "next_seq", "last_seq", "bytes",
-        "barrier_watermark",
+        "barrier_watermark", "invalidated",
     )
 
     def __init__(self) -> None:
@@ -222,6 +222,13 @@ class _DomainState:
         self.last_seq = 0          # max published seq (never resets)
         self.bytes = 0             # summed entry sizes (this domain)
         self.barrier_watermark: int | None = None
+        # 4.12.0 修订六 B-2 round-3: sticky "un-signalled invalidation"
+        # flag — set by the fail-closed path (a replayable resync publish
+        # failed AFTER server state was evicted), consumed by no-cursor
+        # connects (see :meth:`ReplayLog.first_connect_invalidated`).
+        # NOT cleared by append() — sticky for the rest of the process
+        # epoch (see :meth:`mark_invalidated` lifecycle).
+        self.invalidated = False
 
     @property
     def window_start(self) -> int | None:
@@ -353,6 +360,7 @@ class ReplayLog:
         payload: Any,
         *,
         kind: str = FRAME_KIND_BUSINESS,
+        seq: int | None = None,
     ) -> ReplayEntry:
         """Record one published frame; returns the entry carrying its seq.
 
@@ -360,6 +368,14 @@ class ReplayLog:
         append regardless of kind (tombstones included — REPLAY-012). The
         log records *published* frames, not *delivered* frames (§3.2:
         backpressure overflow frames still land here).
+
+        4.12.0 修订六 B-1 (reserve→encode→append): ``seq`` optionally
+        carries a seq previously allocated by :meth:`reserve_seq` — the
+        caller serialized the payload WITH that value embedded, so the
+        log MUST hand the entry exactly that seq (the SSE ``id:`` line and
+        the payload ``seq`` field stay identical). A mismatched value (no
+        outstanding reservation / stale / duplicate) raises
+        :class:`ValueError` — the caller rolls back and drops the frame.
         """
         if self._closed:
             raise RuntimeError("replay log is closed")
@@ -369,11 +385,23 @@ class ReplayLog:
         if state is None:  # lazy creation (per-sid domains on first frame)
             state = _DomainState()
             self._domains[domain] = state
+        if seq is None:
+            seq = state.next_seq
+            state.next_seq = seq + 1
+        elif seq != state.next_seq - 1 or seq <= state.last_seq:
+            # The reserved seq must be exactly the outstanding (allocated
+            # but not yet appended, not yet rolled back) reservation and
+            # strictly past every published seq — otherwise this append
+            # would either duplicate a published seq or silently accept a
+            # value the payload was not built with.
+            raise ValueError(
+                f"append seq {seq!r} does not match the outstanding "
+                f"reservation (expected {state.next_seq - 1}, last "
+                f"published {state.last_seq})"
+            )
         now = self._clock()
         self._ttl_evict_head(state, now)
         self._order += 1
-        seq = state.next_seq
-        state.next_seq = seq + 1
         state.last_seq = seq
         size = self._size_of(payload)
         entry = ReplayEntry(
@@ -390,7 +418,69 @@ class ReplayLog:
         self.total_bytes += size
         self._evict_for_count(state)
         self._evict_for_bytes()
+        # 4.12.0 修订六 B-2 round-3: a successful append deliberately does
+        # NOT clear the sticky invalidation flag. "The sequence resumed
+        # hole-free" ≠ "the invalidation was DELIVERED" — the evicted part
+        # is disabled / REST-owned and only a client HTTP fetch restores
+        # it, which the server cannot observe (no per-client recovery
+        # ACK). Clearing on publish would let one later frame silently
+        # erase the still-undelivered eviction signal (rev-2 counter-
+        # example). Sticky until the process epoch flips — see
+        # :meth:`mark_invalidated` lifecycle.
         return entry
+
+    def reserve_seq(self, domain: str) -> int:
+        """Tentatively allocate the next seq for ``domain`` (4.12.0 修订六
+        B-1 — reserve→encode→append→fanout).
+
+        The caller serializes its payload WITH this value embedded
+        (payload ``seq`` field), then confirms via ``append(..., seq=...)``.
+        If anything between reserve and append fails, the caller MUST call
+        :meth:`rollback_seq` so the domain sequence stays hole-free — the
+        next successful frame reuses the rolled-back value.
+
+        Synchronous-scope contract: reserve and its confirming append (or
+        rollback) run in ONE event-loop step with no ``await`` between, so
+        at most ONE reservation is outstanding per domain at any time and
+        no interleaving publisher can consume the reserved slot. Lazy
+        domain creation mirrors :meth:`append` (the shell is a few ints;
+        REPLAY-018 keeps shells alive for the process epoch).
+
+        Raises :class:`RuntimeError` on a closed log (nothing was
+        allocated — the caller drops the frame without rollback) and
+        :class:`ValueError` on a malformed domain.
+        """
+        if self._closed:
+            raise RuntimeError("replay log is closed")
+        if not isinstance(domain, str) or not domain:
+            raise ValueError("domain must be a non-empty string")
+        state = self._domains.get(domain)
+        if state is None:
+            state = _DomainState()
+            self._domains[domain] = state
+        seq = state.next_seq
+        state.next_seq = seq + 1
+        return seq
+
+    def rollback_seq(self, domain: str, seq: int) -> bool:
+        """Undo a :meth:`reserve_seq` that never reached :meth:`append`.
+
+        Returns ``True`` iff the rollback happened; ``False`` when the
+        value does not exactly undo the outstanding reservation (unknown
+        domain, another reservation/append already consumed the slot, or
+        the seq was actually published). A ``False`` return means the seq
+        is BURNED — the domain will carry a hole at that position — which
+        callers should treat as a loud anomaly (log + counter); it is
+        structurally unreachable under the synchronous-scope contract
+        above.
+        """
+        state = self._domains.get(domain)
+        if state is None:
+            return False
+        if state.next_seq == seq + 1 and seq > state.last_seq:
+            state.next_seq = seq
+            return True
+        return False
 
     # -- read path ----------------------------------------------------------
 
@@ -487,15 +577,90 @@ class ReplayLog:
             if state.barrier_watermark is None or state.barrier_watermark < state.last_seq:
                 state.barrier_watermark = state.last_seq
 
+    # -- sticky invalidation flag (4.12.0 修订六 B-2 round-4 Blocking 1) --
+
+    def mark_invalidated(self, domain: str) -> None:
+        """Flag ``domain`` as carrying an UN-SIGNALLED invalidation.
+
+        Set by the token-stream fail-closed path (:meth:`_fanout_replayable_resync`
+        publish failure after an eviction cleared server state): the
+        replayable ``token_memory_limit`` resync never landed in the log,
+        so neither the live wire nor the replay window carries the
+        invalidation signal. The barrier written alongside intercepts
+        clients WITH a cursor (``after_seq <= watermark`` →
+        ``reconnect_no_replay``), but a barrier cannot reach a client
+        that reconnects with NO ``Last-Event-ID`` at all — first-connect
+        semantics would hand it a plain meta-only stream while it may be
+        running on the stale baseline. This flag closes that gap
+        (:meth:`first_connect_invalidated`).
+
+        Lifecycle (round-3, sticky-for-epoch): once set, the flag
+        persists for the REST of the process epoch — across arbitrary
+        no-cursor connects, successful appends and domain recycles. A
+        process restart flips the epoch, which realigns everyone via
+        ``epoch_changed`` anyway, so the flag dies with the process.
+        Rationale:
+
+        * there is no per-client recovery ACK on this wire — the server
+          CANNOT observe that a stale client has completed its HTTP
+          alignment, and "the sequence resumed hole-free" is not
+          "the eviction signal was delivered": the evicted part is
+          disabled / REST-owned and only a client fetch restores it;
+        * therefore the safest semantics are over-signal, never miss:
+          every no-cursor connect in the flag's lifetime is forced to
+          HTTP alignment (the read is non-destructive — one client's
+          recovery does not un-flag the domain for the next stale
+          client). Clearing on the next successful append (the earlier
+          round-4 option a) failed exactly here: an unrelated part's
+          delta could silently erase a still-undelivered eviction
+          signal (rev-2 counter-example);
+        * clients WITH a cursor are protected orthogonally by the
+          barrier written alongside the flag (barriers are metadata and
+          never advance on append), so the flag only ever over-signals
+          the no-cursor path.
+
+        In-memory like the rest of the log (that is precisely what
+        makes the sticky-until-restart lifecycle safe: the epoch flip
+        guarantees a fresh forced alignment). Lazy domain creation
+        mirrors :meth:`reserve_seq` (the shell is a few ints; REPLAY-018
+        keeps shells alive for the process epoch).
+        """
+        if not isinstance(domain, str) or not domain:
+            raise ValueError("domain must be a non-empty string")
+        state = self._domains.get(domain)
+        if state is None:
+            state = _DomainState()
+            self._domains[domain] = state
+        state.invalidated = True
+
+    def first_connect_invalidated(self, domain: str) -> bool:
+        """No-cursor connect check: does this domain still owe an
+        invalidation signal?
+
+        Called by the wire layer ONLY on the no-``Last-Event-ID`` path
+        (:func:`oc_slimapi.sse.replay_wire.classify_reconnect`); a hit
+        resolves to ``resync{reconnect_no_replay}`` (forced HTTP
+        alignment) instead of plain first-connect semantics. Non-destructive
+        by design (see :meth:`mark_invalidated` lifecycle); counts the
+        outcome under ``reconnect_no_replay`` so forced alignments stay
+        visible in the §9.1 outcome counters.
+        """
+        state = self._domains.get(domain)
+        if state is None or not state.invalidated:
+            return False
+        self.replay_outcomes_total["reconnect_no_replay"] += 1
+        return True
+
     def recycle_domain(self, domain: str) -> bool:
         """Recycle a per-sid domain (TTL expiry / long-no-subscribers hook).
 
         Drops frames + bytes; RETAINS the seq counter (next append
-        continues monotonically — ID no-regression) and any barrier
-        watermark (same-epoch old cursors into a recycled domain keep
+        continues monotonically — ID no-regression), any barrier
+        watermark AND the sticky invalidation flag (same fail-safe
+        reasoning: same-epoch old cursors into a recycled domain keep
         hitting ``reconnect_no_replay`` / ``replay_expired`` instead of
-        first-connect semantics — REPLAY-018 fail-safe). Returns whether
-        the domain existed.
+        first-connect semantics — REPLAY-018). Returns whether the
+        domain existed.
         """
         state = self._domains.get(domain)
         if state is None:

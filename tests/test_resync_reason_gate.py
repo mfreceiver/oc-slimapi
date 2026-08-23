@@ -61,6 +61,10 @@ SRC_ROOT = Path(__file__).resolve().parents[1] / "src" / "oc_slimapi"
 _REASON_CALLEES: dict[str, int] = {
     "_resync_frame": 1,
     "_fanout_resync": 1,
+    # 4.12.0 修订六 B-2: replayable-resync conduit — runtime-gated to
+    # REPLAYABLE_RESYNC_REASONS (a SUBSET of the frozen domain; the
+    # route-private four values are refused with ValueError).
+    "_fanout_replayable_resync": 1,
     "_enqueue_session_resync": 1,
     "terminate": 0,
     "ReplayResync": 0,

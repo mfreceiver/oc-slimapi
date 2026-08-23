@@ -230,28 +230,54 @@ class BudgetMixin:
         and keeps the LivePart alive. The caller's stale ``live`` reference
         remains valid; no gauge drift or orphan deltas.
 
-        Under the older ``triggersReconnect=true`` model this re-snapshot of
-        the current key is redundant (the reconnect handshake restores all
-        anchors), but it is harmless — the client simply ignores the
-        redundant frame.
+        4.12.0 修订六 B-2 (rev-2 修正 2, 语义精化): the eviction clears
+        the part's live/pending state (``drop_part`` — unchanged) and
+        publishes the ``token_memory_limit`` resync as a REPLAYABLE
+        business frame via :meth:`_fanout_replayable_resync` (B-1 atomic
+        path: id line + payload seq + ReplayLog entry) — replacing the
+        historical v3-only control-frame degradation. The stream does NOT
+        terminate: later frames for the sid (other, un-evicted parts /
+        future new parts) keep publishing on the same seq sequence.
+
+        🟠 The EVICTED part itself never resumes its incremental stream in
+        this process lifetime: ``drop_part`` put the key in
+        ``_disabled_parts``, so every later ``message.part.updated`` /
+        ``message.part.delta`` for it is silently dropped at the ingest
+        gates. The part is REST-owned from here on — the client's ONLY
+        authoritative recovery is the HTTP message fetch (``/messages``),
+        never a server-side re-snapshot or state rebuild.
+
+        4.12.0 修订六 B-2 (barrier removal): no replay barrier is written
+        on this path anymore. The replayable resync frame itself now
+        carries the R4 guarantee — it sits in the window at its own seq,
+        so ANY reconnecting cursor below it replays it (and any cursor at
+        it means the client already consumed the eviction signal). A
+        barrier (watermark = last_seq) would intercept every cursor ≤
+        watermark and the resync at watermark+1 could then never be
+        replayed. Barriers remain on the idle/deleted paths whose resyncs
+        are NOT replayable.
         """
         if not self.drop_part(key):
             return  # already disabled — eviction resync already fanned.
         sid = key[0]
         # I1: drain pending for this sid before resync + re-snapshot
         # (mirrors attach_subscriber handshake step 2, preventing C2 double-count).
+        # The drained deltas publish on the B-1 path and take seqs BEFORE
+        # the resync — the eviction signal is therefore ordered strictly
+        # after the evicted part's own last delta on the replay sequence.
         self.flush_sid(sid)
-        # rev-gate R4 BLOCKER-1: the evicted part's server-side state is
-        # gone. Write the barrier AFTER flush_sid so the evicted part's
-        # own drained deltas fall at/below the watermark — a client that
-        # consumed them (cursor == last_seq) reconnects into
-        # resync{reconnect_no_replay} instead of an up-to-date live mode
-        # on a part the server can no longer complete.
-        self._write_replay_barrier(sid, RESYNC_TOKEN_MEMORY_LIMIT)
-        self._fanout_resync(sid, RESYNC_TOKEN_MEMORY_LIMIT)
+        # B-2: replayable resync (fail-closed on publish failure — see
+        # _fanout_replayable_resync; the state is already cleared here).
+        self._fanout_replayable_resync(sid, RESYNC_TOKEN_MEMORY_LIMIT)
         self._metrics.token_memory_limit_total += 1
         # Re-snapshot remaining live parts of this sid to existing subs.
         # MB-P-S1: include skip_key via nodrop path (no drop_part).
+        # [4.12.0 修订六 R4 gate note] This re-snapshot loop only affects
+        # the historical v3 wire (v3 subscribers still receive
+        # snapshot/truncated frames here to get a fresh anchor — S-2
+        # method B). v4 subscribers are NEVER sent the message.part.snapshot
+        # family (R2 frozen philosophy: no snapshots to v4, live or here);
+        # their state alignment is exclusively the client's HTTP fetch.
         subs = list(self._subs_by_sid.get(sid, ()))
         if not subs:
             return

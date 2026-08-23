@@ -66,12 +66,16 @@ async def test_versions_capabilities_map():
         # §19 file/raw).
         assert caps["4"]["messagesSince"] is True
         assert caps["4"]["fileRaw"] is True
+        # 4.12.0 修订六 B-1: token-stream seq-domain capability — static
+        # boolean, same-batch with the implementation.
+        assert caps["4"]["tokenFrameSeq"] is True
         # 4.2.0 close-out: readiness + expand both land (SATISFIED is the
         # full universe); shapes locked in test_versions_readiness.py.
         assert set(caps["4"].keys()) == {
             "globalSessions", "auxiliaryFilters",
             "sseReplay", "qpImmediateFull",
             "messagesSince", "fileRaw",
+            "tokenFrameSeq",
             "readiness", "expand",
         }
 
@@ -106,6 +110,7 @@ async def test_versions_caps4_static_key_order():
             "globalSessions", "auxiliaryFilters",
             "sseReplay", "qpImmediateFull",
             "messagesSince", "fileRaw",
+            "tokenFrameSeq",
             "readiness", "expand",
         ]
 
@@ -122,12 +127,14 @@ async def test_versions_caps4_static_face_no_runtime_keys():
     async with _client(_build_app()) as client:
         caps = (await client.get("/slimapi/versions")).json()["capabilities"]
         for key in ("globalSessions", "auxiliaryFilters", "sseReplay",
-                    "qpImmediateFull", "messagesSince", "fileRaw"):
+                    "qpImmediateFull", "messagesSince", "fileRaw",
+                    "tokenFrameSeq"):
             assert caps["4"][key] is True
         assert set(caps["4"]) == {
             "globalSessions", "auxiliaryFilters",
             "sseReplay", "qpImmediateFull",
             "messagesSince", "fileRaw",
+            "tokenFrameSeq",
             "readiness", "expand",
         }
 

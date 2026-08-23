@@ -91,6 +91,14 @@ CAPABILITIES: dict[str, dict] = {
         # unavailable, clients must not pre-depend.
         "messagesSince": True,
         "fileRaw": True,
+        # 4.12.0 修订六 B-1 (same-batch with the implementation): the
+        # token-stream business frames (message.part.delta /
+        # message.removed / the replayable token_memory_limit resync)
+        # embed the replay publish seq in their payloads and carry
+        # ``id:`` lines — additive static boolean, same pattern as
+        # messagesSince/fileRaw (key absence on older sidecars =
+        # capability unavailable, clients must not pre-depend).
+        "tokenFrameSeq": True,
     },
 }
 

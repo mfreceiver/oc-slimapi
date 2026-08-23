@@ -17,7 +17,7 @@ from ...config import (
 )
 from ...logging_config import get_logger
 from .fanout import _events_token_frame
-from .frames import _delta_frame, _now_ms
+from .frames import _now_ms
 
 
 logger = get_logger(__name__)
@@ -164,13 +164,9 @@ class FlushEngineMixin:
                 self._total_pending_bytes = max(0, self._total_pending_bytes - pending_bytes)
                 if not text:
                     continue
-                self._fanout_frame(
-                    key,
-                    _delta_frame(
-                        key, text,
-                        part_revision=self._next_part_revision(key),
-                    ),
-                )
+                # 4.12.0 修订六 B-1: delta publication rides the atomic
+                # reserve→encode→append path (payload embeds the seq).
+                self._fanout_delta_frame(key, text)
                 # L2-A (plan Task L2-A): curated-events token tap — every
                 # completed (sid, mid, pid) window concat is fanned to the
                 # ``/slimapi/events?tokens=1`` subscribers as a lean
@@ -218,13 +214,9 @@ class FlushEngineMixin:
             self._total_pending_bytes = max(0, self._total_pending_bytes - pending_bytes)
             if not text:
                 continue
-            self._fanout_frame(
-                key,
-                _delta_frame(
-                    key, text,
-                    part_revision=self._next_part_revision(key),
-                ),
-            )
+            # 4.12.0 修订六 B-1: delta publication rides the atomic
+            # reserve→encode→append path (payload embeds the seq).
+            self._fanout_delta_frame(key, text)
         for key in [k for k, v in self._pending.items() if k[0] == sid and not v.chunks]:
             self._pending.pop(key, None)
     # ------------------------------------------------------------------

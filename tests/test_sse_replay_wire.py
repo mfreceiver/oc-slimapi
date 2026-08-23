@@ -67,6 +67,7 @@ from oc_slimapi.sse.replay_log import (
     ReplayResync,
     token_domain,
 )
+from oc_slimapi.sse.hub_types import RESYNC_TOKEN_MEMORY_LIMIT
 from oc_slimapi.sse.replay_wire import (
     V4_RESYNC_REASONS,
     classify_reconnect,
@@ -715,7 +716,9 @@ async def test_token_message_removed_tombstone_logged_contiguous():
         seqs = [e.seq for e in outcome.entries]
         assert kinds == ["business", FRAME_KIND_TOMBSTONE]
         assert seqs == [1, 2]
-        assert outcome.entries[1].payload == _message_removed_frame(SID, "m1")
+        # 4.12.0 修订六 B-1: replay entries keep the payload seq stamped
+        # at encode time (byte-identical to what the live wire received).
+        assert outcome.entries[1].payload == _message_removed_frame(SID, "m1", seq=2)
     finally:
         th.detach_subscriber(SID, sub)
         th.stop()
@@ -1251,7 +1254,10 @@ async def test_v4_stream_first_connect_meta_and_live_delta():
             "subscriberId", "tokens", "capabilities", "epoch", "seqBase",
         }
         assert data0["tokens"] is True
-        assert data0["capabilities"] == {"sseReplay": True}
+        # 4.12.0 修订六 B-1: the token-stream meta advertises tokenFrameSeq
+        # (business frames embed payload seq + id lines) — additive, only
+        # on the token lane (the global events meta stays sseReplay-only).
+        assert data0["capabilities"] == {"sseReplay": True, "tokenFrameSeq": True}
         assert data0["epoch"] == EPOCH
 
         assert frames[1][0] == "message.part.delta"
@@ -1304,10 +1310,11 @@ async def test_v4_stream_tombstone_replay_with_id():
         assert [f[1] for f in frames[1:]] == [
             f"t:{SID}:{EPOCH}:1", f"t:{SID}:{EPOCH}:2", f"t:{SID}:{EPOCH}:3",
         ]
-        # the removed message appears EXACTLY once, WITH its id
+        # the removed message appears EXACTLY once, WITH its id; 4.12.0
+        # 修订六 B-1: the tombstone payload carries its seq (== id segment)
         removed = [f for f in frames if f[0] == "message.removed"]
         assert len(removed) == 1
-        assert removed[0][2] == {"sessionID": SID, "messageID": "m1"}
+        assert removed[0][2] == {"sessionID": SID, "messageID": "m1", "seq": 2}
         assert removed[0][1] == f"t:{SID}:{EPOCH}:2"
         # no un-id'd control frames beyond the frozen set; no snapshots
         assert all(f[0] != "server.connected" for f in frames)
@@ -1605,17 +1612,23 @@ async def test_r3_token_backpressure_v4_terminates_replay_recovers():
         await s.close()
 
 
-async def test_r3_token_memory_eviction_v4_terminates_barrier_resync(monkeypatch):
+async def test_r3_token_memory_eviction_replayable_resync(monkeypatch):
     """Path ③ — LivePart LRU eviction (_reserve → _evict_part_for_memory →
-    _fanout_resync{token_memory_limit}).
+    _fanout_replayable_resync{token_memory_limit}).
 
-    TOKEN_LIVEPARTS_MAX_BYTES=1: part A (1 byte) is resident; part B's
-    delta cannot fit → A is evicted → the sid's subscribers get the
-    resync. v4-only self-lock: terminated (STOP only, meta-only wire);
-    the eviction IS state invalidation — both deltas survive in the log
-    AND the barrier (wm=1) routes any cursor-≤-watermark reconnect to
-    the frozen resync{reconnect_no_replay} (the evicted part's deltas
-    must never resume via replay)."""
+    4.12.0 修订六 B-2 semantics (replaces the pre-4.12.0 terminate +
+    barrier behavior):
+
+    * the eviction resync is a REPLAYABLE BUSINESS frame — id line +
+      payload seq on the v4 wire, appended to the ReplayLog;
+    * the stream does NOT terminate — the post-eviction part's deltas
+      keep arriving on the same sequence;
+    * NO barrier is written (the replayable resync at its own seq IS the
+      R4 guarantee — a barrier at watermark would intercept every cursor
+      ≤ watermark and the resync could never replay);
+    * a reconnect from below the resync replays it (NOT a
+      ``reconnect_no_replay`` blanket resync).
+    """
     monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_LIVEPARTS_MAX_BYTES", 1)
     log = ReplayLog(epoch=EPOCH)
     s = _RealStack(log=log)
@@ -1623,30 +1636,39 @@ async def test_r3_token_memory_eviction_v4_terminates_barrier_resync(monkeypatch
         async def evict(sub, sid):
             s.token_hub.on_part_updated(_text_start(sid, "mA", "p1"))
             s.token_hub.on_part_delta(_delta(sid, "mA", "p1", "a"))
-            s.token_hub.flush()  # seq 1; live gauge = 1 byte
+            s.token_hub.flush()  # seq 1 (delta a); live gauge = 1 byte
             # part B cannot fit under the 1-byte cap → A evicted →
-            # _fanout_resync(sid, token_memory_limit) → v4 terminate.
+            # replayable resync (seq 2) + B continues (seq 3).
             s.token_hub.on_part_updated(_text_start(sid, "mB", "p1"))
             s.token_hub.on_part_delta(_delta(sid, "mB", "p1", "b"))
-            s.token_hub.flush()
+            s.token_hub.flush()  # seq 3 (delta b)
             sub.put(TOKEN_STOP)
 
         s.token_registry.push_script(evict)
         _, body = await _read(s.app, f"/slimapi/sessions/{SID}/stream?v=4")
         frames = list(_frames(body))
         _assert_v4_no_forbidden_frames(frames)
-        # terminate() clears the runtime queue (existing disconnect
-        # idiom): the undelivered delta is dropped from the wire; meta
-        # only, finite body, no resync.
-        assert frames == [("slimapi.meta", None, frames[0][2])]
-        # both deltas survive in the log for replay (the evicted part's
-        # and the post-eviction one — published-not-delivered); the
-        # eviction wrote a barrier at the evicted part's delta seq.
-        assert log.last_seq(token_domain(SID)) == 2
-        assert log.barrier_watermark(token_domain(SID)) == 1
+        # meta, delta a (id 1), replayable resync (id 2), delta b (id 3):
+        # the stream did NOT terminate on the eviction.
+        assert [f[0] for f in frames] == [
+            "slimapi.meta", "message.part.delta", "resync",
+            "message.part.delta",
+        ]
+        assert [f[1] for f in frames[1:]] == [
+            f"t:{SID}:{EPOCH}:{n}" for n in (1, 2, 3)
+        ]
+        # payload seq == id last segment on the resync frame.
+        assert frames[2][2] == {
+            "reason": "token_memory_limit", "sessionID": SID, "seq": 2,
+        }
+        # the resync IS in the log (replayable business frame) and NO
+        # barrier was written (the frame itself carries the R4 guarantee).
+        assert log.last_seq(token_domain(SID)) == 3
+        assert log.barrier_watermark(token_domain(SID)) is None
 
-        # reconnect from cursor 0 (≤ watermark): frozen-reason resync —
-        # NOT a replay of the invalidated part's deltas.
+        # reconnect from cursor 0 → REPLAY (delta a, resync, delta b) —
+        # the eviction signal itself replays; the evicted part's deltas
+        # precede the resync so the client sees exactly what it lost.
         s.token_registry.push_script(_stop_token_stream)
         _, body = await _read(
             s.app, f"/slimapi/sessions/{SID}/stream?v=4",
@@ -1654,11 +1676,14 @@ async def test_r3_token_memory_eviction_v4_terminates_barrier_resync(monkeypatch
         )
         frames = list(_frames(body))
         _assert_v4_no_forbidden_frames(frames)
-        assert [f[0] for f in frames] == ["slimapi.meta", "resync"]
-        assert frames[1] == (
-            "resync", None, {"reason": "reconnect_no_replay", "sessionID": SID},
-        )
-        assert all(f[1] is None for f in frames)
+        assert [f[0] for f in frames] == [
+            "slimapi.meta", "message.part.delta", "resync",
+            "message.part.delta",
+        ]
+        assert [f[1] for f in frames[1:]] == [
+            f"t:{SID}:{EPOCH}:{n}" for n in (1, 2, 3)
+        ]
+        assert all(f[1] is not None for f in frames[1:])
     finally:
         await s.close()
 
@@ -1819,13 +1844,16 @@ async def test_r4_idle_after_real_consumption_barrier_resync():
         await s.close()
 
 
-async def test_r4_memory_eviction_after_real_consumption_barrier(monkeypatch):
-    """Judge condition 4 (eviction variant) + the precise boundary.
+async def test_r4_memory_eviction_replayable_resync_boundary(monkeypatch):
+    """Judge condition 4 (eviction variant) + the precise boundary, under
+    the 4.12.0 修订六 B-2 replayable-resync semantics.
 
     conn1 送达 A 的 delta(id 1) → 离线 LRU 逐出 A（B 进来，cap=1）→
-    barrier watermark=1（A 的 delta 在 flush_sid 后落下）→ conn2 cursor 1
-    → resync；conn3 cursor 2（B 的 delta，B 状态完好）→ 正常 up-to-date
-    ——barrier 不越过失效边界。"""
+    **可重放 resync 落在 seq 2**（B-1 原子路径、零订阅者也要发布）+
+    B 的 delta seq 3；**不再写 barrier**（帧本身承担 R4 语义）→
+    conn2 cursor 1 → 重放 resync(2)+delta(3)（失效信号不丢，客户端
+    HTTP 恢复被逐 part）→ conn3 cursor 3（已消费失效信号+B 状态完好）
+    → 正常 up-to-date。"""
     monkeypatch.setattr("oc_slimapi.sse.tokenstream.budgets.TOKEN_LIVEPARTS_MAX_BYTES", 1)
     log = ReplayLog(epoch=EPOCH)
     s = _RealStack(log=log)
@@ -1843,15 +1871,19 @@ async def test_r4_memory_eviction_after_real_consumption_barrier(monkeypatch):
         assert frames1[1][1] == f"t:{SID}:{EPOCH}:1"  # consumed A's delta
 
         # offline eviction: B cannot fit under the 1-byte cap → A evicted
-        # (barrier, source-level, zero subscribers) → B's delta seq 2.
+        # → the replayable resync publishes even with ZERO subscribers
+        # (B-1 published semantics, seq 2) → B's delta seq 3. NO barrier:
+        # the R4 guarantee is carried by the resync frame's own seq.
         assert not s.token_hub._subs_by_sid.get(SID)
         s.token_hub.on_part_updated(_text_start(SID, "mB", "p1"))
         s.token_hub.on_part_delta(_delta(SID, "mB", "p1", "b"))
         s.token_hub.flush()
-        assert log.barrier_watermark(token_domain(SID)) == 1
-        assert log.last_seq(token_domain(SID)) == 2
+        assert log.barrier_watermark(token_domain(SID)) is None
+        assert log.last_seq(token_domain(SID)) == 3
 
-        # cursor 1 (≤ watermark, A's state gone) → frozen-reason resync.
+        # cursor 1 (missed the eviction): REPLAY carries the invalidation
+        # signal itself — resync(2) + delta(3), all id'd; the payload seq
+        # equals the id last segment.
         s.token_registry.push_script(_stop_token_stream)
         _, body2 = await _read(
             s.app, f"/slimapi/sessions/{SID}/stream?v=4",
@@ -1859,22 +1891,169 @@ async def test_r4_memory_eviction_after_real_consumption_barrier(monkeypatch):
         )
         frames2 = list(_frames(body2))
         _assert_v4_no_forbidden_frames(frames2)
-        assert [f[0] for f in frames2] == ["slimapi.meta", "resync"]
+        assert [f[0] for f in frames2] == [
+            "slimapi.meta", "resync", "message.part.delta",
+        ]
+        assert frames2[1][1] == f"t:{SID}:{EPOCH}:2"
         assert frames2[1][2] == {
-            "reason": "reconnect_no_replay", "sessionID": SID,
+            "reason": "token_memory_limit", "sessionID": SID, "seq": 2,
         }
+        assert frames2[2][1] == f"t:{SID}:{EPOCH}:3"
 
-        # cursor 2 (> watermark — B's state is INTACT server-side): no
-        # resync, no frames (up-to-date). The barrier did not over-block
-        # post-invalidation frames.
+        # cursor 3 (consumed the eviction signal; B's state is INTACT
+        # server-side): no resync, no frames (up-to-date) — the replayed
+        # resync did not over-block post-invalidation frames.
         s.token_registry.push_script(_stop_token_stream)
         _, body3 = await _read(
             s.app, f"/slimapi/sessions/{SID}/stream?v=4",
-            headers={"Last-Event-ID": f"t:{SID}:{EPOCH}:2"},
+            headers={"Last-Event-ID": f"t:{SID}:{EPOCH}:3"},
         )
         frames3 = list(_frames(body3))
         _assert_v4_no_forbidden_frames(frames3)
         assert [f[0] for f in frames3] == ["slimapi.meta"]
+    finally:
+        await s.close()
+
+
+async def test_r3b_failclosed_first_seq_nocursor_forced_alignment(monkeypatch):
+    """Round-4 Blocking 1 (rev-specified scenario): FRESH domain — a
+    seed/count-cap eviction fires with NO prior seq and NO subscriber,
+    and the domain's FIRST token_memory_limit append fails (fail-closed).
+
+    The best-effort barrier lands at watermark 0 (useless for no-cursor
+    clients — classify_reconnect never consults it without a header), so
+    the STICKY invalidation flag is the only surviving signal: a
+    NO-header reconnect must get ``resync{reconnect_no_replay}`` (forced
+    HTTP alignment), NOT a plain meta-only first-connect. Round-3: the
+    flag is STICKY — a successful publish of an UNRELATED part before
+    the reconnect must NOT re-open plain first-connect semantics (the
+    rev-2 counter-example: sequence-resumed ≠ invalidation-delivered)."""
+    monkeypatch.setattr(
+        "oc_slimapi.sse.tokenstream.budgets.TOKEN_LIVE_PARTS_MAX", 1,
+    )
+    log = ReplayLog(epoch=EPOCH)
+    s = _RealStack(log=log)
+    try:
+        # part A seeded only: no delta → zero published seq, zero subs
+        s.token_hub.on_part_updated(_text_start(SID, "mA", "p1"))
+        assert log.last_seq(token_domain(SID)) == 0
+        assert not s.token_hub._subs_by_sid.get(SID)
+
+        # poison the eviction resync append — the domain's FIRST seq
+        fail_next = {"armed": True}
+        orig_append = log.append
+
+        def poison(domain, payload, **kwargs):
+            if fail_next["armed"] and b'"token_memory_limit"' in payload:
+                fail_next["armed"] = False
+                raise RuntimeError("injected first-seq resync failure")
+            return orig_append(domain, payload, **kwargs)
+
+        monkeypatch.setattr(log, "append", poison)
+        # part B's SEED hits the count cap → evicts A → fail-closed at
+        # seq 1 (state already cleared, nobody online to terminate)
+        s.token_hub.on_part_updated(_text_start(SID, "mB", "p1"))
+        fail_next["armed"] = False
+
+        assert s.token_hub._metrics.seq_resync_failclosed_total == 1
+        # the persistent marker is the ONLY no-cursor signal (barrier
+        # sits at watermark 0 — nothing a no-header client can present)
+        assert log.first_connect_invalidated(token_domain(SID)) is True
+        assert log.barrier_watermark(token_domain(SID)) == 0
+
+        # rev-2 counter-example (round-3): an UNRELATED part publishes
+        # SUCCESSFULLY before the reconnect — the eviction signal is
+        # still undelivered, so the flag must survive the append
+        s.token_hub.on_part_delta(_delta(SID, "mB", "p1", "b"))
+        s.token_hub.flush()
+        assert log.last_seq(token_domain(SID)) == 1
+        assert log.first_connect_invalidated(token_domain(SID)) is True
+
+        # NO-header reconnect → STILL forced alignment, not meta-only
+        s.token_registry.push_script(_stop_token_stream)
+        _, body = await _read(s.app, f"/slimapi/sessions/{SID}/stream?v=4")
+        frames = list(_frames(body))
+        _assert_v4_no_forbidden_frames(frames)
+        assert [f[0] for f in frames] == ["slimapi.meta", "resync"]
+        assert frames[1][1] is None  # control resync: no id line
+        assert frames[1][2] == {
+            "reason": "reconnect_no_replay", "sessionID": SID,
+        }
+
+        # sticky across connects too: a second no-cursor connect is
+        # equally forced (the flag is not consumed by the read)
+        s.token_registry.push_script(_stop_token_stream)
+        _, body2 = await _read(s.app, f"/slimapi/sessions/{SID}/stream?v=4")
+        frames2 = list(_frames(body2))
+        _assert_v4_no_forbidden_frames(frames2)
+        assert [f[0] for f in frames2] == ["slimapi.meta", "resync"]
+    finally:
+        await s.close()
+
+
+async def test_r3c_failclosed_zero_subscriber_nocursor_forced_alignment(monkeypatch):
+    """Round-4 Blocking 1 (zero-subscriber variant, PRIOR seq): the
+    eviction fires after every subscriber disconnected — terminate() has
+    nobody to reach, and the no-cursor reconnect still must not slip
+    through as meta-only. The barrier (wm=1) covers cursor'd clients;
+    the sticky flag covers the no-cursor ones."""
+    monkeypatch.setattr(
+        "oc_slimapi.sse.tokenstream.budgets.TOKEN_LIVE_PARTS_MAX", 1,
+    )
+    log = ReplayLog(epoch=EPOCH)
+    s = _RealStack(log=log)
+    try:
+        # leg 1 — consume delta seq 1, then disconnect (zero subscribers)
+        async def leg1(sub, sid):
+            s.token_hub.on_part_updated(_text_start(sid, "mA", "p1"))
+            s.token_hub.on_part_delta(_delta(sid, "mA", "p1", "a"))
+            s.token_hub.flush()
+            sub.put(TOKEN_STOP)
+
+        s.token_registry.push_script(leg1)
+        _, body1 = await _read(s.app, f"/slimapi/sessions/{SID}/stream?v=4")
+        frames1 = list(_frames(body1))
+        _assert_v4_no_forbidden_frames(frames1)
+        assert [f[0] for f in frames1] == ["slimapi.meta", "message.part.delta"]
+        assert log.last_seq(token_domain(SID)) == 1
+        assert not s.token_hub._subs_by_sid.get(SID)  # everyone gone
+
+        # offline eviction with a poisoned resync append (fail-closed)
+        fail_next = {"armed": True}
+        orig_append = log.append
+
+        def poison(domain, payload, **kwargs):
+            if fail_next["armed"] and b'"token_memory_limit"' in payload:
+                fail_next["armed"] = False
+                raise RuntimeError("injected resync failure (zero subs)")
+            return orig_append(domain, payload, **kwargs)
+
+        monkeypatch.setattr(log, "append", poison)
+        s.token_hub.on_part_updated(_text_start(SID, "mB", "p1"))  # evicts A
+        fail_next["armed"] = False
+
+        assert s.token_hub._metrics.seq_resync_failclosed_total == 1
+        assert log.barrier_watermark(token_domain(SID)) == 1  # cursor'd path
+        assert log.first_connect_invalidated(token_domain(SID)) is True
+
+        # round-3 sticky semantics: an UNRELATED part (B is live — only
+        # A was evicted) publishes SUCCESSFULLY with zero subscribers;
+        # the flag must survive the append (no per-client recovery ACK)
+        s.token_hub.on_part_delta(_delta(SID, "mB", "p1", "b"))
+        s.token_hub.flush()
+        assert log.last_seq(token_domain(SID)) == 2
+        assert log.first_connect_invalidated(token_domain(SID)) is True
+
+        # NO-header reconnect → forced alignment (flag), not meta-only
+        s.token_registry.push_script(_stop_token_stream)
+        _, body2 = await _read(s.app, f"/slimapi/sessions/{SID}/stream?v=4")
+        frames2 = list(_frames(body2))
+        _assert_v4_no_forbidden_frames(frames2)
+        assert [f[0] for f in frames2] == ["slimapi.meta", "resync"]
+        assert frames2[1][1] is None
+        assert frames2[1][2] == {
+            "reason": "reconnect_no_replay", "sessionID": SID,
+        }
     finally:
         await s.close()
 
@@ -2050,26 +2229,41 @@ _TOKEN_ID_RE = re.compile(rf"^t:{re.escape(SID)}:{EPOCH}:(\d+)$")
 def _assert_v4_no_forbidden_frames(frames):
     """禁止事件集 + 冻结 reason 值域断言（rev-gate R2+R3 BLOCKER-1）：
     v4 全流遍历永不出现 server.connected 或 message.part.snapshot
-    （任何变体：done/truncated/handshake）；且每个出现的 resync 帧的
-    data.reason ∈ 生产侧 V4_RESYNC_REASONS（import 自 replay_wire——
-    与五条路径的 v4 分支共用同一常量，非测试私有副本）。"""
+    （任何变体：done/truncated/handshake）。resync 帧两值域分离
+    （4.12.0 修订六 B-2）：可重放业务 resync 仅 token_memory_limit
+    ——B-1 原子路径产物，必须有 id 行且 payload seq == id 末段；
+    route-private 控制帧（V4_RESYNC_REASONS 冻结四值，import 自
+    replay_wire）必须无 id、无 payload seq。"""
     for event, frame_id, _data in frames:
         assert event not in _FORBIDDEN_V4_EVENTS, (event, frame_id, _data)
         if event == "resync":
             reason = _data.get("reason")
-            assert reason in V4_RESYNC_REASONS, (reason, frame_id, _data)
+            if reason == RESYNC_TOKEN_MEMORY_LIMIT:
+                assert frame_id is not None, (reason, frame_id, _data)
+                assert _data.get("seq") == int(frame_id.rsplit(":", 1)[1]), (
+                    reason, frame_id, _data,
+                )
+            else:
+                assert reason in V4_RESYNC_REASONS, (reason, frame_id, _data)
+                assert frame_id is None, (reason, frame_id, _data)
 
 
 def _assert_v4_id_invariant(frames, domain, *, sid=SID):
     """通用 invariant（评委通过条件 4）：除裁决控制帧（meta/resync/
     heartbeat）外，v4 流上全部业务/token 帧必须携带正确域的 id 且 seq
     严格递增；控制帧必须无 id；且全流永不出现禁止事件集
-    （server.connected / message.part.snapshot——rev-gate R2 BLOCKER-1）。"""
+    （server.connected / message.part.snapshot——rev-gate R2 BLOCKER-1）。
+    4.12.0 修订六 B-2 例外：可重放 token_memory_limit resync 是业务帧
+    ——带 id、参与同一 seq 链。"""
     _assert_v4_no_forbidden_frames(frames)
     pattern = _GLOBAL_ID_RE if domain == GLOBAL_DOMAIN else _TOKEN_ID_RE
     prev = 0
     for event, frame_id, _data in frames:
-        if event in _CONTROL_EVENTS:
+        if (
+            event in _CONTROL_EVENTS
+            and not (event == "resync"
+                     and _data.get("reason") == RESYNC_TOKEN_MEMORY_LIMIT)
+        ):
             assert frame_id is None, (event, frame_id)
             continue
         assert frame_id is not None, (event, frame_id)

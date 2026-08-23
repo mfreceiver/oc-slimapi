@@ -14,7 +14,7 @@ from ..hub_types import (
     RESYNC_SESSION_IDLE,
     normalize_session_status,
 )
-from .frames import PartKey, _delta_frame, _now_ms, _snapshot_frame
+from .frames import PartKey, _now_ms, _snapshot_frame
 from .models import DeltaAccumulator
 
 
@@ -214,13 +214,9 @@ class IngestMixin:
             self._pending.pop(key, None)
             self._total_pending_bytes = max(0, self._total_pending_bytes - pending_bytes)
             if text:
-                self._fanout_frame(
-                    key,
-                    _delta_frame(
-                        key, text,
-                        part_revision=self._next_part_revision(key),
-                    ),
-                )
+                # 4.12.0 修订六 B-1: delta publication rides the atomic
+                # reserve→encode→append path (payload embeds the seq).
+                self._fanout_delta_frame(key, text)
         # Stage E (§16-C residual): global PENDING budget check. Runs AFTER
         # the per-key early-flush (which may have already popped this key's
         # accumulator). The pending budget is GLOBAL — many small
@@ -382,13 +378,9 @@ class IngestMixin:
             text = acc.drain()
             self._total_pending_bytes = max(0, self._total_pending_bytes - pending_bytes)
             if text:
-                self._fanout_frame(
-                    key,
-                    _delta_frame(
-                        key, text,
-                        part_revision=self._next_part_revision(key),
-                    ),
-                )
+                # 4.12.0 修订六 B-1: delta publication rides the atomic
+                # reserve→encode→append path (payload embeds the seq).
+                self._fanout_delta_frame(key, text)
         # Lever 1: terminal marker (no text) — only if the LivePart still
         # exists. A truncated / evicted / TTL-retired key has no LivePart
         # and the subscriber already received the appropriate frame.

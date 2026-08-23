@@ -43,6 +43,7 @@ from .replay_log import (
     RESYNC_REPLAY_EXPIRED,
     RESYNC_REPLAY_GAP,
     RESYNC_RECONNECT_NO_REPLAY,
+    ReplayResync,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - import-time only
@@ -183,8 +184,24 @@ def classify_reconnect(
     The ③④ delegation goes through :meth:`ReplayLog.replay` so the
     short-circuit order and the §9.1 outcome counters stay in exactly one
     place.
+
+    4.12.0 修订六 B-2 round-4 Blocking 1: a NO-header connect on a domain
+    carrying the sticky un-signalled-invalidation flag
+    (:meth:`ReplayLog.mark_invalidated` — set when a replayable resync
+    publish failed after state eviction) resolves to
+    ``resync{reconnect_no_replay}`` instead of plain first-connect
+    semantics: the client is forced into HTTP alignment even though it
+    presented no cursor (a barrier cannot intercept a client that
+    reconnects with no ``Last-Event-ID`` at all). A ①②-violating header
+    stays ignore+reset (frozen §7.2: a client protocol violation is
+    answered with silence, never a resync — the server has not lost
+    state).
     """
     if not header:
+        # No-cursor connect: first-connect semantics UNLESS the domain
+        # still owes an invalidation signal (fail-closed aftermath).
+        if replay.first_connect_invalidated(domain):
+            return ReplayResync(RESYNC_RECONNECT_NO_REPLAY)
         return None
     parsed = parse_last_event_id(header, token_sid=token_sid)
     if parsed is None:

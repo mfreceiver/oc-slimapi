@@ -89,6 +89,15 @@ class _TokenMetrics:
     dropped_frames_total: int = 0       # Stage C: oversized non-snapshot frames dropped
     truncated_snapshots_total: int = 0  # Stage C: snapshot{truncated:true} fans
     token_memory_limit_total: int = 0   # Stage C: resync{token_memory_limit} fans
+    # 4.12.0 修订六 B-1: general business-frame publish failures on the
+    # reserve→encode→append path (frame dropped + seq rolled back — the
+    # historical "deliver the raw frame un-logged" degradation is gone).
+    seq_publish_failures_total: int = 0
+    # 4.12.0 修订六 B-2 (rev-2 修正 1, fail-closed): replayable-resync
+    # publish failures AFTER eviction already cleared the part state —
+    # every subscriber of the sid was force-terminated instead of being
+    # left on a dead baseline.
+    seq_resync_failclosed_total: int = 0
     # S-3a additive
     gzip_raw_bytes_total: int = 0
     gzip_compressed_bytes_total: int = 0

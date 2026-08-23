@@ -174,6 +174,8 @@ VERSIONS_PAYLOAD_GOLDEN = {
             # 4.11.0 修订五：静态面加性两键（§10.3 / §19），恒 true。
             "messagesSince": True,
             "fileRaw": True,
+            # 4.12.0 修订六 B-1：token 流 seq 域，恒 true。
+            "tokenFrameSeq": True,
             "readiness": {
                 "ready": True,
                 "required": list(CONTRACT_REQUIRED_NORMALIZED),
@@ -511,7 +513,7 @@ def test_caps4_helper_expand_shape_when_satisfied():
     assert list(caps4.keys()) == [
         "globalSessions", "auxiliaryFilters", "sseReplay",
         "qpImmediateFull", "messagesSince", "fileRaw",
-        "readiness", "expand",
+        "tokenFrameSeq", "readiness", "expand",
     ]
     assert caps4["expand"]["categories"] == EXPAND_CATEGORIES
     assert len(EXPAND_CATEGORIES) == 12
@@ -527,7 +529,7 @@ def test_caps4_helper_current_state_expand_emitted():
     assert list(caps4.keys()) == [
         "globalSessions", "auxiliaryFilters", "sseReplay",
         "qpImmediateFull", "messagesSince", "fileRaw",
-        "readiness", "expand",
+        "tokenFrameSeq", "readiness", "expand",
     ]
     assert "expand" in caps4
     assert caps4["expand"]["categories"] == EXPAND_CATEGORIES
@@ -543,7 +545,7 @@ def test_caps4_helper_gate_off_expand_absent():
     assert list(caps4.keys()) == [
         "globalSessions", "auxiliaryFilters", "sseReplay",
         "qpImmediateFull", "messagesSince", "fileRaw",
-        "readiness",
+        "tokenFrameSeq", "readiness",
     ]
     assert "expand" not in caps4
 
@@ -570,7 +572,7 @@ async def test_versions_caps4_readiness_emitted():
     assert list(caps4.keys()) == [
         "globalSessions", "auxiliaryFilters", "sseReplay",
         "qpImmediateFull", "messagesSince", "fileRaw",
-        "readiness", "expand",
+        "tokenFrameSeq", "readiness", "expand",
     ]
     assert caps4["readiness"] == readiness.readiness_payload()
     assert caps4["readiness"] == {

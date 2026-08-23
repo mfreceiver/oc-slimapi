@@ -1114,6 +1114,8 @@ class TestMetricsTokenStream:
                     "pendingAccumulators", "flushedFramesTotal",
                     "droppedFramesTotal", "truncatedSnapshotsTotal",
                     "orphanDeltasTotal", "tokenMemoryLimitTotal",
+                    # 4.12.0 修订六 B-1/B-2 additive counters
+                    "seqPublishFailuresTotal", "seqResyncFailclosedTotal",
                     "gzipRawBytesTotal", "gzipCompressedBytesTotal",
                     "flushDurationMsTotal", "flushTicksTotal",
                     "maxSubscriberQueueDepth",
