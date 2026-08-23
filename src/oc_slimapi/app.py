@@ -239,7 +239,7 @@ async def lifespan(app: FastAPI):
     #   9. replay sweep task      _stop_replay_sweep            (push_async_callback)
     #  10. hub registry           _close_hubs                   (push_async_callback)
     #  11. qp sweep shadow        _stop_qp_sweep                (push_async_callback; only when qp_sweep_enabled)
-    #  12. token hub              _stop_token_hub               (callback; registered AFTER hubs — NB-C4)
+    #  12. token hub              _stop_token_hub               (push_async_callback; registered AFTER hubs — NB-C4)
     #  13. dbaux source           _stop_dbaux                   (push_async_callback)
     #  14. access-log maintenance _stop_maintenance             (push_async_callback; only when access_log_active)
     #
@@ -250,9 +250,12 @@ async def lifespan(app: FastAPI):
     # drop out when their gate is off; the relative order of the rest is
     # unchanged.
     # The only ordering constraint with cross-component semantics is
-    # token_hub.stop() BEFORE hubs.close() (NB-C4: flush loop must drain
-    # while the registry / hub are still coherent); that is satisfied by
-    # registering token_hub AFTER hubs (#12 > #10). Each callback is
+    # token_hub shutdown BEFORE hubs.close() (NB-C4: the flush task's
+    # cancellation/exit completes while the registry / hub are still
+    # coherent); that is satisfied by registering token_hub AFTER hubs
+    # (#12 > #10) and using push_async_callback so the unwind AWAITS the
+    # flush task's exit before entering _close_hubs. Pending flush data is
+    # NOT drained — cancellation discards it by design. Each callback is
     # individually try/except-isolated so one failure does NOT skip the
     # others (mirrors the per-component convergence of the old finally).
     # ------------------------------------------------------------------
@@ -600,15 +603,22 @@ async def lifespan(app: FastAPI):
             replay_log=app.state.replay_log,
         )
 
-        def _stop_token_hub():
+        async def _stop_token_hub():
+            # NB-C4: await the flush task's full exit so its cancellation
+            # is processed BEFORE the LIFO-later _close_hubs runs. Pending
+            # flush data is NOT drained — cancellation discards it by
+            # design; the invariant is loop-exit while the registry stays
+            # coherent.
             try:
-                app.state.token_hub.stop()
+                await app.state.token_hub.stop_and_wait()
             except Exception as exc:
                 get_logger("app").warning("token_hub.stop failed", exc_info=exc)
-        # NB-C4: registered AFTER hubs so LIFO cleanup runs token_hub.stop()
-        # BEFORE hubs.close() (flush loop must drain while the registry stays
-        # coherent).
-        stack.callback(_stop_token_hub)
+        # NB-C4: registered AFTER hubs so LIFO cleanup stops the token hub
+        # BEFORE hubs.close(). Must be push_async_callback: only an awaited
+        # callback guarantees the flush task's cancellation/exit COMPLETES
+        # before hubs.close() begins — a sync callback could only request
+        # cancellation and return.
+        stack.push_async_callback(_stop_token_hub)
         app.state.hubs.set_token_hub(app.state.token_hub)
         # Stage D (design-token-stream.md §5.1 / §6): independent admission
         # ledger for token-stream subscribers. Own cap

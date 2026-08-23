@@ -1383,10 +1383,20 @@ class TestNBD7DirectoryConflict:
         try:
             response = await _get(
                 app, "/slimapi/sessions/s1/stream?directory=/app",
-                extra_headers={"X-Opencode-Directory": "/other"},
+                extra_headers={
+                    "X-Opencode-Directory": "/other",
+                    "Accept-Encoding": "identity",
+                },
             )
+            # B3b wire lock: the token-stream directory rejection is a 400
+            # with raw identity bytes + no Cache-Control — INTENTIONALLY
+            # split from the file-route allowlist 403 on the same code
+            # (structural ambiguity vs authorization denial; do NOT merge).
             assert response.status_code == 400
-            assert response.json()["code"] == "directory_not_allowed"
+            assert response.content == b'{"code":"directory_not_allowed"}'
+            assert response.headers["content-type"] == "application/json"
+            assert response.headers["vary"] == "Accept-Encoding"
+            assert "cache-control" not in response.headers
         finally:
             await _close_app(app)
 

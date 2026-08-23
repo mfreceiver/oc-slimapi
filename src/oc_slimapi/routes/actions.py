@@ -54,6 +54,17 @@ def _request_too_large() -> CodedHTTPException:
     )
 
 
+def _invalid_request_body() -> CodedHTTPException:
+    """422 ``invalid_request_body`` — the shared construction for the three
+    malformed-body branches (JSON decode failure / non-object / non-boolean
+    ``confirm``). Exception FACTORY (does not raise): the JSON-decode caller
+    keeps its ``raise ... from exc`` cause chaining."""
+    return CodedHTTPException(
+        422, code="invalid_request_body",
+        headers={"Cache-Control": _NO_STORE},
+    )
+
+
 async def _read_body(request: Request) -> dict:
     """Read the raw request body as a JSON object, capped at 1 KiB.
 
@@ -91,20 +102,11 @@ async def _read_body(request: Request) -> dict:
     try:
         payload = orjson.loads(raw)
     except orjson.JSONDecodeError as exc:
-        raise CodedHTTPException(
-            422, code="invalid_request_body",
-            headers={"Cache-Control": _NO_STORE},
-        ) from exc
+        raise _invalid_request_body() from exc
     if not isinstance(payload, dict):
-        raise CodedHTTPException(
-            422, code="invalid_request_body",
-            headers={"Cache-Control": _NO_STORE},
-        )
+        raise _invalid_request_body()
     if "confirm" in payload and not isinstance(payload["confirm"], bool):
-        raise CodedHTTPException(
-            422, code="invalid_request_body",
-            headers={"Cache-Control": _NO_STORE},
-        )
+        raise _invalid_request_body()
     return payload
 
 

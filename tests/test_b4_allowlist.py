@@ -134,9 +134,16 @@ async def test_empty_allowlist_blocks_all_file_routes(path, directory):
             query += "&directory=" + directory
         if path.endswith("/file") or path.endswith("/file/content"):
             query += "&path=foo"
-        response = await client.get(path + query)
+        response = await client.get(
+            path + query, headers={"Accept-Encoding": "identity"})
+    # B3b wire lock: the allowlist REJECTION is a 403 with raw identity
+    # bytes + no Cache-Control (intentionally split from the token-stream
+    # side's 400 directory_not_allowed — see test_token_stream_route.py).
     assert response.status_code == 403
-    assert response.json() == {"code": "directory_not_allowed"}
+    assert response.content == b'{"code":"directory_not_allowed"}'
+    assert response.headers["content-type"] == "application/json"
+    assert response.headers["vary"] == "Accept-Encoding"
+    assert "cache-control" not in response.headers
     assert "outside" not in response.text
     assert not seen
 
@@ -262,7 +269,7 @@ async def test_symlink_escape_is_rejected_by_file_routes(tmp_path):
             headers={"Accept-Encoding": "identity"},
         )
     assert response.status_code == 403
-    assert response.json() == {"code": "directory_not_allowed"}
+    assert response.content == b'{"code":"directory_not_allowed"}'
     assert str(outside) not in response.text
     assert not seen
 

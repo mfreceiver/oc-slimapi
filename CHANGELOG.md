@@ -26,6 +26,21 @@ ocdroid 对接时：
 
 ---
 
+## [4.12.2] - 2026-08-23 — 测试确定性与错误响应构造收敛（patch；wire 零变化）
+
+> 承接 4.12.1 深度代码质量审计的 P2/P3 长期项：优先消除质量门禁的真实时钟与宿主进程耦合，补齐生命周期、熔断边界和跨域 replay barrier 的确定性断言，并收敛重复错误响应构造。Wire API 仍为 v4 `(4,4)`；路径、状态码、响应 body、headers 与错误优先级均不变，客户端零必改。
+
+### Fixed
+
+- **测试门禁不再依赖大批固定时长 sleep 或全系统同名进程状态**：leased single-flight 的 lazy expiry/预算回收改由注入时钟确定性推进，必须经过真实 event-loop timer 的少量分支改为有界条件等待；action drain-deadline 用例捕获并清理自身 escaped grandchild 的精确 PID，不再用全局 `pgrep` 判断宿主上是否存在 `sleep 4`。同时新增 lifespan 清理必要偏序（token hub 完成停止后才关闭 hub registry）、breaker 恰等阈值、disconnect/idle 双路径跨域 replay barrier 单调性与 post-barrier 新域语义回归锁。
+- **进程关闭会等待 token flush task 完整退出后再关闭 hub registry**：shutdown 专用清理路径现在会发起取消并等待后台 flush task 的 cancellation/exit 完成，兑现 NB-C4 生命周期偏序；运行期最后一个订阅者离开时的同步 stop 行为保持不变。此项不改变任何 HTTP/SSE wire 行为。
+
+### Changed
+
+- **重复错误响应构造统一走小型工厂并加 wire 字节级回归锁**：sessions 参数版本/游标错误、read-groups upstream 503、session 404 与 actions 非法 body 422 复用统一构造路径；异常 cause chaining、`Cache-Control: no-store`、完整 hint、400/403 `directory_not_allowed` 有意分裂和参数校验优先级均保持原样。
+
+---
+
 ## [4.12.1] - 2026-08-23 — 正确性修复批（patch；wire 仍 v4，客户端零必改）
 
 > 源于 2026-08-23 全仓深度代码质量审计（三项正确性缺陷经对抗反证独立确认）：三项 VERIFIED 正确性缺陷修复（FIX-CORR-1/2/3），方案经 oracle 门控审阅。wire 版本仍 (4,4)。

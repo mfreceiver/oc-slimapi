@@ -98,6 +98,54 @@ class FlushEngineMixin:
         if self._flush_task is not None and not self._flush_task.done():
             self._flush_task.cancel()
         self._flush_task = None
+
+    async def stop_and_wait(self) -> None:
+        """App-shutdown stop: cancel the flush loop and AWAIT its exit.
+
+        Companion to the synchronous :meth:`stop` (kept unchanged for the
+        subscriber last-detach path, which runs in sync detach code and
+        cannot await): this returns only after the flush task has fully
+        terminated — cancellation processed — so the caller can rely on
+        the engine being quiescent (NB-C4). Pending flush data is NOT
+        drained; cancellation discards it by design.
+
+        Result/exception semantics (the task's outcome is ALWAYS
+        retrieved, so a dead task can never become a silent
+        "exception was never retrieved" leak):
+
+        * no task at all (``_flush_task is None``) → return immediately.
+        * child cancelled (the expected stop path) → ``CancelledError``
+          is swallowed and None returned.
+        * child failed with any other ``BaseException`` → re-raised to
+          the caller (whose try/except isolates and logs it) — even when
+          the task was ALREADY dead on entry, whose done-callback may not
+          have run yet (the slot is cleared first, keeping the
+          ``_on_flush_done`` rebuild guard stale so no replacement task
+          is spawned mid-shutdown).
+        * child finished cleanly → None returned.
+        * cancellation of the CALLER (this coroutine's own Task) → the
+          ``CancelledError`` from awaiting the child PROPAGATES (it is
+          distinct from the child's cancellation, which arrives as a
+          gather result) — a caller's cancellation is never swallowed.
+        """
+        task = self._flush_task
+        # Clear the slot BEFORE awaiting: the _on_flush_done watchdog's
+        # stale guard must hold during the await window.
+        self._flush_task = None
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        # return_exceptions=True: the child's own CancelledError comes
+        # back as `result` (expected stop path), while a cancellation of
+        # THIS task raises CancelledError out of the await (never caught
+        # here) and gather reaps the already-cancelled child without a
+        # pending-exception leak.
+        result = (await asyncio.gather(task, return_exceptions=True))[0]
+        if isinstance(result, asyncio.CancelledError):
+            return
+        if isinstance(result, BaseException):
+            raise result
     async def flush_loop(self) -> None:
         """Drain ``_pending`` every ``TOKEN_FLUSH_SECONDS`` (§5.4) + TTL tick.
 

@@ -438,6 +438,96 @@ async def test_network_error_maps_to_503():
 
 
 # ---------------------------------------------------------------------------
+# B3b wire locks — providers v4 error family (§12.5.2 ③/④ + §12.5.3
+# "全部错误 no-store"): raw identity body + headers on each 503/502 site of
+# the §12 pipeline. These are the exact sites whose construction converges
+# into raise_upstream_unavailable() in B3b — the wire shape must not move.
+# ---------------------------------------------------------------------------
+
+
+def _assert_coded_error(resp, status: int, raw_body: bytes,
+                        *, no_store: bool) -> None:
+    assert resp.status_code == status
+    assert resp.content == raw_body
+    assert resp.headers["content-type"] == "application/json"
+    assert resp.headers["vary"] == "Accept-Encoding"
+    if no_store:
+        assert resp.headers["cache-control"] == "no-store"
+    else:
+        assert "cache-control" not in resp.headers
+
+
+async def test_providers_v4_initial_send_network_error_503():
+    """§12.5.2 ③ initial-send RequestError → 503 upstream_unavailable.
+
+    NB (B3b wire survey): the reachable raise here is the SHARED
+    ``stream_upstream`` helper (``_catalog_common.py``), which calls
+    ``raise_upstream_unavailable(exc)`` WITHOUT no-store — the identical
+    inline 503 inside ``_handle_providers_v4`` is a defensive duplicate
+    that cannot fire (stream_upstream never lets RequestError escape).
+    The wire therefore carries NO Cache-Control on this path — locked as
+    such so the B3b convergence cannot silently change it."""
+    def failing(request, payloads):
+        raise httpx.ConnectError("nope")
+
+    app, _ = _build_app(failing)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport,
+                                 base_url="http://t") as client:
+        resp = await client.get("/slimapi/config/providers?v=4",
+                                headers=IDENTITY)
+        _assert_coded_error(resp, 503, b'{"code":"upstream_unavailable"}',
+                            no_store=False)
+
+
+async def test_providers_v4_upstream_5xx_after_drain_503_no_store():
+    """§12.5.2 ③ post-drain upstream 5xx → 503 upstream_unavailable +
+    no-store (the 5xx re-map, NOT verbatim passthrough)."""
+    app, _ = _build_app({"/config/providers": 503, "body": b"boom"})
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport,
+                                 base_url="http://t") as client:
+        resp = await client.get("/slimapi/config/providers?v=4",
+                                headers=IDENTITY)
+        _assert_coded_error(resp, 503, b'{"code":"upstream_unavailable"}',
+                            no_store=True)
+
+
+async def test_providers_v4_mid_read_network_error_503_no_store():
+    """§12.5.2 ④ read_with_cap mid-stream RequestError (initial send OK,
+    200 body dies) → 503 upstream_unavailable + no-store."""
+    def broken(request, payloads):
+        async def dying_body():
+            yield b'{"partial": '
+            raise httpx.ReadError("mid-read boom")
+        return httpx.Response(200, content=dying_body(),
+                              headers={"Content-Type": "application/json"})
+
+    app, _ = _build_app(broken)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport,
+                                 base_url="http://t") as client:
+        resp = await client.get("/slimapi/config/providers?v=4",
+                                headers=IDENTITY)
+        _assert_coded_error(resp, 503, b'{"code":"upstream_unavailable"}',
+                            no_store=True)
+
+
+async def test_providers_v4_other_2xx_502_malformed_no_store():
+    """§12.5.2 ③ a 2xx≠200 (204) is malformed → 502
+    provider_upstream_malformed + no-store (same error family lock)."""
+    app, _ = _build_app({"/config/providers": 204, "body": b""})
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport,
+                                 base_url="http://t") as client:
+        resp = await client.get("/slimapi/config/providers?v=4",
+                                headers=IDENTITY)
+        _assert_coded_error(resp, 502,
+                            b'{"code":"provider_upstream_malformed"}',
+                            no_store=True)
+
+
+# ---------------------------------------------------------------------------
 # ETag (§10.a all-GET enablement) + gzip + cap
 # ---------------------------------------------------------------------------
 

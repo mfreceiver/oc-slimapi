@@ -9,7 +9,7 @@ module shares a single source of truth for the §7 codes instead of inlining
 * HTTP status mapping **after draining the error body** —
   :func:`raise_upstream_status_code` (4xx → 502 ``upstream_http_N``;
   5xx → 503 ``upstream_unavailable``; 404 with ``sid`` → 404
-  ``session_not_found``);
+  ``session_not_found`` via the :func:`session_not_found_error` factory);
 * the legacy :func:`raise_upstream_status` (takes an ``HTTPStatusError``
   from ``response.raise_for_status()``) — used by the buffered
   ``upstream.get()`` routes (e.g. ``GET /slimapi/sessions/status``).
@@ -21,6 +21,7 @@ to obtain the code *string*.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import NoReturn
 
 import httpx
@@ -31,8 +32,29 @@ from .errors import CodedHTTPException
 # stamp the code into an envelope without raising, e.g. questions fan-out).
 UPSTREAM_UNAVAILABLE = "upstream_unavailable"
 
+# Contract §7 session-scoped miss — single source of truth for the 404
+# ``session_not_found`` shape (body code + ``sessionID`` field). Used by both
+# status-mapping helpers below AND the read-groups DB point-query miss.
+SESSION_NOT_FOUND = "session_not_found"
 
-def raise_upstream_unavailable(exc: BaseException | None = None) -> NoReturn:
+
+def session_not_found_error(sid: str) -> CodedHTTPException:
+    """Build the §7 sid-scoped miss: 404 ``session_not_found`` (+ sessionID).
+
+    Exception FACTORY (does not raise): every construction site keeps control
+    of its own cause semantics — ``raise session_not_found_error(sid)`` where
+    no underlying exception exists (drained body / DB point-query miss) and
+    ``raise session_not_found_error(sid) from exc`` where traceback continuity
+    matters (``raise_for_status`` routes).
+    """
+    return CodedHTTPException(404, code=SESSION_NOT_FOUND, sessionID=sid)
+
+
+def raise_upstream_unavailable(
+    exc: BaseException | None = None,
+    *,
+    headers: Mapping[str, str] | None = None,
+) -> NoReturn:
     """Raise 503 ``upstream_unavailable``, optionally chained from ``exc``.
 
     Covers every non-status upstream failure: initial-send network errors
@@ -40,10 +62,19 @@ def raise_upstream_unavailable(exc: BaseException | None = None) -> NoReturn:
     non-list / non-dict bodies, and explicit 5xx-after-drain. Passing
     ``exc`` preserves ``raise ... from exc`` exception chaining for
     diagnostics (the route sites that currently chain keep chaining).
+
+    ``headers`` (keyword-only) attaches extra response headers — e.g. the
+    §12.5.3 ``Cache-Control: no-store`` stamp the read-groups v4 pipeline
+    requires on every error. The mapping is COPIED (``dict(headers)``) so
+    no caller-shared mutable mapping can leak between raises; omitted (the
+    default) keeps the prior bare-exception shape byte-identical.
     """
+    extra: dict[str, dict[str, str]] = {}
+    if headers is not None:
+        extra["headers"] = dict(headers)
     if exc is not None:
-        raise CodedHTTPException(503, code=UPSTREAM_UNAVAILABLE) from exc
-    raise CodedHTTPException(503, code=UPSTREAM_UNAVAILABLE)
+        raise CodedHTTPException(503, code=UPSTREAM_UNAVAILABLE, **extra) from exc
+    raise CodedHTTPException(503, code=UPSTREAM_UNAVAILABLE, **extra)
 
 
 def upstream_error_code_for_status(status: int) -> str:
@@ -78,7 +109,7 @@ def raise_upstream_status_code(
     ``from exc`` for traceback continuity.
     """
     if status == 404 and sid is not None:
-        raise CodedHTTPException(404, code="session_not_found", sessionID=sid)
+        raise session_not_found_error(sid)
     if status < 500:
         raise CodedHTTPException(502, code=f"upstream_http_{status}")
     raise_upstream_unavailable()
@@ -99,7 +130,7 @@ def raise_upstream_status(
     """
     status = exc.response.status_code
     if status == 404 and sid is not None:
-        raise CodedHTTPException(404, code="session_not_found", sessionID=sid) from exc
+        raise session_not_found_error(sid) from exc
     if status < 500:
         raise CodedHTTPException(502, code=f"upstream_http_{status}") from exc
     raise CodedHTTPException(503, code=UPSTREAM_UNAVAILABLE) from exc

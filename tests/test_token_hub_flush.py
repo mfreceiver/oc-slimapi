@@ -1651,3 +1651,163 @@ class TestDebugBudgetOverrides:
         finally:
             hubmod.TOKEN_LIVEPARTS_MAX_BYTES = orig_live
             hubmod.TOKEN_PART_MAX_BYTES = orig_part
+
+
+# ---------------------------------------------------------------------------
+# stop_and_wait() boundary contract (P2, rev-sgpt 9.3): the awaitable
+# app-shutdown stop must (a) re-raise a child flush task's exception —
+# merely cancel-requesting and returning would leave a done-with-exception
+# task whose failure is neither propagated nor logged; (b) propagate a
+# cancellation of the CALLER (outer Task) instead of swallowing it as if
+# it were the managed child's expected cancellation.
+#
+# Deterministic Event-based synchronization only — no fixed sleeps.
+# Tests 2-5 inject a minimal controllable task into ``_flush_task`` with
+# the production-parity ``add_done_callback(hub._on_flush_done)`` wiring
+# that ``start()`` installs; ``stop_and_wait`` itself is never mocked.
+# ---------------------------------------------------------------------------
+
+
+class TestStopAndWait:
+    async def test_live_child_cancelled_and_awaited(self):
+        """Boundary 1: live flush task (real ``start()``) → stop_and_wait
+        cancels it, awaits full exit, clears the slot."""
+        hub = TokenStreamHub()
+        hub.start()
+        task = hub._flush_task
+        assert task is not None and not task.done()
+
+        await hub.stop_and_wait()  # must not raise
+
+        assert hub._flush_task is None
+        assert task.done()
+        assert task.cancelled()
+
+    async def test_already_cancelled_child_returns_normally(self):
+        """Boundary 2: child already cancelled (cancellation processed)
+        → stop_and_wait returns normally and stays idempotent."""
+        hub = TokenStreamHub()
+        cancelled_observed = asyncio.Event()
+
+        async def child():
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(child())
+        task.add_done_callback(lambda t: cancelled_observed.set())
+        task.add_done_callback(hub._on_flush_done)
+        hub._flush_task = task
+        task.cancel()
+        await cancelled_observed.wait()
+        assert task.cancelled()
+
+        await hub.stop_and_wait()  # must not raise
+
+        assert hub._flush_task is None
+
+    async def test_already_successful_child_returns_normally(self):
+        """Boundary 3: child already finished successfully → normal return,
+        no cancellation requested, no exception surfaced."""
+        hub = TokenStreamHub()
+        success_observed = asyncio.Event()
+
+        async def child():
+            return "done-value"
+
+        task = asyncio.create_task(child())
+        task.add_done_callback(lambda t: success_observed.set())
+        task.add_done_callback(hub._on_flush_done)
+        hub._flush_task = task
+        release = asyncio.Event()
+
+        async def runner():
+            await release.wait()
+
+        # Drive the loop so the child actually completes (Event, not sleep).
+        waiter = asyncio.create_task(runner())
+        release.set()
+        await success_observed.wait()
+        waiter.cancel()
+        try:
+            await waiter
+        except asyncio.CancelledError:
+            pass
+        assert task.done() and not task.cancelled() and task.exception() is None
+
+        await hub.stop_and_wait()  # must not raise
+
+        assert hub._flush_task is None
+
+    async def test_already_failed_child_reraises_exception(self):
+        """Boundary 4 (contract a): child already dead with
+        ``RuntimeError("boom")`` → the exception MUST be re-raised out of
+        ``stop_and_wait()`` and actually retrieved (no ``Task exception
+        was never retrieved``). The production ``_on_flush_done`` watchdog
+        must not rebuild a replacement task mid-shutdown."""
+        hub = TokenStreamHub()
+        failed_observed = asyncio.Event()
+        release = asyncio.Event()
+
+        async def child():
+            await release.wait()
+            raise RuntimeError("boom")
+
+        task = asyncio.create_task(child())
+        # Production-parity wiring (what start() installs); observing via a
+        # separate earlier callback keeps ordering deterministic.
+        task.add_done_callback(lambda t: failed_observed.set())
+        task.add_done_callback(hub._on_flush_done)
+        hub._flush_task = task
+        release.set()
+        await failed_observed.wait()
+        assert task.done()
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await hub.stop_and_wait()
+
+        # The raise itself proves retrieval; the asyncio pending-exception
+        # bookkeeping must also be cleared (deterministic proxy for "no
+        # un-retrieved warning").
+        assert not getattr(task, "_log_traceback", False)
+        # Watchdog did not rebuild a replacement flush task.
+        assert hub._flush_task is None
+
+    async def test_caller_cancellation_propagates(self):
+        """Boundary 5 (contract b): cancelling the OUTER Task running
+        ``stop_and_wait()`` must surface ``CancelledError`` to the caller —
+        it must not be mistaken for the managed child's expected
+        cancellation. The child observes its first cancellation (deferrable
+        finalizer) so the two cancellations are distinguishable."""
+        hub = TokenStreamHub()
+        first_cancel_seen = asyncio.Event()
+        finalizer_release = asyncio.Event()
+
+        async def child():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                first_cancel_seen.set()  # observable finalizer entry
+                await finalizer_release.wait()
+                raise
+
+        task = asyncio.create_task(child())
+        task.add_done_callback(hub._on_flush_done)
+        hub._flush_task = task
+
+        outer = asyncio.create_task(hub.stop_and_wait())
+        # Deterministic: proves stop_and_wait already cancel-requested the
+        # child AND the child is parked in its finalizer.
+        await first_cancel_seen.wait()
+
+        outer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await outer
+
+        # Release the child's finalizer; reap it deterministically.
+        finalizer_release.set()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        assert task.cancelled()
+        # No leaked slot / replacement task.
+        assert hub._flush_task is None

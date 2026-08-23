@@ -32,11 +32,15 @@ import pytest
 from fastapi import FastAPI
 
 from oc_slimapi.config import Settings
-from oc_slimapi.errors import register_error_handlers
+from oc_slimapi.errors import CodedHTTPException, register_error_handlers
 from oc_slimapi.proxy import install_proxy
 from oc_slimapi.routes import messages, sessions
 from oc_slimapi.sse.hub import HubRegistry
 from oc_slimapi.transform import TransformConfig, TransformPool
+from oc_slimapi.upstream_errors import (
+    raise_upstream_status,
+    raise_upstream_status_code,
+)
 
 
 VERSION_HEADERS = {"X-Slimapi-Version": "1"}
@@ -106,11 +110,29 @@ def _build_app(upstream: httpx.AsyncClient) -> FastAPI:
 
 
 async def _get(upstream: httpx.AsyncClient, path: str) -> httpx.Response:
-    """Helper: build app + ASGI client, issue a GET, return the response."""
+    """Helper: build app + ASGI client, issue a GET, return the response.
+
+    ``Accept-Encoding: identity`` so the raw response bytes can be locked
+    (the coded-error bodies are orjson-compact — byte equality only holds
+    without gzip negotiation)."""
     app = _build_app(upstream)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        return await client.get(path, headers=VERSION_HEADERS)
+        return await client.get(
+            path, headers={**VERSION_HEADERS, "Accept-Encoding": "identity"})
+
+
+def _assert_upstream_unavailable_wire(response: httpx.Response) -> None:
+    """B3b wire lock for the shared 503 ``upstream_unavailable`` mapping:
+    raw identity body + JSON media type + negotiation Vary. This layer
+    (``raise_upstream_unavailable`` behind the messages/sessions routes)
+    intentionally carries NO ``Cache-Control`` — only the read-groups v4
+    pipeline stamps no-store (§12.5.3). Do NOT add no-store here."""
+    assert response.status_code == 503
+    assert response.content == b'{"code":"upstream_unavailable"}'
+    assert response.headers["content-type"] == "application/json"
+    assert response.headers["vary"] == "Accept-Encoding"
+    assert "cache-control" not in response.headers
 
 
 # ===========================================================================
@@ -137,8 +159,7 @@ async def test_messages_list_initial_send_network_error_returns_503(upstream_fac
 
     upstream = upstream_factory(handler)
     response = await _get(upstream, "/slimapi/messages/ses_x")
-    assert response.status_code == 503
-    assert response.json() == {"code": "upstream_unavailable"}
+    _assert_upstream_unavailable_wire(response)
 
 
 async def test_message_full_single_initial_send_network_error_returns_503(upstream_factory):
@@ -154,8 +175,75 @@ async def test_message_full_single_initial_send_network_error_returns_503(upstre
 
     upstream = upstream_factory(handler)
     response = await _get(upstream, "/slimapi/messages/ses_x/full/m1")
-    assert response.status_code == 503
-    assert response.json() == {"code": "upstream_unavailable"}
+    _assert_upstream_unavailable_wire(response)
+
+
+async def test_message_full_single_mid_read_network_error_returns_503(upstream_factory):
+    """Mid-read boundary: the initial send SUCCEEDS but the 200 body stream
+    dies with an ``httpx.RequestError`` during ``read_with_cap`` → 503
+    upstream_unavailable via the shared mapping (P0-9 catalog guard)."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        async def broken_body():
+            yield b'{"partial": '
+            raise httpx.ReadError("mid-read boom")
+        return httpx.Response(200, content=broken_body(),
+                              headers={"Content-Type": "application/json"})
+
+    upstream = upstream_factory(handler)
+    response = await _get(upstream, "/slimapi/messages/ses_x/full/m1")
+    _assert_upstream_unavailable_wire(response)
+
+
+# ===========================================================================
+# session_not_found — the two §7 mapping paths in upstream_errors.py
+# (upstream 404 + sid → sid-scoped 404 session_not_found), locked at unit
+# level including the exception-chaining contract the B3b session-not-found
+# exception factory must preserve, plus one route-level manifestation.
+# ===========================================================================
+
+
+def test_raise_upstream_status_code_404_sid_is_session_not_found_no_cause():
+    """Mapping path A (``raise_upstream_status_code`` — construction point
+    WITHOUT a cause): 404 + sid → 404 session_not_found + sessionID field."""
+    with pytest.raises(CodedHTTPException) as ei:
+        raise_upstream_status_code(404, sid="ses_x")
+    assert ei.value.status_code == 404
+    assert ei.value.code == "session_not_found"
+    assert ei.value.fields == {"sessionID": "ses_x"}
+    assert ei.value.headers is None
+    assert ei.value.__cause__ is None
+
+
+def test_raise_upstream_status_404_sid_is_session_not_found_chained():
+    """Mapping path B (``raise_upstream_status`` — construction point WITH a
+    cause): 404 + sid → 404 session_not_found raised ``from exc``."""
+    request = httpx.Request("GET", "http://127.0.0.1:4096/session/s1/message")
+    response = httpx.Response(404, request=request)
+    exc = httpx.HTTPStatusError("404 Not Found", request=request,
+                                response=response)
+    with pytest.raises(CodedHTTPException) as ei:
+        raise_upstream_status(exc, sid="ses_x")
+    assert ei.value.status_code == 404
+    assert ei.value.code == "session_not_found"
+    assert ei.value.fields == {"sessionID": "ses_x"}
+    assert ei.value.headers is None
+    assert ei.value.__cause__ is exc
+
+
+async def test_messages_list_upstream_404_maps_session_not_found(upstream_factory):
+    """Route-level manifestation of mapping path A: an upstream 404 on the
+    message-list fetch maps to the sid-scoped 404 ``session_not_found``
+    (NOT verbatim passthrough, NOT 502)."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"error": "not found"})
+
+    upstream = upstream_factory(handler)
+    response = await _get(upstream, "/slimapi/messages/ses_x")
+    assert response.status_code == 404
+    assert response.content == b'{"code":"session_not_found","sessionID":"ses_x"}'
+    assert response.headers["content-type"] == "application/json"
+    assert response.headers["vary"] == "Accept-Encoding"
+    assert "cache-control" not in response.headers
 
 
 

@@ -187,6 +187,25 @@ def _fail_closed_503(request: Request) -> CodedHTTPException:
     return _aux_unavailable()
 
 
+def _param_version_mismatch(hint: str) -> CodedHTTPException:
+    """422 ``param_version_mismatch`` 工厂（§4.1 v4-only 参数域）。
+
+    §8.3 优先级最高的错误族——先于 invalid_cursor 与 503/上游交互，
+    纯内存构造，不触碰 db。hint 由调用点给全量文案（f-string 在
+    调用点求值）。
+    """
+    return CodedHTTPException(
+        422, code="param_version_mismatch", hint=hint,
+    )
+
+
+def _invalid_cursor(hint: str) -> CodedHTTPException:
+    """400 ``invalid_cursor`` 工厂（§8.3——纯内存校验，先于 503）。"""
+    return CodedHTTPException(
+        400, code="invalid_cursor", hint=hint,
+    )
+
+
 def _http_session_to_v4(item: dict) -> dict:
     """Upstream session JSON (SessionInfo camelCase) → SessionSkeletonV4.
 
@@ -258,24 +277,19 @@ async def _sessions_v4(
     # ---- ④ 参数版本不匹配（§8.3：先于 invalid_cursor/503） --------------
     raw_keys = _raw_query_keys(request)
     if "roots" in raw_keys or "start" in raw_keys:
-        raise CodedHTTPException(
-            422, code="param_version_mismatch",
-            hint="roots/start are v3-only; v4 uses the parent filter axis",
+        raise _param_version_mismatch(
+            "roots/start are v3-only; v4 uses the parent filter axis",
         )
     if limit > _V4_LIMIT_MAX:
-        raise CodedHTTPException(
-            422, code="param_version_mismatch",
-            hint=f"v4 limit domain is 1..{_V4_LIMIT_MAX}",
+        raise _param_version_mismatch(
+            f"v4 limit domain is 1..{_V4_LIMIT_MAX}",
         )
     if archived is not None and archived not in _V4_ARCHIVED_STATES:
-        raise CodedHTTPException(
-            422, code="param_version_mismatch",
-            hint=f"archived must be one of {_V4_ARCHIVED_STATES}",
+        raise _param_version_mismatch(
+            f"archived must be one of {_V4_ARCHIVED_STATES}",
         )
     if parent is not None and not parent:
-        raise CodedHTTPException(
-            422, code="param_version_mismatch", hint="parent must not be empty",
-        )
+        raise _param_version_mismatch("parent must not be empty")
 
     archived_state = archived or "omit"
     parent_state = parent or "all"
@@ -289,17 +303,15 @@ async def _sessions_v4(
     try:
         cursor_payload = decode_cursor(cursor)
     except InvalidCursorError:
-        raise CodedHTTPException(
-            400, code="invalid_cursor",
-            hint="cursor is malformed; restart pagination from the first page",
+        raise _invalid_cursor(
+            "cursor is malformed; restart pagination from the first page",
         )
     if cursor_payload is not None and fingerprint_mismatch(
         cursor_payload.f, fingerprint
     ):
-        raise CodedHTTPException(
-            400, code="invalid_cursor",
-            hint="cursor filter context does not match this request; "
-                 "restart pagination from the first page",
+        raise _invalid_cursor(
+            "cursor filter context does not match this request; "
+            "restart pagination from the first page",
         )
 
     # ---- ⑥ 降级矩阵（§4.2 formula；db∈{disabled,tripped} 同形） --------

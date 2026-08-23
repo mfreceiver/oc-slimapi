@@ -76,7 +76,10 @@ from ..skeleton import (
 )
 from ..traffic import stash_up_in
 from ..transform import TransformBusy, read_with_cap
-from ..upstream_errors import UPSTREAM_UNAVAILABLE, raise_upstream_unavailable
+from ..upstream_errors import (
+    raise_upstream_unavailable,
+    session_not_found_error,
+)
 from ._catalog_common import busy_response, stream_upstream
 from ._read_passthrough import (
     _raw_upstream_url,
@@ -138,6 +141,10 @@ def _authorized_file_directory(request: Request, directory: str | None) -> str |
         return directory
     canonical = candidate_canonical(directory)
     if not match_allowlist(allowlist_roots(allowlist), canonical):
+        # 403 = AUTHORIZATION denial (allowlist rejection). Intentionally a
+        # different status from token_stream's 400 ``directory_not_allowed``
+        # (structural query/header ambiguity) — same code, split semantics;
+        # do NOT merge the two sites.
         raise CodedHTTPException(403, code="directory_not_allowed")
     return canonical
 
@@ -288,9 +295,11 @@ async def _handle_providers_v4(request: Request,
     try:
         response = await stream_upstream(request, upstream_url, directory)
     except httpx.RequestError as exc:
-        raise CodedHTTPException(
-            503, code=UPSTREAM_UNAVAILABLE,
-            headers={"Cache-Control": "no-store"}) from exc
+        # Defensive parity with stream_upstream's own guard (it already
+        # converts initial-send RequestError → bare upstream_unavailable);
+        # if this ever fires, the §12.5.3 no-store stamp still applies.
+        raise_upstream_unavailable(
+            exc, headers={"Cache-Control": "no-store"})
     try:
         status = response.status_code
         if status != 200:
@@ -307,8 +316,7 @@ async def _handle_providers_v4(request: Request,
                                "Cache-Control": "no-store"}
                 raise
             if status >= 500:
-                raise CodedHTTPException(
-                    503, code=UPSTREAM_UNAVAILABLE,
+                raise_upstream_unavailable(
                     headers={"Cache-Control": "no-store"})
             if 200 < status < 300:
                 raise CodedHTTPException(
@@ -324,9 +332,8 @@ async def _handle_providers_v4(request: Request,
                 response, config.max_response_bytes,
                 on_read=lambda n: stash_up_in(request, n))
         except httpx.RequestError as exc:
-            raise CodedHTTPException(
-                503, code=UPSTREAM_UNAVAILABLE,
-                headers={"Cache-Control": "no-store"}) from exc
+            raise_upstream_unavailable(
+                exc, headers={"Cache-Control": "no-store"})
         if body is None:
             return _v4_error(
                 "response_too_large", 413,
@@ -536,8 +543,7 @@ async def _handle_session_single_v4(
             raise _aux_unavailable()
         else:
             if not rows:
-                raise CodedHTTPException(
-                    404, code="session_not_found", sessionID=sid)
+                raise session_not_found_error(sid)
             records = rows_to_records(rows)
             if not records:
                 # 行存在但不可投影（坏 JSON 列）→ §13.2c 整响应失败

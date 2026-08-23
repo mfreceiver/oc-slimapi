@@ -8,10 +8,29 @@ ownership_state ∈ {in-flight (incl. detached), grace, retained})``.
 Snapshot shape (plan §3.x): ``{key: [(layer, seq, caller_refs,
 ownership_state), ...]}`` with layer ∈ {"active", "retired"} and
 ownership_state ∈ {"in-flight", "grace", "retained", "failed"}.
+
+Timing strategy (CI de-flake, zero src changes): the grace-expiry waits are
+split by SUBJECT. Tests whose subject is the background grace timer itself
+(``call_later`` dispatch, singleflight.py leased path) keep REAL loop time
+via bounded polls (short interval + loose deadline — never one fixed
+``sleep(grace + margin)``): ``test_normal_release…``,
+``test_grace_expiry_moves_to_retired…``,
+``test_shutdown_grace_entry_becomes_retained_and_timer_cancelled`` and
+``test_release_cuts_body_and_entry_references`` (its unreachability assert
+depends on the timer callback having actually DISPATCHED — a pending
+TimerHandle keeps its args alive on some CPython versions even after
+cancel, so real dispatch is the portable mechanism). Incidental past-grace
+cleanup tails inject a ``_FakeClock`` (constructor ``clock=`` param) and
+drive the LAZY expiry check — ``_expire_if_due``, the exact check
+``fetch_or_bypass`` runs at its serial point — via ``_sweep_lazy``. The
+budget-eviction core is synchronous and clock-free (``_try_reserve`` never
+consults the clock). ``_FakeClock`` never patches the event loop,
+``call_later`` or ``asyncio.sleep``.
 """
 from __future__ import annotations
 
 import asyncio
+from typing import Callable
 
 import pytest
 
@@ -30,6 +49,73 @@ def _registry(**overrides) -> LeasedSingleFlight:
 async def _settle() -> None:
     """Let the event loop run pending timer callbacks + queued tasks."""
     await asyncio.sleep(0)
+
+
+class _FakeClock:
+    """Deterministic monotonic clock (tests/test_burst_watch.py style).
+
+    Injected via ``LeasedSingleFlight(clock=...)``. NOTE: the leased grace
+    timer is still armed with REAL loop delay (``call_later(grace)``), so a
+    FakeClock alone never dispatches it — tests below advance the clock and
+    then run the lazy serial-point check (``_sweep_lazy``). Both routes
+    converge to the identical ledger state, and a real timer firing early
+    on a slow CI box only ever races to the same reaped result.
+    """
+
+    def __init__(self) -> None:
+        self.now = 1_000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, dt: float) -> None:
+        self.now += dt
+
+
+def _sweep_lazy(sf: LeasedSingleFlight) -> None:
+    """Run the lazy grace-expiry check for every live key — exactly what
+    ``fetch_or_bypass`` does at its serial point (``_expire_if_due``),
+    poked directly so no fresh flight is led. Converts + reaps zero-caller
+    grace entries (in-place retired/retained conversion, refund, delete)."""
+    for key in list(sf.snapshot()):
+        sf._expire_if_due(key)
+
+
+# Long grace for all FakeClock-based tests: the real ``call_later`` timer
+# is armed with this value too, so it cannot race before the lazy sweep
+# even on the slowest CI.  Only tests whose SUBJECT is the real background
+# timer (bounded-poll) keep a short ``result_grace_seconds``.
+FAKE_GRACE_SECONDS = 60.0
+
+
+def _fake_clock_registry(**overrides) -> tuple[_FakeClock, LeasedSingleFlight]:
+    """Create a ``_FakeClock`` + ``LeasedSingleFlight`` with long grace.
+    All overrides pass through to the registry constructor."""
+    clock = _FakeClock()
+    kwargs = dict(
+        max_bytes=RESERVE, network_concurrency=8,
+        result_grace_seconds=FAKE_GRACE_SECONDS, clock=clock,
+    )
+    kwargs.update(overrides)
+    return clock, LeasedSingleFlight(**kwargs)
+
+
+async def _poll_until(
+    predicate: Callable[[], bool],
+    *,
+    deadline: float = 2.0,
+    interval: float = 0.01,
+    what: str = "condition",
+) -> None:
+    """Bounded poll for the REAL-loop-timer tests: short-interval state
+    checks with a loose deadline (replaces fixed ``sleep(grace+margin)``)."""
+    loop = asyncio.get_running_loop()
+    end = loop.time() + deadline
+    while not predicate():
+        if loop.time() >= end:
+            raise AssertionError(
+                f"timed out after {deadline}s waiting for {what}")
+        await asyncio.sleep(interval)
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +144,12 @@ async def test_normal_release_path_and_idempotent_double_release():
     lease._release()  # manual double release must be idempotent
     # grace window still retains the body → budget held until expiry
     assert sf.leased_bytes == RESERVE
-    await asyncio.sleep(0.12)  # past grace (0.05) + timer dispatch
+    # REAL loop time — nothing accesses the entry afterwards, so only the
+    # grace timer (call_later, leased completion path) can refund+delete.
+    # Bounded poll past grace (0.05) instead of a fixed sleep.
+    await _poll_until(
+        lambda: sf.leased_bytes == 0 and sf.snapshot() == {},
+        what="grace timer zero-caller refund+delete")
     assert sf.leased_bytes == 0
     assert sf.snapshot() == {}
 
@@ -68,7 +159,7 @@ async def test_normal_release_path_and_idempotent_double_release():
 # ---------------------------------------------------------------------------
 
 async def test_budget_full_returns_none_and_bypass_fetches_directly():
-    sf = _registry()  # budget fits exactly ONE reserve
+    clock, sf = _fake_clock_registry()  # budget fits exactly ONE reserve
     gate = asyncio.Event()
 
     async def gated_factory():
@@ -91,7 +182,9 @@ async def test_budget_full_returns_none_and_bypass_fetches_directly():
     lease_a = await leader
     async with lease_a:
         assert lease_a.body == b"A"
-    await asyncio.sleep(0.12)
+    # incidental past-grace tail → virtual clock + lazy serial-point sweep
+    clock.advance(FAKE_GRACE_SECONDS + 1)
+    _sweep_lazy(sf)
     assert sf.leased_bytes == 0
 
 
@@ -142,7 +235,7 @@ async def test_factory_exception_same_instance_all_callers_immediate_refund():
 
 
 async def test_failure_refunds_budget_so_next_flight_can_reserve():
-    sf = _registry()  # single-flight budget
+    clock, sf = _fake_clock_registry()  # single-flight budget
 
     async def failing():
         raise RuntimeError("first attempt dies")
@@ -157,7 +250,9 @@ async def test_failure_refunds_budget_so_next_flight_can_reserve():
     assert lease is not None and lease.body == b"second"
     async with lease:
         pass
-    await asyncio.sleep(0.12)
+    # incidental past-grace tail → virtual clock + lazy sweep
+    clock.advance(FAKE_GRACE_SECONDS + 1)
+    _sweep_lazy(sf)
     assert sf.leased_bytes == 0
 
 
@@ -166,7 +261,7 @@ async def test_failure_refunds_budget_so_next_flight_can_reserve():
 # ---------------------------------------------------------------------------
 
 async def test_waiter_cancel_releases_own_ref_only_and_shared_flight_lives():
-    sf = _registry()
+    clock, sf = _fake_clock_registry()
     gate = asyncio.Event()
 
     async def gated_factory():
@@ -201,7 +296,9 @@ async def test_waiter_cancel_releases_own_ref_only_and_shared_flight_lives():
     assert survivor_lease.body == b"shared"
     async with leader_lease, survivor_lease:
         pass
-    await asyncio.sleep(0.12)
+    # incidental past-grace tail → virtual clock + lazy sweep
+    clock.advance(FAKE_GRACE_SECONDS + 1)
+    _sweep_lazy(sf)
     assert sf.leased_bytes == 0
     assert sf.snapshot() == {}
 
@@ -211,7 +308,7 @@ async def test_waiter_cancel_releases_own_ref_only_and_shared_flight_lives():
 # ---------------------------------------------------------------------------
 
 async def test_leader_cancel_waiters_shield_relead_and_succeed():
-    sf = _registry()
+    clock, sf = _fake_clock_registry()
     first_gate = asyncio.Event()
     calls: list[str] = []
 
@@ -248,7 +345,9 @@ async def test_leader_cancel_waiters_shield_relead_and_succeed():
     assert calls == ["first", "second"]
     async with lease:
         pass
-    await asyncio.sleep(0.12)
+    # incidental past-grace tail → virtual clock + lazy sweep
+    clock.advance(FAKE_GRACE_SECONDS + 1)
+    _sweep_lazy(sf)
     assert sf.leased_bytes == 0
     assert sf.snapshot() == {}
 
@@ -267,13 +366,24 @@ async def test_grace_expiry_moves_to_retired_then_refunds_on_last_release():
     seq = sf.snapshot()["k"][0][1]
     lease._release()  # caller released; grace still holds the body
     assert sf.leased_bytes == RESERVE
-    await asyncio.sleep(0.08)  # past grace
-    snap = sf.snapshot()
-    if snap:  # timer may or may not have dispatched yet at 0.08 vs 0.05
-        assert snap["k"][0][0] == "retired"
-        assert snap["k"][0][1] == seq  # in-place conversion: same seq
-        assert snap["k"][0][3] == "retained"
-    await asyncio.sleep(0.06)  # timer dispatch + zero-caller refund+delete
+    # REAL loop time — this test's SUBJECT is the grace timer itself
+    # (call_later dispatch → in-place retired/retained conversion →
+    # zero-caller refund+delete). Bounded poll: converge to the empty
+    # snapshot within a loose deadline; anything still visible past the
+    # original 0.08s margin must already show the converted tombstone shape.
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    deadline = started + 2.0
+    while sf.snapshot() != {}:
+        await asyncio.sleep(0.01)
+        now = loop.time()
+        if now >= deadline:
+            raise AssertionError("grace timer did not converge within 2s")
+        snap = sf.snapshot()
+        if snap and now - started > 0.08:
+            assert snap["k"][0][0] == "retired"
+            assert snap["k"][0][1] == seq  # in-place conversion: same seq
+            assert snap["k"][0][3] == "retained"
     assert sf.leased_bytes == 0
     assert sf.snapshot() == {}
 
@@ -304,7 +414,7 @@ async def test_grace_entry_joinable_by_straggler_within_window():
 # ---------------------------------------------------------------------------
 
 async def test_budget_eviction_drops_oldest_zero_caller_grace_entry():
-    sf = _registry(max_bytes=100)  # fits 60 + 60 only after eviction
+    clock, sf = _fake_clock_registry(max_bytes=100)  # fits 60 + 60 only after eviction
 
     async def factory_a():
         return b"A"
@@ -316,12 +426,16 @@ async def test_budget_eviction_drops_oldest_zero_caller_grace_entry():
     lease_a._release()  # zero callers, grace window still holds the body
     assert sf.leased_bytes == RESERVE
 
+    # Budget-driven SYNCHRONOUS eviction (serial-point ``_try_reserve`` —
+    # clock-free): "b" is admitted by evicting zero-caller grace entry "a".
     lease_b = await sf.fetch_or_bypass("b", factory_b, RESERVE)
     assert lease_b is not None  # admitted by evicting "a"
     assert sf.leased_bytes == RESERVE  # exactly one reserve in the ledger
     async with lease_b:
         assert lease_b.body == b"B"
-    await asyncio.sleep(0.12)
+    # incidental past-grace tail ("b") → virtual clock + lazy sweep
+    clock.advance(FAKE_GRACE_SECONDS + 1)
+    _sweep_lazy(sf)
     assert sf.leased_bytes == 0
     assert sf.snapshot() == {}
 
@@ -391,16 +505,35 @@ async def test_shutdown_grace_entry_becomes_retained_and_timer_cancelled():
         return b"body"
 
     lease = await sf.fetch_or_bypass("k", factory, RESERVE)
+    # Save entry ref BEFORE release (release severs lease._entry)
+    entry = lease._entry
+    timer_handle = entry.timer
+    assert timer_handle is not None
+    assert not timer_handle.cancelled()
+
     lease._release()  # grace window, zero callers
+
+    # Timer still live pre-shutdown
+    assert not timer_handle.cancelled()
+
     sf.shutdown()
+    # Shutdown MUST cancel the timer handle
+    assert timer_handle.cancelled()
+
     snap = sf.snapshot()
     if snap:  # zero-caller retained tombstone may already be reaped
         assert snap["k"][0][0] == "retired"
         assert snap["k"][0][3] == "retained"
-    # grace timer must not fire after shutdown: ledger stays converged
-    await asyncio.sleep(0.12)
-    assert sf.leased_bytes == 0
-    assert sf.snapshot() == {}
+    # Ledger stays converged past the original grace deadline — the
+    # cancelled timer will never fire.
+    loop = asyncio.get_running_loop()
+    end = loop.time() + 0.1
+    while True:
+        assert sf.leased_bytes == 0
+        assert sf.snapshot() == {}
+        if loop.time() >= end:
+            break
+        await asyncio.sleep(0.01)
 
 
 async def test_shutdown_failed_entry_refunds_immediately():
@@ -461,7 +594,7 @@ async def test_detached_leader_cancel_residual_waiter_refs_are_pure_counting():
     """After shutdown, a cancelled detached leader fails its flight while a
     waiter still holds a ref: the budget is refunded anyway (pure counting),
     and the waiter re-leads a FRESH flight successfully."""
-    sf = _registry()  # single-flight budget
+    clock, sf = _fake_clock_registry()  # single-flight budget
     gate = asyncio.Event()
     calls: list[str] = []
 
@@ -499,7 +632,9 @@ async def test_detached_leader_cancel_residual_waiter_refs_are_pure_counting():
     assert calls == ["first", "second"]
     async with lease:
         pass
-    await asyncio.sleep(0.12)
+    # incidental past-grace tail → virtual clock + lazy sweep
+    clock.advance(FAKE_GRACE_SECONDS + 1)
+    _sweep_lazy(sf)
     assert sf.leased_bytes == 0
     assert sf.snapshot() == {}
 
@@ -513,8 +648,8 @@ async def test_leader_cancel_double_waiter_generation_interleave():
     release handle is bound to the old ``_Entry`` OBJECT (never a fresh
     active-lookup by key), so the second waiter's later release decrements
     ONLY the old entry (deleting it at zero) and never the new one."""
-    sf = _registry()  # single-flight budget: the failed flight's immediate
-                      # refund is what makes the re-lead reservable.
+    clock, sf = _fake_clock_registry()  # single-flight budget: the failed flight's
+                        # immediate refund is what makes the re-lead reservable.
     gate1 = asyncio.Event()
     gate2 = asyncio.Event()
     observed: list[tuple[dict, int]] = []
@@ -586,15 +721,22 @@ async def test_leader_cancel_double_waiter_generation_interleave():
     assert lease_b is not None and lease_b.body == b"rescued"
     lease_a._release()
     lease_b._release()
-    await asyncio.sleep(0.12)  # past grace (0.05) + timer dispatch
+    # incidental past-grace tail → virtual clock + lazy sweep
+    clock.advance(FAKE_GRACE_SECONDS + 1)
+    _sweep_lazy(sf)
     assert sf.leased_bytes == 0
     assert sf.snapshot() == {}
 
 
 async def test_ownership_inplace_conversion_keeps_seq_within_layers():
     """Success never re-registers: active in-flight → active grace (same seq,
-    same layer); only grace expiry/shutdown moves it to retired."""
-    sf = _registry(result_grace_seconds=0.05)
+    same layer); only grace expiry/shutdown moves it to retired.
+
+    Representative lazy-path proof: saves the entry + timer handle before
+    release, asserts they are live pre-sweep, then proves the lazy serial-
+    point sweep converges them (the 60s grace means the real call_later
+    timer cannot race before the sweep)."""
+    clock, sf = _fake_clock_registry()
 
     async def factory():
         return b"body"
@@ -602,9 +744,23 @@ async def test_ownership_inplace_conversion_keeps_seq_within_layers():
     lease = await sf.fetch_or_bypass("k", factory, RESERVE)
     layer, seq, refs, state = sf.snapshot()["k"][0]
     assert (layer, state) == ("active", "grace")
+
+    # Save entry + timer ref BEFORE release (release severs lease._entry)
+    entry = lease._entry
+    timer_handle = entry.timer
+    assert timer_handle is not None
+    assert not timer_handle.cancelled()
+
     lease._release()
-    await asyncio.sleep(0.12)
-    assert sf.snapshot() == {}  # expired + zero callers → refunded + deleted
+
+    # Before sweep: entry/timer still live (real timer can't race with 60s)
+    assert sf.snapshot() != {}
+    assert not timer_handle.cancelled()
+
+    # Sweep past grace → lazy path converges
+    clock.advance(FAKE_GRACE_SECONDS + 1)
+    _sweep_lazy(sf)
+    assert sf.snapshot() == {}
 
     lease2 = await sf.fetch_or_bypass("k", factory, RESERVE)
     layer2, seq2, refs2, state2 = sf.snapshot()["k"][0]
@@ -647,7 +803,7 @@ async def test_network_concurrency_bounds_inflight_factories():
 
 
 async def test_registry_reusable_after_shutdown():
-    sf = _registry()
+    clock, sf = _fake_clock_registry()
 
     async def factory():
         return b"after"
@@ -657,7 +813,9 @@ async def test_registry_reusable_after_shutdown():
     assert lease is not None and lease.body == b"after"
     async with lease:
         pass
-    await asyncio.sleep(0.12)
+    # incidental past-grace tail → virtual clock + lazy sweep
+    clock.advance(FAKE_GRACE_SECONDS + 1)
+    _sweep_lazy(sf)
     assert sf.leased_bytes == 0
 
 
@@ -665,8 +823,7 @@ async def test_ledger_invariant_across_mixed_lifecycle():
     """Stress-mix: leaders, waiters, cancellations, failures, shutdown —
     leased_bytes must equal the exact set of counted entries at every settle
     point, and must converge to zero after everyone releases."""
-    sf = _registry(max_bytes=600, network_concurrency=8,
-                   result_grace_seconds=0.05)
+    clock, sf = _fake_clock_registry(max_bytes=600, network_concurrency=8)
     counted_states = {"in-flight", "grace", "retained"}
 
     def _assert_invariant() -> None:
@@ -714,7 +871,9 @@ async def test_ledger_invariant_across_mixed_lifecycle():
     for r in results:
         if isinstance(r, BaseException):
             raise r
-    await asyncio.sleep(0.15)  # past grace
+    # past grace (virtual) + lazy serial-point sweep over every live key
+    clock.advance(FAKE_GRACE_SECONDS + 1)
+    _sweep_lazy(sf)
     _assert_invariant()
     assert sf.leased_bytes == 0
     assert sf.snapshot() == {}
@@ -750,6 +909,10 @@ async def test_release_cuts_body_and_entry_references():
         holder["ref"] = weakref.ref(body)
         return body
 
+    def _body_unreachable() -> bool:
+        gc.collect()
+        return holder["ref"]() is None
+
     async def caller():
         lease = await sf.fetch_or_bypass("k", factory, RESERVE)
         assert lease is not None
@@ -759,13 +922,20 @@ async def test_release_cuts_body_and_entry_references():
             pass  # release at exit
         # grace window: the reaped-not-yet entry's future still holds the
         # body BY DESIGN (straggler join window) — deterministic here since
-        # the grace timer (0.05s) cannot have fired yet.
+        # the grace timer (0.05s) cannot have fired inside this synchronous
+        # section.
         gc.collect()
         assert ref() is not None
-        # keep the RELEASED Lease alive across a later await (route pattern:
-        # local handle survives a slow fan-out), past the grace expiry.
-        await asyncio.sleep(0.15)
-        holder["lease"] = lease  # keep the Lease object itself alive too
+        # keep the RELEASED Lease object itself alive too, across later
+        # awaits (route pattern: local handle survives a slow fan-out),
+        # past the grace expiry. REAL loop time: unreachability needs the
+        # grace timer to have actually DISPATCHED (a merely pending
+        # TimerHandle keeps its callback args — and thus the entry/body —
+        # reachable on some CPython versions even after cancel), so this
+        # cannot be virtualized with a FakeClock. Bounded poll.
+        holder["lease"] = lease
+        await _poll_until(_body_unreachable,
+                          what="grace timer dispatch releasing the body")
 
     await caller()
     lease = holder["lease"]
@@ -786,7 +956,7 @@ async def test_release_cut_does_not_break_release_accounting():
     """The cut must not disturb the dual refund rule: releasing still
     decrements the caller ref exactly once and a second (manual) release is
     a no-op even after the body was severed."""
-    sf = _registry(result_grace_seconds=0.05)
+    clock, sf = _fake_clock_registry()
 
     async def factory():
         return b"payload"
@@ -797,6 +967,8 @@ async def test_release_cut_does_not_break_release_accounting():
     assert lease.body is None
     lease._release()  # idempotent double release — no double decrement
     assert sf.leased_bytes == RESERVE  # grace window: budget still held
-    await asyncio.sleep(0.15)
+    # past (virtual) grace + lazy serial-point sweep → refund + delete
+    clock.advance(FAKE_GRACE_SECONDS + 1)
+    _sweep_lazy(sf)
     assert sf.leased_bytes == 0
     assert sf.snapshot() == {}

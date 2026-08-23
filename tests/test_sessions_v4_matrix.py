@@ -1126,3 +1126,174 @@ async def test_marker_503_degraded_flag():
 # state markers — that leg no longer exists; the v4 paths' marker
 # discipline (slimapi_sessions_source / slimapi_degraded_503) is locked
 # by the degraded-503 and Class-A tests above.)
+
+
+# ---------------------------------------------------------------------------
+# B3a attempt-1：param_version_mismatch / invalid_cursor wire 字节级锁定
+#
+# 抽取 exception factory（``_param_version_mismatch`` / ``_invalid_cursor``）
+# 的逐字节等价基线——``Accept-Encoding: identity`` 下锁定每个被抽取分支：
+# - HTTP status；
+# - ``response.content`` **原始 JSON bytes**（errors.coded_exception_handler
+#   → orjson 紧凑渲染，``{"code":…,"hint":…}``，含完整 hint）；
+# - 契约头面（Content-Type / Vary 在场；Cache-Control / Retry-After / ETag /
+#   Content-Encoding 缺席——identity 请求且非 503/§15 族；不锁
+#   Date / Content-Length 等框架派生头）；
+# - §8.3 错误优先级（param mismatch → invalid cursor → 503/上游交互）经
+#   组合输入锁定（本路由中 cursor 在场 × db 不可用的降级公式即 503
+#   fail-closed——上游错误只可达于 cursor 缺席请求，故「cursor 先于
+#   上游」以「400 先于 fail-closed 503 且零上游交互」的组合形态锁定）。
+# ---------------------------------------------------------------------------
+
+_PVM_ROOTS_BYTES = (
+    b'{"code":"param_version_mismatch","hint":"roots/start are v3-only; '
+    b'v4 uses the parent filter axis"}'
+)
+_PVM_LIMIT_BYTES = (
+    b'{"code":"param_version_mismatch","hint":"v4 limit domain is 1..500"}'
+)
+_PVM_ARCHIVED_BYTES = (
+    b'{"code":"param_version_mismatch","hint":"archived must be one of '
+    b"('omit', 'only', 'all')\"}"
+)
+_PVM_PARENT_BYTES = (
+    b'{"code":"param_version_mismatch","hint":"parent must not be empty"}'
+)
+_IC_MALFORMED_BYTES = (
+    b'{"code":"invalid_cursor","hint":"cursor is malformed; '
+    b'restart pagination from the first page"}'
+)
+_IC_FINGERPRINT_BYTES = (
+    b'{"code":"invalid_cursor","hint":"cursor filter context does not '
+    b'match this request; restart pagination from the first page"}'
+)
+
+
+def _assert_coded_error_wire_headers(resp: httpx.Response) -> None:
+    """错误族契约头锁定（identity 请求；不锁框架派生头）。"""
+    assert resp.headers["content-type"] == "application/json"
+    assert resp.headers["vary"] == "Accept-Encoding"
+    assert "cache-control" not in resp.headers
+    assert "retry-after" not in resp.headers
+    assert "etag" not in resp.headers
+    assert "content-encoding" not in resp.headers
+
+
+def _mismatched_cursor() -> str:
+    """铸 archived=only 指纹的合法 cursor（对缺省 omit 请求必不匹配）。"""
+    return encode_cursor(1, "s", {
+        "archived": "only", "parent": "all",
+        "search_hash": "", "allowlist_rev": "",
+    })
+
+
+@pytest.mark.parametrize(
+    ("query", "expected_content"),
+    [
+        pytest.param({"roots": "true"}, _PVM_ROOTS_BYTES, id="roots"),
+        pytest.param({"start": "0"}, _PVM_ROOTS_BYTES, id="start"),
+        pytest.param({"limit": "501"}, _PVM_LIMIT_BYTES, id="limit-501"),
+        pytest.param({"archived": "xyz"}, _PVM_ARCHIVED_BYTES, id="archived"),
+        pytest.param({"parent": ""}, _PVM_PARENT_BYTES, id="parent-empty"),
+    ],
+)
+async def test_param_version_mismatch_wire_bytes(query, expected_content):
+    """§4.1 四个 param_version_mismatch 分支的完整 body bytes + 头面。"""
+    app, seen = _build_app(_StubAux("disabled"))
+    async with _client(app) as client:
+        resp = await client.get(
+            "/slimapi/sessions", params={"v": "4", **query},
+            headers=IDENTITY)
+    assert resp.status_code == 422
+    assert resp.content == expected_content
+    _assert_coded_error_wire_headers(resp)
+    assert not seen
+
+
+@pytest.mark.parametrize(
+    ("cursor_value", "expected_content"),
+    [
+        pytest.param(
+            "!!!not-base64url!!!", _IC_MALFORMED_BYTES, id="malformed"),
+        pytest.param(
+            _mismatched_cursor(), _IC_FINGERPRINT_BYTES,
+            id="fingerprint-mismatch"),
+    ],
+)
+async def test_invalid_cursor_wire_bytes(cursor_value, expected_content):
+    """§8.3 两个 invalid_cursor 分支的完整 body bytes + 头面 + 零上游交互。
+
+    请求为缺省 Class A（archived=omit / parent=all）× db 不可用：若
+    cursor 校验缺席或后置，此请求将落 503 fail-closed（或 200 降级打
+    上游）——failing handler 保证任何上游交互即测试红。
+    """
+    def _fail(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("cursor 校验必须先于任何上游交互")
+
+    app, seen = _build_app(_StubAux("disabled"), handler=_fail)
+    async with _client(app) as client:
+        resp = await client.get("/slimapi/sessions", params={
+            "v": "4", "cursor": cursor_value}, headers=IDENTITY)
+    assert resp.status_code == 400
+    assert resp.content == expected_content
+    _assert_coded_error_wire_headers(resp)
+    assert not seen
+
+
+@pytest.mark.parametrize(
+    ("query", "expected_content"),
+    [
+        pytest.param(
+            {"roots": "true", "cursor": "!!!not-base64url!!!"},
+            _PVM_ROOTS_BYTES, id="roots-beats-cursor"),
+        pytest.param(
+            {"limit": "501", "cursor": _mismatched_cursor()},
+            _PVM_LIMIT_BYTES, id="limit-beats-cursor"),
+        pytest.param(
+            {"archived": "xyz", "cursor": "!!!not-base64url!!!"},
+            _PVM_ARCHIVED_BYTES, id="archived-beats-cursor"),
+        pytest.param(
+            {"parent": "", "cursor": _mismatched_cursor()},
+            _PVM_PARENT_BYTES, id="parent-beats-cursor"),
+    ],
+)
+async def test_priority_param_mismatch_beats_invalid_cursor(
+    query, expected_content,
+):
+    """§8.3 优先级：param_version_mismatch（422）先于 invalid_cursor（400）。
+
+    每个参数分支 ×（坏 cursor | 指纹不匹配 cursor）组合输入——完整
+    body bytes 同时锁定胜出分支身份。
+    """
+    app, seen = _build_app(_StubAux("disabled"))
+    async with _client(app) as client:
+        resp = await client.get(
+            "/slimapi/sessions", params={"v": "4", **query},
+            headers=IDENTITY)
+    assert resp.status_code == 422
+    assert resp.content == expected_content
+    _assert_coded_error_wire_headers(resp)
+    assert not seen
+
+
+async def test_priority_param_branch_evaluation_order():
+    """§4.1 检查次序：roots/start → limit → archived → parent。
+
+    双违规组合输入锁定先胜分支（后续分支不再评估）。
+    """
+    cases = [
+        ({"roots": "true", "limit": "501"}, _PVM_ROOTS_BYTES),
+        ({"start": "0", "archived": "xyz"}, _PVM_ROOTS_BYTES),
+        ({"limit": "501", "archived": "xyz"}, _PVM_LIMIT_BYTES),
+        ({"limit": "501", "parent": ""}, _PVM_LIMIT_BYTES),
+        ({"archived": "xyz", "parent": ""}, _PVM_ARCHIVED_BYTES),
+    ]
+    for query, expected_content in cases:
+        app, seen = _build_app(_StubAux("disabled"))
+        async with _client(app) as client:
+            resp = await client.get(
+                "/slimapi/sessions", params={"v": "4", **query},
+                headers=IDENTITY)
+        assert resp.status_code == 422
+        assert resp.content == expected_content
+        assert not seen

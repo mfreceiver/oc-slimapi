@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -38,6 +39,27 @@ from oc_slimapi.actions import (
     load_registry,
 )
 from oc_slimapi.config import Settings
+
+
+def _os_pid_running(pid: int) -> bool:
+    """Check if a process with the given PID is running (not zombie).
+
+    Reads ``/proc/<pid>/stat``; treats 'Z' (zombie) as not running since
+    a zombie holds no file descriptors and cannot keep a pipe open.
+    Returns ``True`` only if the process exists and is not a zombie.
+    Never raises."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            fields = f.read().split()
+        # field 3 (0-indexed: 2) is the process state character
+        if len(fields) >= 3:
+            return fields[2] != "Z"
+        return False  # truncated stat → not reliably running
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    except (PermissionError, OSError):
+        return True  # defensive: can't determine → assume running
+
 
 # ---------------------------------------------------------------------------
 # Manifest / registry builders
@@ -392,14 +414,22 @@ async def test_single_flight_serializes(tmp_path):
     assert ok[0].ok is True
 
 
-async def test_semaphore_busy_service_level(tmp_path):
+async def test_semaphore_busy_service_level(tmp_path, monkeypatch):
     manifest = {
         "a": _base_exec(argv=[sys.executable, "-c", "import time; time.sleep(5)"], timeout_s=15),
         "b": _base_exec(argv=[sys.executable, "-c", "import time; time.sleep(5)"], timeout_s=15),
     }
     reg = _registry(tmp_path, manifest, max_concurrent=1)
+    # Happens-before: fire event when "a" has acquired the semaphore and starts spawning.
+    # _spawn is @staticmethod — the original takes only spec (no self).
+    spawn_started = asyncio.Event()
+    original_spawn = ActionRegistry._spawn
+    async def _spawn_signal(self, spec):
+        spawn_started.set()
+        return await original_spawn(spec)
+    monkeypatch.setattr(ActionRegistry, "_spawn", _spawn_signal)
     holder = asyncio.create_task(reg.invoke("a", confirmed=False))
-    await asyncio.sleep(0.2)  # let "a" admit + spawn before queuing "b"
+    await spawn_started.wait()  # "a" admitted + spawn started
     with pytest.raises(ActionBusy) as ei:
         await reg.invoke("b", confirmed=False)
     assert ei.value.retry_after == 2
@@ -660,10 +690,61 @@ async def test_audit_throttle(tmp_path, audit_capture):
     assert recs[1]["throttled"] is True
 
 
-async def test_audit_disconnect(tmp_path, audit_capture):
-    reg = _registry(tmp_path, {"run": _base_exec(argv=["/bin/sh", "-c", "sleep 300.5 & sleep 300.5"], timeout_s=60)})
+async def test_audit_disconnect(tmp_path, audit_capture, monkeypatch):
+    # Shell: background two long-lived sleeps, write each child PID to a
+    # pidfile via ``$!`` (POSIX: PID of the most recent background command).
+    # ``wait`` keeps the shell alive until the children terminate (so the
+    # process group leader does NOT exit before cancellation).
+    pidfile1 = tmp_path / "child1.pid"
+    pidfile2 = tmp_path / "child2.pid"
+    shell_cmd = (
+        f"sleep 300.5 & echo $! > {shlex.quote(str(pidfile1))}; "
+        f"sleep 300.5 & echo $! > {shlex.quote(str(pidfile2))}; "
+        f"wait"
+    )
+    reg = _registry(
+        tmp_path,
+        {"run": _base_exec(argv=["/bin/sh", "-c", shell_cmd], timeout_s=60)},
+    )
+    # Capture the group-leader PID (shell) via the spawn seam.
+    proc_pid = None
+    child_pids: list[int] = []
+    original_spawn = ActionRegistry._spawn
+    async def _spawn_capture(self, spec):
+        nonlocal proc_pid
+        proc = await original_spawn(spec)
+        proc_pid = proc.pid
+        return proc
+    monkeypatch.setattr(ActionRegistry, "_spawn", _spawn_capture)
+
+    # Post-spawn happens-before seam: _drain_stdout is called only after
+    # ``proc = await asyncio.shield(spawn_task)`` succeeds at line 651
+    # (``_execute``).  At that point the caller has a valid ``Process`` handle
+    # and the child is running — a cancellation lands in the *post-spawn*
+    # running path, not the spawn-phase (Bug F) path.
+    post_spawn = asyncio.Event()
+    original_drain = ActionRegistry._drain_stdout
+    async def _drain_signal(self, proc, spec, state):
+        post_spawn.set()
+        return await original_drain(proc, spec, state)
+    monkeypatch.setattr(ActionRegistry, "_drain_stdout", _drain_signal)
+
     task = asyncio.create_task(reg.invoke("run", confirmed=False))
-    await asyncio.sleep(0.3)  # let it spawn before cancelling
+    await post_spawn.wait()  # proc is assigned, child is running
+
+    # Wait for both background child pidfiles to appear, then read PIDs.
+    deadline = time.monotonic() + 3.0
+    for pf in (pidfile1, pidfile2):
+        while time.monotonic() < deadline:
+            if pf.exists():
+                break
+            await asyncio.sleep(0.05)
+        assert pf.exists(), f"background child pidfile {pf} not created within deadline"
+        child_pids.append(int(pf.read_text().strip()))
+
+    all_pids = [proc_pid] + child_pids
+    assert all(p is not None for p in all_pids), "failed to capture all descendant PIDs"
+
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -673,9 +754,16 @@ async def test_audit_disconnect(tmp_path, audit_capture):
         and r["timeout"] is False and r["throttled"] is False
         for r in recs
     )
-    # Cleanup must have killed the process group (no orphaned children).
-    out = subprocess.run(["pgrep", "-f", "sleep 300.5"], capture_output=True, text=True)
-    assert out.stdout.strip() == ""
+    # Verify the entire process group (leader + both background children) was
+    # killed by ActionRegistry's killpg.  Bounded poll on exact PIDs — no
+    # global ``pgrep``.
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        if not any(_os_pid_running(p) for p in all_pids):
+            break
+        await asyncio.sleep(0.05)
+    running = [p for p in all_pids if _os_pid_running(p)]
+    assert not running, f"descendant(s) still alive after cleanup: {running}"
 
 
 async def test_audit_under_error_log_level(tmp_path, audit_capture, monkeypatch):
@@ -844,7 +932,7 @@ async def test_drain_phase_cancel_audits_and_cleans(tmp_path, audit_capture):
     assert out.stdout.strip() == "", f"escaped grandchild still alive: {out.stdout!r}"
 
 
-async def test_audit_disconnect_during_semaphore_wait(tmp_path, audit_capture):
+async def test_audit_disconnect_during_semaphore_wait(tmp_path, audit_capture, monkeypatch):
     """Bug E regression: cancelling an invoke parked on the admission
     semaphore must emit a disconnect audit record (previously the cancellation
     propagated WITHOUT any audit)."""
@@ -853,10 +941,27 @@ async def test_audit_disconnect_during_semaphore_wait(tmp_path, audit_capture):
         "b": _base_exec(argv=[sys.executable, "-c", "import time; time.sleep(5)"], timeout_s=15),
     }
     reg = _registry(tmp_path, manifest, max_concurrent=1)
+    # Happens-before: fire event when "a" has acquired the semaphore + spawns.
+    # _spawn is @staticmethod — the original takes only spec (no self).
+    spawn_started = asyncio.Event()
+    original_spawn = ActionRegistry._spawn
+    async def _spawn_signal(self, spec):
+        spawn_started.set()
+        return await original_spawn(spec)
+    monkeypatch.setattr(ActionRegistry, "_spawn", _spawn_signal)
     holder = asyncio.create_task(reg.invoke("a", confirmed=False))
-    await asyncio.sleep(0.2)  # "a" admitted + spawning
+    await spawn_started.wait()  # "a" admitted + spawning
+    # Happens-before: fire event when "b" enters the semaphore acquire (will block).
+    # "a"'s acquire already happened before the tracker was installed, so "b"'s
+    # call is the first call the tracker sees (count == 1).
+    parked_on_semaphore = asyncio.Event()
+    original_acquire = reg._semaphore.acquire
+    async def _tracked_acquire():
+        parked_on_semaphore.set()  # first tracked call = "b" attempting acquire
+        return await original_acquire()
+    monkeypatch.setattr(reg._semaphore, "acquire", _tracked_acquire)
     parked = asyncio.create_task(reg.invoke("b", confirmed=False))
-    await asyncio.sleep(0.1)  # "b" parked on the (held) semaphore
+    await parked_on_semaphore.wait()  # "b" parked on the (held) semaphore
     parked.cancel()
     with pytest.raises(asyncio.CancelledError):
         await parked
@@ -887,12 +992,14 @@ async def test_spawn_cancelled_during_spawn_cleans_child(tmp_path, audit_capture
     recovers the ``Process`` handle, and runs the full killpg + reap +
     failure-path-audit cleanup."""
     real_spawn = ActionRegistry._spawn
+    spawn_entered = asyncio.Event()
 
     async def slow_spawn(self, spec):
+        spawn_entered.set()  # signal: invoke entered the spawn function
         # Widen the spawn window so the cancellation deterministically lands
         # mid-spawn (before any Process handle exists).
         await asyncio.sleep(0.3)
-        return await real_spawn(self, spec)
+        return await real_spawn(spec)  # _spawn is @staticmethod → no self
 
     monkeypatch.setattr(ActionRegistry, "_spawn", slow_spawn)
     reg = _registry(
@@ -900,7 +1007,7 @@ async def test_spawn_cancelled_during_spawn_cleans_child(tmp_path, audit_capture
         {"run": _base_exec(argv=["/bin/sh", "-c", "sleep 31 & sleep 31"], timeout_s=60)},
     )
     task = asyncio.create_task(reg.invoke("run", confirmed=False))
-    await asyncio.sleep(0.05)  # invoke is parked inside the (sleeping) spawn
+    await spawn_entered.wait()  # invoke is parked inside the (sleeping) spawn
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -931,13 +1038,21 @@ async def test_drain_deadline_preserves_partial_output(tmp_path, monkeypatch):
 
     Setup: the sh child writes a prefix then exits; a ``setsid`` grandchild
     escapes the process group and keeps the stdout pipe write end open, so the
-    drain genuinely stalls and the hard deadline fires."""
+    drain genuinely stalls and the hard deadline fires.
+
+    The escaped grandchild's exact PID is captured via a pidfile so cleanup
+    targets only that process — never a global ``pgrep`` scan that could
+    collide with unrelated ``sleep`` processes on the system."""
+    pidfile = tmp_path / "escaped-grandchild.pid"
     monkeypatch.setattr("oc_slimapi.actions._DRAIN_DEADLINE_S", 0.5)
     reg = _registry(
         tmp_path,
         {
             "q": _base_query(
-                argv=["/bin/sh", "-c", "printf 'partial-data-here'; setsid sleep 4 &"],
+                argv=[
+                    "/bin/sh", "-c",
+                    f"printf 'partial-data-here'; setsid sleep 30 & echo $! > {shlex.quote(str(pidfile))}",
+                ],
                 timeout_s=60,
             )
         },
@@ -946,11 +1061,43 @@ async def test_drain_deadline_preserves_partial_output(tmp_path, monkeypatch):
     assert res.ok is True  # child exited 0; drain deadline ≠ action timeout
     assert res.truncated is True
     assert res.markdown == "partial-data-here"
-    await asyncio.sleep(4.0)  # the escaped grandchild self-terminates
-    # anchored: a bare `-f "sleep 4"` substring-matches unrelated long-lived
-    # processes (e.g. an external `sleep 420` monitor from a parallel session).
-    out = subprocess.run(["pgrep", "-f", "^sleep 4$"], capture_output=True, text=True)
-    assert out.stdout.strip() == ""
+
+    # Read the exact PID of the escaped setsid grandchild.
+    escaped_pid = int(pidfile.read_text().strip())
+
+    # Verify the grandchild is still running (confirming it kept the pipe open
+    # and triggered the drain deadline).
+    assert _os_pid_running(escaped_pid), (
+        f"escaped grandchild {escaped_pid} exited before drain deadline could trigger"
+    )
+
+    # Clean up the exact grandchild.  Never orphan — the ``finally`` block is
+    # the last-resort safety net even if an assertion or signal fails.
+    try:
+        os.kill(escaped_pid, signal.SIGTERM)
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if not _os_pid_running(escaped_pid):
+                break
+            await asyncio.sleep(0.05)
+        else:
+            # SIGTERM didn't work within deadline → escalate to SIGKILL.
+            os.kill(escaped_pid, signal.SIGKILL)
+            deadline2 = time.monotonic() + 2.0
+            while time.monotonic() < deadline2:
+                if not _os_pid_running(escaped_pid):
+                    break
+                await asyncio.sleep(0.05)
+    finally:
+        if _os_pid_running(escaped_pid):
+            try:
+                os.kill(escaped_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    assert not _os_pid_running(escaped_pid), (
+        f"escaped grandchild {escaped_pid} still alive after cleanup"
+    )
 
 
 # ---------------------------------------------------------------------------

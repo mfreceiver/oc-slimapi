@@ -601,6 +601,104 @@ async def test_breaker_swap_resets_warmup(good_db: Path):
 
 
 # ---------------------------------------------------------------------------
+# B3a-B1 恰等边界（三个精确边界测试）
+# ---------------------------------------------------------------------------
+
+
+def test_breaker_p99_exactly_trip_threshold():
+    """P99 恰等于 trip 阈值（20.0）→ breaker trip（open）。
+
+    ``_pctl()`` 的 ceil 秩公式对 11 样本：
+      rank = -(-11 * 99 // 100) - 1 = 11 - 1 = 10
+    P99 = ordered[10] = 所有样本的最大值。
+    10 个快样本 warmup + 第 11 个恰为 20.0 → P99 == 20.0 == trip_ms → trip。
+    """
+    clk = FakeClock()
+    br = LatencyBreaker(clock=clk)
+    for _ in range(10):
+        br.record(0.1)
+    assert not br.open
+    br.record(20.0)
+    assert br.open
+    assert br.phase == "open"
+
+
+def test_breaker_probe_at_recover_threshold():
+    """探针恰等于 recover 阈值（10.0）→ 不恢复（连击不增加）。
+
+    ``note_probe()`` 条件 ``latency_ms < self._recover_ms`` 是严格 <，
+    10.0 < 10.0 = False → 连击清零而非增加。对照 9.99 < 10.0 连击增加。
+    """
+    br = LatencyBreaker()
+    for _ in range(11):
+        br.record(1000.0)
+    assert br.open
+
+    # 10.0 恰等于阈值 → 清零连击
+    assert br.note_probe(10.0) is False
+    assert br.snapshot()["probe_streak"] == 0
+
+    # 9.99 < 10.0 → 连击正常计数
+    assert br.note_probe(9.99) is False
+    assert br.snapshot()["probe_streak"] == 1
+    assert br.note_probe(9.99) is False
+    assert br.snapshot()["probe_streak"] == 2
+    assert br.note_probe(9.99) is True
+    assert br.phase == "probation"
+
+
+def test_breaker_prune_at_cutoff_boundary():
+    """时间剪枝恰在 cutoff：cutoff 前样本被删、恰==cutoff 样本保留。
+
+    ``_prune()`` 条件 ``samples[0][0] < cutoff`` 淘汰 / ``>= cutoff`` 保留。
+    构造步骤：
+      ① record(1000.0) at time=1000.0（将落在 cutoff 前）
+      ② advance(60.0) → now=1060.0, cutoff=1000.0 → record(1.0) 恰在 cutoff
+      ③ advance(0.001) → now=1060.001, cutoff=1000.001 → record(2.0) 触发 prune
+    断言：(a) samples==2 而非 3（prune 确被触发）；
+          (b) p99_ms==2.0（1000.0 样本被删，不再拉高 P99）→ cutoff 前样本淘汰；
+          (c) at-cutoff 样本（1.0）存活。
+    """
+    clk = FakeClock()
+    br = LatencyBreaker(clock=clk)
+
+    # 样本 1：时间戳 1000.0（将落在 cutoff 前）
+    br.record(1000.0)
+    snap = br.snapshot()
+    assert snap["p99_ms"] == 1000.0
+    assert snap["samples"] == 1
+
+    # 推进 60s → now=1060.0, cutoff=1000.0
+    clk.advance(60.0)
+
+    # 样本 2：时间戳恰==cutoff（1060.0），条件 >= 保留
+    br.record(1.0)
+    snap = br.snapshot()
+    assert snap["samples"] == 2
+    assert snap["p99_ms"] == 1000.0  # P99 = max(1000.0, 1.0)
+
+    # 再推进 0.001s → now=1060.001, cutoff=1000.001 > 1000.0
+    clk.advance(0.001)
+
+    # 样本 3 触发 prune：
+    #   (1000.0, 1000.0): 1000.0 < 1000.001 → 淘汰
+    #   (1060.0, 1.0):    1060.0 >= 1000.001 → 保留
+    #   追加 (1060.001, 2.0)
+    br.record(2.0)
+
+    snap = br.snapshot()
+    # total=3 但 samples=2 → 1 个被 prune 淘汰（防伪通过）
+    assert snap["total"] == 3
+    assert snap["samples"] == 2  # at-cutoff 样本 + 新样本
+    # P99=2.0（max of {1.0, 2.0}），1000.0 高延迟样本已不在
+    assert snap["p99_ms"] == 2.0
+    # 验证 at-cutoff 样本 (1060.0, 1.0) 确实存活
+    timestamps = [t for t, _ in br._samples]
+    assert 1060.0 in timestamps
+    assert 1000.0 not in timestamps
+
+
+# ---------------------------------------------------------------------------
 # FIX-CORR-3：半开探针两段式 —— SELECT 1 只作存活预检，canary 延迟才
 # 参与关断判据（连接健康但投影仍慢 → 熔断器保持 open）。
 # ---------------------------------------------------------------------------

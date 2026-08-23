@@ -445,6 +445,14 @@ async def test_v4_db_single_unknown_sid_404(tmp_path):
         body = resp.json()
         assert body["code"] == "session_not_found"
         assert body["sessionID"] == "ses_nope"
+        # B3b wire lock (identity): raw orjson-compact bytes + headers. The
+        # DB-path 404 (upstream_errors session-not-found family) carries NO
+        # Cache-Control — unlike the v4 single success body (no-store).
+        assert resp.content == \
+            b'{"code":"session_not_found","sessionID":"ses_nope"}'
+        assert resp.headers["content-type"] == "application/json"
+        assert resp.headers["vary"] == "Accept-Encoding"
+        assert "cache-control" not in resp.headers
         assert seen == []
     finally:
         await aux.stop()

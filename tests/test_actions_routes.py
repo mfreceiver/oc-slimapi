@@ -438,21 +438,78 @@ async def test_post_empty_body_treated_as_object():
 async def test_post_malformed_body_422():
     reg = ActionRegistry(enabled=True, actions={"run": _spec("run")}, max_concurrent=4)
     client, _ = await _client(reg)
+    # identity: lock the raw orjson-compact body bytes (no gzip negotiation)
+    identity = {**VERSION_HEADERS, "Accept-Encoding": "identity"}
     async with client:
         garbage = await client.post(
-            "/slimapi/actions/run", headers=VERSION_HEADERS, content=b"not json{",
+            "/slimapi/actions/run", headers=identity, content=b"not json{",
         )
         non_object = await client.post(
-            "/slimapi/actions/run", headers=VERSION_HEADERS, content=b"[1,2]",
+            "/slimapi/actions/run", headers=identity, content=b"[1,2]",
         )
         non_bool_confirm = await client.post(
             "/slimapi/actions/run",
-            headers=VERSION_HEADERS, content=b'{"confirm": "yes"}',
+            headers=identity, content=b'{"confirm": "yes"}',
         )
     for response in (garbage, non_object, non_bool_confirm):
         assert response.status_code == 422
-        assert orjson.loads(response.content) == {"code": "invalid_request_body"}
+        # B3b wire lock: identical raw bytes from all three 422 branches
+        # (the construction converges into one factory — bytes must not move).
+        assert response.content == b'{"code":"invalid_request_body"}'
         assert response.headers["Cache-Control"] == "no-store"
+        assert response.headers["content-type"] == "application/json"
+        assert response.headers["vary"] == "Accept-Encoding"
+
+
+def _starlette_request(content: bytes):
+    from starlette.requests import Request
+
+    async def receive():
+        return {"type": "http.request", "body": content, "more_body": False}
+
+    scope = {
+        "type": "http", "asgi": {"version": "3.0"},
+        "http_version": "1.1", "method": "POST",
+        "scheme": "http", "path": "/slimapi/actions/run",
+        "raw_path": b"/slimapi/actions/run", "query_string": b"",
+        "root_path": "", "headers": [],  # no Content-Length → chunked path
+        "client": ("testclient", 50000), "server": ("testserver", 80),
+    }
+    return Request(scope, receive)
+
+
+async def test_read_body_decode_error_preserves_cause():
+    """B3b chaining lock: the JSON-decode 422 branch must raise
+    ``... from exc`` — the CodedHTTPException chains the original
+    orjson.JSONDecodeError even after the factory convergence."""
+    import orjson as _orjson
+
+    from oc_slimapi.errors import CodedHTTPException
+    from oc_slimapi.routes.actions import _read_body
+
+    request = _starlette_request(b"not json{")
+    with pytest.raises(CodedHTTPException) as ei:
+        await _read_body(request)
+    assert ei.value.status_code == 422
+    assert ei.value.code == "invalid_request_body"
+    assert ei.value.headers == {"Cache-Control": "no-store"}
+    assert isinstance(ei.value.__cause__, _orjson.JSONDecodeError)
+
+
+async def test_read_body_non_object_and_non_bool_raise_without_cause():
+    """B3b chaining lock: the non-object / non-bool-confirm branches raise
+    the same 422 WITHOUT cause chaining (no underlying exception exists)."""
+    from oc_slimapi.errors import CodedHTTPException
+    from oc_slimapi.routes.actions import _read_body
+
+    for content in (b"[1,2]", b'{"confirm": "yes"}'):
+        request = _starlette_request(content)
+        with pytest.raises(CodedHTTPException) as ei:
+            await _read_body(request)
+        assert ei.value.status_code == 422
+        assert ei.value.code == "invalid_request_body"
+        assert ei.value.headers == {"Cache-Control": "no-store"}
+        assert ei.value.__cause__ is None
 
 
 # ---------------------------------------------------------------------------

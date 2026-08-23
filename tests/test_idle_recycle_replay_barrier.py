@@ -308,3 +308,155 @@ async def test_barrier_write_failure_fails_open_with_error_log(
         and "replay barrier write FAILED" in rec.message
         for rec in caplog.records
     )
+
+
+# ===========================================================================
+# 7 — dual-path monotonicity: disconnect barrier, then idle-recycle barrier
+# ===========================================================================
+
+
+async def test_barrier_watermark_monotonic_across_disconnect_then_idle_recycle(
+    fast_grace,
+):
+    """Two loss rounds must ADVANCE the watermark to the newer last_seq.
+
+    Round 1 goes through the disconnect hook (``_notify_upstream_loss``,
+    global_hub.py:629 — the run() EOF/exception/reconnect paths call
+    exactly this method synchronously); frames then continue the sequence
+    above the watermark; round 2 goes through the idle-recycle teardown
+    (``notify_idle_recycle_loss`` via ``_remove_hub_after_grace``). The
+    replay_log.py:577 only-increase guard must let the second round pin
+    the NEW max — a stale round-1 watermark would let cursors between W1
+    and the new last_seq fall through to window judgment across an
+    unobserved gap (the silent-loss shape FIX-CORR-1 closed).
+    """
+    log = ReplayLog()
+    registry = _armed_registry(log)
+    hub = registry.get_global()
+    sid_domain = token_domain("s-mono")
+
+    for i in range(2):
+        log.append(GLOBAL_DOMAIN, {"i": i})
+    log.append(sid_domain, {"i": 0})
+    w1_global = log.last_seq(GLOBAL_DOMAIN)
+    w1_token = log.last_seq(sid_domain)
+
+    # Round 1 — disconnect path writes the barrier across both domains.
+    hub._notify_upstream_loss()
+    assert log.barrier_watermark(GLOBAL_DOMAIN) == w1_global
+    assert log.barrier_watermark(sid_domain) == w1_token
+
+    # Recovery: new frames push each domain's last_seq past its watermark.
+    for i in range(3):
+        log.append(GLOBAL_DOMAIN, {"i": f"post-{i}"})
+    log.append(sid_domain, {"i": "post"})
+    new_global = log.last_seq(GLOBAL_DOMAIN)
+    new_token = log.last_seq(sid_domain)
+    assert new_global > w1_global
+    assert new_token > w1_token
+
+    # Round 2 — idle-recycle path. The watermark must land on the NEW
+    # larger last_seq (only-increase), never stay at / regress to W1.
+    await _run_idle_removal(registry)
+
+    assert registry._global is None
+    assert log.barrier_watermark(GLOBAL_DOMAIN) == new_global
+    assert log.barrier_watermark(sid_domain) == new_token
+
+
+# ===========================================================================
+# 8 — full-domain enumeration: global + TWO distinct token domains
+# ===========================================================================
+
+
+async def test_barrier_enumerates_every_existing_domain_exactly(fast_grace):
+    """``write_barrier(None)`` snapshots ``list(self._domains.values())``
+    — global + EVERY token domain created in the epoch gets its OWN
+    watermark pinned to its OWN last_seq (not global's, not a shared max).
+    Distinct append counts keep the three expected seqs pairwise
+    distinct, so each per-domain equality is an exact-match check.
+    """
+    log = ReplayLog()
+    registry = _armed_registry(log)
+
+    for i in range(2):
+        log.append(GLOBAL_DOMAIN, {"i": i})
+    sid_a = token_domain("sid-alpha")
+    sid_b = token_domain("sid-beta")
+    for i in range(3):
+        log.append(sid_a, {"i": i})
+    for i in range(5):
+        log.append(sid_b, {"i": i})
+
+    expected = {
+        GLOBAL_DOMAIN: log.last_seq(GLOBAL_DOMAIN),
+        sid_a: log.last_seq(sid_a),
+        sid_b: log.last_seq(sid_b),
+    }
+    assert len(set(expected.values())) == len(expected) == 3
+    for domain in expected:
+        assert log.barrier_watermark(domain) is None
+
+    await _run_idle_removal(registry)
+
+    assert registry._global is None
+    for domain, last in expected.items():
+        assert log.barrier_watermark(domain) == last, domain
+
+
+# ===========================================================================
+# 9 — post-barrier domain: snapshot covers only domains existing at write
+# ===========================================================================
+
+
+async def test_barrier_snapshot_excludes_domains_created_afterwards(
+    fast_grace,
+):
+    """A token domain created AFTER the full-domain barrier carries NO
+    watermark and replays through the normal window judgment — locking
+    the "barrier spans only the write-time snapshot" semantics (§7.2:
+    a first-connect-shaped domain never gets barrier-intercepted).
+
+    Contrast probe: the identical cursor shape (== last_seq) on a domain
+    that DID exist at write time still gets ``resync{reconnect_no_replay}``.
+    """
+    log = ReplayLog()
+    registry = _armed_registry(log)
+
+    log.append(GLOBAL_DOMAIN, {"i": 0})
+    early = token_domain("sid-early")
+    log.append(early, {"i": 0})
+    g_last = log.last_seq(GLOBAL_DOMAIN)
+    e_last = log.last_seq(early)
+
+    await _run_idle_removal(registry)
+
+    # Snapshot domains are barriered as usual.
+    assert registry._global is None
+    assert log.barrier_watermark(GLOBAL_DOMAIN) == g_last
+    assert log.barrier_watermark(early) == e_last
+
+    # Domain created after the barrier write → NOT in the snapshot → no
+    # watermark, ever (barriers only move on a barrier write, never on
+    # append).
+    late = token_domain("sid-late")
+    entry = log.append(late, {"i": "late-1"})
+    assert log.barrier_watermark(late) is None
+
+    # Its frames replay normally (no interception): cursor 0 → the frame.
+    out = log.replay(late, after_seq=0, epoch=log.epoch)
+    assert isinstance(out, ReplayFrames)
+    assert [e.seq for e in out.entries] == [entry.seq]
+
+    # Cursor exactly at the late domain's last_seq → up_to_date EMPTY
+    # frames (not a resync) — the §7.2 defect shape ONLY triggers through
+    # a watermark, which this domain does not have.
+    out_top = log.replay(late, after_seq=entry.seq, epoch=log.epoch)
+    assert isinstance(out_top, ReplayFrames)
+    assert out_top.entries == ()
+
+    # Contrast: the same cursor==last_seq shape on the early domain is
+    # intercepted by its watermark.
+    out_early = log.replay(early, after_seq=e_last, epoch=log.epoch)
+    assert isinstance(out_early, ReplayResync)
+    assert out_early.reason == RESYNC_RECONNECT_NO_REPLAY
