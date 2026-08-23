@@ -560,7 +560,20 @@ class SlimapiSelectorMiddleware:
             )(scope, receive, send)
             return
 
-        if int(values[0]) not in SUPPORTED_WIRE_VERSIONS:
+        # BUG-004: guard against >19-digit decimal strings (exceed int64
+        # range) and Python 3.14's PYTHONINTMAXSTRDIGITS limit (default
+        # 4300). Length > 19 → unsupported version; also wrap int() in
+        # try/except ValueError → same fallback.
+        raw = values[0]
+        if len(raw) > 19:
+            await self._reject_version(scope, receive, send)
+            return
+        try:
+            parsed = int(raw)
+        except ValueError:
+            await self._reject_version(scope, receive, send)
+            return
+        if parsed not in SUPPORTED_WIRE_VERSIONS:
             # §2: lexically-valid values outside {3, 4} are unsupported —
             # including the header-based v2 era (which never reaches here:
             # the header is not read).

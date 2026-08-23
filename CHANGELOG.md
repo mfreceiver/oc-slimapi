@@ -34,6 +34,19 @@ _暂无。_
 
 ---
 
+## [4.13.1] - 2026-08-24 — 深度 Bug Hunting 修复批（patch；wire 仍 v4，客户端零必改）
+
+> 源于 2026-08-24 无人值守深度 Bug Hunting（报告：`docs/automatic/20260824-0714_bug-hunting.md`，BUG-001..005 全部 CONFIRMED + 独立复现）。四项修复并发分批执行，每项带 fail-first 回归锁。Wire API 仍为 v4 `(4,4)`；错误路径行为回归契约语义（不再出现裸 500）。
+
+### Fixed
+
+- **SSE 订阅 admission 在响应启动失败时不再泄漏**：`GET /slimapi/events` 与 `GET /slimapi/tokens/{sid}/stream` 此前在返回 StreamingResponse 前登记订阅者、仅在 body 生成器 `finally` 中注销；当 ASGI 服务器在响应头发送阶段失败时生成器从未启动，订阅槽位（与 token 侧 flush task）将永久占用直至进程重启，重复失败耗尽容量后新连接 503。现响应启动阶段失败会执行同一幂等 detach 回滚。正常路径（含容量 503、断连清理）行为不变。
+- **全局 hub 优雅移除与进程关闭的取消交叠不再截断上游流清理**：grace 移除/`close()` 此前可对已进入取消展开（unwind）的 `GlobalHub.run()` 二次注入 `CancelledError`（直接 cancel 或经父 gather 传播），中断上游 `/global/event` 流的 `__aexit__` 清理。现 registry 层取消遍历与 `close()` 收尾对所有任务加 `cancelling()` 守卫（对齐 `GlobalHub._cancel_live_members` 既有不变量）：已在展开中的任务交由其自身清理完成，`close()` 不再等待也不会二次打断。
+- **ReplayLog 追加失败不再燃烧序号**：`ReplayLog.append` 此前先推进 `last_seq`/内部序再调用可失败的 size 计算；size 异常时文档承诺的回滚失效，幻影序号导致重连客户端被误判 `replay_expired` 而全量 resync。现将 size 计算移至一切状态变异之前，失败零副作用、重试复用同一序号；既有提交后回滚路径不变（默认 sizer 不受影响，属潜伏缺陷修复）。
+- **超长十进制数字不再触发未捕获 `ValueError` 裸 500**：CPython 3.11+ 对十进制转换设 4300 位上限。`?v=` selector 与 `Last-Event-ID` 序号此前未设长度界，≥4301 位请求触发 `ValueError: Exceeds the limit (4300 digits)...` 逃逸为 500。现 selector 超长/不可解析版本统一走 400 `unsupported_version`；`Last-Event-ID` 超长/不可解析序号按契约忽略并重置游标（`v4-contract.md` 既有语义）。4299/4300 位等合法范围内的拒绝行为不变。
+
+---
+
 ## [4.13.0] - 2026-08-24 — v4-native 全局归一化（minor；public wire 零变化）
 
 > 包版本按 minor 从 4.12.2 升至 4.13.0；Wire API 仍为 v4 `(4,4)`。

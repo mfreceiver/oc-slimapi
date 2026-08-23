@@ -21,6 +21,51 @@ TOKENS_STREAM_RETIRED_IN_V4 = {
 }
 
 
+class _SendStartRollbackResponse(StreamingResponse):
+    """StreamingResponse that rolls back route admission when the ASGI
+    response never starts (BUG-002 / FI-001).
+
+    The route admits its subscriber at handler time and detaches it in the
+    body generator's ``finally``. Starlette sends ``http.response.start``
+    BEFORE iterating the generator (``StreamingResponse.stream_response``),
+    so a ``send`` failure at response-start leaves the generator
+    never-started — its ``finally`` never runs and the admission slot leaks
+    (one-shot leak; N failures exhaust the cap and later connections 503).
+    This subclass wraps the ASGI send path: if an exception escapes before
+    the first ``http.response.body`` message was handed to ASGI, the
+    route's rollback hook runs the same idempotent detach routine the
+    generator ``finally`` uses, then the exception re-raises unchanged.
+
+    The guard is ``body_started`` (not "response started"): once any body
+    chunk was submitted the generator HAS started (it yielded that chunk),
+    so its own ``finally`` owns cleanup on that path — skipping the
+    rollback there avoids a redundant (albeit membership-guarded) detach.
+    """
+
+    def __init__(self, content, *, on_start_failure, **kwargs):
+        super().__init__(content, **kwargs)
+        self._on_start_failure = on_start_failure
+
+    async def __call__(self, scope, receive, send):
+        body_started = False
+
+        async def _tracked_send(message):
+            nonlocal body_started
+            if message["type"] == "http.response.body":
+                body_started = True
+            await send(message)
+
+        try:
+            await super().__call__(scope, receive, _tracked_send)
+        except BaseException:
+            if not body_started:
+                rollback = self._on_start_failure
+                self._on_start_failure = None
+                if rollback is not None:
+                    rollback()
+            raise
+
+
 @router.get("/events")
 async def events(request: Request, tokens: str | None = None):
     """Process-wide curated SSE stream.
@@ -205,8 +250,17 @@ async def events(request: Request, tokens: str | None = None):
         "X-Accel-Buffering": "no",
     }
 
-    return StreamingResponse(
+    def _rollback_admission() -> None:
+        # BUG-002: same detach as the generator ``finally`` (idempotent,
+        # membership-guarded in HubRegistry.unsubscribe) — runs only when
+        # the generator never got to execute its own ``finally`` because
+        # the ASGI response failed to start. No sse_close here: sse_open
+        # lives inside the generator and never ran.
+        request.app.state.hubs.unsubscribe(subscriber)
+
+    return _SendStartRollbackResponse(
         generate(),
+        on_start_failure=_rollback_admission,
         media_type="text/event-stream",
         headers=response_headers,
     )

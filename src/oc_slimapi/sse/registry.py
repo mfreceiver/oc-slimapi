@@ -331,13 +331,19 @@ class HubRegistry:
                 # subscriber (Stage D) keeps the hub alive too (§16-B).
                 self._clear_removal_task_if_current()
                 return
-            # Cancel the hub's 4 tasks.
+            # Cancel the hub's 4 tasks. BUG-001: guard every cancel — a
+            # task that already began unwinding (``cancelling() > 0``)
+            # must not receive a second CancelledError, which would
+            # truncate its cleanup (e.g. the upstream stream
+            # ``__aexit__`` teardown). Mirrors
+            # ``GlobalHub._cancel_live_members`` (global_hub.py).
             tasks = [
                 task for task in (hub.task, hub.flush_task, hub.heartbeat_task, hub.stop_task)
                 if task is not None and not task.done()
             ]
             for task in tasks:
-                task.cancel()
+                if task.cancelling() == 0:
+                    task.cancel()
             # INV-2: await full exit so the old run() releases /global/event
             # BEFORE we null the reference (aligns with close()'s gather).
             if tasks:
@@ -495,12 +501,54 @@ class HubRegistry:
             )
             if task is not None
         ]
-        if self._removal_task is not None:
-            tasks.append(self._removal_task)
-            self._removal_task = None
-        for task in tasks:
+        removal = self._removal_task
+        self._removal_task = None
+        # BUG-001: if any hub child is mid-unwind (``cancelling() > 0``,
+        # not done), a pending removal task is parked in its gather
+        # OWNING that unwind — cancelling it here would re-deliver a
+        # second CancelledError into the child's cleanup through the
+        # gather. Await the removal task instead: its own guarded cancel
+        # pass completes promptly once the children finish unwinding
+        # (its grace sleep is already behind it in this state, so this
+        # cannot stall out a 30 s grace timer). If the children are NOT
+        # unwinding, the removal task is merely sleeping in its grace
+        # window and cancelling it stays safe and prompt.
+        if (
+            removal is not None
+            and not removal.done()
+            and removal.cancelling() == 0
+        ):
+            children_mid_unwind = any(
+                task is not None and not task.done() and task.cancelling() > 0
+                for task in tasks
+            )
+            if children_mid_unwind:
+                try:
+                    await removal
+                except asyncio.CancelledError:
+                    # Lost a race with cancel_pending_removal() — the
+                    # guarded pass below still protects the children.
+                    pass
+                removal = None
+            else:
+                removal.cancel()
+        # BUG-001: guarded cancel pass — never cancel a task that is
+        # already unwinding; a second CancelledError would truncate its
+        # cleanup. Mirrors ``GlobalHub._cancel_live_members``. Only
+        # freshly-cancelled tasks are gathered below: a child already
+        # unwinding under another owner (grace-removal gather /
+        # supervisor) is left to finish its cleanup undisturbed, so
+        # close() can neither truncate it nor hang on it forever.
+        cancel_targets = [
+            task for task in tasks
+            if not task.done() and task.cancelling() == 0
+        ]
+        for task in cancel_targets:
             task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        pending: list[asyncio.Task] = list(cancel_targets)
+        if removal is not None and not removal.done():
+            pending.append(removal)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         self._global = None
         self.total_subscribers = 0

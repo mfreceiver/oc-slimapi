@@ -385,6 +385,14 @@ class ReplayLog:
         if state is None:  # lazy creation (per-sid domains on first frame)
             state = _DomainState()
             self._domains[domain] = state
+        now = self._clock()
+        self._ttl_evict_head(state, now)
+        # BUG-003: compute size BEFORE ANY mutation — _size_of can raise
+        # (OSError on transient storage). Moving it before seq assignment
+        # (state.next_seq), _order increment, and last_seq write guarantees
+        # zero mutation on failure → exception propagates cleanly, no seq
+        # or order burn.
+        size = self._size_of(payload)
         if seq is None:
             seq = state.next_seq
             state.next_seq = seq + 1
@@ -399,11 +407,8 @@ class ReplayLog:
                 f"reservation (expected {state.next_seq - 1}, last "
                 f"published {state.last_seq})"
             )
-        now = self._clock()
-        self._ttl_evict_head(state, now)
         self._order += 1
         state.last_seq = seq
-        size = self._size_of(payload)
         entry = ReplayEntry(
             domain=domain,
             seq=seq,

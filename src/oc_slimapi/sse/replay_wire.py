@@ -151,7 +151,16 @@ def parse_last_event_id(
         epoch, seq_text = parts[-2], parts[-1]
     if _EPOCH_RE.match(epoch) is None or _SEQ_RE.match(seq_text) is None:
         return None
-    return epoch, int(seq_text)
+    # BUG-005: guard against >19-digit decimal strings (exceed int64
+    # range) and Python 3.14's PYTHONINTMAXSTRDIGITS limit (default 4300).
+    # Length > 19 or ValueError → ignore+reset (None), never a 500.
+    if len(seq_text) > 19:
+        return None
+    try:
+        seq = int(seq_text)
+    except ValueError:
+        return None
+    return epoch, seq
 
 
 def classify_reconnect(

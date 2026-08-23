@@ -58,6 +58,52 @@ from ..sse_observability import sse_close, sse_open
 router = APIRouter(prefix="/slimapi", tags=["token-stream"])
 
 
+class _SendStartRollbackResponse(StreamingResponse):
+    """StreamingResponse that rolls back route admission when the ASGI
+    response never starts (BUG-002 / FI-001).
+
+    The route admits its subscriber at handler time and detaches it in the
+    body generator's ``finally``. Starlette sends ``http.response.start``
+    BEFORE iterating the generator (``StreamingResponse.stream_response``),
+    so a ``send`` failure at response-start leaves the generator
+    never-started — its ``finally`` never runs and the token admission slot
+    (plus the flush task the first-attach started) leaks; N failures
+    exhaust the cap and later connections 503. This subclass wraps the
+    ASGI send path: if an exception escapes before the first
+    ``http.response.body`` message was handed to ASGI, the route's
+    rollback hook runs the same idempotent detach routine the generator
+    ``finally`` uses, then the exception re-raises unchanged.
+
+    The guard is ``body_started`` (not "response started"): once any body
+    chunk was submitted the generator HAS started (it yielded that chunk),
+    so its own ``finally`` owns cleanup on that path — skipping the
+    rollback there avoids a redundant (albeit membership-guarded) detach.
+    """
+
+    def __init__(self, content, *, on_start_failure, **kwargs):
+        super().__init__(content, **kwargs)
+        self._on_start_failure = on_start_failure
+
+    async def __call__(self, scope, receive, send):
+        body_started = False
+
+        async def _tracked_send(message):
+            nonlocal body_started
+            if message["type"] == "http.response.body":
+                body_started = True
+            await send(message)
+
+        try:
+            await super().__call__(scope, receive, _tracked_send)
+        except BaseException:
+            if not body_started:
+                rollback = self._on_start_failure
+                self._on_start_failure = None
+                if rollback is not None:
+                    rollback()
+            raise
+
+
 def _validate_directory_query(request: Request, directory: str | None) -> None:
     """Validate the no-op ``directory`` query without reading retired headers.
 
@@ -222,8 +268,19 @@ async def token_stream(request: Request, sid: str, directory: str | None = None)
     # is no-cache anyway). ``subscriberId`` is carried by the first
     # slimapi.meta frame rather than an HTTP response header.
 
-    return StreamingResponse(
+    def _rollback_admission() -> None:
+        # BUG-002: same detach as the generator ``finally`` (idempotent,
+        # membership-guarded in TokenStreamRegistry.unsubscribe) — runs only
+        # when the generator never got to execute its own ``finally``
+        # because the ASGI response failed to start. registry.unsubscribe
+        # also stops the flush task on last-detach (NB-C4), so the
+        # first-attach task is torn down with the slot. No sse_close here:
+        # sse_open lives inside the generator and never ran.
+        registry.unsubscribe(subscriber)
+
+    return _SendStartRollbackResponse(
         generate(),
+        on_start_failure=_rollback_admission,
         media_type="text/event-stream",
         headers=headers,
     )
