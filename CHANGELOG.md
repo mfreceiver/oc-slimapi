@@ -26,6 +26,25 @@ ocdroid 对接时：
 
 ---
 
+## [4.12.0] - 2026-08-23 — 修订六：token 帧原子序号 + part 级 digest revision + 恢复语义闭合（minor；wire 仍 v4，全部加性）
+
+> 承接 webui/ocdroid 反馈四需求（part 完成态不可见 / asked 因果序 / eviction 恢复语义 / 帧去重账本），经 rev-sgpt 五轮深审（REJECT→四条款→三门控迭代）冻结实施；Lane A（digest 因果）与 Lane B（token 序号/恢复）分批落地、逐批门控 ≥9.5（Lane A 9.4+条件放行、Lane B 9.8）。契约修订六：`v4-contract.md` §3.1/§7.2/§7.4/§7.5/§7.7。
+
+### Added
+
+- **token 流业务帧 payload `seq`**（§7.7；capability `tokenFrameSeq`）：**v4 sequenced 业务帧集合 = 恰三帧**——`message.part.delta` / `message.removed` / 可重放 `resync{token_memory_limit}` 的 data 增可忽略字段 `seq:<int>`，与 SSE `id:` 末段同源同值（同一 reserve→encode→append 原子路径）；`snapshot` 族为 v2/v3 历史语义（v4 服务端从不发布）。服务端承诺线上不出现「帧已发布而日志无此帧」的空洞（失败即回滚弃帧）。客户端按 per `(epoch, sessionID)` 账本 strict `>` 消费（防重放重投/迟到重复应用；`seq` 跳跃接受推进 = 有意策略，非服务端允许真实空洞）；`meta`/`heartbeat`/控制面 resync 恒无 `seq`。仅重放日志接线时出现（生产 v4 恒有）。
+- **digest `messagesRevision` 事件集扩展**（§7.5）：`message.part.updated` / `message.part.removed` 自本版起 bump 该 sid 的 message revision（part 完成态 text-start/text-end/cleanup 与 revert 撤销可见；同 0.25s debounce 合并，同窗 N 事件单帧窗口末值）——修复 part 完成态变化不触发客户端对账的盲区（webui 需求①根因）。`message.part.delta` 维持排除（per-chunk 不落库）。
+- **flush-before-asked 因果序**（§7.4）：`question.asked` / `question.v2.asked` 立即直推前对该 sid targeted flush pending digest——同一 SSE 流上订阅者先收 digest（含 part 级 revision）再收 asked，asked 阻塞快照所需内容保证已在已推送水位内（webui 需求②因果链闭合；线序断言测试钉死）。
+
+### Changed
+
+- **`token_memory_limit` resync 升级为可重放业务帧 + 恢复协议 v2**（§7.7；webui 需求③）：带 `id:` + payload `seq`、写入重放日志（离线客户端重连按 cursor 重放）、**流不终止**（区别于 `session_idle`/`session_deleted`）。**协议 v2（advisory resync + revision 收敛）**：resync 为 advisory——不 rebase 流基线、不重置增量基，客户端**收到 resync 当下零专用恢复动作**（不清态、无专用恢复 GET、无缓存重放；其余未驱逐 part 照常按 seq 消费，账本规则不变，无恢复专用水位）；被驱逐 part 本进程内 REST-owned（disabled gate 拦截后续流事件），其完成态经 `message.part.updated` → `messagesRevision` bump → digest → 常规 `?since`/GET 对账收敛（**bump 不受驱逐影响**，有界于 part/message 完成时刻）；REST 对 live part 非权威（上游中途 delta 不落库）——**禁止双源合并覆盖** live part，但对账 GET 对终态 part 按**终态 REST 合并规则**覆盖收口（同 part 携带非空 `time.end` 即以 REST 文本覆盖 + 标完成 + 解除 streamOwned；判据仅 `/full/{mid}` 携带，skeleton 结构性无 part `time`——缺席不得推断为未完成）。驱逐序：先清被逐 part live/pending（其未 flush 尾部 delta 随之丢弃、不上 wire）、再 flush 该 sid 其余 part 的 pending 增量（严格先于 resync）。eviction 路径不再写 replay barrier（可重放帧自身按其 seq 承担重放语义，barrier 反而会遮蔽它）。**fail-closed**：resync 发布失败 → 终止该 sid 全部订阅者（`reconnect_no_replay` 原因帧）+ per-sid 失效标记（epoch 内粘滞：无 `Last-Event-ID` 首连一律强制 HTTP 对齐）——零游标/首 seq 失败/零订阅者三类场景均不可静默运行在失效基线上。（CLIENT_CHANGES resync 表同步：`token_memory_limit` 行改协议 v2——清态/重订阅均「否」。）
+- **控制面 resync 值域与业务 resync 显式分离**（§7.2 注记）：控制面四值域（`epoch_changed`/`replay_expired`/`replay_gap`/`reconnect_no_replay`，无 id 不重放）与 token 可重放集合（`token_memory_limit`）结构性不相交（服务端分离集合 + 误用即错），控制面值域不受影响。
+
+### 兼容性
+
+- wire 形状扩展（payload `seq` 字段 / meta capabilities 增键 / digest 条件键）**全部向后兼容**：旧客户端按「忽略未知键」即可运行。**`token_memory_limit` 客户端恢复生命周期有变化 + 终态 REST 合并规则（4.12.0 客户端规则更新，`v4-contract.md` §7.7）**：旧客户端沿用既有「清态 + GET + 重连」路径**最终可经 terminal 对账收敛，但 live 动画可能缺失/停滞**——清掉其他 live part 后 REST 不含其中途 delta，后续 delta 因无 streamOwned 基线被丢弃；4.12.0 推荐改为流内继续消费 + revision 对账 + 终态 REST 合并规则（对账 GET 见同 part 非空 `time.end` 即覆盖收口，见 CLIENT_CHANGES resync 表 / streamOwned 终态例外）。以上**未经 ocdroid 实码验证，不保证无可见退化**——建议升级窗口内对照 CLIENT_CHANGES「token 帧 payload `seq` 消费规则」节核验。**推荐**消费方按 `tokenFrameSeq` / `messagesRevision` 扩展事件集升级对账触发与去重账本。wire 版本仍 (4,4)，不 bump。
+
 ## [4.11.1] - 2026-08-23 — 后端可靠性修复批（patch；wire 面无形状变化，客户端零必改）
 
 > 源于 2026-08-22 后端可靠性审计（`docs/automatic/20260822-1701_backend-reliability.md`）：P2×2 + P3×3 全部修复并附确定性回归测试，经独立对抗评审放行；无 P0/P1。wire 版本仍 (4,4)。

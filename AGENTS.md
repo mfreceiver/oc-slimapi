@@ -50,6 +50,8 @@ ocdroid ──(stunnel mTLS 14096)──▶ opencode :4096   # 直连回退，�
 | event groups | `packages/opencode/src/server/routes/instance/httpapi/groups/event.ts`、`packages/protocol/src/groups/event.ts` |
 | session 核心 / 投影 | `packages/core/src/session.ts`、`packages/schema/src/v1/session.ts` |
 
+**repoint 必审义务（§7.4/§7.5 因果假设依赖，一行清单）**：更新 `current` 符号链接时必复核三锚点——`packages/opencode/src/session/processor.ts`（text-start/delta/end 发布点，v1.18.21 锚 :486-532）、`packages/core/src/session/projector.ts:310-327`（PartUpdated 落库）、question 事件发布序——确认「PartUpdated projection 完成后才 Asked」因果假设仍成立。
+
 **约定**：改 sidecar 行为前，若涉及上游语义（`before` cursor、`Link` 头、`time.archived`、`/global/event` 帧形），**先读上述源码再改**；不要凭记忆编造 opencode 行为。
 
 ---

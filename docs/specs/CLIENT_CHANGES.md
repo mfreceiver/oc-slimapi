@@ -8,6 +8,10 @@
 
 # ocdroid 客户端改动清单（仅文档，不修改 ocdroid）
 
+## 4.12.0 修订六消费指引（token 帧序号 + part 级 revision + 恢复协议 v2 — 2026-08-23，全部加性）
+
+> **权威规范**：`docs/specs/v4-contract.md` 修订六（§7.7 token 帧 payload `seq` + `token_memory_limit` 恢复协议 v2 / §7.4 flush-before-asked / §7.5 `messagesRevision` part 级事件集扩展与跨 sid 规则）。消费侧要点见本文对应节：**「token 帧 payload `seq` 消费规则」**（连接账本）、**「resync 处理」表 `token_memory_limit` 行**（协议 v2：advisory、流不终止、被逐 part 经 revision 对账收敛）、§4.11.0 P4（revision 触发对账的既有姿势，part 级扩展自动受益）。可选接入：不接入则维持既有行为（忽略未知键安全）。
+
 ## 4.11.0 流量优化族消费指引（修订五 P1/P2/P4/P5/P6 — 2026-08-22，全部加性，客户端零必改）
 
 > **权威规范**：`docs/specs/v4-contract.md` 修订五（§10.3 since 差分 / §6.4 thin ETag / §7.5 messagesRevision / §19 file/raw / §3.3 readiness 第 11 ID）。以下为消费侧要点；全部能力**可选接入**，不接入则维持既有行为。
@@ -30,7 +34,17 @@
 ### P4 — digest `messagesRevision`（§7.5，变化信号）
 
 - message 域 digest 帧新增 `messagesRevision: <int>`（进程级单调；session-only digest 无此键）。
-- 用途 = **变化信号**：revision 变化 → 触发 P1 since 差分或 If-None-Match 精拉。**不得跨进程比较**（重启清零；SSE 重连/upstream resync 后可比较——resync 帧后收到更小 revision 属正常，以进程内最新值为准）。不承载 per-sid 语义、非序号承诺。
+- 用途 = **变化信号**：revision 变化 → 触发 P1 since 差分或 If-None-Match 精拉。**不得跨进程比较**（重启清零；SSE 重连/upstream resync 后可比较——resync 帧后收到更小 revision 属正常，以本 sid 进程内最新值为准）。**allocator 非 per-sid 分配，且不保证连续；消费与去重仅允许在同一 sid 内比较。**跨 sid 规则（4.12.0 修订六，`v4-contract.md` §7.5 三条款同步）：① revision allocator 在事件循环内**全局递增**（跨 sid 单点分配，无 per-sid 序号）；② `messagesRevision` **仅同一 sid 的 successive digest 可比较**（跨 sid 比较无语义）；③ **禁止**用其他 sid 的 max revision 丢弃/去重当前 sid digest——不同 sid 因 debounce / targeted flush 时序差，wire 顺序可出现 `[N+1, N]` 逆序（sid-B 先 asked-flush、sid-A 后批量 flush），此为合法序非乱序。
+
+#### 终态收口五步算法（4.12.0 修订六冻结；`v4-contract.md` §7.7 终态 REST 合并规则）
+
+`messagesRevision` 变化后的对账路径（编号步骤，一目了然）：
+
+1. `messagesRevision` 变化 → `?since` 精拉定位变化 message（触发源含 `part.updated` / `part.removed` / `message.updated` / `message.appended` 等**任何** revision 事件）；
+2. 若该 message 存在本地 **unfinished `streamOwned` part** → **必须**请求 `GET /slimapi/messages/{sid}/full/{mid}`（skeleton 面结构性不含 part `time`，其缺席**不得**被推断为「未完成」）；
+3. /full 同 part `time.end != null` → 以 REST 文本**覆盖**、标记完成、解除 `streamOwned`；
+4. 无 `time.end`（中途/未完成）→ 保留本地 live 状态（**禁止** skeleton 覆盖）；
+5. `message.updated` **不是**独立终态判据——它只是触发第 1 步的 revision 事件之一；skeleton 刷新可见性与终态收口（仅 /full）**分离**。
 
 ### P5 — `/slimapi/file/raw` 裸二进制直读（§19，收编 HttpImageHolder）
 
@@ -533,36 +547,44 @@ ocdroid 可在每个请求（含 SSE）**可选**附加三个 request header：
 
 - 前台 opt-in 连 `GET /slimapi/sessions/{sid}/stream`；切后台 / 换 session / 关页面 → **立即断开**（token 订阅独立 T3 账本，预算「同时最多 1 条前台 stream」）。
 - 连接独立于控制面 `/slimapi/events`——两条连接，互不替代。**gzip 三层语义（v3 终态修订——勿笼统说「SSE 都不 gzip」，但现在两条 SSE 面均恒 identity）**：(1) 控制面 `/slimapi/events` 恒 identity、不 gzip；(2) 本 token stream 亦**恒 identity、不 gzip**（**v3 终态**——lever2 压缩路径已随 3.0.0 移除；v2 时代「允许 gzip / 首个 SSE gzip 例外 / 建议 `Accept-Encoding: gzip`」表述**已废止**）；(3) 普通 JSON/catalog 响应按 `Accept-Encoding` 内容协商。即 v3 起两条 SSE 面统一恒 identity，仅 JSON 响应有 gzip 协商。
-- `Last-Event-ID` 可带但**值被忽略**，仅触发首帧 `resync{reason:"reconnect_no_replay",sessionID}`。stream **不发 SSE `id:`、无 replay buffer**——客户端不得依赖 `id:` 续传。
+- `Last-Event-ID` 可带但**值被忽略**，仅触发首帧 `resync{reason:"reconnect_no_replay",sessionID}`；stream **不发 SSE `id:`、无 replay buffer**——客户端不得依赖 `id:` 续传。**（以上为 v2/v3 历史语义——v4 重放已落地（573fc2d）：业务帧带 SSE `id:`，`Last-Event-ID` 重连按重放窗口补帧；现行 v4 消费规则见「token 帧 payload `seq` 消费规则」节与 `v4-contract.md` §7.2/§7.7。）**
 
 ### streamOwned 渲染算法（必须）
 
 收到帧按 part（`(messageID, partID)`）维护本地「streamOwned」缓冲：
 
-- **`message.part.snapshot{done:false}`**（订阅首帧 / 握手锚点——**「握手锚点」为 v2/v3 历史形态**：v4-only 面 no-prefill join 握手**不下发** server-originated 锚点 snapshot，初始全文对齐 = resync 后 HTTP 拉取（Q2 校正，`tests/test_token_stream_route.py:861-888`；`v4-contract.md` §7.7））→ **替换**该 part 本地缓冲为 `text`、标 `streamOwned=true`、未完成（算法不变——v4 下 `done:false` snapshot 仍可能以 `truncated` 等形态出现，替换规则照常适用）。
+- **`message.part.snapshot{done:false}`**（订阅首帧 / 握手锚点——**「握手锚点」为 v2/v3 历史形态**：v4-only 面 no-prefill join 握手**不下发** server-originated 锚点 snapshot，初始全文对齐 = resync 后 HTTP 拉取（Q2 校正，`tests/test_token_stream_route.py:861-888`；`v4-contract.md` §7.7））→ **替换**该 part 本地缓冲为 `text`、标 `streamOwned=true`、未完成（**v4 注记（4.12.0 终门控核实）**：v4 服务端从不发布 snapshot 族帧——含 `truncated` 变体（oversized 路径仅 v3 收帧；v4 面该 part 直接 REST-owned 走 revision/HTTP 对齐），本替换规则在 v4 下结构性不可达，保留供 v3 兼容）。
 - **`message.part.delta{text}`** → 仅当该 part 已 `streamOwned` **且未完成**时 **append** `text`；否则丢弃（不应发生；若发生视为乱序，忽略）。
-- **`message.part.snapshot{done:true}`**（终态）→ **仅完成 marker，无 text**——客户端**不再从该帧取 text**；标**完成**。权威全文走 `/slimapi/messages/{sid}` skeleton 列表或 `/full/{mid}` 展开（持久化真值，幂等且**凌驾**所有 token 帧）。此后该 part 不再收 delta（违反则忽略）。
-- **`/slimapi/messages/{sid}` / `/full/{mid}`**：part 已 `streamOwned` 且**未完成** → **忽略**持久化拉取的该 part text（stream 为准）；part 已 `streamOwned` 且**已完成** → 仅允许 skeleton / full 覆盖（skeleton / full 是持久化真值，幂等且**凌驾**所有 token 帧）。
+- **`message.part.snapshot{done:true}`**（终态；**v2/v3 历史语义——v4 服务端从不发布 done marker**，勿照此实现 v4 终态流程：v4 终态闭合 = revision 对账 + 终态 REST 合并规则，见下条）→ **仅完成 marker，无 text**——客户端**不再从该帧取 text**；标**完成**。权威全文走 `/slimapi/messages/{sid}` skeleton 列表或 `/full/{mid}` 展开（持久化真值，幂等且**凌驾**所有 token 帧）。此后该 part 不再收 delta（违反则忽略）。
+- **`/slimapi/messages/{sid}` / `/full/{mid}`**：part 已 `streamOwned` 且**未完成** → **忽略**持久化拉取的该 part text（stream 为准）；part 已 `streamOwned` 且**已完成** → 仅允许 skeleton / full 覆盖（skeleton / full 是持久化真值，幂等且**凌驾**所有 token 帧）。**终态例外（4.12.0 修订六，`v4-contract.md` §7.7 终态 REST 合并规则；完整算法见 P4「终态收口五步算法」）**：对账 GET 时，对本地**未完成** `streamOwned` part，若响应同 part（同 messageID+partID）携带**非空 `time.end`**（持久化终态判据）→ **必须**以 REST 文本覆盖、标记完成、解除 `streamOwned`；无 `time.end`（中途/未完成）时仍**禁止**覆盖。判据可见性：part 级 `time` 为 /full-only 键——skeleton 列表结构性不含 part `time`，**不得**据其缺席推断「未完成」；携带判据的对账面 = `/full/{mid}`（verbatim 吸收，`time.end` 原样到达）。
 
-### truncated / 降级（必须）
+### truncated / 降级（必须）——v2/v3 wire 行为（v4 面结构性不可达，见首条 v4 注记）
 
 - 收 **`message.part.snapshot{truncated:true}`**（`event: message.part.snapshot`，`done:false` 或 `done:true` 均可能，携带自身的 `partEventRevision`——该帧消费**自己**的 revision，严格大于该 part 上一帧，故用 strict `>` 比较的客户端可直接接受）（2026-08-21 注：`partEventRevision` 语义在 v3 下延续，per-session token stream 帧仍携带；**events `?tokens=1` 的 lean token 帧无此字段**——勿跨面套用 strict `>` 去重）→ 这是**单 part 级**截断（part 累计文本超 `token_stream_max_frame_bytes`≈1MiB，或 part 被服务端 drop_part）：清该 part `streamOwned`、停 append、走 `/slimapi/messages/{sid}` 重拉权威（可能被上游截断，但那是真值）。**不影响**该 session 其它 part；单 part >1MiB **不**走 resync，而是本路径。
 
 ### resync 处理（必须）— 两档恢复
 
-收 **`resync{reason, sessionID}`** 时，**一律**先：丢弃该 sid 全部 token 渲染态（所有 streamOwned part 清空）→ `GET /slimapi/messages/{sid}` 重拉权威。是否 **重订阅** stream 按 reason 分档：
+收 **`resync{reason, sessionID}`** 时，**一律**先：丢弃该 sid 全部 token 渲染态（所有 streamOwned part 清空）→ `GET /slimapi/messages/{sid}` 重拉权威。是否 **重订阅** stream 按 reason 分档。**例外（4.12.0 修订六）**：`token_memory_limit` 为 **advisory resync（协议 v2）**——不触发「丢弃全部渲染态 + 重拉」（见该行：仅被逐 part REST-owned，其余 part 照常流式消费）。
 
 | reason | 清态 + 重拉消息 | 重订阅 stream | 说明 |
 |---|---|---|---|
-| `reconnect_no_replay` | 是 | **是** | 无 replay；新连接拿 handshake snapshot |
-| `subscriber_backpressure` | 是 | **是** | 慢消费者被断；须重连 |
-| `token_memory_limit` | 是 | **是** | 服务端 LRU 驱逐一个 LivePart 后**保持连接**、**不**对现有 sub 重发 snapshot；仅清态会让后续 delta 成 orphan → **必须**重连以 `attach_subscriber` 重建锚点 |
-| `session_idle` | 是 | 否 | 上游 idle，该 sid live parts 已 retire；socket 可留 |
+| `reconnect_no_replay` | 是 | **是** | **v2/v3 历史语义**：无 replay；新连接拿 handshake snapshot。**现行 v4**：存在重放窗口（`Last-Event-ID` 重放，`v4-contract.md` §7.2）；新连接为 **no-prefill join**（无 handshake snapshot，状态对齐 = HTTP 拉取） |
+| `subscriber_backpressure` | 是 | **是** | 慢消费者被断；须重连（v4 面该 reason 断连为 STOP-only、无 resync 帧——帧仅 v3 可见） |
+| `token_memory_limit` | **否**（4.12.0 起） | **否**（流不终止） | **修订六（4.12.0）协议 v2（`v4-contract.md` §7.7）**：可重放业务 resync（带 `id:` + payload `seq`、写重放日志、**流不终止**）。**advisory**：不 rebase 流基线、不重置增量基、不要求丢弃渲染态——其余未驱逐 part 的增量**照常按 seq 消费**（连接账本规则不变，无恢复专用水位）。被驱逐 part 本进程内 REST-owned（disabled gate），其后续流帧被服务端拦截；其**完成态**经 digest `messagesRevision` bump → 常规 `?since`/GET 对账收敛（§7.5）——对账到达前可选 **session 级** UI 提示（resync 仅含 `sessionID` 无 part 身份，定向到某 part 的提示不可实现）。**可选**任意时刻 GET 刷新，但对 live part **不得用作覆盖源**（REST 对 live-accumulating part 非权威——上游中途 delta 不落库，双源合并会丢文本/双重应用）；对账 GET 对**终态** part 按 §7.7 终态 REST 合并规则覆盖收口（同 part 非空 `time.end` → 覆盖 + 标完成 + 解除 streamOwned）。历史（≤4.11.x v3 行为）：保持连接但仅清态会让后续 delta 成 orphan → **必须**重连以 `attach_subscriber` 重建锚点；旧客户端沿用「清态 + GET + 重连」**最终可经 terminal 对账收敛，但 live 动画可能缺失/停滞**（清掉其他 live part 后 REST 不含其中途 delta，后续 delta 因无 streamOwned 基线被丢弃）——**未经 ocdroid 实码验证，不保证无可见退化** |
+| `session_idle` | 是 | 否 | 上游 idle，该 sid live parts 已 retire。**v2/v3 历史语义**：socket 可留。**现行 v4**：该 reason 断连为 STOP-only（服务端终止连接），客户端按需重连 |
 | `session_deleted` | 是 | 否 | 会话**终态**——服务端在发完 `resync{session_deleted}` 后**主动关闭该 token-stream 连接**（`sub.terminate` → STOP，非软 resync），客户端收 STOP 即断；清态 + 重拉权威消息后**不得**重订阅该 sid 的 stream。会话删除本身由控制面 `/events` 的 `session.digest{deleted:true}` 独立驱动，两条信号不互相替代 |
 | 未知 reason（客户端 fallback） | 是 | 否（建议） | 与 idle 同保守路径；勿静默丢帧 |
 
 - token resync **恒带 `sessionID`**；若极端情况收到无 `sessionID` 的 resync，从**连接**推断 sid（token 流每连接绑单 sid）。
-- **不发** `part_too_large`（超限走 `snapshot{truncated:true}`）。
+- **不发** `part_too_large`。单 part 超限（>1MiB）的现行 v4 行为：超限 delta **直接丢弃不发布**、该 part 即刻 REST-owned（后续 delta 拦截）——token wire 上**无任何信号帧**；客户端经 revision 对账在 `/full` 见终态（`time.end` 判据）。「走 `snapshot{truncated:true}`」为 **v2/v3 历史语义**（v4 面结构性不发布，v3-only 投递）。
+
+### token 帧 payload `seq` 消费规则（修订六，4.12.0 必须）
+
+- **前提**：`capabilities["4"].tokenFrameSeq == true`（`GET /slimapi/versions`）且本连接 `slimapi.meta` 首帧含该能力——**v4 sequenced 业务帧集合 = 恰三帧**：`message.part.delta` / `message.removed` / 可重放 `resync{token_memory_limit}`，data 增字段 `seq:<int>`，与 SSE `id:` 末段同源同值（`snapshot` 族为 v2/v3 历史语义，v4 服务端从不发布）。`meta`/`heartbeat`/控制面 resync 恒无 `seq`。**旧 sidecar**：键缺席 = 无序号帧，按既有逻辑消费（`'seq' in data` 判定，勿假设恒有）。
+- **账本**：per `(epoch, sessionID)`（epoch 取自 meta 首帧）维护已处理 seq；**strict `>`** 接受——`seq` ≤ 已处理值的帧（重放重投/迟到回调）丢弃；`seq` > 已处理 +1 的**跳跃**按序缺口处理：接受并推进账本——**这是有意策略，勿误读为服务端允许真实发布空洞**（服务端原子承诺线上无真空洞；缺口仅可能来自背压断连——该路径走重放/`replay_gap`，客户端在 resync 对账后重建）。
+- **同 epoch 重连账本延续**（SSE `Last-Event-ID` 重放与本条规则配合：重放帧 `seq` ≤ 已处理自然丢弃，> 已处理补应用）；**跨 epoch 不可比较**（重启走 `epoch_changed` 全量对齐，账本作废重建）。
+- **与 `partEventRevision` 正交**：`seq` 是连接级投递序（防重放重复应用），`partEventRevision` 是 part 级内容序（strict `>` 去重）——两者各自维护、互不替代。
+- **严格解析提醒**：closed-schema 客户端（Kotlin data class 等）对增字段 `seq` 必须容忍缺席（旧 sidecar / 无日志栈），勿因未知键拒帧（`v4-contract.md` §1「忽略未知键」总则）。
 
 ### `message.removed` 帧处理（必须）
 
@@ -574,7 +596,7 @@ ocdroid 可在每个请求（含 SSE）**可选**附加三个 request header：
 
 以下两项是 ocdroid V2 升级中踩过并修复的实现坑，**契约 §3.x 已规定正确行为**，此处补充客户端实现要点，帮助其他 V2 客户端避坑。
 
-#### 1. `snapshot{done:true}` 仅是完成 marker，**不得取 text**（契约 §3.x 杠杆1）
+#### 1. `snapshot{done:true}` 仅是完成 marker，**不得取 text**（契约 §3.x 杠杆1；**v2/v3 历史语义**——v4 服务端从不发布 done marker，本坑仅适用于尚在 v3 面的实现存档；v4 终态流程勿照此设计）
 - **契约**：终态 `message.part.snapshot{done:true}` 是**仅完成标记，不带 text**——上游 `part.text` 终态重发已被取消；**权威全文走 `/messages/{sid}` 或 `/full/{mid}`**（持久化真值）。
 - **坑**：ocdroid D-wire 初版 `TokenStreamReducer` 在 `done:true` 时取 `frame.text ?: existing?.text ?: ""` 作为终态值——与契约冲突。
 - **正确**：`done:true` 帧仅用于 ① 标记该 part 渲染完成、② 触发权威 fetch；**不得从该帧取 text**。REST skeleton/full 的全文**凌驾所有 token 帧**（幂等覆盖；客户端可接受 digest 完成先于/晚于 token 终态帧）。
@@ -590,12 +612,12 @@ ocdroid 可在每个请求（含 SSE）**可选**附加三个 request header：
 
 ### 终态对齐（必须）
 
-- digest `message.updated`（step-finish）→ 客户端应重新拉取 `/slimapi/messages/{sid}` skeleton 列表以获取权威全文，**幂等覆盖**该 message 所有 part（含 token streamOwned 已完成的）。客户端可接受 digest 完成先于 / 晚于 token `snapshot{done:true}`；重拉 skeleton 替换幂等且凌驾所有 token 帧。
+- digest `message.updated`（step-finish）→ 客户端可重新拉取 `/slimapi/messages/{sid}` skeleton 列表刷新**已完成** part 的可见性/元数据（幂等且凌驾所有 token 帧）；**对本地 unfinished `streamOwned` part，终态判定的唯一权威是 `/full` 的 `time.end`**（五步算法第 2-4 步）——`message.updated` **不是**独立终态判据（它只是触发第 1 步的 revision 事件之一），skeleton 刷新可见性与终态收口（仅 /full）分离。（**v4 注记**：`snapshot{done:true}` 为 v2/v3 历史帧——v4 无 token 终态帧，终态闭合 = revision 对账触发拉取 + §7.7 终态 REST 合并规则按非空 `time.end` 覆盖收口。）
 
 ### 预算与 UX（建议 / 可选）
 
 - **建议**：同时最多 1 条前台 stream 连接（独立于 `/events`）。
-- **可选**（busy-open UX）：打开 busy session 先占位（skeleton / 进度指示），直到 stream 首帧 `snapshot{done:false}` 到达再开始流式渲染。
+- **可选**（busy-open UX；**「等首个 `snapshot{done:false}`」为 v2/v3 历史锚点**——v4 no-prefill join 无握手 snapshot，首到达的是 meta/业务帧（delta/resync），占位应持续到**首条该 sid 业务帧**即开始流式渲染）：打开 busy session 先占位（skeleton / 进度指示），直到**首条该 sid 业务帧**到达再开始流式渲染（meta 帧不算——收到 meta 不应提前结束占位）。
 
 ### 批大小调参：ocdroid 无需配合（§10 硬约束）
 

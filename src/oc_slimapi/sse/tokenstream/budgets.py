@@ -99,8 +99,13 @@ class BudgetMixin:
             self._part_revisions.popitem(last=False)
         return rev
     def _truncate_part_for_all(self, key: PartKey, done: bool) -> int | None:
-        """C6 backstop: fan ``snapshot{truncated:true}`` to ALL subscribers of
-        the key's sid, then :meth:`drop_part`.
+        """C6 backstop (HISTORICAL v3 fanout semantics): fan
+        ``snapshot{truncated:true}`` to **v3 subscribers only** of the
+        key's sid, then :meth:`drop_part`. v4-INELIGIBLE since rev-gate
+        R2 (see ``_deliver_v3_only`` at the call site below): a v4
+        subscriber never receives the truncated frame and there is no
+        snapshot handshake — v4 state alignment is HTTP-based
+        (revision reconciliation per the frozen contract §7.7).
 
         Idempotent via the ``_is_disabled`` check up front (``drop_part``
         would return False for an already-disabled key) — the truncated
@@ -110,9 +115,9 @@ class BudgetMixin:
 
         Returns the per-frame revision consumed for THIS truncated frame
         (or ``None`` if the part was already disabled — second-call no-op).
-        Callers use the returned value to deliver a direct-put truncated
-        frame to a handshake sub that is not yet in the fanout set
-        (:meth:`_emit_snapshot_or_truncated`).
+        (HISTORICAL v3 behavior) callers use the returned value to deliver
+        a direct-put truncated frame to a v3 handshake sub that is not yet
+        in the fanout set (:meth:`_emit_snapshot_or_truncated`).
 
         Stage B v0.4 (MAJOR 4 fix): the per-part revision is captured
         BEFORE :meth:`drop_part` clears ``_part_revisions[key]``, so the
@@ -159,8 +164,12 @@ class BudgetMixin:
 
         * **Per-part cap** (``TOKEN_PART_MAX_BYTES``): this delta would
           push the part over 1 MiB → :meth:`_truncate_part_for_all` fans
-          ``snapshot{truncated:true, done:false}`` to the sid + drop_part.
-          Returns False.
+          ``snapshot{truncated:true, done:false}`` to **v3 subscribers
+          only** + drop_part. Returns False. For a **v4** subscriber there
+          is no token-wire signal at all: the oversized delta is dropped
+          (never appended), the part is disabled by ``drop_part``, and the
+          client converges via revision reconciliation (``/full``
+          ``time.end`` per the frozen contract §7.7).
         * **Global LIVE byte cap** (``TOKEN_LIVEPARTS_MAX_BYTES``, 4MiB
           after Stage E split): this delta would push the global
           accumulator over the cap → LRU-evict the oldest LivePart (by
@@ -203,26 +212,36 @@ class BudgetMixin:
         """LRU-evict a LivePart under global memory pressure (§6 / §16-C).
 
         Retires the part via :meth:`drop_part` (idempotent — late deltas
-        for the key silently drop on ``_disabled``) and fans
-        ``resync{token_memory_limit, sessionID}`` to every subscriber of
-        the evicted sid. The client drops all stream state for that sid
-        and re-fetches authoritative text via ``/since``.
+        for the key silently drop on ``_disabled``) and publishes
+        ``resync{token_memory_limit, sessionID}`` as a REPLAYABLE business
+        frame to the sid (4.12.0 修订六 protocol v2 — advisory resync):
+        the client keeps consuming subsequent frames by the normal seq
+        rules (no state drop, no dedicated recovery GET, no replay
+        buffering on receipt); the evicted part's final state converges
+        via the existing revision channel (part.updated → digest
+        messagesRevision bump → client ?since/GET) plus the final-state
+        REST merge rule (rest text overrides once the same part carries
+        a non-empty ``time.end`` on the reconciliation GET).
 
-        After the eviction, re-emit a ``snapshot{done:false}`` for each
+        (HISTORICAL v3 behavior — the re-snapshot loop below still runs
+        but delivers v3-only frames; v4 subscribers never see it) After
+        the eviction, re-emit a ``snapshot{done:false}`` for each
         REMAINING live part of the same sid to every already-attached
         subscriber, so existing subscribers get a fresh snapshot anchor
         without needing to reconnect (S-2 method B).
 
-        ``skip_key`` (MB-P-S1): the key the CALLER is currently
-        reserving/admitting for (e.g. ``_reserve``'s ``key``,
-        ``_start_part``'s new ``key``). It is **re-included** in the
-        re-snapshot loop via the nodrop path
+        (HISTORICAL v3, same scope) ``skip_key`` (MB-P-S1): the key the
+        CALLER is currently reserving/admitting for (e.g. ``_reserve``'s
+        ``key``, ``_start_part``'s new ``key``). It is **re-included** in
+        the re-snapshot loop via the nodrop path
         (:meth:`_emit_snapshot_or_truncated_nodrop`), which delivers the
-        snapshot or truncated frame **without** calling ``drop_part``. This
-        closes the client-anchor gap for clear-only (method B,
-        ``triggersReconnect=false``) eviction: the current key's client-side
-        anchor is restored by the re-snapshot, just like any other remaining
-        live part.
+        snapshot or truncated frame **without** calling ``drop_part``.
+        This closes the client-anchor gap for clear-only (method B,
+        ``triggersReconnect=false``) eviction: the current key's
+        v3-subscriber-side anchor is restored by the re-snapshot, just
+        like any other remaining live part. On the v4 face the anchor
+        concept is gone — the advisory resync (protocol v2) re-bases
+        nothing and the client keeps consuming by seq.
 
         O1 invariant (still holds): the current key (``skip_key``) is
         ***never*** passed to ``_truncate_part_for_all`` or ``drop_part``
@@ -243,9 +262,11 @@ class BudgetMixin:
         this process lifetime: ``drop_part`` put the key in
         ``_disabled_parts``, so every later ``message.part.updated`` /
         ``message.part.delta`` for it is silently dropped at the ingest
-        gates. The part is REST-owned from here on — the client's ONLY
-        authoritative recovery is the HTTP message fetch (``/messages``),
-        never a server-side re-snapshot or state rebuild.
+        gates. The part is REST-owned from here on — never a server-side
+        re-snapshot or state rebuild. v4 final-state closure face =
+        ``/full/{mid}`` (the ``time.end`` predicate; CLIENT_CHANGES
+        five-step algorithm): the ``/messages`` skeleton face carries no
+        part ``time`` at all.
 
         4.12.0 修订六 B-2 (barrier removal): no replay barrier is written
         on this path anymore. The replayable resync frame itself now
@@ -262,9 +283,13 @@ class BudgetMixin:
         sid = key[0]
         # I1: drain pending for this sid before resync + re-snapshot
         # (mirrors attach_subscriber handshake step 2, preventing C2 double-count).
-        # The drained deltas publish on the B-1 path and take seqs BEFORE
-        # the resync — the eviction signal is therefore ordered strictly
-        # after the evicted part's own last delta on the replay sequence.
+        # The EVICTED key's own pending accumulator was already popped and
+        # DISCARDED by drop_part above — its un-flushed tail delta is never
+        # published. flush_sid therefore only publishes the OTHER live parts'
+        # pending deltas of this sid (B-1 path, taking seqs BEFORE the resync)
+        # — the eviction signal is ordered strictly after every published
+        # delta of this sid on the replay sequence, and the evicted part has
+        # no frame of its own after its last flushed delta.
         self.flush_sid(sid)
         # B-2: replayable resync (fail-closed on publish failure — see
         # _fanout_replayable_resync; the state is already cleared here).
@@ -357,8 +382,10 @@ class BudgetMixin:
         never evicting the key we are admitting (mirrors ``_reserve``'s
         ``never evict the current key`` contract). Seeds do NOT contribute
         to the pending budget (they are never buffered in
-        ``DeltaAccumulator`` — delivered via the handshake snapshot, not a
-        delta frame).
+        ``DeltaAccumulator`` — (HISTORICAL v3 behavior) delivered via the
+        v3 handshake snapshot, not a delta frame; under v4 no-prefill
+        join this snapshot is never published and HTTP is the alignment
+        source).
         """
         # Global part COUNT cap: evict oldest (LRU) before creating.
         while len(self.live_parts) >= TOKEN_LIVE_PARTS_MAX:

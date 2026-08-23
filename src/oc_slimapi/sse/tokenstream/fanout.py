@@ -750,12 +750,13 @@ class FanoutMixin:
             # the per-sub snapshot/truncated DIRECT emits — they bypass
             # the ReplayLog (no ``id:``, no seq). An oversized part still
             # goes through :meth:`_truncate_part_for_all`, whose fanout
-            # publishes the truncated frame through the LOGGED path
-            # (id-stamped business frame) and drops the part — memory
-            # bounding identical to v3; only the un-logged direct
-            # delivery is suppressed. The size probe omits the revision
-            # field, so the v3/v4 truncate boundary can differ by the
-            # revision's digit width (~10 bytes) — internal-only.
+            # delivers the truncated frame via ``_deliver_v3_only``
+            # (budgets.py:141-147): v3 subscribers only, NOT replay-logged
+            # and consuming no seq — memory bounding identical to v3; the
+            # v4 face just never sees the frame (state alignment is
+            # HTTP-based). The size probe omits the revision field, so
+            # the v3/v4 truncate boundary can differ by the revision's
+            # digit width (~10 bytes) — internal-only.
             probe = _snapshot_frame(key, text, done)
             if len(probe) > self._max_frame_bytes:
                 self._truncate_part_for_all(key, done)

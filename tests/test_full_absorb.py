@@ -561,3 +561,42 @@ def test_singleflight_ctor_rejects_leased_only_kwargs_on_plain():
     assert sf_mod.SingleFlight(
         max_bytes=1024, network_concurrency=2
     ) is not None
+
+
+# ---------------------------------------------------------------------------
+# 修订六 round-2 T1 前提：终态 REST 合并规则的持久化终态判据可见性。
+# ---------------------------------------------------------------------------
+
+async def test_full_part_time_end_visible_after_text_end(upstream_factory):
+    """上游 text-end `PartUpdated` 落库后的消息经 `/full/{mid}` 对账——
+    part 携带非空 `time.end` + 插件改写后全文（verbatim 吸收仅剥 LSP
+    diagnostics）；同一 part 的 skeleton 投影**结构性不含** `time`
+    （PART_IDS 限定，time 为 /full-only 键）——客户端不得据 skeleton
+    缺席推断「未完成」（v4-contract §7.7 终态 REST 合并规则锚点）。"""
+    part_done = {
+        "id": "p1", "type": "text", "messageID": "m1", "sessionID": "s1",
+        "time": {"start": 1700000000000, "end": 1700000000123},
+        "text": "REWRITTEN-FINAL",
+    }
+    message = {
+        "info": {"id": "m1", "role": "assistant",
+                 "time": {"created": 1, "updated": 2}},
+        "parts": [part_done],
+    }
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/session/s1/message/m1"
+        return httpx.Response(200, content=_full_body(message))
+
+    async with _test_client(upstream_factory, handler) as client:
+        r = await client.get("/slimapi/messages/s1/full/m1", headers=HDR)
+    assert r.status_code == 200
+    part = r.json()["parts"][0]
+    assert part["text"] == "REWRITTEN-FINAL"          # 权威全文 verbatim
+    assert part["time"]["end"] == 1700000000123        # 持久化终态判据非空
+
+    # skeleton 投影（/messages/{sid} 列表用的同一函数）：结构性无 time 键
+    from oc_slimapi.skeleton import skeleton_part
+    thin = skeleton_part(part_done)
+    assert thin["text"] == "REWRITTEN-FINAL"
+    assert "time" not in thin  # full-only 键——缺席 ≠ 未完成

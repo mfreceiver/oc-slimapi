@@ -87,6 +87,21 @@ def _delta(sid: str, mid: str, pid: str, text: str) -> dict:
     }
 
 
+def _text_end(sid: str, mid: str, pid: str, text: str) -> dict:
+    """text-end PartUpdated（插件可改写全文——`text` 为终态权威文本，
+    仅落库走 REST，从不上 v4 wire）。"""
+    return {
+        "part": {
+            "sessionID": sid,
+            "messageID": mid,
+            "id": pid,
+            "type": "text",
+            "time": {"end": 1700000000000},
+            "text": text,
+        }
+    }
+
+
 def _parse(block: bytes) -> tuple[str | None, dict]:
     """(event, data) for one SSE frame block (no ``id:`` handling)."""
     event: str | None = None
@@ -612,3 +627,161 @@ def test_reservation_primitive_matrix():
         log.append(dom, b"frame-c-stale", seq=r1)
     log.append(dom, b"frame-c", seq=r2)
     assert log.last_seq(dom) == 4
+
+
+# ---------------------------------------------------------------------------
+# 修订六终门控返工（rev-2 Blocking 2 闭合）— 恢复协议 v2 驱逐矩阵
+#
+# 协议 v2（advisory resync + revision 收敛，§7.7）：驱逐不 rebase 流基线
+# ——seq 域连续、其余 part 增量不受扰、被逐 part 无任何后续流帧。矩阵②
+# （text-end 前驱逐 + 收敛通道 revision bump 锚点）在
+# tests/test_digest_revision.py（需 GlobalHub 组合）。实现序锚：
+# drop_part（被逐 key 的 pending 尾部**丢弃不发布**，budgets.py:260→:404）
+# → flush_sid（该 sid 其余 part 的 pending，占 seq）→ replayable resync。
+# ---------------------------------------------------------------------------
+
+
+async def test_eviction_matrix_midstream_pending_tail_discarded(monkeypatch):
+    """矩阵①中途流驱逐：被逐 part 未 flush 的 pending 尾部 delta 随
+    drop_part **丢弃、不发布**（契约按实现记——仅同 sid 其余 part 的
+    pending 先于 resync flush）；resync 占 seq 1、B 增量占 seq 2，流 seq
+    连续；被逐 part 迟到 delta 死于 disabled gate（零帧、零 seq）。"""
+    monkeypatch.setattr(
+        "oc_slimapi.sse.tokenstream.budgets.TOKEN_LIVEPARTS_MAX_BYTES", 1,
+    )
+    log = ReplayLog(epoch=EPOCH)
+    th = TokenStreamHub(replay_log=log)
+    sub = _v4_sub(th)
+    try:
+        th.on_part_updated(_text_start(SID, "mA", "p1"))
+        th.on_part_delta(_delta(SID, "mA", "p1", "a"))  # pending，未 flush
+        # B 准入驱逐 A：drop_part 先弹 A 的 pending 累加器（尾部 "a"
+        # 丢弃）→ 无 A delta 帧；resync 占 seq 1；B delta 占 seq 2。
+        th.on_part_updated(_text_start(SID, "mB", "p1"))
+        th.on_part_delta(_delta(SID, "mB", "p1", "b"))
+        th.flush()
+        parsed = []
+        for raw in _drain(sub):
+            id_, block = _split_id(raw)
+            event, data = _parse(block)
+            parsed.append((event, _seq_of(id_), data))
+        assert [(e, s) for e, s, _ in parsed] == [
+            ("resync", 1),
+            ("message.part.delta", 2),
+        ]
+        assert parsed[0][2] == {
+            "reason": "token_memory_limit", "sessionID": SID, "seq": 1,
+        }
+        assert parsed[1][2]["text"] == "b"  # B（其余 part）增量不受扰
+        assert th.token_memory_limit_total == 1
+        assert ("s1", "mA", "p1") not in th.live_parts
+        assert ("s1", "mA", "p1") in th._disabled_parts
+        # A 迟到 delta 死于 gate：零帧、零 seq 消耗
+        th.on_part_delta(_delta(SID, "mA", "p1", "late"))
+        th.flush()
+        assert log.last_seq(token_domain(SID)) == 2
+        assert _delta_frames(_drain(sub)) == []
+    finally:
+        th.detach_subscriber(SID, sub)
+        th.stop()
+
+
+async def test_eviction_matrix_after_textend_plugin_rewrite(monkeypatch):
+    """矩阵③text-end 插件改写后驱逐：终态全文（插件改写后）**从不上
+    v4 wire**——done marker 为 v3-only 无 seq（lever 1：权威全文走 REST），
+    wire 只见积累 delta；其后另一 part 被驱逐 → resync，seq 域连续、
+    已完成 part 不受扰、被逐 part 无后续流帧。
+    （旋钮注：用 count cap 驱逐——byte cap=1 会让首个 delta 在 ingest
+    即自逐该 part，测不到「完成后另一 part 被逐」场景。）"""
+    monkeypatch.setattr(
+        "oc_slimapi.sse.tokenstream.budgets.TOKEN_LIVE_PARTS_MAX", 1,
+    )
+    log = ReplayLog(epoch=EPOCH)
+    th = TokenStreamHub(replay_log=log)
+    sub = _v4_sub(th)
+    try:
+        th.on_part_updated(_text_start(SID, "mA", "p1"))
+        th.on_part_delta(_delta(SID, "mA", "p1", "pre"))    # 流上积累文本
+        # text-end（插件改写终态 "REWRITTEN"）：finish_part 同步 drain
+        # residual "pre" → delta seq 1；done marker v3-only（无 seq、不入
+        # 日志、不上 v4 wire）；A retire。
+        th.on_part_updated(_text_end(SID, "mA", "p1", "REWRITTEN"))
+        th.on_part_updated(_text_start(SID, "mB", "p1"))
+        th.on_part_delta(_delta(SID, "mB", "p1", "b"))
+        th.flush()  # B delta → seq 2
+        # C 准入驱逐 B（A 已 retire，不在 live 候选）→ resync seq 3
+        th.on_part_updated(_text_start(SID, "mC", "p1"))
+        th.on_part_delta(_delta(SID, "mC", "p1", "c"))
+        th.flush()  # C delta → seq 4
+        parsed = []
+        for raw in _drain(sub):
+            id_, block = _split_id(raw)
+            event, data = _parse(block)
+            parsed.append((event, _seq_of(id_), data))
+        assert [(e, s) for e, s, _ in parsed] == [
+            ("message.part.delta", 1),
+            ("message.part.delta", 2),
+            ("resync", 3),
+            ("message.part.delta", 4),
+        ]
+        # 积累文本上 wire；改写终态 "REWRITTEN" 不在任何帧（REST 独有）
+        texts = [d.get("text") for _, _, d in parsed
+                 if "text" in d]
+        assert texts == ["pre", "b", "c"]
+        assert all("REWRITTEN" != t for t in texts)
+        assert th.token_memory_limit_total == 1
+        # B 迟到 delta 死于 gate；A 早已 disabled——迟到事件零帧零 seq
+        th.on_part_delta(_delta(SID, "mB", "p1", "late-b"))
+        th.on_part_updated(_text_end(SID, "mA", "p1", "again"))
+        th.flush()
+        assert log.last_seq(token_domain(SID)) == 4
+        assert _delta_frames(_drain(sub)) == []
+    finally:
+        th.detach_subscriber(SID, sub)
+        th.stop()
+
+
+async def test_eviction_matrix_before_client_connect(monkeypatch):
+    """矩阵④客户端连接前驱逐：零订阅者时驱逐照常发生——resync 写入
+    重放日志占 seq（B-1 发布与订阅者存在性无关）；后来客户端连接（游标
+    0 重放）在窗口内见到该 advisory resync；连接后同域 seq 继续。
+    （旋钮注：count cap——byte cap 会让后续 delta 自逐 B，attach 后无帧。）"""
+    monkeypatch.setattr(
+        "oc_slimapi.sse.tokenstream.budgets.TOKEN_LIVE_PARTS_MAX", 1,
+    )
+    log = ReplayLog(epoch=EPOCH)
+    th = TokenStreamHub(replay_log=log)  # 无订阅者
+    try:
+        th.on_part_updated(_text_start(SID, "mA", "p1"))
+        th.on_part_delta(_delta(SID, "mA", "p1", "a"))
+        th.flush()  # seq 1 —— 零订阅者：投递丢弃但入日志
+        th.on_part_updated(_text_start(SID, "mB", "p1"))  # 驱逐 A → resync
+        th.on_part_delta(_delta(SID, "mB", "p1", "b"))
+        th.flush()  # seq 3
+        assert th.token_memory_limit_total == 1
+        assert log.last_seq(token_domain(SID)) == 3
+        # 客户端现在才连：路由层握手重放（Last-Event-ID 游标 0）→
+        # 窗口内三帧，含驱逐信号本身（advisory resync 可重放）。
+        outcome = log.replay(token_domain(SID), after_seq=0, epoch=EPOCH)
+        assert isinstance(outcome, ReplayFrames)
+        assert [e.seq for e in outcome.entries] == [1, 2, 3]
+        assert [e.kind for e in outcome.entries] == [
+            FRAME_KIND_BUSINESS, FRAME_KIND_BUSINESS, FRAME_KIND_BUSINESS,
+        ]
+        _, resync_data = _parse(outcome.entries[1].payload)
+        assert resync_data == {
+            "reason": "token_memory_limit", "sessionID": SID, "seq": 2,
+        }
+        # 连接后照常消费：B（仍 live）新增量以同域 seq 4 到达
+        sub = _v4_sub(th)
+        th.on_part_delta(_delta(SID, "mB", "p1", "b2"))
+        th.flush()
+        items = _drain(sub)
+        ids = [_seq_of(_split_id(i)[0]) for i in items]
+        assert ids == [4]
+        _, data = _parse(_split_id(items[0])[1])
+        assert data["text"] == "b2"
+        th.detach_subscriber(SID, sub)
+    finally:
+        th.stop()
+

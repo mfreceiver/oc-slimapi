@@ -685,3 +685,95 @@ async def test_part_events_cross_window_updated_at_monotonic(pair):
     second = only_digests(await drain(sub))
     assert len(second) == 1
     assert second[0]["updatedAt"] > first[0]["updatedAt"]
+
+
+# ---------------------------------------------------------------------------
+# 修订六终门控返工（rev-2）— §7.7 恢复协议 v2 收敛通道锚点 + §7.5 跨 sid
+# ---------------------------------------------------------------------------
+
+
+def part_textend_props(sid: str, mid: str, pid: str, text: str) -> dict:
+    """Properties for a text-end ``message.part.updated``（time.end 已置、
+    part.text 为插件可改写后的终态权威全文——仅落库走 REST）。"""
+    return {
+        "sessionID": sid,
+        "part": {
+            "id": pid,
+            "messageID": mid,
+            "sessionID": sid,
+            "type": "text",
+            "time": {"end": 1700000000000},
+            "text": text,
+        },
+        "time": {},
+    }
+
+
+async def test_evicted_part_late_textend_still_bumps_revision(pair, monkeypatch):
+    """（终门控 Blocking 2 闭合① / 驱逐矩阵② text-end 前驱逐）被逐
+    part 迟到的 text-end part.updated 被 tokenstream disabled gate 拦截
+    （零流帧、零 seq 消耗），但 GlobalHub 侧 revision **仍 bump** 并成
+    digest——收敛通道锚点（§7.7 协议 v2 / §7.5：digest bump 与
+    tokenstream 驱逐 gate 相互独立，`_retired_messages` gate 仅拦
+    whole-removal）。被逐 part 终态由此经 revision → digest → 常规
+    ?since/GET 对账收敛。"""
+    from oc_slimapi.sse.replay_log import ReplayLog, token_domain
+    from oc_slimapi.sse.tokenstream.hub import TokenStreamHub
+
+    hub, sub = pair
+    log = ReplayLog()
+    th = TokenStreamHub(replay_log=log)
+    hub.set_token_hub(th)
+    monkeypatch.setattr(
+        "oc_slimapi.sse.tokenstream.budgets.TOKEN_LIVEPARTS_MAX_BYTES", 1,
+    )
+    # token 侧铺场：A resident（live bytes == cap）+ 已 flush delta（seq 1）
+    th.on_part_updated(part_updated_props("s1", "mA", "p1"))
+    th.on_part_delta({"sessionID": "s1", "messageID": "mA", "partID": "p1",
+                      "field": "text", "delta": "a"})
+    th.flush()
+    # B 准入驱逐 A → advisory resync（seq 2）+ B delta（seq 3）
+    th.on_part_updated(part_updated_props("s1", "mB", "p1"))
+    th.on_part_delta({"sessionID": "s1", "messageID": "mB", "partID": "p1",
+                      "field": "text", "delta": "b"})
+    th.flush()
+    assert th.token_memory_limit_total == 1
+    seq_before = log.last_seq(token_domain("s1"))
+
+    # 被逐 part 的 text-end（插件改写终态 "REWRITTEN"）迟到：
+    # tokenstream 侧 disabled gate 拦截（零帧零 seq）；
+    # GlobalHub 侧不受该 gate 影响——bump 照常发生。
+    before = seq()
+    hub.publish(ev("/p", "message.part.updated",
+                   part_textend_props("s1", "mA", "p1", "REWRITTEN")))
+    assert seq() == before + 1  # 收敛通道锚点：bump 不被驱逐拦截
+    assert log.last_seq(token_domain("s1")) == seq_before  # 零流帧零 seq
+    hub.flush()
+    digests = only_digests(await drain(sub))
+    assert len(digests) == 1
+    assert digests[0]["sessionID"] == "s1"
+    assert digests[0]["messagesRevision"] == before + 1  # 终态变化可见
+
+
+async def test_cross_sid_wire_order_inverse_revision(pair):
+    """（终门控 Blocking 4 闭合）sid-A 分配 N、sid-B 分配 N+1：先
+    asked-flush B（targeted flush）、后批量 flush A → wire 序
+    ``[N+1, N]`` 且两帧均为该 sid 的有效 digest——allocator 事件循环内
+    全局递增（§7.5 ①），但跨 sid wire 顺序可合法逆序（§7.5 ③：禁止用
+    其他 sid 的 max revision 丢弃/去重当前 sid digest）。"""
+    hub, sub = pair
+    before = seq()
+    hub.publish(ev("/p", "message.updated", msg_props("sA", "mA")))  # → N
+    hub.publish(ev("/p", "message.updated", msg_props("sB", "mB")))  # → N+1
+    assert seq() == before + 2
+    n_a, n_b = before + 1, before + 2
+    # B 先 asked → targeted flush：sB digest（revision N+1）先上线
+    hub.publish(ev("/p", "question.asked", asked_props("sB")))
+    # A 后批量 flush：sA digest（revision N）后上线
+    hub.flush()
+    digests = only_digests(await drain(sub))
+    assert [d["sessionID"] for d in digests] == ["sB", "sA"]
+    assert [d["messagesRevision"] for d in digests] == [n_b, n_a]  # [N+1, N]
+    # 两帧各自携带本 sid 的 window-end 修订（有效 digest，非乱序可丢弃）
+    assert n_b == n_a + 1  # 分配序全局递增 ≠ wire 序
+
