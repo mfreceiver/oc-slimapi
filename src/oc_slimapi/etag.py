@@ -41,7 +41,11 @@ _ETAG_SCHEME_VERSION = b"etag-v1"
 #: projection, aggregate diffStats priority chain, edit diff-text files
 #: synthesis. FINGERPRINT_VERSION deliberately unchanged — derived fields
 #: enter the fingerprint naturally through the projected body.
-SKELETON_REPRESENTATION_VERSION = b"skeleton-v2"
+#: v3 (修订八): thin placeholder part no longer carries display copy —
+#: `text` becomes "" and the `thin_placeholder_` ID prefix is the sole
+#: machine marker. Placeholder text participates in the projected body,
+#: so every skeleton validator rotates (no false 304 after upgrade).
+SKELETON_REPRESENTATION_VERSION = b"skeleton-v3"
 
 
 class _ConfigLike(Protocol):

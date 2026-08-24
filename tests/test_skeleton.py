@@ -7,7 +7,6 @@ import orjson
 from oc_slimapi.config import settings as _skel_config
 from oc_slimapi.skeleton import (
     FINGERPRINT_FIELD,
-    PLACEHOLDER_TEXT,
     REASONING_INLINE_MAX_BYTES,
     _compute_diffstats,
     _compute_diffstats_from_files,
@@ -126,11 +125,13 @@ def test_empty_parts_receive_renderable_placeholder():
     source = [{"info": {"id": "m1", "role": "assistant"}, "parts": []}]
     result = skeleton_messages(source)
 
+    # 修订八: placeholder part carries NO display copy — the machine marker is
+    # exclusively the `thin_placeholder_` ID prefix; text is an empty string.
     assert result[0]["parts"] == [{
         "id": "thin_placeholder_m1",
         "messageID": "m1",
         "type": "text",
-        "text": PLACEHOLDER_TEXT,
+        "text": "",
         "hasFull": True,
         "omitted": ["parts"],
     }]

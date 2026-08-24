@@ -34,6 +34,23 @@ _暂无。_
 
 ---
 
+## [4.14.0] - 2026-08-24 — thin placeholder 去显示文案（minor；wire 仍 v4，owner 例外）
+
+> 包版本按 minor 从 4.13.1 升至 4.14.0；Wire API 仍为 v4 `(4,4)`。
+> 源于 webui 用户反馈：busy 会话刚发消息时界面显示「[内容已折叠，点开查看]」——
+> 该文案经 thin placeholder part 的 `text` 字段泄漏到客户端被原样渲染。
+> 「点开查看」属 UI 交互语义，服务端不应替客户端决定展示文案。
+> **owner 例外**（`AGENTS.md` 版本双轨 / `docs/release.md:37-38/54-55`，4.9.0 先例）：
+> wire 版本不变的破坏性 wire 形状变更（placeholder `text` 值 非空 → 空串），
+> 经 owner 批准随 **minor** 发布；契约修订八（`docs/specs/v4-contract.md` §10.2）。
+
+### Changed
+
+- **busy skeleton thin placeholder part 不再携带显示文案**：`GET /slimapi/messages/{sid}?v=4`（缺省 skeleton 视图）中，无任何可渲染 part 的消息注入的 thin placeholder part 其 `text` 字段恒为**空串 `""`**（此前为 `"[内容已折叠，点开查看]"`）。**唯一机器识别依据 = part ID 前缀 `thin_placeholder_`**（不变）；part 其余键（`type:"text"`、`hasFull:true`、`omitted:["parts"]`）与注入时机、merged 合并逻辑（placeholder-first）、SSE 帧结构均零改动。**客户端必改点**：依赖 placeholder `text` 显示文案的消费方需改为按 ID 前缀识别并自渲染展示态（如「思考中」）——webui 已有保底渲染方案零必改；ocdroid 不渲染该文案零必改。
+- **ETag 全量轮换（表示域版本 bump 的可观察效应，4.9.0 后又一次）**：skeleton 表示域 REP_VERSION `skeleton-v2` → `skeleton-v3`——同输入下新旧 v4 validator 必然不同，升级后旧 v4 ETag 全部自然失效重拉（预期内一次性流量；`contentFingerprint` 无 `vN` 改动，placeholder text 经投影后的表示自然进入指纹）。
+
+---
+
 ## [4.13.1] - 2026-08-24 — 深度 Bug Hunting 修复批（patch；wire 仍 v4，客户端零必改）
 
 > 源于 2026-08-24 无人值守深度 Bug Hunting（报告：`docs/automatic/20260824-0714_bug-hunting.md`，BUG-001..005 全部 CONFIRMED + 独立复现）。四项修复并发分批执行，每项带 fail-first 回归锁。Wire API 仍为 v4 `(4,4)`；错误路径行为回归契约语义（不再出现裸 500）。

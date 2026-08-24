@@ -10,7 +10,6 @@ from typing import Any
 
 import orjson
 
-PLACEHOLDER_TEXT = "[内容已折叠，点开查看]"
 PART_IDS = {"id", "type", "messageID", "sessionID"}
 
 # ---------------------------------------------------------------------------
@@ -1043,11 +1042,15 @@ def skeleton_message(
         for part in parts if isinstance(part, dict)
     ]
     if not any(_is_renderable(part) for part in thin_parts):
+        # 修订八: the thin placeholder is a machine marker ONLY — identified
+        # solely by its `thin_placeholder_` ID prefix (mirrored by
+        # routes/messages/_full_merge.py). It carries no display copy; busy
+        # presentation (e.g. "thinking…") is the client's own concern.
         thin_parts.append({
             "id": f"thin_placeholder_{message_id}",
             "messageID": message_id,
             "type": "text",
-            "text": PLACEHOLDER_TEXT,
+            "text": "",
             "hasFull": True,
             "omitted": ["parts"],
         })
